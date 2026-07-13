@@ -16,6 +16,26 @@ const OPERATOR = "test-operator-token-32chars!!";
 const runtimeSso = new Map<string, { id: string; providerId: string }>();
 const runtimeScim = new Map<string, { id: string; providerId: string; token: string }>();
 
+function configureTestEnvironment(dataPath: string) {
+	delete process.env.DATABASE_URL;
+	process.env.CLEARANCE_DATA_PATH = dataPath;
+	process.env.CLEARANCE_SECRET = "unit-test-secret-value-not-default!!";
+	process.env.CLEARANCE_OPERATOR_TOKEN = OPERATOR;
+	process.env.CLEARANCE_CORS_ORIGINS = "http://localhost:3100";
+	process.env.CLEARANCE_BASE_URL = "https://auth.test.example";
+	process.env.NODE_ENV = "development";
+}
+
+function clearTestEnvironment() {
+	delete process.env.CLEARANCE_DATA_PATH;
+	delete process.env.CLEARANCE_SECRET;
+	delete process.env.CLEARANCE_OPERATOR_TOKEN;
+	delete process.env.DATABASE_URL;
+	delete process.env.CLEARANCE_CORS_ORIGINS;
+	delete process.env.CLEARANCE_BASE_URL;
+	delete process.env.NODE_ENV;
+}
+
 const mocks = vi.hoisted(() => ({
 	createSsoConnectionReal: vi.fn(),
 	createScimConnectionReal: vi.fn(),
@@ -34,15 +54,27 @@ vi.mock("@clearance/management", async (importOriginal) => {
 	};
 });
 
+// Transform the large server graph during test-file loading, outside an
+// individual test's 5-second budget. CI runs several package suites in
+// parallel, so the first per-test dynamic import can otherwise time out while
+// Vite is still transforming dependencies. A timed-out import keeps running
+// and the following test can join the same module initialization, reusing its
+// store despite selecting a new data path.
+const warmDirectory = mkdtempSync(join(tmpdir(), "clr-setup-warm-"));
+configureTestEnvironment(join(warmDirectory, "data.json"));
+try {
+	await import("./server.js");
+} finally {
+	vi.resetModules();
+	clearTestEnvironment();
+	rmSync(warmDirectory, { recursive: true, force: true });
+}
+
 afterEach(() => {
 	for (const d of dirs.splice(0)) {
 		rmSync(d, { recursive: true, force: true });
 	}
-	delete process.env.CLEARANCE_DATA_PATH;
-	delete process.env.CLEARANCE_OPERATOR_TOKEN;
-	delete process.env.DATABASE_URL;
-	delete process.env.CLEARANCE_CORS_ORIGINS;
-	delete process.env.CLEARANCE_BASE_URL;
+	clearTestEnvironment();
 	runtimeSso.clear();
 	runtimeScim.clear();
 	vi.resetModules();
@@ -61,13 +93,7 @@ afterEach(() => {
 async function boot() {
 	const dir = mkdtempSync(join(tmpdir(), "clr-setup-"));
 	dirs.push(dir);
-	delete process.env.DATABASE_URL;
-	process.env.CLEARANCE_DATA_PATH = join(dir, "data.json");
-	process.env.CLEARANCE_SECRET = "unit-test-secret-value-not-default!!";
-	process.env.CLEARANCE_OPERATOR_TOKEN = OPERATOR;
-	process.env.CLEARANCE_CORS_ORIGINS = "http://localhost:3100";
-	process.env.CLEARANCE_BASE_URL = "https://auth.test.example";
-	process.env.NODE_ENV = "development";
+	configureTestEnvironment(join(dir, "data.json"));
 
 	const { app, getStore } = await import("./server.js");
 	const {

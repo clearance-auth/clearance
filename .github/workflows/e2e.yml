@@ -46,8 +46,6 @@ jobs:
 
       - name: Compose stack smoke
         run: pnpm stack:smoke
-        env:
-          CLEARANCE_SECRET: ci-compose-secret-value-change-me-32
 
   e2e:
     runs-on: ubuntu-latest
