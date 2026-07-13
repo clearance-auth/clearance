@@ -128,20 +128,24 @@ node packages/clearance-cli/dist/index.js --local-direct upgrade check --json --
 | `@clearance/console` | Dark operator console |
 | `@clearance/sample-b2b` | Sample B2B app for login e2e |
 
-## Scope honesty (current cut)
+## Available today
 
-This repository currently ships a **locally testable Clearance control plane + sample app** covering selected local workflows from INIT milestones M1–M4:
+- CLI-first management for projects, users, organizations, API keys, configuration, runtime schemas, and audit events
+- An operator console for users, organizations, events, settings, and authenticated administration
+- SAML and OIDC connection setup, SCIM provisioning, diagnostics, and readiness checks, including read-only live endpoint conformance tests
+- Validated imports and migration workflows with plan, run, verify, and rollback stages
+- Self-hosted Docker Compose and Helm deployment paths backed by Postgres
+- Operational workflows for health checks, backup, restore, upgrades, and rollback
+- A sample B2B application and end-to-end verification suite for evaluating Clearance locally
 
-- Fresh public history containing only Clearance-owned package names and product identity
-- CLI management of projects, users, orgs, events with a tested single-JSON-document output contract (registry-swept)
-- Console surfaces (Overview / Users / Orgs / Events / Settings) with in-browser operator login/logout, proven by DOM tests and a chromium E2E stage inside the canonical gate
-- SSO/SCIM setup/test with diagnostic stages + readiness report. Fixture/simulation labs remain the default; `sso test --live` / `scim test --live` run **read-only discovery/JWKS and SCIM endpoint conformance against a real external tenant** (HTTPS, non-loopback, `--yes`-armed). Full interactive sign-in certification against Okta/Entra tenants is still open; live SAML refuses rather than pretending
-- Clearance import plus migration plan/run/verify/rollback on validated exports, including coordinated Postgres runtime and management writes
-- Config and runtime-schema lifecycle, operator login/logout/whoami, API-key lifecycle, and event tailing
-- Persistent Compose stack lifecycle, doctor, backup/verify/restore, and the shipped `0.1.0` → `0.2.0` upgrade check/plan/apply/verify/rollback drill, including an exact-token active-database restore path
-- Canonical gate (`scripts/verify-real.sh`) runs the Postgres-backed management suites against disposable databases with a machine-checked zero-skip assertion, plus the browser E2E — silent skip is a gate failure
+## Roadmap
 
-The full milestone gates remain open. Deploy/cloud commands and hosted-source imports are absent; environment promotion remains limited; the console still uses process-local sessions; and the management Postgres store is a single-row JSONB snapshot suitable for local/small-tenant use only (measured baseline and exit design in DESIGN-store-v2.md). Live Okta/Entra tenant *certification* (interactive sign-in) and signed-release publication against the final public registry have not been performed. The beta readiness evidence, external adversarial review result, residual risks, and rollout prerequisites are recorded in `docs/beta-readiness.md`.
+- Public beta packages and signed releases
+- Certified interactive SSO flows with Okta and Microsoft Entra ID
+- Hosted-source imports and expanded environment promotion workflows
+- CLI-driven cloud deployment and production operations
+- Distributed console sessions and a horizontally scalable management data model
+- Published beta readiness, security review, and deployment guidance
 
 ## Docs
 
