@@ -872,15 +872,10 @@ app.get("/metrics", (c) => {
 });
 
 app.get("/health", async (c) => {
-	const store = await storeForRequest();
 	return c.json({
 		ok: true,
 		service: "clearance-api",
 		version: "0.1.0",
-		releaseVersion: store.snapshot.releaseVersion,
-		storeBackend: store.backend,
-		auth: "bearer-operator",
-		cors: corsOrigins,
 	});
 });
 

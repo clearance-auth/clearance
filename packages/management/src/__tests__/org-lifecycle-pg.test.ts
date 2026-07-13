@@ -228,7 +228,7 @@ describe.skipIf(!available)(
 			const owner = await createUserInAuth({
 				email: `owner-${stamp}@org-lc.test`,
 				name: "Owner",
-				password: "OrgLcTest1!",
+				password: "OrgLifecycle1!",
 				managementStore: store,
 			});
 			trackUser(owner);
@@ -513,7 +513,7 @@ describe.skipIf(!available)(
 			const member = await createUserInAuth({
 				email: `mem-${stamp}@org-lc.test`,
 				name: "Member",
-				password: "OrgLcTest1!",
+				password: "OrgLifecycle1!",
 				managementStore: store,
 			});
 			trackUser(member);

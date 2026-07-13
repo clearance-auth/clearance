@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Isolated, destructive end-to-end acceptance test for the complete local stack.
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="${SCRATCH_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/clearance-compose-smoke.XXXXXX")}"
@@ -47,6 +47,15 @@ cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans --rmi local >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
+
+on_error() {
+  local status="$?" line="$1" command="$2"
+  printf 'COMPOSE_SMOKE_FAILED status=%s line=%s command=%s\n' "$status" "$line" "$command" >&2
+  "${COMPOSE[@]}" ps --all >&2 || true
+  "${COMPOSE[@]}" logs --no-color >&2 || true
+  return "$status"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 json_field() {
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(0,'utf8')); const v=$1; if(v===undefined) process.exit(2); process.stdout.write(String(v))"
@@ -193,12 +202,18 @@ wait_for() {
   echo "idempotency replay + conflict asserted"
 
   MARKER="OIDC-SMOKE-PLAINTEXT-$(openssl rand -hex 8)"
-  auth_curl -X POST "$API_URL/v1/sso" -H 'content-type: application/json' \
-    -d "{\"organizationId\":\"$ORG_ID\",\"provider\":\"oidc\",\"issuer\":\"https://idp.example.test\",\"clientId\":\"smoke-client\",\"clientSecret\":\"$MARKER\"}" >"$SCRATCH/sso.json"
+  SSO_STATUS="$(curl -sS -o "$SCRATCH/sso.json" -w '%{http_code}' \
+    -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
+    -X POST "$API_URL/v1/sso" -H 'content-type: application/json' \
+    -d "{\"organizationId\":\"$ORG_ID\",\"provider\":\"oidc\",\"issuer\":\"https://idp.example.test\",\"clientId\":\"smoke-client\",\"clientSecret\":\"$MARKER\"}")"
+  if [[ "$SSO_STATUS" != "201" ]]; then
+    node -e 'const j=require(process.argv[1]); console.error("SSO create failed", process.argv[2], j.error?.code ?? "UNKNOWN", j.error?.message ?? "unknown error")' "$SCRATCH/sso.json" "$SSO_STATUS"
+    exit 1
+  fi
   SSO_ID="$(json_field 'j.connection.id' <"$SCRATCH/sso.json")"
   STORED="$(${COMPOSE[@]} exec -T postgres psql -U "$CLEARANCE_DB_USER" -d "$CLEARANCE_DB_NAME" -Atc "select \"oidcConfig\" from \"ssoProvider\" where id = '$SSO_ID'")"
-  [[ "$STORED" == *'clr-sso:v1:'* ]]
-  [[ "$STORED" != *"$MARKER"* ]]
+  [[ "$STORED" == *'clr-sso:v1:'* ]] || { echo "runtime SSO credential is missing the encrypted-storage marker" >&2; exit 1; }
+  [[ "$STORED" != *"$MARKER"* ]] || { echo "runtime SSO credential retained plaintext" >&2; exit 1; }
 
   export DATABASE_URL CLEARANCE_BASE_URL="$SAMPLE_URL" CLEARANCE_API_URL="$API_URL" CLEARANCE_CONSOLE_URL="$CONSOLE_URL" CLEARANCE_STRICT_SECRETS=1 NODE_ENV=production
   node "$CLI_NODE" doctor --json --no-input >"$SCRATCH/doctor.json"

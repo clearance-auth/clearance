@@ -227,7 +227,7 @@ export function createClearanceAuth(options: CreateClearanceAuthOptions) {
 		database: { db, type: "postgres" },
 		emailAndPassword: {
 			enabled: true,
-			minPasswordLength: 8,
+			minPasswordLength: 12,
 		},
 		user: {
 			additionalFields: userAdditionalFields,
