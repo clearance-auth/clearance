@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@clearance/management": "workspace:*",
-    "commander": "^13.1.0"
+    "commander": "^15.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
