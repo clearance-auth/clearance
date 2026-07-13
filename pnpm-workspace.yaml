@@ -5,9 +5,9 @@ packages:
 catalog:
   '@better-fetch/fetch': 1.3.1
   kysely: ^0.28.17 || ^0.29.0
-  tsdown: 0.21.1
+  tsdown: 0.22.3
   typescript: ^5.9.3
-  vitest: ^4.1.5
+  vitest: ^4.1.10
   '@vitest/coverage-istanbul': ^4.1.5
   '@vitest/ui': ^4.1.5
 
@@ -22,7 +22,7 @@ catalogs:
   vitest:
     '@vitest/coverage-istanbul': ^4.1.5
     '@vitest/ui': ^4.1.5
-    vitest: ^4.1.5
+    vitest: ^4.1.10
 
 linkWorkspacePackages: true
 
