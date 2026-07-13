@@ -61,6 +61,12 @@ done
 # were removed — the behavioral sign-release section below proves the same
 # contracts by execution (refuses missing key, real verifiable signature).
 
+if grep -qE 'trap .*BASH_COMMAND|COMPOSE_SMOKE_FAILED.*command=' scripts/compose-smoke.sh; then
+  bad "compose smoke failure diagnostics can expose expanded secret-bearing commands"
+else
+  ok "compose smoke failure diagnostics omit expanded commands"
+fi
+
 # ---------- static: production compose ----------
 section "static: production compose fail-closed"
 PROD=deploy/compose/docker-compose.production.yml

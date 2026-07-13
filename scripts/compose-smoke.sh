@@ -49,13 +49,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 on_error() {
-  local status="$?" line="$1" command="$2"
-  printf 'COMPOSE_SMOKE_FAILED status=%s line=%s command=%s\n' "$status" "$line" "$command" >&2
+  local status="$?" line="$1"
+  # Never print BASH_COMMAND here: several smoke commands carry temporary
+  # bearer tokens and passwords in their arguments.
+  printf 'COMPOSE_SMOKE_FAILED status=%s line=%s\n' "$status" "$line" >&2
   "${COMPOSE[@]}" ps --all >&2 || true
   "${COMPOSE[@]}" logs --no-color >&2 || true
   return "$status"
 }
-trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_error "$LINENO"' ERR
 
 json_field() {
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(0,'utf8')); const v=$1; if(v===undefined) process.exit(2); process.stdout.write(String(v))"
