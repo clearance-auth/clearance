@@ -130,7 +130,7 @@ const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release-si
 const stagingBuild = releaseWorkflow.indexOf("--tag \"$STAGING_IMAGE\"");
 const cosignVerify = releaseWorkflow.indexOf("cosign verify --certificate-identity");
 const finalTag = releaseWorkflow.indexOf("docker buildx imagetools create --tag \"$IMAGE\"");
-const npmPublish = releaseWorkflow.indexOf("npm publish \"$TARBALL\"");
+const npmPublish = releaseWorkflow.indexOf('npm publish "$(tarball_for "$PACKAGE")"');
 if (stagingBuild < 0 || cosignVerify < stagingBuild || finalTag < cosignVerify || npmPublish < finalTag) {
 	fail("release workflow must build staging references, verify keyless signatures, create final tags, then publish npm");
 }
