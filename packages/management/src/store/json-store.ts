@@ -11,7 +11,7 @@ import type { DataStoreSnapshot } from "../types/resources.js";
 import type { ManagementStore } from "./types.js";
 
 export const STORE_SCHEMA_VERSION = 1;
-export const CLEARANCE_RELEASE_VERSION = "0.1.0";
+export const CLEARANCE_RELEASE_VERSION = "0.1.1";
 
 export function emptySnapshot(
 	config: Record<string, string> = {},

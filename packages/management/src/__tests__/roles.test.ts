@@ -325,7 +325,7 @@ describe("snapshot backward compatibility", () => {
 			path,
 			JSON.stringify({
 				version: 1,
-				releaseVersion: "0.1.0",
+				releaseVersion: "0.1.1",
 				projects: [],
 				environments: [],
 				principals: [],
@@ -352,7 +352,7 @@ describe("snapshot backward compatibility", () => {
 		// Direct normalize of partial object
 		const partial = normalizeSnapshot({
 			version: 1,
-			releaseVersion: "0.1.0",
+			releaseVersion: "0.1.1",
 			projects: [],
 			environments: [],
 			principals: [],

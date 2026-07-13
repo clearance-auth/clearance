@@ -100,6 +100,7 @@ jobs:
         run: |
           corepack enable
           pnpm install --frozen-lockfile
+          pnpm --filter @clearance/e2e exec playwright install chromium
           node scripts/verify-release-version.mjs "$VERSION"
           pnpm verify:real
 
