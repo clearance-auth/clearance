@@ -25,7 +25,7 @@
     "hono": "^4.12.25"
   },
   "devDependencies": {
-    "@types/node": "^22.13.10",
+    "@types/node": "^26.1.1",
     "tsx": "^4.19.3",
     "typescript": "catalog:",
     "vitest": "catalog:"
