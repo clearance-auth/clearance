@@ -268,12 +268,12 @@ jobs:
             TARBALL="$(tarball_for "$PACKAGE")"
             EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
             PUBLISHED_INTEGRITY=""
-            for ATTEMPT in {1..36}; do
+            for ATTEMPT in {1..120}; do
               if PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
                 && [[ -n "$PUBLISHED_INTEGRITY" ]]; then
                 break
               fi
-              echo "Waiting for ${PACKAGE}@${VERSION} to propagate (${ATTEMPT}/36)..."
+              echo "Waiting for ${PACKAGE}@${VERSION} to propagate (${ATTEMPT}/120)..."
               sleep 5
             done
             [[ -n "$PUBLISHED_INTEGRITY" ]] || {
