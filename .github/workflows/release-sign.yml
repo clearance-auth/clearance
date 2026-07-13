@@ -8,21 +8,23 @@ on:
         description: "Clearance release version"
         required: true
         type: string
+      recover_published_npm:
+        description: "Recover signed assets after npm published but release attachment failed"
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
 
 permissions: {}
 
-concurrency:
-  group: clearance-release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   gate:
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - id: version
         env:
@@ -31,6 +33,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           VERSION="${REQUESTED_VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?(\+([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$ ]]; then
             echo "release=true" >> "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -46,6 +49,11 @@ jobs:
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment: npm-release
+    env:
+      RECOVER_PUBLISHED_NPM: ${{ inputs.recover_published_npm && '1' || '0' }}
+    concurrency:
+      group: clearance-release-v${{ needs.gate.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: write
       packages: write
@@ -55,6 +63,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
+
+      - name: Checkout npm recovery verifier
+        if: inputs.recover_published_npm
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: .release-tooling
+          sparse-checkout: scripts/verify-npm-provenance.mjs
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -92,7 +111,24 @@ jobs:
             echo "::error::Tag v${VERSION} must exist and resolve to the release commit"
             exit 1
           }
+          [[ "$GITHUB_REPOSITORY" == "clearance-auth/clearance" ]] || {
+            echo "::error::Releases must run in the canonical clearance-auth/clearance repository"
+            exit 1
+          }
+          if [[ "$RECOVER_PUBLISHED_NPM" == "1" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "::error::npm recovery is available only through an explicit workflow dispatch"
+            exit 1
+          fi
+          if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" \
+              && "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/main" \
+              && "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]] || {
+              echo "::error::npm recovery must use the release workflow from the current main commit"
+              exit 1
+            }
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:$VERSION" >> "$GITHUB_ENV"
           echo "BACKUP_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance-backup:$VERSION" >> "$GITHUB_ENV"
           echo "STAGING_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
@@ -110,10 +146,26 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p dist-release/assets
-          pnpm --filter @clearance/auth pack --pack-destination dist-release/assets
-          pnpm --filter @clearance/management pack --pack-destination dist-release/assets
-          pnpm --filter @clearance/cli pack --pack-destination dist-release/assets
-          pnpm --filter @clearance/api pack --pack-destination dist-release/assets
+          PACKAGES=(@clearance/auth @clearance/management @clearance/cli @clearance/api)
+          if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
+            npm install --global npm@11.5.1
+            AUDIT_DIR="$(mktemp -d)"
+            npm install --prefix "$AUDIT_DIR" --ignore-scripts --save-exact \
+              "${PACKAGES[@]/%/@$VERSION}"
+            npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations \
+              > "$AUDIT_DIR/npm-audit-signatures.json"
+            for PACKAGE in "${PACKAGES[@]}"; do
+              npm pack "${PACKAGE}@${VERSION}" --pack-destination dist-release/assets --ignore-scripts
+            done
+            node .release-tooling/scripts/verify-npm-provenance.mjs \
+              "$VERSION" "$(git rev-parse HEAD)" "$AUDIT_DIR/npm-audit-signatures.json" \
+              dist-release/assets dist-release/assets/npm-provenance.json "${PACKAGES[@]}"
+          else
+            pnpm --filter @clearance/auth pack --pack-destination dist-release/assets
+            pnpm --filter @clearance/management pack --pack-destination dist-release/assets
+            pnpm --filter @clearance/cli pack --pack-destination dist-release/assets
+            pnpm --filter @clearance/api pack --pack-destination dist-release/assets
+          fi
           command -v helm >/dev/null
           helm package deploy/helm/clearance --version "$VERSION" --app-version "$VERSION" --destination dist-release/assets
           pnpm list -r --prod --json --depth Infinity > dist-release/assets/dependency-graph.json
@@ -136,6 +188,7 @@ jobs:
           node scripts/verify-release-runtime-closure.mjs "$(tarball_for '@clearance/management')" dist-release/assets/management-runtime-closure.json
 
       - name: Build and push staging container references
+        if: env.RECOVER_PUBLISHED_NPM != '1'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -144,7 +197,7 @@ jobs:
           docker buildx build --push --tag "$STAGING_IMAGE" \
             --provenance=mode=max --sbom=true \
             --label "org.opencontainers.image.version=$VERSION" \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
             --metadata-file dist-release/image-metadata.json .
           DIGEST="$(node -e "const j=require('./dist-release/image-metadata.json'); process.stdout.write(j['containerimage.digest']||'')")"
           test -n "$DIGEST"
@@ -152,13 +205,49 @@ jobs:
           docker buildx build --push --target backup-runtime --tag "$STAGING_BACKUP_IMAGE" \
             --provenance=mode=max --sbom=true \
             --label "org.opencontainers.image.version=$VERSION" \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
             --metadata-file dist-release/backup-image-metadata.json .
           BACKUP_DIGEST="$(node -e "const j=require('./dist-release/backup-image-metadata.json'); process.stdout.write(j['containerimage.digest']||'')")"
           test -n "$BACKUP_DIGEST"
           printf '%s@%s\n' "${BACKUP_IMAGE%:*}" "$BACKUP_DIGEST" > dist-release/assets/backup-container-image.txt
           echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
           echo "BACKUP_DIGEST=$BACKUP_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Recover existing tag-signed container digests
+        if: env.RECOVER_PUBLISHED_NPM == '1'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          recover_digest() {
+            local image="$1" evidence="$2" digest
+            docker pull "$image" >/dev/null
+            digest="$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | awk -F@ -v repository="${image%:*}" '$1 == repository { print $2; exit }')"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error::$image did not resolve to an immutable digest"
+              exit 1
+            }
+            printf '%s@%s\n' "${image%:*}" "$digest" > "$evidence"
+            printf '%s' "$digest"
+          }
+          DIGEST="$(recover_digest "$IMAGE" dist-release/assets/container-image.txt)"
+          BACKUP_DIGEST="$(recover_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt)"
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "BACKUP_DIGEST=$BACKUP_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Verify recovered immutable container signatures
+        if: env.RECOVER_PUBLISHED_NPM == '1'
+        run: |
+          set -Eeuo pipefail
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
+          cosign verify --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE%:*}@${DIGEST}" >/dev/null
+          cosign verify --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}" >/dev/null
 
       - name: Sign package and container-digest bundle
         env:
@@ -177,6 +266,7 @@ jobs:
           (cd dist-release/assets && sha256sum --check ../assets.sha256)
 
       - name: Keyless-sign and verify immutable container digests
+        if: env.RECOVER_PUBLISHED_NPM != '1'
         run: |
           set -Eeuo pipefail
           PRIMARY_REF="${IMAGE%:*}@${DIGEST}"
@@ -190,6 +280,7 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$BACKUP_REF" >/dev/null
 
       - name: Create final release tags from verified digests
+        if: env.RECOVER_PUBLISHED_NPM != '1'
         run: |
           set -Eeuo pipefail
           docker buildx imagetools create --tag "$IMAGE" "${IMAGE%:*}@${DIGEST}"
@@ -218,6 +309,7 @@ jobs:
           verify_tag_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt
 
       - name: Publish public npm packages with trusted provenance
+        if: env.RECOVER_PUBLISHED_NPM != '1'
         env:
           NPM_CONFIG_PROVENANCE: "true"
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -245,24 +337,37 @@ jobs:
               process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
             ' "$1"
           }
+          registry_status() {
+            local package="$1" encoded response status
+            encoded="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$package")"
+            response="dist-release/npm-registry-response.json"
+            for ATTEMPT in {1..120}; do
+              status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+                "https://registry.npmjs.org/${encoded}/${VERSION}" || true)"
+              case "$status" in
+                200|404) printf '%s' "$status"; return 0 ;;
+                000|429|5??)
+                  echo "Waiting for a conclusive registry response for ${package}@${VERSION} (${ATTEMPT}/120)..." >&2
+                  sleep 5
+                  ;;
+                *)
+                  echo "::error::Registry returned HTTP $status for ${package}@${VERSION}" >&2
+                  return 1
+                  ;;
+              esac
+            done
+            echo "::error::Registry did not return a conclusive response for ${package}@${VERSION}" >&2
+            return 1
+          }
           for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
-            TARBALL="$(tarball_for "$PACKAGE")"
-            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
-            VIEW_RESULT="dist-release/npm-view.json"
-            if npm view "${PACKAGE}@${VERSION}" dist.integrity --json >"$VIEW_RESULT" 2>/dev/null; then
-              PUBLISHED_INTEGRITY="$(tr -d '"\n' <"$VIEW_RESULT")"
-            else
-              PUBLISHED_INTEGRITY=""
-            fi
-            if [[ -n "$PUBLISHED_INTEGRITY" ]]; then
-              [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
-                echo "::error::${PACKAGE}@${VERSION} exists with unexpected tarball integrity"
-                exit 1
-              }
-              echo "${PACKAGE}@${VERSION} already matches the release tarball; skipping."
-            else
-              npm publish "$TARBALL" --access public --provenance
-            fi
+            STATUS="$(registry_status "$PACKAGE")"
+            [[ "$STATUS" == "404" ]] || {
+              echo "::error::${PACKAGE}@${VERSION} already exists; use the explicit provenance-verified recovery path"
+              exit 1
+            }
+          done
+          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
+            npm publish "$(tarball_for "$PACKAGE")" --access public --provenance
           done
           for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
             TARBALL="$(tarball_for "$PACKAGE")"
@@ -294,13 +399,40 @@ jobs:
           if-no-files-found: error
 
       - name: Attach signed assets to tagged GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || env.RECOVER_PUBLISHED_NPM == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          RELEASE_TAG="v${VERSION}"
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
           mapfile -d '' FILES < <(find dist-release -type f -print0)
           test "${#FILES[@]}" -gt 0
-          gh release upload "$GITHUB_REF_NAME" "${FILES[@]}" --clobber
+          RELEASE_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)"
+          EXISTING_ASSETS="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets")"
+          declare -A NAMES=()
+          for FILE in "${FILES[@]}"; do
+            NAME="$(basename "$FILE")"
+            [[ -z "${NAMES[$NAME]:-}" ]] || {
+              echo "::error::Release bundle contains duplicate asset name $NAME"
+              exit 1
+            }
+            NAMES[$NAME]=1
+            mapfile -t MATCHES < <(jq -r --arg name "$NAME" '.[] | select(.name == $name) | [.id, (.digest // "")] | @tsv' <<<"$EXISTING_ASSETS")
+            [[ "${#MATCHES[@]}" -le 1 ]] || {
+              echo "::error::Release already contains duplicate asset name $NAME"
+              exit 1
+            }
+            EXPECTED="sha256:$(sha256sum "$FILE" | awk '{print $1}')"
+            if [[ "${#MATCHES[@]}" -eq 1 ]]; then
+              IFS=$'\t' read -r _ ACTUAL <<<"${MATCHES[0]}"
+              [[ "$ACTUAL" == "$EXPECTED" ]] || {
+                echo "::error::Existing release asset $NAME has digest ${ACTUAL:-missing}; expected $EXPECTED"
+                exit 1
+              }
+              echo "Existing release asset $NAME matches; skipping."
+            else
+              gh release upload "$RELEASE_TAG" "$FILE"
+            fi
+          done
