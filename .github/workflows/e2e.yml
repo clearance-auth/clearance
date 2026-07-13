@@ -38,6 +38,12 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium
+        uses: ./.github/actions/setup-playwright
+        with:
+          working-directory: packages/clearance-e2e
+          browsers: chromium
+
       - name: Build
         run: pnpm build
 
