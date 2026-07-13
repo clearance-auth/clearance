@@ -17,7 +17,7 @@
   "scripts": {
 		"build": "tsc -p tsconfig.json && node scripts/stage-ops.mjs && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

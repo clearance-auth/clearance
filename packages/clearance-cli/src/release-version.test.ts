@@ -37,7 +37,7 @@ describe("release version consistency", () => {
 			cpSync(join(root, relative), join(fixture, relative));
 		}
 		const api = join(fixture, "packages/clearance-api/src/server.ts");
-		writeFileSync(api, readFileSync(api, "utf8").replace('version: "0.1.0",\n\t\treleaseVersion:', 'version: "9.9.9",\n\t\treleaseVersion:'));
+		writeFileSync(api, readFileSync(api, "utf8").replace('version: "0.1.0",', 'version: "9.9.9",'));
 		expect(() => execFileSync(process.execPath, [script, "0.1.0"], {
 			encoding: "utf8",
 			env: { ...process.env, CLEARANCE_RELEASE_ROOT: fixture },

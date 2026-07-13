@@ -116,7 +116,7 @@ if (managementVersion !== version) {
 }
 
 const apiSource = readFileSync(resolve(root, "packages/clearance-api/src/server.ts"), "utf8");
-const apiVersion = apiSource.match(/version:\s*["']([^"']+)["'],\s*\n\s*releaseVersion:/)?.[1];
+const apiVersion = apiSource.match(/app\.get\(["']\/health["'][\s\S]*?version:\s*["']([^"']+)["']/)?.[1];
 if (apiVersion !== version) {
 	fail(`Clearance API health version is ${apiVersion ?? "missing"}; expected ${version}`);
 }
