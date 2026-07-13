@@ -148,7 +148,7 @@ jobs:
           mkdir -p dist-release/assets
           PACKAGES=(@clearance/auth @clearance/management @clearance/cli @clearance/api)
           if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
-            npm install --global npm@11.5.1
+            npm install --global npm@11.16.0
             AUDIT_DIR="$(mktemp -d)"
             npm install --prefix "$AUDIT_DIR" --ignore-scripts --save-exact \
               "${PACKAGES[@]/%/@$VERSION}"
@@ -315,7 +315,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -Eeuo pipefail
-          npm install --global npm@11.5.1
+          npm install --global npm@11.16.0
           test "$(npm config get registry)" = "https://registry.npmjs.org/"
           tarball_for() {
             node -e '

@@ -127,6 +127,11 @@ if (!terraform.includes("@sha256:[0-9a-f]{64}")) {
 }
 
 const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release-sign.yml"), "utf8");
+const releaseNpmPins = [...releaseWorkflow.matchAll(/npm install --global npm@([0-9.]+)/g)].map((match) => match[1]);
+if (releaseNpmPins.length !== 2 || releaseNpmPins.some((pin) => pin !== "11.16.0")
+	|| !releaseWorkflow.includes("npm audit signatures --prefix \"$AUDIT_DIR\" --json --include-attestations")) {
+	fail("release workflow must use npm 11.16.0 with attestation evidence enabled");
+}
 const stagingBuild = releaseWorkflow.indexOf("--tag \"$STAGING_IMAGE\"");
 const cosignVerify = releaseWorkflow.indexOf("cosign verify --certificate-identity");
 const finalTag = releaseWorkflow.indexOf("docker buildx imagetools create --tag \"$IMAGE\"");
