@@ -502,7 +502,7 @@ INSERT INTO "user" VALUES ('u1','ops@example.test'),('u2','it@example.test');
 INSERT INTO organization VALUES ('o1','Acme');
 INSERT INTO session VALUES ('s1','u1');
 INSERT INTO clearance_management_snapshot(id, data) VALUES
-  (1, '{"version":1,"releaseVersion":"0.1.1","meta":{"schemaVersion":1}}'::jsonb);
+  (1, '{"version":1,"releaseVersion":"0.1.2","meta":{"schemaVersion":1}}'::jsonb);
 SQL
   ok "seeded isolated active database"
 
@@ -640,7 +640,7 @@ SQL
     || bad "temp databases remain: $TEMP_LEFT"
 
   # Upgrade flow
-  PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.1 --dir "$UPG_DIR")"
+  PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.2 --dir "$UPG_DIR")"
   PLAN_ID="$(printf '%s\n' "$PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   [[ -n "$PLAN_ID" ]] && ok "upgrade-plan created $PLAN_ID" || bad "upgrade-plan failed"
 
@@ -669,7 +669,7 @@ SQL
   node -e '
     const fs=require("fs");
     const plan={
-      planId:process.argv[1], immutable:true, currentVersion:"0.1.1",
+      planId:process.argv[1], immutable:true, currentVersion:"0.1.2",
       targetVersion:"../../../../tmp/evil", sourceDatabase:""
     };
     fs.writeFileSync(process.argv[2],JSON.stringify(plan,null,2)+"\n");
@@ -702,7 +702,7 @@ SQL
 
   # A target without a shipped hook still fails closed after preserving a
   # verified rollback reference.
-  NO_HOOK_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.1 --current 0.1.1 --dir "$UPG_DIR")"
+  NO_HOOK_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.1 --current 0.1.2 --dir "$UPG_DIR")"
   NO_HOOK_PLAN_ID="$(printf '%s\n' "$NO_HOOK_PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   [[ -n "$NO_HOOK_PLAN_ID" ]] && ok "upgrade-plan created an unshipped-target plan" \
     || bad "upgrade-plan failed for unshipped target"
@@ -732,11 +732,11 @@ SQL
   [[ "$ACTIVE_STILL2" == "2" ]] && ok "active DB untouched after refused upgrade" \
     || bad "active DB changed during refused upgrade"
 
-  # Exercise the real shipped 0.1.1 -> 0.2.0 hook from deploy/upgrades.
+  # Exercise the real shipped 0.1.2 -> 0.2.0 hook from deploy/upgrades.
   bash scripts/upgrade-apply.sh --plan "$PLAN_ID" --dir "$UPG_DIR" --backup-dir "$BAK_DIR" \
     >/dev/null 2>"$SCRATCH/apply-success.err" \
-    && ok "upgrade-apply executes the shipped 0.1.1 to 0.2.0 hook" \
-    || bad "upgrade-apply failed with the shipped 0.1.1 to 0.2.0 hook"
+    && ok "upgrade-apply executes the shipped 0.1.2 to 0.2.0 hook" \
+    || bad "upgrade-apply failed with the shipped 0.1.2 to 0.2.0 hook"
 
   RELEASE_AFTER="$(application_release_version "$DATABASE_URL")"
   LEDGER_AFTER="$(psql --no-psqlrc "$DATABASE_URL" -At -c "SELECT plan_id FROM clearance_schema_migrations WHERE version='0.2.0'")"
@@ -838,7 +838,7 @@ SQL
   PRESERVED_POST_SAFETY="$(psql --no-psqlrc "$PRESERVED_URL" -At -c "SELECT count(*) FROM \"user\" WHERE id='u_after_safety'")"
   psql --no-psqlrc "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c \
     "ALTER DATABASE \"${PRESERVED_DB}\" WITH ALLOW_CONNECTIONS false;" >/dev/null
-  if [[ "$ACTIVE_OID_BEFORE" != "$ACTIVE_OID_AFTER" && "$RELEASE_ROLLED_BACK" == "0.1.1" && "$PRESERVED_POST_SAFETY" == "1" ]] \
+  if [[ "$ACTIVE_OID_BEFORE" != "$ACTIVE_OID_AFTER" && "$RELEASE_ROLLED_BACK" == "0.1.2" && "$PRESERVED_POST_SAFETY" == "1" ]] \
     && node -e 'const j=require(process.argv[1]); if(j.mode!=="active_database_restore"||!j.postRestoreVerified||!j.preRestoreSafetyBackupId||!j.postSafetyWritesPreserved||!j.preservedPreRollbackDatabase) process.exit(1)' "$ACTIVE_RECEIPT"; then
     ok "active rollback proves new database identity, restored version, safety backup, and receipt"
     ok "active rollback preserves writes committed after the safety backup in the drained old database"
@@ -848,7 +848,7 @@ SQL
 
   # Upgrade again, inject a post-swap verification failure, and prove the old
   # database is reinstated with the target version and original oid.
-  FAIL_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.1 --dir "$UPG_DIR")"
+  FAIL_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.2 --dir "$UPG_DIR")"
   FAIL_PLAN_ID="$(printf '%s\n' "$FAIL_PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   bash scripts/upgrade-apply.sh --plan "$FAIL_PLAN_ID" --dir "$UPG_DIR" --backup-dir "$BAK_DIR" >/dev/null
   OID_BEFORE_FAILED_SWAP="$(psql --no-psqlrc "$PG_ADMIN_URL" -At -c "SELECT oid FROM pg_database WHERE datname='${PG_DB}'")"

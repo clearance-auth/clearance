@@ -6,9 +6,9 @@
 deploy/upgrades/steps/<targetVersion>/apply.sh
 ```
 
-The currently supported transition is `0.1.1` to `0.2.0`. Its shipped hook is
+The currently supported transition is `0.1.2` to `0.2.0`. Its shipped hook is
 `deploy/upgrades/steps/0.2.0/apply.sh`; it verifies the release marker is at
-`0.1.1`, advances it to `0.2.0`, and verifies the result. The Clearance CLI
+`0.1.2`, advances it to `0.2.0`, and verifies the result. The Clearance CLI
 packages this hook under `dist/ops/deploy/upgrades/steps/0.2.0/apply.sh`.
 
 ## Contract
