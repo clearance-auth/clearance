@@ -127,6 +127,12 @@ if (!terraform.includes("@sha256:[0-9a-f]{64}")) {
 }
 
 const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release-sign.yml"), "utf8");
+const terraformSetup = releaseWorkflow.indexOf("hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd");
+const terraformPin = releaseWorkflow.indexOf("terraform_version: 1.5.7", terraformSetup);
+const releaseVerification = releaseWorkflow.indexOf("pnpm verify:real");
+if (terraformSetup < 0 || terraformPin < terraformSetup || releaseVerification < terraformPin) {
+	fail("release workflow must install pinned Terraform 1.5.7 before verify:real");
+}
 const releaseNpmPins = [...releaseWorkflow.matchAll(/npm install --global npm@([0-9.]+)/g)].map((match) => match[1]);
 if (releaseNpmPins.length !== 2 || releaseNpmPins.some((pin) => pin !== "11.16.0")
 	|| !releaseWorkflow.includes("npm audit signatures --prefix \"$AUDIT_DIR\" --json --include-attestations")) {
