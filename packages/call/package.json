@@ -1,0 +1,68 @@
+{
+  "name": "@clearance/call",
+  "version": "0.1.0",
+  "description": "Typed endpoint, middleware, routing, and client primitives for Clearance.",
+  "type": "module",
+  "license": "MIT",
+  "copyright": "Copyright (C) 2025 Bereket Engida",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clearance-auth/clearance.git",
+    "directory": "packages/call"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@clearance/utils": "workspace:^",
+    "@better-fetch/fetch": "catalog:",
+    "rou3": "^0.7.12",
+    "set-cookie-parser": "^3.0.1"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "zod": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tsdown": "catalog:"
+  },
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./client": {
+      "dev-source": "./src/client.ts",
+      "types": "./dist/client.d.mts",
+      "default": "./dist/client.mjs"
+    },
+    "./error": {
+      "dev-source": "./src/error.ts",
+      "types": "./dist/error.d.mts",
+      "default": "./dist/error.mjs"
+    },
+    "./node": {
+      "dev-source": "./src/adapters/node/index.ts",
+      "types": "./dist/node.d.mts",
+      "default": "./dist/node.mjs"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{{- range $name, $config := .Values.ingress }}
+{{- if $config.enabled }}
+{{- $servicePort := $.Values.service.port }}
+{{- if eq $name "console" }}{{- $servicePort = $.Values.console.service.port }}{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $.Release.Name }}-{{ $name }}
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $name }}
+{{- with $config.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+{{- with $config.className }}
+  ingressClassName: {{ . }}
+{{- end }}
+{{- if $config.tls.enabled }}
+  tls:
+    - hosts: [{{ required (printf "ingress.%s.host is required" $name) $config.host | quote }}]
+      secretName: {{ required (printf "ingress.%s.tls.secretName is required when TLS is enabled" $name) $config.tls.secretName }}
+{{- end }}
+  rules:
+    - host: {{ required (printf "ingress.%s.host is required" $name) $config.host | quote }}
+      http:
+        paths:
+          - path: {{ $config.path }}
+            pathType: {{ $config.pathType }}
+            backend:
+              service:
+                name: {{ $.Release.Name }}-{{ $name }}
+                port:
+                  number: {{ $servicePort }}
+---
+{{- end }}
+{{- end }}

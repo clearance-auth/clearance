@@ -1,0 +1,25 @@
+{{- if .Values.console.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-console
+  labels:
+    app: clearance-console
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/component: console
+spec:
+  type: {{ .Values.console.service.type }}
+  selector:
+    app: clearance-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  sessionAffinity: {{ .Values.console.service.sessionAffinity }}
+{{- if eq .Values.console.service.sessionAffinity "ClientIP" }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .Values.console.service.sessionAffinityTimeoutSeconds }}
+{{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.console.service.port }}
+      targetPort: http
+{{- end }}

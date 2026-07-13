@@ -1,0 +1,46 @@
+{
+  "name": "@clearance/auth",
+  "version": "0.1.0",
+  "description": "Clearance auth runtime with bundled, audited fork code and Clearance defaults",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./client": {
+      "types": "./types/client.d.ts",
+      "default": "./dist/client.mjs"
+    },
+    "./node": {
+      "types": "./types/node.d.ts",
+      "default": "./dist/node.mjs"
+    }
+  },
+  "files": ["dist", "types"],
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "kysely": "catalog:",
+    "pg": "^8.14.1"
+  },
+  "devDependencies": {
+    "@clearance/runtime": "workspace:*",
+    "@clearance/sso": "workspace:*",
+    "@clearance/scim": "workspace:*",
+    "@types/node": "^22.13.10",
+    "@types/pg": "^8.11.11",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "provider": "entra",
+  "users": [
+    {
+      "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      "userName": "carol.scim@contoso.com",
+      "name": { "formatted": "Carol SCIM" },
+      "emails": [{ "value": "carol.scim@contoso.com", "primary": true }],
+      "active": true
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Clearance customer setup</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="setup-shell">
+    <section class="panel">
+      <p class="eyebrow">Clearance</p>
+      <h1 id="title">Customer setup</h1>
+      <p id="intro">Complete the connection details supplied by your identity provider.</p>
+      <form id="setup-form">
+        <label>Provider <input name="provider" required placeholder="okta"></label>
+        <div id="sso-fields">
+          <label>Protocol
+            <select name="protocol"><option value="oidc">OIDC</option><option value="saml">SAML</option></select>
+          </label>
+	          <label>Issuer / entity ID <input name="issuer" type="url" placeholder="https://example.okta.com/oauth2/default"></label>
+	          <label>Domain <input name="domain" placeholder="customer.example"></label>
+	          <div id="oidc-fields">
+	            <label>Client ID <input name="clientId" autocomplete="off"></label>
+	            <label>Client secret <input name="clientSecret" type="password" autocomplete="new-password"></label>
+	          </div>
+	          <div id="saml-fields" hidden>
+	            <label>Identity provider SSO URL <input name="samlEntryPoint" type="url" placeholder="https://example.okta.com/app/example/sso/saml"></label>
+	            <label>Identity provider signing certificate (PEM) <textarea name="samlCertificate" rows="8" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+	          </div>
+        </div>
+        <button type="submit">Save connection</button>
+      </form>
+      <p id="result" role="status"></p>
+    </section>
+  </main>
+  <script src="/setup.js" defer></script>
+</body>
+</html>

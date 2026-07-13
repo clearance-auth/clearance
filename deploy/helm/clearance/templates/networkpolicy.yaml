@@ -1,0 +1,128 @@
+{{- $trustedProxy := eq (toString .Values.env.CLEARANCE_TRUSTED_PROXY) "1" }}
+{{- $serviceMonitorScrape := and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- if $trustedProxy }}
+{{- if not .Values.networkPolicy.enabled }}{{ fail "env.CLEARANCE_TRUSTED_PROXY=1 requires networkPolicy.enabled=true" }}{{- end }}
+{{- if not .Values.console.enabled }}{{ fail "env.CLEARANCE_TRUSTED_PROXY=1 requires console.enabled=true" }}{{- end }}
+{{- if .Values.ingress.api.enabled }}{{ fail "env.CLEARANCE_TRUSTED_PROXY=1 requires ingress.api.enabled=false; expose the console proxy instead" }}{{- end }}
+{{- if ne .Values.service.type "ClusterIP" }}{{ fail "env.CLEARANCE_TRUSTED_PROXY=1 requires service.type=ClusterIP" }}{{- end }}
+{{- if .Values.console.apiUrl }}{{ fail "env.CLEARANCE_TRUSTED_PROXY=1 requires the release-scoped default console.apiUrl" }}{{- end }}
+{{- if and $serviceMonitorScrape (empty .Values.metrics.networkPolicy.namespaceSelector) }}{{ fail "trusted-proxy ServiceMonitor requires metrics.networkPolicy.namespaceSelector" }}{{- end }}
+{{- if and $serviceMonitorScrape (empty .Values.metrics.networkPolicy.podSelector) }}{{ fail "trusted-proxy ServiceMonitor requires metrics.networkPolicy.podSelector" }}{{- end }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-api-ingress
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  policyTypes: [Ingress]
+  ingress:
+{{- if $trustedProxy }}
+    # Trusted-proxy mode is fail-closed: only this release's console may reach
+    # the API. The console derives X-Forwarded-For from its observed socket.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: clearance
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: console
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+{{- if $serviceMonitorScrape }}
+    # Prometheus is a distinct trusted source. Both selectors are mandatory in
+    # trusted-proxy mode so metrics access never becomes namespace- or pod-wide.
+    - from:
+        - namespaceSelector:
+{{ toYaml .Values.metrics.networkPolicy.namespaceSelector | indent 12 }}
+          podSelector:
+{{ toYaml .Values.metrics.networkPolicy.podSelector | indent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+{{- end }}
+{{- else }}
+    # Direct API ingress is safe only while X-Forwarded-For is untrusted.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-console-ingress
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: console
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.console.service.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-console-api-egress
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: console
+  policyTypes: [Egress]
+  egress:
+    # Release-scoped console-to-API traffic; port 3200 is not open to arbitrary
+    # destinations and the destination selector is namespace-local.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: clearance
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: api
+      ports:
+        - { protocol: TCP, port: {{ .Values.service.port }} }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-egress
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - ports:
+        - { protocol: TCP, port: {{ .Values.postgres.port }} }
+        - { protocol: TCP, port: 80 }
+        - { protocol: TCP, port: 443 }
+{{- with .Values.networkPolicy.additionalEgress }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end }}

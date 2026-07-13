@@ -1,0 +1,35 @@
+{
+  "cases": [
+    {
+      "id": "wrong-issuer",
+      "stage": "discovery.issuer",
+      "discovery": {
+        "issuer": "https://evil-idp.example/oauth2",
+        "authorization_endpoint": "https://evil-idp.example/oauth2/authorize",
+        "token_endpoint": "https://evil-idp.example/oauth2/token",
+        "jwks_uri": "https://evil-idp.example/oauth2/keys"
+      },
+      "configuredIssuer": "https://dev-example.okta.com/oauth2/default"
+    },
+    {
+      "id": "malformed",
+      "stage": "discovery.incomplete",
+      "discovery": { "issuer": "https://dev-example.okta.com/oauth2/default" },
+      "configuredIssuer": "https://dev-example.okta.com/oauth2/default"
+    },
+    {
+      "id": "expired",
+      "stage": "assertion.validity",
+      "saml": {
+        "notBefore": "PAST_MINUS_SKEW",
+        "notOnOrAfter": "PAST_MINUS_SKEW"
+      }
+    },
+    {
+      "id": "wrong-audience",
+      "stage": "assertion.audience",
+      "audience": "wrong-sp",
+      "configuredAudience": "clearance-sp"
+    }
+  ]
+}

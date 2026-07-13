@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clearance Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="login-host" hidden>
+    <div class="login-wrap">
+      <form data-testid="console-login" id="console-login-form" class="login-card" autocomplete="on">
+        <div class="brand">Clearance</div>
+        <h1>Operator sign-in</h1>
+        <p id="login-notice" class="login-notice" role="status" hidden></p>
+        <label for="login-username">Username</label>
+        <input id="login-username" name="username" autocomplete="username" required />
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required />
+        <p id="login-error" class="login-error" role="alert" hidden></p>
+        <button type="submit" id="login-submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">Clearance</div>
+      <nav>
+        <button data-route="overview" class="active" aria-current="page">Overview</button>
+        <button data-route="users">Users</button>
+        <button data-route="organizations">Organizations</button>
+        <button data-route="members">Members</button>
+        <button data-route="sessions">Sessions</button>
+        <button data-route="roles">Roles</button>
+        <button data-route="events">Events</button>
+        <button data-route="readiness">Readiness</button>
+        <button data-route="settings">Settings</button>
+      </nav>
+      <div class="rail-foot">
+        <span id="env-label">development</span>
+      </div>
+    </aside>
+    <main>
+      <header class="top">
+        <h1 id="page-title">Overview</h1>
+        <div class="meta">
+          <span id="health-pill" class="pill" title="API health">…</span>
+          <code id="cli-hint" title="Click to copy CLI">clearance overview --json</code>
+          <button type="button" id="signout-btn" data-testid="console-signout" class="ghost" hidden>Sign out</button>
+        </div>
+      </header>
+      <section id="view" aria-live="polite"></section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+{
+  "name": "@clearance/telemetry",
+  "version": "1.6.23",
+  "description": "Telemetry package for Clearance",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/clearance-auth/clearance",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clearance-auth/clearance.git",
+    "directory": "packages/telemetry"
+  },
+  "keywords": [
+    "auth",
+    "telemetry",
+    "typescript",
+    "clearance"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "lint:package": "publint run --strict --pack false",
+    "lint:types": "attw --profile esm-only --pack .",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "node": "./dist/node.mjs",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "index": [
+        "dist/index.d.mts"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@clearance/core": "workspace:*",
+    "tsdown": "catalog:",
+    "type-fest": "^5.4.4"
+  },
+  "peerDependencies": {
+    "@clearance/core": "workspace:^",
+    "@clearance/utils": "workspace:^",
+    "@better-fetch/fetch": "catalog:"
+  }
+}

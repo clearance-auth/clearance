@@ -1,0 +1,2183 @@
+import type { ClearanceOptions } from "@clearance/core";
+import type { GoogleProfile } from "@clearance/core/social-providers";
+import { safeJSONParse } from "@clearance/core/utils/json";
+import { base64Url } from "@clearance/utils/base64";
+import { createHMAC } from "@clearance/utils/hmac";
+import { serializeCookie } from "@clearance/call";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import {
+	expireCookie,
+	getChunkedCookie,
+	getCookieCache,
+	getCookies,
+	getSessionCookie,
+	parseCookies,
+} from "../cookies";
+import { signJWT, symmetricDecodeJWT } from "../crypto";
+import { getTestInstance } from "../test-utils/test-instance";
+import { DEFAULT_SECRET } from "../utils/constants";
+import {
+	applySetCookies,
+	HOST_COOKIE_PREFIX,
+	parseSetCookieHeader,
+	SECURE_COOKIE_PREFIX,
+	setRequestCookie,
+	stripSecureCookiePrefix,
+	toCookieOptions,
+} from "./cookie-utils";
+
+describe("cookies", async () => {
+	const { client, testUser } = await getTestInstance();
+	it("should set cookies with default options", async () => {
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toBeDefined();
+					expect(setCookie).toContain("Path=/");
+					expect(setCookie).toContain("HttpOnly");
+					expect(setCookie).toContain("SameSite=Lax");
+					expect(setCookie).toContain("clearance");
+				},
+			},
+		);
+	});
+
+	it("should set multiple cookies", async () => {
+		const { client, testUser } = await getTestInstance({
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess(context) {
+					const cookies = context.response.headers.get("Set-Cookie");
+					expect(cookies).toBeDefined();
+					const parsed = parseSetCookieHeader(cookies!);
+					// With cookie cache enabled, we should have session_token and session_data cookies
+					expect(parsed.size).toBeGreaterThan(1);
+				},
+			},
+		);
+	});
+
+	it("should use secure cookies", async () => {
+		const { client, testUser } = await getTestInstance({
+			advanced: { useSecureCookies: true },
+		});
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain("Secure");
+				},
+			},
+		);
+	});
+
+	it("should use secure cookies when the base url is https", async () => {
+		const { client, testUser } = await getTestInstance({
+			baseURL: "https://example.com",
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain("Secure");
+				},
+			},
+		);
+	});
+
+	describe("production environment", () => {
+		afterEach(() => {
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		});
+
+		it("should use secure cookies when baseURL is not configured", async () => {
+			// Set NODE_ENV to production
+			vi.stubEnv("NODE_ENV", "production");
+
+			// Reset modules to reload with new NODE_ENV
+			vi.resetModules();
+
+			// Re-import modules after NODE_ENV change
+			const { getTestInstance: getTestInstanceReloaded } = await import(
+				"../test-utils/test-instance"
+			);
+
+			const { client, testUser } = await getTestInstanceReloaded({
+				baseURL: undefined,
+			});
+
+			await client.signIn.email(
+				{
+					email: testUser.email,
+					password: testUser.password,
+				},
+				{
+					onResponse(context) {
+						const setCookie = context.response.headers.get("set-cookie");
+						expect(setCookie).toContain("Secure");
+					},
+				},
+			);
+		});
+	});
+});
+
+describe("crossSubdomainCookies", () => {
+	it("should update cookies with custom domain", async () => {
+		const { client, testUser } = await getTestInstance({
+			advanced: {
+				crossSubDomainCookies: {
+					enabled: true,
+					domain: "example.com",
+				},
+			},
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain("Domain=example.com");
+					expect(setCookie).toContain("SameSite=Lax");
+				},
+			},
+		);
+	});
+
+	it("should use default domain from baseURL if not provided", async () => {
+		const { testUser, client } = await getTestInstance({
+			baseURL: "https://example.com",
+			advanced: {
+				crossSubDomainCookies: {
+					enabled: true,
+				},
+			},
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onResponse(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toContain("Domain=example.com");
+				},
+			},
+		);
+	});
+});
+
+describe("cookie configuration", () => {
+	it("should return correct cookie options based on configuration", async () => {
+		const options = {
+			baseURL: "https://example.com",
+			database: {} as ClearanceOptions["database"],
+			advanced: {
+				useSecureCookies: true,
+				crossSubDomainCookies: {
+					enabled: true,
+					domain: "example.com",
+				},
+				cookiePrefix: "test-prefix",
+			},
+		} satisfies ClearanceOptions;
+
+		const cookies = getCookies(options);
+
+		expect(cookies.sessionToken.attributes.secure).toBe(true);
+		expect(cookies.sessionToken.name).toContain("test-prefix.session_token");
+		expect(cookies.sessionData.attributes.sameSite).toBe("lax");
+		expect(cookies.sessionData.attributes.domain).toBe("example.com");
+	});
+});
+
+describe("cookie-utils parseSetCookieHeader", () => {
+	it("handles Expires with commas and multiple cookies", () => {
+		const header =
+			"a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/, b=2; Expires=Thu, 22 Oct 2015 07:28:00 GMT; Path=/";
+		const map = parseSetCookieHeader(header);
+		expect(map.get("a")?.value).toBe("1");
+		expect(map.get("b")?.value).toBe("2");
+		expect(map.get("a")?.expires).toEqual(
+			new Date("Wed, 21 Oct 2015 07:28:00 GMT"),
+		);
+		expect(map.get("b")?.expires).toEqual(
+			new Date("Thu, 22 Oct 2015 07:28:00 GMT"),
+		);
+	});
+
+	it("decodes URI-encoded cookie values", () => {
+		const header = "token=hello%20world%3Dfoo; Path=/";
+		const map = parseSetCookieHeader(header);
+		expect(map.get("token")?.value).toBe("hello world=foo");
+	});
+
+	it("handles cookie with Expires followed by cookie without Expires", () => {
+		const map = parseSetCookieHeader(
+			"session=xyz; Expires=Mon, 01 Jan 2026 00:00:00 GMT, token=abc",
+		);
+		expect(map.get("session")?.value).toBe("xyz");
+		expect(map.get("session")?.expires).toEqual(
+			new Date("Mon, 01 Jan 2026 00:00:00 GMT"),
+		);
+		expect(map.get("token")?.value).toBe("abc");
+		expect(map.get("token")?.expires).toBeUndefined();
+	});
+
+	it("handles Expires when cookie value contains gmt substring", () => {
+		const map = parseSetCookieHeader(
+			"session_data=testsessiondata; Path=/; Expires=Mon, 02 Mar 2026 05:42:16 GMT; Max-Age=300; Secure; HttpOnly; SameSite=lax",
+		);
+
+		expect(map.get("session_data")?.value).toBe("testsessiondata");
+		expect(map.get("session_data")?.expires).toEqual(
+			new Date("Mon, 02 Mar 2026 05:42:16 GMT"),
+		);
+	});
+
+	it("handles non-standard Expires=0", () => {
+		const map = parseSetCookieHeader("a=1; Expires=0, b=2");
+		expect(map.get("a")?.value).toBe("1");
+		expect(map.get("b")?.value).toBe("2");
+	});
+
+	it("handles RFC 850 date format", () => {
+		const map = parseSetCookieHeader(
+			"a=1; Expires=Sunday, 06-Nov-94 08:49:37 GMT, b=2",
+		);
+		expect(map.get("a")?.value).toBe("1");
+		expect(map.get("b")?.value).toBe("2");
+	});
+
+	it("handles asctime date format (no comma in date)", () => {
+		const map = parseSetCookieHeader(
+			"a=1; Expires=Sun Nov 6 08:49:37 1994, b=2",
+		);
+		expect(map.get("a")?.value).toBe("1");
+		expect(map.get("b")?.value).toBe("2");
+	});
+
+	it("handles mixed cookies with and without Expires", () => {
+		const map = parseSetCookieHeader(
+			"a=1; Path=/; HttpOnly, b=2; Expires=Mon, 01 Jan 2026 00:00:00 GMT; Secure, c=3; SameSite=Lax",
+		);
+		expect(map.get("a")?.value).toBe("1");
+		expect(map.get("b")?.value).toBe("2");
+		expect(map.get("b")?.expires).toEqual(
+			new Date("Mon, 01 Jan 2026 00:00:00 GMT"),
+		);
+		expect(map.get("c")?.value).toBe("3");
+	});
+
+	it("parses partitioned as a boolean cookie attribute", () => {
+		const map = parseSetCookieHeader(
+			"session=xyz; Path=/; Secure; HttpOnly; SameSite=None; Partitioned",
+		);
+
+		expect(map.get("session")?.value).toBe("xyz");
+		expect(map.get("session")?.secure).toBe(true);
+		expect(map.get("session")?.httponly).toBe(true);
+		expect(map.get("session")?.samesite).toBe("none");
+		expect(map.get("session")?.partitioned).toBe(true);
+	});
+
+	it("converts parsed cookie attributes into cookie options", () => {
+		const attributes = parseSetCookieHeader(
+			"session=xyz; Path=/auth; Expires=Mon, 01 Jan 2026 00:00:00 GMT; Max-Age=300; Secure; HttpOnly; SameSite=None; Partitioned",
+		).get("session");
+
+		expect(attributes).toBeDefined();
+		expect(toCookieOptions(attributes!)).toEqual({
+			path: "/auth",
+			expires: new Date("Mon, 01 Jan 2026 00:00:00 GMT"),
+			maxAge: 300,
+			secure: true,
+			httpOnly: true,
+			sameSite: "none",
+			partitioned: true,
+		});
+	});
+});
+
+describe("cookie-utils stripSecureCookiePrefix", () => {
+	it("should strip __Secure- prefix from cookie name", () => {
+		const cookieName = `${SECURE_COOKIE_PREFIX}session_token`;
+		const result = stripSecureCookiePrefix(cookieName);
+		expect(result).toBe("session_token");
+	});
+
+	it("should strip __Host- prefix from cookie name", () => {
+		const cookieName = `${HOST_COOKIE_PREFIX}session_token`;
+		const result = stripSecureCookiePrefix(cookieName);
+		expect(result).toBe("session_token");
+	});
+
+	it("should return cookie name unchanged if no prefix", () => {
+		const cookieName = "session_token";
+		const result = stripSecureCookiePrefix(cookieName);
+		expect(result).toBe("session_token");
+	});
+
+	it("should handle cookie names with prefix-like strings in the middle", () => {
+		const cookieName = "my__Secure-cookie";
+		const result = stripSecureCookiePrefix(cookieName);
+		expect(result).toBe("my__Secure-cookie");
+	});
+
+	it("should handle empty string", () => {
+		const result = stripSecureCookiePrefix("");
+		expect(result).toBe("");
+	});
+
+	it("should handle cookie names that are exactly the prefix", () => {
+		const secureResult = stripSecureCookiePrefix(SECURE_COOKIE_PREFIX);
+		expect(secureResult).toBe("");
+
+		const hostResult = stripSecureCookiePrefix(HOST_COOKIE_PREFIX);
+		expect(hostResult).toBe("");
+	});
+
+	it("should prioritize __Secure- prefix over __Host- prefix", () => {
+		// Cookie name starting with __Secure- should strip that prefix
+		const secureCookie = `${SECURE_COOKIE_PREFIX}${HOST_COOKIE_PREFIX}test`;
+		const result = stripSecureCookiePrefix(secureCookie);
+		expect(result).toBe(`${HOST_COOKIE_PREFIX}test`);
+	});
+
+	it("should handle cookie names with dots and special characters", () => {
+		const cookieName = `${SECURE_COOKIE_PREFIX}clearance.session_token`;
+		const result = stripSecureCookiePrefix(cookieName);
+		expect(result).toBe("clearance.session_token");
+	});
+});
+
+/**
+ * @see https://github.com/clearance-auth/clearance
+ * @see https://github.com/clearance-auth/clearance
+ */
+describe("cookie-utils setRequestCookie", () => {
+	it("writes a cookie when the header is empty", () => {
+		const headers = new Headers();
+		setRequestCookie(headers, "clearance.session_token", "abc");
+		expect(headers.get("cookie")).toBe("clearance.session_token=abc");
+	});
+
+	it("preserves existing cookies and joins with `; ` per RFC 6265", () => {
+		const headers = new Headers({ cookie: "preference=dark; locale=en" });
+		setRequestCookie(headers, "clearance.session_token", "abc");
+		expect(headers.get("cookie")).toBe(
+			"preference=dark; locale=en; clearance.session_token=abc",
+		);
+	});
+
+	it("replaces an existing cookie of the same name rather than duplicating it", () => {
+		const headers = new Headers({
+			cookie: "clearance.session_token=stale; locale=en",
+		});
+		setRequestCookie(headers, "clearance.session_token", "fresh");
+		expect(headers.get("cookie")).toBe(
+			"clearance.session_token=fresh; locale=en",
+		);
+	});
+
+	it("ignores malformed pairs in the existing header", () => {
+		const headers = new Headers({ cookie: "valid=1; ; =orphan; locale=en" });
+		setRequestCookie(headers, "clearance.session_token", "abc");
+		expect(headers.get("cookie")).toBe(
+			"valid=1; locale=en; clearance.session_token=abc",
+		);
+	});
+
+	it("percent-encodes reserved cookie-octet bytes when serializing", () => {
+		const headers = new Headers({ cookie: "locale=en" });
+		setRequestCookie(headers, "session", "foo;bar=baz");
+		expect(headers.get("cookie")).toBe("locale=en; session=foo%3Bbar%3Dbaz");
+	});
+
+	it("treats input as semantic and percent-encodes literal double-quotes", () => {
+		const headers = new Headers();
+		setRequestCookie(headers, "token", '"abc"');
+		expect(headers.get("cookie")).toBe("token=%22abc%22");
+	});
+});
+
+describe("getSessionCookie", async () => {
+	it("should return the correct session cookie", async () => {
+		const { signInWithTestUser } = await getTestInstance();
+		const { headers } = await signInWithTestUser();
+		const request = new Request("http://localhost:3000/api/auth/session", {
+			headers,
+		});
+		const cookies = getSessionCookie(request);
+		expect(cookies).not.toBeNull();
+		expect(cookies).toBeDefined();
+	});
+
+	it("should work with Headers object directly", async () => {
+		const { signInWithTestUser } = await getTestInstance();
+		const { headers } = await signInWithTestUser();
+
+		// Pass Headers object directly (simulating Next.js ReadonlyHeaders from `await headers()`)
+		const cookies = getSessionCookie(headers);
+		expect(cookies).not.toBeNull();
+		expect(cookies).toBeDefined();
+	});
+
+	it("should work with Headers-like object that has inherited 'headers' property", async () => {
+		const { signInWithTestUser } = await getTestInstance();
+		const { headers } = await signInWithTestUser();
+
+		class ReadonlyHeadersLike extends Headers {
+			// This property exists in the prototype chain, making "headers" in obj return true
+			get headers(): undefined {
+				return undefined;
+			}
+		}
+
+		const readonlyHeaders = new ReadonlyHeadersLike();
+		// Copy cookies from original headers
+		const cookieValue = headers.get("cookie");
+		if (cookieValue) {
+			readonlyHeaders.set("cookie", cookieValue);
+		}
+
+		const cookies = getSessionCookie(readonlyHeaders);
+		expect(cookies).not.toBeNull();
+		expect(cookies).toBeDefined();
+	});
+
+	it("should work with cross-realm Headers-like object (instanceof fails)", async () => {
+		const { signInWithTestUser } = await getTestInstance();
+		const { headers } = await signInWithTestUser();
+
+		// Simulate cross-realm Headers where instanceof check fails
+		// See: https://github.com/clearance-auth/clearance
+		const crossRealmHeaders = {
+			get: (name: string) => headers.get(name),
+			has: (name: string) => headers.has(name),
+		};
+
+		const cookies = getSessionCookie(crossRealmHeaders as Headers);
+		expect(cookies).not.toBeNull();
+		expect(cookies).toBeDefined();
+	});
+
+	it("should return the correct session cookie on production", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			baseURL: "https://example.com",
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		const cookies = getSessionCookie(request);
+		expect(cookies).not.toBeNull();
+		expect(cookies).toBeDefined();
+	});
+
+	describe.each([".", "-"])("with '%s' separator", (separator) => {
+		describe.each([
+			["", "regular"],
+			[SECURE_COOKIE_PREFIX, "secure"],
+		])("with %s prefix (%s)", (securePrefix) => {
+			it.each([
+				[{}, "clearance", "session_token"],
+				[{ cookiePrefix: "myprefix" }, "myprefix", "session_token"],
+				[{ cookieName: "my_token" }, "clearance", "my_token"],
+				[
+					{ cookiePrefix: "myprefix", cookieName: "my_token" },
+					"myprefix",
+					"my_token",
+				],
+			])("finds cookie with config %j", (config, prefix, name) => {
+				const headers = new Headers();
+				headers.set(
+					"cookie",
+					`${securePrefix}${prefix}${separator}${name}=token-123`,
+				);
+
+				const request = new Request("https://example.com/api/auth/session", {
+					headers,
+				});
+
+				expect(getSessionCookie(request, config)).toBe("token-123");
+			});
+		});
+	});
+
+	it("prefers the __Secure- cookie when a non-secure leftover is also present", () => {
+		const headers = new Headers();
+		headers.set(
+			"cookie",
+			"clearance.session_token=stale; __Secure-clearance.session_token=current",
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		expect(getSessionCookie(request)).toBe("current");
+	});
+
+	it("does not fall back to a non-secure cookie when the __Secure- value is empty", () => {
+		const headers = new Headers();
+		headers.set(
+			"cookie",
+			"clearance.session_token=stale; __Secure-clearance.session_token=",
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		expect(getSessionCookie(request)).toBeNull();
+	});
+
+	it("should allow override cookie prefix with secure cookies", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			advanced: {
+				useSecureCookies: true,
+				cookiePrefix: "test-prefix",
+			},
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{ onSuccess: cookieSetter(headers) },
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		const cookies = getSessionCookie(request, {
+			cookiePrefix: "test-prefix",
+		});
+		expect(cookies).not.toBeNull();
+	});
+
+	it("should allow override cookie name", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			advanced: {
+				useSecureCookies: true,
+				cookiePrefix: "test",
+				cookies: {
+					session_token: {
+						name: "test-session-token",
+					},
+				},
+			},
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		const cookies = getSessionCookie(request, {
+			cookieName: "session-token",
+			cookiePrefix: "test",
+		});
+		expect(cookies).not.toBeNull();
+	});
+
+	it("should return cookie cache", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should respect dontRememberMe when storing session in cookie cache", async () => {
+		const { client, testUser } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+				rememberMe: false,
+			},
+			{
+				onSuccess(c) {
+					const headers = c.response.headers;
+					const setCookieHeader = headers.get("set-cookie");
+					expect(setCookieHeader).toBeDefined();
+
+					const parsed = parseSetCookieHeader(setCookieHeader!);
+
+					const sessionTokenCookie = parsed.get("clearance.session_token")!;
+					expect(sessionTokenCookie).toBeDefined();
+					expect(sessionTokenCookie["max-age"]).toBeUndefined();
+
+					const sessionDataCookie = parsed.get("clearance.session_data")!;
+					expect(sessionDataCookie).toBeDefined();
+					expect(sessionDataCookie["max-age"]).toBeUndefined();
+				},
+			},
+		);
+	});
+
+	it("should return null if the cookie is invalid", async () => {
+		const { client, testUser } = await getTestInstance({
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+		const headers = new Headers();
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		const cache = await getCookieCache(request, {
+			secret: "wrong-secret",
+		});
+		expect(cache).toBeNull();
+	});
+
+	it("should throw an error if the secret is not provided", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		await expect(getCookieCache(request)).rejects.toThrow();
+	});
+
+	it("should chunk large cookies instead of logging error", async () => {
+		const { client } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					customField1: {
+						type: "string",
+						defaultValue: "",
+					},
+					customField2: {
+						type: "string",
+						defaultValue: "",
+					},
+					customField3: {
+						type: "string",
+						defaultValue: "",
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		// Create a very large string that will exceed the cookie size limit when combined with session data
+		// The limit is 4093 bytes, so we create data that will definitely exceed it
+		const largeString = "x".repeat(2000);
+
+		const headers = new Headers();
+		let hasCookieChunks = false;
+
+		// Sign up with large user data using the server API
+		await client.signUp.email(
+			{
+				name: "Test User",
+				email: "large-data-test@example.com",
+				password: "password123",
+				customField1: largeString,
+				customField2: largeString,
+				customField3: largeString,
+			} as any,
+			{
+				onSuccess(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					if (setCookie) {
+						const parsed = parseSetCookieHeader(setCookie);
+						parsed.forEach((value, name) => {
+							if (
+								name.includes("session_data.0") ||
+								name.includes("session_data.1")
+							) {
+								hasCookieChunks = true;
+							}
+							headers.append("cookie", `${name}=${value.value}`);
+						});
+					}
+				},
+			},
+		);
+
+		// Verify that chunking happened (instead of logging an error and not caching)
+		expect(hasCookieChunks).toBe(true);
+	});
+});
+
+describe("sensitive session middleware cookie cache", () => {
+	/**
+	 * Sensitive endpoints use `sensitiveSessionMiddleware`, which forces a
+	 * database-backed session lookup via `disableCookieCache: true`. A request
+	 * query parameter (e.g. `?disableCookieCache=`, which coerces to `false`)
+	 * must NOT be able to override that internal flag and re-enable the cookie
+	 * cache, otherwise a revoked session could still pass sensitive operations.
+	 */
+	it("should not let request query re-enable cookie cache on sensitive endpoints", async () => {
+		const { client, testUser, cookieSetter, db } = await getTestInstance({
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+		const signInRes = await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+		const userId = signInRes.data?.user.id!;
+		expect(userId).toBeDefined();
+
+		// Simulate the server-side session being revoked/deleted while the
+		// still-valid signed session_data cookie remains in the client.
+		await db.deleteMany({
+			model: "session",
+			where: [{ field: "userId", value: userId }],
+		});
+
+		// Set the internal flag to a falsy value through the request query so it
+		// would skip the forced DB lookup if it took effect. The sensitive
+		// endpoint must still reject the request because the session no longer
+		// exists.
+		const res = await client.changePassword(
+			{
+				newPassword: "new-password",
+				currentPassword: testUser.password,
+			},
+			{
+				headers,
+				query: { disableCookieCache: "" },
+			},
+		);
+		expect(res.error?.status).toBe(401);
+	});
+});
+
+describe("Cookie Cache Field Filtering", () => {
+	it("should exclude user fields with returned: false from cookie cache", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					internalNote: {
+						type: "string",
+						defaultValue: "",
+						returned: false,
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.user?.internalNote).toBeUndefined();
+	});
+
+	it("should correctly filter multiple user fields based on returned config", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					publicBio: {
+						type: "string",
+						defaultValue: "default-bio",
+						returned: true,
+					},
+					internalNotes: {
+						type: "string",
+						defaultValue: "internal-notes",
+						returned: false,
+					},
+					preferences: {
+						type: "string",
+						defaultValue: "default-prefs",
+						returned: true,
+					},
+					adminFlags: {
+						type: "string",
+						defaultValue: "admin-flags",
+						returned: false,
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		// Fields with returned: true should be included
+		expect(cache?.user?.publicBio).toBeDefined();
+		expect(cache?.user?.preferences).toBeDefined();
+		// Fields with returned: false should be excluded
+		expect(cache?.user?.internalNotes).toBeUndefined();
+		expect(cache?.user?.adminFlags).toBeUndefined();
+	});
+
+	it("should reduce cookie size when large fields are excluded", async () => {
+		const largeString = "x".repeat(2000);
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					largeBio: {
+						type: "string",
+						defaultValue: largeString,
+						returned: false,
+					},
+					smallField: {
+						type: "string",
+						defaultValue: "small-value",
+						returned: true,
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		// Sign in with testUser
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		// Cookie cache should exist (not exceed size limit)
+		expect(cache).not.toBeNull();
+		// Large field should be excluded
+		expect(cache?.user?.largeBio).toBeUndefined();
+		// Small field should be included
+		expect(cache?.user?.smallField).toBeDefined();
+	});
+
+	it("should maintain session field filtering (regression check)", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				additionalFields: {
+					internalSessionData: {
+						type: "string",
+						defaultValue: "internal-data",
+						returned: false,
+					},
+					publicSessionData: {
+						type: "string",
+						defaultValue: "public-data",
+						returned: true,
+					},
+				},
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		// Sign in with testUser
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		// Verify session field filtering still works correctly
+		// Session should have token
+		expect(cache?.session?.token).toEqual(expect.any(String));
+		// Session field with returned: false should be excluded
+		expect(cache?.session?.internalSessionData).toBeUndefined();
+	});
+
+	it("should include unknown user fields for backward compatibility", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					knownField: {
+						type: "string",
+						defaultValue: "known-value",
+						returned: false,
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		// Known field with returned: false should be excluded
+		expect(cache?.user?.knownField).toBeUndefined();
+		// Standard fields like email, name should be included (backward compatibility)
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.user?.name).toBeDefined();
+	});
+
+	it("should work with JWT strategy", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+					strategy: "jwt",
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+			strategy: "jwt",
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should work with compact strategy", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+					strategy: "compact",
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+			strategy: "compact",
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should return null for invalid JWT token", async () => {
+		const headers = new Headers();
+		// Set an invalid JWT token manually
+		headers.set("cookie", "clearance.session_data=invalid.jwt.token");
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+			strategy: "jwt",
+		});
+		expect(cache).toBeNull();
+	});
+
+	it("should default to JWT strategy when not specified", async () => {
+		const { client, testUser, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+					// No strategy specified, should default to "jwt"
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+			// No strategy specified, should default to "jwt"
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+});
+
+describe("Cookie Chunking", () => {
+	it("should chunk cookies when they exceed 4KB", async () => {
+		// Create a large string that will exceed the cookie size limit
+		const largeString = "x".repeat(2000);
+
+		const { client } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					field1: {
+						type: "string",
+						defaultValue: "",
+					},
+					field2: {
+						type: "string",
+						defaultValue: "",
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		// Sign up with large user data
+		await client.signUp.email(
+			{
+				name: "Test User",
+				email: "chunk-test@example.com",
+				password: "password123",
+				field1: largeString,
+				field2: largeString,
+			} as any,
+			{
+				onSuccess(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toBeDefined();
+
+					// Parse set-cookie header to check for chunks
+					const parsed = parseSetCookieHeader(setCookie!);
+					let hasChunks = false;
+
+					// Check if we have chunked cookies
+					parsed.forEach((value, name) => {
+						if (
+							name.includes("session_data.0") ||
+							name.includes("session_data.1")
+						) {
+							hasChunks = true;
+						}
+					});
+
+					expect(hasChunks).toBe(true);
+
+					// Set cookies in headers for next request
+					parsed.forEach((value, name) => {
+						headers.append("cookie", `${name}=${value.value}`);
+					});
+				},
+			},
+		);
+
+		// Now verify we can read it back
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual("chunk-test@example.com");
+		expect(cache?.session?.token).toEqual(expect.any(String));
+	});
+
+	it("should reconstruct chunked cookies correctly", async () => {
+		const largeString = "y".repeat(2500);
+
+		const { client, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					largeField: {
+						type: "string",
+						defaultValue: "",
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signUp.email(
+			{
+				name: "Large Data User",
+				email: "large-chunk-test@example.com",
+				password: "password123",
+				largeField: largeString,
+			} as any,
+			{
+				onSuccess: cookieSetter(headers),
+			},
+		);
+
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual("large-chunk-test@example.com");
+		expect(cache?.user?.largeField).toEqual(largeString);
+	});
+
+	it("should clean up all chunks when deleting session", async () => {
+		const largeString = "z".repeat(2000);
+
+		const { client } = await getTestInstance({
+			secret: "clearance.secret",
+			user: {
+				additionalFields: {
+					field1: {
+						type: "string",
+						defaultValue: "",
+					},
+					field2: {
+						type: "string",
+						defaultValue: "",
+					},
+				},
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		// Sign up with large data to create chunks
+		await client.signUp.email(
+			{
+				name: "Delete Test User",
+				email: "delete-chunk-test@example.com",
+				password: "password123",
+				field1: largeString,
+				field2: largeString,
+			} as any,
+			{
+				onSuccess(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					if (setCookie) {
+						const parsed = parseSetCookieHeader(setCookie);
+						parsed.forEach((value, name) => {
+							headers.append("cookie", `${name}=${value.value}`);
+						});
+					}
+				},
+			},
+		);
+
+		// Sign out
+		await client.signOut({
+			fetchOptions: {
+				headers,
+				onSuccess(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toBeDefined();
+
+					// Should have maxAge=0 for all chunks
+					const parsed = parseSetCookieHeader(setCookie!);
+					let hasCleanupChunks = false;
+
+					parsed.forEach((value, name) => {
+						if (name.includes("session_data")) {
+							expect(value["max-age"]).toBe(0);
+							hasCleanupChunks = true;
+						}
+					});
+
+					expect(hasCleanupChunks).toBe(true);
+				},
+			},
+		});
+	});
+
+	it("should NOT chunk cookies when they are under 4KB", async () => {
+		const { client, testUser } = await getTestInstance({
+			secret: "clearance.secret",
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+		const headers = new Headers();
+
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{
+				onSuccess(context) {
+					const setCookie = context.response.headers.get("set-cookie");
+					expect(setCookie).toBeDefined();
+
+					const parsed = parseSetCookieHeader(setCookie!);
+					let hasChunks = false;
+					let hasSingleSessionData = false;
+
+					parsed.forEach((value, name) => {
+						if (
+							name.includes("session_data.0") ||
+							name.includes("session_data.1")
+						) {
+							hasChunks = true;
+						}
+						if (name.endsWith("session_data")) {
+							hasSingleSessionData = true;
+						}
+					});
+
+					expect(hasChunks).toBe(false);
+					expect(hasSingleSessionData).toBe(true);
+
+					parsed.forEach((value, name) => {
+						headers.append("cookie", `${name}=${value.value}`);
+					});
+				},
+			},
+		);
+
+		// Verify we can read it back
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+		});
+
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual(testUser.email);
+	});
+
+	/**
+	 * @see https://github.com/clearance-auth/clearance
+	 */
+	it("should chunk session cache when attributes push the line over the limit", async () => {
+		// Long prefix shrinks the per-cookie value budget; the value alone
+		// lands under 4093 (so the old value-only gate skipped chunking) yet
+		// the serialized line overflows once name + attributes are added.
+		const longPrefix = "clearance-" + "x".repeat(80);
+		const { client } = await getTestInstance({
+			secret: "clearance.secret",
+			advanced: { cookiePrefix: longPrefix },
+			user: {
+				additionalFields: {
+					entraProfile: { type: "string", defaultValue: "" },
+				},
+			},
+			session: { cookieCache: { enabled: true } },
+		});
+
+		let rawSetCookie = "";
+		await client.signUp.email(
+			{
+				name: "Entra User",
+				email: "entra-chunk@example.com",
+				password: "password123",
+				entraProfile: "x".repeat(2400),
+			} as any,
+			{
+				onSuccess(context) {
+					rawSetCookie = context.response.headers.get("set-cookie") ?? "";
+				},
+			},
+		);
+
+		const sessionDataCookies = [...parseSetCookieHeader(rawSetCookie)].filter(
+			([name]) => name.includes("session_data"),
+		);
+
+		// Every emitted session_data cookie must fit the per-cookie limit.
+		for (const [name, attr] of sessionDataCookies) {
+			const line = serializeCookie(name, attr.value, toCookieOptions(attr));
+			expect(
+				line.length,
+				`session_data cookie "${name}" serialized to ${line.length} bytes`,
+			).toBeLessThanOrEqual(4093);
+		}
+
+		// The value was split rather than emitted as one oversized cookie.
+		const isChunked = sessionDataCookies.some(([name]) =>
+			/session_data\.\d+$/.test(name),
+		);
+		expect(isChunked).toBe(true);
+
+		// The chunks reassemble back into a readable cache.
+		const headers = new Headers();
+		for (const [name, attr] of sessionDataCookies) {
+			headers.append("cookie", `${name}=${attr.value}`);
+		}
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+		const cache = await getCookieCache(request, {
+			secret: "clearance.secret",
+			cookiePrefix: longPrefix,
+		});
+		expect(cache).not.toBeNull();
+		expect(cache?.user?.email).toEqual("entra-chunk@example.com");
+	});
+
+	it("skips the session cache and warns when it is too large to chunk", async () => {
+		const warn = vi.fn();
+		const { client, auth, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			logger: {
+				log: (level, message) => {
+					if (level === "warn") warn(message);
+				},
+			},
+			user: {
+				additionalFields: { blob: { type: "string", defaultValue: "" } },
+			},
+			session: { cookieCache: { enabled: true } },
+		});
+
+		// Far beyond the chunk-count cap, so chunking cannot make it fit.
+		const headers = new Headers();
+		let rawSetCookie = "";
+		const res = await client.signUp.email(
+			{
+				name: "Big",
+				email: "too-big@example.com",
+				password: "password123",
+				blob: "x".repeat(420_000),
+			} as any,
+			{
+				onSuccess(context) {
+					rawSetCookie = context.response.headers.get("set-cookie") ?? "";
+					cookieSetter(headers)(context);
+				},
+			},
+		);
+
+		// Sign-up still succeeds: the optional cache failing does not break auth.
+		expect(res.data).not.toBeNull();
+
+		const names = [...parseSetCookieHeader(rawSetCookie)].map(([name]) => name);
+		// The oversized cache cookie is skipped entirely, ...
+		expect(names.some((name) => name.includes("session_data"))).toBe(false);
+		// ... but the session token cookie is still set.
+		expect(names.some((name) => name.includes("session_token"))).toBe(true);
+
+		// The user is told why the cache was skipped.
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("too large to store even after chunking"),
+		);
+
+		// With no cache cookie, the session still resolves from the token via the
+		// database, so auth keeps working.
+		const session = await auth.api.getSession({ headers });
+		expect(session?.user.email).toBe("too-big@example.com");
+	});
+
+	it("skips the session cache and warns when the prefix alone overflows", async () => {
+		const warn = vi.fn();
+		// A prefix this long leaves no room for any value, even a single chunk.
+		// The store must skip the cache instead of throwing on the request.
+		const longPrefix = "clearance-" + "x".repeat(4100);
+		const { client, auth, cookieSetter } = await getTestInstance({
+			secret: "clearance.secret",
+			advanced: { cookiePrefix: longPrefix },
+			logger: {
+				log: (level, message) => {
+					if (level === "warn") warn(message);
+				},
+			},
+			session: { cookieCache: { enabled: true } },
+		});
+
+		const headers = new Headers();
+		let rawSetCookie = "";
+		const res = await client.signUp.email(
+			{
+				name: "No Room",
+				email: "no-room@example.com",
+				password: "password123",
+			},
+			{
+				onSuccess(context) {
+					rawSetCookie = context.response.headers.get("set-cookie") ?? "";
+					cookieSetter(headers)(context);
+				},
+			},
+		);
+
+		// Sign-up still succeeds: the optional cache failing does not break auth.
+		expect(res.data).not.toBeNull();
+
+		const names = [...parseSetCookieHeader(rawSetCookie)].map(([name]) => name);
+		expect(names.some((name) => name.includes("session_data"))).toBe(false);
+		expect(names.some((name) => name.includes("session_token"))).toBe(true);
+
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("too large to store even after chunking"),
+		);
+
+		const session = await auth.api.getSession({ headers });
+		expect(session?.user.email).toBe("no-room@example.com");
+	});
+});
+
+describe("parse cookies", () => {
+	it("should parse cookies into key-value map", () => {
+		const cookieHeader =
+			"clearance.session_token=session-token.signature; clearance.session_data=session-data.signature";
+
+		const parsedCookies = parseCookies(cookieHeader);
+
+		expect(parsedCookies.get("clearance.session_token")).toBe(
+			"session-token.signature",
+		);
+		expect(parsedCookies.get("clearance.session_data")).toBe(
+			"session-data.signature",
+		);
+	});
+
+	it("should securely parse the signed cookies with padding", () => {
+		const cookieHeader =
+			"clearance.session_token=session-token.signature=; clearance.session_data=session-data.signature=";
+
+		const parsedCookies = parseCookies(cookieHeader);
+
+		expect(parsedCookies.get("clearance.session_token")).toBe(
+			"session-token.signature=",
+		);
+		expect(parsedCookies.get("clearance.session_data")).toBe(
+			"session-data.signature=",
+		);
+	});
+});
+
+/**
+ * @see https://github.com/clearance-auth/clearance
+ */
+describe("Cookie header without whitespace after semicolon", () => {
+	it("parseCookies returns each pair when separator is `;` only", () => {
+		const cookieHeader =
+			"clearance.session_token=session-token.signature;clearance.session_data=session-data.signature";
+
+		const parsed = parseCookies(cookieHeader);
+
+		expect(parsed.get("clearance.session_token")).toBe(
+			"session-token.signature",
+		);
+		expect(parsed.get("clearance.session_data")).toBe(
+			"session-data.signature",
+		);
+	});
+
+	it("parseCookies tolerates mixed `;`, `; `, and `;\\t` separators", () => {
+		const cookieHeader = "a=1; b=2;c=3;\td=4";
+
+		const parsed = parseCookies(cookieHeader);
+
+		expect(parsed.get("a")).toBe("1");
+		expect(parsed.get("b")).toBe("2");
+		expect(parsed.get("c")).toBe("3");
+		expect(parsed.get("d")).toBe("4");
+	});
+
+	it("getSessionCookie finds the session cookie when separator is `;` only", () => {
+		const headers = new Headers();
+		headers.set(
+			"cookie",
+			"preference=dark;clearance.session_token=token-123",
+		);
+		const request = new Request("https://example.com/api/auth/session", {
+			headers,
+		});
+
+		expect(getSessionCookie(request)).toBe("token-123");
+	});
+
+	it("getChunkedCookie reconstructs chunks across `;`-only separators", () => {
+		const headers = new Headers();
+		headers.set(
+			"cookie",
+			"clearance.session_data.0=chunkA;clearance.session_data.1=chunkB",
+		);
+		const ctx = {
+			getCookie: () => undefined,
+			headers,
+		} as unknown as Parameters<typeof getChunkedCookie>[0];
+
+		expect(getChunkedCookie(ctx, "clearance.session_data")).toBe(
+			"chunkAchunkB",
+		);
+	});
+});
+
+describe("parseCookies validation", () => {
+	it("returns empty map for empty header", () => {
+		expect(parseCookies("").size).toBe(0);
+	});
+
+	it("rejects names containing characters outside RFC 7230 token", () => {
+		const map = parseCookies("bad name=v1; ok=v2; bad,name=v3; bad:name=v4");
+		expect(map.has("bad name")).toBe(false);
+		expect(map.has("bad,name")).toBe(false);
+		expect(map.has("bad:name")).toBe(false);
+		expect(map.get("ok")).toBe("v2");
+	});
+
+	it("rejects values containing control chars, double-quote, or backslash", () => {
+		const map = parseCookies('a=ok; b=has\rcr; c=has"quote; d=has\\slash');
+		expect(map.get("a")).toBe("ok");
+		expect(map.has("b")).toBe(false);
+		expect(map.has("c")).toBe(false);
+		expect(map.has("d")).toBe(false);
+	});
+
+	it("accepts values with space and comma (real-world deviation)", () => {
+		const map = parseCookies("a=hello world; b=v1,v2");
+		expect(map.get("a")).toBe("hello world");
+		expect(map.get("b")).toBe("v1,v2");
+	});
+
+	it("splits on first `=` only, preserving subsequent `=` in value", () => {
+		const map = parseCookies("a=b=c=d");
+		expect(map.get("a")).toBe("b=c=d");
+	});
+
+	it("rejects entries with CR/LF in raw key or value (no trim escape)", () => {
+		const map = parseCookies("a=ok\r; b\r=1; c=v\nv; d=ok");
+		expect(map.has("a")).toBe(false);
+		expect(map.has("b")).toBe(false);
+		expect(map.has("c")).toBe(false);
+		expect(map.get("d")).toBe("ok");
+	});
+
+	it("strips double-quoted values per RFC 6265 §4.1.1", () => {
+		const map = parseCookies('a="hello"; b=plain; c="with space"');
+		expect(map.get("a")).toBe("hello");
+		expect(map.get("b")).toBe("plain");
+		expect(map.get("c")).toBe("with space");
+	});
+});
+
+describe("applySetCookies", () => {
+	it("merges into empty Cookie header", () => {
+		const headers = new Headers();
+		applySetCookies(headers, ["a=1; Path=/"]);
+		expect(headers.get("cookie")).toBe("a=1");
+	});
+
+	it("strips Set-Cookie attributes (only name=value lands)", () => {
+		const headers = new Headers();
+		applySetCookies(headers, [
+			"a=1; Path=/; HttpOnly; Secure; Max-Age=3600; SameSite=Lax",
+		]);
+		expect(headers.get("cookie")).toBe("a=1");
+	});
+
+	it("merges multiple Set-Cookie values", () => {
+		const headers = new Headers();
+		applySetCookies(headers, ["a=1; Path=/", "b=2; Path=/"]);
+		expect(headers.get("cookie")).toBe("a=1; b=2");
+	});
+
+	it("last-wins on duplicate cookie name (existing + new)", () => {
+		const headers = new Headers({ cookie: "a=old; b=keep" });
+		applySetCookies(headers, ["a=new; Path=/"]);
+		expect(headers.get("cookie")).toBe("a=new; b=keep");
+	});
+
+	it("re-encodes Set-Cookie values containing reserved bytes on wire join", () => {
+		const headers = new Headers({ cookie: "session=safe" });
+		applySetCookies(headers, ["pref=foo%3Bbar=hello; Path=/"]);
+		expect(headers.get("cookie")).toBe("session=safe; pref=foo%3Bbar%3Dhello");
+	});
+
+	it("strips RFC 6265 quoted-string wrapping from Set-Cookie values", () => {
+		const headers = new Headers();
+		applySetCookies(headers, ['token="abc"; Path=/']);
+		expect(headers.get("cookie")).toBe("token=abc");
+	});
+});
+
+describe("expireCookie", () => {
+	it("preserves attributes", () => {
+		const setCookie = vi.fn();
+		expireCookie({ setCookie } as any, {
+			name: "test",
+			attributes: {
+				path: "/custom",
+				httpOnly: true,
+			},
+		});
+		expect(setCookie).toHaveBeenCalledWith("test", "", {
+			path: "/custom",
+			httpOnly: true,
+			maxAge: 0,
+		});
+	});
+
+	it("scrubs collapsed Set-Cookie headers when getSetCookie is unavailable", () => {
+		const responseHeaders = new Headers();
+		responseHeaders.append("set-cookie", "keep=1; Path=/");
+		responseHeaders.append("set-cookie", "target=valid; Path=/");
+		responseHeaders.append("set-cookie", "target.0=chunk; Path=/");
+		Object.defineProperty(responseHeaders, "getSetCookie", {
+			value: undefined,
+		});
+
+		const setCookie = vi.fn(
+			(
+				name: string,
+				value: string,
+				options: { maxAge: number; path: string },
+			) => {
+				responseHeaders.append(
+					"set-cookie",
+					`${name}=${value}; Path=${options.path}; Max-Age=${options.maxAge}`,
+				);
+			},
+		);
+
+		expireCookie(
+			{
+				responseHeaders,
+				context: { responseHeaders },
+				setCookie,
+			} as any,
+			{
+				name: "target",
+				attributes: {
+					path: "/",
+				},
+			},
+		);
+
+		const setCookieHeader = responseHeaders.get("set-cookie") || "";
+		expect(setCookieHeader).toContain("keep=1");
+		expect(setCookieHeader).not.toContain("target=valid");
+		expect(setCookieHeader).not.toContain("target.0=chunk");
+		expect(setCookieHeader).toContain("target=; Path=/; Max-Age=0");
+	});
+});
+
+describe("account cookie sync on user switch", () => {
+	const server = setupServer();
+	let googleUser = { email: "first@test.com", sub: "first-google-sub" };
+
+	beforeAll(() => {
+		server.listen({ onUnhandledRequest: "bypass" });
+		server.use(
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const data: GoogleProfile = {
+					email: googleUser.email,
+					email_verified: true,
+					name: "Test User",
+					picture: "https://lh3.googleusercontent.com/a-/AOh14GjQ4Z7Vw",
+					exp: 1234567890,
+					sub: googleUser.sub,
+					iat: 1234567890,
+					aud: "test",
+					azp: "test",
+					nbf: 1234567890,
+					iss: "test",
+					locale: "en",
+					jti: "test",
+					given_name: "Test",
+					family_name: "User",
+				};
+				const idToken = await signJWT(data, DEFAULT_SECRET);
+				return HttpResponse.json({
+					access_token: `access-token-${googleUser.sub}`,
+					refresh_token: `refresh-token-${googleUser.sub}`,
+					id_token: idToken,
+				});
+			}),
+		);
+	});
+
+	afterAll(() => server.close());
+
+	const getInstance = () =>
+		getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				storeAccountCookie: true,
+			},
+			session: {
+				cookieCache: {
+					enabled: true,
+				},
+			},
+		});
+
+	it("keeps the fresh account cookie issued for the new user when the request carries another user's stale account cookie", async () => {
+		const { auth, client, cookieSetter } = await getInstance();
+		const ctx = await auth.$context;
+		const accountDataCookieName = ctx.authCookies.accountData.name;
+
+		const headers = new Headers();
+		googleUser = { email: "switch-first@test.com", sub: "switch-first-sub" };
+		const firstSignIn = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const firstState =
+			firstSignIn.data && "url" in firstSignIn.data && firstSignIn.data.url
+				? new URL(firstSignIn.data.url).searchParams.get("state") || ""
+				: "";
+		await client.$fetch("/callback/google", {
+			query: { state: firstState, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		googleUser = { email: "switch-second@test.com", sub: "switch-second-sub" };
+		const secondSignIn = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				headers,
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const secondState =
+			secondSignIn.data && "url" in secondSignIn.data && secondSignIn.data.url
+				? new URL(secondSignIn.data.url).searchParams.get("state") || ""
+				: "";
+		let secondCallbackSetCookie = "";
+		await client.$fetch("/callback/google", {
+			query: { state: secondState, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				secondCallbackSetCookie =
+					context.response.headers.get("set-cookie") || "";
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		const accountSetCookie = parseSetCookieHeader(secondCallbackSetCookie).get(
+			accountDataCookieName,
+		);
+		expect(accountSetCookie?.value).toBeTruthy();
+		expect(accountSetCookie?.["max-age"]).not.toBe(0);
+
+		const session = await auth.api.getSession({ headers });
+		expect(session?.user.email).toBe("switch-second@test.com");
+		const accountData = safeJSONParse<{ userId: string }>(
+			await symmetricDecodeJWT(
+				accountSetCookie?.value || "",
+				ctx.secretConfig,
+				"clearance-account",
+			),
+		);
+		expect(accountData?.userId).toBe(session?.user.id);
+	});
+
+	it("still expires another user's stale account cookie when the response issues no fresh one", async () => {
+		const { auth, client, cookieSetter } = await getInstance();
+		const ctx = await auth.$context;
+		const accountDataCookieName = ctx.authCookies.accountData.name;
+
+		const headers = new Headers();
+		googleUser = { email: "expire-first@test.com", sub: "expire-first-sub" };
+		const firstSignIn = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		const firstState =
+			firstSignIn.data && "url" in firstSignIn.data && firstSignIn.data.url
+				? new URL(firstSignIn.data.url).searchParams.get("state") || ""
+				: "";
+		await client.$fetch("/callback/google", {
+			query: { state: firstState, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		let signUpSetCookie = "";
+		await client.signUp.email(
+			{
+				email: "expire-second@test.com",
+				password: "password123456",
+				name: "Second User",
+			},
+			{
+				headers,
+				onSuccess(context) {
+					signUpSetCookie = context.response.headers.get("set-cookie") || "";
+				},
+			},
+		);
+
+		const accountSetCookie = parseSetCookieHeader(signUpSetCookie).get(
+			accountDataCookieName,
+		);
+		expect(accountSetCookie?.value).toBeFalsy();
+		expect(accountSetCookie?.["max-age"]).toBe(0);
+	});
+});
+
+describe("getCookieCache expiry (compact strategy)", () => {
+	const SECRET = "clearance.secret";
+
+	// Build a validly-signed compact session_data cookie, mirroring the encoding
+	// in setCookieCache, so the only variable under test is freshness.
+	async function buildCompactCookie(
+		embeddedExpiresAt: Date,
+		outerExpiresAt: number | undefined,
+	) {
+		const sessionData = {
+			session: {
+				id: "s1",
+				token: "session-token",
+				userId: "u1",
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				expiresAt: embeddedExpiresAt,
+			},
+			user: {
+				id: "u1",
+				email: "cache@test.com",
+				emailVerified: true,
+				name: "Cache User",
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+			updatedAt: Date.now(),
+			version: "1",
+		};
+		const signature = await createHMAC("SHA-256", "base64urlnopad").sign(
+			SECRET,
+			JSON.stringify({ ...sessionData, expiresAt: outerExpiresAt }),
+		);
+		return base64Url.encode(
+			JSON.stringify({
+				session: sessionData,
+				expiresAt: outerExpiresAt,
+				signature,
+			}),
+			{ padding: false },
+		);
+	}
+
+	function requestWith(cookieValue: string) {
+		const headers = new Headers();
+		headers.set("cookie", `clearance.session_data=${cookieValue}`);
+		return new Request("https://example.com/api/auth/session", { headers });
+	}
+
+	it("returns the session for a fresh snapshot", async () => {
+		const cookie = await buildCompactCookie(
+			new Date(Date.now() + 60 * 60 * 1000),
+			Date.now() + 5 * 60 * 1000,
+		);
+		const cache = await getCookieCache(requestWith(cookie), { secret: SECRET });
+		expect(cache?.user?.email).toBe("cache@test.com");
+	});
+
+	it("returns null when the embedded session has expired", async () => {
+		const cookie = await buildCompactCookie(
+			new Date(Date.now() - 60 * 1000),
+			Date.now() + 5 * 60 * 1000,
+		);
+		const cache = await getCookieCache(requestWith(cookie), { secret: SECRET });
+		expect(cache).toBeNull();
+	});
+
+	it("returns null when the cache window has elapsed", async () => {
+		const cookie = await buildCompactCookie(
+			new Date(Date.now() + 60 * 60 * 1000),
+			Date.now() - 60 * 1000,
+		);
+		const cache = await getCookieCache(requestWith(cookie), { secret: SECRET });
+		expect(cache).toBeNull();
+	});
+});

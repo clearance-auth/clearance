@@ -1,0 +1,15 @@
+# Package preview publish is disabled until Clearance release plumbing is ready.
+# Inherited Clearance pkg-pr-new flow assumed packages/* publish layout + secrets.
+name: Publish Any Commit
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  skipped:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Not applicable
+        run: echo "Preview publish is not enabled for Clearance yet."

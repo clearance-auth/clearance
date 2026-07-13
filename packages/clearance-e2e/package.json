@@ -1,0 +1,14 @@
+{
+  "name": "@clearance/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rendered-browser acceptance specs run inside compose-smoke (chromium only)",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.0"
+  }
+}

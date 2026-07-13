@@ -1,0 +1,23 @@
+{
+  "name": "@clearance/sample-b2b",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sample B2B SaaS app — real Clearance auth sessions on Postgres",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@clearance/auth": "workspace:*",
+    "@clearance/management": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

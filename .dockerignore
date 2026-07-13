@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+.git
+.clearance
+coverage
+*.log
+demo
+docs
+e2e
+test
+.turbo

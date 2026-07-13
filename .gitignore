@@ -1,0 +1,17 @@
+node_modules
+dist
+.turbo
+.clearance
+data
+*.log
+.DS_Store
+coverage
+.env
+.env.*
+UPSTREAM_DIFF.txt
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars

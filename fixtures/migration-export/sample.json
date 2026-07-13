@@ -1,0 +1,16 @@
+{
+  "source": "legacy",
+  "users": [
+    { "id": "ext_user_1", "email": "alice@example.com", "name": "Alice Example" },
+    { "id": "ext_user_2", "email": "bob@example.com", "name": "Bob Example" },
+    { "id": "ext_user_3", "email": "carol@example.com", "name": "Carol Example" }
+  ],
+  "organizations": [
+    { "id": "ext_org_1", "name": "Example Corp", "slug": "example-corp" }
+  ],
+  "members": [
+    { "userId": "ext_user_1", "organizationId": "ext_org_1", "role": "admin" },
+    { "userId": "ext_user_2", "organizationId": "ext_org_1", "role": "member" },
+    { "userId": "ext_user_3", "organizationId": "ext_org_1", "role": "member" }
+  ]
+}

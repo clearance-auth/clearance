@@ -1,0 +1,104 @@
+import { createAuthMiddleware } from "@clearance/core/api";
+import type { RequestEvent } from "@sveltejs/kit";
+import { parseSetCookieHeader, toCookieOptions } from "../cookies";
+import type { ClearanceOptions, ClearancePlugin } from "../types";
+import { PACKAGE_VERSION } from "../version";
+import { warnIfCookiePluginNotLast } from "./cookie-plugin-guard";
+
+export const toSvelteKitHandler = (auth: {
+	handler: (request: Request) => Response | Promise<Response>;
+	options: ClearanceOptions;
+}) => {
+	return (event: { request: Request }) => auth.handler(event.request);
+};
+
+export const svelteKitHandler = async ({
+	auth,
+	event,
+	resolve,
+	building,
+}: {
+	auth: {
+		handler: (request: Request) => Response | Promise<Response>;
+		options: ClearanceOptions;
+	};
+	event: RequestEvent;
+	resolve: (event: RequestEvent) => Response | Promise<Response>;
+	building: boolean;
+}) => {
+	if (building) {
+		return resolve(event);
+	}
+	const { request, url } = event;
+	if (isAuthPath(url.toString(), auth.options)) {
+		return auth.handler(request);
+	}
+	return resolve(event);
+};
+
+export function isAuthPath(url: string, options: ClearanceOptions) {
+	const _url = new URL(url);
+	const baseURLStr =
+		typeof options.baseURL === "string" ? options.baseURL : undefined;
+	const baseURL = new URL(
+		`${baseURLStr || _url.origin}${options.basePath || "/api/auth"}`,
+	);
+	if (_url.origin !== baseURL.origin) return false;
+	if (
+		!_url.pathname.startsWith(
+			baseURL.pathname.endsWith("/")
+				? baseURL.pathname
+				: `${baseURL.pathname}/`,
+		)
+	)
+		return false;
+	return true;
+}
+
+export const sveltekitCookies = (
+	getRequestEvent: () => RequestEvent<any, any>,
+) => {
+	let hasWarned = false;
+
+	return {
+		id: "sveltekit-cookies",
+		version: PACKAGE_VERSION,
+		hooks: {
+			after: [
+				{
+					matcher() {
+						return true;
+					},
+					handler: createAuthMiddleware(async (ctx) => {
+						if (!hasWarned) {
+							warnIfCookiePluginNotLast(ctx.context, "sveltekit-cookies");
+							hasWarned = true;
+						}
+						const returned = ctx.context.responseHeaders;
+						if ("_flag" in ctx && ctx._flag === "router") {
+							return;
+						}
+						if (returned instanceof Headers) {
+							const setCookies = returned?.get("set-cookie");
+							if (!setCookies) return;
+							const event = getRequestEvent();
+							if (!event) return;
+							const parsed = parseSetCookieHeader(setCookies);
+
+							for (const [name, attributes] of parsed) {
+								try {
+									event.cookies.set(name, attributes.value, {
+										...toCookieOptions(attributes),
+										path: attributes.path || "/",
+									});
+								} catch {
+									// this will avoid any issue related to already streamed response
+								}
+							}
+						}
+					}),
+				},
+			],
+		},
+	} satisfies ClearancePlugin;
+};

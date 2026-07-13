@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "./*.ts",
+    "./*.js"
+  ],
+  "references": [
+    { "path": "./packages/runtime/tsconfig.json" },
+    { "path": "./packages/core/tsconfig.json" },
+    { "path": "./packages/telemetry/tsconfig.json" },
+    { "path": "./packages/sso/tsconfig.json" },
+    { "path": "./packages/scim/tsconfig.json" },
+    { "path": "./packages/memory-adapter/tsconfig.json" },
+    { "path": "./packages/kysely-adapter/tsconfig.json" },
+    { "path": "./packages/drizzle-adapter/tsconfig.json" },
+    { "path": "./packages/prisma-adapter/tsconfig.json" },
+    { "path": "./packages/mongo-adapter/tsconfig.json" },
+    { "path": "./packages/test-utils/tsconfig.json" }
+  ]
+}

@@ -1,0 +1,51 @@
+name: 🚩 Bug report
+description: Report a bug or unexpected behavior
+type: Bug
+body:
+  - type: checkboxes
+    attributes:
+      label: Is this suited for GitHub?
+      description: Use GitHub issues for bugs and defects in Clearance.
+      options:
+        - label: Yes, this is suited for GitHub
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug with Clearance!
+
+        - If you have a feature request, please use the feature request form instead.
+        - Before opening a new issue, please check for existing issues and :+1: upvote the existing issue instead.
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Provide a step-by-step description or a minimal reproduction repository link.
+      placeholder: |
+        Steps to reproduce:
+        1. Configure Clearance with ...
+        2. Run `clearance ...` or call the management API with ...
+        3. Observe ...
+
+        Or provide a link to a minimal reproduction repository.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Current vs. Expected behavior
+      description: |
+        A clear and concise description of what the bug is (e.g., screenshots, logs, etc.), and what you expected to happen.
+
+        **Skipping this/failure to provide complete information of the bug will result in the issue being closed.**
+      placeholder: 'Following the steps from the previous section, I expected A to happen, but I observed B instead.'
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: Versions and how you run Clearance (CLI, Docker Compose, host, Node version).
+      placeholder: |
+        - Clearance / package versions:
+        - Node / pnpm:
+        - OS:
+        - Deploy path (Compose / host / other):
+    validations:
+      required: true

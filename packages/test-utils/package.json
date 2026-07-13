@@ -1,0 +1,48 @@
+{
+  "name": "@clearance/test-utils",
+  "version": "1.6.23",
+  "description": "Testing utilities for Clearance adapter development",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/clearance-auth/clearance",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clearance-auth/clearance.git",
+    "directory": "packages/test-utils"
+  },
+  "keywords": [
+    "auth",
+    "testing",
+    "typescript",
+    "clearance"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./adapter": {
+      "dev-source": "./src/adapter/index.ts",
+      "default": "./dist/adapter.mjs",
+      "types": "./dist/adapter.d.mts"
+    }
+  },
+  "devDependencies": {
+    "@clearance/core": "workspace:*",
+    "@clearance/runtime": "workspace:*",
+    "tsdown": "catalog:",
+    "vitest": "catalog:vitest"
+  },
+  "peerDependencies": {
+    "@clearance/core": "workspace:^",
+    "@clearance/runtime": "workspace:^",
+    "vitest": "catalog:vitest"
+  }
+}

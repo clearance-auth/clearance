@@ -1,0 +1,285 @@
+# Build, verify, publish, and sign the actual Clearance release assets.
+name: Clearance release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Clearance release version"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: clearance-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -Eeuo pipefail
+          VERSION="${REQUESTED_VERSION#v}"
+          if [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?(\+([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$ ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "::error::Release version must be exact SemVer: $VERSION"
+            exit 1
+          else
+            echo "Skipping non-release tag: $REQUESTED_VERSION"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: ".nvmrc"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Resolve version and require release signing identity
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
+        run: |
+          set -Eeuo pipefail
+          test -n "${CLEARANCE_RELEASE_SIGNING_KEY:-}" || {
+            echo "::error::CLEARANCE_RELEASE_SIGNING_KEY is required; refusing an unsigned release"
+            exit 1
+          }
+          VERSION="${REQUESTED_VERSION#v}"
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?(\+([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$ ]] || {
+            echo "::error::Release version must be exact SemVer: $VERSION"
+            exit 1
+          }
+          test "$(git rev-parse --is-shallow-repository)" = "false" || {
+            echo "::error::Release checkout must contain full history"
+            exit 1
+          }
+          test "$(git rev-parse "refs/tags/v${VERSION}^{commit}")" = "$(git rev-parse HEAD)" || {
+            echo "::error::Tag v${VERSION} must exist and resolve to the release commit"
+            exit 1
+          }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:$VERSION" >> "$GITHUB_ENV"
+          echo "BACKUP_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance-backup:$VERSION" >> "$GITHUB_ENV"
+          echo "STAGING_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "STAGING_BACKUP_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance-backup:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Install and verify from clean source
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          node scripts/verify-release-version.mjs "$VERSION"
+          pnpm verify:real
+
+      - name: Pack shipping packages
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist-release/assets
+          pnpm --filter @clearance/auth pack --pack-destination dist-release/assets
+          pnpm --filter @clearance/management pack --pack-destination dist-release/assets
+          pnpm --filter @clearance/cli pack --pack-destination dist-release/assets
+          pnpm --filter @clearance/api pack --pack-destination dist-release/assets
+          command -v helm >/dev/null
+          helm package deploy/helm/clearance --version "$VERSION" --app-version "$VERSION" --destination dist-release/assets
+          pnpm list -r --prod --json --depth Infinity > dist-release/assets/dependency-graph.json
+          test "$(find dist-release/assets -name '*.tgz' | wc -l)" -eq 5
+          tarball_for() {
+            node -e '
+              const fs=require("fs"), cp=require("child_process"), path=require("path");
+              const dir=process.argv[1], wanted=process.argv[2];
+              const found=fs.readdirSync(dir).filter(f=>f.endsWith(".tgz")).find(f=>{
+                try {
+                  const p=JSON.parse(cp.execFileSync("tar",["-xzf",path.join(dir,f),"-O","package/package.json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}));
+                  return p.name===wanted;
+                } catch { return false; }
+              });
+              if (!found) process.exit(1);
+              process.stdout.write(path.join(dir,found));
+            ' dist-release/assets "$1"
+          }
+          node scripts/verify-release-runtime-closure.mjs "$(tarball_for '@clearance/auth')" dist-release/assets/auth-runtime-closure.json
+          node scripts/verify-release-runtime-closure.mjs "$(tarball_for '@clearance/management')" dist-release/assets/management-runtime-closure.json
+
+      - name: Build and push staging container references
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --push --tag "$STAGING_IMAGE" \
+            --provenance=mode=max --sbom=true \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file dist-release/image-metadata.json .
+          DIGEST="$(node -e "const j=require('./dist-release/image-metadata.json'); process.stdout.write(j['containerimage.digest']||'')")"
+          test -n "$DIGEST"
+          printf '%s@%s\n' "${IMAGE%:*}" "$DIGEST" > dist-release/assets/container-image.txt
+          docker buildx build --push --target backup-runtime --tag "$STAGING_BACKUP_IMAGE" \
+            --provenance=mode=max --sbom=true \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file dist-release/backup-image-metadata.json .
+          BACKUP_DIGEST="$(node -e "const j=require('./dist-release/backup-image-metadata.json'); process.stdout.write(j['containerimage.digest']||'')")"
+          test -n "$BACKUP_DIGEST"
+          printf '%s@%s\n' "${BACKUP_IMAGE%:*}" "$BACKUP_DIGEST" > dist-release/assets/backup-container-image.txt
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "BACKUP_DIGEST=$BACKUP_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Sign package and container-digest bundle
+        env:
+          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
+          CLEARANCE_RELEASE_ASSET_DIR: ${{ github.workspace }}/dist-release/assets
+          CLEARANCE_REQUIRE_RELEASE_ASSETS: "1"
+          CLEARANCE_REQUIRE_TAG_BINDING: "1"
+          CLEARANCE_VERSION: ${{ env.VERSION }}
+        run: bash scripts/sign-release.sh "${{ github.workspace }}/dist-release"
+
+      - name: Verify detached signature and asset manifest
+        run: |
+          set -Eeuo pipefail
+          openssl dgst -sha256 -verify dist-release/release-public.pem \
+            -signature dist-release/release-bundle.sig dist-release/release-bundle.txt
+          (cd dist-release/assets && sha256sum --check ../assets.sha256)
+
+      - name: Keyless-sign and verify immutable container digests
+        run: |
+          set -Eeuo pipefail
+          PRIMARY_REF="${IMAGE%:*}@${DIGEST}"
+          BACKUP_REF="${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}"
+          cosign sign --yes "$PRIMARY_REF"
+          cosign sign --yes "$BACKUP_REF"
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
+          cosign verify --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$PRIMARY_REF" >/dev/null
+          cosign verify --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$BACKUP_REF" >/dev/null
+
+      - name: Create final release tags from verified digests
+        run: |
+          set -Eeuo pipefail
+          docker buildx imagetools create --tag "$IMAGE" "${IMAGE%:*}@${DIGEST}"
+          docker buildx imagetools create --tag "$BACKUP_IMAGE" "${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}"
+
+      - name: Verify both published container tags match the signed digests
+        run: |
+          set -Eeuo pipefail
+          verify_tag_digest() {
+            local image="$1" evidence="$2" repository expected actual
+            repository="${image%:*}"
+            expected="$(sed -n 's/^.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$evidence")"
+            [[ -n "$expected" ]] || {
+              echo "::error::Signed container evidence has an invalid digest: $evidence"
+              exit 1
+            }
+            docker pull "$image"
+            actual="$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | awk -F@ -v repository="$repository" '$1 == repository { print $2; exit }')"
+            [[ "$actual" == "$expected" ]] || {
+              echo "::error::$image resolves to ${actual:-no digest}; signed digest is $expected"
+              exit 1
+            }
+          }
+          verify_tag_digest "$IMAGE" dist-release/assets/container-image.txt
+          verify_tag_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt
+
+      - name: Publish public npm packages with trusted provenance
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          set -Eeuo pipefail
+          npm install --global npm@11.5.1
+          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          tarball_for() {
+            node -e '
+              const fs=require("fs"), cp=require("child_process"), path=require("path");
+              const dir=process.argv[1], wanted=process.argv[2];
+              const found=fs.readdirSync(dir).filter(f=>f.endsWith(".tgz")).find(f=>{
+                try {
+                  const p=JSON.parse(cp.execFileSync("tar",["-xzf",path.join(dir,f),"-O","package/package.json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}));
+                  return p.name===wanted;
+                } catch { return false; }
+              });
+              if (!found) process.exit(1);
+              process.stdout.write(path.join(dir,found));
+            ' dist-release/assets "$1"
+          }
+          integrity_for() {
+            node -e '
+              const fs=require("fs"), crypto=require("crypto");
+              process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
+            ' "$1"
+          }
+          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
+            TARBALL="$(tarball_for "$PACKAGE")"
+            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
+            PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n' || true)"
+            if [[ -n "$PUBLISHED_INTEGRITY" ]]; then
+              [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
+                echo "::error::${PACKAGE}@${VERSION} exists with unexpected tarball integrity"
+                exit 1
+              }
+              echo "${PACKAGE}@${VERSION} already matches the release tarball; skipping."
+            else
+              npm publish "$TARBALL" --access public --provenance
+            fi
+          done
+          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
+            TARBALL="$(tarball_for "$PACKAGE")"
+            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
+            PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json | tr -d '"\n')"
+            [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
+              echo "::error::${PACKAGE}@${VERSION} failed final registry integrity verification"
+              exit 1
+            }
+          done
+
+      - name: Upload signed release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: clearance-${{ env.VERSION }}-signed
+          path: dist-release/
+          if-no-files-found: error
+
+      - name: Attach signed assets to tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          mapfile -d '' FILES < <(find dist-release -type f -print0)
+          test "${#FILES[@]}" -gt 0
+          gh release upload "$GITHUB_REF_NAME" "${FILES[@]}" --clobber

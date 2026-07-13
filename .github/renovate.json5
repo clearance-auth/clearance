@@ -1,0 +1,59 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    'schedule:weekly',
+    'group:allNonMajor',
+    ':disablePeerDependencies',
+    'helpers:pinGitHubActionDigestsToSemver',
+  ],
+  labels: [
+    'dependencies',
+  ],
+  rangeStrategy: 'bump',
+  postUpdateOptions: [
+    'pnpmDedupe',
+  ],
+  ignorePaths: [
+    '**/node_modules/**',
+  ],
+  packageRules: [
+    {
+      groupName: 'github-actions',
+      matchManagers: [
+        'github-actions',
+      ],
+    },
+    {
+      groupName: 'runtime dependencies',
+      matchManagers: [
+        'npm',
+      ],
+      matchFileNames: [
+        'packages/runtime/**',
+        'packages/core/**',
+        'packages/sso/**',
+        'packages/scim/**',
+        'packages/*-adapter/**',
+      ],
+    },
+    {
+      groupName: 'product dependencies',
+      matchManagers: [
+        'npm',
+      ],
+      matchFileNames: [
+        'packages/clearance-*/**',
+        'packages/management/**',
+        'apps/**',
+      ],
+    },
+  ],
+  ignoreDeps: [
+    '@types/node',
+    'drizzle-orm',
+    'node',
+    'npm',
+    'pnpm',
+  ],
+}

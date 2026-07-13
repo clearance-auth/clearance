@@ -1,0 +1,869 @@
+import { clearance } from "@clearance/runtime";
+import { memoryAdapter } from "@clearance/runtime/adapters/memory";
+import { createAuthClient } from "@clearance/runtime/client";
+import { setCookieToHeader } from "@clearance/runtime/cookies";
+import { bearer, organization } from "@clearance/runtime/plugins";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { sso } from ".";
+import { ssoClient } from "./client";
+import type { SSOOptions } from "./types";
+
+const dnsMock = vi.hoisted(() => {
+	return {
+		resolveTxt: vi.fn(),
+	};
+});
+
+vi.mock("node:dns/promises", () => {
+	return {
+		...dnsMock,
+		default: dnsMock,
+	};
+});
+
+describe("Domain verification", async () => {
+	type TestUser = { email: string; password: string; name: string };
+	const testUser: TestUser = {
+		email: "test@email.com",
+		password: "password",
+		name: "Test User",
+	};
+
+	const createTestAuth = (
+		options?: SSOOptions,
+		clearanceOptions?: {
+			secondaryStorage?: {
+				set: (key: string, value: string, ttl?: number) => void;
+				get: (key: string) => string | null;
+				delete: (key: string) => void;
+			};
+		},
+	) => {
+		const data: Record<string, any[]> = {
+			user: [],
+			session: [],
+			account: [],
+			ssoProvider: [],
+			member: [],
+			organization: [],
+		};
+
+		if (!clearanceOptions?.secondaryStorage) {
+			data.verification = [];
+		}
+
+		const memory = memoryAdapter(data);
+
+		const ssoOptions = {
+			...options,
+			domainVerification: {
+				...options?.domainVerification,
+				enabled: true,
+			},
+		} satisfies SSOOptions;
+
+		const auth = clearance({
+			database: memory,
+			baseURL: "http://localhost:3000",
+			emailAndPassword: {
+				enabled: true,
+			},
+			secondaryStorage: clearanceOptions?.secondaryStorage,
+			plugins: [sso(ssoOptions), organization()],
+		});
+
+		const authClient = createAuthClient({
+			baseURL: "http://localhost:3000",
+			plugins: [bearer(), ssoClient({ domainVerification: { enabled: true } })],
+			fetchOptions: {
+				customFetchImpl: async (url, init) => {
+					return auth.handler(new Request(url, init));
+				},
+			},
+		});
+
+		async function createOrganization(name: string, headers: Headers) {
+			return await auth.api.createOrganization({
+				body: {
+					name,
+					slug: name,
+				},
+				headers,
+			});
+		}
+
+		async function getAuthHeaders(user: TestUser, organizationId?: string) {
+			const headers = new Headers();
+			const response = await authClient.signUp.email({
+				email: user.email,
+				password: user.password,
+				name: user.name,
+			});
+
+			if (response.data && organizationId) {
+				await auth.api.addMember({
+					body: {
+						userId: response.data.user.id,
+						role: "member",
+						organizationId,
+					},
+					headers,
+				});
+			}
+
+			await authClient.signIn.email(user, {
+				throw: true,
+				onSuccess: setCookieToHeader(headers),
+			});
+
+			return headers;
+		}
+
+		async function registerSSOProvider(
+			headers: Headers,
+			organizationId?: string,
+		) {
+			return auth.api.registerSSOProvider({
+				body: {
+					providerId: "saml-provider-1",
+					issuer: "http://hello.com:8081",
+					domain: "http://hello.com:8081",
+					samlConfig: {
+						entryPoint: "http://idp.com:",
+						cert: "the-cert",
+						callbackUrl: "http://hello.com:8081/api/sso/saml2/callback",
+						spMetadata: {},
+					},
+					organizationId,
+				},
+				headers,
+			});
+		}
+
+		return {
+			auth,
+			authClient,
+			registerSSOProvider,
+			getAuthHeaders,
+			createOrganization,
+		};
+	};
+
+	afterEach(() => {
+		vi.useRealTimers();
+		dnsMock.resolveTxt.mockReset();
+	});
+
+	describe("POST /sso/request-domain-verification", () => {
+		it("should return unauthorized when session is missing", async () => {
+			const { auth } = createTestAuth();
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: "the-provider",
+				},
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(401);
+		});
+
+		it("should return not found when no provider is found", async () => {
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: "unknown",
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(404);
+			expect(await response.json()).toEqual({
+				message: "Provider not found",
+			});
+		});
+
+		it("should return the existing active verification token", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			vi.useFakeTimers({ toFake: ["Date"] });
+
+			const newAuthHeaders = await getAuthHeaders(testUser);
+
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: newAuthHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(201);
+			expect(await response.json()).toEqual({
+				domainVerificationToken: provider.domainVerificationToken,
+			});
+		});
+
+		it("should return forbidden if user does not own the provider", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			const notOwnerHeaders = await getAuthHeaders({
+				name: "other",
+				email: "other@test.com",
+				password: "password",
+			});
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: notOwnerHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({
+				message: "You don't have access to this provider",
+			});
+		});
+
+		it("should return forbidden if user does not belong to the provider organization", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider, createOrganization } =
+				createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+
+			const orgA = await createOrganization("org-a", headers);
+			const orgB = await createOrganization("org-b", headers);
+
+			const provider = await registerSSOProvider(headers, orgA?.id);
+
+			const notOrgHeaders = await getAuthHeaders(
+				{
+					name: "other",
+					email: "other@test.com",
+					password: "password",
+				},
+				orgB?.id,
+			);
+
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: notOrgHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({
+				message: "You don't have access to this provider",
+			});
+		});
+
+		it("should return a new domain verification token", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.advanceTimersByTime(Date.now() + 3600 * 24 * 7 * 1000 + 10); // advance 1 week + 10 seconds
+
+			const newHeaders = await getAuthHeaders(testUser);
+			const response = await auth.api.requestDomainVerification({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: newHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(201);
+			expect(await response.json()).toMatchObject({
+				domainVerificationToken: expect.any(String),
+			});
+		});
+
+		it("allows a non-creator org admin to request verification for an org-owned provider", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider, createOrganization } =
+				createTestAuth();
+			const ownerHeaders = await getAuthHeaders(testUser);
+			const org = await createOrganization("org-with-admin", ownerHeaders);
+
+			// The org owner registers the provider; a different org admin who did
+			// not create it must still be able to verify its domain.
+			const provider = await registerSSOProvider(ownerHeaders, org?.id);
+
+			const adminHeaders = await getAuthHeaders({
+				name: "Org Admin",
+				email: "org-admin@test.com",
+				password: "password",
+			});
+			const adminSession = await auth.api.getSession({ headers: adminHeaders });
+			await auth.api.addMember({
+				body: {
+					userId: adminSession!.user.id,
+					role: "admin",
+					organizationId: org!.id,
+				},
+				headers: ownerHeaders,
+			});
+
+			const response = await auth.api.requestDomainVerification({
+				body: { providerId: provider.providerId },
+				headers: adminHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(201);
+			expect(await response.json()).toMatchObject({
+				domainVerificationToken: expect.any(String),
+			});
+		});
+
+		it("should fail to create a new token on an already verified domain", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				[
+					`_clearance-token-saml-provider-1=${provider.domainVerificationToken}`,
+				],
+			]);
+
+			const domainVerificationResponse = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(domainVerificationResponse.status).toBe(204);
+
+			const domainVerificationSubmissionResponse =
+				await auth.api.requestDomainVerification({
+					body: {
+						providerId: provider.providerId,
+					},
+					headers,
+					asResponse: true,
+				});
+
+			expect(domainVerificationSubmissionResponse.status).toBe(409);
+			expect(await domainVerificationSubmissionResponse.json()).toEqual({
+				message: "Domain has already been verified",
+				code: "DOMAIN_VERIFIED",
+			});
+		});
+	});
+
+	describe("POST /sso/verify-domain", () => {
+		it("should return unauthorized when session is missing", async () => {
+			const { auth } = createTestAuth();
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: "the-provider",
+				},
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(401);
+		});
+
+		it("should return not found when no provider is found", async () => {
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: "unknown",
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(404);
+			expect(await response.json()).toEqual({
+				message: "Provider not found",
+			});
+		});
+
+		it("should return not found when no pending verification is found", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.advanceTimersByTime(Date.now() + 3600 * 24 * 7 * 1000 + 10); // advance 1 week + 10 seconds
+
+			const newAuthHeaders = await getAuthHeaders(testUser);
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: newAuthHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(404);
+			expect(await response.json()).toEqual({
+				message: "No pending domain verification exists",
+				code: "NO_PENDING_VERIFICATION",
+			});
+		});
+
+		it("should return bad gateway when unable to verify domain", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				["google-site-verification=the-token"],
+			]);
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(502);
+			expect(await response.json()).toEqual({
+				message:
+					"Unable to verify domain ownership for hello.com. Try again later",
+				code: "DOMAIN_VERIFICATION_FAILED",
+			});
+		});
+
+		it("should return bad gateway when the TXT record only contains the verification token as a substring", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				[`prefix-${provider.domainVerificationToken}-suffix`],
+				[
+					`_clearance-token-saml-provider-1=${provider.domainVerificationToken}-suffix`,
+				],
+			]);
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(502);
+			expect(await response.json()).toEqual({
+				message:
+					"Unable to verify domain ownership for hello.com. Try again later",
+				code: "DOMAIN_VERIFICATION_FAILED",
+			});
+		});
+
+		it("should return forbidden if user does not own the provider", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			const notOwnerHeaders = await getAuthHeaders({
+				name: "other",
+				email: "other@test.com",
+				password: "password",
+			});
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: notOwnerHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({
+				message: "You don't have access to this provider",
+			});
+		});
+
+		it("should return forbidden if user does not belong to the provider organization", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider, createOrganization } =
+				createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const orgA = await createOrganization("org-a", headers);
+			const orgB = await createOrganization("org-b", headers);
+
+			const provider = await registerSSOProvider(headers, orgA?.id);
+
+			const notOrgHeaders = await getAuthHeaders(
+				{
+					name: "other",
+					email: "other@test.com",
+					password: "password",
+				},
+				orgB?.id,
+			);
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers: notOrgHeaders,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({
+				message: "You don't have access to this provider",
+			});
+		});
+
+		it("should verify a provider domain ownership", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			expect(provider.domain).toBe("http://hello.com:8081");
+			expect(provider.domainVerified).toBe(false);
+			expect(provider.domainVerificationToken).toBeTypeOf("string");
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				["google-site-verification=the-token"],
+				[
+					"v=spf1 ip4:50.242.118.232/29 include:_spf.google.com include:mail.zendesk.com ~all",
+				],
+				[
+					"_clearance-token-saml-provider-1=",
+					provider.domainVerificationToken,
+				],
+			]);
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(204);
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_clearance-token-saml-provider-1.hello.com",
+			);
+		});
+
+		it("should verify a provider domain ownership (custom token verification prefix)", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth({
+				domainVerification: { tokenPrefix: "auth-prefix" },
+			});
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				["google-site-verification=the-token"],
+				[
+					"v=spf1 ip4:50.242.118.232/29 include:_spf.google.com include:mail.zendesk.com ~all",
+				],
+				[`_auth-prefix-saml-provider-1=${provider.domainVerificationToken}`],
+			]);
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(204);
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_auth-prefix-saml-provider-1.hello.com",
+			);
+		});
+
+		/**
+		 * @see https://github.com/clearance-auth/clearance
+		 */
+		it("should verify a provider domain ownership with a bare domain", async () => {
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+
+			await auth.api.registerSSOProvider({
+				body: {
+					providerId: "bare-domain-provider",
+					issuer: "http://hello.com:8081",
+					domain: "hello.com",
+					samlConfig: {
+						entryPoint: "http://idp.com:",
+						cert: "the-cert",
+						callbackUrl: "http://hello.com:8081/api/sso/saml2/callback",
+						spMetadata: {},
+					},
+				},
+				headers,
+			});
+
+			const requestResponse = await auth.api.requestDomainVerification({
+				body: { providerId: "bare-domain-provider" },
+				headers,
+				asResponse: true,
+			});
+
+			expect(requestResponse.status).toBe(201);
+			const { domainVerificationToken } = await requestResponse.json();
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				[`_clearance-token-bare-domain-provider=${domainVerificationToken}`],
+			]);
+
+			const verifyResponse = await auth.api.verifyDomain({
+				body: { providerId: "bare-domain-provider" },
+				headers,
+				asResponse: true,
+			});
+
+			expect(verifyResponse.status).toBe(204);
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_clearance-token-bare-domain-provider.hello.com",
+			);
+		});
+
+		it("should return bad request when provider ID exceeds DNS label limit", async () => {
+			const longProviderId = "a".repeat(50);
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+
+			await auth.api.registerSSOProvider({
+				body: {
+					providerId: longProviderId,
+					issuer: "http://hello.com:8081",
+					domain: "http://hello.com:8081",
+					samlConfig: {
+						entryPoint: "http://idp.com:",
+						cert: "the-cert",
+						callbackUrl: "http://hello.com:8081/api/sso/saml2/callback",
+						spMetadata: {},
+					},
+				},
+				headers,
+			});
+
+			const response = await auth.api.verifyDomain({
+				body: {
+					providerId: longProviderId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(400);
+			expect(await response.json()).toEqual({
+				message:
+					"Verification identifier exceeds the DNS label limit of 63 characters",
+				code: "IDENTIFIER_TOO_LONG",
+			});
+		});
+
+		it("should fail to verify an already verified domain", async () => {
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			dnsMock.resolveTxt.mockResolvedValue([
+				[
+					`_clearance-token-saml-provider-1=${provider.domainVerificationToken}`,
+				],
+			]);
+
+			const firstResponse = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(firstResponse.status).toBe(204);
+
+			const secondResponse = await auth.api.verifyDomain({
+				body: {
+					providerId: provider.providerId,
+				},
+				headers,
+				asResponse: true,
+			});
+
+			expect(secondResponse.status).toBe(409);
+			expect(await secondResponse.json()).toEqual({
+				message: "Domain has already been verified",
+				code: "DOMAIN_VERIFIED",
+			});
+		});
+
+		it("does not verify a URL-like multi-domain provider unless every later-accepted domain is owned", async () => {
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+
+			await auth.api.registerSSOProvider({
+				body: {
+					providerId: "multi-domain-provider",
+					issuer: "https://idp.example.com",
+					// The URL-like first entry exercises the shared normalization used
+					// by both verification and later domain matching.
+					domain: "https://attacker.com/path,victim.com",
+					samlConfig: {
+						entryPoint: "http://idp.com:",
+						cert: "the-cert",
+						callbackUrl: "http://hello.com:8081/api/sso/saml2/callback",
+						spMetadata: {},
+					},
+				},
+				headers,
+			});
+
+			const requestResponse = await auth.api.requestDomainVerification({
+				body: { providerId: "multi-domain-provider" },
+				headers,
+				asResponse: true,
+			});
+			const { domainVerificationToken } = await requestResponse.json();
+
+			// Only attacker.com publishes the verifying record; victim.com does not.
+			dnsMock.resolveTxt.mockImplementation(async (name: string) => {
+				if (name === "_clearance-token-multi-domain-provider.attacker.com") {
+					return [
+						[
+							`_clearance-token-multi-domain-provider=${domainVerificationToken}`,
+						],
+					];
+				}
+				return [];
+			});
+
+			const verifyResponse = await auth.api.verifyDomain({
+				body: { providerId: "multi-domain-provider" },
+				headers,
+				asResponse: true,
+			});
+
+			// victim.com ownership was never proven, so the provider must not verify.
+			expect(verifyResponse.status).toBe(502);
+			expect(await verifyResponse.json()).toEqual({
+				message:
+					"Unable to verify domain ownership for victim.com. Try again later",
+				code: "DOMAIN_VERIFICATION_FAILED",
+			});
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_clearance-token-multi-domain-provider.victim.com",
+			);
+		});
+
+		it("verifies a multi-domain provider when every listed domain is owned", async () => {
+			const { auth, getAuthHeaders } = createTestAuth();
+			const headers = await getAuthHeaders(testUser);
+
+			await auth.api.registerSSOProvider({
+				body: {
+					providerId: "owned-multi-domain",
+					issuer: "https://idp.company.example",
+					domain: "company.com,subsidiary.com",
+					samlConfig: {
+						entryPoint: "http://idp.com:",
+						cert: "the-cert",
+						callbackUrl: "http://hello.com:8081/api/sso/saml2/callback",
+						spMetadata: {},
+					},
+				},
+				headers,
+			});
+
+			const requestResponse = await auth.api.requestDomainVerification({
+				body: { providerId: "owned-multi-domain" },
+				headers,
+				asResponse: true,
+			});
+			const { domainVerificationToken } = await requestResponse.json();
+
+			// Both listed domains publish the verifying record.
+			dnsMock.resolveTxt.mockResolvedValue([[domainVerificationToken]]);
+
+			const verifyResponse = await auth.api.verifyDomain({
+				body: { providerId: "owned-multi-domain" },
+				headers,
+				asResponse: true,
+			});
+
+			expect(verifyResponse.status).toBe(204);
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_clearance-token-owned-multi-domain.company.com",
+			);
+			expect(dnsMock.resolveTxt).toHaveBeenCalledWith(
+				"_clearance-token-owned-multi-domain.subsidiary.com",
+			);
+		});
+	});
+
+	/**
+	 * @see https://github.com/clearance-auth/clearance
+	 */
+	describe("with secondaryStorage (no storeInDatabase)", () => {
+		it("should request and verify domain verification via secondary storage", async () => {
+			const store = new Map<string, string>();
+			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth(
+				undefined,
+				{
+					secondaryStorage: {
+						set(key, value, ttl) {
+							store.set(key, value);
+						},
+						get(key) {
+							return store.get(key) || null;
+						},
+						delete(key) {
+							store.delete(key);
+						},
+					},
+				},
+			);
+
+			const headers = await getAuthHeaders(testUser);
+			const provider = await registerSSOProvider(headers);
+
+			expect(provider.domainVerificationToken).toBeTypeOf("string");
+
+			// Re-request should return the existing token from secondary storage
+			const response = await auth.api.requestDomainVerification({
+				body: { providerId: provider.providerId },
+				headers,
+				asResponse: true,
+			});
+
+			expect(response.status).toBe(201);
+			expect(await response.json()).toEqual({
+				domainVerificationToken: provider.domainVerificationToken,
+			});
+
+			// Verify domain via DNS
+			dnsMock.resolveTxt.mockResolvedValue([
+				[
+					`_clearance-token-saml-provider-1=${provider.domainVerificationToken}`,
+				],
+			]);
+
+			const verifyResponse = await auth.api.verifyDomain({
+				body: { providerId: provider.providerId },
+				headers,
+				asResponse: true,
+			});
+
+			expect(verifyResponse.status).toBe(204);
+		});
+	});
+});

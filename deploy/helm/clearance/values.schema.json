@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "replicaCount", "terminationGracePeriodSeconds", "service", "secrets", "env", "console", "ingress", "networkPolicy", "podDisruptionBudget", "metrics", "backup"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "digest", "tag", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 10 },
+    "restartToken": { "type": "string" },
+    "service": {
+      "type": "object",
+      "required": ["type", "port"],
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "required": ["existingSecret"],
+      "properties": { "existingSecret": { "type": "string", "minLength": 1 } }
+    },
+    "env": {
+      "type": "object",
+      "required": ["CLEARANCE_BASE_URL", "CLEARANCE_CORS_ORIGINS", "CLEARANCE_TRUSTED_PROXY"],
+      "properties": {
+        "CLEARANCE_BASE_URL": { "type": "string", "minLength": 1, "pattern": "^https://" },
+        "CLEARANCE_CORS_ORIGINS": { "type": "string", "minLength": 1 },
+        "CLEARANCE_TRUSTED_PROXY": { "type": "string", "enum": ["0", "1"] }
+      }
+    },
+    "console": {
+      "type": "object",
+      "required": ["enabled", "image", "replicaCount", "restartToken", "service", "secrets", "resources", "podDisruptionBudget"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "required": ["repository", "digest", "tag", "pullPolicy"],
+          "properties": {
+            "repository": { "type": "string" },
+            "digest": { "type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string", "enum": ["", "Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "restartToken": { "type": "string" },
+        "service": {
+          "type": "object",
+          "required": ["type", "port", "sessionAffinity", "sessionAffinityTimeoutSeconds"],
+          "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "sessionAffinity": { "type": "string", "enum": ["ClientIP", "None"] },
+            "sessionAffinityTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+          }
+        },
+        "apiUrl": { "type": "string" },
+        "secrets": {
+          "type": "object",
+          "required": ["existingSecret"],
+          "properties": { "existingSecret": { "type": "string" } }
+        },
+        "resources": { "type": "object" },
+        "podDisruptionBudget": { "$ref": "#/definitions/pdb" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "required": ["api", "console"],
+      "properties": {
+        "api": { "$ref": "#/definitions/ingress" },
+        "console": { "$ref": "#/definitions/ingress" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "required": ["enabled", "additionalEgress"],
+      "properties": { "enabled": { "type": "boolean" }, "additionalEgress": { "type": "array" } }
+    },
+    "podDisruptionBudget": { "$ref": "#/definitions/pdb" },
+    "metrics": {
+      "type": "object",
+      "required": ["enabled", "path", "networkPolicy", "serviceMonitor"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "path": { "type": "string", "pattern": "^/" },
+        "networkPolicy": {
+          "type": "object",
+          "required": ["namespaceSelector", "podSelector"],
+          "properties": {
+            "namespaceSelector": { "type": "object" },
+            "podSelector": { "type": "object" }
+          }
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "required": ["enabled", "interval", "scrapeTimeout", "additionalLabels"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "additionalLabels": { "type": "object" }
+          }
+        }
+      }
+    },
+    "backup": {
+      "type": "object",
+      "required": ["enabled", "image", "schedule", "concurrencyPolicy", "retentionDays", "restoreVerify", "existingSecret", "databaseUrlKey", "copyCommandKey", "existingClaim", "storageSize"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "required": ["repository", "digest", "tag", "pullPolicy"],
+          "properties": {
+            "repository": { "type": "string" },
+            "digest": { "type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$" },
+            "tag": { "type": "string", "minLength": 1 },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "schedule": { "type": "string", "minLength": 1 },
+        "concurrencyPolicy": { "type": "string", "enum": ["Forbid", "Allow", "Replace"] },
+        "retentionDays": { "type": "integer", "minimum": 1 },
+        "restoreVerify": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "databaseUrlKey": { "type": "string", "minLength": 1 },
+        "copyCommandKey": { "type": "string", "minLength": 1 },
+        "existingClaim": { "type": "string" },
+        "storageClassName": { "type": "string" },
+        "storageSize": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "definitions": {
+    "pdb": {
+      "type": "object",
+      "required": ["enabled", "minAvailable"],
+      "properties": { "enabled": { "type": "boolean" }, "minAvailable": { "type": "integer", "minimum": 0 } }
+    },
+    "ingress": {
+      "type": "object",
+      "required": ["enabled", "className", "annotations", "host", "path", "pathType", "tls"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "host": { "type": "string" },
+        "path": { "type": "string", "pattern": "^/" },
+        "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
+        "tls": {
+          "type": "object",
+          "required": ["enabled", "secretName"],
+          "properties": { "enabled": { "type": "boolean" }, "secretName": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "console": { "properties": { "enabled": { "const": true } } } } },
+      "then": { "properties": { "console": { "properties": { "secrets": { "properties": { "existingSecret": { "minLength": 1 } } } } } } }
+    },
+    {
+      "if": { "properties": { "backup": { "properties": { "enabled": { "const": true } } } } },
+      "then": {
+        "properties": {
+          "backup": {
+            "properties": {
+              "image": { "properties": { "repository": { "minLength": 1 }, "digest": { "pattern": "^sha256:[0-9a-f]{64}$" } } },
+              "existingSecret": { "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+{{- if .Values.backup.enabled }}
+{{- $secret := required "backup.existingSecret is required when backup.enabled" .Values.backup.existingSecret }}
+{{- if not .Values.backup.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-backups
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: backup
+spec:
+  accessModes: [ReadWriteOnce]
+{{- with .Values.backup.storageClassName }}
+  storageClassName: {{ . }}
+{{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.storageSize }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-backup
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: {{ .Values.backup.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: clearance
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: backup
+          annotations:
+            checksum/runtime-config: {{ printf "%s|%s|%s" $secret .Values.backup.databaseUrlKey .Values.backup.copyCommandKey | sha256sum }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: backup
+              image: "{{ required "backup.image.repository is required when backup.enabled" .Values.backup.image.repository }}@{{ required "backup.image.digest is required when backup.enabled" .Values.backup.image.digest }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              command: ["bash", "scripts/backup-scheduled.sh", "--dir", "/backups", "--retention-days", {{ .Values.backup.retentionDays | quote }}]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+{{ toYaml .Values.backup.resources | indent 16 }}
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: { name: {{ $secret }}, key: {{ .Values.backup.databaseUrlKey }} }
+                - name: CLEARANCE_BACKUP_COPY_COMMAND
+                  valueFrom:
+                    secretKeyRef: { name: {{ $secret }}, key: {{ .Values.backup.copyCommandKey }} }
+                - name: CLEARANCE_BACKUP_RESTORE_VERIFY
+                  value: {{ ternary "1" "0" .Values.backup.restoreVerify | quote }}
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.existingClaim | default (printf "%s-backups" .Release.Name) }}
+            - name: tmp
+              emptyDir: {}
+{{- end }}

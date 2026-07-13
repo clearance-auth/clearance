@@ -1,0 +1,12 @@
+{
+  "source": "legacy",
+  "users": [
+    { "id": "source_existing_user", "email": "ops@compose.test", "name": "Compose Ops" }
+  ],
+  "organizations": [
+    { "id": "source_existing_org", "name": "Compose Org", "slug": "compose-org" }
+  ],
+  "members": [
+    { "userId": "source_existing_user", "organizationId": "source_existing_org", "role": "owner" }
+  ]
+}

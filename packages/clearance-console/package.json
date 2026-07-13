@@ -1,0 +1,17 @@
+{
+  "name": "@clearance/console",
+  "version": "0.1.0",
+  "description": "Clearance operator console",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node -e \"console.log('console is static public assets')\"",
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test src/server.test.js src/ui.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "happy-dom": "^20.10.6"
+  }
+}

@@ -1,0 +1,96 @@
+import type { ClearancePlugin } from "@clearance/runtime";
+import { authMiddlewareFactory } from "./middlewares";
+import {
+	createSCIMUser,
+	deleteSCIMProviderConnection,
+	deleteSCIMUser,
+	generateSCIMToken,
+	getSCIMProviderConnection,
+	getSCIMResourceType,
+	getSCIMResourceTypes,
+	getSCIMSchema,
+	getSCIMSchemas,
+	getSCIMServiceProviderConfig,
+	getSCIMUser,
+	listSCIMProviderConnections,
+	listSCIMUsers,
+	patchSCIMUser,
+	updateSCIMUser,
+} from "./routes";
+import type { SCIMOptions } from "./types";
+import { PACKAGE_VERSION } from "./version";
+
+declare module "@clearance/core" {
+	interface ClearancePluginRegistry<AuthOptions, Options> {
+		scim: {
+			creator: typeof scim;
+		};
+	}
+}
+
+export const scim = (options?: SCIMOptions) => {
+	const opts = {
+		storeSCIMToken: "plain",
+		...options,
+	} satisfies SCIMOptions;
+	// TODO(scim-provider-ownership-default-on): flip default to `true` on next.
+	// Kept default-off on main so existing SQL deployments don't need a schema
+	// migration mid-upgrade. The dedicated next-minor PR adds the
+	// `scimProvider.userId` column and flips the default in one step.
+	const providerOwnershipEnabled = options?.providerOwnership?.enabled ?? false;
+
+	const authMiddleware = authMiddlewareFactory(opts);
+
+	return {
+		id: "scim",
+		version: PACKAGE_VERSION,
+		endpoints: {
+			generateSCIMToken: generateSCIMToken(opts),
+			listSCIMProviderConnections: listSCIMProviderConnections(opts),
+			getSCIMProviderConnection: getSCIMProviderConnection(opts),
+			deleteSCIMProviderConnection: deleteSCIMProviderConnection(opts),
+			getSCIMUser: getSCIMUser(authMiddleware),
+			createSCIMUser: createSCIMUser(authMiddleware, opts),
+			patchSCIMUser: patchSCIMUser(authMiddleware),
+			deleteSCIMUser: deleteSCIMUser(authMiddleware),
+			updateSCIMUser: updateSCIMUser(authMiddleware),
+			listSCIMUsers: listSCIMUsers(authMiddleware),
+			getSCIMServiceProviderConfig,
+			getSCIMSchemas,
+			getSCIMSchema,
+			getSCIMResourceTypes,
+			getSCIMResourceType,
+		},
+		schema: {
+			scimProvider: {
+				fields: {
+					providerId: {
+						type: "string",
+						required: true,
+						unique: true,
+					},
+					scimToken: {
+						type: "string",
+						required: true,
+						unique: true,
+					},
+					organizationId: {
+						type: "string",
+						required: false,
+					},
+					...(providerOwnershipEnabled
+						? {
+								userId: {
+									type: "string",
+									required: false,
+								},
+							}
+						: {}),
+				},
+			},
+		},
+		options,
+	} satisfies ClearancePlugin;
+};
+
+export * from "./types";

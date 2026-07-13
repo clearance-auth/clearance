@@ -1,0 +1,146 @@
+# Clearance local/stack Compose profile (developer defaults allowed only for non-secret knobs).
+#
+# Production deployments MUST use the fail-closed overlay:
+#   scripts/validate-production-env.sh
+#   docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml config|up
+#
+# DATABASE_URL construction embeds the password. Use URL-safe passwords
+# (e.g. openssl rand -hex 32) or set a fully encoded DATABASE_URL.
+# The production overlay REQUIRES DATABASE_URL as a single operator-supplied
+# variable and refuses ${VAR:-default} secret fallbacks.
+#
+# This base file is not a production profile: NODE_ENV defaults to development
+# unless CLEARANCE_NODE_ENV is set. Do not deploy this file alone.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${CLEARANCE_DB_USER:-clearance}
+      POSTGRES_PASSWORD: ${CLEARANCE_DB_PASSWORD:?set CLEARANCE_DB_PASSWORD}
+      POSTGRES_DB: ${CLEARANCE_DB_NAME:-clearance}
+    ports:
+      - "127.0.0.1:${CLEARANCE_POSTGRES_PORT:-15434}:5432"
+    volumes:
+      - clearance_pg:/var/lib/postgresql/data
+    healthcheck:
+      # $$ defers expansion to the container shell (avoids host-side compose interpolation pitfalls)
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: ${CLEARANCE_IMAGE:-clearance-local:dev}
+    command: ["node", "packages/clearance-api/dist/server.js"]
+    environment:
+      CLEARANCE_API_PORT: "3200"
+      CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_CREDENTIAL_KEY: ${CLEARANCE_CREDENTIAL_KEY:?set CLEARANCE_CREDENTIAL_KEY}
+      CLEARANCE_CREDENTIAL_KEY_ID: ${CLEARANCE_CREDENTIAL_KEY_ID:?set CLEARANCE_CREDENTIAL_KEY_ID}
+      CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
+      CLEARANCE_CONSOLE_URL: http://localhost:${CLEARANCE_CONSOLE_PORT:-13100}
+      CLEARANCE_CORS_ORIGINS: http://localhost:${CLEARANCE_CONSOLE_PORT:-13100},http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
+      # Prefer operator-supplied DATABASE_URL (full string). Fallback constructs from parts for local smoke.
+      DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
+      CLEARANCE_STRICT_SECRETS: "1"
+      # Trust x-forwarded-for for rate-limit keying: in this stack the console
+      # BFF is the only proxy in front of the API and stamps XFF from its own
+      # client socket. Only set CLEARANCE_TRUSTED_PROXY=1 in deployments where
+      # the API is reachable EXCLUSIVELY via trusted proxies — on a directly
+      # exposed API this env var lets clients spoof their rate-limit identity.
+      # Trusting XFF requires the API to be unreachable except via trusted
+      # proxies; the published ports above are therefore loopback-bound so a
+      # LAN peer cannot hit the API directly with a spoofed x-forwarded-for.
+      CLEARANCE_TRUSTED_PROXY: "1"
+      NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
+    ports:
+      - "127.0.0.1:${CLEARANCE_API_PORT:-13200}:3200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3200/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  console:
+    image: ${CLEARANCE_IMAGE:-clearance-local:dev}
+    command: ["node", "packages/clearance-console/src/server.js"]
+    environment:
+      CLEARANCE_CONSOLE_PORT: "3100"
+      CLEARANCE_API_URL: http://api:3200
+      CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
+      CLEARANCE_CONSOLE_ADMIN_USER: ${CLEARANCE_CONSOLE_ADMIN_USER:?set CLEARANCE_CONSOLE_ADMIN_USER}
+      CLEARANCE_CONSOLE_ADMIN_PASSWORD: ${CLEARANCE_CONSOLE_ADMIN_PASSWORD:?set CLEARANCE_CONSOLE_ADMIN_PASSWORD}
+      CLEARANCE_CONSOLE_SESSION_SECRET: ${CLEARANCE_CONSOLE_SESSION_SECRET:?set CLEARANCE_CONSOLE_SESSION_SECRET}
+      CLEARANCE_STRICT_SECRETS: "1"
+      NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
+    ports:
+      - "127.0.0.1:${CLEARANCE_CONSOLE_PORT:-13100}:3100"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3100/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  sample-b2b:
+    image: ${CLEARANCE_IMAGE:-clearance-local:dev}
+    command: ["node", "apps/sample-b2b/dist/server.js"]
+    environment:
+      SAMPLE_APP_PORT: "3000"
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
+      CLEARANCE_GITHUB_CLIENT_ID: ${CLEARANCE_GITHUB_CLIENT_ID-}
+      CLEARANCE_GITHUB_CLIENT_SECRET: ${CLEARANCE_GITHUB_CLIENT_SECRET-}
+      CLEARANCE_GOOGLE_CLIENT_ID: ${CLEARANCE_GOOGLE_CLIENT_ID-}
+      CLEARANCE_GOOGLE_CLIENT_SECRET: ${CLEARANCE_GOOGLE_CLIENT_SECRET-}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
+      CLEARANCE_STRICT_SECRETS: "1"
+      NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
+    ports:
+      - "127.0.0.1:${CLEARANCE_SAMPLE_PORT:-13300}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  clearance_pg:
+    name: ${CLEARANCE_PG_VOLUME:-clearance_pg}

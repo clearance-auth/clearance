@@ -1,0 +1,963 @@
+import type {
+	ClearanceOptions,
+	GenericEndpointContext,
+} from "@clearance/core";
+import {
+	createAuthEndpoint,
+	createAuthMiddleware,
+} from "@clearance/core/api";
+import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { safeJSONParse } from "@clearance/core/utils/json";
+import { base64Url } from "@clearance/utils/base64";
+import { binary } from "@clearance/utils/binary";
+import { createHMAC } from "@clearance/utils/hmac";
+
+import * as z from "zod";
+import { hasServerSessionStore } from "../../context/store-capabilities";
+import {
+	deleteSessionCookie,
+	expireCookie,
+	getChunkedCookie,
+	setCookieCache,
+	setSessionCookie,
+} from "../../cookies";
+import { getSessionQuerySchema } from "../../cookies/session-store";
+import { symmetricDecodeJWT, verifyJWT } from "../../crypto";
+import { parseSessionOutput, parseUserOutput } from "../../db";
+import type { Prettify, Session, User } from "../../types";
+import { getDate } from "../../utils/date";
+import { isAPIError } from "../../utils/is-api-error";
+import { getShouldSkipSessionRefresh } from "../state/should-session-refresh";
+
+export const getSession = <Option extends ClearanceOptions>() =>
+	createAuthEndpoint(
+		"/get-session",
+		{
+			method: ["GET", "POST"],
+			operationId: "getSession",
+			query: getSessionQuerySchema,
+			requireHeaders: true,
+			metadata: {
+				openapi: {
+					operationId: "getSession",
+					description: "Get the current session",
+					responses: {
+						"200": {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: {
+										// @clearance/call's OpenAPI schema type doesn't yet model OAS 3.1 union `type`.
+										type: ["object", "null"] as unknown as "object",
+										properties: {
+											session: {
+												$ref: "#/components/schemas/Session",
+											},
+											user: {
+												$ref: "#/components/schemas/User",
+											},
+										},
+										required: ["session", "user"],
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		async (
+			ctx,
+		): Promise<{
+			session: Session<Option["session"], Option["plugins"]>;
+			user: User<Option["user"], Option["plugins"]>;
+		} | null> => {
+			ctx.setHeader("cache-control", "no-store");
+			ctx.setHeader("pragma", "no-cache");
+
+			const deferSessionRefresh =
+				ctx.context.options.session?.deferSessionRefresh;
+			const isPostRequest = ctx.method === "POST";
+
+			if (isPostRequest && !deferSessionRefresh) {
+				throw APIError.from(
+					"METHOD_NOT_ALLOWED",
+					BASE_ERROR_CODES.METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED,
+				);
+			}
+
+			try {
+				const sessionCookieToken = await ctx.getSignedCookie(
+					ctx.context.authCookies.sessionToken.name,
+					ctx.context.secret,
+				);
+
+				if (!sessionCookieToken) {
+					return null;
+				}
+
+				const sessionDataCookie = getChunkedCookie(
+					ctx,
+					ctx.context.authCookies.sessionData.name,
+				);
+
+				let sessionDataPayload: {
+					session: {
+						session: Session;
+						user: User;
+						updatedAt: number;
+						version?: string;
+					};
+					expiresAt: number;
+				} | null = null;
+
+				if (sessionDataCookie) {
+					const strategy =
+						ctx.context.options.session?.cookieCache?.strategy || "compact";
+
+					if (strategy === "jwe") {
+						// Decode JWE (encrypted)
+						const payload = await symmetricDecodeJWT<{
+							session: Session;
+							user: User;
+							updatedAt: number;
+							version?: string;
+							exp?: number;
+						}>(
+							sessionDataCookie,
+							ctx.context.secretConfig,
+							"clearance-session",
+						);
+
+						if (payload && payload.session && payload.user) {
+							sessionDataPayload = {
+								session: {
+									session: payload.session,
+									user: payload.user,
+									updatedAt: payload.updatedAt,
+									version: payload.version,
+								},
+								expiresAt: payload.exp ? payload.exp * 1000 : Date.now(),
+							};
+						} else {
+							// Decryption failed, expire the invalid cookie and fall through
+							// to session_token DB validation. This handles scenarios like
+							// cross-subdomain cookie migrations where stale cookies may be present.
+							expireCookie(ctx, ctx.context.authCookies.sessionData);
+						}
+					} else if (strategy === "jwt") {
+						// Decode JWT (signed with HMAC, not encrypted)
+						const payload = await verifyJWT<{
+							session: Session;
+							user: User;
+							updatedAt: number;
+							version?: string;
+							exp?: number;
+						}>(sessionDataCookie, ctx.context.secret);
+
+						if (payload && payload.session && payload.user) {
+							sessionDataPayload = {
+								session: {
+									session: payload.session,
+									user: payload.user,
+									updatedAt: payload.updatedAt,
+									version: payload.version,
+								},
+								expiresAt: payload.exp ? payload.exp * 1000 : Date.now(),
+							};
+						} else {
+							// Verification failed, expire the invalid cookie and fall through
+							// to session_token DB validation. This handles scenarios like
+							// cross-subdomain cookie migrations where stale cookies may be present.
+							expireCookie(ctx, ctx.context.authCookies.sessionData);
+						}
+					} else {
+						// Decode compact format (or legacy base64-hmac)
+						const parsed = safeJSONParse<{
+							session: {
+								session: Session;
+								user: User;
+								updatedAt: number;
+								version?: string;
+							};
+							signature: string;
+							expiresAt: number;
+						}>(binary.decode(base64Url.decode(sessionDataCookie)));
+
+						if (parsed) {
+							const isValid = await createHMAC(
+								"SHA-256",
+								"base64urlnopad",
+							).verify(
+								ctx.context.secret,
+								JSON.stringify({
+									...parsed.session,
+									expiresAt: parsed.expiresAt,
+								}),
+								parsed.signature,
+							);
+							if (isValid) {
+								sessionDataPayload = parsed;
+							} else {
+								// HMAC verification failed, expire the invalid cookie and fall through
+								// to session_token DB validation. This handles scenarios like
+								// cross-subdomain cookie migrations where stale cookies may be present.
+								expireCookie(ctx, ctx.context.authCookies.sessionData);
+							}
+						}
+					}
+				}
+
+				const dontRememberMe = await ctx.getSignedCookie(
+					ctx.context.authCookies.dontRememberToken.name,
+					ctx.context.secret,
+				);
+
+				/**
+				 * If session data is present in the cookie, check if it should be used or refreshed
+				 */
+				if (
+					sessionDataPayload?.session &&
+					ctx.context.options.session?.cookieCache?.enabled &&
+					!ctx.query?.disableCookieCache
+				) {
+					const session = sessionDataPayload.session;
+
+					const versionConfig =
+						ctx.context.options.session?.cookieCache?.version;
+					let expectedVersion = "1";
+					if (versionConfig) {
+						if (typeof versionConfig === "string") {
+							expectedVersion = versionConfig;
+						} else if (typeof versionConfig === "function") {
+							const result = versionConfig(session.session, session.user);
+							expectedVersion =
+								result instanceof Promise ? await result : result;
+						}
+					}
+
+					const cookieVersion = session.version || "1";
+					if (cookieVersion !== expectedVersion) {
+						// Version mismatch - invalidate the cookie cache
+						expireCookie(ctx, ctx.context.authCookies.sessionData);
+					} else {
+						const cachedSessionExpiresAt = new Date(
+							session.session.expiresAt as unknown as string | number | Date,
+						);
+						const hasExpired =
+							sessionDataPayload.expiresAt < Date.now() ||
+							cachedSessionExpiresAt < new Date();
+
+						if (hasExpired) {
+							// When the session data cookie has expired, delete it;
+							//  then we try to fetch from DB
+							expireCookie(ctx, ctx.context.authCookies.sessionData);
+						} else {
+							// Check if the cookie cache needs to be refreshed based on refreshCache
+							const cookieRefreshCache =
+								ctx.context.sessionConfig.cookieRefreshCache;
+
+							if (cookieRefreshCache === false) {
+								// If refreshCache is disabled, return the session from cookie as-is
+								ctx.context.session = session;
+								// Parse session and user to ensure additionalFields are included
+								// Rehydrate date fields from JSON strings before parsing
+								const parsedSession = parseSessionOutput(ctx.context.options, {
+									...session.session,
+									expiresAt: new Date(session.session.expiresAt),
+									createdAt: new Date(session.session.createdAt),
+									updatedAt: new Date(session.session.updatedAt),
+								});
+								const parsedUser = parseUserOutput(ctx.context.options, {
+									...session.user,
+									createdAt: new Date(session.user.createdAt),
+									updatedAt: new Date(session.user.updatedAt),
+								});
+								return ctx.json({
+									session: parsedSession,
+									user: parsedUser,
+								} as {
+									session: Session<Option["session"], Option["plugins"]>;
+									user: User<Option["user"], Option["plugins"]>;
+								});
+							}
+
+							const timeUntilExpiry = sessionDataPayload.expiresAt - Date.now();
+							const updateAge = cookieRefreshCache.updateAge * 1000; // Convert to milliseconds
+							const shouldSkipSessionRefresh =
+								await getShouldSkipSessionRefresh();
+
+							if (timeUntilExpiry < updateAge && !shouldSkipSessionRefresh) {
+								const refreshedSession = {
+									session: {
+										...session.session,
+									},
+									user: session.user,
+									updatedAt: Date.now(),
+								};
+
+								// Set the refreshed cookie cache
+								await setCookieCache(ctx, refreshedSession, false);
+
+								// Also refresh the session_token cookie expiry
+								const sessionTokenOptions =
+									ctx.context.authCookies.sessionToken.attributes;
+								const sessionTokenMaxAge = dontRememberMe
+									? undefined
+									: ctx.context.sessionConfig.expiresIn;
+								await ctx.setSignedCookie(
+									ctx.context.authCookies.sessionToken.name,
+									session.session.token,
+									ctx.context.secret,
+									{
+										...sessionTokenOptions,
+										maxAge: sessionTokenMaxAge,
+									},
+								);
+
+								// Parse session and user to ensure additionalFields are included
+								// Rehydrate date fields from JSON strings before parsing
+								const parsedRefreshedSession = parseSessionOutput(
+									ctx.context.options,
+									{
+										...refreshedSession.session,
+										expiresAt: new Date(refreshedSession.session.expiresAt),
+										createdAt: new Date(refreshedSession.session.createdAt),
+										updatedAt: new Date(refreshedSession.session.updatedAt),
+									},
+								);
+								const parsedRefreshedUser = parseUserOutput(
+									ctx.context.options,
+									{
+										...refreshedSession.user,
+										createdAt: new Date(refreshedSession.user.createdAt),
+										updatedAt: new Date(refreshedSession.user.updatedAt),
+									},
+								);
+								ctx.context.session = {
+									session: parsedRefreshedSession,
+									user: parsedRefreshedUser,
+								};
+								return ctx.json({
+									session: parsedRefreshedSession,
+									user: parsedRefreshedUser,
+								} as {
+									session: Session<Option["session"], Option["plugins"]>;
+									user: User<Option["user"], Option["plugins"]>;
+								});
+							}
+
+							// Parse session and user to ensure additionalFields are included
+							const parsedSession = parseSessionOutput(ctx.context.options, {
+								...session.session,
+								expiresAt: new Date(session.session.expiresAt),
+								createdAt: new Date(session.session.createdAt),
+								updatedAt: new Date(session.session.updatedAt),
+							});
+							const parsedUser = parseUserOutput(ctx.context.options, {
+								...session.user,
+								createdAt: new Date(session.user.createdAt),
+								updatedAt: new Date(session.user.updatedAt),
+							});
+							ctx.context.session = {
+								session: parsedSession,
+								user: parsedUser,
+							};
+							return ctx.json({
+								session: parsedSession,
+								user: parsedUser,
+							} as {
+								session: Session<Option["session"], Option["plugins"]>;
+								user: User<Option["user"], Option["plugins"]>;
+							});
+						}
+					}
+				}
+
+				const session =
+					await ctx.context.internalAdapter.findSession(sessionCookieToken);
+				ctx.context.session = session;
+				if (!session || session.session.expiresAt < new Date()) {
+					deleteSessionCookie(ctx);
+					if (session) {
+						/**
+						 * if session expired clean up the session
+						 * Only delete on POST when deferSessionRefresh is enabled
+						 */
+						if (!deferSessionRefresh || isPostRequest) {
+							await ctx.context.internalAdapter.deleteSession(
+								session.session.token,
+							);
+						}
+					}
+					return ctx.json(null);
+				}
+				/**
+				 * We don't need to update the session if the user doesn't want to be remembered
+				 * or if the session refresh is disabled
+				 */
+				if (dontRememberMe || ctx.query?.disableRefresh) {
+					// Parse session and user to ensure additionalFields are included
+					const parsedSession = parseSessionOutput(
+						ctx.context.options,
+						session.session,
+					);
+					const parsedUser = parseUserOutput(ctx.context.options, session.user);
+					return ctx.json({
+						session: parsedSession,
+						user: parsedUser,
+					} as {
+						session: Session<Option["session"], Option["plugins"]>;
+						user: User<Option["user"], Option["plugins"]>;
+					});
+				}
+				const expiresIn = ctx.context.sessionConfig.expiresIn;
+				const updateAge = ctx.context.sessionConfig.updateAge;
+				/**
+				 * Calculate last updated date to throttle write updates to database
+				 * Formula: ({expiry date} - sessionMaxAge) + sessionUpdateAge
+				 *
+				 * e.g. ({expiry date} - 30 days) + 1 hour
+				 *
+				 * inspired by: https://github.com/clearancejs/clearance/blob/main/packages/core/src/lib/actions/session.ts
+				 */
+				const sessionIsDueToBeUpdatedDate =
+					session.session.expiresAt.valueOf() -
+					expiresIn * 1000 +
+					updateAge * 1000;
+				const shouldBeUpdated = sessionIsDueToBeUpdatedDate <= Date.now();
+				const disableRefresh =
+					ctx.query?.disableRefresh ||
+					ctx.context.options.session?.disableSessionRefresh;
+				const shouldSkipSessionRefresh = await getShouldSkipSessionRefresh();
+				const needsRefresh =
+					shouldBeUpdated && !disableRefresh && !shouldSkipSessionRefresh;
+
+				/**
+				 * When deferSessionRefresh is enabled and this is a GET request,
+				 * return the session without performing writes, but include needsRefresh flag
+				 */
+				if (deferSessionRefresh && !isPostRequest) {
+					await setCookieCache(ctx, session, !!dontRememberMe);
+					const parsedSession = parseSessionOutput(
+						ctx.context.options,
+						session.session,
+					);
+					const parsedUser = parseUserOutput(ctx.context.options, session.user);
+					return ctx.json({
+						session: parsedSession,
+						user: parsedUser,
+						needsRefresh,
+					} as unknown as {
+						session: Session<Option["session"], Option["plugins"]>;
+						user: User<Option["user"], Option["plugins"]>;
+					});
+				}
+
+				if (needsRefresh) {
+					const updatedSession =
+						await ctx.context.internalAdapter.updateSession(
+							session.session.token,
+							{
+								expiresAt: getDate(ctx.context.sessionConfig.expiresIn, "sec"),
+								updatedAt: new Date(),
+							},
+						);
+					if (!updatedSession) {
+						/**
+						 * Handle case where session update fails (e.g., concurrent deletion)
+						 */
+						deleteSessionCookie(ctx);
+						throw APIError.from(
+							"UNAUTHORIZED",
+							BASE_ERROR_CODES.FAILED_TO_GET_SESSION,
+						);
+					}
+					const maxAge = ctx.context.sessionConfig.expiresIn;
+					await setSessionCookie(
+						ctx,
+						{
+							session: updatedSession,
+							user: session.user,
+						},
+						false,
+						{
+							maxAge,
+						},
+					);
+
+					// Parse session and user to ensure additionalFields are included
+					const parsedUpdatedSession = parseSessionOutput(
+						ctx.context.options,
+						updatedSession,
+					);
+					const parsedUser = parseUserOutput(ctx.context.options, session.user);
+					return ctx.json({
+						session: parsedUpdatedSession,
+						user: parsedUser,
+					} as unknown as {
+						session: Session<Option["session"], Option["plugins"]>;
+						user: User<Option["user"], Option["plugins"]>;
+					});
+				}
+				await setCookieCache(ctx, session, !!dontRememberMe);
+				// Parse session and user to ensure additionalFields are included
+				const parsedSession = parseSessionOutput(
+					ctx.context.options,
+					session.session,
+				);
+				const parsedUser = parseUserOutput(ctx.context.options, session.user);
+				return ctx.json({
+					session: parsedSession,
+					user: parsedUser,
+				} as {
+					session: Session<Option["session"], Option["plugins"]>;
+					user: User<Option["user"], Option["plugins"]>;
+				});
+			} catch (error) {
+				if (isAPIError(error)) {
+					throw error;
+				}
+				ctx.context.logger.error("INTERNAL_SERVER_ERROR", error);
+				throw APIError.from(
+					"INTERNAL_SERVER_ERROR",
+					BASE_ERROR_CODES.FAILED_TO_GET_SESSION,
+				);
+			}
+		},
+	);
+
+/**
+ * Whether the deployment keeps sessions in a durable server-side store
+ * (a database or secondary storage) rather than only in the signed cookie.
+ *
+ * Sensitive operations use this to decide whether the cookie cache is merely an
+ * optimization that must be bypassed for an authoritative read (`true`), or the
+ * only place the session lives and therefore the authority itself (`false`, for
+ * stateless / DB-less deployments). Pass the result as `disableCookieCache` so a
+ * revoked-but-cached session cannot authorize a sensitive action.
+ */
+export const isStateful = (ctx: GenericEndpointContext): boolean =>
+	hasServerSessionStore(ctx.context.options);
+
+export const getSessionFromCtx = async <
+	U extends Record<string, any> = Record<string, any>,
+	S extends Record<string, any> = Record<string, any>,
+>(
+	ctx: GenericEndpointContext,
+	config?:
+		| {
+				disableCookieCache?: boolean;
+				disableRefresh?: boolean;
+		  }
+		| undefined,
+) => {
+	if (ctx.context.session) {
+		return ctx.context.session as {
+			session: S & Session;
+			user: U & User;
+		};
+	}
+
+	const session = await getSession()({
+		...ctx,
+		method: "GET",
+		asResponse: false,
+		headers: ctx.headers!,
+		returnHeaders: true,
+		returnStatus: false,
+		query: {
+			...config,
+			...ctx.query,
+			// `disableCookieCache`/`disableRefresh` only ever make validation
+			// stricter, so OR the caller's intent with the request. A caller that
+			// forces strict validation must not be weakened by a request query
+			// param (e.g. `?disableCookieCache=`), which the plain merge would let
+			// override the forced value back to false.
+			disableCookieCache:
+				config?.disableCookieCache || ctx.query?.disableCookieCache,
+			disableRefresh: config?.disableRefresh || ctx.query?.disableRefresh,
+		},
+	}).catch(() => {
+		return null;
+	});
+	if (!session) {
+		ctx.context.session = null;
+		return null;
+	}
+	if (session.headers) {
+		session.headers.forEach((value, key) => {
+			const lowerKey = key.toLowerCase();
+			// /get-session response cache headers must not leak onto endpoints
+			// that resolve the session via getSessionFromCtx.
+			if (lowerKey === "cache-control" || lowerKey === "pragma") {
+				return;
+			}
+			if (!ctx.context.responseHeaders) {
+				ctx.context.responseHeaders = new Headers({ [key]: value });
+			} else if (lowerKey === "set-cookie") {
+				ctx.context.responseHeaders.append(key, value);
+			} else {
+				ctx.context.responseHeaders.set(key, value);
+			}
+		});
+	}
+	ctx.context.session = session.response;
+	return session.response as {
+		session: S & Session;
+		user: U & User;
+	} | null;
+};
+
+/**
+ * Reads the session from the source that can authorize sensitive work.
+ *
+ * Stateful deployments must re-read the server-side session store because an
+ * earlier hook may have populated `ctx.context.session` from cookie cache.
+ * Stateless deployments keep the signed cookie as the session record.
+ */
+export const getAuthoritativeSessionFromCtx = async <
+	U extends Record<string, any> = Record<string, any>,
+	S extends Record<string, any> = Record<string, any>,
+>(
+	ctx: GenericEndpointContext,
+) => {
+	if (!isStateful(ctx)) {
+		return getSessionFromCtx<U, S>(ctx);
+	}
+
+	ctx.context.session = null;
+	return getSessionFromCtx<U, S>(ctx, { disableCookieCache: true });
+};
+
+/**
+ * The middleware forces the endpoint to require a valid session.
+ */
+export const sessionMiddleware = createAuthMiddleware(async (ctx) => {
+	const session = await getSessionFromCtx(ctx);
+	if (!session?.session) {
+		throw APIError.from("UNAUTHORIZED", {
+			message: "Unauthorized",
+			code: "UNAUTHORIZED",
+		});
+	}
+	return {
+		session,
+	};
+});
+
+/**
+ * This middleware forces the endpoint to require a valid authoritative session.
+ * This should be used for sensitive operations like password changes, account deletion, etc.
+ */
+export const sensitiveSessionMiddleware = createAuthMiddleware(async (ctx) => {
+	const session = await getAuthoritativeSessionFromCtx(ctx);
+	if (!session?.session) {
+		throw APIError.from("UNAUTHORIZED", {
+			message: "Unauthorized",
+			code: "UNAUTHORIZED",
+		});
+	}
+	return {
+		session,
+	};
+});
+
+/**
+ * This middleware allows you to call the endpoint on the client if session is valid.
+ * However, if called on the server, no session is required.
+ */
+export const requestOnlySessionMiddleware = createAuthMiddleware(
+	async (ctx) => {
+		const session = await getSessionFromCtx(ctx);
+		if (!session?.session && (ctx.request || ctx.headers)) {
+			throw APIError.from("UNAUTHORIZED", {
+				message: "Unauthorized",
+				code: "UNAUTHORIZED",
+			});
+		}
+		return { session };
+	},
+);
+
+/**
+ * This middleware forces the endpoint to require a valid session,
+ * as well as making sure the session is fresh before proceeding.
+ *
+ * Session freshness check will be skipped if the session config's freshAge
+ * is set to 0
+ */
+export const freshSessionMiddleware = createAuthMiddleware(async (ctx) => {
+	const session = await getSessionFromCtx(ctx);
+	if (!session?.session) {
+		throw APIError.from("UNAUTHORIZED", {
+			message: "Unauthorized",
+			code: "UNAUTHORIZED",
+		});
+	}
+	if (ctx.context.sessionConfig.freshAge !== 0) {
+		const createdAt = new Date(session.session.createdAt).getTime();
+		const freshAge = ctx.context.sessionConfig.freshAge * 1000;
+		if (Date.now() - createdAt >= freshAge) {
+			throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.SESSION_NOT_FRESH);
+		}
+	}
+	return {
+		session,
+	};
+});
+/**
+ * user active sessions list
+ */
+export const listSessions = <Option extends ClearanceOptions>() =>
+	createAuthEndpoint(
+		"/list-sessions",
+		{
+			method: "GET",
+			operationId: "listUserSessions",
+			use: [freshSessionMiddleware],
+			requireHeaders: true,
+			metadata: {
+				openapi: {
+					operationId: "listUserSessions",
+					description: "List all active sessions for the user",
+					responses: {
+						"200": {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: {
+										type: "array",
+										items: {
+											$ref: "#/components/schemas/Session",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		async (ctx) => {
+			try {
+				const sessions = await ctx.context.internalAdapter.listSessions(
+					ctx.context.session.user.id,
+					{ onlyActiveSessions: true },
+				);
+				const activeSessions = sessions.filter((session) => {
+					return session.expiresAt > new Date();
+				});
+				return ctx.json(
+					activeSessions.map((session) =>
+						parseSessionOutput(ctx.context.options, session),
+					) as unknown as Prettify<
+						Session<Option["session"], Option["plugins"]>
+					>[],
+				);
+			} catch (e: any) {
+				ctx.context.logger.error(e);
+				throw ctx.error("INTERNAL_SERVER_ERROR");
+			}
+		},
+	);
+
+/**
+ * revoke a single session
+ */
+export const revokeSession = createAuthEndpoint(
+	"/revoke-session",
+	{
+		method: "POST",
+		body: z.object({
+			token: z.string().meta({
+				description: "The token to revoke",
+			}),
+		}),
+		use: [sensitiveSessionMiddleware],
+		requireHeaders: true,
+		metadata: {
+			openapi: {
+				description: "Revoke a single session",
+				requestBody: {
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								properties: {
+									token: {
+										type: "string",
+										description: "The token to revoke",
+									},
+								},
+								required: ["token"],
+							},
+						},
+					},
+				},
+				responses: {
+					"200": {
+						description: "Success",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										status: {
+											type: "boolean",
+											description:
+												"Indicates if the session was revoked successfully",
+										},
+									},
+									required: ["status"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		const token = ctx.body.token;
+		const session = await ctx.context.internalAdapter.findSession(token);
+
+		if (session?.session.userId === ctx.context.session.user.id) {
+			try {
+				await ctx.context.internalAdapter.deleteSession(token);
+			} catch (error) {
+				ctx.context.logger.error(
+					error && typeof error === "object" && "name" in error
+						? (error.name as string)
+						: "",
+					error,
+				);
+				throw APIError.from("INTERNAL_SERVER_ERROR", {
+					message: "Internal Server Error",
+					code: "INTERNAL_SERVER_ERROR",
+				});
+			}
+		}
+		return ctx.json({
+			status: true,
+		});
+	},
+);
+/**
+ * revoke all user sessions
+ */
+export const revokeSessions = createAuthEndpoint(
+	"/revoke-sessions",
+	{
+		method: "POST",
+		use: [sensitiveSessionMiddleware],
+		requireHeaders: true,
+		metadata: {
+			openapi: {
+				description: "Revoke all sessions for the user",
+				responses: {
+					"200": {
+						description: "Success",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										status: {
+											type: "boolean",
+											description:
+												"Indicates if all sessions were revoked successfully",
+										},
+									},
+									required: ["status"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		try {
+			await ctx.context.internalAdapter.deleteUserSessions(
+				ctx.context.session.user.id,
+			);
+		} catch (error) {
+			ctx.context.logger.error(
+				error && typeof error === "object" && "name" in error
+					? (error.name as string)
+					: "",
+				error,
+			);
+			throw APIError.from("INTERNAL_SERVER_ERROR", {
+				message: "Internal Server Error",
+				code: "INTERNAL_SERVER_ERROR",
+			});
+		}
+		return ctx.json({
+			status: true,
+		});
+	},
+);
+
+export const revokeOtherSessions = createAuthEndpoint(
+	"/revoke-other-sessions",
+	{
+		method: "POST",
+		requireHeaders: true,
+		use: [sensitiveSessionMiddleware],
+		metadata: {
+			openapi: {
+				description:
+					"Revoke all other sessions for the user except the current one",
+				responses: {
+					"200": {
+						description: "Success",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										status: {
+											type: "boolean",
+											description:
+												"Indicates if all other sessions were revoked successfully",
+										},
+									},
+									required: ["status"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		const session = ctx.context.session;
+		if (!session.user) {
+			throw APIError.from("UNAUTHORIZED", {
+				message: "Unauthorized",
+				code: "UNAUTHORIZED",
+			});
+		}
+		const sessions = await ctx.context.internalAdapter.listSessions(
+			session.user.id,
+		);
+		const activeSessions = sessions.filter((session) => {
+			return session.expiresAt > new Date();
+		});
+		const otherSessions = activeSessions.filter(
+			(session) => session.token !== ctx.context.session.session.token,
+		);
+		await Promise.all(
+			otherSessions.map((session) =>
+				ctx.context.internalAdapter.deleteSession(session.token),
+			),
+		);
+		return ctx.json({
+			status: true,
+		});
+	},
+);

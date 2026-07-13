@@ -1,0 +1,19 @@
+{
+  "provider": "okta",
+  "users": [
+    {
+      "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      "userName": "alice.scim@customer.example",
+      "name": { "formatted": "Alice SCIM" },
+      "emails": [{ "value": "alice.scim@customer.example", "primary": true }],
+      "active": true
+    },
+    {
+      "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      "userName": "bob.scim@customer.example",
+      "name": { "formatted": "Bob SCIM" },
+      "emails": [{ "value": "bob.scim@customer.example", "primary": true }],
+      "active": true
+    }
+  ]
+}

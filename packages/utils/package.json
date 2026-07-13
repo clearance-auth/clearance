@@ -1,0 +1,88 @@
+{
+  "name": "@clearance/utils",
+  "version": "0.1.0",
+  "description": "Cryptographic and encoding utilities for Clearance.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clearance-auth/clearance.git",
+    "directory": "packages/utils"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*.test.ts"
+  ],
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./base32": {
+      "dev-source": "./src/base32.ts",
+      "types": "./dist/base32.d.mts",
+      "default": "./dist/base32.mjs"
+    },
+    "./base64": {
+      "dev-source": "./src/base64.ts",
+      "types": "./dist/base64.d.mts",
+      "default": "./dist/base64.mjs"
+    },
+    "./binary": {
+      "dev-source": "./src/binary.ts",
+      "types": "./dist/binary.d.mts",
+      "default": "./dist/binary.mjs"
+    },
+    "./hash": {
+      "dev-source": "./src/hash.ts",
+      "types": "./dist/hash.d.mts",
+      "default": "./dist/hash.mjs"
+    },
+    "./hex": {
+      "dev-source": "./src/hex.ts",
+      "types": "./dist/hex.d.mts",
+      "default": "./dist/hex.mjs"
+    },
+    "./hmac": {
+      "dev-source": "./src/hmac.ts",
+      "types": "./dist/hmac.d.mts",
+      "default": "./dist/hmac.mjs"
+    },
+    "./otp": {
+      "dev-source": "./src/otp.ts",
+      "types": "./dist/otp.d.mts",
+      "default": "./dist/otp.mjs"
+    },
+    "./random": {
+      "dev-source": "./src/random.ts",
+      "types": "./dist/random.d.mts",
+      "default": "./dist/random.mjs"
+    },
+    "./password": {
+      "dev-source": "./src/password.ts",
+      "types": "./dist/password.d.mts",
+      "node": "./dist/password.node.mjs",
+      "default": "./dist/password.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.0.1"
+  },
+  "devDependencies": {
+    "tsdown": "catalog:"
+  }
+}

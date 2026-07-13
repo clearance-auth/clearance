@@ -1,0 +1,157 @@
+# Clearance Helm values — production defaults are fail-closed for secrets.
+# Create a Kubernetes Secret before install; the chart never embeds secret material.
+
+image:
+  # Required at install time, for example ghcr.io/owner/clearance/clearance.
+  repository: ""
+  # Required immutable digest from the signed release bundle (sha256:...).
+  digest: ""
+  # Informational release version; workloads deploy repository@digest.
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+replicaCount: 2
+revisionHistoryLimit: 5
+terminationGracePeriodSeconds: 30
+# Change after rotating an external Secret to trigger a controlled rollout.
+restartToken: ""
+service:
+  type: ClusterIP
+  port: 3200
+postgres:
+  host: postgres
+  port: 5432
+  database: clearance
+  user: clearance
+secrets:
+  # Name of a pre-created Secret. Required keys for the API:
+  # database-url, clearance-secret, operator-token, credential-key, credential-key-id.
+  existingSecret: ""
+env:
+  CLEARANCE_BASE_URL: ""
+  CLEARANCE_CORS_ORIGINS: ""
+  # Safe default for any directly reachable API. Enabling trusted proxy mode
+  # activates a fail-closed chart contract: ClusterIP API, no API Ingress,
+  # release-local console URL, and NetworkPolicy allowing only console -> API.
+  CLEARANCE_TRUSTED_PROXY: "0"
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+ingress:
+  api:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    path: /
+    pathType: Prefix
+    tls:
+      enabled: true
+      secretName: ""
+  console:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    path: /
+    pathType: Prefix
+    tls:
+      enabled: true
+      secretName: ""
+
+networkPolicy:
+  enabled: true
+  # API/console ingress is allowed on their service ports. Console -> API is
+  # explicitly release-scoped. Egress is otherwise limited to DNS, Postgres,
+  # HTTP, and HTTPS for SSO/SCIM/webhook traffic.
+  additionalEgress: []
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+metrics:
+  enabled: true
+  path: /metrics
+  # Required, non-empty source selectors when ServiceMonitor and trusted-proxy
+  # mode are both enabled. They identify the Prometheus scraper pods without
+  # opening API ingress to every pod or namespace.
+  networkPolicy:
+    namespaceSelector: {}
+    podSelector: {}
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+
+backup:
+  enabled: false
+  image:
+    # Required when backup.enabled=true.
+    repository: ""
+    digest: ""
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  retentionDays: 30
+  restoreVerify: true
+  existingSecret: ""
+  databaseUrlKey: database-url
+  copyCommandKey: backup-copy-command
+  existingClaim: ""
+  storageClassName: ""
+  storageSize: 20Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+# Operator console (management UI). Shares the monorepo image layout with a
+# distinct entrypoint. Wired to the in-chart API Service by default.
+console:
+  enabled: true
+  image:
+    # Multi-service monorepo image works with the command override in the
+    # Deployment. Empty values inherit the top-level API image settings.
+    repository: ""
+    # Empty inherits the required top-level digest.
+    digest: ""
+    tag: ""
+    pullPolicy: ""
+  replicaCount: 1
+  restartToken: ""
+  service:
+    type: ClusterIP
+    port: 3100
+    # Console sessions are process-local. ClientIP affinity reduces session
+    # churn when replicaCount > 1, though rolling replacement still logs users out.
+    sessionAffinity: ClientIP
+    sessionAffinityTimeoutSeconds: 10800
+  # Empty → http://{{ .Release.Name }}-api:{{ .Values.service.port }}
+  apiUrl: ""
+  secrets:
+    # Name of a pre-created Secret. Required when console.enabled.
+    # Required keys: operator-token, console-admin-user, console-admin-password,
+    # console-session-secret. May match secrets.existingSecret (one Secret for both).
+    existingSecret: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1

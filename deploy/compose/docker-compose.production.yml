@@ -1,0 +1,129 @@
+# Production overlay for Clearance.
+#
+# Usage (after validating secrets):
+#   scripts/validate-production-env.sh
+#   docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml config
+#   docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml up -d
+#
+# Fail-closed rules:
+# - NODE_ENV is forced to production
+# - DATABASE_URL must be a complete, operator-supplied connection string
+#   (no shell construction of password-bearing URLs — avoids @:/#? interpolation breakage)
+# - Every secret is required with no defaults
+# - Postgres is NOT published to the host by default (ports reset)
+# - Credential encryption key + key id are mandatory
+# - No VAR-with-default secret fallbacks (only fail-closed ${VAR:?...} forms)
+services:
+  postgres:
+    environment:
+      POSTGRES_USER: ${CLEARANCE_DB_USER:?set CLEARANCE_DB_USER}
+      POSTGRES_PASSWORD: ${CLEARANCE_DB_PASSWORD:?set CLEARANCE_DB_PASSWORD}
+      POSTGRES_DB: ${CLEARANCE_DB_NAME:?set CLEARANCE_DB_NAME}
+    # Production default: internal network only. Host publish requires a local override file.
+    ports: !reset []
+    volumes:
+      - clearance_pg:/var/lib/postgresql/data
+    healthcheck:
+      # $$ defers expansion to the container shell (avoids host-side compose interpolation)
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: always
+    stop_grace_period: 30s
+
+  api:
+    build: !reset null
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    environment:
+      NODE_ENV: production
+      CLEARANCE_STRICT_SECRETS: "1"
+      CLEARANCE_API_PORT: "3200"
+      CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_CREDENTIAL_KEY: ${CLEARANCE_CREDENTIAL_KEY:?set CLEARANCE_CREDENTIAL_KEY}
+      CLEARANCE_CREDENTIAL_KEY_ID: ${CLEARANCE_CREDENTIAL_KEY_ID:?set CLEARANCE_CREDENTIAL_KEY_ID}
+      CLEARANCE_BASE_URL: ${CLEARANCE_BASE_URL:?set CLEARANCE_BASE_URL}
+      CLEARANCE_CONSOLE_URL: ${CLEARANCE_CONSOLE_URL:?set CLEARANCE_CONSOLE_URL}
+      CLEARANCE_CORS_ORIGINS: ${CLEARANCE_CORS_ORIGINS:?set CLEARANCE_CORS_ORIGINS}
+      # Full connection string required — do not embed raw passwords via compose interpolation.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}
+      # Fail-closed override of the dev base file: this profile publishes the
+      # API port, so x-forwarded-for from arbitrary clients must NOT be
+      # trusted for rate-limit keying. Hardcoded (this overlay forbids
+      # ${VAR:-default} interpolation); edit this line to "1" only if your
+      # deployment makes the API reachable EXCLUSIVELY via trusted proxies
+      # (e.g. the console BFF or a fronting load balancer).
+      CLEARANCE_TRUSTED_PROXY: "0"
+    # Replace the base loopback mapping instead of merging a second binding.
+    ports: !override
+      - "127.0.0.1:${CLEARANCE_API_PORT:?set CLEARANCE_API_PORT}:3200"
+    restart: always
+    stop_grace_period: 30s
+
+  console:
+    build: !reset null
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    environment:
+      NODE_ENV: production
+      CLEARANCE_STRICT_SECRETS: "1"
+      CLEARANCE_CONSOLE_PORT: "3100"
+      CLEARANCE_API_URL: http://api:3200
+      CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
+      CLEARANCE_CONSOLE_ADMIN_USER: ${CLEARANCE_CONSOLE_ADMIN_USER:?set CLEARANCE_CONSOLE_ADMIN_USER}
+      CLEARANCE_CONSOLE_ADMIN_PASSWORD: ${CLEARANCE_CONSOLE_ADMIN_PASSWORD:?set CLEARANCE_CONSOLE_ADMIN_PASSWORD}
+      CLEARANCE_CONSOLE_SESSION_SECRET: ${CLEARANCE_CONSOLE_SESSION_SECRET:?set CLEARANCE_CONSOLE_SESSION_SECRET}
+    # Replace the base loopback mapping instead of merging a second binding.
+    ports: !override
+      - "127.0.0.1:${CLEARANCE_CONSOLE_PORT:?set CLEARANCE_CONSOLE_PORT}:3100"
+    restart: always
+    stop_grace_period: 30s
+
+  sample-b2b:
+    build: !reset null
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    environment:
+      NODE_ENV: production
+      CLEARANCE_STRICT_SECRETS: "1"
+      SAMPLE_APP_PORT: "3000"
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_BASE_URL: ${CLEARANCE_BASE_URL:?set CLEARANCE_BASE_URL}
+      # Optional social providers. The application fails startup on incomplete pairs.
+      CLEARANCE_GITHUB_CLIENT_ID: ${CLEARANCE_GITHUB_CLIENT_ID-}
+      CLEARANCE_GITHUB_CLIENT_SECRET: ${CLEARANCE_GITHUB_CLIENT_SECRET-}
+      CLEARANCE_GOOGLE_CLIENT_ID: ${CLEARANCE_GOOGLE_CLIENT_ID-}
+      CLEARANCE_GOOGLE_CLIENT_SECRET: ${CLEARANCE_GOOGLE_CLIENT_SECRET-}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}
+    # Replace the base loopback mapping instead of merging a second binding.
+    ports: !override
+      - "127.0.0.1:${CLEARANCE_SAMPLE_PORT:?set CLEARANCE_SAMPLE_PORT}:3000"
+    restart: always
+
+  # One-shot scheduled job. Invoke from cron/systemd:
+  # docker compose ... --profile backup run --rm backup
+  # The script fails closed unless CLEARANCE_BACKUP_COPY_COMMAND succeeds.
+  backup:
+    profiles: ["backup"]
+    build: !reset null
+    image: "${CLEARANCE_BACKUP_IMAGE_REPOSITORY:?set CLEARANCE_BACKUP_IMAGE_REPOSITORY}@${CLEARANCE_BACKUP_IMAGE_DIGEST:?set signed CLEARANCE_BACKUP_IMAGE_DIGEST}"
+    command: ["bash", "scripts/backup-scheduled.sh", "--dir", "/backups"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}
+      CLEARANCE_BACKUP_COPY_COMMAND: ${CLEARANCE_BACKUP_COPY_COMMAND-}
+      CLEARANCE_BACKUP_RETENTION_DAYS: ${CLEARANCE_BACKUP_RETENTION_DAYS-30}
+      CLEARANCE_BACKUP_RESTORE_VERIFY: "1"
+    volumes:
+      - clearance_backups:/backups
+    tmpfs:
+      - /tmp
+    read_only: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  clearance_pg:
+    name: ${CLEARANCE_PG_VOLUME:?set CLEARANCE_PG_VOLUME to an explicit volume name}
+  clearance_backups:
+    name: ${CLEARANCE_BACKUP_VOLUME:?set CLEARANCE_BACKUP_VOLUME to an explicit volume name}

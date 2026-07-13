@@ -1,0 +1,437 @@
+import type {
+	AuthContext,
+	ClearanceOptions,
+	SecretConfig,
+} from "@clearance/core";
+import { getClearanceVersion } from "@clearance/core/context";
+import { getAuthTables } from "@clearance/core/db";
+import type { DBAdapter } from "@clearance/core/db/adapter";
+import { createLogger, env, isProduction, isTest } from "@clearance/core/env";
+import { ClearanceError } from "@clearance/core/error";
+import type { OAuthProvider } from "@clearance/core/oauth2";
+import type { SocialProviders } from "@clearance/core/social-providers";
+import { socialProviders } from "@clearance/core/social-providers";
+import { generateId } from "@clearance/core/utils/id";
+import { findInvalidTrustedProxies } from "@clearance/core/utils/ip";
+import { createTelemetry } from "@clearance/telemetry";
+import defu from "defu";
+import type { Entries } from "type-fest";
+import { checkEndpointConflicts } from "../api";
+import { matchesOriginPattern } from "../auth/trusted-origins";
+import { createCookieGetter, getCookies } from "../cookies";
+import { hashPassword, verifyPassword } from "../crypto/password";
+import { createInternalAdapter } from "../db/internal-adapter";
+import { DEFAULT_SECRET } from "../utils/constants";
+import { isPromise } from "../utils/is-promise";
+import { checkPassword } from "../utils/password";
+import { getBaseURL, isDynamicBaseURLConfig } from "../utils/url";
+import {
+	getInternalPlugins,
+	getTrustedOrigins,
+	getTrustedProviders,
+	runPluginInit,
+} from "./helpers";
+import {
+	buildSecretConfig,
+	parseSecretsEnv,
+	validateSecretsArray,
+} from "./secret-utils";
+import { hasServerSessionStore } from "./store-capabilities";
+
+/**
+ * Estimates the entropy of a string in bits.
+ * This is a simple approximation that helps detect low-entropy secrets.
+ */
+function estimateEntropy(str: string): number {
+	const unique = new Set(str).size;
+	if (unique === 0) return 0;
+	return Math.log2(Math.pow(unique, str.length));
+}
+
+/**
+ * Validates that the secret meets minimum security requirements.
+ * Throws ClearanceError if the secret is invalid.
+ * Skips validation for DEFAULT_SECRET in test environments only.
+ * Only throws for DEFAULT_SECRET in production environment.
+ */
+function validateSecret(
+	secret: string,
+	logger: ReturnType<typeof createLogger>,
+): void {
+	const isDefaultSecret = secret === DEFAULT_SECRET;
+
+	if (isTest()) {
+		return;
+	}
+
+	if (isDefaultSecret && isProduction) {
+		throw new ClearanceError(
+			"You are using the default secret. Please set `CLEARANCE_SECRET` in your environment variables or pass `secret` in your auth config.",
+		);
+	}
+
+	if (!secret) {
+		throw new ClearanceError(
+			"CLEARANCE_SECRET is missing. Set it in your environment or pass `secret` to clearance({ secret }).",
+		);
+	}
+
+	if (secret.length < 32) {
+		logger.warn(
+			`[clearance] Warning: your CLEARANCE_SECRET should be at least 32 characters long for adequate security. Generate one with \`npx auth secret\` or \`openssl rand -base64 32\`.`,
+		);
+	}
+
+	// Optional high-entropy check: warn if entropy appears low
+	const entropy = estimateEntropy(secret);
+	if (entropy < 120) {
+		logger.warn(
+			"[clearance] Warning: your CLEARANCE_SECRET appears low-entropy. Use a randomly generated secret for production.",
+		);
+	}
+}
+
+export async function createAuthContext<Options extends ClearanceOptions>(
+	adapter: DBAdapter,
+	options: Options,
+	getDatabaseType: (database: Options["database"]) => string,
+): Promise<AuthContext<Options>> {
+	// secondaryStorage is a durable server-side session store, so treat it like
+	// a database for session cache defaults.
+	const isStateful = hasServerSessionStore(options);
+
+	// Cookie-cached sessions stand in for a durable store; only default them on
+	// when there is no durable store at all.
+	if (!isStateful) {
+		options = defu(options, {
+			session: {
+				cookieCache: {
+					enabled: true,
+					strategy: "jwe" as const,
+					refreshCache: true,
+					maxAge: options.session?.expiresIn || 60 * 60 * 24 * 7, // match session expiresIn, default 7 days
+				},
+			},
+		}) as Options;
+	}
+
+	// secondaryStorage holds sessions and verification, not account records, so
+	// without a primary database the account (and its OAuth tokens) only has a
+	// durable home in a cookie. Keep it enabled whenever there is no database.
+	if (!options.database) {
+		options = defu(options, {
+			account: {
+				storeAccountCookie: true,
+			},
+		}) as Options;
+	}
+	const plugins = options.plugins || [];
+	const internalPlugins = getInternalPlugins(options);
+	const logger = createLogger(options.logger);
+
+	const isDynamicConfig = isDynamicBaseURLConfig(options.baseURL);
+
+	if (isDynamicBaseURLConfig(options.baseURL)) {
+		const { allowedHosts } = options.baseURL;
+		if (!allowedHosts || allowedHosts.length === 0) {
+			throw new ClearanceError(
+				"baseURL.allowedHosts cannot be empty. Provide at least one allowed host pattern " +
+					'(e.g., ["myapp.com", "*.vercel.app"]).',
+			);
+		}
+	}
+
+	const baseURL = isDynamicConfig
+		? undefined
+		: getBaseURL(
+				typeof options.baseURL === "string" ? options.baseURL : undefined,
+				options.basePath,
+			);
+
+	if (!baseURL && !isDynamicConfig) {
+		logger.warn(
+			`[clearance] Base URL is not set. Set the baseURL option or CLEARANCE_URL env, or use a dynamic baseURL with allowedHosts for multi-host setups. Without it the origin is derived from the incoming request, and callbacks and redirects may not work correctly.`,
+		);
+	}
+
+	if (
+		adapter.id === "memory" &&
+		options.advanced?.database?.generateId === false
+	) {
+		logger.error(
+			`[clearance] Misconfiguration detected.
+You are using the memory DB with generateId: false.
+This will cause no id to be generated for any model.
+Most of the features of Clearance will not work correctly.`,
+		);
+	}
+
+	const secretsArray =
+		options.secrets ?? parseSecretsEnv(env.CLEARANCE_SECRETS);
+
+	const legacySecret =
+		options.secret || env.CLEARANCE_SECRET || env.AUTH_SECRET || "";
+
+	let secret: string;
+	let secretConfig: string | SecretConfig;
+
+	if (secretsArray) {
+		validateSecretsArray(secretsArray, logger);
+		secret = secretsArray[0]!.value;
+		secretConfig = buildSecretConfig(secretsArray, legacySecret);
+	} else {
+		secret = legacySecret || DEFAULT_SECRET;
+		validateSecret(secret, logger);
+		secretConfig = secret;
+	}
+
+	options = {
+		...options,
+		secret,
+		baseURL: isDynamicConfig
+			? options.baseURL
+			: baseURL
+				? new URL(baseURL).origin
+				: "",
+		basePath: options.basePath || "/api/auth",
+		plugins: plugins.concat(internalPlugins),
+	};
+
+	checkEndpointConflicts(options, logger);
+
+	const trustedProxies = options.advanced?.ipAddress?.trustedProxies;
+	if (trustedProxies && trustedProxies.length > 0) {
+		const invalid = findInvalidTrustedProxies(trustedProxies);
+		if (invalid.length > 0) {
+			logger.warn(
+				`Ignoring invalid \`advanced.ipAddress.trustedProxies\` entries: ${invalid.join(", ")}. Each entry must be an IP address or CIDR range.`,
+			);
+		}
+	}
+
+	const cookies = getCookies(options);
+	const tables = getAuthTables(options);
+	// TODO(#9294): allow registering the same provider multiple times under
+	// distinct ids (e.g. `google:ios`, `google:android`) to support
+	// per-platform clientSecret/redirectURI in the authorization code flow.
+	const providers = (
+		await Promise.all(
+			(
+				Object.entries(
+					options.socialProviders || {},
+				) as unknown as Entries<SocialProviders>
+			).map(async ([key, originalConfig]) => {
+				const config =
+					typeof originalConfig === "function"
+						? await originalConfig()
+						: originalConfig;
+				if (config == null) {
+					return null;
+				}
+				if (config.enabled === false) {
+					return null;
+				}
+				if (!config.clientId) {
+					logger.warn(
+						`Social provider ${key} is missing clientId or clientSecret`,
+					);
+				}
+				const provider = socialProviders[key](config as never);
+				(provider as OAuthProvider).disableImplicitSignUp =
+					config.disableImplicitSignUp;
+				return provider as OAuthProvider;
+			}),
+		)
+	).filter((x) => x !== null);
+
+	const generateIdFunc: AuthContext["generateId"] = ({ model, size }) => {
+		if (typeof (options.advanced as any)?.generateId === "function") {
+			return (options.advanced as any).generateId({ model, size });
+		}
+		const dbGenerateId = options?.advanced?.database?.generateId;
+		if (typeof dbGenerateId === "function") {
+			return dbGenerateId({ model, size });
+		}
+		if (dbGenerateId === "uuid") {
+			return crypto.randomUUID();
+		}
+		if (dbGenerateId === "serial" || dbGenerateId === false) {
+			return false;
+		}
+		return generateId(size);
+	};
+
+	const { publish } = await createTelemetry(options, {
+		adapter: adapter.id,
+		database:
+			typeof options.database === "function"
+				? "adapter"
+				: getDatabaseType(options.database),
+	});
+
+	const pluginIds = new Set(options.plugins!.map((p) => p.id));
+
+	const getPluginFn = (id: string) =>
+		(options.plugins!.find((p) => p.id === id) as never | undefined) ?? null;
+
+	const hasPluginFn = (id: string) => pluginIds.has(id);
+
+	const trustedOrigins = await getTrustedOrigins(options);
+	const trustedProviders = await getTrustedProviders(options);
+
+	const ctx: AuthContext = {
+		appName: options.appName || "Clearance",
+		baseURL: baseURL || "",
+		version: getClearanceVersion(),
+		socialProviders: providers,
+		options,
+		oauthConfig: {
+			storeStateStrategy:
+				options.account?.storeStateStrategy ||
+				(isStateful ? "database" : "cookie"),
+			skipStateCookieCheck: !!options.account?.skipStateCookieCheck,
+		},
+		tables,
+		trustedOrigins,
+		trustedProviders,
+		isTrustedOrigin(
+			url: string,
+			settings?: {
+				allowRelativePaths: boolean;
+			},
+		) {
+			return this.trustedOrigins.some((origin) =>
+				matchesOriginPattern(url, origin, settings),
+			);
+		},
+		sessionConfig: {
+			updateAge:
+				options.session?.updateAge !== undefined
+					? options.session.updateAge
+					: 24 * 60 * 60,
+			expiresIn: options.session?.expiresIn || 60 * 60 * 24 * 7,
+			freshAge:
+				options.session?.freshAge === undefined
+					? 60 * 60 * 24
+					: options.session.freshAge,
+			cookieRefreshCache: (() => {
+				const refreshCache = options.session?.cookieCache?.refreshCache;
+				const maxAge = options.session?.cookieCache?.maxAge || 60 * 5;
+
+				// `refreshCache` is intended for fully stateless / DB-less setups.
+				// If a server-side store is configured, prefer fetching/refreshing from that source
+				// and disable stateless refresh behavior to avoid confusing/unsafe configurations.
+				if (isStateful && refreshCache) {
+					logger.warn(
+						"[clearance] `session.cookieCache.refreshCache` is enabled while `database` or `secondaryStorage` is configured. `refreshCache` is meant for stateless (DB-less) setups. Disabling `refreshCache` — remove it from your config to silence this warning.",
+					);
+					return false;
+				}
+
+				if (refreshCache === false || refreshCache === undefined) {
+					return false;
+				}
+
+				if (refreshCache === true) {
+					return {
+						enabled: true,
+						updateAge: Math.floor(maxAge * 0.2),
+					};
+				}
+
+				return {
+					enabled: true,
+					updateAge:
+						refreshCache.updateAge !== undefined
+							? refreshCache.updateAge
+							: Math.floor(maxAge * 0.2),
+				};
+			})(),
+		},
+		secret,
+		secretConfig,
+		rateLimit: {
+			...options.rateLimit,
+			enabled: options.rateLimit?.enabled ?? isProduction,
+			window: options.rateLimit?.window || 10,
+			max: options.rateLimit?.max || 100,
+			storage:
+				options.rateLimit?.storage ||
+				(options.secondaryStorage ? "secondary-storage" : "memory"),
+		},
+		authCookies: cookies,
+		logger,
+		generateId: generateIdFunc,
+		session: null,
+		secondaryStorage: options.secondaryStorage,
+		password: {
+			hash: options.emailAndPassword?.password?.hash || hashPassword,
+			verify: options.emailAndPassword?.password?.verify || verifyPassword,
+			config: {
+				minPasswordLength: options.emailAndPassword?.minPasswordLength || 8,
+				maxPasswordLength: options.emailAndPassword?.maxPasswordLength || 128,
+			},
+			checkPassword,
+		},
+		setNewSession(session) {
+			this.newSession = session;
+		},
+		newSession: null,
+		adapter: adapter,
+		internalAdapter: createInternalAdapter(adapter, {
+			options,
+			logger,
+			hooks: options.databaseHooks
+				? [{ source: "user", hooks: options.databaseHooks }]
+				: [],
+			generateId: generateIdFunc,
+		}),
+		createAuthCookie: createCookieGetter(options),
+		async runMigrations() {
+			throw new ClearanceError(
+				"runMigrations will be set by the specific init implementation",
+			);
+		},
+		publishTelemetry: publish,
+		skipCSRFCheck: !!options.advanced?.disableCSRFCheck,
+		skipOriginCheck:
+			options.advanced?.disableOriginCheck !== undefined
+				? options.advanced.disableOriginCheck
+				: isTest()
+					? true
+					: false,
+		runInBackground:
+			options.advanced?.backgroundTasks?.handler ??
+			((p) => {
+				p.catch(() => {});
+			}),
+		async runInBackgroundOrAwait(
+			promise: Promise<unknown> | Promise<void> | void | unknown,
+		) {
+			try {
+				if (options.advanced?.backgroundTasks?.handler) {
+					if (promise instanceof Promise) {
+						options.advanced.backgroundTasks.handler(
+							promise.catch((e) => {
+								logger.error("Failed to run background task:", e);
+							}),
+						);
+					}
+				} else {
+					await promise;
+				}
+			} catch (e) {
+				logger.error("Failed to run background task:", e);
+			}
+		},
+		getPlugin: getPluginFn,
+		hasPlugin: hasPluginFn as never,
+	};
+
+	const initOrPromise = runPluginInit(ctx);
+	if (isPromise(initOrPromise)) {
+		await initOrPromise;
+	}
+
+	return ctx as unknown as AuthContext<Options>;
+}

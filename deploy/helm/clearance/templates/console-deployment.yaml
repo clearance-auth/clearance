@@ -1,0 +1,98 @@
+{{- if .Values.console.enabled }}
+{{- $apiUrl := .Values.console.apiUrl | default (printf "http://%s-api:%v" .Release.Name .Values.service.port) }}
+{{- $consoleSecret := required "console.secrets.existingSecret is required when console.enabled" .Values.console.secrets.existingSecret }}
+{{- $consoleRepository := .Values.console.image.repository | default .Values.image.repository }}
+{{- $consoleDigest := .Values.console.image.digest | default .Values.image.digest }}
+{{- $consolePullPolicy := .Values.console.image.pullPolicy | default .Values.image.pullPolicy }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-console
+  labels:
+    app: clearance-console
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: console
+spec:
+  replicas: {{ .Values.console.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      app: clearance-console
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s" $consoleSecret $apiUrl .Values.console.restartToken .Values.restartToken | sha256sum }}
+      labels:
+        app: clearance-console
+        app.kubernetes.io/name: clearance
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: console
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: console
+          image: "{{ $consoleRepository }}@{{ required "console.image.digest or image.digest is required" $consoleDigest }}"
+          imagePullPolicy: {{ $consolePullPolicy }}
+          command: ["node", "packages/clearance-console/src/server.js"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.service.port }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+{{ toYaml .Values.console.resources | indent 12 }}
+          env:
+            - name: CLEARANCE_CONSOLE_PORT
+              value: {{ .Values.console.service.port | quote }}
+            - name: CLEARANCE_API_URL
+              value: {{ $apiUrl | quote }}
+            - name: CLEARANCE_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $consoleSecret }}
+                  key: operator-token
+            - name: CLEARANCE_CONSOLE_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $consoleSecret }}
+                  key: console-admin-user
+            - name: CLEARANCE_CONSOLE_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $consoleSecret }}
+                  key: console-admin-password
+            - name: CLEARANCE_CONSOLE_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $consoleSecret }}
+                  key: console-session-secret
+            - name: CLEARANCE_STRICT_SECRETS
+              value: "1"
+            - name: NODE_ENV
+              value: production
+{{- end }}
