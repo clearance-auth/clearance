@@ -15,8 +15,8 @@
     "@clearance/management": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "tsx": "^4.23.0",
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }

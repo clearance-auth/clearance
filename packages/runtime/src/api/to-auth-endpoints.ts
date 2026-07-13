@@ -105,7 +105,7 @@ export function toAuthEndpoints<const E extends Record<string, Endpoint>>(
 			if (await hasRequestState()) {
 				return run();
 			}
-			const store = new WeakMap();
+			const store = new WeakMap<object, any>();
 			return runWithRequestState(store, run);
 		};
 		api[key].path = endpoint.path;
