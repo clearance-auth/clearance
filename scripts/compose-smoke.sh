@@ -229,6 +229,7 @@ wait_for() {
   " "$SCRATCH/doctor.json"
 
   IMPORT_FIXTURE="$ROOT/fixtures/migration-export/sample.json"
+  IMPORT_BASELINE="$(${COMPOSE[@]} exec -T postgres psql -U "$CLEARANCE_DB_USER" -d "$CLEARANCE_DB_NAME" -Atc "select (select count(*) from \"user\")||'/'||(select count(*) from organization)||'/'||(select count(*) from member)")"
   node "$CLI_NODE" --json --no-input --yes import legacy --file "$IMPORT_FIXTURE" >"$SCRATCH/import-first.json"
   node -e 'const j=require(process.argv[1]); const a=j.verification?.actual; if(!j.verification?.reconciled || a?.users!==3 || a?.organizations!==1 || a?.members!==3 || j.storeBackend!=="postgres") process.exit(1)' "$SCRATCH/import-first.json"
   IMPORT_FIRST_ID="$(json_field 'j.migration.id' <"$SCRATCH/import-first.json")"
@@ -250,7 +251,10 @@ wait_for() {
   IMPORT_SECOND_ID="$(json_field 'j.migration.id' <"$SCRATCH/import-second.json")"
 
   IMPORTED_RUNTIME="$(${COMPOSE[@]} exec -T postgres psql -U "$CLEARANCE_DB_USER" -d "$CLEARANCE_DB_NAME" -Atc "select (select count(*) from \"user\")||'/'||(select count(*) from organization)||'/'||(select count(*) from member)")"
-  [[ "$IMPORTED_RUNTIME" == "4/2/4" ]]
+  node -e '
+    const before=process.argv[1].split("/").map(Number), after=process.argv[2].split("/").map(Number);
+    if(after[0]!==before[0]+3 || after[1]!==before[1]+1 || after[2]!==before[2]+3) process.exit(1);
+  ' "$IMPORT_BASELINE" "$IMPORTED_RUNTIME"
 
   "${COMPOSE[@]}" exec -T postgres psql -U "$CLEARANCE_DB_USER" -d "$CLEARANCE_DB_NAME" -v ON_ERROR_STOP=1 \
     -c "update \"user\" set email = 'changed-after-import@example.test' where id = '$IMPORT_FIRST_USER_ID'" >/dev/null
@@ -265,7 +269,7 @@ wait_for() {
   node "$CLI_NODE" --json --no-input --yes migration rollback --id "$IMPORT_SECOND_ID" --fixture "$IMPORT_FIXTURE" >/dev/null
   node "$CLI_NODE" --json --no-input --yes migration rollback --id "$IMPORT_FIRST_ID" --fixture "$IMPORT_FIXTURE" >/dev/null
   IMPORTED_AFTER_ROLLBACK="$(${COMPOSE[@]} exec -T postgres psql -U "$CLEARANCE_DB_USER" -d "$CLEARANCE_DB_NAME" -Atc "select (select count(*) from \"user\")||'/'||(select count(*) from organization)||'/'||(select count(*) from member)")"
-  [[ "$IMPORTED_AFTER_ROLLBACK" == "1/1/1" ]]
+  [[ "$IMPORTED_AFTER_ROLLBACK" == "$IMPORT_BASELINE" ]]
   echo "CLEARANCE_IMPORT_POSTGRES_OK apply=3/1/3 rerun=0/0/0 rollback=0/0/0"
 
   PREEXISTING_FIXTURE="$ROOT/fixtures/migration-export/preexisting-compose.json"
