@@ -267,7 +267,19 @@ jobs:
           for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
             TARBALL="$(tarball_for "$PACKAGE")"
             EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
-            PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json | tr -d '"\n')"
+            PUBLISHED_INTEGRITY=""
+            for ATTEMPT in {1..36}; do
+              if PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
+                && [[ -n "$PUBLISHED_INTEGRITY" ]]; then
+                break
+              fi
+              echo "Waiting for ${PACKAGE}@${VERSION} to propagate (${ATTEMPT}/36)..."
+              sleep 5
+            done
+            [[ -n "$PUBLISHED_INTEGRITY" ]] || {
+              echo "::error::${PACKAGE}@${VERSION} did not become readable from the public registry"
+              exit 1
+            }
             [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
               echo "::error::${PACKAGE}@${VERSION} failed final registry integrity verification"
               exit 1
