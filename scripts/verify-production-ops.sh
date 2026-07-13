@@ -669,7 +669,7 @@ SQL
     || bad "temp databases remain: $TEMP_LEFT"
 
   # Upgrade flow
-  PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.4 --dir "$UPG_DIR")"
+  PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.1 --current 0.1.4 --dir "$UPG_DIR")"
   PLAN_ID="$(printf '%s\n' "$PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   [[ -n "$PLAN_ID" ]] && ok "upgrade-plan created $PLAN_ID" || bad "upgrade-plan failed"
 
@@ -731,7 +731,7 @@ SQL
 
   # A target without a shipped hook still fails closed after preserving a
   # verified rollback reference.
-  NO_HOOK_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.1 --current 0.1.4 --dir "$UPG_DIR")"
+  NO_HOOK_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.2 --current 0.1.4 --dir "$UPG_DIR")"
   NO_HOOK_PLAN_ID="$(printf '%s\n' "$NO_HOOK_PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   [[ -n "$NO_HOOK_PLAN_ID" ]] && ok "upgrade-plan created an unshipped-target plan" \
     || bad "upgrade-plan failed for unshipped target"
@@ -761,15 +761,15 @@ SQL
   [[ "$ACTIVE_STILL2" == "2" ]] && ok "active DB untouched after refused upgrade" \
     || bad "active DB changed during refused upgrade"
 
-  # Exercise the real shipped 0.1.4 -> 0.2.0 hook from deploy/upgrades.
+  # Exercise the real shipped 0.1.4 -> 0.2.1 hook from deploy/upgrades.
   bash scripts/upgrade-apply.sh --plan "$PLAN_ID" --dir "$UPG_DIR" --backup-dir "$BAK_DIR" \
     >/dev/null 2>"$SCRATCH/apply-success.err" \
-    && ok "upgrade-apply executes the shipped 0.1.4 to 0.2.0 hook" \
-    || bad "upgrade-apply failed with the shipped 0.1.4 to 0.2.0 hook"
+    && ok "upgrade-apply executes the shipped 0.1.4 to 0.2.1 hook" \
+    || bad "upgrade-apply failed with the shipped 0.1.4 to 0.2.1 hook"
 
   RELEASE_AFTER="$(application_release_version "$DATABASE_URL")"
-  LEDGER_AFTER="$(psql --no-psqlrc "$DATABASE_URL" -At -c "SELECT plan_id FROM clearance_schema_migrations WHERE version='0.2.0'")"
-  [[ "$RELEASE_AFTER" == "0.2.0" && "$LEDGER_AFTER" == "$PLAN_ID" ]] \
+  LEDGER_AFTER="$(psql --no-psqlrc "$DATABASE_URL" -At -c "SELECT plan_id FROM clearance_schema_migrations WHERE version='0.2.1'")"
+  [[ "$RELEASE_AFTER" == "0.2.1" && "$LEDGER_AFTER" == "$PLAN_ID" ]] \
     && ok "version hook advanced the real application contract and migration ledger" \
     || bad "application release contract/ledger transition failed"
 
@@ -792,7 +792,7 @@ SQL
   fi
 
   RELEASE_AFTER_DRILL="$(application_release_version "$DATABASE_URL")"
-  [[ "$RELEASE_AFTER_DRILL" == "0.2.0" ]] && ok "rollback drill leaves the active database untouched" \
+  [[ "$RELEASE_AFTER_DRILL" == "0.2.1" ]] && ok "rollback drill leaves the active database untouched" \
     || bad "rollback drill unexpectedly changed the active database"
 
   ACTIVE_OID_BEFORE="$(psql --no-psqlrc "$PG_ADMIN_URL" -At -c "SELECT oid FROM pg_database WHERE datname='${PG_DB}'")"
@@ -861,7 +861,7 @@ SQL
 
   # Upgrade again, inject a post-swap verification failure, and prove the old
   # database is reinstated with the target version and original oid.
-  FAIL_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.0 --current 0.1.4 --dir "$UPG_DIR")"
+  FAIL_PLAN_OUT="$(bash scripts/upgrade-plan.sh --target 0.2.1 --current 0.1.4 --dir "$UPG_DIR")"
   FAIL_PLAN_ID="$(printf '%s\n' "$FAIL_PLAN_OUT" | sed -n 's/^PLAN_ID=//p' | tail -1)"
   bash scripts/upgrade-apply.sh --plan "$FAIL_PLAN_ID" --dir "$UPG_DIR" --backup-dir "$BAK_DIR" >/dev/null
   OID_BEFORE_FAILED_SWAP="$(psql --no-psqlrc "$PG_ADMIN_URL" -At -c "SELECT oid FROM pg_database WHERE datname='${PG_DB}'")"
@@ -875,7 +875,7 @@ SQL
   unset CLEARANCE_ROLLBACK_TEST_FAIL_AFTER_SWAP CLEARANCE_OPS_TESTING
   OID_AFTER_FAILED_SWAP="$(psql --no-psqlrc "$PG_ADMIN_URL" -At -c "SELECT oid FROM pg_database WHERE datname='${PG_DB}'")"
   VERSION_AFTER_FAILED_SWAP="$(application_release_version "$DATABASE_URL")"
-  [[ $ec -ne 0 && "$OID_AFTER_FAILED_SWAP" == "$OID_BEFORE_FAILED_SWAP" && "$VERSION_AFTER_FAILED_SWAP" == "0.2.0" ]] \
+  [[ $ec -ne 0 && "$OID_AFTER_FAILED_SWAP" == "$OID_BEFORE_FAILED_SWAP" && "$VERSION_AFTER_FAILED_SWAP" == "0.2.1" ]] \
     && ok "failed post-swap verification reverses to the original active database" \
     || bad "failed-swap reversal did not preserve the original target database"
   FAIL_STATE="$UPG_DIR/${FAIL_PLAN_ID}.state.json"

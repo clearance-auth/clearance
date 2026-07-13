@@ -166,6 +166,6 @@ node packages/clearance-cli/dist/index.js upgrade check --json --no-input
 ## Docs
 
 - [Beta readiness](./docs/beta-readiness.md) — release evidence and deployment checklist
-- [Security review](./docs/security-review-v0.2.0.md) — focused v0.2.0 review and verified controls
+- [Security review](./docs/security-review-v0.2.1.md) — focused v0.2.1 review and verified controls
 - [COMPATIBILITY.md](./COMPATIBILITY.md) — package map
 - [LICENSE](./LICENSE) — MIT with required attribution

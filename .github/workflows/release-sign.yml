@@ -120,8 +120,8 @@ jobs:
             echo "::error::Releases must run in the canonical clearance-auth/clearance repository"
             exit 1
           }
-          if [[ "$RECOVER_PUBLISHED_NPM" == "1" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
-            echo "::error::npm recovery is available only through an explicit workflow dispatch"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RECOVER_PUBLISHED_NPM" != "1" ]]; then
+            echo "::error::Explicit dispatch is recovery-only; first publication requires a release tag"
             exit 1
           fi
           if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
@@ -132,8 +132,10 @@ jobs:
               exit 1
             }
           fi
+          COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "COSIGN_IDENTITY=$COSIGN_IDENTITY" >> "$GITHUB_ENV"
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:$VERSION" >> "$GITHUB_ENV"
           echo "BACKUP_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance-backup:$VERSION" >> "$GITHUB_ENV"
           echo "STAGING_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/clearance:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
@@ -246,11 +248,10 @@ jobs:
         if: env.RECOVER_PUBLISHED_NPM == '1'
         run: |
           set -Eeuo pipefail
-          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
-          cosign verify --certificate-identity "$IDENTITY" \
+          cosign verify --certificate-identity "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${IMAGE%:*}@${DIGEST}" >/dev/null
-          cosign verify --certificate-identity "$IDENTITY" \
+          cosign verify --certificate-identity "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}" >/dev/null
 
@@ -278,10 +279,9 @@ jobs:
           BACKUP_REF="${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}"
           cosign sign --yes "$PRIMARY_REF"
           cosign sign --yes "$BACKUP_REF"
-          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
-          cosign verify --certificate-identity "$IDENTITY" \
+          cosign verify --certificate-identity "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$PRIMARY_REF" >/dev/null
-          cosign verify --certificate-identity "$IDENTITY" \
+          cosign verify --certificate-identity "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$BACKUP_REF" >/dev/null
 
       - name: Create final release tags from verified digests

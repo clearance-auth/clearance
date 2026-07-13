@@ -1,6 +1,6 @@
 {
   "name": "@clearance/management",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Clearance management plane — services, diagnostics, migration, backup on real auth runtime",
   "type": "module",
   "license": "MIT",

@@ -902,7 +902,7 @@ app.get("/health", async (c) => {
 	return c.json({
 		ok: true,
 		service: "clearance-api",
-		version: "0.2.0",
+		version: "0.2.1",
 	});
 });
 

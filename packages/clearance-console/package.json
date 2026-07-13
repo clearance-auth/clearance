@@ -1,6 +1,6 @@
 {
   "name": "@clearance/console",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Clearance operator console",
   "type": "module",
   "license": "MIT",

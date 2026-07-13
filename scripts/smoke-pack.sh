@@ -26,7 +26,7 @@ required_dist_for() {
   case "$1" in
     "@clearance/auth") echo "dist/index.mjs dist/client.mjs dist/node.mjs types/index.d.ts types/client.d.ts types/node.d.ts" ;;
     "@clearance/management") echo "dist/index.mjs" ;;
-    "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.0/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
+    "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
     "@clearance/api") echo "dist/server.js" ;;
     *) return 1 ;;
   esac

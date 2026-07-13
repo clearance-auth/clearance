@@ -17,17 +17,20 @@ afterEach(() => {
 });
 
 describe("upgrade script lane", () => {
-	it("ships the supported 0.1.4 to 0.2.0 transition hook", () => {
+	it("ships the supported 0.1.4 to 0.2.1 transition hook", () => {
 		const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-		const hook = join(root, "deploy/upgrades/steps/0.2.0/apply.sh");
+		const hook = join(root, "deploy/upgrades/steps/0.2.1/apply.sh");
 		expect(existsSync(hook)).toBe(true);
-		expect(readFileSync(hook, "utf8")).toContain('[[ "$FROM" == "0.1.4" && "$TO" == "0.2.0" ]]');
+		const source = readFileSync(hook, "utf8");
+		expect(source).toContain('[[ "$FROM" == "0.1.4" && "$TO" == "0.2.1" ]]');
+		expect(source).toContain("WITH advanced AS (");
+		expect(source).toContain("FROM advanced;");
 	});
 
 	it("creates an offline plan in an isolated artifact directory", async () => {
 		const dir = directory();
-		const result = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
-		expect(result).toMatchObject({ schemaVersion: "v1", operation: "upgrade.plan", dryRun: false, plan: { currentVersion: "0.1.4", targetVersion: "0.2.0", status: "planned" } });
+		const result = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
+		expect(result).toMatchObject({ schemaVersion: "v1", operation: "upgrade.plan", dryRun: false, plan: { currentVersion: "0.1.4", targetVersion: "0.2.1", status: "planned" } });
 		expect(existsSync(result.plan.path)).toBe(true);
 		expect(existsSync(join(dir, `${result.plan.id}.state.json`))).toBe(true);
 	});
@@ -35,28 +38,28 @@ describe("upgrade script lane", () => {
 	it("keeps dry-run non-mutating", async () => {
 		const parent = directory();
 		const dir = join(parent, "not-created");
-		const result = await planUpgrade({ target: "0.2.0", dir, dryRun: true });
+		const result = await planUpgrade({ target: "0.2.1", dir, dryRun: true });
 		expect(result).toMatchObject({ dryRun: true, plan: { createsArtifacts: false } });
 		expect(existsSync(dir)).toBe(false);
 	});
 
 	it("supports apply dry-run without confirmation and requires confirmation for mutation", async () => {
 		const dir = directory();
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		await expect(applyUpgrade({ plan: planned.plan.id, dir, dryRun: true })).resolves.toMatchObject({ operation: "upgrade.apply", dryRun: true, plan: { status: "planned" } });
 		await expect(applyUpgrade({ plan: planned.plan.id, dir })).rejects.toMatchObject({ code: "UPGRADE_APPLY_CONFIRMATION_REQUIRED", stage: "upgrade.apply" });
 	});
 
 	it("keeps verification dry-run non-mutating", async () => {
 		const dir = directory();
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		const result = await verifyUpgrade({ plan: planned.plan.id, dir, dryRun: true });
 		expect(result).toMatchObject({ dryRun: true, plan: { status: "planned" }, wouldRun: ["backup_reference_check", "apply_marker_check"] });
 	});
 
 	it("keeps rollback dry-run non-mutating and explicit about active database safety", async () => {
 		const dir = directory();
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		const before = readFileSync(join(dir, `${planned.plan.id}.state.json`), "utf8");
 		const result = await rollbackUpgrade({ plan: planned.plan.id, dir, dryRun: true });
 		expect(result).toMatchObject({ operation: "upgrade.rollback", dryRun: true, mode: "isolated_verify_only", activeDatabaseUntouched: true });
@@ -76,10 +79,10 @@ describe("upgrade script lane", () => {
 	it("fails closed on missing, tampered, and invalid plan inputs", async () => {
 		const dir = directory();
 		await expect(verifyUpgrade({ plan: "upg_missing", dir })).rejects.toMatchObject({ code: "UPGRADE_PLAN_INVALID", stage: "upgrade.verify" });
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		chmodSync(planned.plan.path, 0o644);
 		const tampered = JSON.parse(readFileSync(planned.plan.path, "utf8"));
-		tampered.targetVersion = "0.2.1";
+		tampered.targetVersion = "0.2.2";
 		writeFileSync(planned.plan.path, `${JSON.stringify(tampered, null, 2)}\n`);
 		await expect(applyUpgrade({ plan: planned.plan.id, dir, yes: true })).rejects.toMatchObject({ code: "UPGRADE_PLAN_TAMPERED", stage: "upgrade.apply" });
 		await expect(planUpgrade({ target: "bad/version", dir })).rejects.toMatchObject({ code: "UPGRADE_VERSION_INVALID" });
@@ -89,7 +92,7 @@ describe("upgrade script lane", () => {
 
 	it("rejects symlinked artifacts", async () => {
 		const dir = directory();
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		const original = `${planned.plan.path}.original`;
 		writeFileSync(original, readFileSync(planned.plan.path));
 		rmSync(planned.plan.path);
@@ -103,12 +106,12 @@ describe("upgrade script lane", () => {
 		const link = join(parent, "linked");
 		mkdirSync(target);
 		symlinkSync(target, link);
-		await expect(planUpgrade({ target: "0.2.0", current: "0.1.4", dir: link })).rejects.toMatchObject({ code: "UPGRADE_DIR_UNSAFE" });
+		await expect(planUpgrade({ target: "0.2.1", current: "0.1.4", dir: link })).rejects.toMatchObject({ code: "UPGRADE_DIR_UNSAFE" });
 	});
 
 	it("maps child failures to a redacted structured error", async () => {
 		const dir = directory();
-		const planned = await planUpgrade({ target: "0.2.0", current: "0.1.4", dir });
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
 		await expect(applyUpgrade({ plan: planned.plan.id, dir, yes: true })).rejects.toMatchObject({
 			code: "UPGRADE_SCRIPT_FAILED",
 			stage: "upgrade.apply",

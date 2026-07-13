@@ -41,3 +41,4 @@ copyFileSync(
 	resolve(outputRoot, "deploy/compose/docker-compose.production.yml"),
 );
 chmodSync(resolve(outputRoot, "deploy/upgrades/steps/0.2.0/apply.sh"), 0o755);
+chmodSync(resolve(outputRoot, "deploy/upgrades/steps/0.2.1/apply.sh"), 0o755);

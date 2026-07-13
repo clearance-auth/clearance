@@ -133,16 +133,35 @@ const releaseVerification = releaseWorkflow.indexOf("pnpm verify:real");
 if (terraformSetup < 0 || terraformPin < terraformSetup || releaseVerification < terraformPin) {
 	fail("release workflow must install pinned Terraform 1.5.7 before verify:real");
 }
+const dispatchRecoveryOnly = releaseWorkflow.indexOf('"$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RECOVER_PUBLISHED_NPM" != "1"');
+const recoveryGuard = releaseWorkflow.indexOf('if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]', dispatchRecoveryOnly);
+const guardedMainRef = releaseWorkflow.indexOf('"$GITHUB_REF" == "refs/heads/main"', recoveryGuard);
+const guardedWorkflowRef = releaseWorkflow.indexOf('"$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/main"', recoveryGuard);
+const guardedWorkflowSha = releaseWorkflow.indexOf('"$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA"', recoveryGuard);
+if (dispatchRecoveryOnly < 0 || recoveryGuard < dispatchRecoveryOnly || guardedMainRef < recoveryGuard
+	|| guardedWorkflowRef < guardedMainRef
+	|| guardedWorkflowSha < guardedWorkflowRef) {
+	fail("release workflow must reserve canonical main dispatches for explicit npm recovery");
+}
+const tagIdentity = 'release-sign.yml@refs/tags/v${VERSION}';
+const tagIdentityIndex = releaseWorkflow.indexOf(tagIdentity, guardedWorkflowSha);
+const exportedIdentity = releaseWorkflow.indexOf('echo "COSIGN_IDENTITY=$COSIGN_IDENTITY" >> "$GITHUB_ENV"', tagIdentityIndex);
+if (tagIdentityIndex < 0 || exportedIdentity < tagIdentityIndex
+	|| releaseWorkflow.includes('COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/heads/main"')) {
+	fail("release workflow must export the tag signing identity for publication and recovery verification");
+}
 const releaseNpmPins = [...releaseWorkflow.matchAll(/npm install --global npm@([0-9.]+)/g)].map((match) => match[1]);
 if (releaseNpmPins.length !== 2 || releaseNpmPins.some((pin) => pin !== "11.16.0")
 	|| !releaseWorkflow.includes("npm audit signatures --prefix \"$AUDIT_DIR\" --json --include-attestations")) {
 	fail("release workflow must use npm 11.16.0 with attestation evidence enabled");
 }
 const stagingBuild = releaseWorkflow.indexOf("--tag \"$STAGING_IMAGE\"");
-const cosignVerify = releaseWorkflow.indexOf("cosign verify --certificate-identity");
+const cosignVerifications = [...releaseWorkflow.matchAll(/cosign verify --certificate-identity "\$COSIGN_IDENTITY"/g)];
+const cosignVerify = releaseWorkflow.indexOf('cosign verify --certificate-identity "$COSIGN_IDENTITY"');
 const finalTag = releaseWorkflow.indexOf("docker buildx imagetools create --tag \"$IMAGE\"");
 const npmPublish = releaseWorkflow.indexOf('npm publish "$(tarball_for "$PACKAGE")"');
-if (stagingBuild < 0 || cosignVerify < stagingBuild || finalTag < cosignVerify || npmPublish < finalTag) {
+if (cosignVerifications.length !== 4 || stagingBuild < 0 || cosignVerify < stagingBuild
+	|| finalTag < cosignVerify || npmPublish < finalTag) {
 	fail("release workflow must build staging references, verify keyless signatures, create final tags, then publish npm");
 }
 
