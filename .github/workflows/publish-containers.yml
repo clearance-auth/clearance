@@ -17,9 +17,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set -Eeuo pipefail
-          PACKAGES="$(gh api "/orgs/${OWNER}/packages?package_type=container&per_page=100")"
           for NAME in clearance/clearance clearance/clearance-backup; do
-            jq -e --arg name "$NAME" 'any(.[]; .name == $name)' <<<"$PACKAGES" >/dev/null
             ENCODED="$(jq -nr --arg value "$NAME" '$value | @uri')"
             gh api --method PATCH "/orgs/${OWNER}/packages/container/${ENCODED}" -f visibility=public >/dev/null
             echo "Published ghcr.io/${OWNER}/${NAME}"
