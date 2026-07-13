@@ -217,6 +217,7 @@ jobs:
       - name: Publish public npm packages with trusted provenance
         env:
           NPM_CONFIG_PROVENANCE: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -Eeuo pipefail
           npm install --global npm@11.5.1
