@@ -13,6 +13,11 @@ variable "postgres_volume_name" {
   default = "clearance_tf_pg"
 }
 
+variable "backup_volume_name" {
+  type    = string
+  default = "clearance_tf_backups"
+}
+
 variable "clearance_image" {
   description = "Immutable Clearance release image in repository@sha256:<64 lowercase hex> form."
   type        = string

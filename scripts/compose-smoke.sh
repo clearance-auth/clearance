@@ -21,6 +21,7 @@ export CLEARANCE_DB_PASSWORD="${CLEARANCE_DB_PASSWORD:-$(rand)}"
 # destructive smoke volume scoped to this run so concurrent/local stacks can
 # never attach to or remove each other's Postgres data.
 export CLEARANCE_PG_VOLUME="${CLEARANCE_PG_VOLUME:-${PROJECT}-pg}"
+export CLEARANCE_BACKUP_VOLUME="${CLEARANCE_BACKUP_VOLUME:-${PROJECT}-backups}"
 export CLEARANCE_IMAGE="${CLEARANCE_IMAGE:-${PROJECT}:local}"
 export CLEARANCE_SECRET="${CLEARANCE_SECRET:-$(rand)}"
 export CLEARANCE_OPERATOR_TOKEN="${CLEARANCE_OPERATOR_TOKEN:-$(rand)}"
@@ -32,8 +33,6 @@ export CLEARANCE_CONSOLE_SESSION_SECRET="${CLEARANCE_CONSOLE_SESSION_SECRET:-$(r
 # The management CLI runs on the host, so its Docker fallback needs the
 # per-run Compose container identity rather than the ordinary stack default.
 export CLEARANCE_PG_CONTAINER="${CLEARANCE_PG_CONTAINER:-${PROJECT}-postgres-1}"
-export CLEARANCE_LOCAL_DIRECT=1
-
 SAMPLE_URL="http://localhost:$CLEARANCE_SAMPLE_PORT"
 API_URL="http://localhost:$CLEARANCE_API_PORT"
 CONSOLE_URL="http://localhost:$CLEARANCE_CONSOLE_PORT"
@@ -283,19 +282,19 @@ wait_for() {
   auth_curl "$API_URL/v1/organizations" | grep -q "$ORG_ID"
   echo "CLEARANCE_IMPORT_PREEXISTING_OK preserved_user=$USER_ID preserved_org=$ORG_ID"
 
-  node "$CLI_NODE" backup create --dir "$SCRATCH/backups" --json --no-input >"$SCRATCH/backup.json"
+  node "$CLI_NODE" backup create --json --no-input >"$SCRATCH/backup.json"
   BACKUP_ID="$(json_field 'j.backup.id' <"$SCRATCH/backup.json")"
   BACKUP_PATH="$(json_field 'j.backup.path' <"$SCRATCH/backup.json")"
   BACKUP_META="${BACKUP_PATH%.sql}.meta.json"
-  node -e '
+  "${COMPOSE[@]}" exec -T api node -e '
     const fs=require("fs");
-    const paths=[[process.argv[1],0o700],[process.argv[2],0o600],[process.argv[3],0o600]];
+    const paths=[["/backups",0o700],[process.argv[1],0o600],[process.argv[2],0o600]];
     for (const [path, expected] of paths) {
       if ((fs.statSync(path).mode & 0o777) !== expected) process.exit(1);
     }
-  ' "$SCRATCH/backups" "$BACKUP_PATH" "$BACKUP_META"
+  ' "$BACKUP_PATH" "$BACKUP_META"
   node "$CLI_NODE" backup verify --id "$BACKUP_ID" --json --no-input >/dev/null
-  node "$CLI_NODE" backup restore --id "$BACKUP_ID" --json --no-input >"$SCRATCH/restore.json"
+  node "$CLI_NODE" backup restore --id "$BACKUP_ID" --yes --json --no-input >"$SCRATCH/restore.json"
   node -e '
     const j=require(process.argv[1]);
     if(j.verified!==true || j.retained!==false || !j.database) process.exit(1);

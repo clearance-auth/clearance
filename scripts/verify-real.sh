@@ -13,6 +13,8 @@ git rev-parse HEAD >/dev/null 2>&1 || {
   echo "FAIL: repository has no commits; verification requires committed history" >&2
   exit 1
 }
+RELEASE_VERSION="$(node -p "require('./packages/clearance-cli/package.json').version")"
+node "$ROOT/scripts/verify-release-version.mjs" "$RELEASE_VERSION"
 
 echo "### verification step 1: clean source build ###"
 find packages apps -type d -name dist -prune -exec rm -rf {} +
@@ -36,7 +38,10 @@ bash "$ROOT/scripts/compose-smoke.sh"
 echo "### verification step 5: production operations acceptance ###"
 bash "$ROOT/scripts/verify-production-ops.sh"
 
-echo "### verification step 6: publish artifacts ###"
+echo "### verification step 6: Terraform deployment contract ###"
+bash "$ROOT/scripts/verify-terraform.sh"
+
+echo "### verification step 7: publish artifacts ###"
 bash "$ROOT/scripts/smoke-pack.sh"
 bash "$ROOT/scripts/smoke-import.sh"
 

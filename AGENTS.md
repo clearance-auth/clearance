@@ -15,3 +15,5 @@ Treat `npm publish` as pending until the public registry returns SHA-512 integri
 Republish only absent versions; if a rebuild has different bytes, recover only after every existing package's signed provenance binds it to the exact tag commit, then attach assets without republishing.
 Sequence releases as: finish every release-path change, rehearse the exact publish or recovery path locally, run the complete CI matrix once, then push once.
 Any release-path failure resets the gate: reproduce and fix it locally, rerun the exact rehearsal and full local CI, and only then trigger another remote run.
+Freeze the candidate before expensive proof: finish code and security fixes, remove prohibited references, and finalize versions, pins, and workflows; any later source or release-config change invalidates downstream rehearsal and CI evidence.
+Keep terminal actions last and in dependency order: exact local rehearsal, full local CI, one push, hosted CI, signed publication, anonymous install and pull, evidence attachment, then public visibility and documentation.

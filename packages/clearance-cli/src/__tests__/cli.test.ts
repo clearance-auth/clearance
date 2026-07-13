@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { authenticatedApiEnv, stopAuthenticatedApiServers } from "./api-test-server.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const entry = join(root, "dist", "index.js");
@@ -17,7 +18,7 @@ function run(args: string[], dataPath: string): { stdout: string; status: number
 				...process.env,
 				// Force JSON backend for CLI unit tests (no Postgres dual-path)
 				DATABASE_URL: "",
-				CLEARANCE_LOCAL_DIRECT: "1",
+				...authenticatedApiEnv(dataPath),
 				CLEARANCE_SECRET: "unit-test-secret-value-not-default!!",
 				CLEARANCE_BASE_URL: "http://localhost:3000",
 				CLEARANCE_CREDENTIAL_KEY: "unit-test-credential-key-material-32b!!",
@@ -33,6 +34,7 @@ function run(args: string[], dataPath: string): { stdout: string; status: number
 }
 
 afterEach(() => {
+	stopAuthenticatedApiServers();
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -166,9 +168,12 @@ describe("clearance CLI binary", () => {
 			environmentId: initial.environment.id,
 		});
 
-		const inspect = run(["project", "inspect", second.id], data);
-		expect(inspect.status).toBe(0);
-		expect(JSON.parse(inspect.stdout).project.id).toBe(second.id);
+		const inspectCurrent = run(["project", "inspect"], data);
+		expect(inspectCurrent.status).toBe(0);
+		expect(JSON.parse(inspectCurrent.stdout).project.id).toBe(initial.project.id);
+		const inspectOutsideCredentialScope = run(["project", "inspect", second.id], data);
+		expect(inspectOutsideCredentialScope.status).toBe(1);
+		expect(JSON.parse(inspectOutsideCredentialScope.stdout).error.code).toBe("PROJECT_NOT_FOUND");
 		const missing = run(["project", "inspect", "proj_missing"], data);
 		expect(missing.status).toBe(1);
 		expect(JSON.parse(missing.stdout).error).toMatchObject({
@@ -181,12 +186,15 @@ describe("clearance CLI binary", () => {
 		expect(JSON.parse(dryProject.stdout)).toMatchObject({ dryRun: true, project: { slug: "dry-project" } });
 		expect(JSON.parse(readFileSync(data, "utf8")).projects).toHaveLength(2);
 
-		const env = run(
+		const crossScopeEnv = run(
 			["env", "create", "--name", "Second Preview", "--kind", "preview", "--project-id", second.id],
 			data,
 		);
+		expect(crossScopeEnv.status).toBe(1);
+		expect(JSON.parse(crossScopeEnv.stdout).error.code).toBe("SCOPE_MISMATCH");
+		const env = run(["env", "create", "--name", "Primary Preview", "--kind", "preview"], data);
 		expect(env.status).toBe(0);
-		expect(JSON.parse(env.stdout).environment.projectId).toBe(second.id);
+		expect(JSON.parse(env.stdout).environment.projectId).toBe(initial.project.id);
 		const invalidKind = run(["env", "create", "--name", "Bad", "--kind", "invalid"], data);
 		expect(invalidKind.status).toBe(1);
 		expect(JSON.parse(invalidKind.stdout).error.code).toBe("ENV_KIND_INVALID");
@@ -395,7 +403,7 @@ describe("clearance CLI binary", () => {
 		const redacted = JSON.parse(run(["config", "get"], data).stdout);
 		expect(JSON.stringify(redacted)).not.toContain(submittedSecret);
 		expect(redacted.redactedKeys).toEqual(["legacyToken"]);
-		expect(JSON.parse(run(["config", "get", "legacyToken"], data).stdout)).toEqual({ config: {}, redactedKeys: ["legacyToken"] });
+		expect(JSON.parse(run(["config", "get", "legacyToken"], data).stdout)).toMatchObject({ config: {}, redactedKeys: ["legacyToken"] });
 	}, 15_000);
 
 	it("enterprise readiness via CLI", () => {
@@ -1061,7 +1069,7 @@ describe("clearance CLI binary", () => {
 			(event: { action: string }) => event.action === "orgs.members.add",
 		);
 		expect(importEvents).toHaveLength(2);
-		expect(importEvents.every((event: { source: string; actor: string }) => event.source === "import" && event.actor === "cli")).toBe(true);
+		expect(importEvents.every((event: { source: string; actor: string }) => event.source === "import" && event.actor === "api")).toBe(true);
 
 		const rerun = run(["orgs", "members", "import", "--org", org.id, "--file", jsonFile, "--yes"], data);
 		expect(rerun.status).toBe(0);

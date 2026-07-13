@@ -1,43 +1,18 @@
 import type { Command } from "commander";
-import { ClearanceError } from "@clearance/management";
+import { ClearanceError, parseConfigJson, writeExportArtifact } from "@clearance/management";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { requestManagementApi, type ApiSession } from "./api-client.js";
-import type { GlobalOpts } from "./output.js";
-
-export const HOST_LOCAL_COMMANDS = new Map<string, string>([
-	["dev", "prints and launches host development paths"],
-	["users export", "writes a bounded export to a caller-selected host path"],
-	["orgs members import", "reads a caller-selected host file"],
-	["events export", "writes a bounded export to a caller-selected host path"],
-	["events tail", "owns a long-running terminal stream"],
-	["import legacy", "reads a migration fixture from the host"],
-	["migration plan", "creates host migration artifacts"],
-	["migration run", "executes a host migration artifact"],
-	["migration verify", "verifies a host migration fixture"],
-	["migration rollback", "rolls back a host migration fixture"],
-	["migration status", "inspects host migration artifacts"],
-	["backup create", "runs database tooling and writes a host backup"],
-	["backup verify", "verifies a host backup artifact"],
-	["backup restore", "runs database tooling against the selected host"],
-	["upgrade check", "inspects host deployment and database state"],
-	["upgrade plan", "creates signed host upgrade artifacts"],
-	["upgrade apply", "runs host deployment and database upgrade tooling"],
-	["upgrade verify", "verifies host upgrade artifacts and database state"],
-	["upgrade rollback", "restores or verifies a host database backup"],
-	["schema status", "inspects the directly selected runtime database"],
-	["schema generate", "writes SQL to a caller-selected host path"],
-	["schema migrate", "runs migrations against the directly selected runtime database"],
-]);
+import { CliExitError, type GlobalOpts } from "./output.js";
 
 export const REMOTE_COMMANDS = new Set([
-	"init", "doctor", "overview",
+	"init", "doctor", "dev", "overview",
 	"project list", "project inspect", "project create",
 	"env list", "env inspect", "env create", "env promote",
-	"users list", "users inspect", "users create", "users update", "users disable", "users delete",
+	"users list", "users inspect", "users create", "users update", "users disable", "users delete", "users export",
 	"orgs list", "orgs inspect", "orgs create", "orgs update", "orgs archive",
-	"orgs members list", "orgs members add", "orgs members update", "orgs members remove",
-	"events list", "events inspect", "events replay",
+	"orgs members list", "orgs members add", "orgs members update", "orgs members remove", "orgs members import",
+	"events list", "events tail", "events inspect", "events export", "events replay",
 	"keys list", "keys create", "keys rotate", "keys revoke",
 	"sessions list", "sessions revoke",
 	"roles list", "roles validate", "roles create", "roles update",
@@ -45,13 +20,15 @@ export const REMOTE_COMMANDS = new Set([
 	"scim create", "scim test", "scim list", "scim setup-link", "scim rotate", "scim disable", "scim replay",
 	"readiness check", "readiness report",
 	"config get", "config set", "config validate", "config diff",
+	"import legacy", "migration plan", "migration run", "migration verify", "migration rollback", "migration status",
+	"backup create", "backup verify", "backup restore", "upgrade check", "upgrade plan", "upgrade apply", "upgrade verify", "upgrade rollback",
+	"schema status", "schema generate", "schema migrate",
 ]);
 
-export type CommandExecution = "authentication" | "remote-api" | "host-local" | "unavailable";
+export type CommandExecution = "authentication" | "remote-api" | "unavailable";
 
 export function classifyCommandPath(path: string): CommandExecution {
 	if (path === "login" || path === "logout" || path === "whoami") return "authentication";
-	if (HOST_LOCAL_COMMANDS.has(path)) return "host-local";
 	if (REMOTE_COMMANDS.has(path)) return "remote-api";
 	return "unavailable";
 }
@@ -72,6 +49,107 @@ function body(values: Record<string, unknown>): Record<string, unknown> {
 	return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
 }
 
+function localFile(path: unknown, code: string, label: string): string {
+	try {
+		return readFileSync(resolve(String(path)), "utf8");
+	} catch {
+		throw error(code, `${label} could not be read.`, "Provide a readable local file and retry.");
+	}
+}
+
+function configCandidate(path: unknown): Record<string, string> {
+	let contents: string;
+	try {
+		contents = readFileSync(resolve(String(path)), "utf8");
+	} catch {
+		throw new ClearanceError({
+			code: "CONFIG_FILE_UNREADABLE",
+			message: "Config file could not be read.",
+			stage: "config.parse",
+			remediation: "Provide a readable JSON config file.",
+		});
+	}
+	return parseConfigJson(contents);
+}
+
+function writeRemoteExport(
+	envelope: Record<string, unknown>,
+	options: Record<string, unknown>,
+	collection: "users" | "events",
+): Record<string, unknown> {
+	const format = options.format === "jsonl" ? "jsonl" : "json";
+	const values = Array.isArray(envelope[collection]) ? envelope[collection] : [];
+	const contents = format === "jsonl"
+		? values.length === 0
+			? ""
+			: `${values.map((value) => JSON.stringify(value)).join("\n")}\n`
+		: `${JSON.stringify(envelope, null, 2)}\n`;
+	const outputPath = writeExportArtifact(String(options.output), contents, Boolean(options.force), {
+		stage: `${collection}.export`,
+		existsCode: `${collection.toUpperCase()}_EXPORT_EXISTS`,
+		writeFailedCode: `${collection.toUpperCase()}_EXPORT_WRITE_FAILED`,
+	});
+	return { ...envelope, outputPath };
+}
+
+type RemoteAuditEvent = {
+	id: string;
+	createdAt: string;
+	action: string;
+	actor: string;
+	outcome: string;
+};
+
+function emitTailEvent(json: boolean, event: RemoteAuditEvent): void {
+	process.stdout.write(json
+		? `${JSON.stringify(event)}\n`
+		: `${event.createdAt} ${event.action} actor=${event.actor} outcome=${event.outcome} id=${event.id}\n`);
+}
+
+function integerOption(
+	value: unknown,
+	fallback: number,
+	minimum: number,
+	maximum: number,
+	name: string,
+	code = "CLI_OPTION_INVALID",
+): number {
+	const parsed = value === undefined ? fallback : Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+		throw error(code, `${name} must be an integer from ${minimum} to ${maximum}.`, `Pass a valid --${name} value.`);
+	}
+	return parsed;
+}
+
+async function resolveRemoteMembershipId(
+	session: ApiSession,
+	organizationId: unknown,
+	options: Record<string, unknown>,
+): Promise<string> {
+	if (typeof options.member === "string" && options.member.trim()) return options.member;
+	if (typeof options.user !== "string" || !options.user.trim()) {
+		throw error(
+			"MEMBER_ID_REQUIRED",
+			"Membership update or removal requires --member or --user.",
+			"List organization members, then pass a membership id or principal id.",
+		);
+	}
+	const response = await requestManagementApi<{ members?: Array<{ id: string; principalId: string; status: string }> }>(session, {
+		path: `/v1/organizations/${encodeURIComponent(String(organizationId))}/members`,
+	});
+	const membership = (response.members ?? []).find(
+		(candidate) => candidate.principalId === options.user && candidate.status !== "removed",
+	);
+	if (!membership) {
+		throw error(
+			"MEMBER_NOT_FOUND",
+			"Membership not found.",
+			"List organization members and verify the principal id.",
+		);
+	}
+	return membership.id;
+}
+
 export function commandPath(command: Command): string {
 	const names: string[] = [];
 	let current: Command | null = command;
@@ -82,16 +160,12 @@ export function commandPath(command: Command): string {
 	return names.join(" ");
 }
 
-export function isHostLocalCommand(path: string): boolean {
-	return HOST_LOCAL_COMMANDS.has(path);
-}
-
 function requireRemoteMutation(global: GlobalOpts, path: string): void {
 	if (global.dryRun) {
 		throw error(
 			"CLI_REMOTE_DRY_RUN_UNSUPPORTED",
 			`${path} does not yet expose a server-side dry-run contract.`,
-			"Use the command without --dry-run, or choose --local-direct for a local development preview.",
+			"Use the command without --dry-run after reviewing the target.",
 		);
 	}
 }
@@ -122,6 +196,7 @@ export async function dispatchRemoteCommand(
 			requireRemoteMutation(global, path);
 			return requestManagementApi(session, { method: "POST", path: "/v1/init", body: body({ name: opts.name, environment: opts.environment }) });
 		case "doctor": return requestManagementApi(session, { path: "/v1/doctor" });
+		case "dev": return requestManagementApi(session, { path: "/v1/dev" });
 		case "overview": return requestManagementApi(session, { path: "/v1/overview" });
 		case "project list": return requestManagementApi(session, { path: "/v1/projects" });
 		case "project inspect": return requestManagementApi(session, { path: id ? `/v1/projects/${id}` : "/v1/projects/current" });
@@ -145,6 +220,14 @@ export async function dispatchRemoteCommand(
 			requireConfirmation(global, "USER_DELETE_CONFIRM_REQUIRED", "User deletion");
 			requireRemoteMutation(global, path);
 			return requestManagementApi(session, { method: "DELETE", path: `/v1/users/${id}` });
+		case "users export": {
+			const envelope = await requestManagementApi<Record<string, unknown>>(session, {
+				method: "POST",
+				path: "/v1/users/export",
+				body: body({ format: opts.format, limit: opts.limit, status: opts.status }),
+			});
+			return writeRemoteExport(envelope, opts, "users");
+		}
 		case "orgs list": return requestManagementApi(session, { path: query("/v1/organizations", { limit: opts.limit, cursor: opts.cursor }) });
 		case "orgs inspect": return requestManagementApi(session, { path: `/v1/organizations/${id}` });
 		case "orgs create":
@@ -158,16 +241,72 @@ export async function dispatchRemoteCommand(
 		case "orgs members add":
 			return requestManagementApi(session, { method: "POST", path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members`, body: body({ principalId: opts.user, role: opts.role, dryRun: global.dryRun }) });
 		case "orgs members update": {
-			if (!opts.member) throw error("CLI_REMOTE_MEMBER_ID_REQUIRED", "Remote member update requires --member.", "List organization members and pass the membership id with --member.");
-			return requestManagementApi(session, { method: "PATCH", path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members/${encodeURIComponent(String(opts.member))}`, body: { role: opts.role, dryRun: global.dryRun } });
+			const membershipId = await resolveRemoteMembershipId(session, opts.org, opts);
+			return requestManagementApi(session, { method: "PATCH", path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members/${encodeURIComponent(membershipId)}`, body: { role: opts.role, dryRun: global.dryRun } });
 		}
 		case "orgs members remove": {
 			requireConfirmation(global, "MEMBER_REMOVE_CONFIRM_REQUIRED", "Membership removal");
-			if (!opts.member) throw error("CLI_REMOTE_MEMBER_ID_REQUIRED", "Remote member removal requires --member.", "List organization members and pass the membership id with --member.");
-			return requestManagementApi(session, { method: "DELETE", path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members/${encodeURIComponent(String(opts.member))}`, body: { dryRun: global.dryRun } });
+			const membershipId = await resolveRemoteMembershipId(session, opts.org, opts);
+			return requestManagementApi(session, { method: "DELETE", path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members/${encodeURIComponent(membershipId)}`, body: { dryRun: global.dryRun } });
 		}
-		case "events list": return requestManagementApi(session, { path: query("/v1/events", { limit: opts.limit, cursor: opts.cursor, action: opts.action, actor: opts.actor, outcome: opts.outcome }) });
+		case "orgs members import": {
+			requireConfirmation(global, "MEMBER_IMPORT_CONFIRMATION_REQUIRED", "Member import");
+			const filename = String(opts.file);
+			const format = opts.format ?? (filename.toLowerCase().endsWith(".json")
+				? "json"
+				: filename.toLowerCase().endsWith(".csv")
+					? "csv"
+					: undefined);
+			if (format !== "json" && format !== "csv") {
+				throw error("MEMBER_IMPORT_FORMAT_REQUIRED", "Member import format is required.", "Use a .json or .csv file, or pass --format json|csv.");
+			}
+			return requestManagementApi(session, {
+				method: "POST",
+				path: `/v1/organizations/${encodeURIComponent(String(opts.org))}/members/import`,
+				body: {
+					content: localFile(opts.file, "MEMBER_IMPORT_FILE_UNREADABLE", "Member import file"),
+					format,
+					dryRun: global.dryRun || !global.yes,
+					confirm: global.yes && !global.dryRun,
+				},
+			});
+		}
+		case "events list": return requestManagementApi(session, { path: query("/v1/events", { limit: opts.limit, cursor: opts.cursor, action: opts.action, organizationId: opts.org }) });
+		case "events tail": {
+			const limit = integerOption(opts.limit, 20, 1, 1000, "limit", "EVENTS_TAIL_OPTION_INVALID");
+			const pollInterval = integerOption(opts.pollInterval, 1000, 100, 60_000, "poll-interval", "EVENTS_TAIL_OPTION_INVALID");
+			const maxEvents = integerOption(opts.maxEvents, 0, 0, Number.MAX_SAFE_INTEGER, "max-events", "EVENTS_TAIL_OPTION_INVALID");
+			const tailPath = query("/v1/events", { limit, action: opts.action, organizationId: opts.org });
+			const seen = new Set<string>();
+			let emitted = 0;
+			const poll = async () => {
+				const response = await requestManagementApi<{ events?: RemoteAuditEvent[] }>(session, { path: tailPath });
+				const fresh = (response.events ?? []).filter((event) => !seen.has(event.id)).reverse();
+				for (const event of fresh) {
+					seen.add(event.id);
+					if (maxEvents !== 0 && emitted >= maxEvents) break;
+					emitTailEvent(Boolean(global.json), event);
+					emitted += 1;
+				}
+				return response;
+			};
+			await poll();
+			if (opts.once || (maxEvents !== 0 && emitted >= maxEvents)) throw new CliExitError(0);
+			while (maxEvents === 0 || emitted < maxEvents) {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, pollInterval));
+				await poll();
+			}
+			throw new CliExitError(0);
+		}
 		case "events inspect": return requestManagementApi(session, { path: `/v1/events/${id}` });
+		case "events export": {
+			const envelope = await requestManagementApi<Record<string, unknown>>(session, {
+				method: "POST",
+				path: "/v1/events/export",
+				body: body({ format: opts.format, limit: opts.limit, action: opts.action, organizationId: opts.org, before: opts.before }),
+			});
+			return writeRemoteExport(envelope, opts, "events");
+		}
 		case "events replay": return requestManagementApi(session, { method: "POST", path: "/v1/events/replay", body: { id: args[0], dryRun: global.dryRun || !global.yes, confirm: global.yes && !global.dryRun } });
 		case "keys list": return requestManagementApi(session, { path: query("/v1/keys", { includeRevoked: opts.includeRevoked }) });
 		case "keys create":
@@ -180,11 +319,13 @@ export async function dispatchRemoteCommand(
 			return requestManagementApi(session, { method: "POST", path: `/v1/keys/${id}/revoke`, body: { dryRun: global.dryRun } });
 		case "sessions list": return requestManagementApi(session, { path: query("/v1/sessions", { limit: opts.limit, cursor: opts.cursor, userId: opts.user, status: opts.status }) });
 		case "sessions revoke":
-			requireConfirmation(global, "SESSION_REVOKE_CONFIRM_REQUIRED", "Session revocation");
-			requireRemoteMutation(global, path);
-			return requestManagementApi(session, { method: "POST", path: `/v1/sessions/${id}/revoke` });
+			requireConfirmation(global, "SESSION_CONFIRM_REQUIRED", "Session revocation");
+			return requestManagementApi(session, { method: "POST", path: `/v1/sessions/${id}/revoke`, body: { dryRun: global.dryRun } });
 		case "roles list": return requestManagementApi(session, { path: "/v1/roles" });
-		case "roles validate": return requestManagementApi(session, { method: "POST", path: "/v1/roles/validate", body: body({ name: opts.name, slug: opts.slug, permissions: opts.permission }) });
+		case "roles validate": {
+			const validation = await requestManagementApi(session, { method: "POST", path: "/v1/roles/validate", body: body({ name: opts.name, slug: opts.slug, permissions: opts.permission }) });
+			return { validation };
+		}
 		case "roles create":
 			return requestManagementApi(session, { method: "POST", path: "/v1/roles", body: body({ name: opts.name, slug: opts.slug, description: opts.description, permissions: opts.permission, dryRun: global.dryRun }) });
 		case "roles update":
@@ -193,8 +334,7 @@ export async function dispatchRemoteCommand(
 			requireRemoteMutation(global, path);
 			return requestManagementApi(session, { method: "POST", path: "/v1/sso", body: body({ organizationId: opts.org, provider: opts.provider, protocol: opts.protocol, issuer: opts.issuer, audience: opts.audience, domain: opts.domain, samlEntryPoint: opts.entryPoint, samlCertificate: opts.certificate ? readFileSync(resolve(String(opts.certificate)), "utf8") : undefined }) });
 		case "sso configure":
-			requireRemoteMutation(global, path);
-			return requestManagementApi(session, { method: "PATCH", path: `/v1/sso/${id}`, body: body({ issuer: opts.issuer, audience: opts.audience, domain: opts.domain }) });
+			return requestManagementApi(session, { method: "PATCH", path: `/v1/sso/${id}`, body: body({ issuer: opts.issuer, audience: opts.audience, domain: opts.domain, dryRun: global.dryRun }) });
 		case "sso test":
 			if (opts.live && opts.fixture) throw error("SSO_TEST_MODE_CONFLICT", "--live and --fixture are mutually exclusive.", "Use one SSO test mode.");
 			if (opts.live) requireLiveTestMode(global, "SSO_LIVE_CONFIRM_REQUIRED", "Live SSO conformance");
@@ -207,7 +347,7 @@ export async function dispatchRemoteCommand(
 			requireConfirmation(global, "SSO_CONFIRM_REQUIRED", "SSO credential rotation");
 			return requestManagementApi(session, { method: "POST", path: `/v1/sso/${id}/rotate`, body: { dryRun: global.dryRun } });
 		case "sso disable":
-			requireConfirmation(global, "SSO_DISABLE_CONFIRM_REQUIRED", "SSO disable");
+			requireConfirmation(global, "SSO_CONFIRM_REQUIRED", "SSO disable");
 			return requestManagementApi(session, { method: "POST", path: `/v1/sso/${id}/disable`, body: { dryRun: global.dryRun } });
 		case "scim create":
 			requireRemoteMutation(global, path);
@@ -232,21 +372,154 @@ export async function dispatchRemoteCommand(
 			requireRemoteMutation(global, path);
 			return requestManagementApi(session, { method: "POST", path: "/v1/readiness/check", body: { organizationId: opts.org } });
 		case "readiness report": return requestManagementApi(session, { path: `/v1/readiness/${encodeURIComponent(String(opts.org))}` });
+		case "import legacy":
+			requireConfirmation(global, "CLEARANCE_IMPORT_CONFIRMATION_REQUIRED", "Legacy import");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/import/legacy",
+				body: {
+					fixture: localFile(opts.file, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Legacy import file"),
+					dryRun: global.dryRun || !global.yes,
+					confirm: global.yes && !global.dryRun,
+				},
+			});
+		case "migration plan":
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/migrations/plan",
+				body: {
+					source: opts.source,
+					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
+				},
+			});
+		case "migration run":
+			return requestManagementApi(session, {
+				method: "POST",
+				path: `/v1/migrations/${encodeURIComponent(String(opts.id))}/run`,
+				body: {
+					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
+					dryRun: global.dryRun,
+				},
+			});
+		case "migration verify":
+			return requestManagementApi(session, {
+				method: "POST",
+				path: `/v1/migrations/${encodeURIComponent(String(opts.id))}/verify`,
+				body: {
+					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
+				},
+			});
+		case "migration rollback":
+			requireConfirmation(global, "MIGRATION_ROLLBACK_CONFIRM_REQUIRED", "Migration rollback");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: `/v1/migrations/${encodeURIComponent(String(opts.id))}/rollback`,
+				body: {
+					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
+					confirm: global.yes && !global.dryRun,
+				},
+			});
+		case "migration status":
+			return requestManagementApi(session, { path: `/v1/migrations/${encodeURIComponent(String(opts.id))}` });
+		case "backup create":
+			if (opts.dir !== undefined) {
+				throw error(
+					"BACKUP_DIRECTORY_SERVER_MANAGED",
+					"Backup storage is configured by the API deployment.",
+					"Set CLEARANCE_BACKUP_DIR on the API and mount durable storage there.",
+				);
+			}
+			return requestManagementApi(session, { method: "POST", path: "/v1/backups", body: {} });
+		case "backup verify":
+			return requestManagementApi(session, { method: "POST", path: `/v1/backups/${encodeURIComponent(String(opts.id))}/verify`, body: {} });
+		case "backup restore":
+			requireConfirmation(global, "BACKUP_RESTORE_CONFIRM_REQUIRED", "Backup restore");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: `/v1/backups/${encodeURIComponent(String(opts.id))}/restore`,
+				body: { target: opts.target, confirm: global.yes && !global.dryRun },
+			});
+		case "upgrade check":
+			return requestManagementApi(session, { path: "/v1/upgrades/check" });
+		case "upgrade plan":
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/upgrades/plan",
+				body: body({ target: opts.target, dir: opts.dir, current: opts.current, dryRun: global.dryRun }),
+			});
+		case "upgrade apply":
+			requireConfirmation(global, "UPGRADE_APPLY_CONFIRMATION_REQUIRED", "Upgrade apply");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/upgrades/apply",
+				body: { plan: opts.plan, dir: opts.dir, dryRun: global.dryRun, confirm: global.yes && !global.dryRun },
+			});
+		case "upgrade verify":
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/upgrades/verify",
+				body: body({ plan: opts.plan, dir: opts.dir, healthUrl: opts.healthUrl, dryRun: global.dryRun }),
+			});
+		case "upgrade rollback":
+			requireConfirmation(global, "UPGRADE_ROLLBACK_CONFIRMATION_REQUIRED", "Upgrade rollback");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/upgrades/rollback",
+				body: body({
+					plan: opts.plan,
+					dir: opts.dir,
+					dryRun: global.dryRun,
+					confirm: global.yes && !global.dryRun,
+					restoreActive: opts.restoreActive,
+					activeDatabaseConfirmation: opts.confirm,
+					backupDir: opts.backupDir,
+				}),
+			});
+		case "schema status":
+			return requestManagementApi(session, { path: "/v1/schema/status" });
+		case "schema generate": {
+			if (!opts.output) {
+				throw error("SCHEMA_GENERATE_OUTPUT_REQUIRED", "schema generate requires an explicit --output path.", "Provide --output <path> for the generated SQL artifact.");
+			}
+			const result = await requestManagementApi<Record<string, unknown>>(session, {
+				method: "POST",
+				path: "/v1/schema/generate",
+				body: {},
+			});
+			const { sql, ...metadata } = result;
+			if (typeof sql !== "string") {
+				throw error("SCHEMA_GENERATE_RESPONSE_INVALID", "The API did not return generated SQL.", "Upgrade the Clearance API and retry.");
+			}
+			if (global.dryRun) return { ...metadata, dryRun: true };
+			const outputPath = writeExportArtifact(String(opts.output), sql, Boolean(opts.force), {
+				stage: "schema.generate",
+				existsCode: "SCHEMA_GENERATE_EXISTS",
+				writeFailedCode: "SCHEMA_GENERATE_WRITE_FAILED",
+			});
+			return { ...metadata, dryRun: false, outputPath };
+		}
+		case "schema migrate":
+			requireConfirmation(global, "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED", "Schema migration");
+			return requestManagementApi(session, {
+				method: "POST",
+				path: "/v1/schema/migrate",
+				body: { dryRun: global.dryRun, confirm: global.yes && !global.dryRun },
+			});
 		case "config get": return requestManagementApi(session, { path: query("/v1/config", { key: args[0] }) });
 		case "config set": return requestManagementApi(session, { method: "PATCH", path: `/v1/config/${encodeURIComponent(String(args[0]))}`, body: { value: args[1], dryRun: global.dryRun } });
 		case "config validate": {
-			const config = opts.file ? JSON.parse(readFileSync(resolve(String(opts.file)), "utf8")) : undefined;
+			const config = opts.file ? configCandidate(opts.file) : undefined;
 			return requestManagementApi(session, { method: "POST", path: "/v1/config/validate", body: body({ config }) });
 		}
 		case "config diff": {
-			const config = JSON.parse(readFileSync(resolve(String(opts.file)), "utf8"));
+			const config = configCandidate(opts.file);
 			return requestManagementApi(session, { method: "POST", path: "/v1/config/diff", body: { config } });
 		}
 		default:
 			throw error(
 				"CLI_REMOTE_COMMAND_UNAVAILABLE",
 				`${path} has no versioned management API contract in this release.`,
-				"Upgrade the Clearance API, or use --local-direct only for a development or host-local workflow.",
+				"Upgrade the Clearance API to a version that exposes this workflow.",
 			);
 	}
 }

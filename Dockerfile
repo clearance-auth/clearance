@@ -32,15 +32,22 @@ USER clearance
 ENTRYPOINT []
 CMD ["bash", "scripts/backup-scheduled.sh", "--dir", "/backups"]
 
-FROM node:22-bookworm-slim AS runtime
+# The API performs authenticated backup and restore workflows, so its runtime
+# needs the PostgreSQL 16 client matching the supported server. Copy Node 22
+# from the build image into the official PG16 base instead of installing the
+# older Debian Node/Postgres clients.
+FROM postgres:16-bookworm AS runtime
 WORKDIR /app
+COPY --from=build /usr/local /usr/local
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates tini \
   && apt-get clean \
   && find /var/lib/apt/lists -type f -delete \
   && corepack enable \
   && groupadd --system --gid 10001 clearance \
-  && useradd --system --uid 10001 --gid clearance --home-dir /app --shell /usr/sbin/nologin clearance
+  && useradd --system --uid 10001 --gid clearance --home-dir /app --shell /usr/sbin/nologin clearance \
+  && mkdir -p /backups \
+  && chown clearance:clearance /backups
 
 ENV NODE_ENV=production \
     npm_config_update_notifier=false

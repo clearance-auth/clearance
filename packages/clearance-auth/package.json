@@ -1,6 +1,6 @@
 {
   "name": "@clearance/auth",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Clearance auth runtime with bundled, audited fork code and Clearance defaults",
   "type": "module",
   "license": "MIT",

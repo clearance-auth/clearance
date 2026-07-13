@@ -60,7 +60,7 @@ non-secret chart configuration changes.
 
 ## Scheduled off-host backup
 
-Enable `backup.enabled`, provide a writable PVC (or let the chart create one),
+Enable `backup.enabled`, provide a writable `ReadWriteMany` PVC (or let the chart create one),
 set the published backup-runtime repository and signed digest in
 `backup.image.repository` and `backup.image.digest`, and put
 `database-url` plus `backup-copy-command` in `backup.existingSecret`.
@@ -71,6 +71,8 @@ successful off-host receipt. Build and publish the `backup-runtime` Docker
 target as the configured `backup.image`; its official Postgres 16 base supplies
 a matching `pg_dump`. The image and CronJob use fixed UID/GID 10001, a read-only
 root filesystem, and writable mounts limited to `/backups` and `/tmp`. The
+shared claim lets authenticated API backup/verify/restore commands and the
+scheduled off-host copy job address the same artifacts across pods. The
 default hourly schedule supports a one-hour RPO only
 when the CronJob and destination are monitored.
 

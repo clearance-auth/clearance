@@ -1,4 +1,6 @@
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -83,6 +85,42 @@ describe("doctor", () => {
 			"pass",
 		);
 		expect(result.ok).toBe(true);
+	});
+
+	it("uses deployment-internal health URLs instead of public loopback URLs", async () => {
+		const server = createServer((request, response) => {
+			response.statusCode =
+				request.url === "/health" || request.url === "/api/health" ? 200 : 404;
+			response.end("ok");
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const address = server.address() as AddressInfo;
+		const internalUrl = `http://127.0.0.1:${address.port}`;
+		try {
+			const store = tempStore();
+			initProject(store, { name: "Container Doctor" });
+			const result = await runDoctor(store, {
+				secrets: {
+					CLEARANCE_SECRET: "super-secret-value-32chars!!",
+					DATABASE_URL: undefined,
+					CLEARANCE_API_URL: "http://127.0.0.1:1",
+					CLEARANCE_CONSOLE_URL: "http://127.0.0.1:1",
+					CLEARANCE_API_HEALTH_URL: internalUrl,
+					CLEARANCE_CONSOLE_HEALTH_URL: internalUrl,
+				},
+			});
+			expect(result.checks.find((c) => c.id === "api-health")?.status).toBe(
+				"pass",
+			);
+			expect(
+				result.checks.find((c) => c.id === "console-health")?.status,
+			).toBe("pass");
+			expect(result.ok).toBe(true);
+		} finally {
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+		}
 	});
 });
 

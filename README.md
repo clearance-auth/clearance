@@ -4,6 +4,17 @@ Open-source authentication infrastructure for B2B software companies. Clearance 
 
 **CLI:** `clearance` · **Packages:** `@clearance/*` · **Repository:** [clearance-auth/clearance](https://github.com/clearance-auth/clearance)
 
+## Built for B2B auth from day one
+
+Clearance puts product authentication and enterprise identity operations behind one API-first control plane. Builders can ship core sign-in, add SSO and SCIM when customers demand them, and operate the same system through the CLI, API, or console without stitching together separate admin tools.
+
+- **A complete B2B identity model:** Manage users, organizations, memberships, custom roles, sessions, and API keys as scoped resources for multi-tenant products.
+- **Enterprise SSO and SCIM:** Configure SAML or OIDC connections and SCIM directories, then run diagnostics, readiness checks, and read-only conformance probes before rollout.
+- **An API-first CLI:** Script resource and configuration workflows with structured JSON, non-interactive flags, and authenticated `/v1/*` API contracts that behave the same in local development and CI.
+- **An operator console that matches automation:** Inspect and manage users, organizations, roles, sessions, events, and settings through the same services the CLI uses.
+- **Auditable migrations and change history:** Stream or export scoped audit events, and move imports through explicit plan, run, verify, and rollback stages.
+- **Production operations included:** Deploy on Postgres with Docker Compose or Helm, then use built-in health signals, Prometheus metrics, verified backups, restore drills, upgrades, and active rollback.
+
 ## What you can run today
 
 | Surface | Port | How |
@@ -25,11 +36,11 @@ clearance login --profile production --url https://clearance.example.com
 clearance --profile production users list
 ```
 
-After login, ordinary resource and configuration commands use the authenticated `/v1/*` management API and the server-derived project/environment scope. Use `--local-direct` only for a deliberately host-bound workflow such as local development, file export/import, schema tooling, backup/restore, or upgrade/rollback:
+Every operational command uses the authenticated `/v1/*` management API and its server-derived project/environment scope. The CLI reads or writes explicitly named local artifacts for import, export, schema, backup, and upgrade workflows while all validation and state changes stay behind the API:
 
 ```bash
-clearance --local-direct --data-path .clearance/dev.json init --name my-app
-clearance --local-direct backup create --dir /secure/clearance-backups
+clearance --profile production init --name my-app
+clearance --profile production backup create
 ```
 
 ## Full stack (recommended)
@@ -93,6 +104,10 @@ pnpm stack:destroy
 pnpm install && pnpm build
 export CLEARANCE_SECRET="$(openssl rand -hex 32)"
 export CLEARANCE_BASE_URL=http://localhost:3000
+export CLEARANCE_API_URL=http://localhost:3200
+export CLEARANCE_OPERATOR_TOKEN="$(openssl rand -hex 32)"
+export CLEARANCE_CREDENTIAL_KEY="$(openssl rand -hex 32)"
+export CLEARANCE_CREDENTIAL_KEY_ID=local-v1
 export DATABASE_URL='postgres://clearance:replace-me@127.0.0.1:5432/clearance'
 
 pnpm smoke   # CLI init → users/orgs → SSO/SCIM readiness → doctor
@@ -106,15 +121,15 @@ pnpm dev:sample
 CLI examples:
 
 ```bash
-node packages/clearance-cli/dist/index.js --local-direct init --name my-app --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct doctor --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct users create --email a@b.com --name A --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct orgs create --name Acme --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct sso create --org <id> --provider okta --protocol oidc \
+node packages/clearance-cli/dist/index.js init --name my-app --json --no-input
+node packages/clearance-cli/dist/index.js doctor --json --no-input
+node packages/clearance-cli/dist/index.js users create --email a@b.com --name A --json --no-input
+node packages/clearance-cli/dist/index.js orgs create --name Acme --json --no-input
+node packages/clearance-cli/dist/index.js sso create --org <id> --provider okta --protocol oidc \
   --issuer https://example.okta.com --audience clearance-sp --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct readiness check --org <id> --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct backup create --json --no-input
-node packages/clearance-cli/dist/index.js --local-direct upgrade check --json --no-input
+node packages/clearance-cli/dist/index.js readiness check --org <id> --json --no-input
+node packages/clearance-cli/dist/index.js backup create --json --no-input
+node packages/clearance-cli/dist/index.js upgrade check --json --no-input
 ```
 
 ## Packages
@@ -136,18 +151,21 @@ node packages/clearance-cli/dist/index.js --local-direct upgrade check --json --
 - Validated imports and migration workflows with plan, run, verify, and rollback stages
 - Self-hosted Docker Compose and Helm deployment paths backed by Postgres
 - Operational workflows for health checks, backup, restore, upgrades, and rollback
+- Public npm packages with provenance, signed release bundles, and immutable GHCR image digests
 - A sample B2B application and end-to-end verification suite for evaluating Clearance locally
 
 ## Roadmap
 
-- Public beta packages and signed releases
 - Certified interactive SSO flows with Okta and Microsoft Entra ID
 - Hosted-source imports and expanded environment promotion workflows
 - CLI-driven cloud deployment and production operations
 - Distributed console sessions and a horizontally scalable management data model
-- Published beta readiness, security review, and deployment guidance
+- Hardened live-conformance egress with DNS resolution and private-network rejection
+- Framework integration guides for common B2B application stacks
 
 ## Docs
 
-- [COMPATIBILITY.md](./COMPATIBILITY.md) — package map  
-- [LICENSE](./LICENSE) — MIT with required attribution  
+- [Beta readiness](./docs/beta-readiness.md) — release evidence and deployment checklist
+- [Security review](./docs/security-review-v0.2.0.md) — focused v0.2.0 review and verified controls
+- [COMPATIBILITY.md](./COMPATIBILITY.md) — package map
+- [LICENSE](./LICENSE) — MIT with required attribution

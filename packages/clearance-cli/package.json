@@ -1,6 +1,6 @@
 {
   "name": "@clearance/cli",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Clearance CLI — operate auth projects, enterprise connections, migrations, and deploys",
   "type": "module",
   "license": "MIT",

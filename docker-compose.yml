@@ -42,6 +42,9 @@ services:
       CLEARANCE_CREDENTIAL_KEY_ID: ${CLEARANCE_CREDENTIAL_KEY_ID:?set CLEARANCE_CREDENTIAL_KEY_ID}
       CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
       CLEARANCE_CONSOLE_URL: http://localhost:${CLEARANCE_CONSOLE_PORT:-13100}
+      CLEARANCE_API_HEALTH_URL: http://127.0.0.1:3200
+      CLEARANCE_CONSOLE_HEALTH_URL: http://console:3100
+      CLEARANCE_BACKUP_DIR: /backups
       CLEARANCE_CORS_ORIGINS: http://localhost:${CLEARANCE_CONSOLE_PORT:-13100},http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
       # Prefer operator-supplied DATABASE_URL (full string). Fallback constructs from parts for local smoke.
       DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
@@ -58,6 +61,8 @@ services:
       NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
     ports:
       - "127.0.0.1:${CLEARANCE_API_PORT:-13200}:3200"
+    volumes:
+      - clearance_backups:/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -144,3 +149,5 @@ services:
 volumes:
   clearance_pg:
     name: ${CLEARANCE_PG_VOLUME:-clearance_pg}
+  clearance_backups:
+    name: ${CLEARANCE_BACKUP_VOLUME:-clearance_backups}

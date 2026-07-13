@@ -10,7 +10,8 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: backup
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes:
+{{ toYaml .Values.backup.accessModes | indent 4 }}
 {{- with .Values.backup.storageClassName }}
   storageClassName: {{ . }}
 {{- end }}

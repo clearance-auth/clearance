@@ -110,6 +110,26 @@ describe("API /v1/organizations/:id/members", () => {
 		).toBe(true);
 	});
 
+	it("previews and applies a local-file member import through the authenticated API", async () => {
+		const content = JSON.stringify([{ principalId: userId, role: "admin" }]);
+		const preview = await app.request(`/v1/organizations/${orgId}/members/import`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({ content, format: "json", dryRun: true }),
+		});
+		expect(preview.status).toBe(200);
+		expect((await preview.json()).summary.wouldAdd).toBe(1);
+		const applied = await app.request(`/v1/organizations/${orgId}/members/import`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({ content, format: "json", confirm: true }),
+		});
+		expect(applied.status).toBe(200);
+		const result = await applied.json();
+		expect(result.success).toBe(1);
+		expect(result.failure).toBe(0);
+	});
+
 	it("updates role and removes with structured JSON", async () => {
 		const add = await app.request(`/v1/organizations/${orgId}/members`, {
 			method: "POST",

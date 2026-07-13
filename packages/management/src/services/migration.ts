@@ -84,34 +84,26 @@ function organizationSlug(name: string): string {
 	return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48);
 }
 
-/** Reads and fully validates the one Legacy fixture shape supported by this lane. */
-export function loadLegacyFixture(path: string): LegacyExportFixture {
-	let parsed: unknown;
-	let file: number | undefined;
-	try {
-		file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-		const stat = fstatSync(file);
-		if (!stat.isFile()) {
-			fixtureError(
-				"CLEARANCE_IMPORT_FILE_UNREADABLE",
-				"Legacy fixture must be a regular file",
-				"Provide a local, non-symlinked JSON export file.",
-			);
-		}
-		if (stat.size > MAX_FIXTURE_BYTES) {
+/** Parse and fully validate the one legacy fixture shape accepted by Clearance. */
+export function parseLegacyFixture(input: string | unknown): LegacyExportFixture {
+	let parsed = input;
+	if (typeof input === "string") {
+		if (Buffer.byteLength(input, "utf8") > MAX_FIXTURE_BYTES) {
 			fixtureError(
 				"CLEARANCE_IMPORT_FILE_TOO_LARGE",
 				"Legacy fixture exceeds the 25 MiB limit",
 				"Split the export into smaller tenant-scoped fixtures.",
 			);
 		}
-		parsed = JSON.parse(readFileSync(file, "utf8"));
-	} catch (error) {
-		if (error instanceof ClearanceError) throw error;
-		const code = error instanceof SyntaxError ? "CLEARANCE_IMPORT_JSON_INVALID" : "CLEARANCE_IMPORT_FILE_UNREADABLE";
-		fixtureError(code, code === "CLEARANCE_IMPORT_JSON_INVALID" ? "Legacy fixture is not valid JSON" : "Legacy fixture could not be read", "Provide a readable JSON export fixture.");
-	} finally {
-		if (file !== undefined) closeSync(file);
+		try {
+			parsed = JSON.parse(input);
+		} catch {
+			fixtureError(
+				"CLEARANCE_IMPORT_JSON_INVALID",
+				"Legacy fixture is not valid JSON",
+				"Provide a valid JSON export fixture.",
+			);
+		}
 	}
 	const raw = object(parsed, "fixture");
 	onlyKeys(raw, [...fixtureKeys], "fixture");
@@ -174,6 +166,37 @@ export function loadLegacyFixture(path: string): LegacyExportFixture {
 	});
 
 	return { source: "legacy", users, organizations, members };
+}
+
+/** Safely read a local fixture, then apply the same parser used by the API. */
+export function loadLegacyFixture(path: string): LegacyExportFixture {
+	let rawJson = "";
+	let file: number | undefined;
+	try {
+		file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const stat = fstatSync(file);
+		if (!stat.isFile()) {
+			fixtureError(
+				"CLEARANCE_IMPORT_FILE_UNREADABLE",
+				"Legacy fixture must be a regular file",
+				"Provide a local, non-symlinked JSON export file.",
+			);
+		}
+		if (stat.size > MAX_FIXTURE_BYTES) {
+			fixtureError(
+				"CLEARANCE_IMPORT_FILE_TOO_LARGE",
+				"Legacy fixture exceeds the 25 MiB limit",
+				"Split the export into smaller tenant-scoped fixtures.",
+			);
+		}
+		rawJson = readFileSync(file, "utf8");
+	} catch (error) {
+		if (error instanceof ClearanceError) throw error;
+		fixtureError("CLEARANCE_IMPORT_FILE_UNREADABLE", "Legacy fixture could not be read", "Provide a readable JSON export fixture.");
+	} finally {
+		if (file !== undefined) closeSync(file);
+	}
+	return parseLegacyFixture(rawJson);
 }
 
 function compatibleFixture(store: ManagementStore, fixture: LegacyExportFixture): MigrationPreview {

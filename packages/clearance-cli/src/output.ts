@@ -6,7 +6,6 @@ export interface GlobalOpts {
 	yes?: boolean;
 	dryRun?: boolean;
 	dataPath?: string;
-	localDirect?: boolean;
 	profile?: string;
 	apiUrl?: string;
 }

@@ -24,6 +24,7 @@ import {
 	encryptRuntimeCredential,
 	type ClearanceAuthBundle,
 } from "@clearance/auth";
+import { randomBytes } from "node:crypto";
 import type {
 	DataStoreSnapshot,
 	Membership,
@@ -154,20 +155,33 @@ export async function listUsersFromDb(): Promise<Principal[]> {
 export async function createUserInAuth(input: {
 	email: string;
 	name: string;
-	password?: string;
+	password: string;
 	/** When set, persists the runtime user into management with the same stable id */
 	managementStore?: ManagementStore;
 }): Promise<Principal> {
 	const b = getAuthBundle();
-	const password = input.password ?? `Tmp!${newId("pw").slice(3, 15)}aA1`;
 	const result = await b.auth.api.signUpEmail({
 		body: {
 			email: input.email,
-			password,
+			password: input.password,
 			name: input.name,
 		},
 	});
 	const user = result.user;
+	const authContext = (await b.auth.$context) as {
+		internalAdapter: {
+			deleteUserSessions(userId: string): Promise<void>;
+			deleteUser(userId: string): Promise<void>;
+		};
+	};
+	try {
+		// Administrative provisioning must never leave behind the authenticated
+		// session that the public sign-up endpoint normally creates.
+		await authContext.internalAdapter.deleteUserSessions(user.id);
+	} catch (cause) {
+		await authContext.internalAdapter.deleteUser(user.id).catch(() => undefined);
+		throw cause;
+	}
 	const { projectId, environmentId } = projectEnv();
 	const principal: Principal = {
 		id: user.id,
@@ -192,6 +206,75 @@ export async function createUserInAuth(input: {
 	}
 
 	return principal;
+}
+
+export const PASSWORD_SETUP_TTL_SECONDS = 60 * 60;
+
+export type PasswordSetupGrant = {
+	token: string;
+	expiresAt: string;
+};
+
+/**
+ * Provision a user without issuing a reusable temporary credential.
+ *
+ * The inaccessible random password prevents the credential account from being
+ * used directly. The returned reset token is single-use in the auth runtime and
+ * expires after one hour; it can only establish a caller-chosen password.
+ */
+export async function createUserWithPasswordSetupInAuth(input: {
+	email: string;
+	name: string;
+	managementStore?: ManagementStore;
+}): Promise<{ user: Principal; passwordSetup: PasswordSetupGrant }> {
+	const b = getAuthBundle();
+	const inaccessiblePassword = `Clr!${randomBytes(32).toString("base64url")}aA1`;
+	const user = await createUserInAuth({
+		email: input.email,
+		name: input.name,
+		password: inaccessiblePassword,
+	});
+	const token = randomBytes(32).toString("base64url");
+	const expiresAt = new Date(Date.now() + PASSWORD_SETUP_TTL_SECONDS * 1000);
+	const identifier = `reset-password:${token}`;
+	const authContext = (await b.auth.$context) as {
+		internalAdapter: {
+			createVerificationValue(input: {
+				identifier: string;
+				value: string;
+				expiresAt: Date;
+			}): Promise<unknown>;
+			deleteVerificationByIdentifier(identifier: string): Promise<void>;
+			deleteUser(userId: string): Promise<void>;
+		};
+	};
+
+	try {
+		await authContext.internalAdapter.createVerificationValue({
+			identifier,
+			value: user.id,
+			expiresAt,
+		});
+		const durableUser = input.managementStore
+			? await syncRuntimeUserToManagementDurable(input.managementStore, {
+					id: user.id,
+					email: user.email,
+					name: user.name,
+					createdAt: user.createdAt,
+					updatedAt: user.updatedAt,
+				}, { source: "system" })
+			: user;
+		return {
+			user: durableUser,
+			passwordSetup: { token, expiresAt: expiresAt.toISOString() },
+		};
+	} catch (cause) {
+		await authContext.internalAdapter
+			.deleteVerificationByIdentifier(identifier)
+			.catch(() => undefined);
+		await authContext.internalAdapter.deleteUser(user.id).catch(() => undefined);
+		throw cause;
+	}
 }
 
 /**

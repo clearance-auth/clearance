@@ -340,6 +340,21 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     else
       bad "resolved production config has duplicate, missing, or unexpected service bindings"
     fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  api:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const api=m[1];
+      if(!api.includes("CLEARANCE_API_HEALTH_URL: http://127.0.0.1:3200") ||
+         !api.includes("CLEARANCE_CONSOLE_HEALTH_URL: http://console:3100") ||
+         !api.includes("CLEARANCE_BACKUP_DIR: /backups") ||
+         !api.includes("source: clearance_backups") ||
+         !api.includes("target: /backups")) process.exit(1);
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "production API uses internal health endpoints and durable server-managed backup storage"
+    else
+      bad "production API internal health or backup storage wiring is missing"
+    fi
   else
     bad "production compose config failed with strong env"
   fi
@@ -412,6 +427,20 @@ if command -v helm >/dev/null 2>&1; then
     ok "trusted-proxy ServiceMonitor fails closed without scraper selectors"
   else
     bad "trusted-proxy ServiceMonitor accepted empty scraper selectors"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    --set backup.enabled=true \
+    --set backup.image.repository=ghcr.io/example/clearance-backup \
+    --set-string backup.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    --set backup.existingSecret=clearance-secrets \
+    >"$SCRATCH/helm-backup.yml" \
+    && grep -q 'kind: CronJob' "$SCRATCH/helm-backup.yml" \
+    && grep -q 'name: CLEARANCE_BACKUP_DIR' "$SCRATCH/helm-backup.yml" \
+    && grep -q 'value: /backups' "$SCRATCH/helm-backup.yml" \
+    && grep -q 'ReadWriteMany' "$SCRATCH/helm-backup.yml"; then
+    ok "Helm shares durable backup storage between the API and scheduled off-host job"
+  else
+    bad "Helm backup-enabled render lacks shared API/CronJob storage"
   fi
   set +e
   helm template beta deploy/helm/clearance "${HELM_ARGS[@]}" \
@@ -748,25 +777,9 @@ SQL
     && ok "upgrade-verify accepts the applied release" \
     || bad "upgrade-verify rejected the applied release"
 
-  if [[ -f packages/clearance-cli/dist/index.js ]]; then
-    if node packages/clearance-cli/dist/index.js --local-direct --json --yes upgrade rollback \
-      --plan "$PLAN_ID" --dir "$UPG_DIR" >"$SCRATCH/rollback-cli.json"; then
-      if node -e '
-        const j=require(process.argv[1]);
-        if(j.operation!=="upgrade.rollback" || j.mode!=="isolated_verify_only" || j.activeDatabaseUntouched!==true || !j.rollbackReceipt) process.exit(1);
-      ' "$SCRATCH/rollback-cli.json"; then
-        ok "CLI upgrade rollback verifies the reference in isolation"
-      else
-        bad "CLI upgrade rollback returned inconsistent evidence"
-      fi
-    else
-      bad "CLI upgrade rollback reference verification failed"
-    fi
-  else
-    bash scripts/upgrade-rollback.sh --plan "$PLAN_ID" --dir "$UPG_DIR" >/dev/null \
-      && ok "upgrade rollback reference restores and verifies in isolation" \
-      || bad "upgrade rollback reference verification failed"
-  fi
+  bash scripts/upgrade-rollback.sh --plan "$PLAN_ID" --dir "$UPG_DIR" >/dev/null \
+    && ok "upgrade rollback reference restores and verifies in isolation" \
+    || bad "upgrade rollback reference verification failed"
 
   ROLLBACK_RECEIPT="$UPG_DIR/rollbacks/${PLAN_ID}.rollback-drill.json"
   if [[ -f "$ROLLBACK_RECEIPT" ]] && node -e '

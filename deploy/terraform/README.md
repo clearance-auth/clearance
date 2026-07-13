@@ -25,12 +25,20 @@ clearance_image         = "ghcr.io/owner/repo/clearance@sha256:<signed-release-d
 Then run:
 
 ```bash
-terraform init
-terraform validate
+bash ../../scripts/verify-terraform.sh
+terraform init -backend=false -lockfile=readonly
 terraform plan
 terraform apply
 terraform output
 ```
+
+The repository verification command pins Terraform `1.5.7` and Docker provider
+`3.9.0`, checks formatting, initializes without a backend from the committed
+read-only lockfile, validates the module, and creates a refresh-free
+representative plan. By default it plans with a known immutable,
+keyless-signed beta release image. Set `CLEARANCE_TERRAFORM_IMAGE` to another
+digest-addressed image only after verifying that release's signature. The
+verification command never applies the plan.
 
 The default endpoints are `http://localhost:13200` (API), `http://localhost:13100` (console), and `http://localhost:13300` (sample app). Optional GitHub and Google client ID/secret variables must be supplied as complete pairs.
 

@@ -96,7 +96,7 @@ describe("API Idempotency-Key", () => {
 		expect(users.length).toBe(1);
 	});
 
-	it("never persists a generated temporary password in the replay record", async () => {
+	it("never invents or returns a durable credential when a development-store password is omitted", async () => {
 		const app = await loadApp();
 		const body = JSON.stringify({ email: "one-time@t.dev", name: "One Time" });
 		const first = await app.request("/v1/users", {
@@ -106,7 +106,8 @@ describe("API Idempotency-Key", () => {
 		});
 		expect(first.status).toBe(201);
 		const original = await first.json();
-		expect(original.temporaryPassword).toMatch(/^Tmp!/);
+		expect(original.temporaryPassword).toBeUndefined();
+		expect(original.passwordSetupToken).toBeUndefined();
 
 		const replay = await app.request("/v1/users", {
 			method: "POST",
@@ -117,13 +118,25 @@ describe("API Idempotency-Key", () => {
 		expect(replay.headers.get("idempotency-replayed")).toBe("true");
 		const replayed = await replay.json();
 		expect(replayed.user).toEqual(original.user);
-		expect(replayed.temporaryPassword).toBeUndefined();
-		expect(replayed.oneTimeSecretsOmitted).toEqual(["temporaryPassword"]);
-		expect(JSON.stringify(replayed)).not.toContain(original.temporaryPassword);
+		expect(replayed).toEqual(original);
 
 		const list = await app.request("/v1/users", { headers: authHeaders });
 		const users = (await list.json()).users as { email: string }[];
 		expect(users.filter((user) => user.email === "one-time@t.dev")).toHaveLength(1);
+	});
+
+	it("strips a runtime password-setup token from the durable replay body", async () => {
+		const { idempotencyReplayBody } = await import("./server.js");
+		const replayBody = idempotencyReplayBody("/v1/users", JSON.stringify({
+			user: { id: "user_runtime" },
+			passwordSetupToken: "one-time-setup-token",
+			passwordSetupExpiresAt: "2026-07-13T20:00:00.000Z",
+		}));
+		expect(JSON.parse(replayBody ?? "null")).toEqual({
+			user: { id: "user_runtime" },
+			passwordSetupExpiresAt: "2026-07-13T20:00:00.000Z",
+			oneTimeSecretsOmitted: ["passwordSetupToken"],
+		});
 	});
 
 	it("omits every API-key, setup-link, and SCIM one-time secret from replay", async () => {

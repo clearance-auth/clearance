@@ -176,9 +176,21 @@ describe("API enterprise connection rotate / disable / replay", () => {
 
 	it("replays SCIM diagnostic traces under scope", async () => {
 		const app = await loadApp();
+		const dryRun = await app.request(`/v1/scim/traces/${scimTraceId}/replay`, {
+			method: "POST",
+			headers: authHeaders,
+		});
+		expect(dryRun.status).toBe(200);
+		expect(await dryRun.json()).toMatchObject({
+			dryRun: true,
+			idempotent: false,
+			wouldChange: true,
+		});
+
 		const res = await app.request(`/v1/scim/traces/${scimTraceId}/replay`, {
 			method: "POST",
 			headers: authHeaders,
+			body: JSON.stringify({ confirm: true }),
 		});
 		expect(res.status).toBe(200);
 		const body = await res.json();
@@ -187,7 +199,11 @@ describe("API enterprise connection rotate / disable / replay", () => {
 
 		const again = await app.request(
 			`/v1/scim/traces/${scimTraceId}/replay`,
-			{ method: "POST", headers: authHeaders },
+			{
+				method: "POST",
+				headers: authHeaders,
+				body: JSON.stringify({ confirm: true }),
+			},
 		);
 		expect(again.status).toBe(200);
 		const repeated = await again.json();

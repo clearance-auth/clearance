@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
+import { authenticatedApiEnv, stopAuthenticatedApiServers } from "./api-test-server.js";
 
 const execFileAsync = promisify(execFile);
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -25,12 +26,16 @@ const dirs: string[] = [];
 const ENV = {
 	...process.env,
 	DATABASE_URL: "",
-	CLEARANCE_LOCAL_DIRECT: "1",
 	CLEARANCE_SECRET: "unit-test-secret-value-not-default!!",
 	CLEARANCE_BASE_URL: "http://localhost:3000",
 	CLEARANCE_CREDENTIAL_KEY: "unit-test-credential-key-material-32b!!",
 	CLEARANCE_CREDENTIAL_KEY_ID: "k1",
 	NODE_ENV: "development",
+};
+
+const UNREACHABLE_API_ENV = {
+	CLEARANCE_OPERATOR_TOKEN: "test-operator-token-for-cli-api-32chars!!",
+	CLEARANCE_API_URL: "http://127.0.0.1:1",
 };
 
 function tempDir(prefix: string): string {
@@ -40,6 +45,7 @@ function tempDir(prefix: string): string {
 }
 
 afterAll(() => {
+	stopAuthenticatedApiServers();
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -47,12 +53,13 @@ function runSync(
 	args: string[],
 	dataPath: string,
 	cwd?: string,
+	apiEnv?: NodeJS.ProcessEnv,
 ): { stdout: string; stderr: string; status: number } {
 	try {
 		const stdout = execFileSync(
 			process.execPath,
 			[entry, ...args, "--json", "--no-input", "--data-path", dataPath],
-			{ encoding: "utf8", env: ENV, cwd, stdio: ["ignore", "pipe", "pipe"] },
+			{ encoding: "utf8", env: { ...ENV, ...(apiEnv ?? authenticatedApiEnv(dataPath)) }, cwd, stdio: ["ignore", "pipe", "pipe"] },
 		);
 		return { stdout, stderr: "", status: 0 };
 	} catch (err: unknown) {
@@ -105,7 +112,7 @@ describe("destructive refusal paths emit one structured document (the audited do
 	}
 });
 
-describe("read commands emit a structured envelope on store failure (no stack traces)", () => {
+describe("read commands emit a structured envelope on API failure (no stack traces)", () => {
 	const reads: string[][] = [
 		["users", "list"],
 		["orgs", "list"],
@@ -117,10 +124,9 @@ describe("read commands emit a structured envelope on store failure (no stack tr
 	];
 	for (const args of reads) {
 		it(args.join(" "), () => {
-			const dir = tempDir("clr-contract-corrupt-");
-			const bad = join(dir, "bad.json");
-			writeFileSync(bad, "this is not json", "utf8");
-			const res = runSync(args, bad);
+			const dir = tempDir("clr-contract-api-failure-");
+			const data = join(dir, "data.json");
+			const res = runSync(args, data, undefined, UNREACHABLE_API_ENV);
 			expect(res.status).not.toBe(0);
 			const doc = parseSingleDocument(res.stdout, args.join(" ")) as {
 				error: { code: string; message: string };
@@ -172,12 +178,12 @@ describe("numeric option validation fails closed with stage-scoped codes", () =>
 // ---------------------------------------------------------------------------
 
 /**
- * Commands that never open the management store, with justification.
- * These may exit 0 with the corrupt --data-path (that is their correct
- * behavior); everything else must fail with a structured envelope.
+ * Authentication commands that do not call the management API. These may
+ * succeed against an unreachable API; every remote command must fail with a
+ * structured envelope.
  */
-const NO_STORE_COMMANDS = new Set<string>([
-	"dev", // prints canned startup paths; touches no persistence by design
+const NO_REMOTE_COMMANDS = new Set<string>([
+	"login", // validates and saves the explicit origin locally
 	"logout", // removes the operator credential file; never opens the data store
 	"whoami", // reports credential/env state; never opens the data store
 ]);
@@ -322,6 +328,7 @@ async function sweepRun(
 	args: string[],
 	dataPath: string,
 	cwd: string,
+	apiEnv?: NodeJS.ProcessEnv,
 ): Promise<{ stdout: string; stderr: string; status: number }> {
 	// Auto-satisfy commander's required options: run, read the "required
 	// option" parse error, add a dummy value, retry. This walks the real
@@ -334,7 +341,7 @@ async function sweepRun(
 				[entry, ...args, ...extra, "--json", "--no-input", "--data-path", dataPath],
 				{
 					encoding: "utf8",
-					env: ENV,
+					env: { ...ENV, ...(apiEnv ?? authenticatedApiEnv(dataPath)) },
 					cwd,
 					timeout: 20_000,
 					killSignal: "SIGKILL",
@@ -359,23 +366,19 @@ async function sweepRun(
 }
 
 describe("registry sweep: one JSON document per invocation", () => {
-	it("every leaf command honors the single-document contract (valid store and corrupt store)", async () => {
+	it("every leaf command honors the single-document contract (healthy and unreachable API)", async () => {
 		const leaves = await discoverLeaves();
 		expect(leaves.length).toBeGreaterThan(40); // registry really was walked
 
 		const okDir = tempDir("clr-sweep-ok-");
 		const okData = join(okDir, "d.json");
 		runSync(["init", "--name", "Sweep"], okData, okDir);
-		const badDir = tempDir("clr-sweep-bad-");
-		const badData = join(badDir, "bad.json");
-		writeFileSync(badData, "this is not json", "utf8");
-
 		const failures: string[] = [];
 		const queue = leaves.flatMap((leaf) => {
 			const name = leaf.path.join(" ");
 			return [
 				{ mode: "valid" as const, leaf, name },
-				{ mode: "corrupt" as const, leaf, name },
+				{ mode: "unreachable" as const, leaf, name },
 			];
 		});
 
@@ -383,9 +386,14 @@ describe("registry sweep: one JSON document per invocation", () => {
 			const positionals = dummyPositionals(c.leaf.help);
 			const extra = SWEEP_EXTRA_ARGS[c.name] ?? [];
 			const args = [...c.leaf.path, ...positionals, ...extra];
-			const dataPath = c.mode === "valid" ? okData : badData;
+			const dataPath = okData;
 			const cwd = tempDir(`clr-sweep-cwd-`);
-			const res = await sweepRun(args, dataPath, cwd);
+			const res = await sweepRun(
+				args,
+				dataPath,
+				cwd,
+				c.mode === "unreachable" ? UNREACHABLE_API_ENV : undefined,
+			);
 			const label = `${c.name} [${c.mode}]`;
 			if (res.stdout.trim() === "") {
 				// Empty stdout is only acceptable for a commander parse error that
@@ -410,11 +418,11 @@ describe("registry sweep: one JSON document per invocation", () => {
 						failures.push(`${label}: nonzero exit without error envelope`);
 					}
 					if (
-						c.mode === "corrupt" &&
+						c.mode === "unreachable" &&
 						res.status === 0 &&
-						!NO_STORE_COMMANDS.has(c.name)
+						!NO_REMOTE_COMMANDS.has(c.name)
 					) {
-						failures.push(`${label}: succeeded against a corrupt store`);
+						failures.push(`${label}: succeeded against an unreachable API`);
 					}
 				} catch {
 					failures.push(

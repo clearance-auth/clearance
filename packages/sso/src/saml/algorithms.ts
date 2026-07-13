@@ -177,7 +177,7 @@ function validateSignatureAlgorithm(
 		return;
 	}
 
-	const { onDeprecated = "warn", allowedSignatureAlgorithms } = options;
+	const { onDeprecated = "reject", allowedSignatureAlgorithms } = options;
 
 	if (allowedSignatureAlgorithms) {
 		if (!allowedSignatureAlgorithms.includes(algorithm)) {
@@ -211,7 +211,7 @@ function validateEncryptionAlgorithms(
 	options: AlgorithmValidationOptions = {},
 ): void {
 	const {
-		onDeprecated = "warn",
+		onDeprecated = "reject",
 		allowedKeyEncryptionAlgorithms,
 		allowedDataEncryptionAlgorithms,
 	} = options;
@@ -279,7 +279,7 @@ export function validateConfigAlgorithms(
 	options: ConfigAlgorithmValidationOptions = {},
 ): void {
 	const {
-		onDeprecated = "warn",
+		onDeprecated = "reject",
 		allowedSignatureAlgorithms,
 		allowedDigestAlgorithms,
 	} = options;

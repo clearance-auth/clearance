@@ -4,6 +4,10 @@ import type { Context, Next } from "hono";
 import {
 	addMember,
 	addMemberInAuth,
+	applyUpgrade,
+	executeMemberImportPlan,
+	planMemberImport,
+	type MemberImportFormat,
 	archiveOrganization,
 	archiveOrganizationInAuth,
 	assertClientScopeHeaders,
@@ -11,6 +15,8 @@ import {
 	assertProductionSecret,
 	ClearanceError,
 	createManagementStore,
+	createBackup,
+	createPostgresBackup,
 	createProject,
 	createEnvironment,
 	planProjectCreate,
@@ -23,6 +29,7 @@ import {
 	createSsoConnectionReal,
 	createUser,
 	createUserInAuth,
+	createUserWithPasswordSetupInAuth,
 	deleteUser,
 	deleteUserInAuth,
 	disableScimConnection,
@@ -34,11 +41,14 @@ import {
 	ensureAuthMigrated,
 	exportUsers,
 	getLatestReadiness,
+	getRuntimeSchemaStatus,
 	initProject,
 	inspectEnvironment,
 	inspectMembership,
 	inspectOrganization,
 	inspectScimConnection,
+	inspectSession,
+	inspectSessionInAuth,
 	inspectSsoConnection,
 	inspectUser,
 	isClearanceError,
@@ -56,6 +66,18 @@ import {
 	listSessionsPageInAuth,
 	listUsers,
 	listUsersPage,
+	migrateRuntimeSchema,
+	planRuntimeSchema,
+	migrationStatus,
+	parseLegacyFixture,
+	planUpgrade,
+	planMigration,
+	previewMigration,
+	rollbackMigrationDurable,
+	rollbackUpgrade,
+	runMigrationDurable,
+	verifyMigrationDurable,
+	verifyUpgrade,
 	assertIdempotencyKeyValid,
 	createIdempotencyBackend,
 	fingerprintIdempotentRequest,
@@ -65,6 +87,8 @@ import {
 	promoteEnvironment,
 	revokeSession,
 	revokeSessionInAuth,
+	restoreBackup,
+	restorePostgresBackup,
 	removeMember,
 	removeMemberInAuth,
 	parseCorsOrigins,
@@ -111,6 +135,10 @@ import {
 	testSsoConnection,
 	testSsoConnectionReal,
 	testSsoConnectionLive,
+	upgradeCheck,
+	upgradeCheckWithDb,
+	verifyBackup,
+	verifyPostgresBackup,
 	syncRuntimeOrganizationToManagementDurable,
 	type ManagementStore,
 	type ResourceScope,
@@ -472,10 +500,9 @@ let idempotencyBackend: IdempotencyBackend | null = null;
 
 /**
  * Build the response body that is safe to persist for a later replay.
- * Generated temporary passwords are one-time delivery credentials: retaining
- * one in either the Postgres companion table or the development memory backend
- * would extend its lifetime to the idempotency TTL. A replay still returns the
- * original user and status while explicitly reporting the omitted secret.
+ * Password-setup tokens and other one-time credentials must never enter the
+ * Postgres companion table or development memory backend. A replay still
+ * returns the original resource and status while reporting the omitted secret.
  */
 function idempotencyReplayBody(path: string, body: string): string | null {
 	const sensitive =
@@ -490,7 +517,7 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 		const parsed = JSON.parse(body) as Record<string, unknown>;
 		const omitted: string[] = [];
 		for (const key of path === "/v1/users"
-			? ["temporaryPassword"]
+			? ["passwordSetupToken"]
 			: path.endsWith("/setup-links")
 				? ["token", "url"]
 				: path === "/v1/keys" || path.endsWith("/rotate")
@@ -875,7 +902,7 @@ app.get("/health", async (c) => {
 	return c.json({
 		ok: true,
 		service: "clearance-api",
-		version: "0.1.4",
+		version: "0.2.0",
 	});
 });
 
@@ -902,6 +929,17 @@ app.get("/v1/doctor", async (c) => {
 	const store = await storeForRequest();
 	return c.json(await runDoctor(store));
 });
+
+app.get("/v1/dev", (c) => c.json({
+	commands: [
+		"clearance init --name my-app",
+		"pnpm stack:smoke",
+		"pnpm stack:up",
+		"pnpm --filter @clearance/sample-b2b dev",
+		"pnpm --filter @clearance/api dev",
+		"pnpm --filter @clearance/console dev",
+	],
+}));
 
 app.post("/v1/init", async (c) => {
 	const store = await storeForRequest();
@@ -1150,29 +1188,47 @@ app.post("/v1/users", async (c) => {
 			}
 			return c.json({ dryRun: true, email, name: body.name.trim(), scope });
 		}
-		const generatedPassword = body.password
-			? undefined
-			: `Tmp!${randomBytes(18).toString("base64url")}aA1`;
-		const user = process.env.DATABASE_URL
+		const provisioned = process.env.DATABASE_URL
 			? await (async () => {
 					await ensureAuthMigrated();
-					return createUserInAuth({
+					if (typeof body.password === "string" && body.password.length > 0) {
+						return {
+							user: await createUserInAuth({
+								email: body.email,
+								name: body.name,
+								password: body.password,
+								managementStore: store,
+							}),
+							passwordSetup: undefined,
+						};
+					}
+					return createUserWithPasswordSetupInAuth({
 						email: body.email,
 						name: body.name,
-						password: body.password ?? generatedPassword,
 						managementStore: store,
 					});
 				})()
-			: createUser(store, {
-					email: body.email,
-					name: body.name,
-					projectId: scope.projectId,
-					environmentId: scope.environmentId,
-					source: "api",
-				});
+			: {
+					user: createUser(store, {
+						email: body.email,
+						name: body.name,
+						projectId: scope.projectId,
+						environmentId: scope.environmentId,
+						source: "api",
+					}),
+					passwordSetup: undefined,
+				};
 		await store.ready();
 		return c.json(
-			{ user, ...(generatedPassword ? { temporaryPassword: generatedPassword } : {}) },
+			{
+				user: provisioned.user,
+				...(provisioned.passwordSetup
+					? {
+							passwordSetupToken: provisioned.passwordSetup.token,
+							passwordSetupExpiresAt: provisioned.passwordSetup.expiresAt,
+						}
+					: {}),
+			},
 			201,
 		);
 	} catch (e) {
@@ -1624,6 +1680,67 @@ app.post("/v1/organizations/:id/members", async (c) => {
 	}
 });
 
+app.post("/v1/organizations/:id/members/import", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const scope = scopeForRequest(store, c);
+		const body = await c.req.json().catch(() => ({}));
+		const format = body.format as MemberImportFormat | undefined;
+		if (format !== "json" && format !== "csv") {
+			throw new ClearanceError({
+				code: "MEMBER_IMPORT_FORMAT_REQUIRED",
+				message: "Member import format must be json or csv",
+				stage: "orgs.members.import",
+				status: 400,
+				remediation: "Send format as json or csv.",
+			});
+		}
+		if (typeof body.content !== "string") {
+			throw new ClearanceError({
+				code: "MEMBER_IMPORT_CONTENT_REQUIRED",
+				message: "Member import content is required",
+				stage: "orgs.members.import",
+				status: 400,
+				remediation: "Send the local file contents in the authenticated request.",
+			});
+		}
+		const plan = planMemberImport(store, {
+			organizationId: c.req.param("id"),
+			content: body.content,
+			format,
+		});
+		if (body.dryRun === true || body.confirm !== true) {
+			return c.json({ dryRun: true, ...plan, scope });
+		}
+		const result = await executeMemberImportPlan(plan, async (row) => {
+			const membership = process.env.DATABASE_URL
+				? await addMemberInAuth(store, {
+						organizationId: plan.organizationId,
+						principalId: row.principalId,
+						role: row.role,
+						source: "import",
+						actor: "api",
+						auditSource: "import",
+						scope,
+					})
+				: addMember(store, {
+						organizationId: plan.organizationId,
+						principalId: row.principalId,
+						role: row.role,
+						source: "import",
+						actor: "api",
+						auditSource: "import",
+						scope,
+					});
+			await store.ready();
+			return membership;
+		});
+		return c.json({ ...result, scope });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
 app.patch("/v1/organizations/:id/members/:memberId", async (c) => {
 	try {
 		const store = await storeForRequest();
@@ -1729,10 +1846,14 @@ app.get("/v1/events", async (c) => {
 		const scope = scopeForRequest(store, c);
 		const limitRaw = c.req.query("limit");
 		const cursor = c.req.query("cursor");
+		const action = c.req.query("action");
+		const organizationId = c.req.query("organizationId");
 		const page = listEventsPage(store, {
 			scope,
 			...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
 			...(cursor !== undefined ? { cursor } : {}),
+			...(action !== undefined ? { action } : {}),
+			...(organizationId !== undefined ? { organizationId } : {}),
 		});
 		return c.json({ events: page.events, nextCursor: page.nextCursor, scope });
 	} catch (e) {
@@ -1941,6 +2062,13 @@ app.post("/v1/sessions/:id/revoke", async (c) => {
 	try {
 		const store = await storeForRequest();
 		const scope = scopeForRequest(store, c);
+		const body = await c.req.json().catch(() => ({}));
+		if (body.dryRun === true) {
+			const session = process.env.DATABASE_URL
+				? await inspectSessionInAuth(store, c.req.param("id"), { scope })
+				: inspectSession(store, c.req.param("id"), { scope });
+			return c.json({ dryRun: true, session, wouldChange: session.status === "active", scope });
+		}
 		const result = process.env.DATABASE_URL
 			? await (async () => {
 					await ensureAuthMigrated();
@@ -2106,7 +2234,7 @@ app.post("/v1/config/validate", async (c) => {
 		const request = await c.req.json().catch(() => ({}));
 		const candidate = request.config ?? store.snapshot.meta.config;
 		validateConfig(store, candidate);
-		return c.json({ ok: true, ...publicConfig(candidate), scope });
+		return c.json({ ok: true, source: request.config === undefined ? "current" : "candidate", ...publicConfig(candidate), scope });
 	} catch (e) {
 		return handleError(c, e);
 	}
@@ -2160,6 +2288,19 @@ app.patch("/v1/sso/:id", async (c) => {
 		const store = await storeForRequest();
 		const scope = scopeForRequest(store, c);
 		const request = await c.req.json().catch(() => ({}));
+		if (request.dryRun === true) {
+			const current = inspectSsoConnection(store, c.req.param("id"), { scope });
+			return c.json({
+				dryRun: true,
+				connection: current,
+				proposed: {
+					issuer: request.issuer ?? current.issuer,
+					audience: request.audience ?? current.audience,
+					domains: request.domain ? [request.domain] : request.domains ?? current.domains,
+				},
+				scope,
+			});
+		}
 		const connection = configureSsoConnection(store, c.req.param("id"), {
 			issuer: request.issuer,
 			audience: request.audience,
@@ -2401,14 +2542,16 @@ app.post("/v1/scim/traces/:traceId/replay", async (c) => {
 	try {
 		const store = await storeForRequest();
 		const scope = scopeForRequest(store, c);
+		const body = await c.req.json().catch(() => ({}));
+		const dryRun = body.dryRun === true || body.confirm !== true;
 		const result = replayDiagnosticTrace(store, c.req.param("traceId"), {
-			dryRun: false,
-			confirm: true,
+			dryRun,
+			confirm: body.confirm === true && !dryRun,
 			actor: "api",
 			source: "api",
 			scope,
 		});
-		await store.ready();
+		if (!result.dryRun) await store.ready();
 		return c.json(result);
 	} catch (e) {
 		return handleError(c, e);
@@ -2438,6 +2581,334 @@ app.get("/v1/readiness/:orgId", async (c) => {
 		inspectOrganization(store, c.req.param("orgId"), scope);
 		const report = getLatestReadiness(store, c.req.param("orgId"));
 		return c.json({ report });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/backups", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		if (body.dir !== undefined) {
+			throw new ClearanceError({
+				code: "BACKUP_DIRECTORY_SERVER_MANAGED",
+				message: "Backup storage is configured by the API deployment",
+				stage: "backup.create",
+				status: 400,
+				remediation: "Set CLEARANCE_BACKUP_DIR on the API and mount durable storage there.",
+			});
+		}
+		const configuredDirectory = process.env.CLEARANCE_BACKUP_DIR?.trim();
+		if (process.env.NODE_ENV === "production" && !configuredDirectory) {
+			throw new ClearanceError({
+				code: "BACKUP_DIRECTORY_NOT_CONFIGURED",
+				message: "The API backup directory is not configured",
+				stage: "backup.create",
+				status: 503,
+				remediation: "Set CLEARANCE_BACKUP_DIR and mount durable backup storage before retrying.",
+			});
+		}
+		const backup = process.env.DATABASE_URL
+			? createPostgresBackup(store, configuredDirectory || undefined)
+			: createBackup(store, configuredDirectory || undefined);
+		await store.ready();
+		return c.json({ backup }, 201);
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/backups/:id/verify", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const backup = process.env.DATABASE_URL
+			? await verifyPostgresBackup(store, c.req.param("id"))
+			: verifyBackup(store, c.req.param("id"));
+		await store.ready();
+		return c.json({ backup });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/backups/:id/restore", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		if (body.confirm !== true) {
+			throw new ClearanceError({
+				code: "BACKUP_RESTORE_CONFIRM_REQUIRED",
+				message: "Backup restore requires explicit confirmation",
+				stage: "backup.restore",
+				status: 400,
+				remediation: "Verify the backup first, then send confirm as true.",
+			});
+		}
+		const target = typeof body.target === "string" ? body.target : undefined;
+		const result = process.env.DATABASE_URL
+			? await restorePostgresBackup(store, c.req.param("id"), target)
+			: (() => {
+					if (!target) {
+						throw new ClearanceError({
+							code: "BACKUP_RESTORE_TARGET_REQUIRED",
+							message: "A restore target is required for the development store",
+							stage: "backup.restore",
+							status: 400,
+							remediation: "Send an isolated target path.",
+						});
+					}
+					return restoreBackup(store, c.req.param("id"), target);
+				})();
+		await store.ready();
+		return c.json(result);
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.get("/v1/upgrades/check", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const result = process.env.DATABASE_URL
+			? await upgradeCheckWithDb(store)
+			: upgradeCheck(store);
+		await store.ready();
+		return c.json(result);
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/upgrades/plan", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		return c.json(await planUpgrade({
+			target: typeof body.target === "string" ? body.target : undefined,
+			dir: typeof body.dir === "string" ? body.dir : undefined,
+			current: typeof body.current === "string" ? body.current : undefined,
+			dryRun: body.dryRun === true,
+		}));
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/upgrades/apply", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		return c.json(await applyUpgrade({
+			plan: typeof body.plan === "string" ? body.plan : undefined,
+			dir: typeof body.dir === "string" ? body.dir : undefined,
+			dryRun: body.dryRun === true,
+			yes: body.confirm === true,
+		}));
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/upgrades/verify", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		return c.json(await verifyUpgrade({
+			plan: typeof body.plan === "string" ? body.plan : undefined,
+			dir: typeof body.dir === "string" ? body.dir : undefined,
+			healthUrl: typeof body.healthUrl === "string" ? body.healthUrl : undefined,
+			dryRun: body.dryRun === true,
+		}));
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/upgrades/rollback", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		return c.json(await rollbackUpgrade({
+			plan: typeof body.plan === "string" ? body.plan : undefined,
+			dir: typeof body.dir === "string" ? body.dir : undefined,
+			dryRun: body.dryRun === true,
+			yes: body.confirm === true,
+			restoreActive: body.restoreActive === true,
+			confirm: typeof body.activeDatabaseConfirmation === "string"
+				? body.activeDatabaseConfirmation
+				: undefined,
+			backupDir: typeof body.backupDir === "string" ? body.backupDir : undefined,
+		}));
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.get("/v1/schema/status", async (c) => {
+	try {
+		const store = await storeForRequest();
+		return c.json({
+			management: {
+				schemaVersion: store.snapshot.meta.schemaVersion,
+				releaseVersion: store.snapshot.releaseVersion,
+				initializedAt: store.snapshot.meta.initializedAt,
+			},
+			runtime: await getRuntimeSchemaStatus(),
+		});
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/schema/generate", async (c) => {
+	try {
+		const plan = await planRuntimeSchema("schema.generate");
+		return c.json({ kind: "schema.generate", ...plan });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/schema/migrate", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		const dryRun = body.dryRun === true;
+		if (!dryRun && body.confirm !== true) {
+			throw new ClearanceError({
+				code: "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED",
+				message: "Schema migration requires explicit confirmation",
+				stage: "schema.migrate",
+				status: 400,
+				remediation: "Review a dry run, then send confirm as true.",
+			});
+		}
+		return c.json(await migrateRuntimeSchema({ dryRun }));
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+function migrationFixture(body: Record<string, unknown>) {
+	if (!("fixture" in body)) {
+		throw new ClearanceError({
+			code: "CLEARANCE_IMPORT_FIXTURE_REQUIRED",
+			message: "A legacy migration fixture is required",
+			stage: "import.legacy.fixture",
+			status: 400,
+			remediation: "Send the validated fixture in the authenticated request body.",
+		});
+	}
+	return parseLegacyFixture(body.fixture);
+}
+
+app.post("/v1/import/legacy", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		const fixture = migrationFixture(body);
+		const preview = previewMigration(store, fixture);
+		if (body.dryRun === true || body.confirm !== true) {
+			return c.json({
+				schemaVersion: "v1",
+				dryRun: true,
+				source: "legacy",
+				preview,
+				storeBackend: store.backend,
+			});
+		}
+		const planned = planMigration(store, fixture);
+		await store.ready();
+		await store.refresh();
+		await runMigrationDurable(store, planned.id, fixture);
+		const verification = await verifyMigrationDurable(store, planned.id, fixture);
+		await store.ready();
+		return c.json({
+			schemaVersion: "v1",
+			dryRun: false,
+			source: "legacy",
+			migration: verification.plan,
+			preview,
+			verification: {
+				reconciled: verification.reconciled,
+				expected: verification.expected,
+				actual: verification.actual,
+			},
+			storeBackend: store.backend,
+		});
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/migrations/plan", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		if (body.source !== "legacy") {
+			throw new ClearanceError({
+				code: "CLEARANCE_IMPORT_SOURCE_INVALID",
+				message: "Only legacy imports are supported",
+				stage: "migration.plan",
+				status: 400,
+				remediation: "Send source as legacy.",
+			});
+		}
+		const plan = planMigration(store, migrationFixture(body));
+		await store.ready();
+		return c.json({ plan });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/migrations/:id/run", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		const plan = await runMigrationDurable(store, c.req.param("id"), migrationFixture(body), {
+			dryRun: body.dryRun === true,
+		});
+		await store.ready();
+		return c.json({ plan });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/migrations/:id/verify", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		const result = await verifyMigrationDurable(store, c.req.param("id"), migrationFixture(body));
+		await store.ready();
+		return c.json(result);
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.post("/v1/migrations/:id/rollback", async (c) => {
+	try {
+		const store = await storeForRequest();
+		const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+		if (body.confirm !== true) {
+			throw new ClearanceError({
+				code: "MIGRATION_ROLLBACK_CONFIRM_REQUIRED",
+				message: "Migration rollback requires explicit confirmation",
+				stage: "migration.rollback",
+				status: 400,
+				remediation: "Review the plan, then send confirm as true.",
+			});
+		}
+		const plan = await rollbackMigrationDurable(store, c.req.param("id"), migrationFixture(body));
+		await store.ready();
+		return c.json({ plan });
+	} catch (e) {
+		return handleError(c, e);
+	}
+});
+
+app.get("/v1/migrations/:id", async (c) => {
+	try {
+		const store = await storeForRequest();
+		return c.json({ plan: migrationStatus(store, c.req.param("id")) });
 	} catch (e) {
 		return handleError(c, e);
 	}

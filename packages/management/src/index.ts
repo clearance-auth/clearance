@@ -50,6 +50,7 @@ export * from "./services/readiness.js";
 export * from "./services/migration.js";
 export * from "./services/migration-postgres.js";
 export * from "./services/runtime-schema.js";
+export * from "./services/upgrade.js";
 export * from "./services/backup.js";
 export * from "./services/backup-pg.js";
 export * from "./services/fixtures.js";

@@ -7,7 +7,7 @@ image:
   # Required immutable digest from the signed release bundle (sha256:...).
   digest: ""
   # Informational release version; workloads deploy repository@digest.
-  tag: "0.1.4"
+  tag: "0.2.0"
   pullPolicy: IfNotPresent
 replicaCount: 2
 revisionHistoryLimit: 5
@@ -95,7 +95,7 @@ backup:
     # Required when backup.enabled=true.
     repository: ""
     digest: ""
-    tag: "0.1.4"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   schedule: "0 * * * *"
   concurrencyPolicy: Forbid
@@ -107,6 +107,8 @@ backup:
   databaseUrlKey: database-url
   copyCommandKey: backup-copy-command
   existingClaim: ""
+  # The API and scheduled backup job share artifacts; use a multi-writer claim.
+  accessModes: [ReadWriteMany]
   storageClassName: ""
   storageSize: 20Gi
   resources:

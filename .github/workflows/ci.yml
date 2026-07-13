@@ -90,9 +90,26 @@ jobs:
       - name: Pack smoke
         run: pnpm smoke:pack
 
+  terraform:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.5.7
+          terraform_wrapper: false
+
+      - name: Verify Terraform profile
+        run: bash scripts/verify-terraform.sh
+
   ci:
     runs-on: ubuntu-latest
-    needs: [typecheck, test]
+    needs: [typecheck, test, terraform]
     if: always()
     steps:
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2

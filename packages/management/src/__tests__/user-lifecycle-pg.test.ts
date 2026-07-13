@@ -14,6 +14,7 @@ import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import {
 	createUserInAuth,
+	createUserWithPasswordSetupInAuth,
 	deleteUserInAuth,
 	disableUserInAuth,
 	resetAuthBundle,
@@ -243,6 +244,43 @@ describe.skipIf(!available)("user lifecycle Postgres runtime + management", () =
 			body: { email, password },
 		});
 	}
+
+	it("passwordless provisioning returns an expiring single-use setup token, never a sign-in credential", async () => {
+		const store = await freshStore();
+		const email = `setup-${Date.now()}@lifecycle.test`;
+		const provisioned = await createUserWithPasswordSetupInAuth({
+			email,
+			name: "Setup User",
+			managementStore: store,
+		});
+		trackRuntimeUser(provisioned.user);
+
+		expect(provisioned.passwordSetup.token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+		const expiresAt = new Date(provisioned.passwordSetup.expiresAt).getTime();
+		expect(expiresAt).toBeGreaterThan(Date.now());
+		expect(expiresAt).toBeLessThanOrEqual(Date.now() + 60 * 60 * 1000);
+		await expect(signIn(email, provisioned.passwordSetup.token)).rejects.toMatchObject({
+			status: "UNAUTHORIZED",
+		});
+
+		const newPassword = "CallerChosenSetup1!";
+		const b = getAuthBundle();
+		await expect(b.auth.api.resetPassword({
+			body: {
+				newPassword,
+				token: provisioned.passwordSetup.token,
+			},
+		})).resolves.toEqual({ status: true });
+		await expect(b.auth.api.resetPassword({
+			body: {
+				newPassword: "SecondAttemptSetup1!",
+				token: provisioned.passwordSetup.token,
+			},
+		})).rejects.toBeTruthy();
+		await expect(signIn(email, newPassword)).resolves.toMatchObject({
+			user: { id: provisioned.user.id, email },
+		});
+	});
 
 	it("update parity: same id/name/email in runtime and management", async () => {
 		const store = await freshStore();

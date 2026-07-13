@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+import { authenticatedApiEnv, stopAuthenticatedApiServers } from "./api-test-server.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const entry = join(root, "dist", "index.js");
@@ -23,7 +24,7 @@ function run(args: string[], dataPath: string): { stdout: string; status: number
 				env: {
 					...process.env,
 					DATABASE_URL: "",
-					CLEARANCE_LOCAL_DIRECT: "1",
+					...authenticatedApiEnv(dataPath),
 					CLEARANCE_SECRET: "unit-test-secret-value-not-default!!",
 					CLEARANCE_BASE_URL: "http://localhost:3000",
 					CLEARANCE_CREDENTIAL_KEY: "unit-test-credential-key-material-32b!!",
@@ -40,6 +41,7 @@ function run(args: string[], dataPath: string): { stdout: string; status: number
 }
 
 afterAll(() => {
+	stopAuthenticatedApiServers();
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 

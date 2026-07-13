@@ -174,7 +174,8 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
+import net from "node:net";
+import { spawn, spawnSync } from "node:child_process";
 
 const consumerRoot = process.cwd();
 const monorepoRoot = process.env.ROOT_FOR_CHECK || "";
@@ -268,7 +269,29 @@ const { JsonStore } = management;
 const client = await import("@clearance/auth/client");
 const node = await import("@clearance/auth/node");
 
-// API public entry (side-effect free unless executed as main).
+const apiPort = await new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once("error", reject);
+  probe.listen(0, "127.0.0.1", () => {
+    const address = probe.address();
+    const selected = typeof address === "object" && address ? address.port : 0;
+    probe.close((error) => error ? reject(error) : resolve(selected));
+  });
+});
+const packedApiDir = fs.mkdtempSync(path.join(os.tmpdir(), "clearance-packed-api-"));
+const packedOperatorToken = "packed-operator-token-value-32-chars";
+process.env.DATABASE_URL = "";
+process.env.CLEARANCE_DATA_PATH = path.join(packedApiDir, "data.json");
+process.env.CLEARANCE_API_PORT = String(apiPort);
+process.env.CLEARANCE_OPERATOR_TOKEN = packedOperatorToken;
+process.env.CLEARANCE_SECRET = "packed-clearance-secret-value-32-chars";
+process.env.CLEARANCE_BASE_URL = `http://127.0.0.1:${apiPort}`;
+process.env.CLEARANCE_CREDENTIAL_KEY = "packed-credential-key-value-32-chars";
+process.env.CLEARANCE_CREDENTIAL_KEY_ID = "packed-k1";
+process.env.CLEARANCE_CORS_ORIGINS = "http://localhost:3100";
+process.env.NODE_ENV = "development";
+
+// API public entry and the installed CLI-to-API execution path.
 const api = await import("@clearance/api");
 
 const checks = [
@@ -323,9 +346,54 @@ if (!/Clearance CLI/i.test(help.stdout)) {
 // Execute an operational command from the installed tarball. This must use
 // packaged scripts; the consumer has no monorepo scripts directory.
 const upgradeDir = fs.mkdtempSync(path.join(os.tmpdir(), "clearance-packed-upgrade-"));
+const cliEnv = {
+  ...process.env,
+  NODE_PATH: "",
+  DATABASE_URL: "",
+  CLEARANCE_OPERATOR_TOKEN: packedOperatorToken,
+  CLEARANCE_API_URL: `http://127.0.0.1:${apiPort}`,
+};
+const apiPkgDir = path.dirname(packageJsonPath("@clearance/api"));
+const apiEntry = path.join(apiPkgDir, "dist", "server.js");
+assertUnderConsumer("clearance.api.bin", apiEntry);
+const apiProcess = spawn(process.execPath, [apiEntry], {
+  env: cliEnv,
+  cwd: consumerRoot,
+  stdio: ["ignore", "ignore", "ignore"],
+});
+let apiReady = false;
+for (let attempt = 0; attempt < 100; attempt += 1) {
+  if (apiProcess.exitCode !== null) break;
+  try {
+    const response = await fetch(`http://127.0.0.1:${apiPort}/health`);
+    if (response.ok) { apiReady = true; break; }
+  } catch {
+    // The child is still starting.
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+if (!apiReady) {
+  apiProcess.kill("SIGTERM");
+  console.error("SMOKE_IMPORT_FAILED: packed Clearance API failed to start");
+  process.exit(1);
+}
+const initialize = spawnSync(process.execPath, [
+  clearanceBin,
+  "--json",
+  "init",
+  "--name",
+  "packed-consumer",
+], {
+  encoding: "utf8",
+  env: cliEnv,
+  cwd: consumerRoot,
+});
+if (initialize.status !== 0) {
+  console.error("SMOKE_IMPORT_FAILED: packed clearance init failed", initialize.stderr || initialize.stdout);
+  process.exit(1);
+}
 const upgradePlan = spawnSync(process.execPath, [
   clearanceBin,
-  "--local-direct",
   "--json",
   "upgrade",
   "plan",
@@ -337,7 +405,7 @@ const upgradePlan = spawnSync(process.execPath, [
   upgradeDir,
 ], {
 	encoding: "utf8",
-	env: { ...process.env, NODE_PATH: "", DATABASE_URL: "" },
+	env: cliEnv,
   cwd: consumerRoot,
 });
 if (upgradePlan.status !== 0) {
@@ -365,6 +433,7 @@ const preflight = spawnSync("bash", [
   cwd: consumerRoot,
   env: {
     ...process.env,
+    NODE_ENV: "production",
     CLEARANCE_STRICT_SECRETS: "1",
     CLEARANCE_ALLOW_LOCALHOST_PRODUCTION: "1",
     CLEARANCE_OPERATOR_TOKEN: "packed-operator-token-value-32-chars",
@@ -396,6 +465,9 @@ if (preflight.status !== 0 || !preflight.stdout.includes("PREFLIGHT_OK=1")) {
   console.error("SMOKE_IMPORT_FAILED: packed strict upgrade preflight failed", preflight.stderr || preflight.stdout);
   process.exit(1);
 }
+apiProcess.kill("SIGTERM");
+await new Promise((resolve) => apiProcess.once("exit", resolve));
+fs.rmSync(packedApiDir, { recursive: true, force: true });
 fs.rmSync(upgradeDir, { recursive: true, force: true });
 
 // Prove installed package.json has no workspace leftovers.

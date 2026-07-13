@@ -389,8 +389,16 @@ export async function runDoctor(
 	}
 
 	for (const [id, label, url] of [
-		["api-health", "Management API", secrets.CLEARANCE_API_URL],
-		["console-health", "Console", secrets.CLEARANCE_CONSOLE_URL],
+		[
+			"api-health",
+			"Management API",
+			secrets.CLEARANCE_API_HEALTH_URL ?? secrets.CLEARANCE_API_URL,
+		],
+		[
+			"console-health",
+			"Console",
+			secrets.CLEARANCE_CONSOLE_HEALTH_URL ?? secrets.CLEARANCE_CONSOLE_URL,
+		],
 	] as const) {
 		if (!url) continue;
 		let healthUrl: string;

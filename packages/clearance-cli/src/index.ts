@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -34,6 +33,7 @@ import {
 	upgradeCheckWithDb,
 	createUser,
 	createUserInAuth,
+	createUserWithPasswordSetupInAuth,
 	configureSsoConnection,
 	closeAuthBundle,
 	deleteUser,
@@ -142,7 +142,6 @@ import { resolveApiSession } from "./api-client.js";
 import {
 	commandPath,
 	dispatchRemoteCommand,
-	isHostLocalCommand,
 } from "./remote-dispatch.js";
 
 const VERSION = (
@@ -159,7 +158,6 @@ function globals(cmd: Command): GlobalOpts {
 		yes: Boolean(opts.yes),
 		dryRun: Boolean(opts.dryRun),
 		dataPath: opts.dataPath as string | undefined,
-		localDirect: Boolean(opts.localDirect) || process.env.CLEARANCE_LOCAL_DIRECT === "1",
 		profile: opts.profile as string | undefined,
 		apiUrl: opts.apiUrl as string | undefined,
 	};
@@ -295,30 +293,20 @@ async function main() {
 		.option("--dry-run", "Preview mutations", false)
 		.option("--data-path <path>", "Path to Clearance data store")
 		.option("--profile <name>", "Saved API profile")
-		.option("--api-url <url>", "Clearance management API origin override")
-		.option("--local-direct", "Explicitly operate the local JSON/Postgres store (development and host operations only)", false);
+		.option("--api-url <url>", "Clearance management API origin override");
 
 	program.hook("preAction", async (_root, actionCommand) => {
 		const g = globals(actionCommand);
 		try {
 			const path = commandPath(actionCommand);
 			if (path === "login" || path === "logout" || path === "whoami") return;
-			if (g.localDirect) return;
-			if (isHostLocalCommand(path)) {
-				throw new ClearanceError({
-					code: "CLI_LOCAL_DIRECT_REQUIRED",
-					message: `${path} is an explicitly host-local workflow.`,
-					stage: "cli.dispatch",
-					remediation: "Rerun with --local-direct after confirming the selected host and database.",
-				});
-			}
 			const session = await resolveApiSession({ profile: g.profile, apiUrl: g.apiUrl });
 			if (!session) {
 				throw new ClearanceError({
 					code: "CLI_LOGIN_REQUIRED",
 					message: "An authenticated Clearance API profile is required.",
 					stage: "cli.dispatch",
-					remediation: "Run clearance login --profile <name>, or choose --local-direct for local development.",
+					remediation: "Run clearance login --profile <name> for the intended API origin.",
 				});
 			}
 			const result = await dispatchRemoteCommand(
@@ -613,7 +601,7 @@ async function main() {
 		.command("create")
 		.requiredOption("--email <email>")
 		.requiredOption("--name <name>")
-		.option("--password <password>", "Initial password; generated and returned once when omitted")
+		.option("--password <password>", "Explicit initial password; omitted creates an expiring single-use setup token")
 		.action(async (opts, cmd) => {
 			const g = globals(cmd);
 			try {
@@ -623,31 +611,41 @@ async function main() {
 					return;
 				}
 				await store.refresh();
-				const generatedPassword = opts.password
-					? undefined
-					: `Tmp!${randomBytes(18).toString("base64url")}aA1`;
-				const password = opts.password ?? generatedPassword;
-				const user = process.env.DATABASE_URL
-					? await createUserInAuth({
-							email: opts.email,
-							name: opts.name,
-							password,
-							managementStore: store,
-					  })
-					: createUser(store, {
+				const provisioned = process.env.DATABASE_URL
+					? typeof opts.password === "string" && opts.password.length > 0
+						? {
+								user: await createUserInAuth({
+									email: opts.email,
+									name: opts.name,
+									password: opts.password,
+									managementStore: store,
+								}),
+								passwordSetup: undefined,
+							}
+						: await createUserWithPasswordSetupInAuth({
+								email: opts.email,
+								name: opts.name,
+								managementStore: store,
+							})
+					: { user: createUser(store, {
 							email: opts.email,
 							name: opts.name,
 							source: "cli",
-					  });
+					  }), passwordSetup: undefined };
 				await flushStore(store);
 				printResult(
 					g,
 					{
-						user,
-						...(generatedPassword ? { temporaryPassword: generatedPassword } : {}),
+						user: provisioned.user,
+						...(provisioned.passwordSetup
+							? {
+									passwordSetupToken: provisioned.passwordSetup.token,
+									passwordSetupExpiresAt: provisioned.passwordSetup.expiresAt,
+								}
+							: {}),
 						storeBackend: store.backend,
 					},
-					`Created ${user.email} (${user.id})`,
+					`Created ${provisioned.user.email} (${provisioned.user.id})`,
 				);
 			} catch (e) {
 				fail(e, g);
@@ -2716,12 +2714,13 @@ async function main() {
 					}, `operator ${whoami.projectId}/${whoami.environmentId} via ${via} (${session.apiUrl})`);
 					return;
 				}
-				printResult(g, {
-					authenticated: false,
-					mode: "local-direct",
-					credentialSource: "none",
-					storeBackend: process.env.DATABASE_URL ? "postgres" : "json",
-				}, "Local direct mode; no remote operator credential is configured.");
+				throw new ClearanceError({
+					code: "CLI_LOGIN_REQUIRED",
+					message: "No authenticated Clearance API profile is configured.",
+					stage: "cli.auth",
+					status: 401,
+					remediation: "Run clearance login --profile <name> for the intended API origin.",
+				});
 			} catch (e) {
 				fail(e, g);
 			}

@@ -154,9 +154,11 @@ function extractAssertionId(samlContent: string): string | null {
 		const parsed = parser.parse(samlContent);
 
 		const response = parsed.Response || parsed["samlp:Response"];
-		if (!response) return null;
-
-		const rawAssertion = response.Assertion || response["saml:Assertion"];
+		const rawAssertion =
+			response?.Assertion ||
+			response?.["saml:Assertion"] ||
+			parsed.Assertion ||
+			parsed["saml:Assertion"];
 		const assertion = Array.isArray(rawAssertion)
 			? rawAssertion[0]
 			: rawAssertion;
@@ -166,6 +168,23 @@ function extractAssertionId(samlContent: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Requires the stable assertion identifier used to reserve replay tombstones.
+ * Accepting an assertion without one would make repeat submissions impossible
+ * to distinguish, so the authentication flow must fail closed.
+ */
+export function requireSAMLAssertionId(samlContent: string): string {
+	const assertionId = extractAssertionId(samlContent);
+	if (!assertionId) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML assertion must include an ID for replay protection",
+			code: "SAML_ASSERTION_ID_REQUIRED",
+		});
+	}
+
+	return assertionId;
 }
 
 export interface SAMLResponseParams {
@@ -433,49 +452,38 @@ export async function processSAMLResponse(
 	// and proceeds, every later caller (including a concurrent submission) finds
 	// the row already present and is rejected. The deterministic primary key is
 	// the gate, so no separate find/expiry check is needed.
-	const assertionId = extractAssertionId(samlBindingContent);
+	const assertionId = requireSAMLAssertionId(samlBindingContent);
+	const issuer = idp.entityMeta.getEntityID();
+	const conditions = (extract as SAMLAssertionExtract).conditions as
+		| SAMLConditions
+		| undefined;
+	const clockSkew = options?.saml?.clockSkew ?? constants.DEFAULT_CLOCK_SKEW_MS;
+	const expiresAt = conditions?.notOnOrAfter
+		? new Date(conditions.notOnOrAfter).getTime() + clockSkew
+		: Date.now() + constants.DEFAULT_ASSERTION_TTL_MS;
 
-	if (assertionId) {
-		const issuer = idp.entityMeta.getEntityID();
-		const conditions = (extract as SAMLAssertionExtract).conditions as
-			| SAMLConditions
-			| undefined;
-		const clockSkew =
-			options?.saml?.clockSkew ?? constants.DEFAULT_CLOCK_SKEW_MS;
-		const expiresAt = conditions?.notOnOrAfter
-			? new Date(conditions.notOnOrAfter).getTime() + clockSkew
-			: Date.now() + constants.DEFAULT_ASSERTION_TTL_MS;
+	const reserved = await ctx.context.internalAdapter.reserveVerificationValue({
+		identifier: `${constants.USED_ASSERTION_KEY_PREFIX}${assertionId}`,
+		value: JSON.stringify({
+			assertionId,
+			issuer,
+			providerId,
+			usedAt: Date.now(),
+			expiresAt,
+		}),
+		expiresAt: new Date(expiresAt),
+	});
 
-		const reserved = await ctx.context.internalAdapter.reserveVerificationValue(
-			{
-				identifier: `${constants.USED_ASSERTION_KEY_PREFIX}${assertionId}`,
-				value: JSON.stringify({
-					assertionId,
-					issuer,
-					providerId,
-					usedAt: Date.now(),
-					expiresAt,
-				}),
-				expiresAt: new Date(expiresAt),
-			},
+	if (!reserved) {
+		ctx.context.logger.error(
+			"SAML assertion replay detected: assertion ID already used",
+			{ assertionId, issuer, providerId },
 		);
-
-		if (!reserved) {
-			ctx.context.logger.error(
-				"SAML assertion replay detected: assertion ID already used",
-				{ assertionId, issuer, providerId },
-			);
-			throw ctx.redirect(
-				buildSAMLRedirectUrl(samlRedirectUrl, {
-					error: "replay_detected",
-					error_description: "SAML assertion has already been used",
-				}),
-			);
-		}
-	} else {
-		ctx.context.logger.warn(
-			"Could not extract assertion ID for replay protection",
-			{ providerId },
+		throw ctx.redirect(
+			buildSAMLRedirectUrl(samlRedirectUrl, {
+				error: "replay_detected",
+				error_description: "SAML assertion has already been used",
+			}),
 		);
 	}
 

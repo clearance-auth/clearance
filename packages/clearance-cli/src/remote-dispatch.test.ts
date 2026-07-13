@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	classifyCommandPath,
 	dispatchRemoteCommand,
-	HOST_LOCAL_COMMANDS,
 } from "./remote-dispatch.js";
 import type { ApiSession } from "./api-client.js";
 
@@ -18,7 +17,6 @@ afterEach(() => vi.unstubAllGlobals());
 function children(path: string[]): string[] {
 	const help = execFileSync(process.execPath, [entry, ...path, "--help"], {
 		encoding: "utf8",
-		env: { ...process.env, CLEARANCE_LOCAL_DIRECT: "1" },
 	});
 	const commands = help.split("\n").slice(help.split("\n").findIndex((line) => line === "Commands:") + 1);
 	const names: string[] = [];
@@ -42,18 +40,13 @@ function leafCommands(path: string[] = []): string[] {
 }
 
 describe("CLI transport parity", () => {
-	it("classifies every leaf command as API-backed, authenticated, or explicitly host-local", () => {
+	it("classifies every leaf command as API-backed or authentication-only", () => {
 		const leaves = leafCommands();
 		const unavailable = leaves.filter((path) => classifyCommandPath(path) === "unavailable");
 		expect(unavailable).toEqual([]);
 		expect(leaves.length).toBeGreaterThan(50);
-	});
-
-	it("documents why each host-local exception cannot use ordinary management API dispatch", () => {
-		for (const [path, reason] of HOST_LOCAL_COMMANDS) {
-			expect(path).toBeTruthy();
-			expect(reason.length).toBeGreaterThan(20);
-		}
+		expect(leaves.filter((path) => classifyCommandPath(path) === "remote-api").length)
+			.toBe(leaves.length - 3);
 	});
 
 	it("preserves optional-id and replay apply semantics", async () => {
@@ -82,6 +75,22 @@ describe("CLI transport parity", () => {
 		await dispatchRemoteCommand(session, "sso rotate", ["sso_1"], {}, { dryRun: true });
 		await dispatchRemoteCommand(session, "scim rotate", ["scim_1"], {}, { dryRun: true });
 		for (const [, init] of calls) expect(JSON.parse(String(init.body)).dryRun).toBe(true);
+	});
+
+	it("uses server-managed backup storage and rejects host paths", async () => {
+		const fetchMock = vi.fn(async () =>
+			new Response(JSON.stringify({ backup: { id: "bak_1" } }), { status: 201 }),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		await expect(
+			dispatchRemoteCommand(session, "backup create", [], { dir: "/host/backups" }, {}),
+		).rejects.toMatchObject({ code: "BACKUP_DIRECTORY_SERVER_MANAGED" });
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		await dispatchRemoteCommand(session, "backup create", [], {}, {});
+		expect(fetchMock).toHaveBeenCalledOnce();
+		expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.clearance.test/v1/backups");
+		expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({});
 	});
 
 	it.each(["sso test", "scim test"])("rejects %s --live with --dry-run before issuing a request", async (path) => {

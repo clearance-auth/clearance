@@ -1,6 +1,6 @@
 {
   "name": "@clearance/management",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Clearance management plane — services, diagnostics, migration, backup on real auth runtime",
   "type": "module",
   "license": "MIT",
@@ -15,7 +15,7 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && node scripts/stage-ops.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

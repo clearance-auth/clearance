@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = "= 1.5.7"
   required_providers {
     docker = {
       source  = "kreuzwerker/docker"
-      version = "~> 3.0"
+      version = "3.9.0"
     }
   }
 }
@@ -49,6 +49,10 @@ resource "docker_network" "clearance" {
 
 resource "docker_volume" "postgres" {
   name = var.postgres_volume_name
+}
+
+resource "docker_volume" "backups" {
+  name = var.backup_volume_name
 }
 
 resource "docker_image" "postgres" {
@@ -107,6 +111,9 @@ resource "docker_container" "api" {
     "CLEARANCE_CREDENTIAL_KEY_ID=${var.credential_key_id}",
     "CLEARANCE_BASE_URL=${local.sample_url}",
     "CLEARANCE_CONSOLE_URL=${local.console_url}",
+    "CLEARANCE_API_HEALTH_URL=http://127.0.0.1:3200",
+    "CLEARANCE_CONSOLE_HEALTH_URL=http://console:3100",
+    "CLEARANCE_BACKUP_DIR=/backups",
     "CLEARANCE_CORS_ORIGINS=${local.console_url},${local.sample_url}",
     "DATABASE_URL=${local.database_url}",
   ]
@@ -114,6 +121,11 @@ resource "docker_container" "api" {
   networks_advanced {
     name    = docker_network.clearance.name
     aliases = ["api"]
+  }
+
+  volumes {
+    volume_name    = docker_volume.backups.name
+    container_path = "/backups"
   }
 
   ports {
@@ -222,4 +234,8 @@ output "sample_url" {
 
 output "postgres_volume" {
   value = docker_volume.postgres.name
+}
+
+output "backup_volume" {
+  value = docker_volume.backups.name
 }

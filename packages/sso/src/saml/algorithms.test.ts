@@ -32,6 +32,36 @@ const deprecatedEncryptionXml = `
 </samlp:Response>
 `;
 
+const deprecatedKeyEncryptionXml = `
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
+	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
+			<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+			<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+				<xenc:EncryptedKey>
+					<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+				</xenc:EncryptedKey>
+			</ds:KeyInfo>
+		</xenc:EncryptedData>
+	</saml:EncryptedAssertion>
+</samlp:Response>
+`;
+
+const deprecatedDataEncryptionXml = `
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
+	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
+			<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#tripledes-cbc"/>
+			<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+				<xenc:EncryptedKey>
+					<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/>
+				</xenc:EncryptedKey>
+			</ds:KeyInfo>
+		</xenc:EncryptedData>
+	</saml:EncryptedAssertion>
+</samlp:Response>
+`;
+
 const plainAssertionXml = `
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
 	<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
@@ -51,16 +81,27 @@ describe("validateSAMLAlgorithms", () => {
 			).not.toThrow();
 		});
 
-		it("should warn by default for deprecated signature algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated signature algorithms by default", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
 					samlContent: plainAssertionXml,
 				}),
-			).not.toThrow();
+			).toThrow(/deprecated/i);
+		});
 
+		it("should warn for deprecated signature algorithms when opted in", () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			expect(() =>
+				alg.validateSAMLAlgorithms(
+					{
+						sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
+						samlContent: plainAssertionXml,
+					},
+					{ onDeprecated: "warn" },
+				),
+			).not.toThrow();
 			expect(warnSpy).toHaveBeenCalledWith(
 				expect.stringContaining("SAML Security Warning"),
 			);
@@ -135,17 +176,38 @@ describe("validateSAMLAlgorithms", () => {
 			).not.toThrow();
 		});
 
-		it("should warn by default for deprecated encryption algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated key encryption algorithms by default", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
-					samlContent: deprecatedEncryptionXml,
+					samlContent: deprecatedKeyEncryptionXml,
 				}),
+			).toThrow(/deprecated key encryption algorithm/i);
+		});
+
+		it("should reject deprecated data encryption algorithms by default", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
+					samlContent: deprecatedDataEncryptionXml,
+				}),
+			).toThrow(/deprecated data encryption algorithm/i);
+		});
+
+		it("should warn for deprecated encryption algorithms when opted in", () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			expect(() =>
+				alg.validateSAMLAlgorithms(
+					{
+						sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
+						samlContent: deprecatedEncryptionXml,
+					},
+					{ onDeprecated: "warn" },
+				),
 			).not.toThrow();
 
-			expect(warnSpy).toHaveBeenCalled();
+			expect(warnSpy).toHaveBeenCalledTimes(2);
 		});
 
 		it("should reject deprecated encryption with onDeprecated: reject", () => {
@@ -210,15 +272,23 @@ describe("validateConfigAlgorithms", () => {
 			).not.toThrow();
 		});
 
-		it("should warn by default for deprecated signature algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated signature algorithms by default", () => {
 			expect(() =>
 				alg.validateConfigAlgorithms({
 					signatureAlgorithm: alg.SignatureAlgorithm.RSA_SHA1,
 				}),
-			).not.toThrow();
+			).toThrow(/deprecated/i);
+		});
 
+		it("should warn for deprecated signature algorithms when opted in", () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			expect(() =>
+				alg.validateConfigAlgorithms(
+					{ signatureAlgorithm: alg.SignatureAlgorithm.RSA_SHA1 },
+					{ onDeprecated: "warn" },
+				),
+			).not.toThrow();
 			expect(warnSpy).toHaveBeenCalledWith(
 				expect.stringContaining("SAML Security Warning"),
 			);
@@ -291,18 +361,12 @@ describe("validateConfigAlgorithms", () => {
 			).toThrow(/not recognized/i);
 		});
 
-		it("should warn for deprecated short-form signature algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated short-form signature algorithms by default", () => {
 			expect(() =>
 				alg.validateConfigAlgorithms({
 					signatureAlgorithm: "rsa-sha1",
 				}),
-			).not.toThrow();
-
-			expect(warnSpy).toHaveBeenCalledWith(
-				expect.stringContaining("SAML Security Warning"),
-			);
+			).toThrow(/deprecated/i);
 		});
 
 		it("should support short-form names in signature allow-list", () => {
@@ -324,15 +388,23 @@ describe("validateConfigAlgorithms", () => {
 			).not.toThrow();
 		});
 
-		it("should warn by default for deprecated digest algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated digest algorithms by default", () => {
 			expect(() =>
 				alg.validateConfigAlgorithms({
 					digestAlgorithm: alg.DigestAlgorithm.SHA1,
 				}),
-			).not.toThrow();
+			).toThrow(/deprecated/i);
+		});
 
+		it("should warn for deprecated digest algorithms when opted in", () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			expect(() =>
+				alg.validateConfigAlgorithms(
+					{ digestAlgorithm: alg.DigestAlgorithm.SHA1 },
+					{ onDeprecated: "warn" },
+				),
+			).not.toThrow();
 			expect(warnSpy).toHaveBeenCalledWith(
 				expect.stringContaining("SAML Security Warning"),
 			);
@@ -380,18 +452,12 @@ describe("validateConfigAlgorithms", () => {
 			).toThrow(/not recognized/i);
 		});
 
-		it("should warn for deprecated short-form digest algorithms", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+		it("should reject deprecated short-form digest algorithms by default", () => {
 			expect(() =>
 				alg.validateConfigAlgorithms({
 					digestAlgorithm: "sha1",
 				}),
-			).not.toThrow();
-
-			expect(warnSpy).toHaveBeenCalledWith(
-				expect.stringContaining("SAML Security Warning"),
-			);
+			).toThrow(/deprecated/i);
 		});
 
 		it("should support short-form names in digest allow-list", () => {

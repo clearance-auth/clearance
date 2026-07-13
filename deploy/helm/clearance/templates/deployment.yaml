@@ -61,6 +61,10 @@ spec:
             periodSeconds: 20
           resources:
 {{ toYaml .Values.resources | indent 12 }}
+{{- if .Values.backup.enabled }}
+          volumeMounts:
+            - { name: backups, mountPath: /backups }
+{{- end }}
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -69,6 +73,16 @@ spec:
                   key: database-url
             - name: CLEARANCE_BASE_URL
               value: {{ required "env.CLEARANCE_BASE_URL is required" .Values.env.CLEARANCE_BASE_URL | quote }}
+            - name: CLEARANCE_API_HEALTH_URL
+              value: {{ printf "http://127.0.0.1:%v" .Values.service.port | quote }}
+{{- if .Values.console.enabled }}
+            - name: CLEARANCE_CONSOLE_HEALTH_URL
+              value: {{ printf "http://%s-console:%v" .Release.Name .Values.console.service.port | quote }}
+{{- end }}
+{{- if .Values.backup.enabled }}
+            - name: CLEARANCE_BACKUP_DIR
+              value: /backups
+{{- end }}
             - name: CLEARANCE_CORS_ORIGINS
               value: {{ required "env.CLEARANCE_CORS_ORIGINS is required" .Values.env.CLEARANCE_CORS_ORIGINS | quote }}
             - name: CLEARANCE_TRUSTED_PROXY
@@ -97,3 +111,9 @@ spec:
               value: "1"
             - name: NODE_ENV
               value: production
+{{- if .Values.backup.enabled }}
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: {{ .Values.backup.existingClaim | default (printf "%s-backups" .Release.Name) }}
+{{- end }}
