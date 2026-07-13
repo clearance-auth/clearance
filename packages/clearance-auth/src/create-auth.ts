@@ -7,7 +7,7 @@ import { scim } from "@clearance/scim";
 import { Kysely, PostgresDialect } from "kysely";
 import pg from "pg";
 
-export const CLEARANCE_AUTH_VERSION = "0.1.3";
+export const CLEARANCE_AUTH_VERSION = "0.1.4";
 export const RUNTIME_BASELINE = {
 	package: "@clearance/runtime",
 	version: "1.6.23",

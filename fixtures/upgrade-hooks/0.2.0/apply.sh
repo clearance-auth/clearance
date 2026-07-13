@@ -19,8 +19,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$PLAN" ]] || die "fixture upgrade plan is missing"
-[[ "$FROM" == "0.1.3" && "$TO" == "0.2.0" ]] \
-  || die "fixture hook only supports 0.1.3 to 0.2.0"
+[[ "$FROM" == "0.1.4" && "$TO" == "0.2.0" ]] \
+  || die "fixture hook only supports 0.1.4 to 0.2.0"
 
 require_pg_client
 URL="$(resolve_database_url)"

@@ -332,7 +332,7 @@ const upgradePlan = spawnSync(process.execPath, [
   "--target",
   "0.2.0",
   "--current",
-  "0.1.3",
+  "0.1.4",
   "--dir",
   upgradeDir,
 ], {

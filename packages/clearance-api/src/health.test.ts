@@ -39,7 +39,7 @@ describe("clearance-api app", () => {
 		const healthBody = await health.json();
 		expect(healthBody.ok).toBe(true);
 		expect(healthBody.service).toBe("clearance-api");
-		expect(healthBody.version).toBe("0.1.3");
+		expect(healthBody.version).toBe("0.1.4");
 		expect(Object.keys(healthBody).sort()).toEqual(["ok", "service", "version"]);
 
 		const unauth = await app.request("/v1/users");
