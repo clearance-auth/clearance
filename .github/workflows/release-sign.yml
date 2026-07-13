@@ -248,7 +248,12 @@ jobs:
           for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
             TARBALL="$(tarball_for "$PACKAGE")"
             EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
-            PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n' || true)"
+            VIEW_RESULT="dist-release/npm-view.json"
+            if npm view "${PACKAGE}@${VERSION}" dist.integrity --json >"$VIEW_RESULT" 2>/dev/null; then
+              PUBLISHED_INTEGRITY="$(tr -d '"\n' <"$VIEW_RESULT")"
+            else
+              PUBLISHED_INTEGRITY=""
+            fi
             if [[ -n "$PUBLISHED_INTEGRITY" ]]; then
               [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
                 echo "::error::${PACKAGE}@${VERSION} exists with unexpected tarball integrity"

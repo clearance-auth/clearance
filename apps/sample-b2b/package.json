@@ -1,6 +1,6 @@
 {
   "name": "@clearance/sample-b2b",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Sample B2B SaaS app — real Clearance auth sessions on Postgres",

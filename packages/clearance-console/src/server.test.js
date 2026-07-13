@@ -354,7 +354,7 @@ describe("operator sessions, roles, CSRF", () => {
 			if (req.url?.startsWith("/health")) {
 				res.statusCode = 200;
 				res.setHeader("content-type", "application/json");
-				res.end(JSON.stringify({ ok: true, version: "0.1.2", service: "clearance-api" }));
+				res.end(JSON.stringify({ ok: true, version: "0.1.3", service: "clearance-api" }));
 				return;
 			}
 			if (req.url?.startsWith("/v1/users")) {

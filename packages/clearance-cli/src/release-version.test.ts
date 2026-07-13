@@ -29,7 +29,7 @@ afterEach(() => {
 
 describe("release version consistency", () => {
 	it("accepts the current release and rejects drift in a release-bearing surface", () => {
-		expect(execFileSync(process.execPath, [script, "0.1.2"], { encoding: "utf8" })).toContain("RELEASE_VERSION_OK");
+		expect(execFileSync(process.execPath, [script, "0.1.3"], { encoding: "utf8" })).toContain("RELEASE_VERSION_OK");
 		const fixture = mkdtempSync(join(tmpdir(), "clearance-release-version-"));
 		dirs.push(fixture);
 		for (const relative of required) {
@@ -37,8 +37,8 @@ describe("release version consistency", () => {
 			cpSync(join(root, relative), join(fixture, relative));
 		}
 		const api = join(fixture, "packages/clearance-api/src/server.ts");
-		writeFileSync(api, readFileSync(api, "utf8").replace('version: "0.1.2",', 'version: "9.9.9",'));
-		expect(() => execFileSync(process.execPath, [script, "0.1.2"], {
+		writeFileSync(api, readFileSync(api, "utf8").replace('version: "0.1.3",', 'version: "9.9.9",'));
+		expect(() => execFileSync(process.execPath, [script, "0.1.3"], {
 			encoding: "utf8",
 			env: { ...process.env, CLEARANCE_RELEASE_ROOT: fixture },
 			stdio: "pipe",

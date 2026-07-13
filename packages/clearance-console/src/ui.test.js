@@ -91,7 +91,7 @@ function createMockServer() {
 			return respond(200, { ok: true });
 		}
 		if (url === "/api/health") {
-			return respond(200, { ok: true, version: "0.1.2" });
+			return respond(200, { ok: true, version: "0.1.3" });
 		}
 		if (url === "/api/console/config") {
 			return respond(200, {

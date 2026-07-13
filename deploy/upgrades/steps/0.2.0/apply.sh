@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shipped 0.1.2 -> 0.2.0 database transition.
+# Shipped 0.1.3 -> 0.2.0 database transition.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
@@ -19,8 +19,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$PLAN" ]] || die "upgrade plan is missing"
-[[ "$FROM" == "0.1.2" && "$TO" == "0.2.0" ]] \
-  || die "this hook only supports 0.1.2 to 0.2.0"
+[[ "$FROM" == "0.1.3" && "$TO" == "0.2.0" ]] \
+  || die "this hook only supports 0.1.3 to 0.2.0"
 
 require_pg_client
 require_cmd node
