@@ -101,13 +101,13 @@ function main() {
 
 	const pr = fetchPR(prNumber);
 
-	// Promote PRs (next → main) already carry versioned changesets — skip entirely
-	if (pr.headRef === "next" && pr.baseRef === "main" && !pr.isFork) {
-		console.log("Skipping: promote PR (next → main) — already versioned");
+	// Promote PRs (next → master) already carry versioned changesets — skip entirely
+	if (pr.headRef === "next" && pr.baseRef === "master" && !pr.isFork) {
+		console.log("Skipping: promote PR (next → master) — already versioned");
 		setOutput("skip", "true");
 		setOutput(
 			"skip_reason",
-			"promote PR (next → main) already contains versioned changesets",
+			"promote PR (next → master) already contains versioned changesets",
 		);
 		return;
 	}
@@ -169,8 +169,8 @@ function main() {
 
 	let resolvedBump = bump === "skip" ? "patch" : bump;
 
-	// main and release/* only accept patch
-	const patchOnly = pr.baseRef === "main" || pr.baseRef.startsWith("release/");
+	// master and release/* only accept patch
+	const patchOnly = pr.baseRef === "master" || pr.baseRef.startsWith("release/");
 	if (patchOnly && resolvedBump !== "patch") {
 		if (force) {
 			console.log(

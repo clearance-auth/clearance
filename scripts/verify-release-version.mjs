@@ -135,19 +135,19 @@ if (terraformSetup < 0 || terraformPin < terraformSetup || releaseVerification <
 }
 const dispatchRecoveryOnly = releaseWorkflow.indexOf('"$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RECOVER_PUBLISHED_NPM" != "1"');
 const recoveryGuard = releaseWorkflow.indexOf('if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]', dispatchRecoveryOnly);
-const guardedMainRef = releaseWorkflow.indexOf('"$GITHUB_REF" == "refs/heads/main"', recoveryGuard);
-const guardedWorkflowRef = releaseWorkflow.indexOf('"$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/main"', recoveryGuard);
+const guardedMasterRef = releaseWorkflow.indexOf('"$GITHUB_REF" == "refs/heads/master"', recoveryGuard);
+const guardedWorkflowRef = releaseWorkflow.indexOf('"$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/master"', recoveryGuard);
 const guardedWorkflowSha = releaseWorkflow.indexOf('"$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA"', recoveryGuard);
-if (dispatchRecoveryOnly < 0 || recoveryGuard < dispatchRecoveryOnly || guardedMainRef < recoveryGuard
-	|| guardedWorkflowRef < guardedMainRef
+if (dispatchRecoveryOnly < 0 || recoveryGuard < dispatchRecoveryOnly || guardedMasterRef < recoveryGuard
+	|| guardedWorkflowRef < guardedMasterRef
 	|| guardedWorkflowSha < guardedWorkflowRef) {
-	fail("release workflow must reserve canonical main dispatches for explicit npm recovery");
+	fail("release workflow must reserve canonical master dispatches for explicit npm recovery");
 }
 const tagIdentity = 'release-sign.yml@refs/tags/v${VERSION}';
 const tagIdentityIndex = releaseWorkflow.indexOf(tagIdentity, guardedWorkflowSha);
 const exportedIdentity = releaseWorkflow.indexOf('echo "COSIGN_IDENTITY=$COSIGN_IDENTITY" >> "$GITHUB_ENV"', tagIdentityIndex);
 if (tagIdentityIndex < 0 || exportedIdentity < tagIdentityIndex
-	|| releaseWorkflow.includes('COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/heads/main"')) {
+	|| releaseWorkflow.includes('COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/heads/master"')) {
 	fail("release workflow must export the tag signing identity for publication and recovery verification");
 }
 const releaseNpmPins = [...releaseWorkflow.matchAll(/npm install --global npm@([0-9.]+)/g)].map((match) => match[1]);

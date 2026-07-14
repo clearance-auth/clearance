@@ -4,7 +4,7 @@ Report vulnerabilities to the Clearance maintainers (private disclosure). Do not
 
 ## Supported releases
 
-- Current `0.x` development line: best-effort fixes on `main`.
+- Current `0.x` development line: best-effort fixes on `master`.
 
 ## Policy highlights
 

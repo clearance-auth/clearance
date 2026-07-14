@@ -125,10 +125,10 @@ jobs:
             exit 1
           fi
           if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
-            [[ "$GITHUB_REF" == "refs/heads/main" \
-              && "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/main" \
+            [[ "$GITHUB_REF" == "refs/heads/master" \
+              && "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/release-sign.yml@refs/heads/master" \
               && "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]] || {
-              echo "::error::npm recovery must use the release workflow from the current main commit"
+              echo "::error::npm recovery must use the release workflow from the current master commit"
               exit 1
             }
           fi

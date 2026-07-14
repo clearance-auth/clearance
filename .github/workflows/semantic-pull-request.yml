@@ -40,16 +40,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
-      # Block breaking changes (feat!, fix!, etc.) on PRs targeting main
-      - name: Block breaking changes on main
+      # Block breaking changes (feat!, fix!, etc.) on PRs targeting master
+      - name: Block breaking changes on master
         if: >
-          github.event.pull_request.base.ref == 'main' &&
+          github.event.pull_request.base.ref == 'master' &&
           steps.lint_pr_title.outputs.error_message == null
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if echo "$PR_TITLE" | grep -qE '^[a-z]+(\(.+\))?!:'; then
-            echo "::error::Breaking changes (indicated by '!' in the PR title) are not allowed on main."
+            echo "::error::Breaking changes (indicated by '!' in the PR title) are not allowed on master."
             echo "::error::Please target the 'next' branch for breaking changes."
             exit 1
           fi

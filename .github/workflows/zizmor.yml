@@ -2,7 +2,7 @@ name: GitHub Actions Security Analysis
 
 on:
   push:
-    branches: [main, next]
+    branches: [master, next]
     paths:
       - '.github/workflows/**'
       - '.github/zizmor.yml'

@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, labeled, unlabeled, edited]
     branches:
-      - main
+      - master
       - next
       - 'release/**'
   merge_group:
@@ -41,12 +41,12 @@ jobs:
             esac
 
             if [ "$exempt" = "false" ]; then
-              if [ "$HEAD_REF" = "next" ] && [ "$BASE_REF" = "main" ]; then
+              if [ "$HEAD_REF" = "next" ] && [ "$BASE_REF" = "master" ]; then
                 exempt=true
-                reason="next -> main promotion PR"
-              elif [ "$HEAD_REF" = "main" ] && [ "$BASE_REF" = "next" ]; then
+                reason="next -> master promotion PR"
+              elif [ "$HEAD_REF" = "master" ] && [ "$BASE_REF" = "next" ]; then
                 exempt=true
-                reason="main -> next sync PR"
+                reason="master -> next sync PR"
               fi
             fi
           fi
@@ -67,13 +67,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Block pre.json on main
-        if: steps.gate.outputs.exempt == 'false' && github.base_ref == 'main'
+      - name: Block pre.json on master
+        if: steps.gate.outputs.exempt == 'false' && github.base_ref == 'master'
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
           if git diff --diff-filter=d --name-only "origin/$BASE_REF"...HEAD | grep -q '^\.changeset/pre\.json$'; then
-            echo "::error::.changeset/pre.json must not be committed to main. Pre-release mode belongs on the 'next' branch only."
+            echo "::error::.changeset/pre.json must not be committed to master. Pre-release mode belongs on the 'next' branch only."
             exit 1
           fi
 
@@ -161,7 +161,7 @@ jobs:
 
           [ "$HAS_ERROR" -ne 0 ] && exit 1
 
-          if [ "$BASE_REF" = "main" ] || echo "$BASE_REF" | grep -q '^release/'; then
+          if [ "$BASE_REF" = "master" ] || echo "$BASE_REF" | grep -q '^release/'; then
             for f in $CHANGESET_FILES; do
               BUMPS=$(sed -n '/^---$/,/^---$/p' "$f" | grep -oE '(major|minor|patch)' | sort -u)
               if echo "$BUMPS" | grep -q "major"; then

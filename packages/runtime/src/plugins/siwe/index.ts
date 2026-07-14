@@ -294,7 +294,7 @@ export const siwe = (options: SIWEPluginOptions) => {
 							// Silent fallback (no distinct error) avoids an enumeration oracle.
 							// FIXME(siwe-contact-ownership): non-breaking floor; the durable fix
 							// drops the `email` body field and attaches a verified email via a
-							// separate authenticated link flow. Land on `next` after main->next sync.
+							// separate authenticated link flow. Land on `next` after master->next sync.
 							let userEmail = `${walletAddress}@${domain}`;
 							if (!isAnon && normalizedEmail) {
 								const existingUser =

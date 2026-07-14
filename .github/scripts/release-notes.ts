@@ -352,7 +352,7 @@ function buildChangesetIndex(branch: string): {
 	}
 
 	// Walk recent ancestors (including merge parents via rev-list's full graph
-	// traversal) to find a commit that still has changeset files. On main after
+	// traversal) to find a commit that still has changeset files. On master after
 	// promotion, `changeset version` deletes them, so we may need to look at
 	// the merged next branch side.
 	const skipFiles = new Set(["README", "config"]);

@@ -30,7 +30,7 @@
   "linked": [],
   "access": "public",
   "privatePackages": false,
-  "baseBranch": "main",
+  "baseBranch": "master",
   "updateInternalDependencies": "patch",
   "bumpVersionsWithWorkspaceProtocolOnly": true,
   "ignore": ["@clearance/sample-b2b", "@clearance/root"],

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     # Skip PRs targeting next (retargeted or direct) to avoid label explosion
     # from the large diff between next and feature branches.
-    # Skip bot sync PRs (main→next) which touch many files but are purely devops.
+    # Skip bot sync PRs (master→next) which touch many files but are purely devops.
     if: >
       github.repository_owner == 'clearance' &&
       github.event.pull_request.base.ref != 'next' &&

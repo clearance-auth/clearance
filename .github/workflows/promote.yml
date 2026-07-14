@@ -75,15 +75,15 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          EXISTING=$(gh pr list --base main --head next --state open --repo "$GITHUB_REPOSITORY" --json number --jq '.[0].number // empty')
+          EXISTING=$(gh pr list --base master --head next --state open --repo "$GITHUB_REPOSITORY" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             echo "Promote PR #$EXISTING already exists"
           else
             gh pr create \
-              --base main \
+              --base master \
               --head next \
               --title "chore: promote v${VERSION} to stable" \
-              --body "Promotes v${VERSION} from beta to stable. Merging this PR publishes all packages to npm with the \`latest\` tag.\n\n**This PR must be merged by an admin using 'Create a merge commit'** (not squash, not rebase). The admin bypass is required because main enforces linear history for regular PRs, but the promotion needs a merge commit to preserve individual contributor commits and their verified signatures."
+              --body "Promotes v${VERSION} from beta to stable. Merging this PR publishes all packages to npm with the \`latest\` tag.\n\n**This PR must be merged by an admin using 'Create a merge commit'** (not squash, not rebase). The admin bypass is required because master enforces linear history for regular PRs, but the promotion needs a merge commit to preserve individual contributor commits and their verified signatures."
           fi
 
       - name: Summary
@@ -97,7 +97,7 @@ jobs:
             echo "- **Action:** Review and merge the PR with **Create a merge commit** (admin bypass)."
             echo ""
             echo "### After promotion"
-            echo "Once the promote PR is merged and the sync PR (main to next) is merged:"
+            echo "Once the promote PR is merged and the sync PR (master to next) is merged:"
             echo '```'
             echo "pnpm changeset pre enter beta && git add .changeset/pre.json && git commit -m 'chore: re-enter beta pre-release mode' && git push origin next"
             echo '```'

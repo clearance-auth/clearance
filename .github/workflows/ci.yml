@@ -7,7 +7,7 @@ on:
       - synchronize
   push:
     branches:
-      - main
+      - master
       - next
   merge_group:
 
