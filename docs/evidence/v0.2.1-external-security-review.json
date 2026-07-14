@@ -1,0 +1,105 @@
+{
+  "evidenceVersion": 1,
+  "metadata": {
+    "reviewedAt": "2026-07-13T22:35:36.041Z",
+    "provider": "Anthropic",
+    "model": "claude-fable-5",
+    "mode": "read-only CLI",
+    "allowedTools": [
+      "Read",
+      "Grep",
+      "Glob"
+    ],
+    "sessionId": "427abecf-467c-48e5-b8d3-cdc38edb6009",
+    "resultUuid": "c7bc1884-1bba-43ef-b3ee-6f5d74c160c2",
+    "terminalReason": "completed",
+    "permissionDenials": []
+  },
+  "candidate": {
+    "release": "v0.2.1",
+    "finalCommit": "47c48a65b7c12833dbfca1b97c01351610f2e984",
+    "reviewedState": "the final candidate diff before the immutable release commit"
+  },
+  "review": {
+    "review_status": "complete",
+    "critical_or_high_remains": false,
+    "findings": [],
+    "non_blocking_observations": [
+      {
+        "severity": "medium",
+        "path": "deploy/upgrades/steps/0.2.1/apply.sh",
+        "lines": "39-57",
+        "observation": "The ledger INSERT for the target version is not conditioned on the snapshot UPDATE having matched a row. require_application_release checks 0.1.4 at line 31, but if the snapshot's releaseVersion changes between that check and the transaction (TOCTOU), the guarded UPDATE (WHERE data->>'releaseVersion' = from) affects 0 rows while the INSERT of the 0.2.1 ledger row still commits. The post-check at line 60 then dies (fail closed, backup and rollbackReference already persisted by upgrade-apply.sh), but the database is left with a 0.2.1 ledger entry and a non-0.2.1 snapshot; a retry then aborts on the ledger primary-key conflict until an operator manually deletes the row. Same pattern exists in deploy/upgrades/steps/0.2.0/apply.sh lines 39-57. No data loss and no silent success, so this does not meet the HIGH bar.",
+        "suggestion": "Make the ledger INSERT conditional on the UPDATE row count inside the same transaction, e.g. a CTE (`WITH advanced AS (UPDATE ... RETURNING 1) INSERT ... SELECT ... FROM advanced`) or re-assert the from-version with a row-count check before COMMIT."
+      },
+      {
+        "severity": "low",
+        "path": "scripts/verify-npm-provenance.mjs",
+        "lines": "27-28",
+        "observation": "The certificate identity is built as an escaped, anchored regex string and passed to sigstore-js as certificateIdentityURI (consumed at line 99). This is correct today because sigstore-js matches the policy identity with String.match (regex semantics), and the pattern is fully escaped and ^...$-anchored, so it cannot over-match. However, the verifier's correctness silently depends on the regex-matching behavior of the sigstore library bundled inside the pinned npm@11.16.0; a library change to exact-string matching would make recovery always fail (fail closed, availability only).",
+        "suggestion": "Add a comment pinning this assumption, or additionally compare the raw certificate SAN string for exact equality so the check is independent of library match semantics."
+      },
+      {
+        "severity": "low",
+        "path": ".github/workflows/release-sign.yml",
+        "lines": "367-376",
+        "observation": "First-publish protection does a registry 404 pre-check per package and then publishes in a second loop, leaving a small window where a version could appear between check and publish. The npm registry itself rejects duplicate versions and the subsequent dist.integrity read-back (lines 377-397) fails the run on any byte mismatch, so this cannot produce a mis-versioned or substituted release.",
+        "suggestion": "None required; the registry's immutability plus the integrity read-back close the window."
+      },
+      {
+        "severity": "informational",
+        "path": "scripts/verify-release-version.mjs",
+        "lines": "129-166",
+        "observation": "The workflow-shape assertions (dispatch-is-recovery-only ordering, guarded main ref, exported tag COSIGN_IDENTITY, exactly four cosign verifications, staging-before-verify-before-final-tag-before-publish ordering) are string/indexOf based and thus brittle to cosmetic workflow edits, but every failure path calls fail() and exits non-zero, so drift breaks the release rather than passing it. All checks were confirmed to match the current release-sign.yml content and ordering (identity export at workflow lines 135-138, four $COSIGN_IDENTITY verifications at lines 251-256 and 282-285).",
+        "suggestion": "Consider parsing the workflow YAML for structural assertions if these checks grow further."
+      },
+      {
+        "severity": "informational",
+        "path": "packages/clearance-cli/scripts/stage-ops.mjs",
+        "lines": "43-44",
+        "observation": "The CLI dist ships both the 0.2.0 and 0.2.1 hooks, and deploy/upgrades/steps/0.2.0/apply.sh remains a valid 0.1.4->0.2.0 transition even though deploy/upgrades/README.md now documents 0.1.4->0.2.1 as the supported transition. An operator explicitly planning --target 0.2.0 would land on a stale version. Both hooks are guarded, backed up, and ledgered, so this is an operational-clarity note only. (Same duplication in packages/management/scripts/stage-ops.mjs lines 43-44.)",
+        "suggestion": "Either drop the 0.2.0 hook from the shipped ops bundle or document it as a historical transition."
+      }
+    ],
+    "areas_checked": [
+      "Current git diff (all 25 modified files) plus untracked deploy/upgrades/steps/0.2.1/",
+      ".github/workflows/release-sign.yml: trigger gating (tag-push first publish, dispatch reserved for recovery, both directions now enforced at lines 123-134), tag-to-HEAD commit binding (line 115), canonical-repo check, full-history/shallow check, semver validation before GITHUB_ENV writes (no env injection), pinned action SHAs, persist-credentials:false, scoped job permissions, npm-release environment, COSIGN_IDENTITY bound to refs/tags/v${VERSION} for both sign and recovery verify, recovery verifier checked out from github.workflow_sha, staging-digest -> cosign sign -> verify -> final-tag -> tag/digest recheck -> publish ordering, registry 404 pre-check and post-publish sha512 integrity read-back, duplicate/existing release-asset digest enforcement",
+      "scripts/verify-release-version.mjs: version binding across all six shipping package.json files, Helm Chart version/appVersion, values.yaml image/backup/console tags, CLEARANCE_AUTH_VERSION, CLEARANCE_RELEASE_VERSION, API /health version, substitutable-fork-dependency check, new workflow-shape assertions (dispatch-recovery gate, guarded workflow ref/sha, exported tag identity, four cosign verifications), fail-closed behavior of every branch",
+      "scripts/verify-npm-provenance.mjs: semver/commit input validation, fail-closed audit parsing (invalid/missing must be empty), exactly-one publish and SLSA provenance bundle per package, sigstore verification of provenance against anchored tag identity and GitHub OIDC issuer, subject purl and sha512 digest binding to the actual registry tarballs, workflow path/ref/repository binding, resolvedDependencies gitCommit and git+repo@refs/tags/v tag-source binding, unique tarball resolution by embedded manifest",
+      "deploy/upgrades/steps/0.2.1/apply.sh and 0.2.0/apply.sh: from/to hard pinning, plan-id regex, pre/post require_application_release, guarded snapshot UPDATE + append-only ledger in one transaction, ledger plan-id post-verification, psql :'var' quoting (no SQL injection; interpolated ${TO} is pinned to a literal by the guard)",
+      "scripts/upgrade-apply.sh: mandatory verified backup with isolated restore before any mutation, rollback reference persisted before the hook runs, fail-closed on missing hook, assert_safe_version on plan-derived target/current preventing step-path traversal, plan-id regex gating state-path construction",
+      "scripts/lib/ops-common.sh: assert_safe_version regex (no slash, no leading dot), require_application_release/application_release_version, resolve_database_url, psql_q, sha256_file",
+      "scripts/verify-production-ops.sh: 0.2.1 hook exercised against a real database, tampered/traversal plan rejection, unshipped-target (now 0.2.2) fail-closed with retained rollback reference, ledger/contract transition assertions, isolated rollback drill, active-restore swap with post-safety write preservation, failed-swap reversal and failed-reversal artifact-preservation drills all retargeted to 0.2.1",
+      "Version consistency sweep: no stale 0.2.0 references remain outside the intentionally retained 0.2.0 hook, fixtures, docs, lockfile, and an unrelated IPv4 literal",
+      "AGENTS.md release rules vs executable behavior: the two new rules (tag-triggered first publication, branch dispatch reserved for provenance-verified recovery) match the workflow gates exactly; no conflict"
+    ],
+    "notes": "Static review only per constraints (no builds, tests, or workflow executions). The sigstore-js regex-matching semantics for certificateIdentityURI (verify-npm-provenance.mjs line 99) were assessed from knowledge of the pinned npm@11.16.0 bundled library, not by executing it; both possible behaviors are fail-closed. Tag-push authority and npm-release environment approval policies are GitHub-side controls outside the repository and were assumed to be restricted as designed."
+  },
+  "finalDispositions": [
+    {
+      "observation": "upgrade hook TOCTOU",
+      "status": "fixed before v0.2.1",
+      "evidence": "deploy/upgrades/steps/0.2.1/apply.sh uses one CTE so the ledger insert depends on UPDATE RETURNING"
+    },
+    {
+      "observation": "sigstore identity matcher semantics",
+      "status": "accepted below threshold",
+      "evidence": "the anchored escaped matcher fails closed if library semantics change"
+    },
+    {
+      "observation": "npm publish pre-check race",
+      "status": "accepted below threshold",
+      "evidence": "registry immutability plus exact post-publish integrity verification prevents substitution"
+    },
+    {
+      "observation": "workflow shape checks",
+      "status": "roadmap",
+      "evidence": "every mismatch fails the release closed"
+    },
+    {
+      "observation": "historical 0.2.0 upgrade hook",
+      "status": "accepted below threshold",
+      "evidence": "the transition remains explicit, guarded, backed up, and ledgered"
+    }
+  ]
+}

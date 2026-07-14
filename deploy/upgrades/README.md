@@ -21,4 +21,4 @@ packages this hook under `dist/ops/deploy/upgrades/steps/0.2.1/apply.sh`.
 
 Without a hook, apply fails after creating and verifying its rollback backup. It never records a no-op version transition as applied.
 
-`scripts/upgrade-rollback.sh` is a rollback **drill**: it verifies the deterministic backup reference through an isolated restore and leaves the active environment unchanged. An actual rollback remains an operator-runbook action until active restore automation is designed and tested separately.
+By default, `scripts/upgrade-rollback.sh` runs a rollback drill: it verifies the deterministic backup reference through an isolated restore and leaves the active environment unchanged. With `--restore-active` and the exact plan/database confirmation token, it creates and verifies a safety backup, restores the rollback backup to a staging database, validates counts and the application release, drains connections, swaps database names, and verifies the live result. The pre-rollback database is retained, and a failed live check reverses the swap.

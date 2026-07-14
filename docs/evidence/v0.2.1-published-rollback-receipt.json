@@ -1,0 +1,21 @@
+{
+  "planId": "upg_20260713T233659Z_896785",
+  "rolledBackAt": "2026-07-13T23:37:08Z",
+  "mode": "active_database_restore",
+  "database": "clearance_active",
+  "fromVersion": "0.2.1",
+  "toVersion": "0.1.4",
+  "backupId": "bak_20260713T233701Z_05ff6e00",
+  "backupDumpSha256": "3f670ffd57a958a5ed68081c34323c12e78a4090a41b62a3db91f48d2519d801",
+  "backupMetaSha256": "4b47d45093b381a55d9a03cc2b515dd1a9adc39cf266e78df77891ff2c46d26d",
+  "backupEvidenceSha256": "b6457cdecc5476857d5849c3c05e89616ea21410798c871a7e6dc0a38ba79fe8",
+  "preRestoreSafetyBackupId": "bak_20260713T233706Z_e30eaa2b",
+  "preRestoreSafetyDumpSha256": "8acb6e6412a33d4c3b867cd591789279e27a4819853f045e096cba360106197a",
+  "preRestoreSafetyMetaSha256": "8ba692fcbe051e5702f26e116556a1af51b251bef630cfd4b16e83559df43ac1",
+  "preRestoreSafetyEvidenceSha256": "1253706defd73ebd2dce2e87822af31f68ff78e11f997ff628feb72714d7b53d",
+  "preservedPreRollbackDatabase": "clr_old_cc8658b4",
+  "preservedPreRollbackDatabaseOid": "16384",
+  "postSafetyWritesPreserved": true,
+  "advisoryLockKey": "7176324950072026",
+  "postRestoreVerified": true
+}

@@ -4,6 +4,8 @@
 
 A focused independent adversarial review of the v0.2.1 release candidate found no unresolved critical or high vulnerabilities. The review covered authentication, authorization, replay protection, credential lifecycle, request boundaries, the operator console, database recovery, immutable deployment, and the tag-bound npm and container release path.
 
+The final release-delta pass was completed on 2026-07-13 by Anthropic Claude Fable 5 in a read-only CLI session restricted to `Read`, `Grep`, and `Glob`. The exact reviewer identity, session/result identifiers, findings, and dispositions are retained in [`docs/evidence/v0.2.1-external-security-review.json`](./evidence/v0.2.1-external-security-review.json).
+
 ## Critical findings
 
 None.
@@ -31,6 +33,7 @@ None.
 - API idempotency and one-time-secret replay suite: 9 passed.
 - Production dependency audit: 0 critical, 0 high, 0 low, and 2 moderate advisories.
 - Independent read-only adversarial review of the product and final release-path delta: 0 critical and 0 high findings.
+- The review's one medium finding, a retry-blocking TOCTOU in the `0.2.1` upgrade hook, was fixed before release by making the ledger insert conditional on the guarded snapshot update in one CTE.
 
 ## Design constraints below the release threshold
 

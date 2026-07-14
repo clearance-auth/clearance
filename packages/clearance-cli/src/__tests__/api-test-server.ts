@@ -7,6 +7,8 @@ const apiEntry = resolve(
 	"../../../clearance-api/dist/server.js",
 );
 const OPERATOR_TOKEN = "test-operator-token-for-cli-api-32chars!!";
+const API_STARTUP_TIMEOUT_MS = 15_000;
+const API_STARTUP_POLL_MS = 50;
 const servers = new Map<string, { process: ChildProcess; apiUrl: string }>();
 
 function allocatePort(): number {
@@ -50,7 +52,8 @@ export function authenticatedApiEnv(dataPath: string): NodeJS.ProcessEnv {
 	servers.set(dataPath, { process: child, apiUrl });
 
 	let ready = false;
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+	const startupDeadline = Date.now() + API_STARTUP_TIMEOUT_MS;
+	while (Date.now() < startupDeadline) {
 		if (child.exitCode !== null) break;
 		try {
 			execFileSync("curl", ["--fail", "--silent", "--max-time", "1", `${apiUrl}/livez`], {
@@ -59,7 +62,7 @@ export function authenticatedApiEnv(dataPath: string): NodeJS.ProcessEnv {
 			ready = true;
 			break;
 		} catch {
-			pause(50);
+			pause(API_STARTUP_POLL_MS);
 		}
 	}
 	if (!ready) {

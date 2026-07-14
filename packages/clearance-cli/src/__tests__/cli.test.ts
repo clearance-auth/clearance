@@ -410,8 +410,11 @@ describe("clearance CLI binary", () => {
 		const dir = mkdtempSync(join(tmpdir(), "clr-ent-"));
 		dirs.push(dir);
 		const data = join(dir, "data.json");
-		run(["init", "--name", "Ent"], data);
-		const org = JSON.parse(run(["orgs", "create", "--name", "Cust"], data).stdout);
+		const initialized = run(["init", "--name", "Ent"], data);
+		expect(initialized.status).toBe(0);
+		const createdOrg = run(["orgs", "create", "--name", "Cust"], data);
+		expect(createdOrg.status).toBe(0);
+		const org = JSON.parse(createdOrg.stdout);
 		const orgId = org.organization.id;
 		const sso = JSON.parse(
 			run(

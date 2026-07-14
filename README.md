@@ -23,7 +23,7 @@ Clearance puts product authentication and enterprise identity operations behind 
 | Operator console | **13100** (Compose) / 3100 (host dev) | Compose or `pnpm dev:console` |
 | Management API | **13200** (Compose) / 3200 (host dev) | Compose or `pnpm dev:api` |
 | Postgres (production-like dependency) | **15434** | Compose |
-| CLI | — | `node packages/clearance-cli/dist/index.js` |
+| CLI | — | `clearance` |
 
 ## Install and authenticate the CLI
 
@@ -121,15 +121,15 @@ pnpm dev:sample
 CLI examples:
 
 ```bash
-node packages/clearance-cli/dist/index.js init --name my-app --json --no-input
-node packages/clearance-cli/dist/index.js doctor --json --no-input
-node packages/clearance-cli/dist/index.js users create --email a@b.com --name A --json --no-input
-node packages/clearance-cli/dist/index.js orgs create --name Acme --json --no-input
-node packages/clearance-cli/dist/index.js sso create --org <id> --provider okta --protocol oidc \
+clearance init --name my-app --json --no-input
+clearance doctor --json --no-input
+clearance users create --email a@b.com --name A --json --no-input
+clearance orgs create --name Acme --json --no-input
+clearance sso create --org <id> --provider okta --protocol oidc \
   --issuer https://example.okta.com --audience clearance-sp --json --no-input
-node packages/clearance-cli/dist/index.js readiness check --org <id> --json --no-input
-node packages/clearance-cli/dist/index.js backup create --json --no-input
-node packages/clearance-cli/dist/index.js upgrade check --json --no-input
+clearance readiness check --org <id> --json --no-input
+clearance backup create --json --no-input
+clearance upgrade check --json --no-input
 ```
 
 ## Packages
