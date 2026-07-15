@@ -28,8 +28,13 @@ import {
 import {
 	syncRuntimeOrganizationToManagementDurable,
 	syncRuntimeUserToManagement,
+	syncRuntimeUserToManagementDurable,
 } from "../services/identity.js";
 import { ClearanceError } from "../services/errors.js";
+import type {
+	ManagementStore,
+	StoreV2PrincipalRepository,
+} from "../store/types.js";
 
 const dirs: string[] = [];
 
@@ -48,6 +53,50 @@ afterEach(() => {
 });
 
 describe("canonical identity bridge", () => {
+	it("fails closed when an existing relational principal disappears during sync", async () => {
+		const base = tempStore();
+		const { project, environment } = initProject(base, { name: "Relational Sync" });
+		const existing = createUser(base, {
+			email: "relational-sync@example.com",
+			name: "Before Sync",
+		});
+		const principals: StoreV2PrincipalRepository = {
+			authoritative: true,
+			getById: async () => structuredClone(existing),
+			findActiveByEmail: async () => null,
+			listPage: async () => ({ principals: [], hasMore: false }),
+			insert: async (principal) => structuredClone(principal),
+			update: async () => null,
+			disable: async () => null,
+			delete: async () => null,
+		};
+		const store = {
+			snapshot: base.snapshot,
+			storeV2Principals: principals,
+			mutateStoreV2Identity: async <T>(fn: (context: {
+				principals: StoreV2PrincipalRepository;
+				appendAudit: () => never;
+			}) => Promise<T> | T) => fn({
+				principals,
+				appendAudit: () => {
+					throw new Error("Audit must not be appended after a failed update");
+				},
+			}),
+		} as unknown as ManagementStore;
+
+		await expect(syncRuntimeUserToManagementDurable(store, {
+			id: existing.id,
+			email: existing.email,
+			name: "After Sync",
+		}, {
+			projectId: project.id,
+			environmentId: environment.id,
+		})).rejects.toMatchObject({
+			code: "IDENTITY_SYNC_CONFLICT",
+			status: 409,
+		});
+	});
+
 	it("syncs runtime user with identical stable id and scope", () => {
 		const store = tempStore();
 		const { project, environment } = initProject(store, { name: "Bridge App" });
@@ -560,4 +609,3 @@ describe("users update / disable / delete lifecycle", () => {
 		).toThrow(/invalid status/i);
 	});
 });
-

@@ -25,6 +25,7 @@ import {
 	USER_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	SYSTEM_OPERATIONS,
+	WEBHOOK_ENDPOINT_OPERATIONS,
 	type OperationOutput,
 } from "./operations.js";
 
@@ -55,7 +56,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(94);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(103);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -65,6 +66,33 @@ describe("management operation contracts", () => {
 		});
 		expect(MEMBER_OPERATIONS.remove.confirmation).toBe("client-required");
 		expect(MEMBER_OPERATIONS.import.confirmation).toBe("server-required");
+	});
+
+	it("defines the complete webhook endpoint transport and safety contract", () => {
+		expect(Object.values(WEBHOOK_ENDPOINT_OPERATIONS)).toHaveLength(7);
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.list).toMatchObject({
+			id: "delivery.webhook_endpoints.list",
+			cliPath: "delivery endpoints list",
+			http: { method: "GET", path: "/v1/delivery/webhook-endpoints" },
+			mutation: false,
+		});
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.create).toMatchObject({
+			http: { method: "POST", path: "/v1/delivery/webhook-endpoints" },
+			mutation: true,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.update.http.method).toBe("PATCH");
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.delete.http.method).toBe("DELETE");
+		for (const action of ["rotate", "delete", "test"] as const) {
+			expect(WEBHOOK_ENDPOINT_OPERATIONS[action]).toMatchObject({
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
+		expect(resolveOperationPath(WEBHOOK_ENDPOINT_OPERATIONS.test, { id: "wh /1" }))
+			.toBe("/v1/delivery/webhook-endpoints/wh%20%2F1/test");
 	});
 
 	it("defines the complete delivery transport and safety contract", () => {
@@ -135,6 +163,14 @@ describe("management operation contracts", () => {
 			confirmation: "server-required",
 		});
 		expect(STORE_V2_OPERATIONS.eventsRollback.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.principalsCutover).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/principals/cutover" },
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.principalsRollback).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/principals/rollback" },
+			confirmation: "server-required",
+		});
 	});
 
 	it("distinguishes readiness evidence writes from config inspection", () => {

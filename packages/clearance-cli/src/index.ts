@@ -561,6 +561,9 @@ async function main() {
 	const storeV2Events = storeV2.command("events").description("Relational audit-event authority");
 	storeV2Events.command("cutover").description("Make relational audit events authoritative").action(remoteCommandAction);
 	storeV2Events.command("rollback").description("Return audit-event authority to the snapshot").action(remoteCommandAction);
+	const storeV2Principals = storeV2.command("principals").description("Relational principal authority");
+	storeV2Principals.command("cutover").description("Make normalized principals authoritative").action(remoteCommandAction);
+	storeV2Principals.command("rollback").description("Reverse-materialize principals into the snapshot").action(remoteCommandAction);
 
 	// config
 	const config = program.command("config").description("Config");

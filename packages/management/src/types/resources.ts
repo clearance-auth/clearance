@@ -282,6 +282,7 @@ export interface MigrationPlan {
 				name: string;
 				status: Principal["status"];
 				externalId?: string;
+				createdAt: string;
 				updatedAt: string;
 			}>;
 			organizations: Array<{

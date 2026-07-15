@@ -22,6 +22,7 @@ import {
 	SYSTEM_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	USER_OPERATIONS,
+	WEBHOOK_ENDPOINT_OPERATIONS,
 } from "@clearance/management";
 import type { ApiSession } from "./api-client.js";
 import { dispatchAccessCommand } from "./dispatch/access.js";
@@ -116,6 +117,13 @@ export async function dispatchRemoteCommand(
 		case DELIVERY_OPERATIONS.cancel.cliPath:
 		case DELIVERY_OPERATIONS.retry.cliPath:
 		case DELIVERY_OPERATIONS.replay.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.list.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.inspect.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.create.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.update.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.rotate.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.test.cliPath:
 			return dispatchDeliveryCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
@@ -175,6 +183,8 @@ export async function dispatchRemoteCommand(
 		case STORE_V2_OPERATIONS.rollback.cliPath:
 		case STORE_V2_OPERATIONS.eventsCutover.cliPath:
 		case STORE_V2_OPERATIONS.eventsRollback.cliPath:
+		case STORE_V2_OPERATIONS.principalsCutover.cliPath:
+		case STORE_V2_OPERATIONS.principalsRollback.cliPath:
 			return dispatchStoreV2Command({ session, path, args, opts, global });
 		default:
 			throw error(

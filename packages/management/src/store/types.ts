@@ -1,6 +1,7 @@
 import type {
 	AuditEvent,
 	DataStoreSnapshot,
+	Principal,
 } from "../types/resources.js";
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
@@ -14,6 +15,8 @@ import type {
 	EnqueueDeliveryInput,
 	PublicDeliveryJob,
 } from "@clearance/delivery";
+import type { ManagementWebhookEndpointFanout } from "../application/delivery.js";
+import type { AuditEventInput } from "../services/audit.js";
 
 export const STORE_V2_COLLECTIONS = [
 	"projects",
@@ -36,10 +39,12 @@ export interface StoreV2CollectionStatus {
 }
 
 export interface StoreV2Status {
-	schemaVersion: 1 | null;
+	schemaVersion: 2 | null;
 	phase: StoreV2Phase;
 	snapshotRevision: number;
 	relationalRevision: number | null;
+	/** Changes only when relational principal rows change or authority moves. */
+	principalRevision: number | null;
 	consistent: boolean;
 	authoritativeCollections: StoreV2Collection[];
 	collections: Record<StoreV2Collection, StoreV2CollectionStatus>;
@@ -52,7 +57,7 @@ export interface StoreV2PlanBlocker {
 }
 
 export interface StoreV2Plan {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	phase: StoreV2Phase;
 	snapshotRevision: number;
 	collections: readonly StoreV2Collection[];
@@ -70,6 +75,8 @@ export interface StoreV2MigrationControl {
 	disable(): Promise<StoreV2Status>;
 	cutoverEvents(): Promise<StoreV2Status>;
 	rollbackEvents(): Promise<StoreV2Status>;
+	cutoverPrincipals(): Promise<StoreV2Status>;
+	rollbackPrincipals(): Promise<StoreV2Status>;
 }
 
 /** Postgres event reads once store-v2 events are relational-authoritative. */
@@ -84,9 +91,83 @@ export interface StoreV2EventReader {
 	}): Promise<{ events: AuditEvent[]; hasMore: boolean }>;
 }
 
+/** PostgreSQL principal reads backed by normalized store-v2 rows. */
+export interface StoreV2PrincipalReader {
+	readonly authoritative: boolean;
+	getById(input: {
+		scope: ResourceScope;
+		id: string;
+		includeDeleted?: boolean;
+	}): Promise<Principal | null>;
+	findActiveByEmail(input: {
+		scope: ResourceScope;
+		email: string;
+	}): Promise<Principal | null>;
+	findActiveByExternalId(input: {
+		scope: ResourceScope;
+		externalId: string;
+	}): Promise<Principal | null>;
+	listPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		includeDeleted?: boolean;
+		status?: Principal["status"];
+	}): Promise<{ principals: Principal[]; hasMore: boolean }>;
+	/** Bounded relational join used by runtime session operator reads. */
+	listActiveSessionsPage?(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+	}): Promise<{
+		sessions: Array<{
+			id: string;
+			principal: Principal;
+			createdAt: string;
+			cursorCreatedAt: string;
+			expiresAt?: string;
+			ipAddress?: string;
+			userAgent?: string;
+		}>;
+		hasMore: boolean;
+	}>;
+	listForExport?(input: {
+		scope: ResourceScope;
+		limit: number;
+		status?: "active" | "disabled";
+	}): Promise<{ principals: Principal[]; hasMore: boolean }>;
+	countByScope?(input: { scope: ResourceScope }): Promise<{
+		total: number;
+		active: number;
+	}>;
+	countActiveSessions?(input: { scope: ResourceScope }): Promise<number>;
+}
+
+/** Transaction-bound normalized principal mutations. PostgreSQL only. */
+export interface StoreV2PrincipalRepository extends StoreV2PrincipalReader {
+	insert(principal: Principal): Promise<Principal>;
+	update(
+		principal: Principal,
+		input: { expectedUpdatedAt: string },
+	): Promise<Principal | null>;
+	disable(input: {
+		scope: ResourceScope;
+		id: string;
+		updatedAt: string;
+		expectedUpdatedAt: string;
+	}): Promise<Principal | null>;
+	delete(input: {
+		scope: ResourceScope;
+		id: string;
+		updatedAt: string;
+		expectedUpdatedAt: string;
+	}): Promise<Principal | null>;
+}
+
 /** Read-only view used by domain queries and validation. */
 export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
+	readonly storeV2Principals?: StoreV2PrincipalReader;
 }
 
 export type DeliveryControlScope = {
@@ -126,14 +207,50 @@ export type DeliveryControlMutationInput = DeliveryControlScope &
 		now?: Date;
 	};
 
+export type DeliveryControlMutationOutcome<T> = {
+	preview: DeliveryControlPreview;
+	result: T;
+};
+
 /**
  * Same-transaction delivery mutations. Implementations own the management
  * audit append; callers cannot obtain the underlying unaudited SQL primitive.
  */
 export interface ManagementDeliveryControlMutation {
-	cancel(input: DeliveryControlMutationInput): Promise<PublicDeliveryJob | null>;
-	retry(input: DeliveryControlMutationInput): Promise<PublicDeliveryJob | null>;
-	replay(input: DeliveryControlMutationInput & { maxAttempts?: number }): Promise<EnqueuedDelivery | null>;
+	cancel(
+		input: DeliveryControlMutationInput,
+	): Promise<DeliveryControlMutationOutcome<PublicDeliveryJob> | null>;
+	retry(
+		input: DeliveryControlMutationInput,
+	): Promise<DeliveryControlMutationOutcome<PublicDeliveryJob> | null>;
+	replay(
+		input: DeliveryControlMutationInput & { maxAttempts?: number },
+	): Promise<DeliveryControlMutationOutcome<EnqueuedDelivery> | null>;
+}
+
+export type ManagementCoordinatedQuery = (
+	sql: string,
+	params?: unknown[],
+) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+
+export interface ManagementCoordinatedMutationContext {
+	data: DataStoreSnapshot;
+	/** Present only when normalized principals are authoritative. */
+	principals?: StoreV2PrincipalRepository;
+	/** Opaque same-transaction outbox capability when delivery is configured. */
+	enqueueDelivery?: (
+		input: EnqueueDeliveryInput,
+	) => Promise<EnqueuedDelivery>;
+	/** Audited same-transaction delivery controls when configured. */
+	controlDelivery?: ManagementDeliveryControlMutation;
+	/** Managed endpoint fanout in the same product transaction when configured. */
+	fanoutWebhookEndpoints?: ManagementWebhookEndpointFanout;
+}
+
+/** Package-internal runtime SQL seam; never exposed to public store callbacks. */
+export interface InternalManagementCoordinatedMutationContext
+	extends ManagementCoordinatedMutationContext {
+	query: ManagementCoordinatedQuery;
 }
 
 /**
@@ -161,8 +278,22 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Postgres-only, explicitly activated normalized shadow-store migration. */
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	readonly storeV2Principals?: StoreV2PrincipalReader;
+	/** Direct normalized transaction, available only after principal authority. */
+	mutateStoreV2Principals?<T>(
+		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
+	): Promise<T>;
+	/** Relational-only identity transaction with append-only audit authority. */
+	mutateStoreV2Identity?<T>(
+		fn: (context: {
+			principals: StoreV2PrincipalRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T>;
 	/** Present only when PostgreSQL delivery storage and keys are configured. */
 	readonly deliveryControl?: ManagementDeliveryControlReader;
+	/** Audited customer-managed webhook endpoint lifecycle when delivery is configured. */
+	readonly webhookEndpoints?: import("../services/webhook-endpoints.js").ManagementWebhookEndpointCapability;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */
@@ -182,24 +313,12 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Execute against the latest durable draft and resolve only after commit. */
 	mutateDurable<T>(fn: (data: DataStoreSnapshot) => T): Promise<T>;
 	/**
-	 * Postgres only: one transaction covering management snapshot (+ uniqueness +
-	 * audit via the mutator) and arbitrary runtime SQL on the same connection.
+	 * Postgres only: one transaction covering management snapshot, normalized
+	 * principal mutations, uniqueness, audit, and opaque delivery capabilities.
 	 * JsonStore does not implement this — callers must use management-only paths.
 	 */
 	mutateCoordinated?<T>(
-		fn: (ctx: {
-			data: DataStoreSnapshot;
-			query: (
-				sql: string,
-				params?: unknown[],
-			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
-			/** Opaque same-transaction outbox capability when delivery is configured. */
-			enqueueDelivery?: (
-				input: EnqueueDeliveryInput,
-			) => Promise<EnqueuedDelivery>;
-			/** Audited same-transaction delivery controls when configured. */
-			controlDelivery?: ManagementDeliveryControlMutation;
-		}) => Promise<T> | T,
+		fn: (ctx: ManagementCoordinatedMutationContext) => Promise<T> | T,
 	): Promise<T>;
 	checksum(): string;
 	resourceCounts(): Record<string, number>;

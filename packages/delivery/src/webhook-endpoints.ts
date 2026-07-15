@@ -784,6 +784,176 @@ export type WebhookEndpointDeletionResult = {
 	};
 };
 
+export type WebhookEndpointSecretRotationPreview = {
+	action: "rotate";
+	endpoint: PublicWebhookEndpoint;
+	expectedVersion: number;
+	nextResourceVersion: number;
+	nextSecretVersion: number;
+	secretGenerated: false;
+};
+
+export type WebhookEndpointDeletionPreview = {
+	action: "delete";
+	endpoint: PublicWebhookEndpoint;
+	expectedVersion: number;
+	nextResourceVersion: number;
+	erasedPayloads: number;
+	jobs: WebhookEndpointDeletionResult["jobs"];
+};
+
+export type WebhookEndpointTestPreview = {
+	action: "test";
+	endpoint: PublicWebhookEndpoint;
+	expectedVersion: number;
+	nextResourceVersion: number;
+	createsDelivery: true;
+};
+
+export type WebhookEndpointMutationPreview =
+	| WebhookEndpointSecretRotationPreview
+	| WebhookEndpointDeletionPreview
+	| WebhookEndpointTestPreview;
+
+async function lockWebhookEndpointForPreview(
+	transaction: DeliveryRawTransaction,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions,
+): Promise<{ target: DeliveryScope; row: EndpointRow } | null> {
+	const target = endpointScope(input);
+	const id = endpointId(input.endpointId);
+	const version = expectedVersion(input.expectedVersion);
+	const table = qualifiedDeliveryTables(options).webhookEndpoint;
+	const query = requireEndpointTransaction(transaction);
+	const found = await query<EndpointRow>(
+		`SELECT * FROM ${table} WHERE id=$1 AND project_id=$2 AND environment_id=$3
+		   AND status <> 'deleted' FOR UPDATE`,
+		[id, target.projectId, target.environmentId],
+	);
+	const row = found.rows[0];
+	if (!row) return null;
+	if (Number(row.resource_version) !== version) conflict();
+	decryptRowConfig(row, keyring);
+	return { target, row };
+}
+
+export async function previewWebhookEndpointSecretRotationInExistingTransaction(
+	transaction: DeliveryRawTransaction,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointSecretRotationPreview | null> {
+	const locked = await lockWebhookEndpointForPreview(transaction, input, keyring, options);
+	if (!locked) return null;
+	const resourceVersion = Number(locked.row.resource_version);
+	return {
+		action: "rotate",
+		endpoint: publicEndpoint(locked.row, keyring),
+		expectedVersion: resourceVersion,
+		nextResourceVersion: resourceVersion + 1,
+		nextSecretVersion: Number(locked.row.secret_version) + 1,
+		secretGenerated: false,
+	};
+}
+
+export async function previewWebhookEndpointSecretRotation(
+	pool: pg.Pool,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointSecretRotationPreview | null> {
+	return transaction(pool, (client) => previewWebhookEndpointSecretRotationInExistingTransaction(
+		clientTransaction(client), input, keyring, options,
+	));
+}
+
+export async function previewWebhookEndpointDeletionInExistingTransaction(
+	transaction: DeliveryRawTransaction,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointDeletionPreview | null> {
+	const locked = await lockWebhookEndpointForPreview(transaction, input, keyring, options);
+	if (!locked) return null;
+	const tables = qualifiedDeliveryTables(options);
+	const query = requireEndpointTransaction(transaction);
+	const jobs = await query<{
+		queued_or_retry: number | string;
+		leased: number | string;
+	}>(
+		`WITH target_jobs AS (
+			SELECT j.state FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
+			WHERE e.webhook_endpoint_id=$1 AND e.project_id=$2 AND e.environment_id=$3
+			  AND j.state IN ('queued','retry','leased')
+			FOR UPDATE OF j
+		)
+		SELECT count(*) FILTER (WHERE state IN ('queued','retry'))::int queued_or_retry,
+			count(*) FILTER (WHERE state='leased')::int leased FROM target_jobs`,
+		[locked.row.id, locked.target.projectId, locked.target.environmentId],
+	);
+	const payloads = await query<{ count: number | string }>(
+		`SELECT count(*)::int count FROM ${tables.payload} p JOIN ${tables.event} e ON e.id=p.event_id
+		 WHERE e.webhook_endpoint_id=$1 AND e.project_id=$2 AND e.environment_id=$3`,
+		[locked.row.id, locked.target.projectId, locked.target.environmentId],
+	);
+	const queuedOrRetryCancelled = Number(jobs.rows[0]?.queued_or_retry ?? 0);
+	const leasedCancellationRequested = Number(jobs.rows[0]?.leased ?? 0);
+	const resourceVersion = Number(locked.row.resource_version);
+	return {
+		action: "delete",
+		endpoint: publicEndpoint(locked.row, keyring),
+		expectedVersion: resourceVersion,
+		nextResourceVersion: resourceVersion + 1,
+		erasedPayloads: Number(payloads.rows[0]?.count ?? 0),
+		jobs: {
+			queuedOrRetryCancelled,
+			leasedCancellationRequested,
+			leasedDeliveryOutcomeAmbiguous: leasedCancellationRequested > 0,
+		},
+	};
+}
+
+export async function previewWebhookEndpointDeletion(
+	pool: pg.Pool,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointDeletionPreview | null> {
+	return transaction(pool, (client) => previewWebhookEndpointDeletionInExistingTransaction(
+		clientTransaction(client), input, keyring, options,
+	));
+}
+
+export async function previewWebhookEndpointTestInExistingTransaction(
+	transaction: DeliveryRawTransaction,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointTestPreview | null> {
+	const locked = await lockWebhookEndpointForPreview(transaction, input, keyring, options);
+	if (!locked) return null;
+	const resourceVersion = Number(locked.row.resource_version);
+	return {
+		action: "test",
+		endpoint: publicEndpoint(locked.row, keyring),
+		expectedVersion: resourceVersion,
+		nextResourceVersion: resourceVersion + 1,
+		createsDelivery: true,
+	};
+}
+
+export async function previewWebhookEndpointTest(
+	pool: pg.Pool,
+	input: DeliveryScope & { endpointId: string; expectedVersion: number },
+	keyring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<WebhookEndpointTestPreview | null> {
+	return transaction(pool, (client) => previewWebhookEndpointTestInExistingTransaction(
+		clientTransaction(client), input, keyring, options,
+	));
+}
+
 export async function softDeleteWebhookEndpointInExistingTransaction(
 	transaction: DeliveryRawTransaction,
 	input: DeliveryScope & { endpointId: string; expectedVersion: number; now?: Date },

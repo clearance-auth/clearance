@@ -91,7 +91,7 @@ describe("API cursor pagination", () => {
 		expect(new Set(seen)).toEqual(created);
 	});
 
-	it("users: legacy call without params is unchanged (no pagination envelope)", async () => {
+	it("users: a complete legacy call keeps its compact response", async () => {
 		const app = await loadApp();
 		for (let i = 0; i < 3; i++) {
 			await app.request("/v1/users", {
@@ -105,6 +105,34 @@ describe("API cursor pagination", () => {
 		const body = await res.json();
 		expect(body.users.length).toBe(3);
 		expect("nextCursor" in body).toBe(false);
+	});
+
+	it("users: a truncated legacy call exposes continuation", async () => {
+		const app = await loadApp();
+		for (let i = 0; i < 101; i++) {
+			const created = await app.request("/v1/users", {
+				method: "POST",
+				headers: authHeaders,
+				body: JSON.stringify({
+					email: `legacy-truncated-${i}@t.dev`,
+					name: `Legacy Truncated ${i}`,
+				}),
+			});
+			expect(created.status).toBe(201);
+		}
+		const first = await app.request("/v1/users", { headers: authHeaders });
+		expect(first.status).toBe(200);
+		const firstBody = await first.json();
+		expect(firstBody.users).toHaveLength(100);
+		expect(typeof firstBody.nextCursor).toBe("string");
+		const second = await app.request(
+			`/v1/users?cursor=${encodeURIComponent(firstBody.nextCursor)}`,
+			{ headers: authHeaders },
+		);
+		expect(second.status).toBe(200);
+		const secondBody = await second.json();
+		expect(secondBody.users).toHaveLength(1);
+		expect(secondBody.nextCursor).toBeNull();
 	});
 
 	it("organizations: cursor page plus follow-up page covers all orgs", async () => {

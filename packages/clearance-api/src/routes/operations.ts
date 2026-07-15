@@ -9,6 +9,7 @@ import {
 	applyUpgrade,
 	applyStoreV2,
 	cutoverStoreV2Events,
+	cutoverStoreV2Principals,
 	createBackup,
 	createPostgresBackup,
 	getRuntimeSchemaStatus,
@@ -16,17 +17,18 @@ import {
 	migrateRuntimeSchema,
 	migrationStatus,
 	parseLegacyFixture,
-	planMigration,
+	planMigrationDurable,
 	planRuntimeSchema,
 	planStoreV2,
 	planUpgrade,
-	previewMigration,
+	previewMigrationDurable,
 	restoreBackup,
 	restorePostgresBackup,
 	rollbackMigrationDurable,
 	rollbackUpgrade,
 	rollbackStoreV2,
 	rollbackStoreV2Events,
+	rollbackStoreV2Principals,
 	runMigrationDurable,
 	upgradeCheck,
 	upgradeCheckWithDb,
@@ -328,6 +330,28 @@ export function registerOperationRoutes({
 		}
 	});
 
+	routes.post(STORE_V2_OPERATIONS.principalsCutover.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await cutoverStoreV2Principals(await storeForRequest(), {
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.post(STORE_V2_OPERATIONS.principalsRollback.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await rollbackStoreV2Principals(await storeForRequest(), {
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
 	function migrationFixture(body: Record<string, unknown>) {
 		if (!("fixture" in body)) {
 			throw new ClearanceError({
@@ -346,7 +370,7 @@ export function registerOperationRoutes({
 			const store = await storeForRequest();
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
 			const fixture = migrationFixture(body);
-			const preview = previewMigration(store, fixture);
+			const preview = await previewMigrationDurable(store, fixture);
 			if (body.dryRun === true || body.confirm !== true) {
 				return c.json({
 					schemaVersion: "v1",
@@ -356,7 +380,7 @@ export function registerOperationRoutes({
 					storeBackend: store.backend,
 				});
 			}
-			const planned = planMigration(store, fixture);
+			const planned = await planMigrationDurable(store, fixture);
 			await store.ready();
 			await store.refresh();
 			await runMigrationDurable(store, planned.id, fixture);
@@ -393,7 +417,7 @@ export function registerOperationRoutes({
 					remediation: "Send source as legacy.",
 				});
 			}
-			const plan = planMigration(store, migrationFixture(body));
+			const plan = await planMigrationDurable(store, migrationFixture(body));
 			await store.ready();
 			return c.json({ plan });
 		} catch (e) {

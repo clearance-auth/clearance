@@ -1,6 +1,9 @@
 import { Command } from "commander";
 import { describe, expect, it, vi } from "vitest";
-import { DELIVERY_OPERATIONS } from "../../management/src/contracts/operations.js";
+import {
+	DELIVERY_OPERATIONS,
+	WEBHOOK_ENDPOINT_OPERATIONS,
+} from "../../management/src/contracts/operations.js";
 import { registerDeliveryCommands } from "./delivery-command.js";
 
 function deliveryProgram(action: (command: Command) => void): Command {
@@ -17,9 +20,34 @@ describe("delivery command parser", () => {
 		const program = deliveryProgram(() => undefined);
 		const delivery = program.commands.find((command) => command.name() === "delivery");
 		expect(delivery).toBeDefined();
-		expect(delivery?.commands.map((command) => `delivery ${command.name()}`)).toEqual(
+		expect(delivery?.commands.filter((command) => command.name() !== "endpoints")
+			.map((command) => `delivery ${command.name()}`)).toEqual(
 			Object.values(DELIVERY_OPERATIONS).map((operation) => operation.cliPath),
 		);
+		const endpoints = delivery?.commands.find((command) => command.name() === "endpoints");
+		expect(endpoints?.commands.map((command) => `delivery endpoints ${command.name()}`))
+			.toEqual(Object.values(WEBHOOK_ENDPOINT_OPERATIONS).map((operation) => operation.cliPath));
+	});
+
+	it("parses webhook endpoint create and versioned controls", async () => {
+		const create = vi.fn();
+		await deliveryProgram((command) => create(command.processedArgs, command.opts())).parseAsync([
+			"node", "clearance", "delivery", "endpoints", "create",
+			"--name", "Audit sink", "--url", "https://hooks.example.test/events",
+			"--event-kind", "organization.updated",
+		]);
+		expect(create).toHaveBeenCalledWith([], {
+			name: "Audit sink",
+			url: "https://hooks.example.test/events",
+			eventKind: ["organization.updated"],
+		});
+
+		const rotate = vi.fn();
+		await deliveryProgram((command) => rotate(command.processedArgs, command.opts())).parseAsync([
+			"node", "clearance", "delivery", "endpoints", "rotate", "endpoint_1",
+			"--expected-version", "4",
+		]);
+		expect(rotate).toHaveBeenCalledWith(["endpoint_1"], { expectedVersion: "4" });
 	});
 
 	it("parses repeatable list filters without interaction", async () => {

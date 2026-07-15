@@ -1,10 +1,9 @@
 import {
 	ClearanceError,
 	USER_OPERATIONS,
-	exportUsers,
-	inspectUser,
-	listUsers,
-	listUsersPage,
+	exportUsersAuthoritative,
+	inspectUserAuthoritative,
+	listUsersPageAuthoritative,
 } from "@clearance/management";
 import { Hono } from "hono";
 import { requestActor } from "../request-auth.js";
@@ -23,27 +22,26 @@ export function registerUserRoutes({
 }: UserRouteDependencies) {
 	const routes = new Hono();
 
-	/**
-	 * List users. Without limit/cursor this is the legacy unpaginated contract.
-	 * With ?limit= and/or ?cursor= it is keyset-paginated (createdAt+id asc,
-	 * opaque fail-closed cursor) and the response carries nextCursor.
-	 */
+	/** Bounded keyset-paginated list across snapshot and relational authority. */
 	routes.get(USER_OPERATIONS.list.http.path, async (c) => {
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const limitRaw = c.req.query("limit");
 			const cursor = c.req.query("cursor");
-			if (limitRaw !== undefined || cursor !== undefined) {
-				const page = listUsersPage(store, {
-					scope,
-					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
-					...(cursor !== undefined ? { cursor } : {}),
-				});
-				return c.json({ users: page.users, nextCursor: page.nextCursor, scope });
-			}
-			const users = listUsers(store, { scope });
-			return c.json({ users, scope });
+			const paginated = limitRaw !== undefined || cursor !== undefined;
+			const page = await listUsersPageAuthoritative(store, {
+				scope,
+				...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
+				...(cursor !== undefined ? { cursor } : {}),
+			});
+			return c.json({
+				users: page.users,
+				...(paginated || page.nextCursor !== null
+					? { nextCursor: page.nextCursor }
+					: {}),
+				scope,
+			});
 		} catch (e) {
 			return handleError(c, e);
 		}
@@ -54,7 +52,7 @@ export function registerUserRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			// Cross-scope ids fail closed as USER_NOT_FOUND
-			const user = inspectUser(store, c.req.param("id"), scope);
+			const user = await inspectUserAuthoritative(store, c.req.param("id"), scope);
 			return c.json({ user, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -190,7 +188,7 @@ export function registerUserRoutes({
 				typeof (body as { status?: unknown }).status === "string"
 					? (body as { status: string }).status
 					: undefined;
-			const envelope = exportUsers(store, {
+			const envelope = await exportUsersAuthoritative(store, {
 				scope,
 				format,
 				limit,

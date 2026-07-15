@@ -81,8 +81,20 @@ export type DeliveryReadinessSummary = {
 		available: boolean;
 		missingReferences: number;
 	};
+	webhookEndpoints: {
+		total: number;
+		active: number;
+		disabled: number;
+		untestedActive: number;
+		testPendingActive: number;
+		testFailedActive: number;
+		testSucceededActive: number;
+		lastTestRequestedAt: string | null;
+	};
 	reasons: Array<
-		"schema_unavailable" | "schema_outdated" | "worker_unavailable" | "key_unavailable"
+		"schema_unavailable" | "schema_outdated" | "worker_unavailable" | "key_unavailable" |
+		"webhook_endpoint_untested" | "webhook_endpoint_test_pending" |
+		"webhook_endpoint_test_failed"
 	>;
 };
 
@@ -695,6 +707,16 @@ export async function deliveryReadiness(
 	const jobs = Object.fromEntries(DELIVERY_STATES.map((state) => [state, 0])) as Record<DeliveryJobState, number>;
 	let workerSummary = { total: 0, ready: 0, freshReady: 0, stale: 0, lastSeenAt: null as string | null };
 	let keySummary = { checked: false, available: true, missingReferences: 0 };
+	let webhookEndpointSummary = {
+		total: 0,
+		active: 0,
+		disabled: 0,
+		untestedActive: 0,
+		testPendingActive: 0,
+		testFailedActive: 0,
+		testSucceededActive: 0,
+		lastTestRequestedAt: null as string | null,
+	};
 	const reasons: DeliveryReadinessSummary["reasons"] = [];
 	try {
 		await assertDeliverySchemaCurrent(pool, options);
@@ -716,11 +738,54 @@ export async function deliveryReadiness(
 			 max(last_seen_at) last_seen_at FROM ${tables.worker}`,
 			[staleBefore],
 		);
-		const row = workers.rows[0]!;
-		workerSummary = {
-			total: Number(row.total), ready: Number(row.ready), freshReady: Number(row.fresh_ready),
-			stale: Number(row.stale), lastSeenAt: iso(row.last_seen_at),
-		};
+			const row = workers.rows[0]!;
+			workerSummary = {
+				total: Number(row.total), ready: Number(row.ready), freshReady: Number(row.fresh_ready),
+				stale: Number(row.stale), lastSeenAt: iso(row.last_seen_at),
+			};
+			const endpointCounts = await pool.query<{
+				total: string;
+				active: string;
+				disabled: string;
+				untested_active: string;
+				test_pending_active: string;
+				test_failed_active: string;
+				test_succeeded_active: string;
+				last_test_requested_at: Date | string | null;
+			}>(
+				`SELECT
+				 count(*) FILTER (WHERE w.status <> 'deleted') total,
+				 count(*) FILTER (WHERE w.status = 'active') active,
+				 count(*) FILTER (WHERE w.status = 'disabled') disabled,
+				 count(*) FILTER (WHERE w.status = 'active' AND w.last_test_job_id IS NULL) untested_active,
+				 count(*) FILTER (WHERE w.status = 'active' AND j.state IN ('queued','leased','retry')) test_pending_active,
+				 count(*) FILTER (WHERE w.status = 'active' AND w.last_test_job_id IS NOT NULL
+				   AND (j.id IS NULL OR j.state IN ('dead','cancelled'))) test_failed_active,
+				 count(*) FILTER (WHERE w.status = 'active' AND j.state = 'delivered') test_succeeded_active,
+				 max(w.last_test_requested_at) last_test_requested_at
+				 FROM ${tables.webhookEndpoint} w
+				 LEFT JOIN ${tables.job} j ON j.id = w.last_test_job_id`,
+			);
+			const endpointRow = endpointCounts.rows[0]!;
+			webhookEndpointSummary = {
+				total: Number(endpointRow.total),
+				active: Number(endpointRow.active),
+				disabled: Number(endpointRow.disabled),
+				untestedActive: Number(endpointRow.untested_active),
+				testPendingActive: Number(endpointRow.test_pending_active),
+				testFailedActive: Number(endpointRow.test_failed_active),
+				testSucceededActive: Number(endpointRow.test_succeeded_active),
+				lastTestRequestedAt: iso(endpointRow.last_test_requested_at),
+			};
+			if (webhookEndpointSummary.untestedActive > 0) {
+				reasons.push("webhook_endpoint_untested");
+			}
+			if (webhookEndpointSummary.testPendingActive > 0) {
+				reasons.push("webhook_endpoint_test_pending");
+			}
+			if (webhookEndpointSummary.testFailedActive > 0) {
+				reasons.push("webhook_endpoint_test_failed");
+			}
 		if (keyring) {
 			const referenced = await pool.query<{ key_kind: "encryption" | "fingerprint"; key_id: string }>(
 				`SELECT DISTINCT 'encryption' key_kind, p.key_id
@@ -768,6 +833,7 @@ export async function deliveryReadiness(
 		jobs,
 		workers: { ...workerSummary, staleAfterMs },
 		keys: keySummary,
+		webhookEndpoints: webhookEndpointSummary,
 		reasons,
 	};
 }

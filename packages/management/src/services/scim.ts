@@ -1,6 +1,7 @@
 import type { ManagementStore } from "../store/types.js";
+import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DiagnosticTrace, DirectoryConnection } from "../types/resources.js";
+import type { DiagnosticTrace, DirectoryConnection, Membership, Principal } from "../types/resources.js";
 import { deleteScimProviderById } from "../auth-bridge.js";
 import { appendAuditEvent, recordEvent } from "./audit.js";
 import {
@@ -305,7 +306,7 @@ export async function disableScimConnectionReal(
 	const now = nowIso();
 
 	if (typeof store.mutateCoordinated === "function") {
-		return store.mutateCoordinated(async ({ data, query }) => {
+		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query }) => {
 			const deleted = await query(`delete from "scimProvider" where id = $1`, [
 				conn.id,
 			]);
@@ -765,6 +766,243 @@ export function testScimConnection(
 		connection: publicDirectoryConnection(
 			store.snapshot.directoryConnections.find((c) => c.id === id)!,
 		) as DirectoryConnection,
+		mode: SCIM_FIXTURE_MODE,
+	};
+}
+
+/** Fixture apply using the typed relational principal repository after cutover. */
+export async function testScimConnectionAuthoritative(
+	store: ManagementStore,
+	id: string,
+	opts: {
+		dryRun?: boolean;
+		users?: ScimUserPayload[];
+		fixture?: "ok" | "malformed" | "unauthorized";
+		actor?: string;
+		source?: ScimActorSource;
+	} = {},
+): Promise<ReturnType<typeof testScimConnection>> {
+	if (!store.storeV2Principals?.authoritative || opts.dryRun !== false) {
+		return testScimConnection(store, id, opts);
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_TRANSACTION_REQUIRED",
+			message: "Relational principal authority requires a coordinated transaction",
+			stage: "scim.test",
+			status: 500,
+		});
+	}
+	await store.ready();
+	const fixture = opts.fixture ?? "ok";
+	if (!["ok", "malformed", "unauthorized"].includes(fixture)) {
+		throw new ClearanceError({
+			code: "SCIM_UNKNOWN_FIXTURE",
+			message: `Unknown SCIM fixture "${fixture}" — fail-closed (simulation mode)`,
+			stage: "scim.test",
+			remediation: "Use a known fixture: ok|malformed|unauthorized",
+		});
+	}
+	const users = opts.users ?? [
+		{ userName: "alice@customer.example", displayName: "Alice", active: true },
+		{ userName: "bob@customer.example", displayName: "Bob", active: true },
+	];
+	const proposed = users.map((user) => ({
+		action: user.active === false ? "deprovision" : "upsert",
+		email: user.userName,
+	}));
+	const corr = `corr_scim_${newId("t").slice(4)}`;
+	const outcome = await store.mutateCoordinated(async ({ data, principals }) => {
+		if (!principals) {
+			throw new ClearanceError({
+				code: "STORE_V2_PRINCIPAL_TRANSACTION_REQUIRED",
+				message: "Relational principal repository is unavailable",
+				stage: "scim.test",
+				status: 500,
+			});
+		}
+		const conn = data.directoryConnections.find((candidate) => candidate.id === id);
+		if (!conn) {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${id} not found`,
+				stage: "scim.test",
+				status: 404,
+			});
+		}
+		const org = data.organizations.find(
+			(candidate) => candidate.id === conn.organizationId && candidate.status !== "archived",
+		);
+		if (!org) {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "scim.test",
+				status: 404,
+			});
+		}
+		const timestamp = nowIso();
+		if (fixture !== "ok") {
+			const malformed = fixture === "malformed";
+			const trace: DiagnosticTrace = {
+				id: newId("tr"),
+				correlationId: corr,
+				organizationId: conn.organizationId,
+				connectionId: conn.id,
+				subsystem: "scim",
+				mode: SCIM_FIXTURE_MODE,
+				stage: malformed ? "request.parse" : "auth.bearer",
+				outcome: "fail",
+				cause: malformed
+					? "SCIM payload failed schema validation"
+					: "Bearer token rejected",
+				causeConfidence: malformed ? 0.95 : 0.99,
+				owner: "customer",
+				remediation: malformed
+					? "Ensure userName and schemas[] are present per RFC 7644"
+					: "Rotate token with clearance scim rotate and update IdP",
+				createdAt: timestamp,
+				checks: [{ name: malformed ? "schema" : "bearer", pass: false }],
+			};
+			data.traces.unshift(trace);
+			appendAuditEvent(data, {
+				actor: opts.actor ?? "system",
+				action: "scim.test",
+				subjectType: "directory_connection",
+				subjectId: id,
+				outcome: "failure",
+				source: opts.source ?? "scim",
+				projectId: org.projectId,
+				environmentId: org.environmentId,
+				organizationId: conn.organizationId,
+				correlationId: corr,
+				message: malformed ? "SCIM simulation apply rejected malformed input" : "SCIM simulation apply rejected unauthorized input",
+				metadata: { mode: SCIM_FIXTURE_MODE, fixture },
+			});
+			return {
+				kind: "failure" as const,
+				code: malformed ? "SCIM_MALFORMED" : "SCIM_UNAUTHORIZED",
+				message: malformed ? "Malformed SCIM payload" : "Unauthorized",
+				stage: trace.stage,
+				remediation: trace.remediation!,
+			};
+		}
+		const scope = { projectId: org.projectId, environmentId: org.environmentId };
+		for (const user of users) {
+			if (user.active === false) continue;
+			const email = user.userName.toLowerCase();
+			let principal = await principals.findActiveByEmail({ scope, email });
+			if (!principal) {
+				principal = await principals.insert({
+					id: newId("user"),
+					projectId: scope.projectId,
+					environmentId: scope.environmentId,
+					email,
+					name: user.displayName?.trim() || email,
+					status: "active",
+					...(user.externalId ? { externalId: user.externalId } : {}),
+					createdAt: timestamp,
+					updatedAt: timestamp,
+				} satisfies Principal);
+			} else {
+				const nextName = user.displayName?.trim() || email;
+				const nextExternalId = user.externalId ?? principal.externalId;
+				if (principal.name !== nextName || principal.externalId !== nextExternalId) {
+					principal = (await principals.update(
+						{
+							...principal,
+							name: nextName,
+							...(nextExternalId === undefined
+								? { externalId: undefined }
+								: { externalId: nextExternalId }),
+							updatedAt: timestamp,
+						},
+						{ expectedUpdatedAt: principal.updatedAt },
+					))!;
+				}
+			}
+			const existing = data.memberships.find(
+				(membership) =>
+					membership.organizationId === org.id &&
+					membership.principalId === principal.id &&
+					membership.status === "active",
+			);
+			if (!existing) {
+				data.memberships.push({
+					id: newId("mem"),
+					organizationId: org.id,
+					principalId: principal.id,
+					role: "member",
+					status: "active",
+					source: "scim",
+					createdAt: timestamp,
+					updatedAt: timestamp,
+				} satisfies Membership);
+			}
+		}
+		const trace: DiagnosticTrace = {
+			id: newId("tr"),
+			correlationId: corr,
+			organizationId: conn.organizationId,
+			connectionId: conn.id,
+			subsystem: "scim",
+			mode: SCIM_FIXTURE_MODE,
+			stage: "sync.apply",
+			outcome: "pass",
+			cause: "Sync applied to local store (simulation — not live directory)",
+			causeConfidence: 1,
+			owner: "application",
+			createdAt: timestamp,
+			checks: [
+				{ name: "auth.bearer", pass: true },
+				{ name: "schema", pass: true },
+				{ name: "map_users", pass: true, detail: `${proposed.length} users` },
+				{ name: "mode", pass: true, detail: "simulation" },
+			],
+			redactedResponse: { proposedCount: proposed.length, dryRun: false },
+		};
+		data.traces.unshift(trace);
+		const connectionIndex = data.directoryConnections.findIndex(
+			(candidate) => candidate.id === id,
+		);
+		data.directoryConnections[connectionIndex] = {
+			...conn,
+			status: "testing",
+			updatedAt: timestamp,
+		};
+		appendAuditEvent(data, {
+			actor: opts.actor ?? "system",
+			action: "scim.test",
+			subjectType: "directory_connection",
+			subjectId: id,
+			outcome: "success",
+			source: opts.source ?? "scim",
+			projectId: org.projectId,
+			environmentId: org.environmentId,
+			organizationId: conn.organizationId,
+			correlationId: corr,
+			message: "SCIM simulation apply passed (not live directory conformance)",
+			metadata: { proposed, mode: SCIM_FIXTURE_MODE, fixture },
+		});
+		return {
+			kind: "success" as const,
+			trace: structuredClone(trace),
+			connection: structuredClone(data.directoryConnections[connectionIndex]!),
+		};
+	});
+	if (outcome.kind === "failure") {
+		throw new ClearanceError({
+			code: outcome.code,
+			message: outcome.message,
+			stage: outcome.stage,
+			remediation: outcome.remediation,
+		});
+	}
+	return {
+		pass: true,
+		trace: outcome.trace,
+		proposed,
+		connection: publicDirectoryConnection(outcome.connection) as DirectoryConnection,
 		mode: SCIM_FIXTURE_MODE,
 	};
 }

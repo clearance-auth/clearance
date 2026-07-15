@@ -74,7 +74,13 @@ import {
 	decodePageCursor,
 	encodePageCursor,
 } from "./services/pagination.js";
-import type { ManagementStore } from "./store/types.js";
+import type {
+	InternalManagementCoordinatedMutationContext,
+	ManagementStore,
+	StoreV2PrincipalRepository,
+} from "./store/types.js";
+import { mutateCoordinatedWithRuntimeSql } from "./store/coordinated-internal.js";
+import { advancingPrincipalUpdatedAt } from "./store/store-v2-principals.js";
 import type { OperationContext } from "./application/context.js";
 import type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
 import {
@@ -228,11 +234,16 @@ export async function createUserInAuth(input: {
 
 	if (input.managementStore) {
 		// Durable canonical bridge — failures propagate (not swallowed)
-		return syncRuntimeUserToManagementDurable(
-			input.managementStore,
-			user,
-			managementSyncOptions(input.operationContext),
-		);
+		try {
+			return await syncRuntimeUserToManagementDurable(
+				input.managementStore,
+				user,
+				managementSyncOptions(input.operationContext),
+			);
+		} catch (cause) {
+			await authContext.internalAdapter.deleteUser(user.id).catch(() => undefined);
+			throw cause;
+		}
 	}
 
 	return principal;
@@ -863,6 +874,29 @@ export async function listSessionsInAuth(
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const limit = normalizeSessionLimit(opts?.limit);
 	const b = getAuthBundle();
+	if (store.storeV2Principals?.authoritative) {
+		const reader = store.storeV2Principals.listActiveSessionsPage;
+		if (!reader) {
+			throw new ClearanceError({
+				code: "STORE_V2_PRINCIPAL_SESSION_READER_REQUIRED",
+				message: "Relational principal session reader is unavailable",
+				stage: "sessions.list",
+				status: 500,
+			});
+		}
+		const page = await reader({ scope, limit });
+		return page.sessions.map((row) => sanitizeSessionView({
+			id: row.id,
+			principalId: row.principal.id,
+			projectId: row.principal.projectId,
+			environmentId: row.principal.environmentId,
+			status: "active",
+			createdAt: row.createdAt,
+			...(row.expiresAt ? { expiresAt: row.expiresAt } : {}),
+			...(row.ipAddress ? { ipAddress: row.ipAddress } : {}),
+			...(row.userAgent ? { userAgent: row.userAgent } : {}),
+		}));
+	}
 
 	const principals = new Map(
 		store.snapshot.principals
@@ -932,6 +966,42 @@ export async function listSessionsPageInAuth(
 	const limit = normalizeSessionLimit(opts?.limit);
 	const cursor = decodePageCursor(opts?.cursor, "sessions", "sessions.list");
 	const b = getAuthBundle();
+	if (store.storeV2Principals?.authoritative) {
+		const reader = store.storeV2Principals.listActiveSessionsPage;
+		if (!reader) {
+			throw new ClearanceError({
+				code: "STORE_V2_PRINCIPAL_SESSION_READER_REQUIRED",
+				message: "Relational principal session reader is unavailable",
+				stage: "sessions.list",
+				status: 500,
+			});
+		}
+		const page = await reader({
+			scope,
+			limit,
+			...(cursor ? { cursor } : {}),
+		});
+		const last = page.sessions[page.sessions.length - 1];
+		return {
+			sessions: page.sessions.map((row) => sanitizeSessionView({
+				id: row.id,
+				principalId: row.principal.id,
+				projectId: row.principal.projectId,
+				environmentId: row.principal.environmentId,
+				status: "active",
+				createdAt: row.createdAt,
+				...(row.expiresAt ? { expiresAt: row.expiresAt } : {}),
+				...(row.ipAddress ? { ipAddress: row.ipAddress } : {}),
+				...(row.userAgent ? { userAgent: row.userAgent } : {}),
+			})),
+			nextCursor: page.hasMore && last
+				? encodePageCursor("sessions", {
+						createdAt: last.cursorCreatedAt,
+						id: last.id,
+					})
+				: null,
+		};
+	}
 
 	const principals = new Map(
 		store.snapshot.principals
@@ -1032,11 +1102,44 @@ export async function inspectSessionInAuth(
 				userAgent?: string | null;
 		  }
 		| undefined;
-	if (!row) return inspectSession(store, sessionId, { scope });
+	if (!row) {
+		if (!store.storeV2Principals?.authoritative) {
+			return inspectSession(store, sessionId, { scope });
+		}
+		const tombstone = store.snapshot.sessions.find(
+			(candidate) => candidate.id === sessionId,
+		);
+		if (!tombstone) {
+			throw new ClearanceError({
+				code: "SESSION_NOT_FOUND",
+				message: "Session not found",
+				stage: "sessions.inspect",
+				status: 404,
+			});
+		}
+		const tombstonePrincipal = await store.storeV2Principals.getById({
+			scope,
+			id: tombstone.principalId,
+		});
+		if (!tombstonePrincipal) {
+			throw new ClearanceError({
+				code: "SESSION_NOT_FOUND",
+				message: "Session not found",
+				stage: "sessions.inspect",
+				status: 404,
+			});
+		}
+		return toSessionView(tombstone, tombstonePrincipal.projectId);
+	}
 
-	const principal = store.snapshot.principals.find(
-		(candidate) => candidate.id === String(row.userId),
-	);
+	const principal = store.storeV2Principals?.authoritative
+		? await store.storeV2Principals.getById({
+				scope,
+				id: String(row.userId),
+			})
+		: store.snapshot.principals.find(
+				(candidate) => candidate.id === String(row.userId),
+			);
 	if (!principal || principal.status === "deleted") {
 		throw new ClearanceError({
 			code: "SESSION_NOT_FOUND",
@@ -1096,7 +1199,7 @@ export async function revokeSessionInAuth(
 		});
 	}
 
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, principals, query }) => {
 		// Never select token.
 		const runtime = await query(
 			`select id, "userId", "createdAt", "expiresAt", "ipAddress", "userAgent"
@@ -1129,7 +1232,9 @@ export async function revokeSessionInAuth(
 			});
 		}
 
-		const principal = data.principals.find((p) => p.id === principalId);
+		const principal = principals
+			? await principals.getById({ scope, id: principalId })
+			: data.principals.find((p) => p.id === principalId);
 		if (!principal || principal.status === "deleted") {
 			throw new ClearanceError({
 				code: "SESSION_NOT_FOUND",
@@ -1240,7 +1345,11 @@ function requireCoordinatedStore(
 	stage = "users.lifecycle",
 	code = "USER_LIFECYCLE_BACKEND",
 ): {
-	mutateCoordinated: NonNullable<ManagementStore["mutateCoordinated"]>;
+	mutateCoordinated: <T>(
+		fn: (
+			context: InternalManagementCoordinatedMutationContext,
+		) => Promise<T> | T,
+	) => Promise<T>;
 } {
 	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
 		throw new ClearanceError({
@@ -1253,7 +1362,10 @@ function requireCoordinatedStore(
 				"Set DATABASE_URL and use the Postgres management backend, or use JsonStore management-only mutations without runtime auth",
 		});
 	}
-	return { mutateCoordinated: store.mutateCoordinated.bind(store) };
+	return {
+		mutateCoordinated: (fn) =>
+			mutateCoordinatedWithRuntimeSql(store, fn),
+	};
 }
 
 async function ensureRuntimeLifecycleSchema(): Promise<void> {
@@ -1268,13 +1380,16 @@ async function ensureRuntimeLifecycleSchema(): Promise<void> {
 	);
 }
 
-function findPrincipalInScope(
+async function findPrincipalInScope(
 	data: DataStoreSnapshot,
+	principals: StoreV2PrincipalRepository | undefined,
 	id: string,
 	scope: ResourceScope,
 	stage: string,
-): Principal {
-	const user = data.principals.find((p) => p.id === id);
+): Promise<Principal> {
+	const user = principals
+		? await principals.getById({ scope, id })
+		: data.principals.find((p) => p.id === id);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -1418,19 +1533,21 @@ export async function updateUserInAuth(
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, query }) => {
-		const user = findPrincipalInScope(data, id, scope, "users.update");
+	return mutateCoordinated(async ({ data, principals, query }) => {
+		const user = await findPrincipalInScope(data, principals, id, scope, "users.update");
 		const runtime = await requireRuntimeUser(query, id, "users.update");
 
 		if (email && email !== user.email.toLowerCase()) {
-			const conflict = data.principals.find(
-				(p) =>
-					p.id !== user.id &&
-					p.email.toLowerCase() === email &&
-					p.projectId === user.projectId &&
-					p.environmentId === user.environmentId &&
-					p.status !== "deleted",
-			);
+			const conflict = principals
+				? await principals.findActiveByEmail({ scope, email })
+				: data.principals.find(
+						(p) =>
+							p.id !== user.id &&
+							p.email.toLowerCase() === email &&
+							p.projectId === user.projectId &&
+							p.environmentId === user.environmentId &&
+							p.status !== "deleted",
+					);
 			if (conflict) {
 				throw new ClearanceError({
 					code: "USER_EXISTS",
@@ -1455,6 +1572,10 @@ export async function updateUserInAuth(
 
 		const nextEmail = email ?? user.email;
 		const nextName = name ?? user.name;
+		const previousUpdatedAt = user.updatedAt;
+		const principalUpdatedAt = principals
+			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			: now;
 		let nextBanned = Boolean(runtime.banned);
 		let nextBanReason: string | null =
 			nextBanned ? "disabled" : null;
@@ -1497,7 +1618,7 @@ export async function updateUserInAuth(
            "updatedAt" = $5
        where id = $6
        returning id, email, name, banned, "updatedAt"`,
-			[nextEmail, nextName, nextBanned, nextBanReason, new Date(now), id],
+			[nextEmail, nextName, nextBanned, nextBanReason, new Date(principalUpdatedAt), id],
 		);
 		if (!updated.rows[0]) {
 			throw new ClearanceError({
@@ -1511,9 +1632,22 @@ export async function updateUserInAuth(
 		if (email) user.email = nextEmail;
 		if (name !== undefined) user.name = nextName;
 		if (status !== undefined) user.status = status;
-		user.updatedAt = now;
+		user.updatedAt = principalUpdatedAt;
 
 		const principal: Principal = { ...user };
+		if (principals) {
+			const updatedPrincipal = await principals.update(principal, {
+				expectedUpdatedAt: previousUpdatedAt,
+			});
+			if (!updatedPrincipal) {
+				throw new ClearanceError({
+					code: "USER_NOT_FOUND",
+					message: "User not found",
+					stage: "users.update",
+					status: 404,
+				});
+			}
+		}
 		appendAuditEvent(data, {
 			actor: input.actor ?? "operator",
 			action: "users.update",
@@ -1557,9 +1691,13 @@ export async function disableUserInAuth(
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, query }) => {
-		const user = findPrincipalInScope(data, id, scope, "users.disable");
+	return mutateCoordinated(async ({ data, principals, query }) => {
+		const user = await findPrincipalInScope(data, principals, id, scope, "users.disable");
 		await requireRuntimeUser(query, id, "users.disable");
+		const previousUpdatedAt = user.updatedAt;
+		const principalUpdatedAt = principals
+			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			: now;
 
 		const alreadyDisabled = user.status === "disabled";
 		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id);
@@ -1571,12 +1709,28 @@ export async function disableUserInAuth(
            "banReason" = 'disabled',
            "updatedAt" = $1
        where id = $2`,
-			[new Date(now), id],
+			[new Date(principalUpdatedAt), id],
 		);
 
 		if (!alreadyDisabled) {
 			user.status = "disabled";
-			user.updatedAt = now;
+			user.updatedAt = principalUpdatedAt;
+		}
+		if (principals && !alreadyDisabled) {
+			const disabledPrincipal = await principals.disable({
+				scope,
+				id: user.id,
+				updatedAt: user.updatedAt,
+				expectedUpdatedAt: previousUpdatedAt,
+			});
+			if (!disabledPrincipal) {
+				throw new ClearanceError({
+					code: "USER_NOT_FOUND",
+					message: "User not found",
+					stage: "users.disable",
+					status: 404,
+				});
+			}
 		}
 
 		const principal: Principal = { ...user };
@@ -1622,9 +1776,13 @@ export async function deleteUserInAuth(
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, query }) => {
-		const user = findPrincipalInScope(data, id, scope, "users.delete");
+	return mutateCoordinated(async ({ data, principals, query }) => {
+		const user = await findPrincipalInScope(data, principals, id, scope, "users.delete");
 		await requireRuntimeUser(query, id, "users.delete");
+		const previousUpdatedAt = user.updatedAt;
+		const principalUpdatedAt = principals
+			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			: now;
 
 		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id);
 		const strippedAccounts = await stripRuntimeCredentials(query, id);
@@ -1637,11 +1795,27 @@ export async function deleteUserInAuth(
            "banReason" = 'deleted',
            "updatedAt" = $2
        where id = $3`,
-			[tombstoneEmail, new Date(now), id],
+			[tombstoneEmail, new Date(principalUpdatedAt), id],
 		);
 
 		user.status = "deleted";
-		user.updatedAt = now;
+		user.updatedAt = principalUpdatedAt;
+		if (principals) {
+			const deletedPrincipal = await principals.delete({
+				scope,
+				id: user.id,
+				updatedAt: user.updatedAt,
+				expectedUpdatedAt: previousUpdatedAt,
+			});
+			if (!deletedPrincipal) {
+				throw new ClearanceError({
+					code: "USER_NOT_FOUND",
+					message: "User not found",
+					stage: "users.delete",
+					status: 404,
+				});
+			}
+		}
 
 		const revokedMgmtSessions = revokeManagementSessions(data, user.id, now);
 		for (const membership of data.memberships) {
@@ -1799,9 +1973,15 @@ export async function addMemberInAuth(
 		stage,
 	});
 
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, principals, query }) => {
 		const org = findOrgInScope(data, input.organizationId, scope, stage);
-		const principal = findPrincipalInScope(data, input.principalId, scope, stage);
+		const principal = await findPrincipalInScope(
+			data,
+			principals,
+			input.principalId,
+			scope,
+			stage,
+		);
 		if (
 			org.projectId !== principal.projectId ||
 			org.environmentId !== principal.environmentId
@@ -1976,7 +2156,7 @@ export async function updateMemberInAuth(
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, principals, query }) => {
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			// Try runtime-only membership by id — fail closed (not auto-create on update)
@@ -2001,7 +2181,13 @@ export async function updateMemberInAuth(
 		}
 
 		const org = findOrgInScope(data, row.organizationId, scope, stage);
-		const principal = findPrincipalInScope(data, row.principalId, scope, stage);
+		const principal = await findPrincipalInScope(
+			data,
+			principals,
+			row.principalId,
+			scope,
+			stage,
+		);
 
 		const resolved = resolveAssignableRole(
 			{ snapshot: data } as ManagementStore,
@@ -2112,7 +2298,7 @@ export async function removeMemberInAuth(
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, principals, query }) => {
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			const runtimeOnly = await loadRuntimeMemberById(query, id);
@@ -2137,7 +2323,9 @@ export async function removeMemberInAuth(
 
 		const org = findOrgInScope(data, row.organizationId, scope, stage);
 		// Principal may already be disabled; still allow remove if in scope
-		const principal = data.principals.find((p) => p.id === row.principalId);
+		const principal = principals
+			? await principals.getById({ scope, id: row.principalId, includeDeleted: true })
+			: data.principals.find((p) => p.id === row.principalId);
 		if (principal) {
 			assertResourceInScope(principal, scope, {
 				code: "MEMBER_NOT_FOUND",
@@ -2279,7 +2467,12 @@ export async function updateOrganizationInAuth(
 		? "migration"
 		: input.source ?? "cli";
 
-	return mutateCoordinated(async ({ data, query, enqueueDelivery }) => {
+	return mutateCoordinated(async ({
+		data,
+		query,
+		enqueueDelivery,
+		fanoutWebhookEndpoints,
+	}) => {
 		const org = findOrgInScope(data, id, scope, "orgs.update");
 		const runtime = await requireRuntimeOrg(query, org.id, "orgs.update");
 
@@ -2390,9 +2583,26 @@ export async function updateOrganizationInAuth(
 					: {}),
 			},
 		});
+		const managedDeliveries = await fanoutWebhookEndpoints?.({
+			context: {
+				scope,
+				actor: input.actor ?? "operator",
+				source,
+				correlationId: corr,
+			},
+			organization: { ...org },
+			before,
+			occurredAt: new Date(now),
+		}) ?? [];
 		await enqueueOrganizationUpdatedWebhooks({
 			enqueue: enqueueDelivery,
 			targets: input.webhookTargets ?? [],
+			excludeTargetIds: new Set(
+				managedDeliveries.map((delivery) => delivery.endpointId),
+			),
+			excludeDestinationUrls: new Set(
+				managedDeliveries.map((delivery) => delivery.destinationUrl),
+			),
 			context: {
 				scope,
 				actor: input.actor ?? "operator",

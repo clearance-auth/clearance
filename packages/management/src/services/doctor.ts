@@ -3,7 +3,7 @@ import { createConnection } from "node:net";
 import { resolve } from "node:path";
 import pg from "pg";
 import type { ManagementStore } from "../store/types.js";
-import type { DoctorCheck } from "../types/resources.js";
+import type { DoctorCheck, Principal } from "../types/resources.js";
 import { STORE_SCHEMA_VERSION } from "../store/json-store.js";
 import { recordEvent } from "./audit.js";
 import { resolveCredentialKeyring } from "./credentials.js";
@@ -35,6 +35,32 @@ async function httpReachable(url: string, timeoutMs = 2000): Promise<boolean> {
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+async function principalsForDoctor(store: ManagementStore): Promise<Principal[]> {
+	if (!store.storeV2Principals?.authoritative) {
+		return store.snapshot.principals.filter((principal) => principal.status !== "deleted");
+	}
+	const principals: Principal[] = [];
+	for (const environment of store.snapshot.environments) {
+		let cursor: { createdAt: string; id: string } | undefined;
+		do {
+			const page = await store.storeV2Principals.listPage({
+				scope: {
+					projectId: environment.projectId,
+					environmentId: environment.id,
+				},
+				limit: 1_000,
+				...(cursor ? { cursor } : {}),
+			});
+			principals.push(...page.principals);
+			const last = page.principals[page.principals.length - 1];
+			cursor = page.hasMore && last
+				? { createdAt: last.createdAt, id: last.id }
+				: undefined;
+		} while (cursor);
+	}
+	return principals;
 }
 
 export async function runDoctor(
@@ -267,6 +293,35 @@ export async function runDoctor(
 		}
 	}
 
+	if (store.deliveryControl) {
+		try {
+			const readiness = await store.deliveryControl.readiness();
+			checks.push({
+				id: "delivery-readiness",
+				name: "Durable delivery readiness",
+				status: readiness.ready ? "pass" : "fail",
+				detail: readiness.ready
+					? `${readiness.workers.freshReady} fresh workers; webhook endpoints active=${readiness.webhookEndpoints.active}, disabled=${readiness.webhookEndpoints.disabled}, tested=${readiness.webhookEndpoints.testSucceededActive}`
+					: `Delivery blockers: ${readiness.reasons.join(", ") || "unknown"}; webhook endpoint tests untested=${readiness.webhookEndpoints.untestedActive}, pending=${readiness.webhookEndpoints.testPendingActive}, failed=${readiness.webhookEndpoints.testFailedActive}, succeeded=${readiness.webhookEndpoints.testSucceededActive}`,
+				remediation: readiness.ready
+					? undefined
+					: readiness.webhookEndpoints.untestedActive > 0 ||
+							readiness.webhookEndpoints.testPendingActive > 0 ||
+							readiness.webhookEndpoints.testFailedActive > 0
+						? "Run clearance delivery endpoints test for every active endpoint and confirm its test job reaches delivered, then restore other reported dependencies"
+						: "Run clearance delivery readiness --json and restore the reported worker, schema, or key dependency",
+			});
+		} catch {
+			checks.push({
+				id: "delivery-readiness",
+				name: "Durable delivery readiness",
+				status: "fail",
+				detail: "Delivery readiness could not be verified",
+				remediation: "Run clearance delivery readiness --json and inspect the PostgreSQL delivery schema",
+			});
+		}
+	}
+
 	if (secrets.DATABASE_URL?.startsWith("postgres")) {
 		try {
 			const u = new URL(secrets.DATABASE_URL);
@@ -333,6 +388,7 @@ export async function runDoctor(
 			});
 
 			if (missing.length === 0) {
+				const managementPrincipals = await principalsForDoctor(store);
 				const runtimeUsers = await pool.query<{ id: string; email: string }>(
 					`select id, email from "user" where email <> 'operator@clearance.local'`,
 				);
@@ -351,9 +407,7 @@ export async function runDoctor(
 					),
 				);
 				const managementUserIds = new Set(
-					store.snapshot.principals
-						.filter((principal) => principal.status !== "deleted")
-						.map((principal) => principal.id),
+					managementPrincipals.map((principal) => principal.id),
 				);
 				const managementOrgIds = new Set(
 					store.snapshot.organizations
@@ -366,9 +420,9 @@ export async function runDoctor(
 				const missingOrgs = runtimeOrgs.rows.filter(
 					(org) => !managementOrgIds.has(org.id),
 				);
-				const managementOnlyUsers = store.snapshot.principals.filter(
+				const managementOnlyUsers = managementPrincipals.filter(
 					(principal) =>
-						principal.status !== "deleted" && !runtimeUserIds.has(principal.id),
+						!runtimeUserIds.has(principal.id),
 				);
 				const managementOnlyOrgs = store.snapshot.organizations.filter(
 					(organization) =>

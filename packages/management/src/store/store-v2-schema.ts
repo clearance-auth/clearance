@@ -1,6 +1,62 @@
 import { createHash } from "node:crypto";
+import {
+	STORE_V2_COLLECTIONS,
+	type StoreV2Collection,
+} from "./types.js";
 
-export const STORE_V2_SCHEMA_VERSION = 1 as const;
+export const STORE_V2_SCHEMA_VERSION = 2 as const;
+export const STORE_V2_PRINCIPAL_AUTHORITY_VERSION = 1 as const;
+export const STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY =
+	"store_v2_authoritative_collections";
+export const STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY =
+	"store_v2_principal_authority_version";
+export const STORE_V2_PRINCIPAL_REVISION_META_KEY =
+	"store_v2_principal_revision";
+export const STORE_V2_PRINCIPAL_STATE_META_KEY =
+	"store_v2_principal_state";
+
+/** Strict parser shared by every store-v2 revision/version metadata read. */
+export function parseStoreV2MetadataInteger(value: unknown): number | null {
+	if (typeof value === "number") {
+		return Number.isSafeInteger(value) && value >= 0 ? value : null;
+	}
+	if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) return null;
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+const STORE_V2_AUTHORITY_ORDER: readonly StoreV2Collection[] = [
+	"events",
+	"principals",
+	"projects",
+	"environments",
+	"organizations",
+];
+
+export function canonicalStoreV2AuthoritySet(
+	collections: readonly StoreV2Collection[],
+): StoreV2Collection[] {
+	const selected = new Set(collections);
+	return STORE_V2_AUTHORITY_ORDER.filter((collection) => selected.has(collection));
+}
+
+export function parseStoreV2AuthoritySet(value: unknown): StoreV2Collection[] {
+	if (!Array.isArray(value)) {
+		throw new Error("STORE_V2_AUTHORITY_SET_INVALID");
+	}
+	const valid = new Set<string>(STORE_V2_COLLECTIONS);
+	const collections: StoreV2Collection[] = [];
+	for (const collection of value) {
+		if (typeof collection !== "string" || !valid.has(collection)) {
+			throw new Error("STORE_V2_AUTHORITY_SET_INVALID");
+		}
+		if (collections.includes(collection as StoreV2Collection)) {
+			throw new Error("STORE_V2_AUTHORITY_SET_INVALID");
+		}
+		collections.push(collection as StoreV2Collection);
+	}
+	return canonicalStoreV2AuthoritySet(collections);
+}
 
 export interface StoreV2TableNames {
 	meta: string;
@@ -29,6 +85,92 @@ function derivedIdentifier(value: string): string {
 	);
 }
 
+export function storeV2PrincipalEmailUniqueIndex(
+	tables: StoreV2TableNames,
+): string {
+	return derivedIdentifier(`${tables.principals}_email_unique`);
+}
+
+export function storeV2PrincipalExternalIdUniqueIndex(
+	tables: StoreV2TableNames,
+): string {
+	return derivedIdentifier(`${tables.principals}_external_id_unique`);
+}
+
+export function storeV2PrincipalProjectionGuardStatements(
+	tables: StoreV2TableNames,
+	snapshotTable: string,
+): string[] {
+	const safeSnapshotTable = safeIdentifier(snapshotTable);
+	const functionName = derivedIdentifier(`${safeSnapshotTable}_v2_principal_guard_fn`);
+	const triggerName = derivedIdentifier(`${safeSnapshotTable}_v2_principal_guard`);
+	const authorityFunctionName = derivedIdentifier(`${safeSnapshotTable}_v2_authority_guard_fn`);
+	const authorityTriggerName = derivedIdentifier(`${safeSnapshotTable}_v2_authority_guard`);
+	return [
+		`CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
+		DECLARE authority_set jsonb;
+		BEGIN
+			SELECT value INTO authority_set
+			FROM ${tables.meta}
+			WHERE key = '${STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY}';
+			IF authority_set IS NULL OR jsonb_typeof(authority_set) <> 'array'
+			THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '23514',
+					MESSAGE = 'STORE_V2_AUTHORITY_SET_INVALID';
+			END IF;
+			IF EXISTS (
+					SELECT 1 FROM jsonb_array_elements_text(authority_set) AS item(value)
+					WHERE item.value NOT IN ('events', 'principals', 'projects', 'environments', 'organizations')
+				)
+				OR jsonb_array_length(authority_set) <> (
+					SELECT count(DISTINCT item.value)
+					FROM jsonb_array_elements_text(authority_set) AS item(value)
+				)
+			THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '23514',
+					MESSAGE = 'STORE_V2_AUTHORITY_SET_INVALID';
+			END IF;
+			IF authority_set ? 'principals'
+				AND (
+					jsonb_typeof(NEW.data->'principals') IS DISTINCT FROM 'array'
+					OR jsonb_array_length(NEW.data->'principals') > 0
+				)
+			THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '23514',
+					MESSAGE = 'STORE_V2_PRINCIPAL_PROJECTION_FORBIDDEN';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS ${triggerName} ON ${safeSnapshotTable}`,
+		`CREATE TRIGGER ${triggerName}
+			BEFORE INSERT OR UPDATE OF data ON ${safeSnapshotTable}
+			FOR EACH ROW EXECUTE FUNCTION ${functionName}()`,
+		`CREATE OR REPLACE FUNCTION ${authorityFunctionName}() RETURNS trigger AS $$
+		BEGIN
+			IF OLD.key = '${STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY}'
+				AND OLD.value ? 'principals'
+				AND NOT (NEW.value ? 'principals')
+				AND current_setting('clearance.principal_authority_rollback', true)
+					IS DISTINCT FROM '${STORE_V2_PRINCIPAL_AUTHORITY_VERSION}'
+			THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '23514',
+					MESSAGE = 'STORE_V2_PRINCIPAL_AUTHORITY_ROLLBACK_CAPABILITY_REQUIRED';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS ${authorityTriggerName} ON ${tables.meta}`,
+		`CREATE TRIGGER ${authorityTriggerName}
+			BEFORE UPDATE OF value ON ${tables.meta}
+			FOR EACH ROW EXECUTE FUNCTION ${authorityFunctionName}()`,
+	];
+}
+
 export function storeV2TableNames(prefix: string): StoreV2TableNames {
 	const safePrefix = safeIdentifier(prefix);
 	return {
@@ -49,9 +191,8 @@ export function storeV2SchemaStatements(
 	const environmentCursorIndex = derivedIdentifier(
 		`${tables.environments}_cursor`,
 	);
-	const principalEmailIndex = derivedIdentifier(
-		`${tables.principals}_email_unique`,
-	);
+	const principalEmailIndex = storeV2PrincipalEmailUniqueIndex(tables);
+	const principalExternalIdIndex = storeV2PrincipalExternalIdUniqueIndex(tables);
 	const principalCursorIndex = derivedIdentifier(`${tables.principals}_cursor`);
 	const organizationSlugIndex = derivedIdentifier(
 		`${tables.organizations}_slug_unique`,
@@ -103,14 +244,22 @@ export function storeV2SchemaStatements(
 			name text NOT NULL,
 			status text NOT NULL CHECK (status IN ('active', 'disabled', 'deleted')),
 			external_id text,
-			created_at timestamptz NOT NULL,
-			updated_at timestamptz NOT NULL,
+			created_at timestamptz(3) NOT NULL,
+			updated_at timestamptz(3) NOT NULL,
 			FOREIGN KEY (project_id, environment_id)
 				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
 		)`,
+		`ALTER TABLE ${tables.principals}
+			ALTER COLUMN created_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', created_at),
+			ALTER COLUMN updated_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', updated_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${principalEmailIndex}
 			ON ${tables.principals} (project_id, environment_id, lower(email))
 			WHERE status <> 'deleted'`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ${principalExternalIdIndex}
+			ON ${tables.principals} (project_id, environment_id, external_id)
+			WHERE status <> 'deleted' AND external_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS ${principalCursorIndex}
 			ON ${tables.principals}
 				(project_id, environment_id, created_at DESC, id DESC)`,
@@ -144,7 +293,7 @@ export function storeV2SchemaStatements(
 			subject_type text NOT NULL,
 			subject_id text,
 			outcome text NOT NULL CHECK (outcome IN ('success', 'failure', 'pending')),
-			source text NOT NULL CHECK (source IN ('cli', 'console', 'api', 'system', 'migration', 'sso', 'scim')),
+			source text NOT NULL CHECK (source IN ('cli', 'console', 'api', 'system', 'migration', 'import', 'sso', 'scim')),
 			message text NOT NULL,
 			metadata jsonb,
 			created_at timestamptz NOT NULL,

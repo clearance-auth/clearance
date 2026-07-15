@@ -7,7 +7,7 @@ import type { Organization } from "../types/resources.js";
 import type { OperationContext } from "./context.js";
 
 const TARGET_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const WEBHOOK_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+export const MANAGEMENT_WEBHOOK_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export type ManagementWebhookTarget = {
 	id: string;
@@ -26,6 +26,17 @@ export type ValidatedManagementWebhookTarget = Readonly<{
 export type ManagementDeliveryEnqueue = (
 	input: EnqueueDeliveryInput,
 ) => Promise<EnqueuedDelivery>;
+
+export type ManagementWebhookEndpointFanout = (input: {
+	context: OperationContext;
+	organization: Organization;
+	before: { name: string; slug: string };
+	occurredAt: Date;
+}) => Promise<readonly {
+	endpointId: string;
+	destinationUrl: string;
+	delivery: EnqueuedDelivery;
+}[]>;
 
 function isLoopback(hostname: string): boolean {
 	return hostname === "localhost" ||
@@ -90,6 +101,8 @@ export function validateManagementWebhookTargets(
 export async function enqueueOrganizationUpdatedWebhooks(input: {
 	enqueue: ManagementDeliveryEnqueue | undefined;
 	targets: readonly ValidatedManagementWebhookTarget[];
+	excludeTargetIds?: ReadonlySet<string>;
+	excludeDestinationUrls?: ReadonlySet<string>;
 	context: OperationContext;
 	organization: Organization;
 	before: { name: string; slug: string };
@@ -102,9 +115,13 @@ export async function enqueueOrganizationUpdatedWebhooks(input: {
 		);
 	}
 	const occurredAt = input.occurredAt.toISOString();
-	const expiresAt = new Date(input.occurredAt.getTime() + WEBHOOK_TTL_MS);
+	const expiresAt = new Date(input.occurredAt.getTime() + MANAGEMENT_WEBHOOK_TTL_MS);
 	const deliveries: EnqueuedDelivery[] = [];
 	for (const target of input.targets) {
+		if (
+			input.excludeTargetIds?.has(target.id) ||
+			input.excludeDestinationUrls?.has(target.url)
+		) continue;
 		const eventId = randomUUID();
 		const correlationId = input.context.correlationId ?? eventId;
 		const sourceGeneration = input.context.correlationId ?? occurredAt;

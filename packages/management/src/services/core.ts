@@ -24,6 +24,7 @@ import { ClearanceError } from "./errors.js";
 import { writeExportArtifact } from "./export-artifact.js";
 import {
 	decodePageCursor,
+	encodePageCursor,
 	normalizePageLimit,
 	paginateByCreatedAt,
 } from "./pagination.js";
@@ -41,6 +42,35 @@ function slugify(name: string): string {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "")
 		.slice(0, 48);
+}
+
+function assertSnapshotPrincipalWriterDisabled(
+	store: ManagementUnitOfWork,
+	stage: string,
+): void {
+	const candidate = store as ManagementUnitOfWork &
+		Partial<Pick<ManagementStore, "storeV2Principals">>;
+	if (candidate.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPALS_TYPED_MUTATION_REQUIRED",
+			message: "Relational principal authority requires the coordinated principal writer.",
+			stage,
+			status: 409,
+			remediation: "Use the management application or auth-coordinated user workflow.",
+		});
+	}
+}
+
+function principalReadView(store: ManagementStore): readonly Principal[] {
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage: "principals.read",
+			status: 500,
+		});
+	}
+	return store.snapshot.principals;
 }
 
 const PROJECT_NAME_MAX_LENGTH = 120;
@@ -389,11 +419,20 @@ export type EnvironmentInspectResult = {
  * Inspect a canonical environment plus truthful local status (no secrets).
  * Default id is the operator principal environment. Cross-project ids fail closed.
  */
-export function inspectEnvironment(
+function inspectEnvironmentSnapshot(
 	store: ManagementStore,
 	id?: string,
 	opts?: { scope?: ResourceScope },
+	allowRelationalPlaceholder = false,
 ): EnvironmentInspectResult {
+	if (store.storeV2Principals?.authoritative && !allowRelationalPlaceholder) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+			message: "Relational environment inspection requires bounded counts.",
+			stage: "env.inspect",
+			status: 500,
+		});
+	}
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const key = id?.trim() || scope.environmentId;
 	const environment = findEnvironmentInProject(
@@ -407,7 +446,9 @@ export function inspectEnvironment(
 	const project =
 		store.snapshot.projects.find((p) => p.id === environment.projectId) ?? null;
 
-	const principals = store.snapshot.principals.filter(
+	const principals = (store.storeV2Principals?.authoritative
+		? []
+		: principalReadView(store)).filter(
 		(p) =>
 			p.projectId === environment.projectId &&
 			p.environmentId === environment.id &&
@@ -484,6 +525,51 @@ export function inspectEnvironment(
 		scope,
 		local,
 		correlationId: correlationId(),
+	};
+}
+
+export function inspectEnvironment(
+	store: ManagementStore,
+	id?: string,
+	opts?: { scope?: ResourceScope },
+): EnvironmentInspectResult {
+	return inspectEnvironmentSnapshot(store, id, opts);
+}
+
+export async function inspectEnvironmentAuthoritative(
+	store: ManagementStore,
+	id?: string,
+	opts?: { scope?: ResourceScope },
+): Promise<EnvironmentInspectResult> {
+	if (!store.storeV2Principals?.authoritative) return inspectEnvironment(store, id, opts);
+	const result = inspectEnvironmentSnapshot(store, id, opts, true);
+	const scope = {
+		projectId: result.environment.projectId,
+		environmentId: result.environment.id,
+	};
+	const countReader = store.storeV2Principals.countByScope;
+	if (!countReader) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+			message: "Relational principal count reader is unavailable",
+			stage: "env.inspect",
+			status: 500,
+		});
+	}
+	const [counts, sessions] = await Promise.all([
+		countReader({ scope }),
+		store.storeV2Principals.countActiveSessions?.({ scope }) ?? Promise.resolve(0),
+	]);
+	return {
+		...result,
+		local: {
+			...result.local,
+			resourceCounts: {
+				...result.local.resourceCounts,
+				principals: counts.total,
+				sessions,
+			},
+		},
 	};
 }
 
@@ -691,6 +777,7 @@ export function createUser(
 		source?: AuditEvent["source"] | "import";
 	},
 ): Principal {
+	assertSnapshotPrincipalWriterDisabled(store, "users.create");
 	const scope = resolveCreateScope(store, input);
 	const email = input.email.toLowerCase();
 	const principalId = input.id?.trim() || newId("user");
@@ -785,7 +872,7 @@ export function listUsers(
 	},
 ): Principal[] {
 	const inScope = filter?.scope ? scopeFilter(filter.scope) : null;
-	return store.snapshot.principals.filter((p) => {
+	return principalReadView(store).filter((p) => {
 		if (p.status === "deleted") return false;
 		if (inScope && !inScope(p)) return false;
 		if (filter?.projectId && p.projectId !== filter.projectId) return false;
@@ -838,6 +925,71 @@ export function listUsersPage(
 }
 
 /**
+ * Authority-aware bounded user listing. Relational authority never falls back
+ * to the snapshot projection, which is intentionally empty after cutover.
+ */
+export async function listUsersPageAuthoritative(
+	store: ManagementStore,
+	opts?: {
+		scope?: ResourceScope;
+		status?: Principal["status"];
+		limit?: number;
+		cursor?: string;
+	},
+): Promise<{ users: Principal[]; nextCursor: string | null }> {
+	if (!store.storeV2Principals?.authoritative) {
+		return listUsersPage(store, opts);
+	}
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "users.list",
+		code: "USERS_LIST_LIMIT_INVALID",
+		defaultValue: USERS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: USERS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "users", "users.list");
+	const page = await store.storeV2Principals.listPage({
+		scope,
+		limit,
+		...(cursor ? { cursor } : {}),
+		...(opts?.status ? { status: opts.status } : {}),
+	});
+	const last = page.principals[page.principals.length - 1];
+	return {
+		users: page.principals,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("users", { createdAt: last.createdAt, id: last.id })
+				: null,
+	};
+}
+
+/** Scope-safe authority-aware point lookup. */
+export async function inspectUserAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<Principal> {
+	if (!store.storeV2Principals?.authoritative) {
+		return inspectUser(store, id, scope);
+	}
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const user = await store.storeV2Principals.getById({
+		scope: resolvedScope,
+		id,
+	});
+	if (!user) {
+		throw new ClearanceError({
+			code: "USER_NOT_FOUND",
+			message: "User not found",
+			stage: "users.inspect",
+			status: 404,
+		});
+	}
+	return user;
+}
+
+/**
  * Lookup by id. When scope is provided, cross-scope ids fail closed as NOT_FOUND
  * without revealing that the foreign resource exists.
  */
@@ -846,7 +998,7 @@ export function inspectUser(
 	id: string,
 	scope?: ResourceScope,
 ): Principal {
-	const user = store.snapshot.principals.find((p) => p.id === id);
+	const user = principalReadView(store).find((p) => p.id === id);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -900,6 +1052,7 @@ export function updateUser(
 		scope?: ResourceScope;
 	},
 ): Principal {
+	assertSnapshotPrincipalWriterDisabled(store, "users.update");
 	const hasName = input.name !== undefined;
 	const hasEmail = input.email !== undefined;
 	// Validate status before any mutation (fail closed; never ignore invalid).
@@ -1023,6 +1176,7 @@ export function disableUser(
 		scope?: ResourceScope;
 	},
 ): Principal {
+	assertSnapshotPrincipalWriterDisabled(store, "users.disable");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	let updated: Principal | undefined;
@@ -1100,6 +1254,7 @@ export function deleteUser(
 		scope?: ResourceScope;
 	},
 ): Principal {
+	assertSnapshotPrincipalWriterDisabled(store, "users.delete");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	let deleted: Principal | undefined;
@@ -1722,7 +1877,7 @@ export function selectUsersForExport(
 		scope: ResourceScope;
 	},
 ): { users: Principal[]; truncated: boolean } {
-	let users = store.snapshot.principals.filter(
+	let users = principalReadView(store).filter(
 		(p) =>
 			p.status !== "deleted" &&
 			p.projectId === filter.scope.projectId &&
@@ -1831,6 +1986,84 @@ export function exportUsers(
 	return envelope;
 }
 
+/** Bounded authority-aware export backed by the relational email-order index. */
+export async function exportUsersAuthoritative(
+	store: ManagementStore,
+	opts: UsersExportOptions = {},
+): Promise<UsersExportEnvelope> {
+	if (!store.storeV2Principals?.authoritative) return exportUsers(store, opts);
+	const reader = store.storeV2Principals.listForExport;
+	if (!reader) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_EXPORT_READER_REQUIRED",
+			message: "Relational principal export reader is unavailable",
+			stage: "users.export",
+			status: 500,
+		});
+	}
+	const scope = opts.scope ?? resolveOperatorScope(store);
+	const limit = normalizeUsersExportLimit(opts.limit);
+	const format = normalizeUsersExportFormat(opts.format);
+	const status = normalizeUsersExportStatus(opts.status as string | undefined);
+	const corr = correlationId();
+	const selected = await reader({
+		scope,
+		limit,
+		...(status ? { status } : {}),
+	});
+	const users = selected.principals.map(sanitizePrincipalForExport);
+	const envelope: UsersExportEnvelope = {
+		schemaVersion: 1,
+		kind: "users.export",
+		exportedAt: nowIso(),
+		format,
+		scope,
+		limit,
+		count: users.length,
+		truncated: selected.hasMore,
+		filters: { ...(status ? { status } : {}) },
+		users,
+		correlationId: corr,
+	};
+	if (opts.outputPath) {
+		const written = writeExportArtifact(
+			opts.outputPath,
+			serializeUsersExportBody(envelope, format),
+			Boolean(opts.force),
+			{
+				stage: "users.export",
+				existsCode: "USERS_EXPORT_EXISTS",
+				writeFailedCode: "USERS_EXPORT_WRITE_FAILED",
+			},
+		);
+		envelope.outputPath = written;
+	}
+	if (!opts.skipAudit) {
+		store.mutate((data) => {
+			appendAuditEvent(data, {
+				actor: opts.actor ?? "operator",
+				action: "users.export",
+				subjectType: "user_export",
+				outcome: "success",
+				source: opts.source ?? "cli",
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				correlationId: corr,
+				message: `Exported ${users.length} user(s)`,
+				metadata: {
+					count: users.length,
+					limit,
+					truncated: selected.hasMore,
+					format,
+					wroteFile: Boolean(envelope.outputPath),
+					filters: envelope.filters,
+				},
+			});
+		});
+	}
+	return envelope;
+}
+
 // Membership lifecycle lives in members.ts (role validation + owner invariants).
 // Re-exported from index for a single public surface.
 export {
@@ -1918,6 +2151,14 @@ export function createSession(
 	input: { principalId: string; environmentId: string; scope?: ResourceScope },
 ): SessionRecord {
 	const principal = inspectUser(store, input.principalId, input.scope);
+	return createSessionForPrincipal(store, principal, input);
+}
+
+function createSessionForPrincipal(
+	store: ManagementUnitOfWork,
+	principal: Principal,
+	input: { principalId: string; environmentId: string; scope?: ResourceScope },
+): SessionRecord {
 	if (input.scope && principal.environmentId !== input.environmentId) {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -1951,6 +2192,46 @@ export function createSession(
 	return session;
 }
 
+/** Transaction-bound session seed for normalized principal authority. */
+export async function createSessionAuthoritative(
+	store: ManagementStore,
+	input: { principalId: string; environmentId: string; scope?: ResourceScope },
+): Promise<SessionRecord> {
+	if (!store.storeV2Principals?.authoritative) return createSession(store, input);
+	if (!input.scope || typeof store.mutateCoordinated !== "function") {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_MUTATION_REQUIRED",
+			message: "Relational session creation requires scoped coordinated storage.",
+			stage: "sessions.create",
+			status: 500,
+		});
+	}
+	return store.mutateCoordinated(async ({ data, principals }) => {
+		const principal = await principals?.getById({
+			scope: input.scope!,
+			id: input.principalId,
+		});
+		if (!principal) {
+			throw new ClearanceError({
+				code: "USER_NOT_FOUND",
+				message: "User not found",
+				stage: "sessions.create",
+				status: 404,
+			});
+		}
+		const draft: ManagementUnitOfWork = {
+			get snapshot() {
+				return data;
+			},
+			mutate(mutator) {
+				mutator(data);
+				return data;
+			},
+		};
+		return createSessionForPrincipal(draft, principal, input);
+	});
+}
+
 export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	const users = listUsers(store, scope ? { scope } : undefined);
 	const orgs = listOrganizations(store, scope ? { scope } : undefined);
@@ -1961,7 +2242,7 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	const activeSessions = store.snapshot.sessions.filter((s) => {
 		if (s.status !== "active") return false;
 		if (!scope) return true;
-		const p = store.snapshot.principals.find((x) => x.id === s.principalId);
+		const p = principalReadView(store).find((x) => x.id === s.principalId);
 		return p
 			? p.projectId === scope.projectId && p.environmentId === scope.environmentId
 			: false;
@@ -1975,6 +2256,44 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 		releaseVersion: store.snapshot.releaseVersion,
 		schemaVersion: store.snapshot.meta.schemaVersion,
 		resourceCounts: store.resourceCounts(),
+	};
+}
+
+export async function overviewStatsAuthoritative(
+	store: ManagementStore,
+	scope?: ResourceScope,
+): Promise<ReturnType<typeof overviewStats>> {
+	if (!store.storeV2Principals?.authoritative) return overviewStats(store, scope);
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const countReader = store.storeV2Principals.countByScope;
+	if (!countReader) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+			message: "Relational principal count reader is unavailable",
+			stage: "overview",
+			status: 500,
+		});
+	}
+	const [counts, activeSessions] = await Promise.all([
+		countReader({ scope: resolvedScope }),
+		store.storeV2Principals.countActiveSessions?.({ scope: resolvedScope }) ??
+			Promise.resolve(0),
+	]);
+	const orgs = listOrganizations(store, { scope: resolvedScope });
+	const recentEvents = listEvents(store, { limit: 10, scope: resolvedScope });
+	return {
+		totalUsers: counts.total,
+		activeUsers: counts.active,
+		organizations: orgs.length,
+		activeSessions,
+		recentEvents,
+		releaseVersion: store.snapshot.releaseVersion,
+		schemaVersion: store.snapshot.meta.schemaVersion,
+		resourceCounts: {
+			...store.resourceCounts(),
+			principals: counts.total,
+			sessions: activeSessions,
+		},
 	};
 }
 

@@ -1,4 +1,5 @@
 import type { ManagementStore } from "../store/types.js";
+import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
 import { deleteSsoProviderById } from "../auth-bridge.js";
@@ -425,7 +426,7 @@ export async function disableSsoConnectionReal(
 	const now = nowIso();
 
 	if (typeof store.mutateCoordinated === "function") {
-		return store.mutateCoordinated(async ({ data, query }) => {
+		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query }) => {
 			const deleted = await query(`delete from "ssoProvider" where id = $1`, [
 				conn.id,
 			]);

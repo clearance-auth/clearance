@@ -51,10 +51,12 @@ import type {
 import type {
 	applyStoreV2,
 	cutoverStoreV2Events,
+	cutoverStoreV2Principals,
 	getStoreV2Status,
 	planStoreV2,
 	rollbackStoreV2,
 	rollbackStoreV2Events,
+	rollbackStoreV2Principals,
 	verifyStoreV2,
 } from "../services/store-v2.js";
 import type { restoreBackup, upgradeCheck } from "../services/backup.js";
@@ -77,9 +79,18 @@ import type {
 	ScopedDeliveryJobPage,
 } from "../services/delivery-control.js";
 import type {
+	ScopedWebhookEndpoint,
+	ScopedWebhookEndpointPage,
+	WebhookEndpointControlResult,
+	WebhookEndpointCreateResult,
+	WebhookEndpointUpdateResult,
+} from "../services/webhook-endpoints.js";
+import type {
 	DeliveryJobState,
 	DeliveryQuotaStatus,
 	DeliveryReadinessSummary,
+	WebhookEndpointStatus,
+	WebhookEventKind,
 } from "@clearance/delivery";
 
 export type OperationConfirmation =
@@ -337,6 +348,46 @@ export interface ManagementOperationTypes {
 		input: { id: string; maxAttempts?: number; dryRun?: boolean; confirm?: boolean };
 		output: DeliveryControlResult;
 	};
+	"delivery.webhook_endpoints.list": {
+		input: {
+			limit?: number;
+			cursor?: string;
+			statuses?: WebhookEndpointStatus[];
+			eventKind?: WebhookEventKind;
+		};
+		output: ScopedWebhookEndpointPage;
+	};
+	"delivery.webhook_endpoints.inspect": {
+		input: { id: string };
+		output: ScopedWebhookEndpoint;
+	};
+	"delivery.webhook_endpoints.create": {
+		input: { name: string; url: string; eventKinds?: WebhookEventKind[] };
+		output: WebhookEndpointCreateResult;
+	};
+	"delivery.webhook_endpoints.update": {
+		input: {
+			id: string;
+			expectedVersion: number;
+			name?: string;
+			url?: string;
+			eventKinds?: WebhookEventKind[];
+			status?: "active" | "disabled";
+		};
+		output: WebhookEndpointUpdateResult;
+	};
+	"delivery.webhook_endpoints.rotate": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointControlResult;
+	};
+	"delivery.webhook_endpoints.delete": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointControlResult;
+	};
+	"delivery.webhook_endpoints.test": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointControlResult;
+	};
 	"config.get": {
 		input: { key?: string };
 		output: ReturnType<typeof publicConfig> & { scope: ResourceScope };
@@ -475,6 +526,14 @@ export interface ManagementOperationTypes {
 	"schema.store-v2.events.rollback": {
 		input: { confirm?: boolean };
 		output: Awaited<ReturnType<typeof rollbackStoreV2Events>>;
+	};
+	"schema.store-v2.principals.cutover": {
+		input: { confirm?: boolean };
+		output: Awaited<ReturnType<typeof cutoverStoreV2Principals>>;
+	};
+	"schema.store-v2.principals.rollback": {
+		input: { confirm?: boolean };
+		output: Awaited<ReturnType<typeof rollbackStoreV2Principals>>;
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
@@ -1018,6 +1077,65 @@ export const DELIVERY_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const WEBHOOK_ENDPOINT_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "delivery.webhook_endpoints.list",
+		cliPath: "delivery endpoints list",
+		http: { method: "GET", path: "/v1/delivery/webhook-endpoints" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "delivery.webhook_endpoints.inspect",
+		cliPath: "delivery endpoints inspect",
+		http: { method: "GET", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "delivery.webhook_endpoints.create",
+		cliPath: "delivery endpoints create",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	update: defineOperation({
+		id: "delivery.webhook_endpoints.update",
+		cliPath: "delivery endpoints update",
+		http: { method: "PATCH", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	rotate: defineOperation({
+		id: "delivery.webhook_endpoints.rotate",
+		cliPath: "delivery endpoints rotate",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints/:id/rotate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	delete: defineOperation({
+		id: "delivery.webhook_endpoints.delete",
+		cliPath: "delivery endpoints delete",
+		http: { method: "DELETE", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	test: defineOperation({
+		id: "delivery.webhook_endpoints.test",
+		cliPath: "delivery endpoints test",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints/:id/test" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const CONFIG_OPERATIONS = Object.freeze({
 	get: defineOperation({
 		id: "config.get",
@@ -1261,6 +1379,22 @@ export const STORE_V2_OPERATIONS = Object.freeze({
 		supportsDryRun: false,
 		confirmation: "server-required",
 	}),
+	principalsCutover: defineOperation({
+		id: "schema.store-v2.principals.cutover",
+		cliPath: "schema store-v2 principals cutover",
+		http: { method: "POST", path: "/v1/schema/store-v2/principals/cutover" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	principalsRollback: defineOperation({
+		id: "schema.store-v2.principals.rollback",
+		cliPath: "schema store-v2 principals rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/principals/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
 });
 
 export const USER_OPERATIONS = Object.freeze({
@@ -1420,6 +1554,7 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(SCIM_OPERATIONS),
 	...Object.values(READINESS_OPERATIONS),
 	...Object.values(DELIVERY_OPERATIONS),
+	...Object.values(WEBHOOK_ENDPOINT_OPERATIONS),
 	...Object.values(CONFIG_OPERATIONS),
 	...Object.values(IMPORT_OPERATIONS),
 	...Object.values(MIGRATION_OPERATIONS),

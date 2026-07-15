@@ -229,6 +229,51 @@ describe.skipIf(!available)("user lifecycle Postgres runtime + management", () =
 			| undefined;
 	}
 
+	it("removes the runtime user and credential account when management sync fails", async () => {
+		const store = await freshStore();
+		const email = `sync-cleanup-${Date.now()}@lifecycle.test`;
+		const syncFailure = new Error("forced management sync failure");
+		const runtime = getAuthBundle();
+		let deletedRuntimeUserId: string | undefined;
+		const failingStore = new Proxy(store, {
+			get(target, property) {
+				if (property === "mutate") {
+					return (apply: (data: typeof store.snapshot) => void) => {
+						const draft = structuredClone(store.snapshot);
+						apply(draft);
+						deletedRuntimeUserId = draft.principals.find(
+							(principal) => principal.email === email,
+						)?.id;
+						throw syncFailure;
+					};
+				}
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as PgStore;
+
+		await expect(createUserInAuth({
+			email,
+			name: "Failed Management Sync",
+			password: "Valid!password123",
+			managementStore: failingStore,
+		})).rejects.toBe(syncFailure);
+
+		expect(deletedRuntimeUserId).toBeTruthy();
+		const users = await runtime.pool.query<{ id: string }>(
+			`select id from "user" where id = $1`,
+			[deletedRuntimeUserId],
+		);
+		expect(users.rows).toHaveLength(0);
+		const accounts = await runtime.pool.query<{ count: string }>(
+			`select count(*)::text count
+			 from account
+			 where "userId" = $1`,
+			[deletedRuntimeUserId],
+		);
+		expect(accounts.rows[0]?.count).toBe("0");
+	});
+
 	async function runtimeSessionCount(userId: string): Promise<number> {
 		const b = getAuthBundle();
 		const r = await b.pool.query(

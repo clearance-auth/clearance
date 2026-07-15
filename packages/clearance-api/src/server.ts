@@ -34,6 +34,7 @@ import {
 import { registerAccessRoutes } from "./routes/access.js";
 import { registerConfigRoutes } from "./routes/config.js";
 import { registerDeliveryRoutes } from "./routes/delivery.js";
+import { registerWebhookEndpointRoutes } from "./routes/webhook-endpoints.js";
 import { registerEnterpriseRoutes } from "./routes/enterprise.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerOperationRoutes } from "./routes/operations.js";
@@ -484,13 +485,17 @@ let idempotencyBackend: IdempotencyBackend | null = null;
  * returns the original resource and status while reporting the omitted secret.
  */
 function idempotencyReplayBody(path: string, body: string): string | null {
+	const webhookEndpointSecretPath =
+		path === "/v1/delivery/webhook-endpoints" ||
+		/^\/v1\/delivery\/webhook-endpoints\/[^/]+\/rotate$/.test(path);
 	const sensitive =
 		path === "/v1/users" ||
 		path === "/v1/keys" ||
 		/^\/v1\/keys\/[^/]+\/rotate$/.test(path) ||
 		path === "/v1/sso/setup-links" ||
 		path === "/v1/scim/setup-links" ||
-		path === "/v1/scim";
+		path === "/v1/scim" ||
+		webhookEndpointSecretPath;
 	if (!sensitive) return body;
 	try {
 		const parsed = JSON.parse(body) as Record<string, unknown>;
@@ -515,6 +520,20 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 				delete (connection as Record<string, unknown>).bearerTokenOnce;
 				omitted.push("connection.bearerTokenOnce");
 			}
+		}
+		if (webhookEndpointSecretPath) {
+			if (Object.hasOwn(parsed, "signingSecret")) {
+				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
+				delete parsed.signingSecret;
+				omitted.push("signingSecret");
+			}
+			const result = parsed.result;
+			if (typeof result === "object" && result !== null && "signingSecret" in result) {
+				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
+				delete result.signingSecret;
+				omitted.push("result.signingSecret");
+			}
+			if (omitted.length > 0) parsed.secretAlreadyIssued = true;
 		}
 		if (omitted.length === 0) return body;
 		parsed.oneTimeSecretsOmitted = omitted;
@@ -937,6 +956,8 @@ app.route(
 app.route("/", registerConfigRoutes({ storeForRequest, scopeForRequest, handleError }));
 
 app.route("/", registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }));
+
+app.route("/", registerWebhookEndpointRoutes({ storeForRequest, scopeForRequest, handleError }));
 
 app.route(
 	"/",

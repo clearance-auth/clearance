@@ -80,5 +80,29 @@ export async function dispatchStoreV2Command({
 				path: STORE_V2_OPERATIONS.eventsRollback.http.path,
 				body: { confirm: true },
 			});
+		case STORE_V2_OPERATIONS.principalsCutover.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_PRINCIPALS_CUTOVER_CONFIRMATION_REQUIRED",
+				"Store-v2 principal cutover",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.principalsCutover.http.method,
+				path: STORE_V2_OPERATIONS.principalsCutover.http.path,
+				body: { confirm: true },
+			});
+		case STORE_V2_OPERATIONS.principalsRollback.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_PRINCIPALS_ROLLBACK_CONFIRMATION_REQUIRED",
+				"Store-v2 principal rollback",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.principalsRollback.http.method,
+				path: STORE_V2_OPERATIONS.principalsRollback.http.path,
+				body: { confirm: true },
+			});
 	}
 }

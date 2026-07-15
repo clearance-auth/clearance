@@ -109,5 +109,10 @@ describe("delivery store environment configuration", () => {
 		expect(() => new PgStore("postgres://unused:unused@127.0.0.1:1/unused", {
 			delivery: { ...options, prefix: "invalid prefix" },
 		})).toThrow();
+		expect(() => new PgStore("postgres://unused:unused@127.0.0.1:1/unused", {
+			delivery: { ...options, prefix: "p".repeat(41) },
+		})).toThrowError(expect.objectContaining({
+			code: "DELIVERY_SCHEMA_IDENTIFIER_INVALID",
+		}));
 	});
 });

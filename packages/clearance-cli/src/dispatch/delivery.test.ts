@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("@clearance/management", async (importOriginal) => {
 	const original = await importOriginal<typeof import("@clearance/management")>();
 	const source = await import("../../../management/src/contracts/operations.ts");
-	return { ...original, DELIVERY_OPERATIONS: source.DELIVERY_OPERATIONS };
+	return {
+		...original,
+		DELIVERY_OPERATIONS: source.DELIVERY_OPERATIONS,
+		WEBHOOK_ENDPOINT_OPERATIONS: source.WEBHOOK_ENDPOINT_OPERATIONS,
+	};
 });
 
 import type { ApiSession } from "../api-client.js";
@@ -128,6 +132,58 @@ describe("delivery remote dispatch", () => {
 		]);
 	});
 
+	it("uses exact webhook endpoint routes and preview confirmation", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return jsonResponse();
+		}));
+
+		await dispatchDeliveryCommand({
+			session,
+			path: "delivery endpoints list",
+			args: [],
+			opts: { limit: "10", status: ["active", "disabled"], eventKind: "organization.updated" },
+			global: {},
+		});
+		await dispatchDeliveryCommand({
+			session,
+			path: "delivery endpoints create",
+			args: [],
+			opts: { name: "Audit sink", url: "https://hooks.example.test/events" },
+			global: {},
+		});
+		await dispatchDeliveryCommand({
+			session,
+			path: "delivery endpoints rotate",
+			args: ["endpoint /1"],
+			opts: { expectedVersion: "3" },
+			global: { yes: true },
+		});
+
+		expect(calls.map(([url, init]) => ({
+			url,
+			method: init.method,
+			body: init.body === undefined ? undefined : JSON.parse(String(init.body)),
+		}))).toEqual([
+			{
+				url: "https://api.clearance.test/v1/delivery/webhook-endpoints?limit=10&status=active&status=disabled&eventKind=organization.updated",
+				method: "GET",
+				body: undefined,
+			},
+			{
+				url: "https://api.clearance.test/v1/delivery/webhook-endpoints",
+				method: "POST",
+				body: { name: "Audit sink", url: "https://hooks.example.test/events" },
+			},
+			{
+				url: "https://api.clearance.test/v1/delivery/webhook-endpoints/endpoint%20%2F1/rotate",
+				method: "POST",
+				body: { expectedVersion: 3, dryRun: false, confirm: true },
+			},
+		]);
+	});
+
 	it.each([
 		["delivery list", { limit: "0" }],
 		["delivery list", { state: ["unknown"] }],
@@ -144,6 +200,19 @@ describe("delivery remote dispatch", () => {
 			opts,
 			global: {},
 		})).rejects.toMatchObject({ code: "DELIVERY_OPTION_INVALID" });
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("rejects unsupported endpoint create dry-runs before network I/O", async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		await expect(dispatchDeliveryCommand({
+			session,
+			path: "delivery endpoints create",
+			args: [],
+			opts: { name: "Audit sink", url: "https://hooks.example.test/events" },
+			global: { dryRun: true },
+		})).rejects.toMatchObject({ code: "CLI_REMOTE_DRY_RUN_UNSUPPORTED" });
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 

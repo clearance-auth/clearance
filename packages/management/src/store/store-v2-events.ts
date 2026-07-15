@@ -92,9 +92,10 @@ async function writeState(
 async function readState(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
+	forUpdate = false,
 ): Promise<EventsState> {
 	const result = await queryable.query<{ value: unknown }>(
-		`SELECT value FROM ${tables.meta} WHERE key = $1`,
+		`SELECT value FROM ${tables.meta} WHERE key = $1${forUpdate ? " FOR UPDATE" : ""}`,
 		[EVENTS_STATE_KEY],
 	);
 	const value = result.rows[0]?.value;
@@ -185,7 +186,7 @@ export async function appendStoreV2Events(
 	events: readonly AuditEvent[],
 	revision: number,
 ): Promise<StoreV2EventDelta> {
-	const state = await readState(client, tables);
+	const state = await readState(client, tables, true);
 	for (const event of events) {
 		await insertEvent(client, tables, event, revision);
 	}

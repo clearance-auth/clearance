@@ -139,6 +139,32 @@ describe("API Idempotency-Key", () => {
 		});
 	});
 
+	it("never persists or replays webhook endpoint signing secrets", async () => {
+		const { idempotencyReplayBody } = await import("./server.js");
+		const created = idempotencyReplayBody(
+			"/v1/delivery/webhook-endpoints",
+			JSON.stringify({ endpoint: { id: "endpoint_1" }, signingSecret: "whsec_create" }),
+		);
+		expect(JSON.parse(created ?? "null")).toEqual({
+			endpoint: { id: "endpoint_1" },
+			secretAlreadyIssued: true,
+			oneTimeSecretsOmitted: ["signingSecret"],
+		});
+		const rotated = idempotencyReplayBody(
+			"/v1/delivery/webhook-endpoints/endpoint_1/rotate",
+			JSON.stringify({
+				dryRun: false,
+				result: { endpoint: { id: "endpoint_1" }, signingSecret: "whsec_rotate" },
+			}),
+		);
+		expect(JSON.parse(rotated ?? "null")).toEqual({
+			dryRun: false,
+			result: { endpoint: { id: "endpoint_1" } },
+			secretAlreadyIssued: true,
+			oneTimeSecretsOmitted: ["result.signingSecret"],
+		});
+	});
+
 	it("omits every API-key, setup-link, and SCIM one-time secret from replay", async () => {
 		const app = await loadApp();
 		const orgResponse = await app.request("/v1/organizations", {

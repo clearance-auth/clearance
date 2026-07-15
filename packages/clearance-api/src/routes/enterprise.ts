@@ -24,7 +24,7 @@ import {
 	rotateScimCredential,
 	rotateSsoCredential,
 	runReadinessCheck,
-	testScimConnection,
+	testScimConnectionAuthoritative,
 	testScimConnectionLive,
 	testScimConnectionReal,
 	testSsoConnection,
@@ -302,7 +302,7 @@ export function registerEnterpriseRoutes({
 				? await testScimConnectionLive(store, c.req.param("id"))
 				: runtimeDatabaseConfigured()
 					? await testScimConnectionReal(store, c.req.param("id"), testInput)
-					: testScimConnection(store, c.req.param("id"), testInput);
+					: await testScimConnectionAuthoritative(store, c.req.param("id"), testInput);
 			await store.ready();
 			return c.json(result);
 		} catch (e) {

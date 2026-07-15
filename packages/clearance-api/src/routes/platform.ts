@@ -6,10 +6,10 @@ import {
 	createEnvironment,
 	createProject,
 	initProject,
-	inspectEnvironment,
+	inspectEnvironmentAuthoritative,
 	listEnvironments,
 	listProjects,
-	overviewStats,
+	overviewStatsAuthoritative,
 	planEnvironmentCreate,
 	planProjectCreate,
 	promoteEnvironment,
@@ -81,7 +81,7 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				return c.json(overviewStats(store, scope));
+				return c.json(await overviewStatsAuthoritative(store, scope));
 			} catch (error) {
 				return handleError(c, error);
 			}
@@ -111,7 +111,7 @@ export function registerPlatformRoutes({
 						status: 404,
 					});
 				}
-				return c.json({ project, overview: overviewStats(store, scope), scope });
+				return c.json({ project, overview: await overviewStatsAuthoritative(store, scope), scope });
 			} catch (error) {
 				return handleError(c, error);
 			}
@@ -131,7 +131,7 @@ export function registerPlatformRoutes({
 						status: 404,
 					});
 				}
-				return c.json({ project, overview: overviewStats(store, scope), scope });
+				return c.json({ project, overview: await overviewStatsAuthoritative(store, scope), scope });
 			} catch (error) {
 				return handleError(c, error);
 			}
@@ -166,7 +166,7 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				return c.json(inspectEnvironment(store, undefined, { scope }));
+				return c.json(await inspectEnvironmentAuthoritative(store, undefined, { scope }));
 			} catch (error) {
 				return handleError(c, error);
 			}
@@ -212,7 +212,7 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				const result = inspectEnvironment(store, c.req.param("id"), { scope });
+				const result = await inspectEnvironmentAuthoritative(store, c.req.param("id"), { scope });
 				return c.json(result);
 			} catch (error) {
 				return handleError(c, error);

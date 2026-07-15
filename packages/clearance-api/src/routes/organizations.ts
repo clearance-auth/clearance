@@ -5,11 +5,11 @@ import {
 	executeMemberImportPlan,
 	inspectMembership,
 	inspectOrganization,
-	inspectUser,
+	inspectUserAuthoritative,
 	listMembers,
 	listOrganizations,
 	listOrganizationsPage,
-	planMemberImport,
+	planMemberImportAuthoritative,
 	type MemberImportFormat,
 } from "@clearance/management";
 import { Hono } from "hono";
@@ -238,7 +238,7 @@ export function registerOrganizationRoutes({
 			const role = body.role !== undefined ? body.role : "member";
 			if (body.dryRun === true) {
 				inspectOrganization(store, c.req.param("id"), scope);
-				inspectUser(store, principalId, scope);
+				await inspectUserAuthoritative(store, principalId, scope);
 				return c.json({ dryRun: true, organizationId: c.req.param("id"), principalId, role, scope });
 			}
 			const membership = await applicationFor(store).members.add(
@@ -280,7 +280,7 @@ export function registerOrganizationRoutes({
 					remediation: "Send the local file contents in the authenticated request.",
 				});
 			}
-			const plan = planMemberImport(store, {
+			const plan = await planMemberImportAuthoritative(store, {
 				organizationId: c.req.param("id"),
 				content: body.content,
 				format,

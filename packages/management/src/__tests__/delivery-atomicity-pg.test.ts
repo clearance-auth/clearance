@@ -17,8 +17,16 @@ import {
 	inspectDeliveryJobForManagement,
 	listDeliveryJobsForManagement,
 } from "../services/delivery-control.js";
+import {
+	createWebhookEndpointForManagement,
+	deleteWebhookEndpointForManagement,
+	rotateWebhookEndpointForManagement,
+	testWebhookEndpointForManagement,
+	updateWebhookEndpointForManagement,
+} from "../services/webhook-endpoints.js";
 import { JsonStore } from "../store/json-store.js";
 import { createPgStore, type PgStoreDeliveryOptions } from "../store/pg-store.js";
+import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import type { ManagementStore } from "../store/types.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
@@ -61,14 +69,37 @@ function deliveryInput(input: {
 		sourceKey: input.sourceKey,
 		projectId: input.projectId,
 		environmentId: input.environmentId,
+		organizationId: "organization-atomicity",
 		channel: "webhook",
 		destination: "https://hooks.example.test/clearance",
 		payload: {
+			version: 1,
 			endpoint: {
+				id: "legacy-atomicity-target",
 				url: "https://hooks.example.test/clearance",
 				signingSecret: "test-only-signing-secret-that-stays-encrypted",
 			},
-			event: { id: input.eventId, type: "organization.updated" },
+			event: {
+				id: input.eventId,
+				type: "organization.updated",
+				occurredAt: input.now.toISOString(),
+				context: {
+					projectId: input.projectId,
+					environmentId: input.environmentId,
+					organizationId: "organization-atomicity",
+					actor: "atomicity-test",
+					correlationId: input.eventId,
+				},
+				data: {
+					organization: {
+						id: "organization-atomicity",
+						name: "Atomicity",
+						slug: "atomicity",
+						status: "active",
+					},
+					previous: { name: "Atomicity", slug: "atomicity" },
+				},
+			},
 		},
 		semanticExpiresAt: new Date(input.now.getTime() + 60 * 60_000),
 		now: input.now,
@@ -114,6 +145,7 @@ describe.skipIf(!available)("PgStore coordinated delivery atomicity", () => {
 			names.job,
 			names.payload,
 			names.event,
+			names.webhookEndpoint,
 			names.worker,
 			names.meta,
 		]) {
@@ -377,6 +409,263 @@ describe.skipIf(!available)("PgStore coordinated delivery atomicity", () => {
 		});
 	});
 
+	it("returns and audits leased cancellation as pending", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		const project = store.snapshot.projects[0]!;
+		const environment = store.snapshot.environments[0]!;
+		const now = new Date();
+		const eventId = `delivery-control-pending-${suffix}`;
+		const jobId = `delivery-control-pending-job-${suffix}`;
+		await store.mutateCoordinated!((context) => requireDelivery(context)(deliveryInput({
+			eventId,
+			jobId,
+			projectId: project.id,
+			environmentId: environment.id,
+			sourceKey: `control-pending:${suffix}`,
+			now,
+		})));
+		const names = deliveryTableNames({ prefix: DELIVERY_PREFIX });
+		await inspectionPool.query(
+			`UPDATE ${quoteIdentifier("public")}.${quoteIdentifier(names.job)}
+			 SET state='leased', lease_token=$2, lease_owner=$3,
+			     lease_expires_at=$4, updated_at=$1
+			 WHERE id=$5`,
+			[now, `lease-${suffix}`, `worker-${suffix}`, new Date(now.getTime() + 60_000), jobId],
+		);
+
+		const controlled = await controlDeliveryJob(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId,
+			action: "cancel",
+			actor: "operator",
+			source: "cli",
+			now: new Date(now.getTime() + 1),
+			confirm: true,
+		});
+		expect(controlled).toMatchObject({
+			dryRun: false,
+			preview: {
+				job: { state: "leased", cancelRequested: false },
+				effect: { state: "leased", cancelRequested: true },
+			},
+			result: { id: jobId, state: "leased", cancelRequested: true },
+		});
+		expect(store.snapshot.events.find((event) => event.subjectId === jobId)).toMatchObject({
+			action: "delivery.job.cancel",
+			outcome: "pending",
+			message: "Delivery job cancellation requested",
+			metadata: { cancelRequested: true, state: "leased" },
+		});
+	});
+
+	it("runs the managed endpoint lifecycle with scoped, redacted audit and atomic test enqueue", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		const project = store.snapshot.projects[0]!;
+		const environment = store.snapshot.environments[0]!;
+		const audit = {
+			actor: "endpoint-operator",
+			source: "cli" as const,
+			correlationId: `endpoint-correlation-${suffix}`,
+		};
+		const url = `https://managed-${suffix}.example.test/events`;
+		const created = await createWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			name: "Managed organization updates",
+			url,
+			eventKinds: ["organization.updated"],
+			...audit,
+		});
+		expect(created.signingSecret).toMatch(/^whsec_[A-Za-z0-9_-]{43}$/);
+		expect(created.endpoint).toMatchObject({
+			status: "disabled",
+			resourceVersion: 1,
+			secretVersion: 1,
+			eventKinds: ["organization.updated"],
+		});
+
+		const activated = await updateWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: created.endpoint.resourceVersion,
+			status: "active",
+			...audit,
+		});
+		expect(activated.endpoint).toMatchObject({ status: "active", resourceVersion: 2 });
+		expect(await store.deliveryControl!.readiness()).toMatchObject({
+			ready: false,
+			webhookEndpoints: { total: 1, active: 1, disabled: 0, untestedActive: 1 },
+			reasons: expect.arrayContaining(["webhook_endpoint_untested"]),
+		});
+
+		const rotatePreview = await rotateWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: activated.endpoint.resourceVersion,
+			...audit,
+		});
+		expect(rotatePreview).toMatchObject({
+			dryRun: true,
+			preview: { action: "rotate", nextResourceVersion: 3, secretGenerated: false },
+		});
+		const auditBeforeRotate = store.snapshot.events.length;
+		const rotated = await rotateWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: activated.endpoint.resourceVersion,
+			confirm: true,
+			...audit,
+		});
+		expect(rotated.result).toMatchObject({
+			endpoint: { resourceVersion: 3, secretVersion: 2 },
+		});
+		expect((rotated.result as { signingSecret: string }).signingSecret)
+			.not.toBe(created.signingSecret);
+		expect(store.snapshot.events).toHaveLength(auditBeforeRotate + 1);
+
+		let fanoutPromise!: Promise<readonly {
+			endpointId: string;
+			destinationUrl: string;
+			delivery: EnqueuedDelivery;
+		}[]>;
+		await store.mutateCoordinated!((context) => {
+			if (!context.fanoutWebhookEndpoints) {
+				throw new Error("Managed webhook fanout is required");
+			}
+			context.data.projects[0]!.name = "Managed fanout committed";
+			fanoutPromise = context.fanoutWebhookEndpoints({
+				context: {
+					scope: { projectId: project.id, environmentId: environment.id },
+					actor: audit.actor,
+					source: audit.source,
+					correlationId: audit.correlationId,
+				},
+				organization: {
+					id: "organization-managed-fanout",
+					projectId: project.id,
+					environmentId: environment.id,
+					name: "Managed Fanout",
+					slug: "managed-fanout",
+					status: "active",
+					updatedAt: new Date().toISOString(),
+				},
+				before: { name: "Managed Fanout Before", slug: "managed-fanout-before" },
+				occurredAt: new Date(),
+			});
+		});
+		expect(await fanoutPromise).toMatchObject([
+			{
+				endpointId: created.endpoint.id,
+				destinationUrl: url,
+				delivery: { state: "queued" },
+			},
+		]);
+		expect(store.snapshot.projects[0]!.name).toBe("Managed fanout committed");
+		const names = deliveryTableNames({ prefix: DELIVERY_PREFIX });
+		const managedEvents = await inspectionPool.query<{ count: string }>(
+			`SELECT count(*)::text count
+			 FROM ${quoteIdentifier("public")}.${quoteIdentifier(names.event)}
+			 WHERE webhook_endpoint_id=$1 AND organization_id='organization-managed-fanout'`,
+			[created.endpoint.id],
+		);
+		expect(Number(managedEvents.rows[0]!.count)).toBe(1);
+
+		const tested = await testWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: 3,
+			confirm: true,
+			...audit,
+		});
+		expect(tested).toMatchObject({
+			dryRun: false,
+			result: {
+				endpoint: { resourceVersion: 4 },
+				delivery: { state: "queued" },
+			},
+		});
+		const readinessWhileTestPending = await store.deliveryControl!.readiness();
+		expect(readinessWhileTestPending.webhookEndpoints).toMatchObject({
+			total: 1,
+			active: 1,
+			untestedActive: 0,
+			testPendingActive: 1,
+			testFailedActive: 0,
+			testSucceededActive: 0,
+		});
+		expect(readinessWhileTestPending.reasons).not.toContain("webhook_endpoint_untested");
+		expect(readinessWhileTestPending.reasons).toContain("webhook_endpoint_test_pending");
+
+		const testDelivery = (tested.result as { delivery: EnqueuedDelivery }).delivery;
+		await inspectionPool.query(
+			`UPDATE ${quoteIdentifier("public")}.${quoteIdentifier(names.job)}
+			 SET state='delivered', delivered_at=now(), updated_at=now()
+			 WHERE id=$1`,
+			[testDelivery.jobId],
+		);
+		const readinessAfterTestDelivery = await store.deliveryControl!.readiness();
+		expect(readinessAfterTestDelivery.webhookEndpoints).toMatchObject({
+			total: 1,
+			active: 1,
+			untestedActive: 0,
+			testPendingActive: 0,
+			testFailedActive: 0,
+			testSucceededActive: 1,
+		});
+		expect(readinessAfterTestDelivery.reasons).not.toEqual(
+			expect.arrayContaining([
+				"webhook_endpoint_untested",
+				"webhook_endpoint_test_pending",
+				"webhook_endpoint_test_failed",
+			]),
+		);
+
+		const deletionPreview = await deleteWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: 4,
+			...audit,
+		});
+		expect(deletionPreview).toMatchObject({
+			dryRun: true,
+			preview: { action: "delete", nextResourceVersion: 5 },
+		});
+		const deleted = await deleteWebhookEndpointForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			endpointId: created.endpoint.id,
+			expectedVersion: 4,
+			confirm: true,
+			...audit,
+		});
+		expect(deleted).toMatchObject({
+			dryRun: false,
+			result: { endpoint: { status: "deleted", resourceVersion: 5 } },
+		});
+
+		const endpointAudit = store.snapshot.events.filter(
+			(event) => event.subjectId === created.endpoint.id,
+		);
+		expect(endpointAudit.map((event) => event.action)).toEqual([
+			"delivery.webhook_endpoints.delete",
+			"delivery.webhook_endpoints.test",
+			"delivery.webhook_endpoints.rotate",
+			"delivery.webhook_endpoints.update",
+			"delivery.webhook_endpoints.create",
+		]);
+		const serializedAudit = JSON.stringify(endpointAudit);
+		expect(serializedAudit).not.toContain(url);
+		expect(serializedAudit).not.toContain(created.signingSecret);
+		expect(serializedAudit).not.toContain("config_envelope");
+		expect(serializedAudit).not.toContain("keyId");
+	});
+
 	it("rolls audited control back and awaits a dropped control promise before commit", async () => {
 		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
 		const project = store.snapshot.projects[0]!;
@@ -435,5 +724,57 @@ describe.skipIf(!available)("PgStore coordinated delivery atomicity", () => {
 		expect(store.snapshot.events.some((event) =>
 			event.action === "delivery.job.cancel" && event.subjectId === droppedJobId,
 		)).toBe(true);
+	});
+
+	it("clones, drains, and revokes the coordinated raw query capability", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		let escapedQuery!: (
+			sql: string,
+			params?: unknown[],
+		) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+		let droppedQuery!: Promise<{
+			rows: Record<string, unknown>[];
+			rowCount: number | null;
+		}>;
+		const params: unknown[] = [{ name: "captured-before-mutation" }];
+
+		await mutateCoordinatedWithRuntimeSql(store, (context) => {
+			escapedQuery = context.query;
+			droppedQuery = context.query("select $1::jsonb as captured", params);
+			(params[0] as { name: string }).name = "mutated-after-issuance";
+		});
+
+		expect(await droppedQuery).toMatchObject({
+			rows: [{ captured: { name: "captured-before-mutation" } }],
+		});
+		await expect(escapedQuery("select 1")).rejects.toMatchObject({
+			code: "TRANSACTION_CAPABILITY_REVOKED",
+		});
+
+		const beforeName = store.snapshot.projects[0]!.name;
+		await expect(mutateCoordinatedWithRuntimeSql(store, (context) => {
+			context.data.projects[0]!.name = "must roll back after dropped query failure";
+			void context.query("select * from clearance_missing_transaction_table");
+		})).rejects.toBeTruthy();
+		await store.refresh();
+		expect(store.snapshot.projects[0]!.name).toBe(beforeName);
+	});
+
+	it("rolls a coordinated mutation back when the callback rejects with undefined", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		const beforeName = store.snapshot.projects[0]!.name;
+		let rejected = false;
+		try {
+			await store.mutateCoordinated!((context) => {
+				context.data.projects[0]!.name = "must not commit undefined rejection";
+				throw undefined;
+			});
+		} catch (error) {
+			rejected = true;
+			expect(error).toBeUndefined();
+		}
+		expect(rejected).toBe(true);
+		await store.refresh();
+		expect(store.snapshot.projects[0]!.name).toBe(beforeName);
 	});
 });

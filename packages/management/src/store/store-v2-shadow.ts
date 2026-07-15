@@ -18,10 +18,20 @@ import {
 	type StoreV2Phase,
 	type StoreV2Plan,
 	type StoreV2PlanBlocker,
+	type StoreV2PrincipalReader,
 	type StoreV2Status,
 } from "./types.js";
 import {
+	STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY,
+	STORE_V2_PRINCIPAL_AUTHORITY_VERSION,
+	STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY,
+	STORE_V2_PRINCIPAL_REVISION_META_KEY,
+	STORE_V2_PRINCIPAL_STATE_META_KEY,
 	STORE_V2_SCHEMA_VERSION,
+	canonicalStoreV2AuthoritySet,
+	parseStoreV2MetadataInteger,
+	parseStoreV2AuthoritySet,
+	storeV2PrincipalProjectionGuardStatements,
 	storeV2SchemaStatements,
 	storeV2TableNames,
 	type StoreV2TableNames,
@@ -33,6 +43,19 @@ import {
 	replaceStoreV2Events,
 	type StoreV2EventDelta,
 } from "./store-v2-events.js";
+import {
+	findActiveStoreV2PrincipalByEmail,
+	findActiveStoreV2PrincipalByExternalId,
+	getStoreV2PrincipalById,
+	listStoreV2PrincipalsPage,
+	mapStoreV2PrincipalRow,
+	advanceStoreV2PrincipalState,
+	readStoreV2PrincipalState,
+	readStoreV2PrincipalRevision,
+	readStoreV2Principals,
+	writeStoreV2PrincipalState,
+	type StoreV2PrincipalRow,
+} from "./store-v2-principals.js";
 
 const MAX_DIFFERING_IDS = 20;
 const META_SCHEMA_VERSION = "store_v2_schema_version";
@@ -40,7 +63,8 @@ const META_PHASE = "store_v2_phase";
 const META_SNAPSHOT_REVISION = "store_v2_snapshot_revision";
 const META_COLLECTIONS = "store_v2_collections";
 const META_ENABLED_AT = "store_v2_enabled_at";
-const META_AUTHORITATIVE_COLLECTIONS = "store_v2_authoritative_collections";
+const META_AUTHORITATIVE_COLLECTIONS =
+	STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY;
 
 type StoreV2Resource = Project | Environment | Principal | Organization | AuditEvent;
 type Queryable = pg.Pool | pg.PoolClient;
@@ -48,6 +72,8 @@ type Queryable = pg.Pool | pg.PoolClient;
 export interface StoreV2SyncResult {
 	phase: StoreV2Phase;
 	persistedSnapshot: DataStoreSnapshot;
+	authoritativeCollections: StoreV2Collection[];
+	principalRevision: number | null;
 	eventDelta?: StoreV2EventDelta;
 }
 
@@ -72,14 +98,6 @@ interface ProjectRow {
 interface EnvironmentRow extends ProjectRow {
 	project_id: string;
 	kind: Environment["kind"];
-}
-
-interface PrincipalRow extends ProjectRow {
-	project_id: string;
-	environment_id: string;
-	email: string;
-	status: Principal["status"];
-	external_id: string | null;
 }
 
 interface OrganizationRow extends ProjectRow {
@@ -283,6 +301,17 @@ export function planStoreV2Snapshot(
 				: `${principal.projectId}\u0000${principal.environmentId}\u0000${principal.email.toLowerCase()}`,
 		(principal) => principal.id,
 	);
+	addDuplicateBlockers(
+		blockers,
+		"principals",
+		"STORE_V2_DUPLICATE_ACTIVE_PRINCIPAL_EXTERNAL_ID",
+		snapshot.principals,
+		(principal) =>
+			principal.status === "deleted" || principal.externalId === undefined
+				? null
+				: `${principal.projectId}\u0000${principal.environmentId}\u0000${principal.externalId}`,
+		(principal) => principal.id,
+	);
 	for (const principal of snapshot.principals) {
 		if (!environmentScopes.has(`${principal.projectId}\u0000${principal.environmentId}`)) {
 			blockers.push({
@@ -377,20 +406,6 @@ function mapEnvironment(row: EnvironmentRow): Environment {
 	};
 }
 
-function mapPrincipal(row: PrincipalRow): Principal {
-	return {
-		id: row.id,
-		projectId: row.project_id,
-		environmentId: row.environment_id,
-		email: row.email,
-		name: row.name,
-		status: row.status,
-		...optional<Principal, "externalId">("externalId", row.external_id),
-		createdAt: iso(row.created_at),
-		updatedAt: iso(row.updated_at),
-	};
-}
-
 function mapOrganization(row: OrganizationRow): Organization {
 	return {
 		id: row.id,
@@ -458,10 +473,43 @@ function phaseFromMeta(meta: Map<string, unknown>): StoreV2Phase {
 	);
 }
 
-function numberFromMeta(value: unknown): number | null {
-	if (typeof value === "number" && Number.isSafeInteger(value)) return value;
-	if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
-	return null;
+function authoritativeCollectionsFromMeta(
+	meta: Map<string, unknown>,
+	phase: StoreV2Phase,
+): StoreV2Collection[] {
+	if (phase !== "hybrid") return [];
+	try {
+		const collections = parseStoreV2AuthoritySet(
+			meta.get(META_AUTHORITATIVE_COLLECTIONS),
+		);
+		if (collections.length === 0 || !collections.includes("events")) {
+			throw new Error("STORE_V2_AUTHORITY_SET_INVALID");
+		}
+		return collections;
+	} catch {
+		throw new StoreV2MigrationError(
+			"STORE_V2_AUTHORITY_SET_INVALID",
+			"Store-v2 authoritative collection metadata is invalid.",
+		);
+	}
+}
+
+const numberFromMeta = parseStoreV2MetadataInteger;
+
+function incrementStoreV2Revision(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new StoreV2MigrationError(
+			"STORE_V2_REVISION_INVALID",
+			"The store-v2 revision is invalid.",
+		);
+	}
+	if (value === Number.MAX_SAFE_INTEGER) {
+		throw new StoreV2MigrationError(
+			"STORE_V2_REVISION_EXHAUSTED",
+			"The store-v2 revision capacity is exhausted.",
+		);
+	}
+	return value + 1;
 }
 
 async function readSnapshot(
@@ -479,9 +527,16 @@ async function readSnapshot(
 			"The authoritative management snapshot row is missing.",
 		);
 	}
+	const revision = parseStoreV2MetadataInteger(row.revision);
+	if (revision === null) {
+		throw new StoreV2MigrationError(
+			"STORE_V2_SNAPSHOT_REVISION_INVALID",
+			"The management snapshot revision is invalid.",
+		);
+	}
 	return {
 		snapshot: normalizeSnapshot(cloneSnapshot(row.data)),
-		revision: Number(row.revision ?? 0),
+		revision,
 	};
 }
 
@@ -499,9 +554,7 @@ async function relationalCollections(
 	const environments = await queryable.query<EnvironmentRow>(
 		`SELECT * FROM ${tables.environments}`,
 	);
-	const principals = await queryable.query<PrincipalRow>(
-		`SELECT * FROM ${tables.principals}`,
-	);
+	const principals = await readStoreV2Principals(queryable, tables);
 	const organizations = await queryable.query<OrganizationRow>(
 		`SELECT * FROM ${tables.organizations}`,
 	);
@@ -509,7 +562,7 @@ async function relationalCollections(
 	return {
 		projects: projects.rows.map(mapProject),
 		environments: environments.rows.map(mapEnvironment),
-		principals: principals.rows.map(mapPrincipal),
+		principals,
 		organizations: organizations.rows.map(mapOrganization),
 		events,
 	};
@@ -523,13 +576,22 @@ async function buildStatus(
 	const { snapshot, revision } = await readSnapshot(queryable, snapshotTable);
 	const meta = await readMeta(queryable, tables);
 	const phase = phaseFromMeta(meta);
+	const authoritativeCollections = authoritativeCollectionsFromMeta(meta, phase);
 	const relational =
 		phase === "absent" ? null : await relationalCollections(queryable, tables);
-	const selected = selectedCollections(
-		phase === "hybrid" && relational
-			? { ...snapshot, events: relational.events as AuditEvent[] }
-			: snapshot,
-	);
+	let materialized = snapshot;
+	if (relational && authoritativeCollections.length > 0) {
+		materialized = {
+			...snapshot,
+			...(authoritativeCollections.includes("events")
+				? { events: relational.events as AuditEvent[] }
+				: {}),
+			...(authoritativeCollections.includes("principals")
+				? { principals: relational.principals as Principal[] }
+				: {}),
+		};
+	}
+	const selected = selectedCollections(materialized);
 	const collections = Object.fromEntries(
 		STORE_V2_COLLECTIONS.map((collection) => [
 			collection,
@@ -544,20 +606,36 @@ async function buildStatus(
 			? STORE_V2_SCHEMA_VERSION
 			: null;
 	const relationalRevision = numberFromMeta(meta.get(META_SNAPSHOT_REVISION));
+	const principalState = phase === "absent"
+		? null
+		: await readStoreV2PrincipalState(queryable, tables);
+	const principalRevision = principalState?.revision ?? null;
+	const principalStateConsistent =
+		phase === "absent" ||
+		(principalState !== null &&
+			principalState.count === (relational?.principals.length ?? 0));
+	const authoritativeProjectionsEmpty = authoritativeCollections.every(
+		(collection) =>
+			(collection !== "events" || snapshot.events.length === 0) &&
+			(collection !== "principals" || snapshot.principals.length === 0),
+	);
 
 	return {
 		schemaVersion,
 		phase,
 		snapshotRevision: revision,
 		relationalRevision,
+		principalRevision,
 		consistent:
 			phase !== "absent" &&
 			schemaVersion === STORE_V2_SCHEMA_VERSION &&
 			relationalRevision === revision &&
+			principalRevision !== null &&
+			principalStateConsistent &&
 			STORE_V2_COLLECTIONS.every(
 				(collection) => collections[collection].consistent,
-			) && (phase !== "hybrid" || snapshot.events.length === 0),
-		authoritativeCollections: phase === "hybrid" ? ["events"] : [],
+			) && authoritativeProjectionsEmpty,
+		authoritativeCollections,
 		collections,
 	};
 }
@@ -753,7 +831,9 @@ async function syncDiff(
 	tables: StoreV2TableNames,
 	before: DataStoreSnapshot,
 	after: DataStoreSnapshot,
+	authoritativeCollections: readonly StoreV2Collection[] = [],
 ): Promise<void> {
+	const principalsAuthoritative = authoritativeCollections.includes("principals");
 	const projects = changedResources(before.projects, after.projects);
 	const environments = changedResources(before.environments, after.environments);
 	const principals = changedResources(before.principals, after.principals);
@@ -771,6 +851,12 @@ async function syncDiff(
 				previousEnvironments.get(environment.id)?.projectId !== environment.projectId,
 		)
 		.map((environment) => environment.id);
+	if (principalsAuthoritative && reparentedEnvironmentIds.length > 0) {
+		throw new StoreV2MigrationError(
+			"STORE_V2_PRINCIPAL_ENVIRONMENT_REPARENT_REQUIRES_TYPED_MUTATION",
+			"Environment reparenting requires a typed relational principal mutation while principals are authoritative.",
+		);
+	}
 	if (reparentedEnvironmentIds.length > 0) {
 		await client.query(
 			`DELETE FROM ${tables.principals} WHERE environment_id = ANY($1::text[])`,
@@ -794,7 +880,9 @@ async function syncDiff(
 		}
 	}
 
-	await deleteIds(client, tables.principals, principals.deletedIds);
+	if (!principalsAuthoritative) {
+		await deleteIds(client, tables.principals, principals.deletedIds);
+	}
 	await deleteIds(client, tables.organizations, organizations.deletedIds);
 	await neutralizeUniqueValues(client, tables, {
 		projectIds: [
@@ -803,7 +891,9 @@ async function syncDiff(
 				...projects.deletedIds,
 			]),
 		],
-		principalIds: principals.upserted.map((principal) => principal.id),
+		principalIds: principalsAuthoritative
+			? []
+			: principals.upserted.map((principal) => principal.id),
 		organizationIds: organizations.upserted.map(
 			(organization) => organization.id,
 		),
@@ -839,8 +929,9 @@ async function syncDiff(
 			],
 		);
 	}
-	for (const principal of principals.upserted) {
-		await client.query(
+	if (!principalsAuthoritative) {
+		for (const principal of principals.upserted) {
+			await client.query(
 			`INSERT INTO ${tables.principals}
 			 (id, project_id, environment_id, email, name, status, external_id,
 			  created_at, updated_at)
@@ -861,8 +952,9 @@ async function syncDiff(
 				principal.externalId ?? null,
 				principal.createdAt,
 				principal.updatedAt,
-			],
-		);
+				],
+			);
+		}
 	}
 	for (const organization of organizations.upserted) {
 		await client.query(
@@ -929,11 +1021,17 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		return this.readStatus();
 	}
 
-	async loadSnapshot(): Promise<{
+	async loadSnapshot(_cache?: {
+		principalRevision: number | null;
+		principalCount: number;
+	}): Promise<{
 		snapshot: DataStoreSnapshot;
 		storedSnapshot: DataStoreSnapshot;
+		principalCount: number;
 		revision: number;
 		phase: StoreV2Phase;
+		authoritativeCollections: StoreV2Collection[];
+		principalRevision: number | null;
 	}> {
 		const client = await this.pool.connect();
 		try {
@@ -944,6 +1042,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			const meta = await readMeta(client, this.tables);
 			const phase = phaseFromMeta(meta);
+			const authoritativeCollections = authoritativeCollectionsFromMeta(meta, phase);
 			if (
 				phase === "hybrid" &&
 				numberFromMeta(meta.get(META_SNAPSHOT_REVISION)) !== revision
@@ -953,11 +1052,48 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 					"Store-v2 revision does not match the management snapshot.",
 				);
 			}
-			const snapshot = phase === "hybrid"
-				? { ...cloneSnapshot(storedSnapshot), events: await readStoreV2Events(client, this.tables) }
-				: storedSnapshot;
+			const principalState = phase === "absent"
+				? null
+				: await readStoreV2PrincipalState(client, this.tables);
+			const principalRevision = principalState?.revision ?? null;
+			if (phase !== "absent" && principalRevision === null) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_REVISION_INVALID",
+					"Store-v2 principal revision metadata is missing or invalid.",
+				);
+			}
+			let snapshot = storedSnapshot;
+			let principalCount = storedSnapshot.principals.length;
+			if (authoritativeCollections.length > 0) {
+				if (authoritativeCollections.includes("principals")) {
+					if (!principalState) {
+						throw new StoreV2MigrationError(
+							"STORE_V2_PRINCIPAL_STATE_INVALID",
+							"Store-v2 principal state metadata is missing or invalid.",
+						);
+					}
+					principalCount = principalState.count;
+				}
+				snapshot = {
+					...cloneSnapshot(storedSnapshot),
+					...(authoritativeCollections.includes("events")
+						? { events: await readStoreV2Events(client, this.tables) }
+						: {}),
+					...(authoritativeCollections.includes("principals")
+						? { principals: [] }
+						: {}),
+				};
+			}
 			await client.query("COMMIT");
-			return { snapshot, storedSnapshot, revision, phase };
+			return {
+					snapshot,
+					storedSnapshot,
+					principalCount,
+				revision,
+				phase,
+				authoritativeCollections,
+				principalRevision,
+			};
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
@@ -968,15 +1104,314 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 
 	async eventsAreAuthoritative(): Promise<boolean> {
 		const meta = await readMeta(this.pool, this.tables);
-		return phaseFromMeta(meta) === "hybrid";
+		const phase = phaseFromMeta(meta);
+		return authoritativeCollectionsFromMeta(meta, phase).includes("events");
+	}
+
+	async principalsAreAuthoritative(): Promise<boolean> {
+		const meta = await readMeta(this.pool, this.tables);
+		const phase = phaseFromMeta(meta);
+		return authoritativeCollectionsFromMeta(meta, phase).includes("principals");
 	}
 
 	async transactionPhase(queryable: Queryable): Promise<StoreV2Phase> {
 		return phaseFromMeta(await readMeta(queryable, this.tables));
 	}
 
+	async lockPrincipalAuthority(client: pg.PoolClient): Promise<void> {
+		await client.query(
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			[`clearance:store-v2:principals:${this.snapshotTable}`],
+		);
+	}
+
+	async lockPrincipalAuthorityShared(client: pg.PoolClient): Promise<void> {
+		await client.query(
+			"SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+			[`clearance:store-v2:principals:${this.snapshotTable}`],
+		);
+	}
+
+	async transactionAuthoritativeCollections(
+		queryable: Queryable,
+	): Promise<StoreV2Collection[]> {
+		const meta = await readMeta(queryable, this.tables);
+		return authoritativeCollectionsFromMeta(meta, phaseFromMeta(meta));
+	}
+
 	async materializeEvents(queryable: Queryable): Promise<AuditEvent[]> {
 		return readStoreV2Events(queryable, this.tables);
+	}
+
+	async countPrincipals(queryable: Queryable): Promise<number> {
+		const result = await queryable.query<{ count: string }>(
+			`SELECT count(*)::text AS count FROM ${this.tables.principals}`,
+		);
+		const count = parseStoreV2MetadataInteger(result.rows[0]?.count);
+		if (count === null) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPAL_COUNT_INVALID",
+				"Store-v2 principal count is invalid.",
+			);
+		}
+		return count;
+	}
+
+	async principalRevision(queryable: Queryable): Promise<number | null> {
+		return readStoreV2PrincipalRevision(queryable, this.tables);
+	}
+
+	async principalState(queryable: Queryable) {
+		return readStoreV2PrincipalState(queryable, this.tables);
+	}
+
+	async getPrincipalById(
+		input: Parameters<StoreV2PrincipalReader["getById"]>[0],
+	): Promise<Principal | null> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		return getStoreV2PrincipalById(this.pool, this.tables, input);
+	}
+
+	async findActivePrincipalByEmail(
+		input: Parameters<StoreV2PrincipalReader["findActiveByEmail"]>[0],
+	): Promise<Principal | null> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		return findActiveStoreV2PrincipalByEmail(this.pool, this.tables, input);
+	}
+
+	async findActivePrincipalByExternalId(
+		input: Parameters<StoreV2PrincipalReader["findActiveByExternalId"]>[0],
+	): Promise<Principal | null> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		return findActiveStoreV2PrincipalByExternalId(this.pool, this.tables, input);
+	}
+
+	async listPrincipalsPage(
+		input: Parameters<StoreV2PrincipalReader["listPage"]>[0],
+	): Promise<{ principals: Principal[]; hasMore: boolean }> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		return listStoreV2PrincipalsPage(this.pool, this.tables, input);
+	}
+
+	async listActivePrincipalSessionsPage(
+		input: Parameters<NonNullable<StoreV2PrincipalReader["listActiveSessionsPage"]>>[0],
+	): Promise<Awaited<ReturnType<NonNullable<StoreV2PrincipalReader["listActiveSessionsPage"]>>>> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPAL_PAGE_LIMIT_INVALID",
+				"Session page limit must be an integer between 1 and 1000.",
+			);
+		}
+		const params: unknown[] = [input.scope.projectId, input.scope.environmentId];
+		let keyset = "";
+		if (input.cursor) {
+			const timestamp = new Date(input.cursor.createdAt);
+			if (!Number.isFinite(timestamp.getTime()) || !input.cursor.id) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_CURSOR_INVALID",
+					"The session page cursor is invalid.",
+				);
+			}
+			params.push(input.cursor.createdAt, input.cursor.id);
+			keyset = `AND (s.created_at, s.id) < ($3::timestamptz, $4)`;
+		}
+		params.push(input.limit + 1);
+		const result = await this.pool.query<{
+			session_id: string;
+			created_at: Date | string;
+			created_at_raw: string;
+			expires_at: Date | string | null;
+			ip_address: string | null;
+			user_agent: string | null;
+			id: string;
+			project_id: string;
+			environment_id: string;
+			email: string;
+			name: string;
+			status: Principal["status"];
+			external_id: string | null;
+			principal_created_at: Date | string;
+			principal_updated_at: Date | string;
+		}>(
+			`WITH snapshot_sessions AS (
+			   SELECT item.value
+			   FROM ${this.snapshotTable} snapshot,
+			        LATERAL jsonb_array_elements(snapshot.data->'sessions') item(value)
+			   WHERE snapshot.id = 1 AND item.value->>'status' = 'active'
+			 ), session_rows AS (
+			   SELECT runtime.id, runtime."userId" AS user_id,
+			          runtime."createdAt" AS created_at,
+			          runtime."createdAt"::text AS created_at_raw,
+			          runtime."expiresAt" AS expires_at,
+			          runtime."ipAddress" AS ip_address,
+			          runtime."userAgent" AS user_agent
+			   FROM session runtime
+			   WHERE runtime."expiresAt" > now()
+			   UNION ALL
+			   SELECT value->>'id', value->>'principalId',
+			          (value->>'createdAt')::timestamptz, value->>'createdAt',
+			          NULL::timestamptz, NULL::text, NULL::text
+			   FROM snapshot_sessions
+			   WHERE NOT EXISTS (
+			     SELECT 1 FROM session runtime WHERE runtime.id = value->>'id'
+			   )
+			 )
+			 SELECT s.id AS session_id, s.created_at, s.created_at_raw, s.expires_at,
+			        s.ip_address, s.user_agent,
+			        p.id, p.project_id, p.environment_id, p.email, p.name, p.status,
+			        p.external_id, p.created_at AS principal_created_at,
+			        p.updated_at AS principal_updated_at
+			 FROM session_rows s
+			 JOIN ${this.tables.principals} p ON p.id = s.user_id
+			 WHERE p.project_id = $1 AND p.environment_id = $2
+			   AND p.status <> 'deleted' ${keyset}
+			 ORDER BY s.created_at DESC, s.id DESC
+			 LIMIT $${params.length}`,
+			params,
+		);
+		return {
+			sessions: result.rows.slice(0, input.limit).map((row) => ({
+				id: row.session_id,
+				principal: {
+					id: row.id,
+					projectId: row.project_id,
+					environmentId: row.environment_id,
+					email: row.email,
+					name: row.name,
+					status: row.status,
+					...(row.external_id === null ? {} : { externalId: row.external_id }),
+					createdAt: iso(row.principal_created_at),
+					updatedAt: iso(row.principal_updated_at),
+				},
+				createdAt: iso(row.created_at),
+				cursorCreatedAt: row.created_at_raw,
+				...(row.expires_at ? { expiresAt: iso(row.expires_at) } : {}),
+				...(row.ip_address ? { ipAddress: row.ip_address } : {}),
+				...(row.user_agent ? { userAgent: row.user_agent } : {}),
+			})),
+			hasMore: result.rows.length > input.limit,
+		};
+	}
+
+	async listPrincipalsForExport(
+		input: Parameters<NonNullable<StoreV2PrincipalReader["listForExport"]>>[0],
+	): Promise<Awaited<ReturnType<NonNullable<StoreV2PrincipalReader["listForExport"]>>>> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPAL_PAGE_LIMIT_INVALID",
+				"Principal export limit must be an integer between 1 and 1000.",
+			);
+		}
+		const params: unknown[] = [input.scope.projectId, input.scope.environmentId];
+		let status = "";
+		if (input.status) {
+			params.push(input.status);
+			status = `AND status = $3`;
+		}
+		params.push(input.limit + 1);
+		const result = await this.pool.query<StoreV2PrincipalRow>(
+			`SELECT id, project_id, environment_id, email, name, status, external_id,
+			        created_at, updated_at
+			 FROM ${this.tables.principals}
+			 WHERE project_id = $1 AND environment_id = $2
+			   AND status <> 'deleted' ${status}
+			 ORDER BY lower(email) ASC, id ASC
+			 LIMIT $${params.length}`,
+			params,
+		);
+		return {
+			principals: result.rows.slice(0, input.limit).map(mapStoreV2PrincipalRow),
+			hasMore: result.rows.length > input.limit,
+		};
+	}
+
+	async countPrincipalsByScope(
+		input: Parameters<NonNullable<StoreV2PrincipalReader["countByScope"]>>[0],
+	): Promise<{ total: number; active: number }> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		const result = await this.pool.query<{ total: string; active: string }>(
+			`SELECT count(*) FILTER (WHERE status <> 'deleted')::text AS total,
+			        count(*) FILTER (WHERE status = 'active')::text AS active
+			 FROM ${this.tables.principals}
+			 WHERE project_id = $1 AND environment_id = $2`,
+			[input.scope.projectId, input.scope.environmentId],
+		);
+		return {
+			total: Number(result.rows[0]?.total ?? 0),
+			active: Number(result.rows[0]?.active ?? 0),
+		};
+	}
+
+	async countActivePrincipalSessions(
+		input: Parameters<NonNullable<StoreV2PrincipalReader["countActiveSessions"]>>[0],
+	): Promise<number> {
+		if (!(await this.principalsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+				"Store-v2 principals are not relational-authoritative.",
+			);
+		}
+		const result = await this.pool.query<{ count: string }>(
+			`WITH snapshot_sessions AS (
+			   SELECT item.value
+			   FROM ${this.snapshotTable} snapshot,
+			        LATERAL jsonb_array_elements(snapshot.data->'sessions') item(value)
+			   WHERE snapshot.id = 1 AND item.value->>'status' = 'active'
+			 ), session_rows AS (
+			   SELECT runtime.id, runtime."userId" AS user_id
+			   FROM session runtime WHERE runtime."expiresAt" > now()
+			   UNION ALL
+			   SELECT value->>'id', value->>'principalId'
+			   FROM snapshot_sessions
+			   WHERE NOT EXISTS (
+			     SELECT 1 FROM session runtime WHERE runtime.id = value->>'id'
+			   )
+			 )
+			 SELECT count(*)::text AS count
+			 FROM session_rows s
+			 JOIN ${this.tables.principals} p ON p.id = s.user_id
+			 WHERE p.project_id = $1 AND p.environment_id = $2
+			   AND p.status <> 'deleted'`,
+			[input.scope.projectId, input.scope.environmentId],
+		);
+		return Number(result.rows[0]?.count ?? 0);
 	}
 
 	async listEventsPage(
@@ -1014,6 +1449,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
 			const { snapshot, revision } = await readSnapshot(
 				client,
 				this.snapshotTable,
@@ -1033,11 +1469,42 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			if (
 				(existingPhase !== "absent" || existingVersion !== null) &&
+				existingVersion !== 1 &&
 				existingVersion !== STORE_V2_SCHEMA_VERSION
 			) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_SCHEMA_VERSION_INVALID",
 					"The existing store-v2 schema version is incompatible with this release.",
+				);
+			}
+			const existingPrincipalAuthorityVersion = numberFromMeta(
+				existingMeta.get(STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY),
+			);
+			if (
+				existingPrincipalAuthorityVersion !== null &&
+				existingPrincipalAuthorityVersion !== STORE_V2_PRINCIPAL_AUTHORITY_VERSION
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_AUTHORITY_VERSION_INVALID",
+					"The existing principal authority capability is incompatible with this release.",
+				);
+			}
+			if (
+				existingMeta.has(STORE_V2_PRINCIPAL_REVISION_META_KEY) &&
+				numberFromMeta(existingMeta.get(STORE_V2_PRINCIPAL_REVISION_META_KEY)) === null
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_REVISION_INVALID",
+					"The existing principal revision marker is invalid.",
+				);
+			}
+			if (
+				existingMeta.has(STORE_V2_PRINCIPAL_STATE_META_KEY) &&
+				!(await readStoreV2PrincipalState(client, this.tables))
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_STATE_INVALID",
+					"The existing principal authority state is invalid.",
 				);
 			}
 			const plan = planStoreV2Snapshot(
@@ -1056,18 +1523,65 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			for (const statement of storeV2SchemaStatements(this.tables)) {
 				await client.query(statement);
 			}
-			if (existingPhase === "hybrid") {
-				const status = await buildStatus(client, this.tables, this.snapshotTable);
-				await client.query("COMMIT");
-				return status;
+			for (const statement of storeV2PrincipalProjectionGuardStatements(
+				this.tables,
+				this.snapshotTable,
+			)) {
+				await client.query(statement);
 			}
-			await replaceAll(client, this.tables, snapshot, revision);
 			await writeMeta(
 				client,
 				this.tables,
 				META_SCHEMA_VERSION,
 				STORE_V2_SCHEMA_VERSION,
 			);
+			await writeMeta(
+				client,
+				this.tables,
+				STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY,
+				STORE_V2_PRINCIPAL_AUTHORITY_VERSION,
+			);
+			const existingAuthorities = existingPhase === "hybrid"
+				? authoritativeCollectionsFromMeta(existingMeta, existingPhase)
+				: [];
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				existingAuthorities,
+			);
+			if (existingPhase === "hybrid") {
+				const currentState = await readStoreV2PrincipalState(client, this.tables);
+				if (!currentState) {
+					const count = await client.query<{ count: string }>(
+						`SELECT count(*)::text AS count FROM ${this.tables.principals}`,
+					);
+					const parsedCount = parseStoreV2MetadataInteger(count.rows[0]?.count);
+					if (parsedCount === null) {
+						throw new StoreV2MigrationError(
+							"STORE_V2_PRINCIPAL_COUNT_INVALID",
+							"Store-v2 principal count is invalid.",
+						);
+					}
+					await writeStoreV2PrincipalState(client, this.tables, {
+						revision:
+							numberFromMeta(
+								existingMeta.get(STORE_V2_PRINCIPAL_REVISION_META_KEY),
+							) ?? revision,
+						count: parsedCount,
+					});
+				}
+				const status = await buildStatus(client, this.tables, this.snapshotTable);
+				await client.query("COMMIT");
+				return status;
+			}
+			await replaceAll(client, this.tables, snapshot, revision);
+			await writeStoreV2PrincipalState(client, this.tables, {
+				revision:
+					numberFromMeta(existingMeta.get(STORE_V2_PRINCIPAL_REVISION_META_KEY)) ??
+					revision,
+				count: snapshot.principals.length,
+			});
 			await writeMeta(client, this.tables, META_PHASE, "shadow");
 			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, revision);
 			await writeMeta(
@@ -1099,6 +1613,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
 			await readSnapshot(client, this.snapshotTable, true);
 			const meta = await readMeta(client, this.tables);
 			if (phaseFromMeta(meta) === "hybrid") {
@@ -1124,6 +1639,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
 			const { snapshot, revision } = await readSnapshot(
 				client,
 				this.snapshotTable,
@@ -1143,7 +1659,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 					"Store-v2 shadow data diverged before event cutover.",
 				);
 			}
-			const nextRevision = revision + 1;
+			const nextRevision = incrementStoreV2Revision(revision);
 			await client.query(
 				`UPDATE ${this.snapshotTable}
 				 SET data = $1::jsonb, revision = $2, updated_at = now()
@@ -1152,7 +1668,12 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			await writeMeta(client, this.tables, META_PHASE, "hybrid");
 			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
-			await writeMeta(client, this.tables, META_AUTHORITATIVE_COLLECTIONS, ["events"]);
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				canonicalStoreV2AuthoritySet(["events"]),
+			);
 			await client.query("COMMIT");
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -1167,6 +1688,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
 			const { snapshot, revision } = await readSnapshot(
 				client,
 				this.snapshotTable,
@@ -1179,8 +1701,18 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 					"Event rollback requires relational-authoritative events.",
 				);
 			}
+			const authoritativeCollections = authoritativeCollectionsFromMeta(
+				meta,
+				"hybrid",
+			);
+			if (authoritativeCollections.includes("principals")) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPALS_ROLLBACK_REQUIRED",
+					"Roll back relational principal authority before rolling back events.",
+				);
+			}
 			const events = await readStoreV2Events(client, this.tables);
-			const nextRevision = revision + 1;
+			const nextRevision = incrementStoreV2Revision(revision);
 			await client.query(
 				`UPDATE ${this.snapshotTable}
 				 SET data = $1::jsonb, revision = $2, updated_at = now()
@@ -1200,6 +1732,168 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		return this.readStatus();
 	}
 
+	/** Cut over principal authority after relational parity and capability checks. */
+	async cutoverPrincipals(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			const phase = phaseFromMeta(meta);
+			const authoritativeCollections = authoritativeCollectionsFromMeta(meta, phase);
+			if (
+				phase !== "hybrid" ||
+				!authoritativeCollections.includes("events") ||
+				authoritativeCollections.includes("principals")
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPALS_CUTOVER_PHASE_INVALID",
+					"Principal cutover requires relational-authoritative events and snapshot-authoritative principals.",
+				);
+			}
+			if (
+				numberFromMeta(meta.get(STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY)) !==
+				STORE_V2_PRINCIPAL_AUTHORITY_VERSION
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_AUTHORITY_VERSION_INVALID",
+					"Principal authority capability metadata is missing or invalid.",
+				);
+			}
+			const status = await buildStatus(client, this.tables, this.snapshotTable);
+			if (!status.consistent || !status.collections.principals.consistent) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_DIVERGENCE",
+					"Store-v2 principals diverged before principal cutover.",
+				);
+			}
+			const principalRevision = await readStoreV2PrincipalRevision(
+				client,
+				this.tables,
+			);
+			if (principalRevision === null) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_REVISION_INVALID",
+					"Principal authority revision metadata is missing or invalid.",
+				);
+			}
+			const nextRevision = incrementStoreV2Revision(revision);
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[JSON.stringify({ ...snapshot, principals: [] }), nextRevision],
+			);
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				canonicalStoreV2AuthoritySet([
+					...authoritativeCollections,
+					"principals",
+				]),
+			);
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await advanceStoreV2PrincipalState(
+				client,
+				this.tables,
+				0,
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
+	/** Reverse-materialize principals before returning authority to the snapshot. */
+	async rollbackPrincipals(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			const phase = phaseFromMeta(meta);
+			const authoritativeCollections = authoritativeCollectionsFromMeta(meta, phase);
+			if (phase !== "hybrid" || !authoritativeCollections.includes("principals")) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPALS_ROLLBACK_PHASE_INVALID",
+					"Principal rollback requires relational-authoritative principals.",
+				);
+			}
+			const principalRevision = await readStoreV2PrincipalRevision(
+				client,
+				this.tables,
+			);
+			if (principalRevision === null) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPAL_REVISION_INVALID",
+					"Principal authority revision metadata is missing or invalid.",
+				);
+			}
+			const principals = await readStoreV2Principals(client, this.tables);
+			const remainingAuthorities = canonicalStoreV2AuthoritySet(
+				authoritativeCollections.filter(
+					(collection) => collection !== "principals",
+				),
+			);
+			const nextRevision = incrementStoreV2Revision(revision);
+			// Remove authority first inside this transaction so the projection guard
+			// permits the paired reverse materialization. Any later failure rolls both back.
+			await client.query(
+				"SELECT set_config('clearance.principal_authority_rollback', $1, true)",
+				[String(STORE_V2_PRINCIPAL_AUTHORITY_VERSION)],
+			);
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				remainingAuthorities,
+			);
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[JSON.stringify({ ...snapshot, principals }), nextRevision],
+			);
+			const companionEmailTable = `${this.snapshotTable}_principal_email`;
+			await client.query(`DELETE FROM ${companionEmailTable}`);
+			await client.query(
+				`INSERT INTO ${companionEmailTable}
+				 (project_id, environment_id, email_lower, principal_id)
+				 SELECT project_id, environment_id, lower(email), id
+				 FROM ${this.tables.principals}
+				 WHERE status <> 'deleted'`,
+			);
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await advanceStoreV2PrincipalState(
+				client,
+				this.tables,
+				0,
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
 	async syncTransaction(
 		client: pg.PoolClient,
 		before: DataStoreSnapshot,
@@ -1209,8 +1903,17 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 	): Promise<StoreV2SyncResult> {
 		const meta = await readMeta(client, this.tables);
 		const phase = phaseFromMeta(meta);
+		const authoritativeCollections = authoritativeCollectionsFromMeta(meta, phase);
+		let principalState = phase === "absent"
+			? null
+			: await readStoreV2PrincipalState(client, this.tables);
 		if (phase !== "shadow" && phase !== "hybrid") {
-			return { phase, persistedSnapshot: after };
+			return {
+				phase,
+				persistedSnapshot: after,
+				authoritativeCollections,
+				principalRevision: principalState?.revision ?? null,
+			};
 		}
 		if (
 			numberFromMeta(meta.get(META_SCHEMA_VERSION)) !== STORE_V2_SCHEMA_VERSION
@@ -1227,10 +1930,43 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				"Store-v2 shadow revision does not match the authoritative pre-mutation revision; reconcile before writing.",
 			);
 		}
-		await syncDiff(client, this.tables, before, after);
+		if (
+			authoritativeCollections.includes("principals") &&
+			stableJson(before.principals) !== stableJson(after.principals)
+		) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_TYPED_MUTATION_REQUIRED",
+				"Generic snapshot mutation cannot change relational-authoritative principals.",
+			);
+		}
+		await syncDiff(
+			client,
+			this.tables,
+			before,
+			after,
+			authoritativeCollections,
+		);
+		if (
+			!authoritativeCollections.includes("principals") &&
+			stableJson(before.principals) !== stableJson(after.principals)
+		) {
+			principalState = await advanceStoreV2PrincipalState(
+				client,
+				this.tables,
+				after.principals.length - before.principals.length,
+			);
+		} else {
+			principalState = await readStoreV2PrincipalState(client, this.tables);
+		}
+		if (!principalState) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPAL_STATE_INVALID",
+				"Principal authority state metadata is missing or invalid.",
+			);
+		}
 		let eventDelta: StoreV2EventDelta | undefined;
 		let persistedSnapshot = after;
-		if (phase === "shadow") {
+		if (!authoritativeCollections.includes("events")) {
 			await replaceStoreV2Events(client, this.tables, after.events, revision);
 		} else {
 			let appended: AuditEvent[];
@@ -1289,7 +2025,16 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			persistedSnapshot = { ...after, events: [] };
 		}
+		if (authoritativeCollections.includes("principals")) {
+			persistedSnapshot = { ...persistedSnapshot, principals: [] };
+		}
 		await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, revision);
-		return { phase, persistedSnapshot, ...(eventDelta ? { eventDelta } : {}) };
+		return {
+			phase,
+			persistedSnapshot,
+			authoritativeCollections,
+			principalRevision: principalState.revision,
+			...(eventDelta ? { eventDelta } : {}),
+		};
 	}
 }

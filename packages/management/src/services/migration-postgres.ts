@@ -1,14 +1,21 @@
 import { ensureAuthMigrated } from "../auth-bridge.js";
-import type { ManagementStore } from "../store/types.js";
-import { nowIso } from "../store/json-store.js";
-import type { DataStoreSnapshot, Membership, MigrationPlan } from "../types/resources.js";
-import { appendAuditEvent } from "./audit.js";
+import type {
+	InternalManagementCoordinatedMutationContext,
+	ManagementStore,
+} from "../store/types.js";
+import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
+import { hardDeleteImportedPrincipalForRollback } from "../store/store-v2-principals.js";
+import { newId, nowIso } from "../store/json-store.js";
+import type { DataStoreSnapshot, Membership, MigrationPlan, Principal } from "../types/resources.js";
+import { appendAuditEvent, recordEvent } from "./audit.js";
 import { addMember, createOrganization, createUser } from "./core.js";
 import { ClearanceError } from "./errors.js";
 import {
 	type LegacyExportFixture,
+	type MigrationPreview,
 	assertMigrationRunnable,
 	migrationStatus,
+	planMigration,
 	previewMigration,
 	rollbackMigration,
 	runMigration,
@@ -39,7 +46,11 @@ function requireCoordinated(store: ManagementStore, stage: string) {
 			remediation: "Set DATABASE_URL and use the Postgres management backend, or use the JSON local profile.",
 		});
 	}
-	return store.mutateCoordinated.bind(store);
+	return <T>(
+		fn: (
+			context: InternalManagementCoordinatedMutationContext,
+		) => Promise<T> | T,
+	) => mutateCoordinatedWithRuntimeSql(store, fn);
 }
 
 function checkpointMismatch(stage: string): never {
@@ -77,6 +88,106 @@ function sourceSlug(source: LegacyExportFixture["organizations"][number]): strin
 
 function fixtureMemberRole(member: LegacyExportFixture["members"][number]): string {
 	return member.role ?? "member";
+}
+
+function migrationFixtureConflict(
+	code: string,
+	message: string,
+	remediation: string,
+): never {
+	throw new ClearanceError({
+		code,
+		message,
+		stage: "import.legacy.preview",
+		status: 409,
+		remediation,
+	});
+}
+
+async function relationalPreview(
+	store: ManagementStore,
+	fixture: LegacyExportFixture,
+	reader = store.storeV2Principals,
+): Promise<MigrationPreview> {
+	if (!reader?.authoritative) return previewMigration(store, fixture);
+	const scope = resolveOperatorScope(store);
+	const userMap = new Map<string, string>();
+	const organizationMap = new Map<string, string>();
+	for (const user of fixture.users) {
+		const [byExternalId, byEmail] = await Promise.all([
+			reader.findActiveByExternalId({ scope, externalId: user.id }),
+			reader.findActiveByEmail({ scope, email: user.email }),
+		]);
+		if (byExternalId && byEmail && byExternalId.id !== byEmail.id) {
+			migrationFixtureConflict("CLEARANCE_IMPORT_USER_CONFLICT", `User ${user.email} maps to different existing identities`, "Resolve the conflicting external id or email before retrying.");
+		}
+		if (byExternalId && byExternalId.email.toLowerCase() !== user.email) {
+			migrationFixtureConflict("CLEARANCE_IMPORT_USER_CONFLICT", `User id ${user.id} has a different email in Clearance`, "Resolve the conflicting identity before retrying.");
+		}
+		if (byEmail?.externalId && byEmail.externalId !== user.id) {
+			migrationFixtureConflict("CLEARANCE_IMPORT_USER_CONFLICT", `User ${user.email} belongs to a different import source`, "Resolve the conflicting external id before retrying.");
+		}
+		const existing = byExternalId ?? byEmail;
+		if (existing) userMap.set(user.id, existing.id);
+	}
+	const organizations = store.snapshot.organizations.filter(
+		(org) => org.projectId === scope.projectId && org.environmentId === scope.environmentId && org.status !== "archived",
+	);
+	for (const organization of fixture.organizations) {
+		const byExternalId = organizations.find((candidate) => candidate.externalId === organization.id);
+		const bySlug = organizations.find((candidate) => candidate.slug === organization.slug);
+		if (byExternalId && bySlug && byExternalId.id !== bySlug.id) migrationFixtureConflict("CLEARANCE_IMPORT_ORGANIZATION_CONFLICT", `Organization ${organization.id} maps to different existing organizations`, "Resolve the conflicting organization id or slug before retrying.");
+		if (byExternalId && byExternalId.slug !== organization.slug) migrationFixtureConflict("CLEARANCE_IMPORT_ORGANIZATION_CONFLICT", `Organization id ${organization.id} has a different slug in Clearance`, "Resolve the conflicting organization before retrying.");
+		if (bySlug?.externalId && bySlug.externalId !== organization.id) migrationFixtureConflict("CLEARANCE_IMPORT_ORGANIZATION_CONFLICT", `Organization slug ${organization.slug} belongs to a different import source`, "Resolve the conflicting external id before retrying.");
+		const existing = byExternalId ?? bySlug;
+		if (existing) organizationMap.set(organization.id, existing.id);
+	}
+	let existingMembers = 0;
+	for (const member of fixture.members) {
+		const principalId = userMap.get(member.userId);
+		const organizationId = organizationMap.get(member.organizationId);
+		const existing = principalId && organizationId
+			? store.snapshot.memberships.find((candidate) => candidate.status === "active" && candidate.principalId === principalId && candidate.organizationId === organizationId)
+			: undefined;
+		if (existing && existing.role !== fixtureMemberRole(member)) migrationFixtureConflict("CLEARANCE_IMPORT_MEMBERSHIP_ROLE_CONFLICT", `Membership for user ${member.userId} in organization ${member.organizationId} has role ${existing.role}, not ${fixtureMemberRole(member)}`, "Align the existing membership role with the fixture, or import into a new environment.");
+		if (existing) existingMembers += 1;
+	}
+	return {
+		source: "legacy",
+		fixtureChecksum: previewMigration(draftStore(store.snapshot), fixture).fixtureChecksum,
+		counts: { users: fixture.users.length, organizations: fixture.organizations.length, members: fixture.members.length },
+		wouldCreate: { users: fixture.users.length - userMap.size, organizations: fixture.organizations.length - organizationMap.size, members: fixture.members.length - existingMembers },
+		idempotent: { users: userMap.size, organizations: organizationMap.size, members: existingMembers },
+	};
+}
+
+export async function previewMigrationDurable(
+	store: ManagementStore,
+	fixture: LegacyExportFixture,
+): Promise<MigrationPreview> {
+	return relationalPreview(store, fixture);
+}
+
+export async function planMigrationDurable(
+	store: ManagementStore,
+	fixture: LegacyExportFixture,
+): Promise<MigrationPlan> {
+	if (!store.storeV2Principals?.authoritative) return planMigration(store, fixture);
+	const preview = await relationalPreview(store, fixture);
+	const scope = resolveOperatorScope(store);
+	const now = nowIso();
+	const plan: MigrationPlan = {
+		id: newId("mig"), source: "legacy", projectId: scope.projectId, environmentId: scope.environmentId,
+		status: "planned", counts: preview.counts, fixtureChecksum: preview.fixtureChecksum,
+		checkpoint: { phase: "planned", ...preview },
+		steps: [{ name: "validate_fixture", status: "done", detail: "Legacy fixture schema and references validated" }, { name: "import_users", status: "pending" }, { name: "import_organizations", status: "pending" }, { name: "import_memberships", status: "pending" }, { name: "verify_counts", status: "pending" }],
+		createdAt: now, updatedAt: now,
+	};
+	store.mutate((data) => {
+		data.migrations.unshift(plan);
+	});
+	recordEvent(store, { actor: "operator", action: "migration.plan", subjectType: "migration", subjectId: plan.id, outcome: "success", source: "migration", projectId: scope.projectId, environmentId: scope.environmentId, message: `Planned Clearance import of ${plan.counts.users} users`, metadata: { source: plan.source, fixtureChecksum: plan.fixtureChecksum, counts: plan.counts } });
+	return plan;
 }
 
 function nullableString(value: unknown): string | null {
@@ -133,17 +244,17 @@ export async function runMigrationDurable(
 ): Promise<MigrationPlan> {
 	if (store.backend === "json") return runMigration(store, planId, fixture, opts);
 	const initial = migrationStatus(store, planId);
-	const preview = previewMigration(store, fixture);
+	const preview = await relationalPreview(store, fixture);
 	if (initial.fixtureChecksum !== preview.fixtureChecksum) checkpointMismatch("import.legacy.run");
 	assertMigrationRunnable(initial, "import.legacy.run");
 	if (opts.dryRun) return { ...initial, checkpoint: { phase: "dry_run", ...preview }, updatedAt: nowIso() };
 
 	await ensureAuthMigrated();
 	const mutate = requireCoordinated(store, "import.legacy.run");
-	return mutate(async ({ data, query }) => {
+	return mutate(async ({ data, principals, query }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);
-		const txPreview = previewMigration(draft, fixture);
+		const txPreview = await relationalPreview(draft, fixture, principals);
 		if (plan.fixtureChecksum !== txPreview.fixtureChecksum) checkpointMismatch("import.legacy.run");
 		assertMigrationRunnable(plan, "import.legacy.run");
 		const scope = resolveOperatorScope(draft);
@@ -157,16 +268,36 @@ export async function runMigrationDurable(
 		};
 
 		for (const source of fixture.users) {
-			const existing = data.principals.find((candidate) =>
-				candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.status !== "deleted" &&
-				(candidate.externalId === source.id || candidate.email.toLowerCase() === source.email));
+			const existing = principals
+				? (await principals.findActiveByExternalId({ scope, externalId: source.id })) ??
+					(await principals.findActiveByEmail({ scope, email: source.email }))
+				: data.principals.find((candidate) =>
+					candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.status !== "deleted" &&
+					(candidate.externalId === source.id || candidate.email.toLowerCase() === source.email));
 			const runtime = await runtimeUser(query, source.id, source.email);
 			if (existing && runtime && existing.id !== runtime.id) runtimeConflict("user", "Runtime and management identities must share one stable id.");
 			const id = existing?.id ?? runtime?.id;
-			const principal = existing ?? createUser(draft, { ...(id ? { id } : {}), email: source.email, name: source.name, externalId: source.id, source: "import", actor: "cli", projectId: scope.projectId, environmentId: scope.environmentId });
+			let principal: Principal;
+			if (existing) principal = existing;
+			else if (principals) {
+				const now = nowIso();
+				principal = await principals.insert({
+					id: id ?? newId("user"),
+					projectId: scope.projectId,
+					environmentId: scope.environmentId,
+					email: source.email.toLowerCase(),
+					name: source.name,
+					status: "active",
+					externalId: source.id,
+					createdAt: now,
+					updatedAt: now,
+				});
+			} else {
+				principal = createUser(draft, { ...(id ? { id } : {}), email: source.email, name: source.name, externalId: source.id, source: "import", actor: "cli", projectId: scope.projectId, environmentId: scope.environmentId });
+			}
 			if (!existing) {
 				createdResourceIds.users.push(principal.id);
-				rollbackResourceState.management.users.push({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), updatedAt: principal.updatedAt });
+				rollbackResourceState.management.users.push({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), createdAt: principal.createdAt, updatedAt: principal.updatedAt });
 			}
 			if (!runtime) {
 				const inserted = await query(
@@ -224,7 +355,22 @@ export async function runMigrationDurable(
 				createdResourceIds.memberships.push(membership.id);
 				rollbackResourceState.management.memberships.push({ id: membership.id, organizationId, principalId, role: membership.role, status: membership.status, source: membership.source, updatedAt: membership.updatedAt });
 			} else {
-				membership = addMember(draft, { organizationId, principalId, role: source.role ?? "member", source: "import", actor: "cli", auditSource: "import" });
+				if (principals) {
+					const now = nowIso();
+					membership = {
+						id: newId("mem"),
+						organizationId,
+						principalId,
+						role: source.role ?? "member",
+						status: "active",
+						source: "import",
+						createdAt: now,
+						updatedAt: now,
+					};
+					data.memberships.push(membership);
+				} else {
+					membership = addMember(draft, { organizationId, principalId, role: source.role ?? "member", source: "import", actor: "cli", auditSource: "import" });
+				}
 				createdResourceIds.memberships.push(membership.id);
 				rollbackResourceState.management.memberships.push({ id: membership.id, organizationId, principalId, role: membership.role, status: membership.status, source: membership.source, updatedAt: membership.updatedAt });
 			}
@@ -244,7 +390,7 @@ export async function runMigrationDurable(
 			createdResourceIds,
 			createdRuntimeResourceIds,
 			rollbackResourceState,
-			checkpoint: { phase: "imported", ...previewMigration(draft, fixture) },
+			checkpoint: { phase: "imported", ...await relationalPreview(draft, fixture, principals) },
 			updatedAt: nowIso(),
 			steps: [
 				{ name: "validate_fixture", status: "done" },
@@ -264,17 +410,21 @@ export async function verifyMigrationDurable(store: ManagementStore, planId: str
 	if (store.backend === "json") return verifyMigration(store, planId, fixture);
 	await ensureAuthMigrated();
 	const mutate = requireCoordinated(store, "import.legacy.verify");
-	const result = await mutate(async ({ data, query }) => {
+	const result = await mutate(async ({ data, principals, query }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);
-		const preview = previewMigration(draft, fixture);
+		const preview = await relationalPreview(draft, fixture, principals);
 		if (plan.fixtureChecksum !== preview.fixtureChecksum) checkpointMismatch("import.legacy.verify");
 		const scope = resolveOperatorScope(draft);
 		const expected = { users: fixture.users.length, organizations: fixture.organizations.length, members: fixture.members.length };
-		const userMap = new Map(fixture.users.flatMap((source) => {
-			const found = data.principals.find((candidate) => candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.status !== "deleted" && (candidate.externalId === source.id || candidate.email.toLowerCase() === source.email));
-			return found ? [[source.id, found.id] as const] : [];
-		}));
+		const userMap = new Map<string, string>();
+		for (const source of fixture.users) {
+			const found = principals
+				? (await principals.findActiveByExternalId({ scope, externalId: source.id })) ??
+					(await principals.findActiveByEmail({ scope, email: source.email }))
+				: data.principals.find((candidate) => candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.status !== "deleted" && (candidate.externalId === source.id || candidate.email.toLowerCase() === source.email));
+			if (found) userMap.set(source.id, found.id);
+		}
 		const organizationMap = new Map(fixture.organizations.flatMap((source) => {
 			const slug = sourceSlug(source);
 			const found = data.organizations.find((candidate) => candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.status !== "archived" && (candidate.externalId === source.id || candidate.slug === slug));
@@ -314,10 +464,10 @@ export async function rollbackMigrationDurable(store: ManagementStore, planId: s
 	if (store.backend === "json") return rollbackMigration(store, planId, fixture);
 	await ensureAuthMigrated();
 	const mutate = requireCoordinated(store, "import.legacy.rollback");
-	return mutate(async ({ data, query }) => {
+	return mutate(async ({ data, principals, query }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);
-		const preview = previewMigration(draft, fixture);
+		const preview = await relationalPreview(draft, fixture, principals);
 		if (plan.fixtureChecksum !== preview.fixtureChecksum) checkpointMismatch("import.legacy.rollback");
 		if (!plan.createdResourceIds || !plan.createdRuntimeResourceIds || !plan.rollbackResourceState) {
 			throw new ClearanceError({ code: "CLEARANCE_IMPORT_ROLLBACK_UNSAFE", message: "Migration checkpoint does not identify exact runtime and management resources", stage: "import.legacy.rollback", remediation: "Use a checkpoint created by the coordinated Postgres importer." });
@@ -329,8 +479,15 @@ export async function rollbackMigrationDurable(store: ManagementStore, planId: s
 		}
 
 		for (const expected of state.management.users) {
-			const current = data.principals.find((candidate) => candidate.id === expected.id && candidate.projectId === expected.projectId && candidate.environmentId === expected.environmentId && candidate.email === expected.email && candidate.name === expected.name && candidate.status === expected.status && candidate.externalId === expected.externalId && candidate.updatedAt === expected.updatedAt);
-			if (!current) rollbackStateConflict("user", expected.id);
+			const current = principals
+				? await principals.getById({
+						scope: { projectId: expected.projectId, environmentId: expected.environmentId },
+						id: expected.id,
+						includeDeleted: true,
+					})
+				: data.principals.find((candidate) => candidate.id === expected.id);
+			const matches = current && current.projectId === expected.projectId && current.environmentId === expected.environmentId && current.email === expected.email && current.name === expected.name && current.status === expected.status && current.externalId === expected.externalId && current.createdAt === expected.createdAt && current.updatedAt === expected.updatedAt;
+			if (!matches) rollbackStateConflict("user", expected.id);
 		}
 		for (const expected of state.management.organizations) {
 			const current = data.organizations.find((candidate) => candidate.id === expected.id && candidate.projectId === expected.projectId && candidate.environmentId === expected.environmentId && candidate.name === expected.name && candidate.slug === expected.slug && candidate.status === expected.status && candidate.externalId === expected.externalId && candidate.updatedAt === expected.updatedAt);
@@ -387,7 +544,15 @@ export async function rollbackMigrationDurable(store: ManagementStore, planId: s
 		for (const id of plan.createdRuntimeResourceIds.organizations) await query(`delete from organization where id = $1`, [id]);
 		for (const id of plan.createdRuntimeResourceIds.users) await query(`delete from "user" where id = $1`, [id]);
 		data.memberships = data.memberships.filter((membership) => !membershipIds.has(membership.id));
-		data.principals = data.principals.filter((principal) => !userIds.has(principal.id));
+		if (principals) {
+			for (const expected of state.management.users) {
+				if (!(await hardDeleteImportedPrincipalForRollback(principals, expected))) {
+					rollbackStateConflict("user", expected.id);
+				}
+			}
+		} else {
+			data.principals = data.principals.filter((principal) => !userIds.has(principal.id));
+		}
 		data.organizations = data.organizations.filter((organization) => !organizationIds.has(organization.id));
 		const updated: MigrationPlan = { ...plan, status: "rolled_back", checkpoint: { ...plan.checkpoint, phase: "rolled_back" }, updatedAt: nowIso(), steps: [...plan.steps, { name: "rollback", status: "done", detail: "Exact imported runtime and management resources removed atomically" }] };
 		data.migrations[data.migrations.findIndex((candidate) => candidate.id === planId)] = updated;

@@ -41,6 +41,18 @@ export type SessionView = {
 	userAgent?: string;
 };
 
+function principalReadView(store: ManagementSnapshotReader) {
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage: "sessions.read",
+			status: 500,
+		});
+	}
+	return store.snapshot.principals;
+}
+
 export type SessionSource = AuditEvent["source"];
 
 export type RevokeSessionResult = {
@@ -101,7 +113,9 @@ function principalForSession(
 	scope: ResourceScope,
 	stage: string,
 ) {
-	const principal = store.snapshot.principals.find((p) => p.id === principalId);
+	const principal = principalReadView(store).find(
+		(p) => p.id === principalId,
+	);
 	if (!principal || principal.status === "deleted") {
 		throw new ClearanceError({
 			code: "SESSION_NOT_FOUND",
@@ -164,7 +178,7 @@ function selectSessionViews(
 	includeRevoked: boolean,
 ): SessionView[] {
 	const principals = new Map(
-		store.snapshot.principals
+		principalReadView(store)
 			.filter(
 				(p) =>
 					p.projectId === scope.projectId &&
@@ -292,7 +306,9 @@ export function revokeSession(
 			});
 		}
 
-		const principal = data.principals.find((p) => p.id === session.principalId);
+		const principal = principalReadView(store).find(
+			(p) => p.id === session.principalId,
+		);
 		if (!principal || principal.status === "deleted") {
 			throw new ClearanceError({
 				code: "SESSION_NOT_FOUND",

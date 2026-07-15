@@ -27,6 +27,7 @@ const job = {
 	organizationId: "organization_delivery",
 	channel: "webhook" as const,
 	state: "queued" as const,
+	cancelRequested: false,
 	attemptCount: 0,
 	maxAttempts: 5,
 	availableAt: timestamp,
@@ -61,6 +62,7 @@ function fakeStore(input: {
 			job,
 			effect: {
 				state: controlInput.action === "replay" ? "queued" as const : "cancelled" as const,
+				cancelRequested: false,
 				maxAttempts: controlInput.action === "replay"
 					? controlInput.maxAttempts ?? 5
 					: 5,
@@ -82,6 +84,7 @@ function fakeStore(input: {
 			lastSeenAt: timestamp,
 		},
 		keys: { checked: true, available: true, missingReferences: 0 },
+		webhookEndpoints: { total: 0, active: 0, disabled: 0, untestedActive: 0, testPendingActive: 0, testFailedActive: 0, testSucceededActive: 0, lastTestRequestedAt: null },
 		reasons: [],
 	}));
 	const quota = vi.fn(async () => ({
@@ -96,21 +99,39 @@ function fakeStore(input: {
 			resetsAt: null,
 		},
 	}));
-	const cancel = vi.fn(async () => ({
-		...job,
-		state: "cancelled" as const,
-		cancelledAt: timestamp,
-	}));
-	const retry = vi.fn(async () => ({ ...job, state: "retry" as const }));
-	const replay = vi.fn(async () => ({
-		eventId: "event_replay",
-		jobId: "job_replay",
-		kind: job.kind,
-		channel: job.channel,
-		state: "queued" as const,
-		createdAt: timestamp,
-		semanticExpiresAt: job.semanticExpiresAt,
-	}));
+	const cancel = vi.fn(async (controlInput: { maxAttempts?: number }) => {
+		const lockedPreview = await preview({ ...controlInput, action: "cancel" });
+		return lockedPreview ? {
+		preview: lockedPreview,
+		result: {
+			...job,
+			state: "cancelled" as const,
+			cancelledAt: timestamp,
+		},
+		} : null;
+	});
+	const retry = vi.fn(async (controlInput: { maxAttempts?: number }) => {
+		const lockedPreview = await preview({ ...controlInput, action: "retry" });
+		return lockedPreview ? {
+			preview: lockedPreview,
+			result: { ...job, state: "retry" as const },
+		} : null;
+	});
+	const replay = vi.fn(async (controlInput: { maxAttempts?: number }) => {
+		const lockedPreview = await preview({ ...controlInput, action: "replay" });
+		return lockedPreview ? {
+		preview: lockedPreview,
+		result: {
+			eventId: "event_replay",
+			jobId: "job_replay",
+			kind: job.kind,
+			channel: job.channel,
+			state: "queued" as const,
+			createdAt: timestamp,
+			semanticExpiresAt: job.semanticExpiresAt,
+		},
+		} : null;
+	});
 	const store = {
 		backend: "postgres",
 		path: "/test/delivery",
@@ -217,7 +238,7 @@ describe("delivery API routes", () => {
 		});
 		expect(mutation.status).toBe(404);
 		expect((await mutation.json()).error.code).toBe("DELIVERY_JOB_NOT_FOUND");
-		expect(calls.cancel).not.toHaveBeenCalled();
+		expect(calls.cancel).toHaveBeenCalledOnce();
 	});
 
 	it("previews by default and executes only with confirm true", async () => {

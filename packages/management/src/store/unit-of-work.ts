@@ -2,13 +2,18 @@ import type { DataStoreSnapshot } from "../types/resources.js";
 import type {
 	ManagementStore,
 	ManagementUnitOfWork,
+	StoreV2PrincipalReader,
 } from "./types.js";
 
-function draftUnitOfWork(snapshot: DataStoreSnapshot): ManagementUnitOfWork {
+function draftUnitOfWork(
+	snapshot: DataStoreSnapshot,
+	storeV2Principals?: StoreV2PrincipalReader,
+): ManagementUnitOfWork {
 	return {
 		get snapshot() {
 			return snapshot;
 		},
+		...(storeV2Principals ? { storeV2Principals } : {}),
 		mutate(mutator) {
 			mutator(snapshot);
 			return snapshot;
@@ -26,7 +31,9 @@ export function withManagementUnitOfWork<T>(
 	transition: (unitOfWork: ManagementUnitOfWork) => T,
 ): Promise<T> {
 	return store.mutateDurable((snapshot) => {
-		const result = transition(draftUnitOfWork(snapshot));
+		const result = transition(
+			draftUnitOfWork(snapshot, store.storeV2Principals),
+		);
 		if (
 			typeof result === "object" &&
 			result !== null &&

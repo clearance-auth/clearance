@@ -258,7 +258,7 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 			await pool.query(`DROP TABLE ${GUARD_PREFIX}projects`);
 			expect((await store.storeV2!.apply()).consistent).toBe(true);
 			await pool.query(
-				`UPDATE ${GUARD_PREFIX}meta SET value = '2'::jsonb WHERE key = 'store_v2_schema_version'`,
+				`UPDATE ${GUARD_PREFIX}meta SET value = '3'::jsonb WHERE key = 'store_v2_schema_version'`,
 			);
 			await expect(store.storeV2!.apply()).rejects.toMatchObject({
 				code: "STORE_V2_SCHEMA_VERSION_INVALID",

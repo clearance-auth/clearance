@@ -286,7 +286,7 @@ function checkpointManagementState(
 	const membershipIds = new Set(created.memberships);
 	return {
 		management: {
-			users: store.snapshot.principals.filter((principal) => userIds.has(principal.id)).map((principal) => ({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), updatedAt: principal.updatedAt })),
+			users: store.snapshot.principals.filter((principal) => userIds.has(principal.id)).map((principal) => ({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), createdAt: principal.createdAt, updatedAt: principal.updatedAt })),
 			organizations: store.snapshot.organizations.filter((organization) => organizationIds.has(organization.id)).map((organization) => ({ id: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, name: organization.name, slug: organization.slug, status: organization.status, ...(organization.externalId ? { externalId: organization.externalId } : {}), updatedAt: organization.updatedAt })),
 			memberships: store.snapshot.memberships.filter((membership) => membershipIds.has(membership.id)).map((membership) => ({ id: membership.id, organizationId: membership.organizationId, principalId: membership.principalId, role: membership.role, status: membership.status, source: membership.source, updatedAt: membership.updatedAt })),
 		},

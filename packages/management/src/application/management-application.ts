@@ -141,7 +141,11 @@ export function createManagementApplication(input: {
 	store: ManagementStore;
 	authRuntime?: AuthRuntimeGateway;
 }): ManagementApplication {
-	if (input.store.backend === "postgres" && !input.authRuntime) {
+	if (
+		input.store.backend === "postgres" &&
+		!input.authRuntime &&
+		!input.store.storeV2Principals?.authoritative
+	) {
 		throw new Error("Postgres ManagementApplication requires an AuthRuntimeGateway");
 	}
 	const authRuntime = input.store.backend === "postgres" ? input.authRuntime : undefined;

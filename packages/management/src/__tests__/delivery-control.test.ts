@@ -24,6 +24,7 @@ const job: PublicDeliveryJob = {
 	organizationId: null,
 	channel: "webhook",
 	state: "queued",
+	cancelRequested: false,
 	attemptCount: 0,
 	maxAttempts: 5,
 	availableAt: "2026-07-15T00:00:00.000Z",
@@ -43,6 +44,7 @@ const preview: DeliveryControlPreview = {
 	job,
 	effect: {
 		state: "cancelled",
+		cancelRequested: false,
 		maxAttempts: null,
 		createsEvent: false,
 		createsJob: false,
@@ -69,6 +71,7 @@ function reader(overrides: Partial<ManagementDeliveryControlReader> = {}): Manag
 			jobs: { queued: 1, leased: 0, retry: 0, delivered: 0, dead: 0, cancelled: 0 },
 			workers: { total: 1, ready: 1, freshReady: 1, stale: 0, staleAfterMs: 60_000, lastSeenAt: null },
 			keys: { checked: true, available: true, missingReferences: 0 },
+			webhookEndpoints: { total: 0, active: 0, disabled: 0, untestedActive: 0, testPendingActive: 0, testFailedActive: 0, testSucceededActive: 0, lastTestRequestedAt: null },
 			reasons: [],
 		}),
 		quota: async (scope) => ({
@@ -199,5 +202,33 @@ describe("management delivery control service", () => {
 			message: "Delivery operation failed.",
 		});
 		expect(String(failure)).not.toContain(secret);
+
+		const historicalKeyId = "customer-key-2025-secret-label";
+		const unavailableKeyStore = store({
+			reader: reader({
+				list: async () => {
+					throw Object.assign(
+						new Error(`Delivery fingerprint key ${historicalKeyId} is unavailable`),
+						{ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" },
+					);
+				},
+			}),
+		});
+		let keyFailure: unknown;
+		try {
+			await listDeliveryJobsForManagement(unavailableKeyStore, {
+				projectId: "project-1",
+				environmentId: "environment-1",
+			});
+		} catch (error) {
+			keyFailure = error;
+		}
+		expect(keyFailure).toMatchObject({
+			code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+			status: 503,
+			retryable: true,
+			message: "Delivery service configuration is unavailable.",
+		});
+		expect(String(keyFailure)).not.toContain(historicalKeyId);
 	});
 });

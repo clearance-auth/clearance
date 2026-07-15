@@ -16,27 +16,48 @@ import { resolve } from "node:path";
 import pg from "pg";
 import {
 	cancelDeliveryInExistingTransaction,
+	createWebhookEndpointInExistingTransaction,
 	createDeliveryKeyring,
 	DEFAULT_DELIVERY_QUOTA_POLICY,
 	deliveryQuotaStatus,
 	deliveryReadiness,
 	deliverySchemaName,
 	deliveryTableNames,
+	fanoutOrganizationUpdatedWebhookInExistingTransaction,
 	enqueueDeliveryInExistingTransaction,
 	inspectDeliveryJobScoped,
+	inspectWebhookEndpointScoped,
 	listDeliveryJobs,
+	listWebhookEndpoints,
 	migrateDeliverySchema,
 	normalizeDeliveryQuotaPolicy,
 	previewDeliveryControl,
+	previewDeliveryControlInExistingTransaction,
+	previewWebhookEndpointDeletion,
+	previewWebhookEndpointDeletionInExistingTransaction,
+	previewWebhookEndpointSecretRotation,
+	previewWebhookEndpointSecretRotationInExistingTransaction,
+	previewWebhookEndpointTest,
+	previewWebhookEndpointTestInExistingTransaction,
 	replayDeliveryInExistingTransaction,
+	rotateWebhookEndpointSecretInExistingTransaction,
 	retryDeliveryInExistingTransaction,
+	softDeleteWebhookEndpointInExistingTransaction,
+	updateWebhookEndpointInExistingTransaction,
+	enqueueWebhookEndpointTestInExistingTransaction,
 	type DeliveryKeyring,
 	type DeliveryKeyringInput,
 	type DeliveryQuotaPolicy,
 	type DeliverySchemaOptions,
+	type DeliveryRawTransaction,
 	type EnqueuedDelivery,
 	type EnqueueDeliveryInput,
 } from "@clearance/delivery";
+import type { ManagementWebhookEndpointCapability } from "../services/webhook-endpoints.js";
+import {
+	MANAGEMENT_WEBHOOK_TTL_MS,
+	type ManagementWebhookEndpointFanout,
+} from "../application/delivery.js";
 import {
 	CLEARANCE_RELEASE_VERSION,
 	cloneSnapshot,
@@ -46,25 +67,52 @@ import {
 	stableSnapshotJson,
 	STORE_SCHEMA_VERSION,
 } from "./snapshot.js";
-import type { DataStoreSnapshot } from "../types/resources.js";
-import { PgStoreV2Shadow, StoreV2MigrationError } from "./store-v2-shadow.js";
-import { applyStoreV2EventDelta } from "./store-v2-events.js";
+import type { AuditEvent, DataStoreSnapshot } from "../types/resources.js";
+import {
+	PgStoreV2Shadow,
+	StoreV2MigrationError,
+	type StoreV2SyncResult,
+} from "./store-v2-shadow.js";
+import {
+	appendStoreV2Events,
+	applyStoreV2EventDelta,
+} from "./store-v2-events.js";
+import { PgStoreV2PrincipalRepository } from "./store-v2-principals.js";
+import { registerInternalCoordinatedExecutor } from "./coordinated-internal.js";
 import {
 	appendAuditEvent,
+	buildAuditEvent,
 	consumeDeferredAuditEvents,
 	deferAuditRetentionForDraft,
+	type AuditEventInput,
 } from "../services/audit.js";
 import type {
 	DeliveryControlMutationInput,
+	DeliveryControlAuditContext,
+	DeliveryControlScope,
 	ManagementDeliveryControlMutation,
 	ManagementDeliveryControlReader,
+	InternalManagementCoordinatedMutationContext,
+	ManagementCoordinatedMutationContext,
 	ManagementStore,
 	StoreV2EventReader,
 	StoreV2MigrationControl,
 	StoreV2Phase,
+	StoreV2PrincipalReader,
+	StoreV2PrincipalRepository,
+	StoreV2Collection,
 } from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
+
+class TransactionCapabilityRevokedError extends Error {
+	readonly code = "TRANSACTION_CAPABILITY_REVOKED";
+
+	constructor() {
+		super("The transaction query capability is no longer active.");
+		this.name = "TransactionCapabilityRevokedError";
+	}
+}
 
 export type PgStoreDeliveryOptions = DeliverySchemaOptions & {
 	keyring: DeliveryKeyringInput | DeliveryKeyring;
@@ -106,7 +154,9 @@ export class PgStore implements ManagementStore {
 	readonly path: string;
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	readonly storeV2Principals?: StoreV2PrincipalReader;
 	readonly deliveryControl?: ManagementDeliveryControlReader;
+	readonly webhookEndpoints?: ManagementWebhookEndpointCapability;
 	private data: DataStoreSnapshot;
 	private revision = 0;
 	private pool: pg.Pool;
@@ -119,9 +169,13 @@ export class PgStore implements ManagementStore {
 	private deliveryQuotaPolicy: DeliveryQuotaPolicy = DEFAULT_DELIVERY_QUOTA_POLICY;
 	private storeV2Shadow?: PgStoreV2Shadow;
 	private storeV2Phase: StoreV2Phase = "absent";
+	private storeV2AuthoritativeCollections: StoreV2Collection[] = [];
+	private storeV2PrincipalRevision: number | null = null;
+	private storeV2PrincipalCount = 0;
 	private pending: Promise<void> = Promise.resolve();
 	/** Set when a queued write fails; rethrown from ready() so the chain never rejects. */
 	private writeError: unknown = null;
+	private readonly activePrincipalTransactions = new Set<Promise<unknown>>();
 	private initialized = false;
 
 	constructor(
@@ -187,6 +241,157 @@ export class PgStore implements ManagementStore {
 					this.deliverySchemaOptions,
 				),
 			};
+			const keyring = normalizedDelivery.keyring;
+			const options = normalizedDelivery.options;
+			this.webhookEndpoints = {
+				list: (input) => listWebhookEndpoints(this.pool, input, keyring, options),
+				inspect: (input) => inspectWebhookEndpointScoped(
+					this.pool,
+					input,
+					keyring,
+					options,
+				),
+				preview: (input) => {
+					if (input.action === "rotate") {
+						return previewWebhookEndpointSecretRotation(
+							this.pool,
+							input,
+							keyring,
+							options,
+						);
+					}
+					if (input.action === "delete") {
+						return previewWebhookEndpointDeletion(
+							this.pool,
+							input,
+							keyring,
+							options,
+						);
+					}
+					return previewWebhookEndpointTest(this.pool, input, keyring, options);
+				},
+				create: (input) => this.mutateWebhookEndpoint(
+					input,
+					"create",
+					(transaction) => createWebhookEndpointInExistingTransaction(
+						transaction,
+						input,
+						keyring,
+						options,
+					),
+					(result) => ({
+						endpointId: result.endpoint.id,
+						resourceVersion: result.endpoint.resourceVersion,
+						secretVersion: result.endpoint.secretVersion,
+						status: result.endpoint.status,
+						eventKinds: result.endpoint.eventKinds,
+						urlFingerprint: result.endpoint.urlFingerprint,
+					}),
+				),
+				update: (input) => this.mutateWebhookEndpoint(
+					input,
+					"update",
+					(transaction) => updateWebhookEndpointInExistingTransaction(
+						transaction,
+						input,
+						keyring,
+						options,
+					),
+					(endpoint) => ({
+						endpointId: endpoint.id,
+						resourceVersion: endpoint.resourceVersion,
+						secretVersion: endpoint.secretVersion,
+						status: endpoint.status,
+						eventKinds: endpoint.eventKinds,
+						urlFingerprint: endpoint.urlFingerprint,
+					}),
+				),
+				rotate: (input) => this.mutateWebhookEndpoint(
+					input,
+					"rotate",
+					async (transaction) => {
+						const preview = await previewWebhookEndpointSecretRotationInExistingTransaction(
+							transaction,
+							input,
+							keyring,
+							options,
+						);
+						if (!preview) return null;
+						const result = await rotateWebhookEndpointSecretInExistingTransaction(
+							transaction,
+							input,
+							keyring,
+							options,
+						);
+						return result ? { preview, ...result } : null;
+					},
+					(result) => ({
+						endpointId: result.endpoint.id,
+						resourceVersion: result.endpoint.resourceVersion,
+						secretVersion: result.endpoint.secretVersion,
+						status: result.endpoint.status,
+						urlFingerprint: result.endpoint.urlFingerprint,
+					}),
+				),
+				delete: (input) => this.mutateWebhookEndpoint(
+					input,
+					"delete",
+					async (transaction) => {
+						const preview = await previewWebhookEndpointDeletionInExistingTransaction(
+							transaction,
+							input,
+							keyring,
+							options,
+						);
+						if (!preview) return null;
+						const result = await softDeleteWebhookEndpointInExistingTransaction(
+							transaction,
+							input,
+							options,
+						);
+						return result ? { preview, result } : null;
+					},
+					(result) => ({
+						endpointId: result.result.endpoint.id,
+						resourceVersion: result.result.endpoint.resourceVersion,
+						status: result.result.endpoint.status,
+						urlFingerprint: result.preview.endpoint.urlFingerprint,
+						erasedPayloads: result.result.erasedPayloads,
+						...result.result.jobs,
+					}),
+				),
+				test: (input) => this.mutateWebhookEndpoint(
+					input,
+					"test",
+					async (transaction) => {
+						const preview = await previewWebhookEndpointTestInExistingTransaction(
+							transaction,
+							input,
+							keyring,
+							options,
+						);
+						if (!preview) return null;
+						const result = await enqueueWebhookEndpointTestInExistingTransaction(
+							transaction,
+							{
+								...input,
+								actorId: input.actor,
+								quota: this.deliveryQuotaPolicy,
+							},
+							keyring,
+							options,
+						);
+						return result ? { preview, ...result } : null;
+					},
+					(result) => ({
+						endpointId: result.endpoint.id,
+						resourceVersion: result.endpoint.resourceVersion,
+						status: result.endpoint.status,
+						urlFingerprint: result.endpoint.urlFingerprint,
+						testJobId: result.delivery.jobId,
+					}),
+				),
+			};
 		}
 		const normalizedPrefix =
 			opts?.normalizedPrefix ??
@@ -224,22 +429,56 @@ export class PgStore implements ManagementStore {
 					await this.refresh();
 					return status;
 				},
-				rollbackEvents: async () => {
+					rollbackEvents: async () => {
 					await this.ready();
 					const status = await this.storeV2Shadow!.rollbackEvents();
 					await this.refresh();
-					return status;
-				},
-			};
+						return status;
+					},
+					cutoverPrincipals: async () => {
+						await this.ready();
+						const status = await this.storeV2Shadow!.cutoverPrincipals();
+						await this.refresh();
+						return status;
+					},
+					rollbackPrincipals: async () => {
+						await this.ready();
+						const status = await this.storeV2Shadow!.rollbackPrincipals();
+						await this.refresh();
+						return status;
+					},
+				};
 			const owner = this;
 			this.storeV2Events = {
 				get authoritative() {
-					return owner.storeV2Phase === "hybrid";
+					return owner.storeV2AuthoritativeCollections.includes("events");
 				},
 				listPage: (input) => this.storeV2Shadow!.listEventsPage(input),
 			};
+			this.storeV2Principals = {
+				get authoritative() {
+					return owner.storeV2AuthoritativeCollections.includes("principals");
+				},
+				getById: (input) => this.storeV2Shadow!.getPrincipalById(input),
+				findActiveByEmail: (input) =>
+					this.storeV2Shadow!.findActivePrincipalByEmail(input),
+				findActiveByExternalId: (input) =>
+					this.storeV2Shadow!.findActivePrincipalByExternalId(input),
+				listPage: (input) => this.storeV2Shadow!.listPrincipalsPage(input),
+				listActiveSessionsPage: (input) =>
+					this.storeV2Shadow!.listActivePrincipalSessionsPage(input),
+				listForExport: (input) =>
+					this.storeV2Shadow!.listPrincipalsForExport(input),
+				countByScope: (input) =>
+					this.storeV2Shadow!.countPrincipalsByScope(input),
+				countActiveSessions: (input) =>
+					this.storeV2Shadow!.countActivePrincipalSessions(input),
+			};
 		}
 		this.data = emptySnapshot();
+		registerInternalCoordinatedExecutor(this, (fn) =>
+			this.queueCoordinated(fn),
+		);
 	}
 
 	/** Ensure schema + load snapshot. Call before first use. */
@@ -328,8 +567,11 @@ export class PgStore implements ManagementStore {
 		if (this.storeV2Shadow) {
 			const loaded = await this.storeV2Shadow.loadSnapshot();
 			this.data = loaded.snapshot;
+			this.storeV2PrincipalCount = loaded.principalCount;
 			this.revision = loaded.revision;
 			this.storeV2Phase = loaded.phase;
+			this.storeV2AuthoritativeCollections = loaded.authoritativeCollections;
+			this.storeV2PrincipalRevision = loaded.principalRevision;
 		}
 		this.initialized = true;
 		return this;
@@ -354,6 +596,9 @@ export class PgStore implements ManagementStore {
 
 	async ready(): Promise<void> {
 		await this.pending;
+		while (this.activePrincipalTransactions.size > 0) {
+			await Promise.allSettled([...this.activePrincipalTransactions]);
+		}
 		if (this.writeError) {
 			const err = this.writeError;
 			this.writeError = null;
@@ -368,10 +613,16 @@ export class PgStore implements ManagementStore {
 	async refresh(): Promise<void> {
 		await this.ready();
 		if (this.storeV2Shadow) {
-			const loaded = await this.storeV2Shadow.loadSnapshot();
+			const loaded = await this.storeV2Shadow.loadSnapshot({
+				principalRevision: this.storeV2PrincipalRevision,
+				principalCount: this.storeV2PrincipalCount,
+			});
 			this.data = loaded.snapshot;
+			this.storeV2PrincipalCount = loaded.principalCount;
 			this.revision = loaded.revision;
 			this.storeV2Phase = loaded.phase;
+			this.storeV2AuthoritativeCollections = loaded.authoritativeCollections;
+			this.storeV2PrincipalRevision = loaded.principalRevision;
 			if (process.env.CLEARANCE_STORE_V2_VERIFY === "1") {
 				const status = await this.storeV2Shadow.verify();
 				if ((status.phase === "shadow" || status.phase === "hybrid") && !status.consistent) {
@@ -419,6 +670,34 @@ export class PgStore implements ManagementStore {
 		});
 	}
 
+	mutateStoreV2Principals<T>(
+		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
+	): Promise<T> {
+		return this.trackPrincipalTransaction(this.transactStoreV2Principals(fn));
+	}
+
+	mutateStoreV2Identity<T>(
+		fn: (context: {
+			principals: StoreV2PrincipalRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T> {
+		return this.trackPrincipalTransaction(this.transactStoreV2Identity(fn));
+	}
+
+	private trackPrincipalTransaction<T>(transaction: Promise<T>): Promise<T> {
+		this.activePrincipalTransactions.add(transaction);
+		transaction.then(
+			() => {
+				this.activePrincipalTransactions.delete(transaction);
+			},
+			() => {
+				this.activePrincipalTransactions.delete(transaction);
+			},
+		);
+		return transaction;
+	}
+
 	/**
 	 * Single Postgres transaction: lock management snapshot, run caller SQL
 	 * (runtime user/session/account tables) + snapshot mutator, enforce
@@ -426,17 +705,18 @@ export class PgStore implements ManagementStore {
 	 * success when runtime and management diverge.
 	 */
 	mutateCoordinated<T>(
-		fn: (ctx: {
-			data: DataStoreSnapshot;
-			query: (
-				sql: string,
-				params?: unknown[],
-			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
-			enqueueDelivery?: (
-				input: EnqueueDeliveryInput,
-			) => Promise<EnqueuedDelivery>;
-			controlDelivery?: ManagementDeliveryControlMutation;
-		}) => Promise<T> | T,
+		fn: (ctx: ManagementCoordinatedMutationContext) => Promise<T> | T,
+	): Promise<T> {
+		return this.queueCoordinated(async (context) => {
+			const { query: _query, ...publicContext } = context;
+			return fn(publicContext);
+		});
+	}
+
+	private queueCoordinated<T>(
+		fn: (
+			context: InternalManagementCoordinatedMutationContext,
+		) => Promise<T> | T,
 	): Promise<T> {
 		return new Promise<T>((resolvePromise, rejectPromise) => {
 			this.pending = this.pending.then(async () => {
@@ -454,7 +734,11 @@ export class PgStore implements ManagementStore {
 	}
 
 	resourceCounts(): Record<string, number> {
-		return snapshotResourceCounts(this.data);
+		const counts = snapshotResourceCounts(this.data);
+		if (this.storeV2AuthoritativeCollections.includes("principals")) {
+			counts.principals = this.storeV2PrincipalCount;
+		}
+		return counts;
 	}
 
 	async destroy(): Promise<void> {
@@ -559,6 +843,9 @@ export class PgStore implements ManagementStore {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			if (this.storeV2Shadow) {
+				await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
+			}
 			const result = await client.query<{
 				data: DataStoreSnapshot;
 				revision: string | number;
@@ -611,16 +898,23 @@ export class PgStore implements ManagementStore {
 				appendedEvents,
 			);
 			// Enforce uniqueness indexes from the committed snapshot draft
-			await this.syncUniqueness(client, next);
+			await this.syncUniqueness(
+				client,
+				next,
+				sync?.authoritativeCollections ?? [],
+			);
 
 			const persisted = sync?.persistedSnapshot ?? next;
-			let materialized = next;
-			if (sync?.phase === "hybrid" && sync.eventDelta) {
-				const events = rev === this.revision
-					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
-					: await this.storeV2Shadow!.materializeEvents(client);
-				materialized = { ...next, events };
-			}
+			const materialized = await this.materializeStoreV2Candidate(
+				client,
+				next,
+				rev,
+				sync,
+			);
+			const principalCount = await this.resolvePrincipalCount(
+				client,
+				sync?.authoritativeCollections ?? [],
+			);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -634,6 +928,10 @@ export class PgStore implements ManagementStore {
 			this.data = materialized;
 			this.revision = newRevision;
 			this.storeV2Phase = sync?.phase ?? phase;
+			this.storeV2AuthoritativeCollections =
+				sync?.authoritativeCollections ?? [];
+			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
+			this.storeV2PrincipalCount = principalCount;
 		} catch (e) {
 			try {
 				await client.query("ROLLBACK");
@@ -652,6 +950,9 @@ export class PgStore implements ManagementStore {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			if (this.storeV2Shadow) {
+				await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
+			}
 			const result = await client.query<{
 				data: DataStoreSnapshot;
 				revision: string | number;
@@ -677,15 +978,22 @@ export class PgStore implements ManagementStore {
 				revision,
 				appendedEvents,
 			);
-			await this.syncUniqueness(client, base);
+			await this.syncUniqueness(
+				client,
+				base,
+				sync?.authoritativeCollections ?? [],
+			);
 			const persisted = sync?.persistedSnapshot ?? base;
-			let materialized = base;
-			if (sync?.phase === "hybrid" && sync.eventDelta) {
-				const events = previousRevision === this.revision
-					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
-					: await this.storeV2Shadow!.materializeEvents(client);
-				materialized = { ...base, events };
-			}
+			const materialized = await this.materializeStoreV2Candidate(
+				client,
+				base,
+				previousRevision,
+				sync,
+			);
+			const principalCount = await this.resolvePrincipalCount(
+				client,
+				sync?.authoritativeCollections ?? [],
+			);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -699,6 +1007,107 @@ export class PgStore implements ManagementStore {
 			this.data = materialized;
 			this.revision = revision;
 			this.storeV2Phase = sync?.phase ?? phase;
+			this.storeV2AuthoritativeCollections =
+				sync?.authoritativeCollections ?? [];
+			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
+			this.storeV2PrincipalCount = principalCount;
+			return value;
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	private transactStoreV2Principals<T>(
+		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
+	): Promise<T> {
+		return this.transactStoreV2Identity(({ principals }) => fn(principals));
+	}
+
+	private async transactStoreV2Identity<T>(
+		fn: (context: {
+			principals: StoreV2PrincipalRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T> {
+		if (!this.storeV2Shadow) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPALS_UNAVAILABLE",
+				"Normalized principal storage is not configured for this store.",
+			);
+		}
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
+			const authoritativeCollections =
+				await this.storeV2Shadow.transactionAuthoritativeCollections(client);
+			if (!authoritativeCollections.includes("principals")) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
+					"Direct principal mutation requires relational principal authority.",
+				);
+			}
+			if (!authoritativeCollections.includes("events")) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_NOT_AUTHORITATIVE",
+					"Relational identity transactions require append-only event authority.",
+				);
+			}
+			const repository = new PgStoreV2PrincipalRepository(
+				client,
+				this.storeV2Shadow.tables,
+			);
+			const audits: AuditEvent[] = [];
+			let auditActive = true;
+			const appendAudit = (input: AuditEventInput): AuditEvent => {
+				if (!auditActive) {
+					throw new TransactionCapabilityRevokedError();
+				}
+				const event = buildAuditEvent(structuredClone(input));
+				audits.push(event);
+				return structuredClone(event);
+			};
+			let value!: T;
+			let callbackError: unknown;
+			let callbackFailed = false;
+			try {
+				value = await fn({ principals: repository.capability, appendAudit });
+			} catch (error) {
+				callbackFailed = true;
+				callbackError = error;
+			}
+			repository.revoke();
+			auditActive = false;
+			let issuedError: unknown;
+			try {
+				await repository.settleIssued();
+			} catch (error) {
+				issuedError = error;
+			}
+			if (callbackFailed) throw callbackError;
+			if (issuedError !== undefined) throw issuedError;
+			const principalState = await repository.finalizeState();
+			const eventDelta = audits.length > 0
+				? await appendStoreV2Events(
+						client,
+						this.storeV2Shadow.tables,
+						audits,
+						principalState.revision,
+					)
+				: undefined;
+			await client.query("COMMIT");
+			this.storeV2AuthoritativeCollections = authoritativeCollections;
+			if (eventDelta) {
+				this.data = {
+					...this.data,
+					events: applyStoreV2EventDelta(this.data.events, eventDelta),
+				};
+			}
+			this.storeV2PrincipalCount = principalState.count;
+			this.storeV2PrincipalRevision = principalState.revision;
 			return value;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -709,21 +1118,16 @@ export class PgStore implements ManagementStore {
 	}
 
 	private async transactCoordinated<T>(
-		fn: (ctx: {
-			data: DataStoreSnapshot;
-			query: (
-				sql: string,
-				params?: unknown[],
-			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
-			enqueueDelivery?: (
-				input: EnqueueDeliveryInput,
-			) => Promise<EnqueuedDelivery>;
-			controlDelivery?: ManagementDeliveryControlMutation;
-		}) => Promise<T> | T,
+		fn: (
+			context: InternalManagementCoordinatedMutationContext,
+		) => Promise<T> | T,
 	): Promise<T> {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			if (this.storeV2Shadow) {
+				await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
+			}
 			const result = await client.query<{
 				data: DataStoreSnapshot;
 				revision: string | number;
@@ -735,23 +1139,69 @@ export class PgStore implements ManagementStore {
 			const phase = this.storeV2Shadow
 				? await this.storeV2Shadow.transactionPhase(client)
 				: "absent";
+			const authoritativeCollections = this.storeV2Shadow
+				? await this.storeV2Shadow.transactionAuthoritativeCollections(client)
+				: [];
+			const principalTransaction = authoritativeCollections.includes("principals")
+				? new PgStoreV2PrincipalRepository(client, this.storeV2Shadow!.tables)
+				: undefined;
+			const principals = principalTransaction?.capability;
 			const before = cloneSnapshot(base);
 			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			const revision = previousRevision + 1;
 
-			const query = async (sql: string, params?: unknown[]) => {
-				const r = await client.query(sql, params);
-				return {
-					rows: r.rows as Record<string, unknown>[],
-					rowCount: r.rowCount,
-				};
+			let queryActive = true;
+			const pendingQueries = new Set<Promise<{
+				rows: Record<string, unknown>[];
+				rowCount: number | null;
+			}>>();
+			const issueQuery = (sql: string, params?: readonly unknown[]) => {
+				const capturedParams = params === undefined
+					? undefined
+					: structuredClone([...params]).map((value, index) =>
+						Buffer.isBuffer(params[index])
+							? Buffer.from(params[index] as Buffer)
+							: value,
+					);
+				const pending = Promise.resolve().then(async () => {
+					const r = await client.query(sql, capturedParams);
+					return {
+						rows: r.rows as Record<string, unknown>[],
+						rowCount: r.rowCount,
+					};
+				});
+				// Observe every rejection at issuance time even when the caller drops
+				// the returned promise. transactCoordinated still drains and rethrows it.
+				pending.then(
+					() => undefined,
+					() => undefined,
+				);
+				pendingQueries.add(pending);
+				return pending;
+			};
+			const query = (sql: string, params?: unknown[]) => {
+				if (!queryActive) {
+					const rejected = Promise.reject(new TransactionCapabilityRevokedError());
+					rejected.catch(() => undefined);
+					return rejected;
+				}
+				return issueQuery(sql, params);
+			};
+			const settleIssuedQueries = async (): Promise<PromiseSettledResult<unknown>[]> => {
+				const settled: PromiseSettledResult<unknown>[] = [];
+				while (pendingQueries.size > 0) {
+					const issued = [...pendingQueries];
+					pendingQueries.clear();
+					settled.push(...await Promise.allSettled(issued));
+				}
+				return settled;
 			};
 
 			const rawTransaction = {
 				rawTransactionQuery: async <
 					Row extends Record<string, unknown> = Record<string, unknown>,
 				>(text: string, values?: readonly unknown[]) => {
-					const result = await query(text, values ? [...values] : undefined);
+					const result = await issueQuery(text, values);
 					return {
 						rows: result.rows as Row[],
 						rowCount: result.rowCount,
@@ -778,33 +1228,52 @@ export class PgStore implements ManagementStore {
 			const pendingDeliveryControls: Promise<unknown>[] = [];
 			const trackedControl = <T>(
 				action: "cancel" | "retry" | "replay",
-				input: DeliveryControlMutationInput,
+				input: DeliveryControlMutationInput & { maxAttempts?: number },
 				operation: () => Promise<T | null>,
-			): Promise<T | null> => {
+			) => {
 				const pending = (async () => {
+					const preview = await previewDeliveryControlInExistingTransaction(
+						rawTransaction,
+						{
+							...input,
+							action,
+							...(input.maxAttempts === undefined
+								? {}
+								: { maxAttempts: input.maxAttempts }),
+						},
+						this.deliverySchemaOptions,
+					);
+					if (!preview) return null;
 					const controlled = await operation();
 					if (controlled !== null) {
 						const result = controlled as Record<string, unknown>;
+						const cancellationPending = action === "cancel" &&
+							result.cancelRequested === true;
 						appendAuditEvent(base, {
 							actor: input.actor,
 							action: `delivery.job.${action}`,
 							subjectType: "delivery_job",
 							subjectId: input.jobId,
-							outcome: "success",
+							outcome: cancellationPending ? "pending" : "success",
 							source: input.source,
 							projectId: input.projectId,
 							environmentId: input.environmentId,
 							...(input.correlationId ? { correlationId: input.correlationId } : {}),
-							message: `Delivery job ${action} completed`,
+							message: cancellationPending
+								? "Delivery job cancellation requested"
+								: `Delivery job ${action} completed`,
 							metadata: {
 								action,
+								...(typeof result.cancelRequested === "boolean"
+									? { cancelRequested: result.cancelRequested }
+									: {}),
 								resultJobId: result.jobId ?? result.id,
 								resultEventId: result.eventId,
 								state: result.state,
 							},
 						});
 					}
-					return controlled;
+					return controlled === null ? null : { preview, result: controlled };
 				})();
 				pendingDeliveryControls.push(pending);
 				return pending;
@@ -821,7 +1290,7 @@ export class PgStore implements ManagementStore {
 							retry: (input) => trackedControl("retry", input, () =>
 								retryDeliveryInExistingTransaction(
 									rawTransaction,
-									input,
+									{ ...input, quota: this.deliveryQuotaPolicy },
 									this.deliverySchemaOptions,
 								)),
 							replay: (input) => trackedControl("replay", input, () =>
@@ -836,32 +1305,97 @@ export class PgStore implements ManagementStore {
 								)),
 						}
 					: undefined;
+			const pendingWebhookFanouts: Promise<unknown>[] = [];
+			const fanoutWebhookEndpoints: ManagementWebhookEndpointFanout | undefined =
+				this.deliveryKeyring
+					? (input) => {
+							const occurredAt = input.occurredAt.toISOString();
+							const sourceGeneration = input.context.correlationId ?? occurredAt;
+							const pending = fanoutOrganizationUpdatedWebhookInExistingTransaction(
+								rawTransaction,
+								{
+									projectId: input.context.scope.projectId,
+									environmentId: input.context.scope.environmentId,
+									sourceKey: `organization.updated:${input.organization.id}:${sourceGeneration}`,
+									event: {
+										occurredAt,
+										data: {
+											organization: {
+												id: input.organization.id,
+												name: input.organization.name,
+												slug: input.organization.slug,
+												status: input.organization.status,
+											},
+											previous: input.before,
+										},
+									},
+									organizationId: input.organization.id,
+									actorId: input.context.actor,
+									...(input.context.correlationId
+										? { correlationId: input.context.correlationId }
+										: {}),
+									semanticExpiresAt: new Date(
+										input.occurredAt.getTime() + MANAGEMENT_WEBHOOK_TTL_MS,
+									),
+									quota: this.deliveryQuotaPolicy,
+									now: input.occurredAt,
+								},
+								this.deliveryKeyring!,
+								this.deliverySchemaOptions,
+							).then((results) =>
+								results.map(({ endpoint, delivery }) => {
+									if (!endpoint.url) {
+										throw new Error(
+											`Active webhook endpoint ${endpoint.id} has no destination URL`,
+										);
+									}
+									return {
+										endpointId: endpoint.id,
+										destinationUrl: endpoint.url,
+										delivery,
+									};
+								}),
+							);
+							pendingWebhookFanouts.push(pending);
+							return pending;
+						}
+					: undefined;
 
 			let value!: T;
 			let callbackError: unknown;
+			let callbackFailed = false;
 			try {
 				value = await fn({
 					data: base,
+					...(principals ? { principals } : {}),
 					query,
 					...(enqueueDelivery ? { enqueueDelivery } : {}),
 					...(controlDelivery ? { controlDelivery } : {}),
+					...(fanoutWebhookEndpoints ? { fanoutWebhookEndpoints } : {}),
 				});
 			} catch (error) {
+				callbackFailed = true;
 				callbackError = error;
 			}
+			queryActive = false;
+			principalTransaction?.revoke();
 			// A caller cannot accidentally commit product state before an issued
 			// outbox/control write settles by forgetting to await the returned
 			// promise. Settle issued work even when the callback throws so no query or
 			// rejection can escape after this transaction starts rolling back.
 			const issued = await Promise.allSettled([
 				...pendingDeliveryEnqueues,
-				...pendingDeliveryControls,
+					...pendingDeliveryControls,
+					...pendingWebhookFanouts,
+				...(principalTransaction ? [principalTransaction.settleIssued()] : []),
 			]);
-			if (callbackError !== undefined) throw callbackError;
+			issued.push(...await settleIssuedQueries());
+			if (callbackFailed) throw callbackError;
 			const failed = issued.find(
 				(result): result is PromiseRejectedResult => result.status === "rejected",
 			);
 			if (failed) throw failed.reason;
+			await principalTransaction?.finalizeState();
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
 				: undefined;
@@ -873,15 +1407,22 @@ export class PgStore implements ManagementStore {
 				revision,
 				appendedEvents,
 			);
-			await this.syncUniqueness(client, base);
+			await this.syncUniqueness(
+				client,
+				base,
+				sync?.authoritativeCollections ?? [],
+			);
 			const persisted = sync?.persistedSnapshot ?? base;
-			let materialized = base;
-			if (sync?.phase === "hybrid" && sync.eventDelta) {
-				const events = previousRevision === this.revision
-					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
-					: await this.storeV2Shadow!.materializeEvents(client);
-				materialized = { ...base, events };
-			}
+			const materialized = await this.materializeStoreV2Candidate(
+				client,
+				base,
+				previousRevision,
+				sync,
+			);
+			const principalCount = await this.resolvePrincipalCount(
+				client,
+				sync?.authoritativeCollections ?? [],
+			);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -895,6 +1436,10 @@ export class PgStore implements ManagementStore {
 			this.data = materialized;
 			this.revision = revision;
 			this.storeV2Phase = sync?.phase ?? phase;
+			this.storeV2AuthoritativeCollections =
+				sync?.authoritativeCollections ?? [];
+			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
+			this.storeV2PrincipalCount = principalCount;
 			return value;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -902,6 +1447,47 @@ export class PgStore implements ManagementStore {
 		} finally {
 			client.release();
 		}
+	}
+
+	private mutateWebhookEndpoint<T>(
+		input: DeliveryControlScope & DeliveryControlAuditContext,
+		action: "create" | "update" | "rotate" | "delete" | "test",
+		operation: (transaction: DeliveryRawTransaction) => Promise<T>,
+		metadata: (result: NonNullable<T>) => Record<string, unknown> & { endpointId: string },
+	): Promise<T> {
+		return this.queueCoordinated(async ({ data, query }) => {
+			const transaction: DeliveryRawTransaction = {
+				rawTransactionQuery: async <
+					Row extends Record<string, unknown> = Record<string, unknown>,
+				>(text: string, values?: readonly unknown[]) => {
+					const result = await query(
+						text,
+						values === undefined ? undefined : [...values],
+					);
+					return {
+						rows: result.rows as Row[],
+						rowCount: result.rowCount,
+					};
+				},
+			};
+			const result = await operation(transaction);
+			if (result === null) return null;
+			const { endpointId, ...safeMetadata } = metadata(result as NonNullable<T>);
+			appendAuditEvent(data, {
+				actor: input.actor,
+				action: `delivery.webhook_endpoints.${action}`,
+				subjectType: "webhook_endpoint",
+				subjectId: endpointId,
+				outcome: "success",
+				source: input.source,
+				projectId: input.projectId,
+				environmentId: input.environmentId,
+				correlationId: input.correlationId,
+				message: `Webhook endpoint ${action} completed`,
+				metadata: safeMetadata,
+			});
+			return result;
+		}) as Promise<T>;
 	}
 
 	/**
@@ -913,13 +1499,18 @@ export class PgStore implements ManagementStore {
 	private async syncUniqueness(
 		client: pg.PoolClient,
 		snapshot: DataStoreSnapshot,
+		authoritativeCollections: readonly StoreV2Collection[] = [],
 	): Promise<void> {
-		await client.query(`DELETE FROM ${this.emailUniqueTable}`);
+		const principalsAuthoritative = authoritativeCollections.includes("principals");
+		if (!principalsAuthoritative) {
+			await client.query(`DELETE FROM ${this.emailUniqueTable}`);
+		}
 		await client.query(`DELETE FROM ${this.slugUniqueTable}`);
 
-		for (const p of snapshot.principals) {
-			if (p.status === "deleted") continue;
-			await client.query(
+		if (!principalsAuthoritative) {
+			for (const p of snapshot.principals) {
+				if (p.status === "deleted") continue;
+				await client.query(
 				`INSERT INTO ${this.emailUniqueTable}
          (project_id, environment_id, email_lower, principal_id)
          VALUES ($1, $2, $3, $4)`,
@@ -929,7 +1520,8 @@ export class PgStore implements ManagementStore {
 					p.email.toLowerCase(),
 					p.id,
 				],
-			);
+				);
+			}
 		}
 
 		for (const o of snapshot.organizations) {
@@ -941,6 +1533,43 @@ export class PgStore implements ManagementStore {
 				[o.projectId, o.environmentId, o.slug, o.id],
 			);
 		}
+	}
+
+	private async materializeStoreV2Candidate(
+		client: pg.PoolClient,
+		candidate: DataStoreSnapshot,
+		previousRevision: number,
+		sync: StoreV2SyncResult | undefined,
+	): Promise<DataStoreSnapshot> {
+		if (!sync) return candidate;
+		let materialized = candidate;
+		if (sync.authoritativeCollections.includes("events")) {
+			const events = sync.eventDelta && previousRevision === this.revision
+				? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
+				: await this.storeV2Shadow!.materializeEvents(client);
+			materialized = { ...materialized, events };
+		}
+		if (sync.authoritativeCollections.includes("principals")) {
+			materialized = { ...materialized, principals: [] };
+		}
+		return materialized;
+	}
+
+	private async resolvePrincipalCount(
+		client: pg.PoolClient,
+		authoritativeCollections: readonly StoreV2Collection[],
+	): Promise<number> {
+		if (!authoritativeCollections.includes("principals")) {
+			return 0;
+		}
+		const state = await this.storeV2Shadow!.principalState(client);
+		if (!state) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_PRINCIPAL_STATE_INVALID",
+				"Principal authority state metadata is missing or invalid.",
+			);
+		}
+		return state.count;
 	}
 
 	/** Initial insert path used only from init when the row is missing. */

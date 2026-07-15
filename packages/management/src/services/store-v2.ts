@@ -17,7 +17,9 @@ export interface StoreV2CommandEnvelope {
 		| "schema.store-v2.verify"
 		| "schema.store-v2.rollback"
 		| "schema.store-v2.events.cutover"
-		| "schema.store-v2.events.rollback";
+		| "schema.store-v2.events.rollback"
+		| "schema.store-v2.principals.cutover"
+		| "schema.store-v2.principals.rollback";
 	storeBackend: "postgres";
 	dryRun: boolean;
 	status?: StoreV2Status;
@@ -59,12 +61,16 @@ function requireConfirmation(
 		| "schema.store-v2.apply"
 		| "schema.store-v2.rollback"
 		| "schema.store-v2.events.cutover"
-		| "schema.store-v2.events.rollback",
+		| "schema.store-v2.events.rollback"
+		| "schema.store-v2.principals.cutover"
+		| "schema.store-v2.principals.rollback",
 ): void {
 	if (confirm === true) return;
 	const applying = stage === "schema.store-v2.apply";
 	const cuttingOverEvents = stage === "schema.store-v2.events.cutover";
 	const rollingBackEvents = stage === "schema.store-v2.events.rollback";
+	const cuttingOverPrincipals = stage === "schema.store-v2.principals.cutover";
+	const rollingBackPrincipals = stage === "schema.store-v2.principals.rollback";
 	throw new ClearanceError({
 		code: applying
 			? "STORE_V2_APPLY_CONFIRMATION_REQUIRED"
@@ -72,6 +78,10 @@ function requireConfirmation(
 				? "STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED"
 				: rollingBackEvents
 					? "STORE_V2_EVENTS_ROLLBACK_CONFIRMATION_REQUIRED"
+					: cuttingOverPrincipals
+						? "STORE_V2_PRINCIPALS_CUTOVER_CONFIRMATION_REQUIRED"
+						: rollingBackPrincipals
+							? "STORE_V2_PRINCIPALS_ROLLBACK_CONFIRMATION_REQUIRED"
 					: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED",
 		message: applying
 			? "Store-v2 apply requires explicit confirmation."
@@ -79,6 +89,10 @@ function requireConfirmation(
 				? "Store-v2 event cutover requires explicit confirmation."
 				: rollingBackEvents
 					? "Store-v2 event rollback requires explicit confirmation."
+					: cuttingOverPrincipals
+						? "Store-v2 principal cutover requires explicit confirmation."
+						: rollingBackPrincipals
+							? "Store-v2 principal rollback requires explicit confirmation."
 					: "Store-v2 rollback requires explicit confirmation.",
 		stage,
 		status: 400,
@@ -88,6 +102,10 @@ function requireConfirmation(
 				? "Run schema store-v2 verify, then retry schema store-v2 events cutover with --yes."
 				: rollingBackEvents
 					? "Review schema store-v2 status, then retry schema store-v2 events rollback with --yes."
+					: cuttingOverPrincipals
+						? "Run schema store-v2 verify, then retry schema store-v2 principals cutover with --yes."
+						: rollingBackPrincipals
+							? "Review schema store-v2 status, then retry schema store-v2 principals rollback with --yes."
 					: "Review schema store-v2 status, then retry rollback with --yes.",
 	});
 }
@@ -247,6 +265,40 @@ export async function rollbackStoreV2Events(
 		return envelope(operation, {
 			dryRun: false,
 			status: await control.rollbackEvents(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function cutoverStoreV2Principals(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.principals.cutover" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.cutoverPrincipals(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function rollbackStoreV2Principals(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.principals.rollback" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.rollbackPrincipals(),
 		});
 	} catch (error) {
 		return translateStoreError(error, operation);

@@ -74,6 +74,8 @@ describe("authenticated operational API contracts", () => {
 			["POST", "/v1/schema/store-v2/rollback", { confirm: true }],
 			["POST", "/v1/schema/store-v2/events/cutover", { confirm: true }],
 			["POST", "/v1/schema/store-v2/events/rollback", { confirm: true }],
+			["POST", "/v1/schema/store-v2/principals/cutover", { confirm: true }],
+			["POST", "/v1/schema/store-v2/principals/rollback", { confirm: true }],
 		] as const) {
 			const response = await app.request(path, {
 				method,

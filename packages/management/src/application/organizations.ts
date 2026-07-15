@@ -17,8 +17,21 @@ export async function createOrganizationUseCase(
 	input: { name: string; slug?: string; ownerUserId?: string },
 ): Promise<Organization> {
 	if (authRuntime) {
-		const ownerUserId = input.ownerUserId ??
-			store.snapshot.principals.find((principal) => principal.status === "active")?.id;
+		const defaultOwner = input.ownerUserId
+			? undefined
+			: store.storeV2Principals?.authoritative
+				? (await store.storeV2Principals.listPage({
+						scope: context.scope,
+						status: "active",
+						limit: 1,
+					})).principals[0]
+				: store.snapshot.principals.find(
+						(principal) =>
+							principal.status === "active" &&
+							principal.projectId === context.scope.projectId &&
+							principal.environmentId === context.scope.environmentId,
+					);
+		const ownerUserId = input.ownerUserId ?? defaultOwner?.id;
 		if (!ownerUserId) throw new Error("Create a user first or provide ownerUserId");
 		return await authRuntime.organizations.provision(context, {
 			name: input.name,

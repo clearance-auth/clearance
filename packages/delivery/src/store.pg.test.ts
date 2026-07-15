@@ -26,6 +26,9 @@ import {
 	fanoutOrganizationUpdatedWebhookInExistingTransaction,
 	inspectWebhookEndpointScoped,
 	listWebhookEndpoints,
+	previewWebhookEndpointDeletion,
+	previewWebhookEndpointSecretRotation,
+	previewWebhookEndpointTest,
 	rotateWebhookEndpointSecret,
 	softDeleteWebhookEndpoint,
 	softDeleteWebhookEndpointInExistingTransaction,
@@ -410,6 +413,16 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await expect(updateWebhookEndpoint(pool, {
 			...scope, endpointId: "endpoint-1", expectedVersion: 1, name: "Stale", now: start,
 		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_VERSION_CONFLICT" });
+		expect(await previewWebhookEndpointSecretRotation(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 2,
+		}, keyring, mainOptions)).toMatchObject({
+			action: "rotate",
+			expectedVersion: 2,
+			nextResourceVersion: 3,
+			nextSecretVersion: 2,
+			secretGenerated: false,
+			endpoint: { resourceVersion: 2, secretVersion: 1 },
+		});
 		const rotated = await rotateWebhookEndpointSecret(pool, {
 			...scope, endpointId: "endpoint-1", expectedVersion: 2, now: start,
 		}, keyring, mainOptions);
@@ -431,6 +444,15 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			now: start,
 		}, keyring, mainOptions);
 		expect(reactivated).toMatchObject({ status: "active", resourceVersion: 5 });
+		expect(await previewWebhookEndpointTest(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 5,
+		}, keyring, mainOptions)).toMatchObject({
+			action: "test",
+			expectedVersion: 5,
+			nextResourceVersion: 6,
+			createsDelivery: true,
+			endpoint: { resourceVersion: 5 },
+		});
 		const testClient = await pool.connect();
 		let tested: Awaited<ReturnType<typeof enqueueWebhookEndpointTestInExistingTransaction>>;
 		try {
@@ -494,6 +516,20 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			 lease_expires_at=$2,updated_at=$1 WHERE id=$3`,
 			[start, new Date(start.getTime() + 60_000), tested!.delivery.jobId],
 		);
+		expect(await previewWebhookEndpointDeletion(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 6,
+		}, keyring, mainOptions)).toMatchObject({
+			action: "delete",
+			expectedVersion: 6,
+			nextResourceVersion: 7,
+			erasedPayloads: 2,
+			jobs: {
+				queuedOrRetryCancelled: 1,
+				leasedCancellationRequested: 1,
+				leasedDeliveryOutcomeAmbiguous: true,
+			},
+			endpoint: { resourceVersion: 6, status: "active" },
+		});
 		const deleteClient = await pool.connect();
 		let deleted: Awaited<ReturnType<typeof softDeleteWebhookEndpoint>>;
 		try {

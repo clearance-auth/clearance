@@ -18,6 +18,7 @@ import {
 	type PgStore,
 	type PgStoreDeliveryOptions,
 } from "../store/pg-store.js";
+import { wrapInternalCoordinatedExecutor } from "../store/coordinated-internal.js";
 import {
 	createDeliveryKeyring,
 	decryptDeliveryPayload,
@@ -154,8 +155,6 @@ async function cleanupTracked(): Promise<void> {
 	}
 }
 
-type CoordinatedFn = NonNullable<PgStore["mutateCoordinated"]>;
-
 /**
  * After the real mutator completes (runtime + management draft applied), force
  * a SQL error so COMMIT never lands — full rollback of runtime + management + audit.
@@ -164,12 +163,11 @@ function injectSqlFailureAfter(
 	store: PgStore,
 	match: (sql: string) => boolean,
 ): () => void {
-	const original = store.mutateCoordinated.bind(store) as CoordinatedFn;
-	const wrapped: CoordinatedFn = (fn) =>
+	return wrapInternalCoordinatedExecutor(store, (original) => (fn) =>
 		original(async (ctx) => {
 			let saw = false;
 			const value = await fn({
-				data: ctx.data,
+				...ctx,
 				query: async (sql, params) => {
 					const result = await ctx.query(sql, params);
 					if (match(sql.replace(/\s+/g, " ").toLowerCase())) {
@@ -177,9 +175,6 @@ function injectSqlFailureAfter(
 					}
 					return result;
 				},
-				...(ctx.enqueueDelivery
-					? { enqueueDelivery: ctx.enqueueDelivery }
-					: {}),
 			});
 			if (saw) {
 				await ctx.query(
@@ -187,11 +182,8 @@ function injectSqlFailureAfter(
 				);
 			}
 			return value;
-		});
-	store.mutateCoordinated = wrapped;
-	return () => {
-		store.mutateCoordinated = original;
-	};
+		}),
+	);
 }
 
 const available = await gatePostgresSuite(DATABASE_URL, "org-lifecycle-pg");
@@ -577,8 +569,8 @@ describe.skipIf(!available)(
 						sourceKey,
 						projectId: scope.projectId,
 						environmentId,
-						channel: "webhook",
-						destination: webhookTarget.url,
+						channel: "email",
+						destination: "delivery-seam@example.test",
 						payload: { generation: sourceKey },
 						semanticExpiresAt: expiresAt,
 						now,

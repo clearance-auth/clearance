@@ -10,8 +10,14 @@
  * / use the durable helper for Postgres).
  */
 import type { ManagementStore } from "../store/types.js";
-import type { AuditEvent, Organization, Principal } from "../types/resources.js";
+import type {
+	AuditEvent,
+	DataStoreSnapshot,
+	Organization,
+	Principal,
+} from "../types/resources.js";
 import { newId, nowIso } from "../store/json-store.js";
+import { advancingPrincipalUpdatedAt } from "../store/store-v2-principals.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { resolveOperatorScope, type ResourceScope } from "./scope.js";
@@ -101,7 +107,7 @@ export function syncRuntimeUserToManagement(
 		updatedAt,
 	};
 
-	store.mutate((data) => {
+	const apply = (data: DataStoreSnapshot) => {
 		const byId = data.principals.find((p) => p.id === runtimeUser.id);
 		if (byId) {
 			if (
@@ -167,7 +173,8 @@ export function syncRuntimeUserToManagement(
 			message: `Synced runtime user ${email} into management (canonical id)`,
 			metadata: { origin: "runtime", stableId: runtimeUser.id },
 		});
-	});
+	};
+	store.mutate(apply);
 
 	return principal;
 }
@@ -186,6 +193,105 @@ export async function syncRuntimeUserToManagementDurable(
 		source?: AuditEvent["source"];
 	},
 ): Promise<Principal> {
+	if (store.storeV2Principals?.authoritative) {
+		if (!runtimeUser.id?.trim()) {
+			throw new ClearanceError({
+				code: "IDENTITY_ID_REQUIRED",
+				message: "Runtime user id is required for canonical identity sync",
+				stage: "identity.sync",
+				status: 400,
+			});
+		}
+		if (!runtimeUser.email?.trim()) {
+			throw new ClearanceError({
+				code: "IDENTITY_EMAIL_REQUIRED",
+				message: "Runtime user email is required for canonical identity sync",
+				stage: "identity.sync",
+				status: 400,
+			});
+		}
+		if (typeof store.mutateStoreV2Identity !== "function") {
+			throw new ClearanceError({
+				code: "IDENTITY_SYNC_BACKEND_INVALID",
+				message: "Relational principal authority requires relational identity transactions",
+				stage: "identity.sync",
+				status: 500,
+			});
+		}
+		const scope = resolveOperatorScope(store, {
+			projectId: opts?.projectId,
+			environmentId: opts?.environmentId,
+		});
+		const email = runtimeUser.email.toLowerCase();
+		const name = runtimeUser.name?.trim() || email;
+		const now = nowIso();
+		const createdAt = toIso(runtimeUser.createdAt, now);
+		const updatedAt = toIso(runtimeUser.updatedAt, now);
+		return store.mutateStoreV2Identity(async ({ principals, appendAudit }) => {
+			const audit = () => appendAudit({
+				actor: opts?.actor ?? email,
+				action: "users.sync_runtime",
+				subjectType: "principal",
+				subjectId: runtimeUser.id,
+				outcome: "success",
+				source: opts?.source ?? "system",
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Synced runtime user ${email} into management (canonical id)`,
+				metadata: { origin: "runtime", stableId: runtimeUser.id },
+			});
+			const byId = await principals.getById({
+				scope,
+				id: runtimeUser.id,
+				includeDeleted: true,
+			});
+			if (byId) {
+				const nextUpdatedAt = advancingPrincipalUpdatedAt(updatedAt, byId.updatedAt);
+				const principal: Principal = {
+					...byId,
+					email,
+					name,
+					status: byId.status === "deleted" ? "active" : byId.status,
+					updatedAt: nextUpdatedAt,
+				};
+				const synchronized = await principals.update(principal, {
+					expectedUpdatedAt: byId.updatedAt,
+				});
+				if (!synchronized) {
+					throw new ClearanceError({
+						code: "IDENTITY_SYNC_CONFLICT",
+						message: "Canonical identity changed during synchronization",
+						stage: "identity.sync",
+						status: 409,
+						remediation: "Reload the canonical identity and retry synchronization",
+					});
+				}
+				audit();
+				return synchronized;
+			}
+			const byEmail = await principals.findActiveByEmail({ scope, email });
+			if (byEmail) {
+				throw new ClearanceError({
+					code: "IDENTITY_EMAIL_CONFLICT",
+					message: `User ${email} already exists with a different stable id`,
+					stage: "identity.sync",
+					status: 409,
+				});
+			}
+			const principal = await principals.insert({
+				id: runtimeUser.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				email,
+				name,
+				status: "active",
+				createdAt,
+				updatedAt,
+			});
+			audit();
+			return principal;
+		});
+	}
 	const principal = syncRuntimeUserToManagement(store, runtimeUser, opts);
 	await store.ready();
 	const found = store.snapshot.principals.find((p) => p.id === principal.id);
@@ -242,8 +348,8 @@ export async function syncRuntimeOrganizationToManagementDurable(
 		updatedAt: now,
 	};
 
-	store.mutate((data) => {
-		const principal = data.principals.find(
+	const apply = (data: DataStoreSnapshot, authoritativePrincipal?: Principal) => {
+		const principal = authoritativePrincipal ?? data.principals.find(
 			(p) =>
 				p.id === ownerPrincipalId &&
 				p.projectId === scope.projectId &&
@@ -413,7 +519,34 @@ export async function syncRuntimeOrganizationToManagementDurable(
 			membership.id = ownerMembershipId;
 			membership.updatedAt = now;
 		}
-	});
+	};
+	if (store.storeV2Principals?.authoritative) {
+		if (typeof store.mutateCoordinated !== "function") {
+			throw new ClearanceError({
+				code: "ORGANIZATION_SYNC_BACKEND_INVALID",
+				message: "Relational principal authority requires coordinated Postgres mutations",
+				stage: "identity.organization_sync",
+				status: 500,
+			});
+		}
+		await store.mutateCoordinated(async ({ data, principals }) => {
+			const principal = await principals?.getById({
+				scope,
+				id: ownerPrincipalId,
+			});
+			if (!principal) {
+				throw new ClearanceError({
+					code: "USER_NOT_FOUND",
+					message: "Organization owner was not found in the authorized scope",
+					stage: "identity.organization_sync",
+					status: 404,
+				});
+			}
+			apply(data, principal);
+		});
+	} else {
+		store.mutate(apply);
+	}
 
 	await store.ready();
 	const durable = store.snapshot.organizations.find(

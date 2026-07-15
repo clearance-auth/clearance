@@ -57,7 +57,17 @@ function requirePrincipal(
 	scope: ResourceScope | undefined,
 	stage: string,
 ): Principal {
-	const user = store.snapshot.principals.find((p) => p.id === id);
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage,
+			status: 500,
+		});
+	}
+	const user = store.snapshot.principals.find(
+		(p) => p.id === id,
+	);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -217,9 +227,7 @@ function assertPrincipalOrgScope(
  * Idempotent: returns existing active membership without a second audit.
  * Invalid roles fail closed with no write.
  */
-export function addMember(
-	store: ManagementUnitOfWork,
-	input: {
+export type AddMemberInput = {
 		organizationId: string;
 		principalId: string;
 		role?: string;
@@ -229,11 +237,30 @@ export function addMember(
 		scope?: ResourceScope;
 		/** Force a specific membership id (runtime id preservation) */
 		id?: string;
-	},
+	};
+
+export function addMember(
+	store: ManagementUnitOfWork,
+	input: AddMemberInput,
+): Membership {
+	requireOrganization(store, input.organizationId, input.scope, "orgs.members.add");
+	const principal = requirePrincipal(
+		store,
+		input.principalId,
+		input.scope,
+		"orgs.members.add",
+	);
+	return addMemberWithPrincipal(store, principal, input);
+}
+
+/** Same transition with a transaction-bound relational principal already resolved. */
+export function addMemberWithPrincipal(
+	store: ManagementUnitOfWork,
+	principal: Principal,
+	input: AddMemberInput,
 ): Membership {
 	const stage = "orgs.members.add";
 	const org = requireOrganization(store, input.organizationId, input.scope, stage);
-	const principal = requirePrincipal(store, input.principalId, input.scope, stage);
 	assertPrincipalOrgScope(org, principal, stage);
 
 	const roleSlug = input.role ?? "member";

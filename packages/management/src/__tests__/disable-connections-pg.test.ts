@@ -15,6 +15,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
+import { wrapInternalCoordinatedExecutor } from "../store/coordinated-internal.js";
 import {
 	ensureAuthMigrated,
 	getAuthBundle,
@@ -163,8 +164,6 @@ async function cleanupTrackedRuntime(opts?: {
 	}
 }
 
-type CoordinatedFn = NonNullable<ManagementStore["mutateCoordinated"]>;
-
 /**
  * Wrap mutateCoordinated so runtime DELETE + management mutator/audit run in
  * the open transaction, then a deliberate runtime SQL error forces ROLLBACK of
@@ -174,12 +173,11 @@ function injectRuntimeSqlFailureAfterMutator(
 	store: PgStore,
 	table: "ssoProvider" | "scimProvider",
 ): () => void {
-	const original = store.mutateCoordinated.bind(store) as CoordinatedFn;
-	const wrapped: CoordinatedFn = (fn) =>
+	return wrapInternalCoordinatedExecutor(store, (original) => (fn) =>
 		original(async (ctx) => {
 			let sawTargetDelete = false;
 			const value = await fn({
-				data: ctx.data,
+				...ctx,
 				query: async (sql, params) => {
 					const result = await ctx.query(sql, params);
 					const normalized = sql.replace(/\s+/g, " ").toLowerCase();
@@ -198,11 +196,8 @@ function injectRuntimeSqlFailureAfterMutator(
 				);
 			}
 			return value;
-		});
-	store.mutateCoordinated = wrapped;
-	return () => {
-		store.mutateCoordinated = original;
-	};
+		}),
+	);
 }
 
 async function runtimeSsoExists(id: string): Promise<boolean> {
