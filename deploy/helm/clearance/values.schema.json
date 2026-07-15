@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["image", "replicaCount", "terminationGracePeriodSeconds", "service", "secrets", "env", "console", "ingress", "networkPolicy", "podDisruptionBudget", "metrics", "backup"],
+  "required": ["image", "replicaCount", "terminationGracePeriodSeconds", "service", "secrets", "env", "console", "ingress", "networkPolicy", "podDisruptionBudget", "metrics", "delivery", "backup"],
   "properties": {
     "image": {
       "type": "object",
@@ -116,6 +116,123 @@
         }
       }
     },
+    "delivery": {
+      "type": "object",
+      "required": ["enabled", "existingSecret", "schema", "prefix", "legacyFingerprintKeyId", "quota", "worker"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "schema": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,62}$" },
+        "prefix": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,39}$" },
+        "legacyFingerprintKeyId": { "type": "string", "pattern": "^(|[A-Za-z0-9._-]{1,64})$" },
+        "quota": {
+          "type": "object",
+          "required": ["maxActive", "maxBacklog", "maxEnqueuesPerWindow", "windowMs"],
+          "properties": {
+            "maxActive": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+            "maxBacklog": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+            "maxEnqueuesPerWindow": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+            "windowMs": { "type": "integer", "minimum": 1000, "maximum": 86400000 }
+          }
+        },
+        "worker": {
+          "type": "object",
+          "required": ["replicaCount", "restartToken", "healthPort", "terminationGracePeriodSeconds", "concurrency", "pollMs", "leaseMs", "heartbeatMs", "maintenanceMs", "drainTimeoutMs", "maxBodyBytes", "appName", "email", "webhook", "resources", "podDisruptionBudget", "networkPolicy", "metrics"],
+          "properties": {
+            "replicaCount": { "type": "integer", "minimum": 1 },
+            "restartToken": { "type": "string" },
+            "healthPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "terminationGracePeriodSeconds": { "type": "integer", "minimum": 45 },
+            "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "pollMs": { "type": "integer", "minimum": 25, "maximum": 60000 },
+            "leaseMs": { "type": "integer", "minimum": 5000, "maximum": 600000 },
+            "heartbeatMs": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+            "maintenanceMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+            "drainTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+            "maxBodyBytes": { "type": "integer", "minimum": 1024, "maximum": 10485760 },
+            "appName": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "email": {
+              "type": "object",
+              "required": ["transport", "from", "smtp", "ses"],
+              "properties": {
+                "transport": { "type": "string", "enum": ["smtp", "ses"] },
+                "from": { "type": "string", "maxLength": 320 },
+                "smtp": {
+                  "type": "object",
+                  "required": ["host", "port", "secure", "requireTls", "connectionTimeoutMs", "socketTimeoutMs", "greetingTimeoutMs"],
+                  "properties": {
+                    "host": { "type": "string" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "secure": { "type": "boolean" },
+                    "requireTls": { "type": "boolean" },
+                    "connectionTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 120000 },
+                    "socketTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+                    "greetingTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 120000 }
+                  }
+                },
+                "ses": {
+                  "type": "object",
+                  "required": ["region", "requestTimeoutMs"],
+                  "properties": {
+                    "region": { "type": "string" },
+                    "requestTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 120000 }
+                  }
+                }
+              }
+            },
+            "webhook": {
+              "type": "object",
+              "required": ["dnsTimeoutMs", "connectTimeoutMs", "responseTimeoutMs", "maxResponseBytes"],
+              "properties": {
+                "dnsTimeoutMs": { "type": "integer", "minimum": 250, "maximum": 60000 },
+                "connectTimeoutMs": { "type": "integer", "minimum": 250, "maximum": 60000 },
+                "responseTimeoutMs": { "type": "integer", "minimum": 250, "maximum": 120000 },
+                "maxResponseBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 }
+              }
+            },
+            "resources": { "type": "object" },
+            "podDisruptionBudget": { "$ref": "#/definitions/pdb" },
+            "networkPolicy": {
+              "type": "object",
+              "required": ["smtpEgress", "metrics"],
+              "properties": {
+                "smtpEgress": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": { "$ref": "#/definitions/smtpEgressRule" }
+                },
+                "metrics": {
+                  "type": "object",
+                  "required": ["namespaceSelector", "podSelector"],
+                  "properties": {
+                    "namespaceSelector": { "type": "object" },
+                    "podSelector": { "type": "object" }
+                  }
+                }
+              }
+            },
+            "metrics": {
+              "type": "object",
+              "required": ["enabled", "path", "serviceMonitor"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "path": { "type": "string", "const": "/metrics" },
+                "serviceMonitor": {
+                  "type": "object",
+                  "required": ["enabled", "interval", "scrapeTimeout", "additionalLabels"],
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "interval": { "type": "string" },
+                    "scrapeTimeout": { "type": "string" },
+                    "additionalLabels": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "backup": {
       "type": "object",
       "required": ["enabled", "image", "schedule", "concurrencyPolicy", "retentionDays", "restoreVerify", "existingSecret", "databaseUrlKey", "copyCommandKey", "existingClaim", "accessModes", "storageSize"],
@@ -171,6 +288,88 @@
           "properties": { "enabled": { "type": "boolean" }, "secretName": { "type": "string" } }
         }
       }
+    },
+    "labelSelector": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "matchLabels": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "matchExpressions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["key", "operator"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string", "minLength": 1 },
+              "operator": { "type": "string", "enum": ["In", "NotIn", "Exists", "DoesNotExist"] },
+              "values": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "networkPolicyPeer": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "podSelector": { "$ref": "#/definitions/labelSelector" },
+        "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+        "ipBlock": {
+          "type": "object",
+          "required": ["cidr"],
+          "additionalProperties": false,
+          "properties": {
+            "cidr": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$" },
+            "except": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$" }
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["ipBlock"],
+          "not": { "anyOf": [{ "required": ["podSelector"] }, { "required": ["namespaceSelector"] }] }
+        },
+        {
+          "anyOf": [{ "required": ["podSelector"] }, { "required": ["namespaceSelector"] }],
+          "not": { "required": ["ipBlock"] }
+        }
+      ]
+    },
+    "smtpEgressRule": {
+      "type": "object",
+      "required": ["to", "ports"],
+      "additionalProperties": false,
+      "properties": {
+        "to": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
+        "ports": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["protocol", "port"],
+            "additionalProperties": false,
+            "properties": {
+              "protocol": { "type": "string", "const": "TCP" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            }
+          }
+        }
+      }
     }
   },
   "allOf": [
@@ -186,6 +385,73 @@
             "properties": {
               "image": { "properties": { "repository": { "minLength": 1 }, "digest": { "pattern": "^sha256:[0-9a-f]{64}$" } } },
               "existingSecret": { "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "delivery": { "properties": { "enabled": { "const": true } } } } },
+      "then": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "worker": {
+                "properties": {
+                  "email": { "properties": { "from": { "minLength": 1, "pattern": "^[^\\s@<>]+@[^\\s@<>]+$" } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "enabled": { "const": true },
+              "worker": { "properties": { "email": { "properties": { "transport": { "const": "smtp" } } } } }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "worker": {
+                "properties": {
+                  "email": { "properties": { "smtp": { "properties": { "host": { "minLength": 1 } } } } },
+                  "networkPolicy": { "properties": { "smtpEgress": { "minItems": 1 } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "enabled": { "const": true },
+              "worker": { "properties": { "email": { "properties": { "transport": { "const": "ses" } } } } }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "worker": {
+                "properties": {
+                  "email": { "properties": { "ses": { "properties": { "region": { "minLength": 1 } } } } }
+                }
+              }
             }
           }
         }

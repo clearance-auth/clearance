@@ -14,6 +14,23 @@ spec:
       app: clearance-api
       app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+{{- if and .Values.delivery.enabled .Values.delivery.worker.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-delivery-worker
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: delivery-worker
+spec:
+  minAvailable: {{ .Values.delivery.worker.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: clearance-delivery-worker
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
 {{- if and .Values.console.enabled .Values.console.podDisruptionBudget.enabled }}
 ---
 apiVersion: policy/v1

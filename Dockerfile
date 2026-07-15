@@ -57,7 +57,7 @@ COPY --from=build --chown=clearance:clearance /app /app
 
 USER clearance
 
-EXPOSE 3000 3100 3200
+EXPOSE 3000 3100 3200 8091
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 

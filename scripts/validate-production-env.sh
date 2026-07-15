@@ -20,6 +20,13 @@ Required (strong secrets, no defaults):
   CLEARANCE_SECRET
   CLEARANCE_CREDENTIAL_KEY
   CLEARANCE_CREDENTIAL_KEY_ID
+  CLEARANCE_DELIVERY_KEY_ID
+  CLEARANCE_DELIVERY_KEYS_JSON
+  CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID
+  CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON
+  CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY
+  CLEARANCE_EMAIL_TRANSPORT       # smtp or ses
+  CLEARANCE_EMAIL_FROM
   CLEARANCE_CONSOLE_ADMIN_USER
   CLEARANCE_CONSOLE_ADMIN_PASSWORD
   CLEARANCE_CONSOLE_SESSION_SECRET
@@ -33,6 +40,7 @@ Required (strong secrets, no defaults):
   CLEARANCE_API_PORT
   CLEARANCE_CONSOLE_PORT
   CLEARANCE_SAMPLE_PORT
+  CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT
   CLEARANCE_PG_VOLUME
   CLEARANCE_BACKUP_VOLUME
   CLEARANCE_IMAGE_REPOSITORY
@@ -88,6 +96,15 @@ check_port() {
   fi
 }
 
+check_integer_range() {
+  local label="$1" value="$2" minimum="$3" maximum="$4"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( 10#$value < minimum || 10#$value > maximum )); then
+    fail "$label must be an integer from $minimum through $maximum"
+  else
+    note "$label is within its supported range"
+  fi
+}
+
 check_https_url() {
   local label="$1"
   local value="$2"
@@ -106,6 +123,11 @@ check_secret CLEARANCE_OPERATOR_TOKEN "${CLEARANCE_OPERATOR_TOKEN-}"
 check_secret CLEARANCE_SECRET "${CLEARANCE_SECRET-}"
 check_secret CLEARANCE_CREDENTIAL_KEY "${CLEARANCE_CREDENTIAL_KEY-}"
 check_present CLEARANCE_CREDENTIAL_KEY_ID "${CLEARANCE_CREDENTIAL_KEY_ID-}"
+check_present CLEARANCE_DELIVERY_KEY_ID "${CLEARANCE_DELIVERY_KEY_ID-}"
+check_present CLEARANCE_DELIVERY_KEYS_JSON "${CLEARANCE_DELIVERY_KEYS_JSON-}"
+check_present CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID "${CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID-}"
+check_present CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON "${CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON-}"
+check_present CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY "${CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY-}"
 check_present CLEARANCE_CONSOLE_ADMIN_USER "${CLEARANCE_CONSOLE_ADMIN_USER-}"
 check_secret CLEARANCE_CONSOLE_ADMIN_PASSWORD "${CLEARANCE_CONSOLE_ADMIN_PASSWORD-}"
 check_secret CLEARANCE_CONSOLE_SESSION_SECRET "${CLEARANCE_CONSOLE_SESSION_SECRET-}"
@@ -120,10 +142,107 @@ check_present CLEARANCE_CORS_ORIGINS "${CLEARANCE_CORS_ORIGINS-}"
 check_port CLEARANCE_API_PORT "${CLEARANCE_API_PORT-}"
 check_port CLEARANCE_CONSOLE_PORT "${CLEARANCE_CONSOLE_PORT-}"
 check_port CLEARANCE_SAMPLE_PORT "${CLEARANCE_SAMPLE_PORT-}"
+check_port CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT "${CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT-}"
 check_present CLEARANCE_PG_VOLUME "${CLEARANCE_PG_VOLUME-}"
 check_present CLEARANCE_BACKUP_VOLUME "${CLEARANCE_BACKUP_VOLUME-}"
 check_present CLEARANCE_IMAGE_REPOSITORY "${CLEARANCE_IMAGE_REPOSITORY-}"
 check_present CLEARANCE_BACKUP_IMAGE_REPOSITORY "${CLEARANCE_BACKUP_IMAGE_REPOSITORY-}"
+
+# Delivery keys are three purpose-separated 32-byte authorities. Validate the
+# complete ring without printing ids, JSON, or decoded material.
+if node -e '
+  const decode=(raw)=>{
+    if(typeof raw!=="string") throw new Error();
+    const v=raw.trim();
+    let b;
+    if(/^[0-9a-fA-F]{64}$/.test(v)) b=Buffer.from(v,"hex");
+    else if(/^[A-Za-z0-9+/_-]+={0,2}$/.test(v)) b=Buffer.from(v.replace(/-/g,"+").replace(/_/g,"/"),"base64");
+    else throw new Error();
+    if(b.length!==32) throw new Error();
+    return b.toString("hex");
+  };
+  const id=/^[A-Za-z0-9._-]{1,64}$/;
+  const current=process.env.CLEARANCE_DELIVERY_KEY_ID||"";
+  const fingerprint=process.env.CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID||"";
+  if(!id.test(current)||!id.test(fingerprint)) throw new Error();
+  const keys=JSON.parse(process.env.CLEARANCE_DELIVERY_KEYS_JSON||"");
+  const fingerprints=JSON.parse(process.env.CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON||"");
+  if(!keys||Array.isArray(keys)||typeof keys!=="object"||!fingerprints||Array.isArray(fingerprints)||typeof fingerprints!=="object") throw new Error();
+  const decoded=[...Object.entries(keys),...Object.entries(fingerprints)].map(([keyId,value])=>{
+    if(!id.test(keyId)) throw new Error();
+    return decode(value);
+  });
+  if(!Object.hasOwn(keys,current)||!Object.hasOwn(fingerprints,fingerprint)) throw new Error();
+  decoded.push(decode(process.env.CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY||""));
+  if(new Set(decoded).size!==decoded.length) throw new Error();
+' 2>/dev/null; then
+  note "delivery keyring is complete, decodable, and purpose-separated"
+else
+  fail "delivery keyring must contain distinct 32-byte encryption, fingerprint, and source-dedupe keys"
+fi
+
+if [[ "${CLEARANCE_DELIVERY_SCHEMA-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]; then
+  note "CLEARANCE_DELIVERY_SCHEMA is a valid Postgres identifier"
+else
+  fail "CLEARANCE_DELIVERY_SCHEMA must be a valid Postgres identifier"
+fi
+if [[ "${CLEARANCE_DELIVERY_PREFIX-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,39}$ ]]; then
+  note "CLEARANCE_DELIVERY_PREFIX is a bounded Postgres identifier prefix"
+else
+  fail "CLEARANCE_DELIVERY_PREFIX must be a valid identifier no longer than 40 characters"
+fi
+check_integer_range CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE "${CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE-}" 1 10000000
+check_integer_range CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG "${CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG-}" 1 10000000
+check_integer_range CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW "${CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW-}" 1 10000000
+check_integer_range CLEARANCE_DELIVERY_QUOTA_WINDOW_MS "${CLEARANCE_DELIVERY_QUOTA_WINDOW_MS-}" 1000 86400000
+check_integer_range CLEARANCE_DELIVERY_CONCURRENCY "${CLEARANCE_DELIVERY_CONCURRENCY-}" 1 64
+check_integer_range CLEARANCE_DELIVERY_POLL_MS "${CLEARANCE_DELIVERY_POLL_MS-}" 25 60000
+check_integer_range CLEARANCE_DELIVERY_LEASE_MS "${CLEARANCE_DELIVERY_LEASE_MS-}" 5000 600000
+check_integer_range CLEARANCE_DELIVERY_HEARTBEAT_MS "${CLEARANCE_DELIVERY_HEARTBEAT_MS-}" 1000 60000
+check_integer_range CLEARANCE_DELIVERY_MAINTENANCE_MS "${CLEARANCE_DELIVERY_MAINTENANCE_MS-}" 1000 300000
+check_integer_range CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS "${CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS-}" 1000 300000
+check_integer_range CLEARANCE_DELIVERY_MAX_BODY_BYTES "${CLEARANCE_DELIVERY_MAX_BODY_BYTES-}" 1024 10485760
+check_present CLEARANCE_DELIVERY_APP_NAME "${CLEARANCE_DELIVERY_APP_NAME-}"
+check_integer_range CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS "${CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS-}" 250 60000
+check_integer_range CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS "${CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS-}" 250 60000
+check_integer_range CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS "${CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS-}" 250 120000
+check_integer_range CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES "${CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES-}" 0 1048576
+
+if [[ "${CLEARANCE_EMAIL_FROM-}" =~ ^[^[:space:]@\<\>]+@[^[:space:]@\<\>]+$ ]]; then
+  note "CLEARANCE_EMAIL_FROM is a single mailbox"
+else
+  fail "CLEARANCE_EMAIL_FROM must be a single mailbox"
+fi
+case "${CLEARANCE_EMAIL_TRANSPORT-}" in
+  smtp)
+    check_present CLEARANCE_SMTP_HOST "${CLEARANCE_SMTP_HOST-}"
+    check_port CLEARANCE_SMTP_PORT "${CLEARANCE_SMTP_PORT-}"
+    if [[ "${CLEARANCE_SMTP_SECURE-}" != "true" && "${CLEARANCE_SMTP_SECURE-}" != "false" ]]; then fail "CLEARANCE_SMTP_SECURE must be true or false"; fi
+    if [[ "${CLEARANCE_SMTP_REQUIRE_TLS-}" != "true" && "${CLEARANCE_SMTP_REQUIRE_TLS-}" != "false" ]]; then fail "CLEARANCE_SMTP_REQUIRE_TLS must be true or false"; fi
+    if [[ "${CLEARANCE_SMTP_SECURE-}" != "true" && "${CLEARANCE_SMTP_REQUIRE_TLS-}" != "true" ]]; then fail "production SMTP must use implicit TLS or require STARTTLS"; fi
+    if [[ -n "${CLEARANCE_SMTP_USER-}" || -n "${CLEARANCE_SMTP_PASSWORD-}" ]]; then
+      check_present CLEARANCE_SMTP_USER "${CLEARANCE_SMTP_USER-}"
+      check_secret CLEARANCE_SMTP_PASSWORD "${CLEARANCE_SMTP_PASSWORD-}"
+    else
+      note "SMTP authentication is intentionally disabled"
+    fi
+    check_integer_range CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS "${CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS-}" 1000 120000
+    check_integer_range CLEARANCE_SMTP_SOCKET_TIMEOUT_MS "${CLEARANCE_SMTP_SOCKET_TIMEOUT_MS-}" 1000 300000
+    check_integer_range CLEARANCE_SMTP_GREETING_TIMEOUT_MS "${CLEARANCE_SMTP_GREETING_TIMEOUT_MS-}" 1000 120000
+    ;;
+  ses)
+    ses_secret="${CLEARANCE_SES_SECRET_ACCESS_KEY-}"
+    ses_session="${CLEARANCE_SES_SESSION_TOKEN-}"
+    if [[ "${CLEARANCE_SES_REGION-}" =~ ^[a-z]{2}(-gov)?-[a-z0-9-]{2,24}-[1-9]$ ]]; then note "CLEARANCE_SES_REGION is valid"; else fail "CLEARANCE_SES_REGION is invalid"; fi
+    if [[ "${CLEARANCE_SES_ACCESS_KEY_ID-}" =~ ^[A-Za-z0-9]{16,128}$ ]]; then note "CLEARANCE_SES_ACCESS_KEY_ID is valid"; else fail "CLEARANCE_SES_ACCESS_KEY_ID is invalid"; fi
+    if (( ${#ses_secret} >= 20 && ${#ses_secret} <= 256 )); then note "CLEARANCE_SES_SECRET_ACCESS_KEY has a supported length"; else fail "CLEARANCE_SES_SECRET_ACCESS_KEY must contain 20 through 256 characters"; fi
+    if [[ -n "$ses_session" ]]; then
+      if (( ${#ses_session} >= 16 && ${#ses_session} <= 8192 )); then note "CLEARANCE_SES_SESSION_TOKEN has a supported length"; else fail "CLEARANCE_SES_SESSION_TOKEN must contain 16 through 8192 characters"; fi
+    fi
+    check_integer_range CLEARANCE_SES_REQUEST_TIMEOUT_MS "${CLEARANCE_SES_REQUEST_TIMEOUT_MS-}" 1000 120000
+    ;;
+  *) fail "CLEARANCE_EMAIL_TRANSPORT must be smtp or ses" ;;
+esac
 if [[ "${CLEARANCE_IMAGE_DIGEST-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   note "CLEARANCE_IMAGE_DIGEST is an immutable sha256 digest"
 else

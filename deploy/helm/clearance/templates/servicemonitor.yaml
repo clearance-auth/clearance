@@ -21,3 +21,28 @@ spec:
       interval: {{ .Values.metrics.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
 {{- end }}
+{{- if and .Values.delivery.enabled .Values.delivery.worker.metrics.enabled .Values.delivery.worker.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-delivery-worker
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: delivery-worker
+{{- with .Values.delivery.worker.metrics.serviceMonitor.additionalLabels }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: delivery-worker
+  endpoints:
+    - port: health
+      path: {{ .Values.delivery.worker.metrics.path }}
+      interval: {{ .Values.delivery.worker.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.delivery.worker.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}

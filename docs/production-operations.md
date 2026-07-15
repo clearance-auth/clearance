@@ -22,6 +22,61 @@ and watches Kubernetes Jobs or the host scheduler.
   HTTP work and pending store writes, closes the Postgres pool, and has a
   25-second hard deadline under the chart's 30-second grace period.
 
+## Delivery worker operations
+
+Production Compose and Helm run `packages/delivery-worker/dist/cli.mjs` from
+the same immutable application image as the API. The API and every worker must
+receive the same delivery encryption ring, fingerprint ring, source-dedupe key,
+schema, and prefix. Purpose keys must use distinct 32-byte material. The source
+dedupe key stays stable across encryption and fingerprint rotations.
+
+Check one running worker directly with its built-in CLI:
+
+```bash
+docker compose -f docker-compose.yml \
+  -f deploy/compose/docker-compose.production.yml \
+  exec -T delivery-worker \
+  node packages/delivery-worker/dist/cli.mjs --ready
+
+kubectl --namespace clearance exec deployment/clearance-delivery-worker -- \
+  node packages/delivery-worker/dist/cli.mjs --ready
+```
+
+The command exits non-zero unless Postgres, the owned schema, retained keys,
+worker heartbeat, and the selected SMTP or SES transport are ready. Use the
+management CLI for fleet and queue state:
+
+```bash
+clearance --json --no-input delivery readiness
+clearance --json --no-input delivery quotas
+clearance --json --no-input delivery list --state retry --state dead
+```
+
+`/live` is process-only, `/ready` checks the complete delivery dependency set,
+and `/metrics` exports low-cardinality job outcomes and worker health. The
+Compose port is loopback-only. The Helm Service is ClusterIP-only, has no
+Ingress, and grants scrape access only to the configured Prometheus selectors.
+
+Alert when no worker is ready for five minutes, schema or email transport health
+is zero, or `accepted_unconfirmed` and `finish_failed` outcomes increase. Track
+sustained retry/dead growth and quota saturation. Counters are process-local
+and reset with a pod, so aggregate by workload in Prometheus. A live SES account
+readiness check remains part of release-environment proof.
+
+The worker migrates the delivery schema before serving health endpoints. A
+custom schema must exist before rollout, and its database role needs DDL rights
+over the owned delivery tables and guard function. Keep the worker termination
+grace longer than `CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS`. The production Compose
+profile allows 310 seconds for the supported maximum drain; the default Helm
+profile allows 45 seconds for the default 30-second drain and rejects an unsafe
+grace/deadline combination.
+
+For key rotation, deploy the expanded retained rings to API and workers first.
+After all replicas are ready, switch the current encryption and fingerprint IDs
+in a second rollout. Keep old keys until `clearance delivery readiness` proves
+they are no longer required. External Kubernetes Secret contents are invisible
+to Helm checksums, so change the API and worker restart tokens for each phase.
+
 ## Backup, RPO, and retention
 
 The beta target is **RPO <= 1 hour** and **RTO <= 60 minutes**. These targets are

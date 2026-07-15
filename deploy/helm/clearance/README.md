@@ -58,6 +58,84 @@ Secret objects are external and Helm cannot hash their contents. Change
 controlled rollout. The checksum annotation also rolls pods when relevant
 non-secret chart configuration changes.
 
+## Transactional delivery worker
+
+Set `delivery.enabled=true` to deploy the separately scalable delivery worker.
+The API and worker then share the delivery schema, prefix, quotas, and one
+external keyring. Add these keys to `delivery.existingSecret`, or to
+`secrets.existingSecret` when the delivery-specific name is empty:
+
+- `database-url`
+- `delivery-key-id` and `delivery-keys-json`
+- `delivery-fingerprint-key-id` and `delivery-fingerprint-keys-json`
+- `delivery-source-dedupe-key`
+
+Each encryption, fingerprint, and source-dedupe value must decode to 32 bytes,
+and every purpose must use different material. The JSON values map retained key
+IDs to hex or base64 material. Generate each key independently. Keep retired
+encryption and fingerprint keys in their rings until `clearance delivery
+readiness` reports that queued and leased jobs no longer reference them.
+
+SMTP requires `delivery.worker.email.from`, `smtp.host`, and an explicit
+destination-scoped rule in `delivery.worker.networkPolicy.smtpEgress`. Each
+rule must include at least one non-empty destination selector or CIDR and TCP
+ports exactly matching `smtp.port`; empty and allow-all rules are rejected.
+The SMTP port must not overlap the worker's DNS, database, or HTTPS egress
+ports, because such an overlap would bypass destination scoping. Put
+optional authenticated SMTP credentials in `smtp-user` and `smtp-password`;
+supplying only one makes worker startup fail. TLS or STARTTLS remains mandatory.
+
+```yaml
+delivery:
+  enabled: true
+  worker:
+    email:
+      transport: smtp
+      from: auth@example.com
+      smtp:
+        host: smtp.example.com
+        port: 587
+        secure: false
+        requireTls: true
+    networkPolicy:
+      smtpEgress:
+        - to:
+            - ipBlock: { cidr: 203.0.113.0/24 }
+          ports:
+            - { protocol: TCP, port: 587 }
+```
+
+SES requires `ses-access-key-id` and `ses-secret-access-key` in the Secret;
+`ses-session-token` is optional. The worker currently reads explicit static or
+session credentials, so workload-identity-only pods are unsupported. SES uses
+the chart's HTTPS egress rule.
+
+```yaml
+delivery:
+  enabled: true
+  worker:
+    email:
+      transport: ses
+      from: auth@example.com
+      ses:
+        region: us-east-1
+```
+
+The worker Service is ClusterIP-only and has no Ingress. It serves `/live`,
+`/ready`, and `/metrics` on the internal health port. Enabling its
+ServiceMonitor requires exact Prometheus namespace and pod selectors under
+`delivery.worker.networkPolicy.metrics`. Kubernetes probes remain node-local.
+The PodDisruptionBudget assumes the default two replicas, and the 45-second
+termination grace exceeds the default 30-second drain deadline.
+
+The worker owns delivery schema migration during startup. A custom
+`delivery.schema` must already exist, and the database role needs ownership or
+the DDL grants required to create and verify owned delivery assets. After an
+external Secret change, update both `restartToken` and
+`delivery.worker.restartToken` so API producers and workers roll onto the same
+ring. Rotate in two deployments: first add retained keys everywhere, then
+switch the current IDs everywhere.
+
 ## Scheduled off-host backup
 
 Enable `backup.enabled`, provide a writable `ReadWriteMany` PVC (or let the chart create one),

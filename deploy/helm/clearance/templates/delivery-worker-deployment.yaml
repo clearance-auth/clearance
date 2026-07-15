@@ -1,0 +1,169 @@
+{{- if .Values.delivery.enabled }}
+{{- $deliverySecret := required "delivery.existingSecret or secrets.existingSecret is required when delivery.enabled" (.Values.delivery.existingSecret | default .Values.secrets.existingSecret) }}
+{{- $worker := .Values.delivery.worker }}
+{{- if le (mul (int $worker.terminationGracePeriodSeconds) 1000) (int $worker.drainTimeoutMs) }}{{ fail "delivery.worker.terminationGracePeriodSeconds must exceed delivery.worker.drainTimeoutMs" }}{{- end }}
+{{- if and $worker.podDisruptionBudget.enabled (ge (int $worker.podDisruptionBudget.minAvailable) (int $worker.replicaCount)) }}{{ fail "delivery worker PDB minAvailable must be less than replicaCount" }}{{- end }}
+{{- if and .Values.networkPolicy.enabled (eq $worker.email.transport "smtp") (empty $worker.networkPolicy.smtpEgress) }}{{ fail "SMTP delivery with networkPolicy.enabled requires delivery.worker.networkPolicy.smtpEgress" }}{{- end }}
+{{- if and .Values.networkPolicy.enabled (eq $worker.email.transport "smtp") }}
+{{- if or (eq (int $worker.email.smtp.port) 53) (eq (int $worker.email.smtp.port) 443) (eq (int $worker.email.smtp.port) (int .Values.postgres.port)) }}{{ fail "delivery.worker.email.smtp.port must not overlap the worker DNS, database, or HTTPS egress ports" }}{{- end }}
+{{- range $rule := $worker.networkPolicy.smtpEgress }}
+{{- if or (empty $rule.to) (empty $rule.ports) }}{{ fail "every delivery.worker.networkPolicy.smtpEgress rule requires non-empty to and ports" }}{{- end }}
+{{- range $port := $rule.ports }}
+{{- if ne (toString $port.protocol) "TCP" }}{{ fail "delivery.worker.networkPolicy.smtpEgress permits TCP only" }}{{- end }}
+{{- if ne (int $port.port) (int $worker.email.smtp.port) }}{{ fail "every delivery.worker.networkPolicy.smtpEgress port must equal delivery.worker.email.smtp.port" }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and $worker.metrics.enabled $worker.metrics.serviceMonitor.enabled (empty $worker.networkPolicy.metrics.namespaceSelector) }}{{ fail "delivery worker ServiceMonitor requires delivery.worker.networkPolicy.metrics.namespaceSelector" }}{{- end }}
+{{- if and $worker.metrics.enabled $worker.metrics.serviceMonitor.enabled (empty $worker.networkPolicy.metrics.podSelector) }}{{ fail "delivery worker ServiceMonitor requires delivery.worker.networkPolicy.metrics.podSelector" }}{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-delivery-worker
+  labels:
+    app: clearance-delivery-worker
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: delivery-worker
+spec:
+  replicas: {{ $worker.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      app: clearance-delivery-worker
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s" $deliverySecret (toJson .Values.delivery) $worker.restartToken .Values.restartToken | sha256sum }}
+      labels:
+        app: clearance-delivery-worker
+        app.kubernetes.io/name: clearance
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: delivery-worker
+        clearance.dev/delivery-worker: "true"
+    spec:
+      terminationGracePeriodSeconds: {{ $worker.terminationGracePeriodSeconds }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: delivery-worker
+          image: "{{ required "image.repository is required" .Values.image.repository }}@{{ required "image.digest is required; deploy the signed release digest" .Values.image.digest }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "packages/delivery-worker/dist/cli.mjs"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: health
+              containerPort: {{ $worker.healthPort }}
+          startupProbe:
+            httpGet:
+              path: /live
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+{{ toYaml $worker.resources | indent 12 }}
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: database-url }
+            - name: CLEARANCE_DELIVERY_WORKER_ID
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: CLEARANCE_DELIVERY_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: delivery-key-id }
+            - name: CLEARANCE_DELIVERY_KEYS_JSON
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: delivery-keys-json }
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: delivery-fingerprint-key-id }
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: delivery-fingerprint-keys-json }
+            - name: CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: delivery-source-dedupe-key }
+{{- with .Values.delivery.legacyFingerprintKeyId }}
+            - name: CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID
+              value: {{ . | quote }}
+{{- end }}
+            - { name: CLEARANCE_DELIVERY_SCHEMA, value: {{ .Values.delivery.schema | quote }} }
+            - { name: CLEARANCE_DELIVERY_PREFIX, value: {{ .Values.delivery.prefix | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE, value: {{ printf "%d" (int .Values.delivery.quota.maxActive) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG, value: {{ printf "%d" (int .Values.delivery.quota.maxBacklog) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW, value: {{ printf "%d" (int .Values.delivery.quota.maxEnqueuesPerWindow) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_WINDOW_MS, value: {{ printf "%d" (int .Values.delivery.quota.windowMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_CONCURRENCY, value: {{ printf "%d" (int $worker.concurrency) | quote }} }
+            - { name: CLEARANCE_DELIVERY_POLL_MS, value: {{ printf "%d" (int $worker.pollMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_LEASE_MS, value: {{ printf "%d" (int $worker.leaseMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_HEARTBEAT_MS, value: {{ printf "%d" (int $worker.heartbeatMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_MAINTENANCE_MS, value: {{ printf "%d" (int $worker.maintenanceMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS, value: {{ printf "%d" (int $worker.drainTimeoutMs) | quote }} }
+            - { name: CLEARANCE_DELIVERY_MAX_BODY_BYTES, value: {{ printf "%d" (int $worker.maxBodyBytes) | quote }} }
+            - { name: CLEARANCE_DELIVERY_APP_NAME, value: {{ $worker.appName | quote }} }
+            - { name: CLEARANCE_DELIVERY_ALLOW_HTTP_LINKS, value: "false" }
+            - { name: CLEARANCE_DELIVERY_HEALTH_HOST, value: "0.0.0.0" }
+            - { name: CLEARANCE_DELIVERY_HEALTH_PORT, value: {{ printf "%d" (int $worker.healthPort) | quote }} }
+            - { name: CLEARANCE_EMAIL_TRANSPORT, value: {{ $worker.email.transport | quote }} }
+            - { name: CLEARANCE_EMAIL_FROM, value: {{ $worker.email.from | quote }} }
+{{- if eq $worker.email.transport "smtp" }}
+            - { name: CLEARANCE_SMTP_HOST, value: {{ $worker.email.smtp.host | quote }} }
+            - { name: CLEARANCE_SMTP_PORT, value: {{ printf "%d" (int $worker.email.smtp.port) | quote }} }
+            - { name: CLEARANCE_SMTP_SECURE, value: {{ $worker.email.smtp.secure | quote }} }
+            - { name: CLEARANCE_SMTP_REQUIRE_TLS, value: {{ $worker.email.smtp.requireTls | quote }} }
+            - { name: CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK, value: "false" }
+            - { name: CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS, value: {{ printf "%d" (int $worker.email.smtp.connectionTimeoutMs) | quote }} }
+            - { name: CLEARANCE_SMTP_SOCKET_TIMEOUT_MS, value: {{ printf "%d" (int $worker.email.smtp.socketTimeoutMs) | quote }} }
+            - { name: CLEARANCE_SMTP_GREETING_TIMEOUT_MS, value: {{ printf "%d" (int $worker.email.smtp.greetingTimeoutMs) | quote }} }
+            - name: CLEARANCE_SMTP_USER
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: smtp-user, optional: true }
+            - name: CLEARANCE_SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: smtp-password, optional: true }
+{{- else }}
+            - { name: CLEARANCE_SES_REGION, value: {{ $worker.email.ses.region | quote }} }
+            - { name: CLEARANCE_SES_REQUEST_TIMEOUT_MS, value: {{ printf "%d" (int $worker.email.ses.requestTimeoutMs) | quote }} }
+            - name: CLEARANCE_SES_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: ses-access-key-id }
+            - name: CLEARANCE_SES_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: ses-secret-access-key }
+            - name: CLEARANCE_SES_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ $deliverySecret }}, key: ses-session-token, optional: true }
+{{- end }}
+            - { name: CLEARANCE_WEBHOOK_ALLOW_INSECURE_LOOPBACK, value: "false" }
+            - { name: CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS, value: {{ printf "%d" (int $worker.webhook.dnsTimeoutMs) | quote }} }
+            - { name: CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS, value: {{ printf "%d" (int $worker.webhook.connectTimeoutMs) | quote }} }
+            - { name: CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS, value: {{ printf "%d" (int $worker.webhook.responseTimeoutMs) | quote }} }
+            - { name: CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES, value: {{ printf "%d" (int $worker.webhook.maxResponseBytes) | quote }} }
+{{- end }}

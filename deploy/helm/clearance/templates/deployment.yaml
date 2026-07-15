@@ -19,7 +19,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken | sha256sum }}
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken (toJson .Values.delivery) | sha256sum }}
       labels:
         app: clearance-api
         app.kubernetes.io/name: clearance
@@ -107,6 +107,43 @@ spec:
                 secretKeyRef:
                   name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
                   key: credential-key-id
+{{- if .Values.delivery.enabled }}
+            - name: CLEARANCE_DELIVERY_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "delivery.existingSecret or secrets.existingSecret is required when delivery.enabled" (.Values.delivery.existingSecret | default .Values.secrets.existingSecret) }}
+                  key: delivery-key-id
+            - name: CLEARANCE_DELIVERY_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-keys-json
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-fingerprint-key-id
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-fingerprint-keys-json
+            - name: CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-source-dedupe-key
+{{- with .Values.delivery.legacyFingerprintKeyId }}
+            - name: CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID
+              value: {{ . | quote }}
+{{- end }}
+            - { name: CLEARANCE_DELIVERY_SCHEMA, value: {{ .Values.delivery.schema | quote }} }
+            - { name: CLEARANCE_DELIVERY_PREFIX, value: {{ .Values.delivery.prefix | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE, value: {{ printf "%d" (int .Values.delivery.quota.maxActive) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG, value: {{ printf "%d" (int .Values.delivery.quota.maxBacklog) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW, value: {{ printf "%d" (int .Values.delivery.quota.maxEnqueuesPerWindow) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_WINDOW_MS, value: {{ printf "%d" (int .Values.delivery.quota.windowMs) | quote }} }
+{{- end }}
             - name: CLEARANCE_STRICT_SECRETS
               value: "1"
             - name: NODE_ENV

@@ -95,10 +95,10 @@ else
     bad "postgres ports not reset in production overlay"
   fi
   PROD_PORT_OVERRIDES="$(grep -cE '^[[:space:]]+ports: !override$' "$PROD" || true)"
-  if [[ "$PROD_PORT_OVERRIDES" == "3" ]]; then
-    ok "API, console, and sample production ports replace base bindings"
+  if [[ "$PROD_PORT_OVERRIDES" == "4" ]]; then
+    ok "API, delivery worker, console, and sample production ports replace base bindings"
   else
-    bad "expected three production !override port lists, found $PROD_PORT_OVERRIDES"
+    bad "expected four production !override port lists, found $PROD_PORT_OVERRIDES"
   fi
   if grep -qE 'CLEARANCE_SECRET:-\$\{|:-dev-secret|:-change-me|:-clearance"' "$PROD"; then
     bad "weak secret defaults in production overlay"
@@ -141,6 +141,39 @@ export CLEARANCE_OPERATOR_TOKEN="short"
 export CLEARANCE_SECRET="dev-secret-change-me"
 export CLEARANCE_CREDENTIAL_KEY="x"
 export CLEARANCE_CREDENTIAL_KEY_ID="k1"
+export CLEARANCE_DELIVERY_KEY_ID="enc-v1"
+export CLEARANCE_DELIVERY_KEYS_JSON='{"enc-v1":"short"}'
+export CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID="fp-v1"
+export CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON='{"fp-v1":"short"}'
+export CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY="short"
+export CLEARANCE_DELIVERY_SCHEMA="public"
+export CLEARANCE_DELIVERY_PREFIX="delivery_"
+export CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE="10000"
+export CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG="5000"
+export CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW="1000"
+export CLEARANCE_DELIVERY_QUOTA_WINDOW_MS="60000"
+export CLEARANCE_DELIVERY_CONCURRENCY="4"
+export CLEARANCE_DELIVERY_POLL_MS="500"
+export CLEARANCE_DELIVERY_LEASE_MS="60000"
+export CLEARANCE_DELIVERY_HEARTBEAT_MS="10000"
+export CLEARANCE_DELIVERY_MAINTENANCE_MS="30000"
+export CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS="30000"
+export CLEARANCE_DELIVERY_MAX_BODY_BYTES="1048576"
+export CLEARANCE_DELIVERY_APP_NAME="Clearance"
+export CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT="8091"
+export CLEARANCE_EMAIL_TRANSPORT="smtp"
+export CLEARANCE_EMAIL_FROM="auth@example.test"
+export CLEARANCE_SMTP_HOST="smtp.example.test"
+export CLEARANCE_SMTP_PORT="587"
+export CLEARANCE_SMTP_SECURE="false"
+export CLEARANCE_SMTP_REQUIRE_TLS="true"
+export CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS="10000"
+export CLEARANCE_SMTP_SOCKET_TIMEOUT_MS="30000"
+export CLEARANCE_SMTP_GREETING_TIMEOUT_MS="10000"
+export CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS="5000"
+export CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS="5000"
+export CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS="10000"
+export CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES="65536"
 export CLEARANCE_CONSOLE_ADMIN_USER="admin"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="password"
 export CLEARANCE_CONSOLE_SESSION_SECRET="change-me"
@@ -188,6 +221,12 @@ unset CLEARANCE_GITHUB_CLIENT_ID
 export CLEARANCE_OPERATOR_TOKEN="$(openssl rand -hex 24)"
 export CLEARANCE_SECRET="$(openssl rand -hex 24)"
 export CLEARANCE_CREDENTIAL_KEY="$(openssl rand -hex 24)"
+DELIVERY_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+DELIVERY_FINGERPRINT_KEY="$(openssl rand -hex 32)"
+DELIVERY_SOURCE_KEY="$(openssl rand -hex 32)"
+export CLEARANCE_DELIVERY_KEYS_JSON="{\"enc-v1\":\"$DELIVERY_ENCRYPTION_KEY\"}"
+export CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON="{\"fp-v1\":\"$DELIVERY_FINGERPRINT_KEY\"}"
+export CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY="$DELIVERY_SOURCE_KEY"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="$(openssl rand -hex 24)"
 export CLEARANCE_CONSOLE_SESSION_SECRET="$(openssl rand -hex 24)"
 export CLEARANCE_DB_PASSWORD="$(openssl rand -hex 24)"
@@ -204,6 +243,24 @@ if [[ $ec -eq 0 ]]; then
 else
   bad "validate-production-env rejected strong env: $(head -5 "$SCRATCH/val-ok.txt" | tr '\n' ' ')"
 fi
+
+export CLEARANCE_EMAIL_TRANSPORT="ses"
+export CLEARANCE_SES_REGION="us-east-1"
+export CLEARANCE_SES_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+export CLEARANCE_SES_SECRET_ACCESS_KEY="$(openssl rand -base64 32)"
+export CLEARANCE_SES_SESSION_TOKEN="$(openssl rand -base64 32)"
+export CLEARANCE_SES_REQUEST_TIMEOUT_MS="10000"
+set +e
+bash scripts/validate-production-env.sh >"$SCRATCH/val-ses-ok.txt" 2>&1
+ec=$?
+set -e
+if [[ $ec -eq 0 ]]; then
+  ok "validate-production-env accepts a complete SES session credential set"
+else
+  bad "validate-production-env rejected complete SES configuration"
+fi
+export CLEARANCE_EMAIL_TRANSPORT="smtp"
+unset CLEARANCE_SES_REGION CLEARANCE_SES_ACCESS_KEY_ID CLEARANCE_SES_SECRET_ACCESS_KEY CLEARANCE_SES_SESSION_TOKEN CLEARANCE_SES_REQUEST_TIMEOUT_MS
 
 # ---------- behavioral: sign-release ----------
 section "behavioral: sign-release fail-closed without key"
@@ -307,6 +364,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
       const expected={
         api:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
+        "delivery-worker":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         console:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         "sample-b2b":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         backup:"ghcr.io/example/clearance-backup@sha256:"+"b".repeat(64),
@@ -323,7 +381,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if node -e '
       const fs=require("fs");
       const y=fs.readFileSync(process.argv[1],"utf8");
-      const expected={api:3200,console:3100,"sample-b2b":3000};
+      const expected={api:3200,"delivery-worker":8091,console:3100,"sample-b2b":3000};
       for (const [name,target] of Object.entries(expected)) {
         const escaped=name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
         const m=y.match(new RegExp(`^  ${escaped}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|\\nvolumes:|\\nnetworks:)`,"m"));
@@ -336,7 +394,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         }
       }
     ' "$SCRATCH/compose-ok.yml"; then
-      ok "resolved production config has exactly one API/console/sample binding each"
+      ok "resolved production config has exactly one API/worker/console/sample binding each"
     else
       bad "resolved production config has duplicate, missing, or unexpected service bindings"
     fi
@@ -354,6 +412,30 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       ok "production API uses internal health endpoints and durable server-managed backup storage"
     else
       bad "production API internal health or backup storage wiring is missing"
+    fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  delivery-worker:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const worker=m[1];
+      const required=[
+        "packages/delivery-worker/dist/cli.mjs",
+        "http://127.0.0.1:8091/ready",
+      ];
+      if(required.some(value=>!worker.includes(value))) process.exit(1);
+      if(!/CLEARANCE_DELIVERY_HEALTH_HOST:\s*["\x27]?0\.0\.0\.0/.test(worker) ||
+         !/CLEARANCE_DELIVERY_HEALTH_PORT:\s*["\x27]?8091/.test(worker) ||
+         !/CLEARANCE_EMAIL_TRANSPORT:\s*["\x27]?smtp/.test(worker) ||
+         !/read_only:\s*true/.test(worker) ||
+         !/no-new-privileges:true/.test(worker) ||
+         !/stop_grace_period:\s*(?:45s|5m10s)/.test(worker)) process.exit(1);
+      for(const name of ["CLEARANCE_DELIVERY_KEYS_JSON","CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON","CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY"]) {
+        if(!worker.includes(name+":")) process.exit(1);
+      }
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "production delivery worker uses shared keys, hardened runtime, readiness, and graceful drain"
+    else
+      bad "production delivery worker wiring is incomplete"
     fi
   else
     bad "production compose config failed with strong env"
@@ -427,6 +509,58 @@ if command -v helm >/dev/null 2>&1; then
     ok "trusted-proxy ServiceMonitor fails closed without scraper selectors"
   else
     bad "trusted-proxy ServiceMonitor accepted empty scraper selectors"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.smtp.host=smtp.example.test \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
+    >"$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: beta-delivery-worker' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'packages/delivery-worker/dist/cli.mjs' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'path: /live' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'path: /ready' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: CLEARANCE_SMTP_HOST' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE' "$SCRATCH/helm-delivery-smtp.yml" \
+    && awk 'BEGIN{RS="---"} /kind: NetworkPolicy/ && /name: beta-delivery-worker/{found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-delivery-smtp.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Ingress/ && /name: beta-delivery-worker/{found=1} END{exit found ? 1 : 0}' "$SCRATCH/helm-delivery-smtp.yml"; then
+    ok "Helm renders hardened SMTP delivery worker with API producer configuration and scoped egress"
+  else
+    bad "Helm SMTP delivery worker render is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.worker.email.transport=ses \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.ses.region=us-east-1 \
+    --set delivery.worker.metrics.serviceMonitor.enabled=true \
+    --set-string 'delivery.worker.networkPolicy.metrics.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=monitoring' \
+    --set-string 'delivery.worker.networkPolicy.metrics.podSelector.matchLabels.app\.kubernetes\.io/name=prometheus' \
+    >"$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: CLEARANCE_SES_ACCESS_KEY_ID' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: CLEARANCE_SES_SECRET_ACCESS_KEY' "$SCRATCH/helm-delivery-ses.yml" \
+    && awk 'BEGIN{RS="---"} /kind: NetworkPolicy/ && /name: beta-delivery-worker/{found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: beta-delivery-worker' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'path: /metrics' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'runAsUser: 10001' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'readOnlyRootFilesystem: true' "$SCRATCH/helm-delivery-ses.yml"; then
+    ok "Helm renders SES delivery worker, restricted metrics scraping, and hardened pod security"
+  else
+    bad "Helm SES delivery worker render is incomplete"
+  fi
+  set +e
+  helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.smtp.host=smtp.example.test \
+    >"$SCRATCH/helm-delivery-unsafe.out" 2>"$SCRATCH/helm-delivery-unsafe.err"
+  delivery_unsafe_ec=$?
+  set -e
+  if [[ $delivery_unsafe_ec -ne 0 ]] \
+    && grep -Eq 'requires delivery.worker.networkPolicy.smtpEgress|smtpEgress.*minItems' "$SCRATCH/helm-delivery-unsafe.err"; then
+    ok "Helm SMTP delivery fails closed without explicit egress"
+  else
+    bad "Helm SMTP delivery accepted missing egress"
   fi
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
     --set backup.enabled=true \

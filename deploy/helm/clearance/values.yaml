@@ -89,6 +89,82 @@ metrics:
     scrapeTimeout: 10s
     additionalLabels: {}
 
+# Transactional email/webhook delivery. Disabled by default so existing chart
+# installs remain compatible; enabling it fails closed on a complete external
+# keyring and one explicitly configured email transport.
+delivery:
+  enabled: false
+  # Empty inherits secrets.existingSecret. Required Secret keys:
+  # delivery-key-id, delivery-keys-json, delivery-fingerprint-key-id,
+  # delivery-fingerprint-keys-json, and delivery-source-dedupe-key.
+  existingSecret: ""
+  schema: public
+  prefix: delivery_
+  legacyFingerprintKeyId: ""
+  quota:
+    maxActive: 10000
+    maxBacklog: 5000
+    maxEnqueuesPerWindow: 1000
+    windowMs: 60000
+  worker:
+    replicaCount: 2
+    restartToken: ""
+    healthPort: 8091
+    terminationGracePeriodSeconds: 45
+    concurrency: 4
+    pollMs: 500
+    leaseMs: 60000
+    heartbeatMs: 10000
+    maintenanceMs: 30000
+    drainTimeoutMs: 30000
+    maxBodyBytes: 1048576
+    appName: Clearance
+    email:
+      transport: smtp
+      from: ""
+      smtp:
+        host: ""
+        port: 587
+        secure: false
+        requireTls: true
+        connectionTimeoutMs: 10000
+        socketTimeoutMs: 30000
+        greetingTimeoutMs: 10000
+      ses:
+        region: ""
+        requestTimeoutMs: 10000
+    webhook:
+      dnsTimeoutMs: 5000
+      connectTimeoutMs: 5000
+      responseTimeoutMs: 10000
+      maxResponseBytes: 65536
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    networkPolicy:
+      # The worker has a dedicated DNS/database/HTTPS egress policy. When SMTP
+      # is selected, every rule here must contain a destination and TCP port
+      # exactly matching email.smtp.port; empty and allow-all rules are rejected.
+      smtpEgress: []
+      metrics:
+        namespaceSelector: {}
+        podSelector: {}
+    metrics:
+      enabled: true
+      path: /metrics
+      serviceMonitor:
+        enabled: false
+        interval: 30s
+        scrapeTimeout: 10s
+        additionalLabels: {}
+
 backup:
   enabled: false
   image:
