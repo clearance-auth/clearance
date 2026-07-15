@@ -231,10 +231,14 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 
 	it("delivers exact signed webhook bytes and refuses redirects without following them", async () => {
 		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });
+		const webhookLogs: string[] = [];
 		const worker = new DeliveryWorker({
 			...config,
 			workerId: `webhook-${suffix}`,
-		}, { pool: workerPool });
+		}, {
+			pool: workerPool,
+			logger: { log(level, event, fields) { webhookLogs.push(JSON.stringify({ level, event, fields })); } },
+		});
 		await worker.initialize();
 		const delivered = await enqueueWebhook(
 			"event-webhook-delivered",
@@ -251,6 +255,8 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		expect(request.body.toString("utf8")).not.toContain(delivered.signingSecret);
 		const timestamp = String(request.headers["webhook-timestamp"]);
 		const signature = String(request.headers["webhook-signature"]);
+		expect(request.headers["webhook-id"]).toBe("event-webhook-delivered");
+		expect(request.headers["idempotency-key"]).toBe("job-webhook-delivered");
 		expect(signature).toBe(webhookSignature(
 			delivered.signingSecret,
 			"event-webhook-delivered",
@@ -282,6 +288,15 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		const redirected = await worker.store.inspectJob("job-webhook-redirect");
 		expect(redirected?.state).toBe("dead");
 		expect(redirected?.lastErrorClass).toBe("webhook.redirect_refused");
+		const tables = qualifiedDeliveryTables({ prefix });
+		const persisted = JSON.stringify((await pool.query(
+			`SELECT e.*, p.*, j.*, a.* FROM ${tables.event} e JOIN ${tables.payload} p ON p.event_id=e.id JOIN ${tables.job} j ON j.event_id=e.id JOIN ${tables.attempt} a ON a.job_id=j.id WHERE j.id = ANY($1::text[])`,
+			[["job-webhook-delivered", "job-webhook-redirect"]],
+		)).rows);
+		for (const privateValue of [delivered.destination, delivered.signingSecret, "Updated Org", "Old Org"]) {
+			expect(persisted).not.toContain(privateValue);
+			expect(webhookLogs.join("\n")).not.toContain(privateValue);
+		}
 		await worker.stop();
 	});
 
