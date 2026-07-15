@@ -200,6 +200,17 @@ describe.skipIf(!available)("delivery control Postgres primitives", () => {
 			jobId: leased!.id, leaseToken: leased!.leaseToken, workerId: "replay-worker",
 			now: new Date(start.getTime() + 1),
 		});
+		expect(await store.previewControl({
+			projectId: "replay-project",
+			environmentId: "env-1",
+			jobId: "replay-job",
+			action: "replay",
+			maxAttempts: 12,
+			now: new Date(start.getTime() + 2),
+		})).toMatchObject({
+			allowed: true,
+			effect: { maxAttempts: 12, createsEvent: true, createsJob: true },
+		});
 		await expect(transaction((tx) => retryDeliveryInExistingTransaction(tx, {
 			projectId: "replay-project", environmentId: "env-1", jobId: "replay-job", now: start,
 		}, options))).rejects.toMatchObject({ code: "DELIVERY_CONTROL_CONFLICT", httpStatus: 409 });

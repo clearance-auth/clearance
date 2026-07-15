@@ -53,7 +53,16 @@ function reader(overrides: Partial<ManagementDeliveryControlReader> = {}): Manag
 	return {
 		list: async () => ({ items: [job], nextCursor: null }),
 		inspect: async () => job,
-		preview: async () => preview,
+		preview: async (input) => ({
+			...preview,
+			action: input.action,
+			effect: {
+				...preview.effect,
+				maxAttempts: input.action === "replay"
+					? input.maxAttempts ?? job.maxAttempts
+					: preview.effect.maxAttempts,
+			},
+		}),
 		readiness: async () => ({
 			ready: true,
 			schema: { owner: "clearance.delivery", version: 3, currentVersion: 3, current: true },
@@ -117,6 +126,15 @@ describe("management delivery control service", () => {
 			confirm: true,
 			dryRun: true,
 		})).toMatchObject({ dryRun: true });
+		expect(await controlDeliveryJob(managementStore, {
+			...controlInput,
+			action: "replay",
+			maxAttempts: 12,
+		})).toMatchObject({
+			operation: "delivery.jobs.replay",
+			dryRun: true,
+			preview: { action: "replay", effect: { maxAttempts: 12 } },
+		});
 		expect(mutationCalls).toBe(0);
 	});
 

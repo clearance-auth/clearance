@@ -48,7 +48,10 @@ function fakeStore(input: {
 } = {}) {
 	const list = vi.fn(async () => ({ items: [job], nextCursor: "cursor_next" }));
 	const inspect = vi.fn(async () => input.inspectResult === undefined ? job : input.inspectResult);
-	const preview = vi.fn(async (controlInput: { action: "cancel" | "retry" | "replay" }) => {
+	const preview = vi.fn(async (controlInput: {
+		action: "cancel" | "retry" | "replay";
+		maxAttempts?: number;
+	}) => {
 		if (input.previewError !== undefined) throw input.previewError;
 		if (input.previewResult === null) return null;
 		return {
@@ -58,7 +61,9 @@ function fakeStore(input: {
 			job,
 			effect: {
 				state: controlInput.action === "replay" ? "queued" as const : "cancelled" as const,
-				maxAttempts: 5,
+				maxAttempts: controlInput.action === "replay"
+					? controlInput.maxAttempts ?? 5
+					: 5,
 				createsEvent: controlInput.action === "replay",
 				createsJob: controlInput.action === "replay",
 			},
@@ -272,6 +277,25 @@ describe("delivery API routes", () => {
 		);
 		expect(conflictResponse.status).toBe(409);
 		expect((await conflictResponse.json()).error.code).toBe("DELIVERY_CONTROL_CONFLICT");
+
+		const replayPreview = fakeStore();
+		const replayPreviewResponse = await routeApp(replayPreview.store).request(
+			`/v1/delivery/jobs/${job.id}/replay`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ maxAttempts: 12 }),
+			},
+		);
+		expect(replayPreviewResponse.status).toBe(200);
+		expect(await replayPreviewResponse.json()).toMatchObject({
+			dryRun: true,
+			preview: { effect: { maxAttempts: 12 } },
+		});
+		expect(replayPreview.calls.preview).toHaveBeenCalledWith(expect.objectContaining({
+			action: "replay",
+			maxAttempts: 12,
+		}));
 
 		const invalidResponse = await routeApp(fakeStore().store).request(
 			`/v1/delivery/jobs/${job.id}/replay`,

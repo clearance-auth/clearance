@@ -305,6 +305,7 @@ function effectFor(
 	action: DeliveryControlAction,
 	row: ControlJobRow & { payload_exists: boolean; payload_expires_at: Date | string | null },
 	now: Date,
+	requestedMaxAttempts?: number,
 ): Omit<DeliveryControlPreview, "job"> {
 	const expired = new Date(row.semantic_expires_at) <= now ||
 		(row.payload_expires_at !== null && new Date(row.payload_expires_at) <= now);
@@ -341,6 +342,9 @@ function effectFor(
 			},
 		};
 	}
+	const replayMaxAttempts = requestedMaxAttempts === undefined
+		? Number(row.max_attempts)
+		: bounded(requestedMaxAttempts, "maxAttempts", 1, 100);
 	const terminal = ["delivered", "dead", "cancelled"].includes(row.state);
 	const reason = !terminal ? "active_delivery"
 		: !row.payload_exists ? "payload_erased"
@@ -349,7 +353,7 @@ function effectFor(
 		action, allowed: reason === null, reason,
 		effect: {
 			state: reason === null ? "queued" : null,
-			maxAttempts: reason === null ? Number(row.max_attempts) : null,
+			maxAttempts: reason === null ? replayMaxAttempts : null,
 			createsEvent: reason === null,
 			createsJob: reason === null,
 		},
@@ -358,7 +362,12 @@ function effectFor(
 
 export async function previewDeliveryControl(
 	pool: pg.Pool,
-	input: DeliveryScope & { jobId: string; action: DeliveryControlAction; now?: Date },
+	input: DeliveryScope & {
+		jobId: string;
+		action: DeliveryControlAction;
+		now?: Date;
+		maxAttempts?: number;
+	},
 	options: DeliverySchemaOptions = {},
 ): Promise<DeliveryControlPreview | null> {
 	const target = scope(input);
@@ -376,7 +385,9 @@ export async function previewDeliveryControl(
 		[jobId(input.jobId), target.projectId, target.environmentId],
 	);
 	const row = result.rows[0];
-	return row ? { ...effectFor(input.action, row, now), job: record(row) } : null;
+	return row
+		? { ...effectFor(input.action, row, now, input.maxAttempts), job: record(row) }
+		: null;
 }
 
 async function lockedScopedJob(

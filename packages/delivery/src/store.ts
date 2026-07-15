@@ -764,7 +764,12 @@ export class DeliveryStore {
 	}
 
 	previewControl(
-		input: DeliveryScope & { jobId: string; action: DeliveryControlAction; now?: Date },
+		input: DeliveryScope & {
+			jobId: string;
+			action: DeliveryControlAction;
+			now?: Date;
+			maxAttempts?: number;
+		},
 	): Promise<DeliveryControlPreview | null> {
 		return previewDeliveryControl(this.pool, input, this.options);
 	}

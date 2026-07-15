@@ -108,6 +108,7 @@ export interface ManagementDeliveryControlReader {
 		jobId: string;
 		action: "cancel" | "retry" | "replay";
 		now?: Date;
+		maxAttempts?: number;
 	}): Promise<DeliveryControlPreview | null>;
 	readiness(input?: { now?: Date; staleAfterMs?: number }): Promise<DeliveryReadinessSummary>;
 	quota(input: DeliveryControlScope & { now?: Date }): Promise<DeliveryQuotaStatus>;
