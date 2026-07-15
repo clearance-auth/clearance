@@ -277,6 +277,13 @@ describe.sequential.skipIf(!available)(
 				healthHost: "127.0.0.1",
 				healthPort: 8091,
 				processOnceLimit: 10,
+				webhook: {
+					allowInsecureLoopback: true,
+					dnsTimeoutMs: 2_000,
+					connectTimeoutMs: 2_000,
+					responseTimeoutMs: 2_000,
+					maxResponseBytes: 65_536,
+				},
 			};
 			const worker = new DeliveryWorker(workerConfig, {
 				pool: workerPool,

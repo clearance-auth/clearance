@@ -1,4 +1,5 @@
 import net, { type Server, type Socket } from "node:net";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import {
 } from "@clearance/delivery";
 import type { WorkerConfig } from "./config.js";
 import type { EmailSender } from "./smtp.js";
+import { verifyWebhookSignature, webhookSignature } from "./webhook.js";
 import { DeliveryDrainTimeoutError, DeliveryWorker } from "./worker.js";
 
 const DATABASE_URL = process.env.CLEARANCE_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? "postgres://clearance:clearance@localhost:5434/clearance";
@@ -60,6 +62,39 @@ class SmtpFixture {
 	async stop() { if (this.server) await new Promise<void>((resolve) => this.server!.close(() => resolve())); }
 }
 
+class WebhookFixture {
+	server?: HttpServer;
+	port = 0;
+	status = 204;
+	requests: Array<{ headers: Record<string, string | string[] | undefined>; body: Buffer }> = [];
+	async start() {
+		this.server = createHttpServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer | string) => {
+				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			});
+			request.on("end", () => {
+				this.requests.push({ headers: request.headers, body: Buffer.concat(chunks) });
+				response.statusCode = this.status;
+				if (this.status >= 300 && this.status < 400) {
+					response.setHeader("location", "http://127.0.0.1/redirect-refused");
+				}
+				response.end();
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			this.server!.once("error", reject);
+			this.server!.listen(0, "127.0.0.1", resolve);
+		});
+		this.port = (this.server.address() as net.AddressInfo).port;
+	}
+	async stop() {
+		if (this.server) {
+			await new Promise<void>((resolve) => this.server!.close(() => resolve()));
+		}
+	}
+}
+
 async function unusedPort(): Promise<number> {
 	const server = net.createServer();
 	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -80,11 +115,13 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		sourceDedupeKey: randomBytes(32),
 	});
 	const smtp = new SmtpFixture();
+	const webhooks = new WebhookFixture();
 	const logs: string[] = [];
 	let config: WorkerConfig;
 
 	beforeAll(async () => {
 		await smtp.start();
+		await webhooks.start();
 		config = {
 			mode: "once", databaseUrl: DATABASE_URL, workerId: `test-worker-${suffix}`, keyring, schema: "public", prefix,
 			smtp: { host: "127.0.0.1", port: smtp.port, secure: false, requireTls: false, allowInsecureLoopback: true, from: "support@example.test", connectionTimeoutMs: 2_000, socketTimeoutMs: 2_000, greetingTimeoutMs: 2_000 },
@@ -92,11 +129,19 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 			drainTimeoutMs: 5_000, maxBodyBytes: 1024 * 1024, appName: "Clearance Test",
 			allowHttpLinks: false,
 			healthHost: "127.0.0.1", healthPort: await unusedPort(), processOnceLimit: 10,
+			webhook: {
+				allowInsecureLoopback: true,
+				dnsTimeoutMs: 2_000,
+				connectTimeoutMs: 2_000,
+				responseTimeoutMs: 2_000,
+				maxResponseBytes: 65_536,
+			},
 		};
 	});
 
 	afterAll(async () => {
 		await smtp.stop();
+		await webhooks.stop();
 		const names = deliveryTableNames({ prefix });
 		for (const name of [names.attempt, names.job, names.payload, names.event, names.worker, names.meta]) {
 			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`).catch(() => undefined);
@@ -130,6 +175,115 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 			url: `https://app.example.test/reset?token=${label}`,
 		};
 	}
+
+	async function enqueueWebhook(eventId: string, jobId: string, sourceKey: string) {
+		const destination = `http://127.0.0.1:${webhooks.port}/events`;
+		const signingSecret = "worker-webhook-signing-secret-at-least-32-bytes";
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await enqueueDelivery(createDeliveryTransactionAdapter(client), {
+				eventId,
+				jobId,
+				sourceKey,
+				kind: "organization.updated",
+				projectId: "project-1",
+				environmentId: "env-1",
+				organizationId: "organization-1",
+				channel: "webhook",
+				destination,
+				payload: {
+					version: 1,
+					endpoint: { id: "primary", url: destination, signingSecret },
+					event: {
+						id: eventId,
+						type: "organization.updated",
+						occurredAt: "2026-07-15T00:00:00.000Z",
+						context: {
+							projectId: "project-1",
+							environmentId: "env-1",
+							organizationId: "organization-1",
+							actor: "operator-1",
+							correlationId: "correlation-1",
+						},
+						data: {
+							organization: {
+								id: "organization-1",
+								name: "Updated Org",
+								slug: "updated-org",
+								status: "active",
+							},
+							previous: { name: "Old Org", slug: "old-org" },
+						},
+					},
+				},
+				semanticExpiresAt: new Date(Date.now() + 60_000),
+			}, keyring, { prefix });
+			await client.query("COMMIT");
+			return { destination, signingSecret };
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	it("delivers exact signed webhook bytes and refuses redirects without following them", async () => {
+		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });
+		const worker = new DeliveryWorker({
+			...config,
+			workerId: `webhook-${suffix}`,
+		}, { pool: workerPool });
+		await worker.initialize();
+		const delivered = await enqueueWebhook(
+			"event-webhook-delivered",
+			"job-webhook-delivered",
+			"source-webhook-delivered",
+		);
+		expect(await worker.processOnce(1)).toBe(1);
+		expect((await worker.store.inspectJob("job-webhook-delivered"))?.state).toBe("delivered");
+		const request = webhooks.requests.at(-1)!;
+		expect(JSON.parse(request.body.toString("utf8"))).toMatchObject({
+			version: 1,
+			event: { id: "event-webhook-delivered", type: "organization.updated" },
+		});
+		expect(request.body.toString("utf8")).not.toContain(delivered.signingSecret);
+		const timestamp = String(request.headers["webhook-timestamp"]);
+		const signature = String(request.headers["webhook-signature"]);
+		expect(signature).toBe(webhookSignature(
+			delivered.signingSecret,
+			"event-webhook-delivered",
+			timestamp,
+			request.body,
+		));
+		expect({
+			valid: verifyWebhookSignature(
+				delivered.signingSecret,
+				"event-webhook-delivered",
+				timestamp,
+				request.body,
+				signature,
+			),
+			timestamp,
+			signature,
+			eventIdHeader: request.headers["webhook-id"],
+		}).toMatchObject({ valid: true });
+
+		webhooks.status = 302;
+		await enqueueWebhook(
+			"event-webhook-redirect",
+			"job-webhook-redirect",
+			"source-webhook-redirect",
+		);
+		const beforeRedirect = webhooks.requests.length;
+		expect(await worker.processOnce(1)).toBe(1);
+		expect(webhooks.requests).toHaveLength(beforeRedirect + 1);
+		const redirected = await worker.store.inspectJob("job-webhook-redirect");
+		expect(redirected?.state).toBe("dead");
+		expect(redirected?.lastErrorClass).toBe("webhook.redirect_refused");
+		await worker.stop();
+	});
 
 	it("migrates, reports ready, sends through SMTP, records status, and persists/logs no plaintext", async () => {
 		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });

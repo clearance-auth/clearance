@@ -3,6 +3,13 @@ import { describe, expect, it } from "vitest";
 import { parseWorkerConfig } from "./config.js";
 import { createJsonLogger } from "./logger.js";
 import { classifySmtpError, renderEmailPayload, validateEmailPayload } from "./smtp.js";
+import {
+	canonicalWebhookBytes,
+	classifyWebhookError,
+	parseOrganizationUpdatedPayload,
+	verifyWebhookSignature,
+	webhookSignature,
+} from "./webhook.js";
 
 const key = () => randomBytes(32).toString("base64");
 function env(): NodeJS.ProcessEnv {
@@ -103,6 +110,56 @@ describe("delivery worker boundaries", () => {
 		expect(classifySmtpError({ code: "ETLS" })).toEqual({ retryable: true, errorClass: "smtp.transport" });
 		expect(classifySmtpError({ responseCode: 250 })).toEqual({ retryable: false, errorClass: "smtp.protocol", providerStatus: "250" });
 		expect(classifySmtpError(new Error("body_too_large"))).toEqual({ retryable: false, errorClass: "payload.invalid" });
+	});
+
+	it("canonicalizes and verifies exact webhook bytes with terminal redirect handling", () => {
+		const signingSecret = "webhook-signing-secret-at-least-32-bytes";
+		const payload = parseOrganizationUpdatedPayload({
+			version: 1,
+			endpoint: {
+				id: "primary",
+				url: "https://hooks.example.test/clearance",
+				signingSecret,
+			},
+			event: {
+				id: "event-1",
+				type: "organization.updated",
+				occurredAt: "2026-07-15T00:00:00.000Z",
+				context: {
+					projectId: "project-1",
+					environmentId: "environment-1",
+					organizationId: "organization-1",
+					actor: "operator-1",
+					correlationId: "correlation-1",
+				},
+				data: {
+					organization: {
+						id: "organization-1",
+						name: "Updated Org",
+						slug: "updated-org",
+						status: "active",
+					},
+					previous: { name: "Old Org", slug: "old-org" },
+				},
+			},
+		});
+		const body = canonicalWebhookBytes(payload, 16_384);
+		expect(body.toString("utf8")).not.toContain(signingSecret);
+		expect(body.toString("utf8")).not.toContain("endpoint");
+		const timestamp = "1784073600";
+		const signature = webhookSignature(signingSecret, payload.event.id, timestamp, body);
+		expect(verifyWebhookSignature(signingSecret, payload.event.id, timestamp, body, signature)).toBe(true);
+		expect(verifyWebhookSignature(signingSecret, payload.event.id, timestamp, Buffer.from("changed"), signature)).toBe(false);
+		expect(classifyWebhookError({ code: "WEBHOOK_REDIRECT_REFUSED", status: 302 })).toEqual({
+			retryable: false,
+			errorClass: "webhook.redirect_refused",
+			providerStatus: "302",
+		});
+		expect(classifyWebhookError({ code: "WEBHOOK_HTTP_STATUS", status: 503 })).toEqual({
+			retryable: true,
+			errorClass: "webhook.transient",
+			providerStatus: "503",
+		});
 	});
 
 	it("redacts message and credential fields from structured logs", () => {

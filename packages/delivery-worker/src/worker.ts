@@ -4,13 +4,19 @@ import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleD
 import type { WorkerConfig } from "./config.js";
 import { createJsonLogger, type WorkerLogger } from "./logger.js";
 import { classifySmtpError, createSmtpSender, renderEmailPayload, type EmailSender } from "./smtp.js";
+import {
+	classifyWebhookError,
+	createWebhookSender,
+	parseOrganizationUpdatedPayload,
+	type WebhookSender,
+} from "./webhook.js";
 
 const VERSION = "0.2.1";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 class ProviderAcceptedUnconfirmedError extends Error {
 	constructor(readonly cause: unknown) {
-		super("SMTP accepted the message but durable completion was not confirmed");
+		super("Provider accepted the delivery but durable completion was not confirmed");
 		this.name = "ProviderAcceptedUnconfirmedError";
 	}
 }
@@ -38,6 +44,7 @@ export class DeliveryWorker {
 	readonly store: DeliveryStore;
 	readonly config: WorkerConfig;
 	private readonly sender: EmailSender;
+	private readonly webhookSender: WebhookSender;
 	private readonly logger: WorkerLogger;
 	private stopping = false;
 	private stopped = false;
@@ -52,7 +59,12 @@ export class DeliveryWorker {
 	private maintenanceTimer?: NodeJS.Timeout;
 	private maintenanceRunning = false;
 
-	constructor(config: WorkerConfig, dependencies: { pool?: pg.Pool; sender?: EmailSender; logger?: WorkerLogger } = {}) {
+	constructor(config: WorkerConfig, dependencies: {
+		pool?: pg.Pool;
+		sender?: EmailSender;
+		webhookSender?: WebhookSender;
+		logger?: WorkerLogger;
+	} = {}) {
 		this.config = config;
 		this.pool = dependencies.pool ?? new pg.Pool({
 			connectionString: config.databaseUrl,
@@ -66,6 +78,7 @@ export class DeliveryWorker {
 			legacyFingerprintKeyId: config.legacyFingerprintKeyId,
 		});
 		this.sender = dependencies.sender ?? createSmtpSender(config);
+		this.webhookSender = dependencies.webhookSender ?? createWebhookSender(config);
 		this.logger = dependencies.logger ?? createJsonLogger();
 	}
 
@@ -148,20 +161,35 @@ export class DeliveryWorker {
 		if (!leased) return false;
 		this.logger.log("info", "delivery.claimed", { jobId: leased.id, eventId: leased.eventId, kind: leased.kind, attempt: leased.attemptCount });
 		try {
-			if (leased.channel !== "email") {
+			if (leased.channel !== "email" && leased.channel !== "webhook") {
 				await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: "transport.unsupported" });
 				return true;
 			}
 			const payload = await this.store.readLeasedPayload<unknown>({ jobId: leased.id, leaseToken: leased.leaseToken, keyring: this.config.keyring });
-			const email = renderEmailPayload(payload, this.config);
+			const email = leased.channel === "email"
+				? renderEmailPayload(payload, this.config)
+				: undefined;
+			const destination = email?.to ??
+				parseOrganizationUpdatedPayload(payload).endpoint.url;
 			await this.store.assertLeasedDestination({
 				jobId: leased.id,
 				leaseToken: leased.leaseToken,
-				destination: email.to,
+				destination,
 				keyring: this.config.keyring,
 			});
-			const result = await this.sendWithLeaseRenewal(leased, email);
-			this.smtpHealthy = true;
+			const result = await this.sendWithLeaseRenewal(
+				leased,
+				email
+					? () => this.sender.send(email, {
+							jobId: leased.id,
+							eventId: leased.eventId,
+						})
+					: () => this.webhookSender.send(payload, {
+							jobId: leased.id,
+							eventId: leased.eventId,
+						}),
+			);
+			if (leased.channel === "email") this.smtpHealthy = true;
 			try {
 				await this.store.markProviderAccepted({
 					jobId: leased.id,
@@ -188,8 +216,12 @@ export class DeliveryWorker {
 				this.logger.log("warn", "delivery.stale_lease", { jobId: leased.id, eventId: leased.eventId });
 				return true;
 			}
-			const classified = classifySmtpError(error);
-			if (classified.errorClass === "smtp.transport") this.smtpHealthy = false;
+			const classified = leased.channel === "webhook"
+				? classifyWebhookError(error)
+				: classifySmtpError(error);
+			if (leased.channel === "email" && classified.errorClass === "smtp.transport") {
+				this.smtpHealthy = false;
+			}
 			try {
 				const result = classified.retryable
 					? await this.store.retry({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus })
@@ -204,7 +236,7 @@ export class DeliveryWorker {
 
 	private async sendWithLeaseRenewal(
 		leased: { id: string; eventId: string; leaseToken: string },
-		payload: unknown,
+		send: () => Promise<Awaited<ReturnType<EmailSender["send"]>>>,
 	): Promise<Awaited<ReturnType<EmailSender["send"]>>> {
 		let stopped = false;
 		let renewalFailure: unknown;
@@ -224,10 +256,7 @@ export class DeliveryWorker {
 			});
 		}, intervalMs);
 		try {
-			const result = await this.sender.send(payload, {
-				jobId: leased.id,
-				eventId: leased.eventId,
-			});
+			const result = await send();
 			stopped = true;
 			clearInterval(timer);
 			await pending;

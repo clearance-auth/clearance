@@ -25,6 +25,13 @@ export type WorkerConfig = {
 	maxBodyBytes: number;
 	appName: string;
 	allowHttpLinks: boolean;
+	webhook: {
+		allowInsecureLoopback: boolean;
+		dnsTimeoutMs: number;
+		connectTimeoutMs: number;
+		responseTimeoutMs: number;
+		maxResponseBytes: number;
+	};
 	healthHost: string;
 	healthPort: number;
 	processOnceLimit: number;
@@ -134,6 +141,13 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 		maxBodyBytes: integer(env, "CLEARANCE_DELIVERY_MAX_BODY_BYTES", 1_048_576, 1_024, 10_485_760),
 		appName: boundedLine(env.CLEARANCE_DELIVERY_APP_NAME?.trim() || "Clearance", "CLEARANCE_DELIVERY_APP_NAME", 120),
 		allowHttpLinks: boolean(env, "CLEARANCE_DELIVERY_ALLOW_HTTP_LINKS", false),
+		webhook: {
+			allowInsecureLoopback: boolean(env, "CLEARANCE_WEBHOOK_ALLOW_INSECURE_LOOPBACK", false),
+			dnsTimeoutMs: integer(env, "CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS", 5_000, 250, 60_000),
+			connectTimeoutMs: integer(env, "CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS", 5_000, 250, 60_000),
+			responseTimeoutMs: integer(env, "CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS", 10_000, 250, 120_000),
+			maxResponseBytes: integer(env, "CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES", 65_536, 0, 1_048_576),
+		},
 		healthHost: env.CLEARANCE_DELIVERY_HEALTH_HOST?.trim() || "127.0.0.1",
 		healthPort: integer(env, "CLEARANCE_DELIVERY_HEALTH_PORT", 8091, 1, 65_535),
 		processOnceLimit: integer(env, "CLEARANCE_DELIVERY_ONCE_LIMIT", 100, 1, 10_000),
