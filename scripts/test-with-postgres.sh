@@ -10,9 +10,8 @@
 #   org-lifecycle -> CLEARANCE_ORG_TEST_DATABASE_URL  (hard-deletes runtime
 #                    rows; refuses the shared database by design)
 #
-# Ephemeral host ports (-p 127.0.0.1::5432) eliminate port collisions rather
-# than detecting them; deterministic container names + docker rm -f before
-# start make a SIGKILLed previous run self-healing.
+# Ephemeral host ports (-p 127.0.0.1::5432) and per-process container names
+# allow concurrent gates without one run deleting another run's databases.
 #
 # Usage:
 #   scripts/test-with-postgres.sh                 # management + delivery/runtime worker suites + 0-skip asserts
@@ -27,15 +26,15 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || die "docker is required (fail closed: the Pg suites must run, not skip)"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable (fail closed: the Pg suites must run, not skip)"
 
-SHARED_NAME="clearance-pgtest-shared"
-ORG_NAME="clearance-pgtest-org"
+SHARED_NAME="clearance-pgtest-shared-$$"
+ORG_NAME="clearance-pgtest-org-$$"
 
 cleanup() {
   docker rm -f "$SHARED_NAME" "$ORG_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
-# Self-heal any stale containers from a killed prior run.
+# Self-heal a stale pair if the operating system later reuses this PID.
 cleanup
 
 docker run -d --rm --name "$SHARED_NAME" \
