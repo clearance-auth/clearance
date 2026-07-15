@@ -62,6 +62,10 @@
 | 2026-07-15 | Hardened store-v2 adoption boundaries during manager review | Apply refuses unowned target-table collisions, invalid phase metadata, and future schema versions without touching external data |
 | 2026-07-15 | Completed store-v2 control-plane integration | Stable registry/API/CLI envelopes for status, plan, apply, verify, and rollback; two-sided confirmation, doctor visibility, structured failure, operation contracts 9/9, API operations 5/5, CLI transport 11/11 |
 | 2026-07-15 | Closed two strict security reviews on the foundation | Fixed missed-writer revision masking, valid unique swaps and environment reparenting, forged enterprise audit actors, raw settings exposure, expired rotation and dry-run, case-variant staging, and SCIM SSRF using all-answer validation, global-unicast policy, pinned DNS, redirect refusal, and operator-only enterprise probes; final review reported no blocker |
+| 2026-07-15 | Committed the first mergeable foundation unit | Commit `ca361e7` contains managed API authorization, store-v2 shadow/control plane, strict-review hardening, live-ledger evidence, and no live secret material |
+| 2026-07-15 | Selected first relational-authority cutover | Audit events move first into a hybrid authoritative store: immutable append cost becomes O(1), the JSON backend remains unchanged, rollback reverse-materializes the visible projection, and 5k/50k production-path append benchmarks gate acceptance; storage implementation started |
+| 2026-07-15 | Froze the delivery-plane transaction and security boundary | Runtime email only in Slice 1; product state plus immutable event, encrypted payload, and initial job must use the ambient runtime adapter transaction; no pool, second Kysely instance, background helper, or post-commit hook; management webhooks remain deferred |
+| 2026-07-15 | Started delivery storage/worker-core implementation | New `@clearance/delivery` package is limited to guarded schema migration, purpose-specific AEAD/HMAC keyring, transaction-adapter enqueue, fenced leasing/retry/dead/cancel/reclaim, retention crypto-erasure, redacted views, and Postgres proof; SMTP/runtime/API/CLI/deploy wiring follows after core review |
 
 ### Current implementation decisions
 
@@ -71,6 +75,8 @@
 - Delivery uses Postgres-native immutable events, leased jobs, attempts, and worker heartbeats. Payloads and endpoint secrets are encrypted under a purpose-specific rotating keyring.
 - Runtime verification, reset, and invitation email jobs use their existing relational transaction context. Management-originated webhooks wait for a store-v2 unit-of-work delivery-intent seam.
 - Delivery semantics are at-least-once with stable event IDs, bounded full-jitter retries, dead-letter state, CLI retry/cancel/replay, exact-byte HMAC signatures, and production SSRF controls.
+- Runtime delivery uses a distinct durable enqueue capability. Signup uses its existing adapter transaction; reset and invitation state changes must be wrapped with `runWithTransaction` and enqueue through `getCurrentAdapter`. Legacy background email callbacks and `queueAfterTransactionHook` are prohibited because they leave post-commit loss windows.
+- Delivery persistence separates immutable event metadata, encrypted expiring payloads, jobs, append-only attempts, and worker heartbeats. Recipient, subject, body, URLs, reset/verification tokens, and invitation details remain inside a purpose-specific AES-256-GCM envelope; keyed fingerprints support quotas and deduplication without plaintext PII.
 
 ### Terminal PR and `0.3.0` release gate
 
