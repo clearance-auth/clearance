@@ -15,6 +15,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import pg from "pg";
 import {
+	createDeliveryKeyring,
+	enqueueDeliveryInExistingTransaction,
+	migrateDeliverySchema,
+	type DeliveryKeyring,
+	type DeliveryKeyringInput,
+	type DeliverySchemaOptions,
+	type EnqueuedDelivery,
+	type EnqueueDeliveryInput,
+} from "@clearance/delivery";
+import {
 	CLEARANCE_RELEASE_VERSION,
 	cloneSnapshot,
 	emptySnapshot,
@@ -39,6 +49,10 @@ import type {
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
 
+export type PgStoreDeliveryOptions = DeliverySchemaOptions & {
+	keyring: DeliveryKeyringInput;
+};
+
 function safeTableName(value: string): string {
 	if (!/^[a-z_][a-z0-9_]*$/i.test(value)) {
 		throw new Error(`Invalid Postgres snapshot table name: ${value}`);
@@ -58,6 +72,8 @@ export class PgStore implements ManagementStore {
 	private emailUniqueTable: string;
 	private slugUniqueTable: string;
 	private idempotencyTable: string;
+	private deliveryKeyring?: DeliveryKeyring;
+	private deliverySchemaOptions?: DeliverySchemaOptions;
 	private storeV2Shadow?: PgStoreV2Shadow;
 	private storeV2Phase: StoreV2Phase = "absent";
 	private pending: Promise<void> = Promise.resolve();
@@ -71,6 +87,7 @@ export class PgStore implements ManagementStore {
 			backupDir?: string;
 			tableName?: string;
 			normalizedPrefix?: string;
+			delivery?: PgStoreDeliveryOptions;
 		},
 	) {
 		this.path = resolve(opts?.backupDir ?? process.cwd(), ".clearance", "pg");
@@ -80,6 +97,16 @@ export class PgStore implements ManagementStore {
 		this.emailUniqueTable = safeTableName(`${this.table}_principal_email`);
 		this.slugUniqueTable = safeTableName(`${this.table}_organization_slug`);
 		this.idempotencyTable = safeTableName(`${this.table}_idempotency`);
+		if (opts?.delivery) {
+			this.deliveryKeyring = createDeliveryKeyring(opts.delivery.keyring);
+			this.deliverySchemaOptions = {
+				...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
+				...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
+				legacyFingerprintKeyId:
+					opts.delivery.legacyFingerprintKeyId ??
+					this.deliveryKeyring.currentFingerprintKeyId,
+			};
+		}
 		const normalizedPrefix =
 			opts?.normalizedPrefix ??
 			(this.table === SNAPSHOT_TABLE ? "mgmt_" : undefined);
@@ -145,6 +172,9 @@ export class PgStore implements ManagementStore {
 				updated_at timestamptz NOT NULL DEFAULT now()
 			)
 		`);
+		if (this.deliveryKeyring) {
+			await migrateDeliverySchema(this.pool, this.deliverySchemaOptions);
+		}
 		// Existing installs created before revision column
 		await this.pool.query(`
 			ALTER TABLE ${this.table}
@@ -310,6 +340,9 @@ export class PgStore implements ManagementStore {
 				sql: string,
 				params?: unknown[],
 			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+			enqueueDelivery?: (
+				input: EnqueueDeliveryInput,
+			) => Promise<EnqueuedDelivery>;
 		}) => Promise<T> | T,
 	): Promise<T> {
 		return new Promise<T>((resolvePromise, rejectPromise) => {
@@ -589,6 +622,9 @@ export class PgStore implements ManagementStore {
 				sql: string,
 				params?: unknown[],
 			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+			enqueueDelivery?: (
+				input: EnqueueDeliveryInput,
+			) => Promise<EnqueuedDelivery>;
 		}) => Promise<T> | T,
 	): Promise<T> {
 		const client = await this.pool.connect();
@@ -617,7 +653,43 @@ export class PgStore implements ManagementStore {
 				};
 			};
 
-			const value = await fn({ data: base, query });
+			const pendingDeliveryEnqueues: Promise<EnqueuedDelivery>[] = [];
+			const enqueueDelivery = this.deliveryKeyring
+				? (input: EnqueueDeliveryInput) => {
+						const pending = enqueueDeliveryInExistingTransaction(
+							{
+								rawTransactionQuery: async <
+									Row extends Record<string, unknown> = Record<string, unknown>,
+								>(text: string, values?: readonly unknown[]) => {
+									const result = await query(
+										text,
+										values ? [...values] : undefined,
+									);
+									return {
+										rows: result.rows as Row[],
+										rowCount: result.rowCount,
+									};
+								},
+							},
+							input,
+							this.deliveryKeyring!,
+							this.deliverySchemaOptions,
+						);
+						pendingDeliveryEnqueues.push(pending);
+						return pending;
+					}
+				: undefined;
+
+			const value = await fn({
+				data: base,
+				query,
+				...(enqueueDelivery ? { enqueueDelivery } : {}),
+			});
+			// A caller cannot accidentally commit product state before an issued
+			// outbox write settles by forgetting to await the returned promise.
+			// Any issued enqueue failure remains transaction-fatal even if a caller
+			// catches or drops its individual promise.
+			await Promise.all(pendingDeliveryEnqueues);
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
 				: undefined;
@@ -740,6 +812,7 @@ export async function createPgStore(
 		backupDir?: string;
 		tableName?: string;
 		normalizedPrefix?: string;
+		delivery?: PgStoreDeliveryOptions;
 	},
 ): Promise<PgStore> {
 	const store = new PgStore(databaseUrl, opts);

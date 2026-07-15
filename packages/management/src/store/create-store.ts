@@ -1,6 +1,10 @@
 import { resolve } from "node:path";
 import { JsonStore, defaultDataPath } from "./json-store.js";
-import { createPgStore, type PgStore } from "./pg-store.js";
+import {
+	createPgStore,
+	type PgStore,
+	type PgStoreDeliveryOptions,
+} from "./pg-store.js";
 import type { ManagementStore } from "./types.js";
 
 export type CreateStoreOptions = {
@@ -9,6 +13,8 @@ export type CreateStoreOptions = {
 	/** Force backend; default chooses postgres when DATABASE_URL is set */
 	backend?: "json" | "postgres" | "auto";
 	databaseUrl?: string;
+	/** Optional encrypted outbox capability for coordinated Postgres mutations. */
+	delivery?: PgStoreDeliveryOptions;
 };
 
 /**
@@ -31,7 +37,9 @@ export async function createManagementStore(
 				"Postgres management store requires DATABASE_URL (or opts.databaseUrl)",
 			);
 		}
-		return createPgStore(databaseUrl);
+		return createPgStore(databaseUrl, {
+			...(opts.delivery ? { delivery: opts.delivery } : {}),
+		});
 	}
 
 	const path = opts.dataPath

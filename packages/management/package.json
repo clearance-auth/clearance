@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@clearance/auth": "workspace:*",
+    "@clearance/delivery": "workspace:*",
     "pg": "^8.14.1"
   },
   "devDependencies": {

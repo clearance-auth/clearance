@@ -10,9 +10,22 @@
  * up only those IDs. Isolated management table names per process.
  */
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
-import { createPgStore, type PgStore } from "../store/pg-store.js";
+import {
+	createPgStore,
+	type PgStore,
+	type PgStoreDeliveryOptions,
+} from "../store/pg-store.js";
+import {
+	createDeliveryKeyring,
+	decryptDeliveryPayload,
+	deliveryTableNames,
+	qualifiedDeliveryTables,
+	quoteIdentifier,
+	type DeliveryPayloadAad,
+} from "@clearance/delivery";
 import {
 	addMemberInAuth,
 	archiveOrganizationInAuth,
@@ -42,6 +55,23 @@ if (DATABASE_URL.includes(":5434")) {
 }
 
 const TEST_TABLE = `clearance_mgmt_org_lc_${process.pid}`;
+const DELIVERY_PREFIX = `org_lc_delivery_${process.pid}_`;
+const deliveryOptions = { prefix: DELIVERY_PREFIX } as const;
+const deliveryKeyInput = {
+	currentKeyId: "org-lifecycle-current",
+	keys: { "org-lifecycle-current": randomBytes(32) },
+	fingerprintKey: randomBytes(32),
+};
+const deliveryKeyring = createDeliveryKeyring(deliveryKeyInput);
+const storeDeliveryOptions: PgStoreDeliveryOptions = {
+	...deliveryOptions,
+	keyring: deliveryKeyInput,
+};
+const webhookTarget = {
+	id: "primary",
+	url: "https://hooks.example.test/clearance",
+	signingSecret: "organization-lifecycle-signing-secret",
+} as const;
 
 const createdRuntimeUserIds = new Set<string>();
 const createdRuntimeOrgIds = new Set<string>();
@@ -145,6 +175,9 @@ function injectSqlFailureAfter(
 					}
 					return result;
 				},
+				...(ctx.enqueueDelivery
+					? { enqueueDelivery: ctx.enqueueDelivery }
+					: {}),
 			});
 			if (saw) {
 				await ctx.query(
@@ -196,6 +229,22 @@ describe.skipIf(!available)(
 			resetAuthBundle();
 			const pool = new pg.Pool({ connectionString: DATABASE_URL });
 			try {
+				const names = deliveryTableNames(deliveryOptions);
+				for (const name of [
+					names.attempt,
+					names.job,
+					names.payload,
+					names.event,
+					names.worker,
+					names.meta,
+				]) {
+					await pool.query(
+						`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`,
+					);
+				}
+				await pool.query(
+					`DROP FUNCTION IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(names.rejectMutationFunction)}()`,
+				);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_principal_email`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_organization_slug`);
@@ -208,8 +257,11 @@ describe.skipIf(!available)(
 			}
 		});
 
-		async function freshStore(): Promise<PgStore> {
-			const store = await createPgStore(DATABASE_URL, { tableName: TEST_TABLE });
+		async function freshStore(input?: { delivery?: boolean }): Promise<PgStore> {
+			const store = await createPgStore(DATABASE_URL, {
+				tableName: TEST_TABLE,
+				...(input?.delivery ? { delivery: storeDeliveryOptions } : {}),
+			});
 			stores.push(store);
 			await store.refresh();
 			if (store.snapshot.projects.length === 0) {
@@ -309,6 +361,256 @@ describe.skipIf(!available)(
 			);
 			expect(audits).toHaveLength(1);
 			expect(audits[0]?.outcome).toBe("success");
+		});
+
+		it("commits one encrypted organization.updated webhook intent with the product mutation", async () => {
+			const store = await freshStore({ delivery: true });
+			const { organization } = await seedOwnerAndOrg(store);
+			const scope = resolveOperatorScope(store);
+			const correlationId = `corr-org-update-${Date.now()}`;
+			const nextName = "Webhook Transaction Corp";
+
+			await updateOrganizationInAuth(store, organization.id, {
+				name: nextName,
+				actor: "webhook-test",
+				source: "api",
+				correlationId,
+				webhookTargets: [webhookTarget],
+			});
+
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				const tables = qualifiedDeliveryTables(deliveryOptions);
+				const result = await pool.query<{
+					id: string;
+					kind: string;
+					project_id: string;
+					environment_id: string;
+					organization_id: string;
+					actor_id: string;
+					correlation_id: string;
+					destination_fingerprint: string;
+					semantic_expires_at: Date;
+					channel: "webhook";
+					state: "queued";
+					envelope: string;
+				}>(
+					`SELECT e.id, e.kind, e.project_id, e.environment_id,
+					 e.organization_id, e.actor_id, e.correlation_id,
+					 e.destination_fingerprint, e.semantic_expires_at,
+					 j.channel, j.state, p.envelope
+					 FROM ${tables.event} e
+					 JOIN ${tables.payload} p ON p.event_id = e.id
+					 JOIN ${tables.job} j ON j.event_id = e.id
+					 WHERE e.organization_id = $1`,
+					[organization.id],
+				);
+				expect(result.rows).toHaveLength(1);
+				const row = result.rows[0]!;
+				expect(row).toMatchObject({
+					kind: "organization.updated",
+					project_id: scope.projectId,
+					environment_id: scope.environmentId,
+					organization_id: organization.id,
+					actor_id: "webhook-test",
+					correlation_id: correlationId,
+					channel: "webhook",
+					state: "queued",
+				});
+				const atRest = JSON.stringify(result.rows);
+				expect(atRest).not.toContain(webhookTarget.url);
+				expect(atRest).not.toContain(webhookTarget.signingSecret);
+
+				const aad: DeliveryPayloadAad = {
+					version: 1,
+					eventId: row.id,
+					kind: row.kind,
+					channel: row.channel,
+					projectId: row.project_id,
+					environmentId: row.environment_id,
+					destinationFingerprint: row.destination_fingerprint,
+					expiresAt: row.semantic_expires_at.toISOString(),
+				};
+				const payload = decryptDeliveryPayload<{
+					endpoint: { id: string; url: string; signingSecret: string };
+					event: {
+						id: string;
+						type: string;
+						context: { correlationId: string };
+						data: { organization: { id: string; name: string } };
+					};
+				}>(row.envelope, aad, deliveryKeyring);
+				expect(payload.endpoint).toEqual({
+					id: webhookTarget.id,
+					url: webhookTarget.url,
+					signingSecret: webhookTarget.signingSecret,
+				});
+				expect(payload.event).toMatchObject({
+					id: row.id,
+					type: "organization.updated",
+					context: { correlationId },
+					data: {
+						organization: { id: organization.id, name: nextName },
+					},
+				});
+			} finally {
+				await pool.end();
+			}
+
+			const audit = listEvents(store, { limit: 200 }).find(
+				(event) =>
+					event.action === "orgs.update" &&
+					event.subjectId === organization.id,
+			);
+			expect(audit?.correlationId).toBe(correlationId);
+			expect((await runtimeOrgRow(organization.id))?.name).toBe(nextName);
+			expect(
+				store.snapshot.organizations.find((org) => org.id === organization.id)?.name,
+			).toBe(nextName);
+		});
+
+		it("rolls the product mutation back when delivery enqueue fails", async () => {
+			const store = await freshStore({ delivery: true });
+			const { organization } = await seedOwnerAndOrg(store);
+			const beforeRuntime = await runtimeOrgRow(organization.id);
+			const beforeEvents = listEvents(store, { limit: 500 }).length;
+			const tables = qualifiedDeliveryTables(deliveryOptions);
+			const names = deliveryTableNames(deliveryOptions);
+			const unavailableJobTable = `${names.job}_unavailable`;
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			await pool.query(
+				`ALTER TABLE ${tables.job} RENAME TO ${quoteIdentifier(unavailableJobTable)}`,
+			);
+			try {
+				await expect(
+					updateOrganizationInAuth(store, organization.id, {
+						name: "Must Roll Back",
+						actor: "webhook-test",
+						correlationId: `corr-enqueue-failure-${Date.now()}`,
+						webhookTargets: [webhookTarget],
+					}),
+				).rejects.toBeTruthy();
+			} finally {
+				await pool.query(
+					`ALTER TABLE ${quoteIdentifier("public")}.${quoteIdentifier(unavailableJobTable)} RENAME TO ${quoteIdentifier(names.job)}`,
+				);
+				await pool.end();
+			}
+
+			await store.refresh();
+			expect((await runtimeOrgRow(organization.id))?.name).toBe(beforeRuntime?.name);
+			expect(
+				store.snapshot.organizations.find((org) => org.id === organization.id)?.name,
+			).toBe(organization.name);
+			expect(listEvents(store, { limit: 500 })).toHaveLength(beforeEvents);
+			const verifyPool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				expect(
+					(
+						await verifyPool.query(
+							`SELECT count(*)::int count FROM ${tables.event} WHERE organization_id = $1`,
+							[organization.id],
+						)
+					).rows[0]?.count,
+				).toBe(0);
+			} finally {
+				await verifyPool.end();
+			}
+		});
+
+		it("rolls the delivery intent back when a later coordinated mutation step fails", async () => {
+			const store = await freshStore({ delivery: true });
+			const { organization } = await seedOwnerAndOrg(store);
+			const beforeRuntime = await runtimeOrgRow(organization.id);
+			const restore = injectSqlFailureAfter(store, (sql) =>
+				sql.includes("update organization"),
+			);
+			try {
+				await expect(
+					updateOrganizationInAuth(store, organization.id, {
+						name: "Late Failure",
+						actor: "webhook-test",
+						correlationId: `corr-late-failure-${Date.now()}`,
+						webhookTargets: [webhookTarget],
+					}),
+				).rejects.toBeTruthy();
+			} finally {
+				restore();
+			}
+
+			await store.refresh();
+			expect((await runtimeOrgRow(organization.id))?.name).toBe(beforeRuntime?.name);
+			expect(
+				store.snapshot.organizations.find((org) => org.id === organization.id)?.name,
+			).toBe(organization.name);
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				const tables = qualifiedDeliveryTables(deliveryOptions);
+				expect(
+					(
+						await pool.query(
+							`SELECT count(*)::int count FROM ${tables.event} WHERE organization_id = $1`,
+							[organization.id],
+						)
+					).rows[0]?.count,
+				).toBe(0);
+			} finally {
+				await pool.end();
+			}
+		});
+
+		it("deduplicates concurrent delivery generations and isolates environments", async () => {
+			const firstStore = await freshStore({ delivery: true });
+			const secondStore = await freshStore({ delivery: true });
+			const scope = resolveOperatorScope(firstStore);
+			const now = new Date();
+			const expiresAt = new Date(now.getTime() + 60_000);
+			const sourceKey = `concurrent-generation-${Date.now()}`;
+			const enqueue = (store: PgStore, eventId: string, environmentId: string) =>
+				store.mutateCoordinated!(({ enqueueDelivery }) => {
+					if (!enqueueDelivery) throw new Error("delivery enqueue unavailable");
+					return enqueueDelivery({
+						eventId,
+						kind: "management.delivery.seam",
+						sourceKey,
+						projectId: scope.projectId,
+						environmentId,
+						channel: "webhook",
+						destination: webhookTarget.url,
+						payload: { generation: sourceKey },
+						semanticExpiresAt: expiresAt,
+						now,
+					});
+				});
+
+			const concurrent = await Promise.allSettled([
+				enqueue(firstStore, `event-a-${Date.now()}`, scope.environmentId),
+				enqueue(secondStore, `event-b-${Date.now()}`, scope.environmentId),
+			]);
+			expect(concurrent.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+			expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
+			const rejected = concurrent.find((result) => result.status === "rejected");
+			expect(rejected).toMatchObject({
+				status: "rejected",
+				reason: { code: "DELIVERY_DUPLICATE" },
+			});
+
+			const otherEnvironmentId = `${scope.environmentId}-isolated`;
+			await enqueue(firstStore, `event-other-env-${Date.now()}`, otherEnvironmentId);
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				const tables = qualifiedDeliveryTables(deliveryOptions);
+				const rows = await pool.query<{ environment_id: string }>(
+					`SELECT environment_id FROM ${tables.event}
+					 WHERE kind = 'management.delivery.seam'
+					 ORDER BY environment_id`,
+				);
+				expect(rows.rows.map((row) => row.environment_id).sort()).toEqual(
+					[scope.environmentId, otherEnvironmentId].sort(),
+				);
+			} finally {
+				await pool.end();
+			}
 		});
 
 		it("update idempotent no-op adds no duplicate audit", async () => {

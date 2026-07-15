@@ -4,6 +4,10 @@ import type {
 } from "../types/resources.js";
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
+import type {
+	EnqueuedDelivery,
+	EnqueueDeliveryInput,
+} from "@clearance/delivery";
 
 export const STORE_V2_COLLECTIONS = [
 	"projects",
@@ -134,6 +138,10 @@ export interface ManagementStore extends ManagementUnitOfWork {
 				sql: string,
 				params?: unknown[],
 			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+			/** Opaque same-transaction outbox capability when delivery is configured. */
+			enqueueDelivery?: (
+				input: EnqueueDeliveryInput,
+			) => Promise<EnqueuedDelivery>;
 		}) => Promise<T> | T,
 	): Promise<T>;
 	checksum(): string;

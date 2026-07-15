@@ -356,6 +356,9 @@ importers:
       '@clearance/auth':
         specifier: workspace:*
         version: link:../clearance-auth
+      '@clearance/delivery':
+        specifier: workspace:*
+        version: link:../delivery
       pg:
         specifier: ^8.14.1
         version: 8.22.0

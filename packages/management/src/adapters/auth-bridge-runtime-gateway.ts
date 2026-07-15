@@ -18,14 +18,22 @@ import {
 import { syncRuntimeOrganizationToManagementDurable } from "../services/identity.js";
 import type { AuthRuntimeGateway } from "../application/auth-runtime-gateway.js";
 import type { ManagementStore } from "../store/types.js";
+import {
+	validateManagementWebhookTargets,
+	type ManagementWebhookTarget,
+} from "../application/delivery.js";
 
 export function createAuthBridgeRuntimeGateway(input: {
 	store: ManagementStore;
+	webhookTargets?: readonly ManagementWebhookTarget[];
 }): AuthRuntimeGateway {
 	const { store } = input;
 	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
 		throw new Error("AuthBridgeRuntimeGateway requires a coordinated Postgres management store");
 	}
+	const webhookTargets = validateManagementWebhookTargets(
+		input.webhookTargets ?? [],
+	);
 
 	return {
 		users: {
@@ -110,6 +118,10 @@ export function createAuthBridgeRuntimeGateway(input: {
 					actor: context.actor,
 					source: context.source,
 					scope: context.scope,
+					...(context.correlationId
+						? { correlationId: context.correlationId }
+						: {}),
+					webhookTargets,
 				}),
 			archiveCoordinated: (context, id, archiveInput) =>
 				archiveOrganizationInAuth(store, id, {

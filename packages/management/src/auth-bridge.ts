@@ -33,7 +33,12 @@ import type {
 	Principal,
 	SessionRecord,
 } from "./types/resources.js";
-import { fingerprint, newId, nowIso } from "./store/json-store.js";
+import {
+	correlationId,
+	fingerprint,
+	newId,
+	nowIso,
+} from "./store/json-store.js";
 import { ClearanceError } from "./services/errors.js";
 import { assertProductionSecret, isForbiddenDefaultSecret } from "./services/secrets.js";
 import {
@@ -72,6 +77,10 @@ import {
 import type { ManagementStore } from "./store/types.js";
 import type { OperationContext } from "./application/context.js";
 import type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
+import {
+	enqueueOrganizationUpdatedWebhooks,
+	type ValidatedManagementWebhookTarget,
+} from "./application/delivery.js";
 
 export type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
 
@@ -2218,6 +2227,8 @@ export async function updateOrganizationInAuth(
 		actor?: string;
 		source?: OrgLifecycleSource;
 		scope?: ResourceScope;
+		correlationId?: string;
+		webhookTargets?: readonly ValidatedManagementWebhookTarget[];
 	},
 ): Promise<Organization> {
 	await ensureAuthMigrated();
@@ -2263,8 +2274,12 @@ export async function updateOrganizationInAuth(
 	const nextName = hasName ? String(input.name).trim() : undefined;
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
+	const corr = input.correlationId ?? correlationId();
+	const source = input.source === "import"
+		? "migration"
+		: input.source ?? "cli";
 
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, query, enqueueDelivery }) => {
 		const org = findOrgInScope(data, id, scope, "orgs.update");
 		const runtime = await requireRuntimeOrg(query, org.id, "orgs.update");
 
@@ -2350,12 +2365,13 @@ export async function updateOrganizationInAuth(
 		org.updatedAt = now;
 
 		appendAuditEvent(data, {
+			correlationId: corr,
 			actor: input.actor ?? "operator",
 			action: "orgs.update",
 			subjectType: "organization",
 			subjectId: org.id,
 			outcome: "success",
-			source: (input.source as "cli") ?? "cli",
+			source,
 			projectId: org.projectId,
 			environmentId: org.environmentId,
 			organizationId: org.id,
@@ -2373,6 +2389,19 @@ export async function updateOrganizationInAuth(
 						}
 					: {}),
 			},
+		});
+		await enqueueOrganizationUpdatedWebhooks({
+			enqueue: enqueueDelivery,
+			targets: input.webhookTargets ?? [],
+			context: {
+				scope,
+				actor: input.actor ?? "operator",
+				source,
+				correlationId: corr,
+			},
+			organization: { ...org },
+			before,
+			occurredAt: new Date(now),
 		});
 
 		return { ...org };
