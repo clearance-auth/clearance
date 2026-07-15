@@ -1,6 +1,6 @@
 import type { GenerateIdFn, LiteralString } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
-import { runWithTransaction } from "@clearance/core/context";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getSessionFromCtx } from "../../../api/routes";
@@ -379,25 +379,47 @@ export const createInvitation = <O extends OrganizationOptions>(option: O) => {
 					"sec",
 				);
 
-				await ctx.context.adapter.update({
-					model: "invitation",
-					where: [
-						{
-							field: "id",
-							value: existingInvitation!.id,
-						},
-					],
-					update: {
-						expiresAt: newExpiresAt,
-					},
-				});
-
-				const updatedInvitation = {
-					...existingInvitation,
-					expiresAt: newExpiresAt,
+				const persistResend = async () => {
+					const transaction = await getCurrentAdapter(ctx.context.adapter);
+					await transaction.update({
+						model: "invitation",
+						where: [{ field: "id", value: existingInvitation!.id }],
+						update: { expiresAt: newExpiresAt },
+					});
+					const updated = { ...existingInvitation, expiresAt: newExpiresAt };
+					if (ctx.context.options.durableDelivery) {
+						const invitationEmail = updated.email!.toLowerCase();
+						await ctx.context.options.durableDelivery.enqueue(transaction, {
+							kind: "organization.invitation",
+							sourceKey: `organization-invitation:${updated.id}:${newExpiresAt.toISOString()}`,
+							organizationId,
+							actorId: session.user.id,
+							channel: "email",
+							destination: invitationEmail,
+							payload: {
+								template: "organization-invitation",
+								to: invitationEmail,
+								role: updated.role,
+								organizationName: organization.name,
+								inviterName: session.user.name,
+								acceptanceUrl:
+									ctx.context.options.durableDelivery.createInvitationUrl(
+										updated.id!,
+									),
+							},
+							semanticExpiresAt: newExpiresAt,
+						});
+					}
+					return updated;
 				};
+				const updatedInvitation = ctx.context.options.durableDelivery
+					? await runWithTransaction(ctx.context.adapter, persistResend)
+					: await persistResend();
 
-				if (ctx.context.orgOptions.sendInvitationEmail) {
+				if (
+					!ctx.context.options.durableDelivery &&
+					ctx.context.orgOptions.sendInvitationEmail
+				) {
 					await ctx.context.runInBackgroundOrAwait(
 						ctx.context.orgOptions.sendInvitationEmail(
 							{
@@ -419,15 +441,9 @@ export const createInvitation = <O extends OrganizationOptions>(option: O) => {
 				return ctx.json(updatedInvitation as unknown as InferInvitation<O>);
 			}
 
-			if (
+			const shouldCancelExisting =
 				alreadyInvited.length &&
-				ctx.context.orgOptions.cancelPendingInvitationsOnReInvite
-			) {
-				await adapter.updateInvitation({
-					invitationId: alreadyInvited[0]!.id,
-					status: "canceled",
-				});
-			}
+				Boolean(ctx.context.orgOptions.cancelPendingInvitationsOnReInvite);
 
 			const invitationLimit =
 				typeof ctx.context.orgOptions.invitationLimit === "function"
@@ -574,12 +590,50 @@ export const createInvitation = <O extends OrganizationOptions>(option: O) => {
 				}
 			}
 
-			const invitation = await adapter.createInvitation({
-				invitation: invitationData,
-				user: session.user,
-			});
+			const persistInvitation = async () => {
+				if (shouldCancelExisting) {
+					await adapter.updateInvitation({
+						invitationId: alreadyInvited[0]!.id,
+						status: "canceled",
+					});
+				}
+				const invitation = await adapter.createInvitation({
+					invitation: invitationData,
+					user: session.user,
+				});
+				if (ctx.context.options.durableDelivery) {
+					const transaction = await getCurrentAdapter(ctx.context.adapter);
+					await ctx.context.options.durableDelivery.enqueue(transaction, {
+						kind: "organization.invitation",
+						sourceKey: `organization-invitation:${invitation.id}:${invitation.expiresAt.toISOString()}`,
+						organizationId,
+						actorId: session.user.id,
+						channel: "email",
+						destination: invitation.email.toLowerCase(),
+						payload: {
+							template: "organization-invitation",
+							to: invitation.email.toLowerCase(),
+							role: invitation.role,
+							organizationName: organization.name,
+							inviterName: session.user.name,
+							acceptanceUrl:
+								ctx.context.options.durableDelivery.createInvitationUrl(
+									invitation.id,
+								),
+						},
+						semanticExpiresAt: invitation.expiresAt,
+					});
+				}
+				return invitation;
+			};
+			const invitation = ctx.context.options.durableDelivery
+				? await runWithTransaction(ctx.context.adapter, persistInvitation)
+				: await persistInvitation();
 
-			if (ctx.context.orgOptions.sendInvitationEmail) {
+			if (
+				!ctx.context.options.durableDelivery &&
+				ctx.context.orgOptions.sendInvitationEmail
+			) {
 				await ctx.context.runInBackgroundOrAwait(
 					ctx.context.orgOptions.sendInvitationEmail(
 						{

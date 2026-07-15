@@ -25,6 +25,7 @@ const mainOptions = { prefix: `delivery_${suffix}` } satisfies DeliverySchemaOpt
 const collisionOptions = { prefix: `delivery_collision_${suffix}` } satisfies DeliverySchemaOptions;
 const futureOptions = { prefix: `delivery_future_${suffix}` } satisfies DeliverySchemaOptions;
 const driftOptions = { prefix: `delivery_drift_${suffix}` } satisfies DeliverySchemaOptions;
+const migrationOptions = { prefix: `delivery_migration_${suffix}` } satisfies DeliverySchemaOptions;
 
 const gate = new pg.Pool({ connectionString: DATABASE_URL, connectionTimeoutMillis: 500 });
 let available = false;
@@ -63,7 +64,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 	const expiry = new Date(start.getTime() + 60 * 60_000);
 
 	afterAll(async () => {
-		for (const options of [mainOptions, collisionOptions, futureOptions, driftOptions]) {
+		for (const options of [mainOptions, collisionOptions, futureOptions, driftOptions, migrationOptions]) {
 			await dropSchemaAssets(pool, options).catch(() => undefined);
 		}
 		await pool.end();
@@ -84,7 +85,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await migrateDeliverySchema(pool, futureOptions);
 		const future = qualifiedDeliveryTables(futureOptions);
 		await pool.query(
-			`UPDATE ${future.meta} SET value='2'::jsonb WHERE key='schema_version'`,
+			`UPDATE ${future.meta} SET value='3'::jsonb WHERE key='schema_version'`,
 		);
 		await expect(migrateDeliverySchema(pool, futureOptions)).rejects.toMatchObject({
 			code: "DELIVERY_SCHEMA_VERSION_FUTURE",
@@ -98,9 +99,45 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		});
 	});
 
+	it("transactionally upgrades owned v1 storage to v2 without losing rows", async () => {
+		await migrateDeliverySchema(pool, migrationOptions);
+		const tables = qualifiedDeliveryTables(migrationOptions);
+		await pool.query(
+			`ALTER TABLE ${tables.job}
+			 DROP CONSTRAINT ${quoteIdentifier(`${tables.names.job}_provider_check`)},
+			 DROP COLUMN provider_accepted_at,
+			 DROP COLUMN provider_status,
+			 DROP COLUMN provider_request_id`,
+		);
+		for (const name of [tables.names.meta, tables.names.event, tables.names.payload, tables.names.job, tables.names.attempt, tables.names.worker]) {
+			await pool.query(`COMMENT ON TABLE ${quoteIdentifier(tables.schema)}.${quoteIdentifier(name)} IS 'clearance.delivery:v1'`);
+		}
+		await pool.query(`COMMENT ON FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}() IS 'clearance.delivery:v1'`);
+		await pool.query(`UPDATE ${tables.meta} SET value='1'::jsonb WHERE key='schema_version'`);
+		await pool.query(
+			`INSERT INTO ${tables.event}
+			 (id,kind,source_fingerprint,project_id,environment_id,destination_fingerprint,created_at,semantic_expires_at)
+			 VALUES ('v1-event','password.reset',$1,'project-1','env-1',$2,$3,$4)`,
+			["a".repeat(64), "b".repeat(64), start, expiry],
+		);
+		await pool.query(
+			`INSERT INTO ${tables.job}
+			 (id,event_id,channel,destination_fingerprint,state,available_at,semantic_expires_at,max_attempts,created_at,updated_at)
+			 VALUES ('v1-job','v1-event','email',$1,'queued',$2,$3,3,$2,$2)`,
+			["b".repeat(64), start, expiry],
+		);
+
+		const migrated = await migrateDeliverySchema(pool, migrationOptions);
+		expect(migrated.version).toBe(2);
+		expect((await pool.query(`SELECT id, state, provider_accepted_at FROM ${tables.job} WHERE id='v1-job'`)).rows).toEqual([
+			{ id: "v1-job", state: "queued", provider_accepted_at: null },
+		]);
+		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(2);
+	});
+
 	it("rolls enqueue back atomically and stores no plaintext", async () => {
 		await store.migrate();
-		expect((await store.migrate()).version).toBe(1);
+		expect((await store.migrate()).version).toBe(2);
 		const client = await pool.connect();
 		try {
 			await expect(enqueueDelivery(
@@ -261,6 +298,33 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			deadJobs: 0,
 			erasedPayloads: 1,
 		});
+	});
+
+	it("renews only a live lease held by the matching token and owner", async () => {
+		await enqueue("event-renew", "job-renew", "source-renew", expiry);
+		const leased = await store.claimNext({ workerId: "worker-renew", leaseMs: 1_000, now: start });
+		expect(leased?.id).toBe("job-renew");
+		const renewAt = new Date(start.getTime() + 500);
+		const renewedExpiry = await store.renewLease({
+			jobId: leased!.id,
+			leaseToken: leased!.leaseToken,
+			workerId: leased!.leaseOwner,
+			leaseMs: 5_000,
+			now: renewAt,
+		});
+		expect(renewedExpiry).toBe(new Date(renewAt.getTime() + 5_000).toISOString());
+		await expect(store.renewLease({
+			jobId: leased!.id, leaseToken: "stale", workerId: leased!.leaseOwner,
+			leaseMs: 5_000, now: renewAt,
+		})).rejects.toMatchObject({ code: "DELIVERY_STALE_LEASE" });
+		await expect(store.renewLease({
+			jobId: leased!.id, leaseToken: leased!.leaseToken, workerId: "wrong-owner",
+			leaseMs: 5_000, now: renewAt,
+		})).rejects.toMatchObject({ code: "DELIVERY_STALE_LEASE" });
+		await expect(store.renewLease({
+			jobId: leased!.id, leaseToken: leased!.leaseToken, workerId: leased!.leaseOwner,
+			leaseMs: 5_000, now: new Date(renewAt.getTime() + 5_001),
+		})).rejects.toMatchObject({ code: "DELIVERY_STALE_LEASE" });
 	});
 
 	it("validates worker, lease, date, retry, and maintenance bounds", async () => {

@@ -6,6 +6,23 @@ import {
 	withClearanceDefaults,
 } from "./index.js";
 
+const databaseUrl =
+	"postgres://clearance:clearance@127.0.0.1:5434/clearance";
+const durableKeyring = {
+	currentKeyId: "current",
+	keys: { current: Buffer.alloc(32, 1).toString("base64") },
+	fingerprintKey: Buffer.alloc(32, 2).toString("base64"),
+};
+
+function durableDelivery(invitationUrl: (invitationId: string) => string) {
+	return {
+		projectId: "project-test",
+		environmentId: "environment-test",
+		invitationUrl,
+		keyring: durableKeyring,
+	};
+}
+
 describe("@clearance/auth runtime wrapper", () => {
 	it("exports real clearance factory (not constants-only stub)", async () => {
 		const mod = await import("@clearance/runtime");
@@ -116,6 +133,124 @@ describe("@clearance/auth runtime wrapper", () => {
 			).toThrow(/refuses default/i);
 		} finally {
 			process.env.NODE_ENV = prev;
+		}
+	});
+
+	it("enables adapter transactions only for durable delivery", async () => {
+		const legacy = createClearanceAuth({
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			enableSso: false,
+			enableScim: false,
+		});
+		const durable = createClearanceAuth({
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			enableSso: false,
+			enableScim: false,
+			durableDelivery: durableDelivery(
+				(id) => `http://localhost:3300/invitations/${id}`,
+			),
+		});
+		try {
+			const legacyDatabase = (
+				legacy.auth as unknown as {
+					options: { database: Record<string, unknown> };
+				}
+			).options.database;
+			const durableDatabase = (
+				durable.auth as unknown as {
+					options: { database: Record<string, unknown> };
+				}
+			).options.database;
+			expect(legacyDatabase).not.toHaveProperty("transaction");
+			expect(durableDatabase).toHaveProperty("transaction", true);
+		} finally {
+			await Promise.all([legacy.destroy(), durable.destroy()]);
+		}
+	});
+
+	it("requires HTTPS durable delivery URLs in strict mode", async () => {
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "http://example.test/api/auth",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				strictSecrets: true,
+				enableSso: false,
+				enableScim: false,
+				durableDelivery: durableDelivery(
+					(id) => `https://example.test/invitations/${id}`,
+				),
+			}),
+		).toThrow(/baseURL must use HTTPS/i);
+
+		const strictBundle = createClearanceAuth({
+			baseURL: "https://example.test/api/auth",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			strictSecrets: true,
+			enableSso: false,
+			enableScim: false,
+			durableDelivery: durableDelivery(
+				(id) => `http://example.test/invitations/${id}`,
+			),
+		});
+		try {
+			const strictDelivery = (
+				strictBundle.auth as unknown as {
+					options: {
+						durableDelivery: { createInvitationUrl(id: string): string };
+					};
+				}
+			).options.durableDelivery;
+			expect(() => strictDelivery.createInvitationUrl("invitation-1")).toThrow(
+				/durableDelivery\.invitationUrl must use HTTPS/i,
+			);
+		} finally {
+			await strictBundle.destroy();
+		}
+	});
+
+	it("allows loopback HTTP durable delivery URLs outside strict mode", async () => {
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "http://example.test/api/auth",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				enableSso: false,
+				enableScim: false,
+				durableDelivery: durableDelivery(
+					(id) => `https://example.test/invitations/${id}`,
+				),
+			}),
+		).toThrow(/HTTP only on a loopback host/i);
+
+		const bundle = createClearanceAuth({
+			baseURL: "http://localhost:3300/api/auth",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			enableSso: false,
+			enableScim: false,
+			durableDelivery: durableDelivery(
+				(id) => `http://localhost:3300/invitations/${id}`,
+			),
+		});
+		try {
+			const runtimeDelivery = (
+				bundle.auth as unknown as {
+					options: {
+						durableDelivery: { createInvitationUrl(id: string): string };
+					};
+				}
+			).options.durableDelivery;
+			expect(runtimeDelivery.createInvitationUrl("invitation-1")).toBe(
+				"http://localhost:3300/invitations/invitation-1",
+			);
+		} finally {
+			await bundle.destroy();
 		}
 	});
 });

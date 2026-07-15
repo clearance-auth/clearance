@@ -396,6 +396,13 @@ export type DBTransactionAdapter<
 	Options extends ClearanceOptions = ClearanceOptions,
 > = Omit<DBAdapter<Options>, "transaction">;
 
+export type DBRawTransactionQuery = <
+	Row extends Record<string, unknown> = Record<string, unknown>,
+>(
+	text: string,
+	values?: readonly unknown[],
+) => Promise<{ rows: Row[]; rowCount: number | null }>;
+
 export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 	id: string;
 	create: <T extends Record<string, any>, R = T>(data: {
@@ -510,6 +517,12 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 		callback: (trx: DBTransactionAdapter<Options>) => Promise<R>,
 	) => Promise<R>;
 	/**
+	 * Execute parameterized SQL on the adapter's already-active transaction.
+	 * PostgreSQL adapters expose this only on the transaction adapter passed to
+	 * `transaction(...)`; base adapters and non-PostgreSQL adapters omit it.
+	 */
+	rawTransactionQuery?: DBRawTransactionQuery | undefined;
+	/**
 	 *
 	 * @param options
 	 * @param file - file path if provided by the user
@@ -527,6 +540,7 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 export type CleanedWhere = Required<Where>;
 
 export interface CustomAdapter {
+	rawTransactionQuery?: DBRawTransactionQuery | undefined;
 	create: <T extends Record<string, any>>({
 		data,
 		model,

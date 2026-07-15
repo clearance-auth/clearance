@@ -846,6 +846,9 @@ export const createAdapterFactory =
 
 		let lazyLoadTransaction: DBAdapter<Options>["transaction"] | null = null;
 		const adapter: DBAdapter<Options> = {
+			...(adapterInstance.rawTransactionQuery
+				? { rawTransactionQuery: adapterInstance.rawTransactionQuery }
+				: {}),
 			transaction: async (cb) => {
 				if (!lazyLoadTransaction) {
 					if (!config.transaction) {

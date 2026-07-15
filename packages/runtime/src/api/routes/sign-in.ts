@@ -2,6 +2,7 @@ import type { ClearanceOptions } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
 import type { User } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import { SocialProviderListEnum } from "@clearance/core/social-providers";
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
@@ -12,7 +13,10 @@ import { handleOAuthUserInfo } from "../../oauth2/link-account";
 import { generateState } from "../../utils";
 import { safeCloneRequest } from "../../utils/request";
 import { formCsrfMiddleware } from "../middlewares/origin-check";
-import { createEmailVerificationToken } from "./email-verification";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "./email-verification";
 
 const socialSignInBodySchema = z.object({
 	/**
@@ -536,7 +540,10 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 				ctx.context.options?.emailAndPassword?.requireEmailVerification &&
 				!user.user.emailVerified
 			) {
-				if (!ctx.context.options?.emailVerification?.sendVerificationEmail) {
+				if (
+					!ctx.context.options.durableDelivery &&
+					!ctx.context.options?.emailVerification?.sendVerificationEmail
+				) {
 					throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.EMAIL_NOT_VERIFIED);
 				}
 
@@ -546,21 +553,17 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 						user.user.email,
 						undefined,
 						ctx.context.options.emailVerification?.expiresIn,
+						{ jti: generateId(16) },
 					);
 					const callbackURL = ctx.body.callbackURL
 						? encodeURIComponent(ctx.body.callbackURL)
 						: encodeURIComponent("/");
 					const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${callbackURL}`;
-					await ctx.context.runInBackgroundOrAwait(
-						ctx.context.options.emailVerification.sendVerificationEmail(
-							{
-								user: user.user,
-								url,
-								token,
-							},
-							safeCloneRequest(ctx.request),
-						),
-					);
+					await dispatchVerificationEmail(ctx, {
+						user: user.user,
+						url,
+						token,
+					});
 				}
 
 				throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.EMAIL_NOT_VERIFIED);

@@ -5,6 +5,7 @@ import {
 	decryptDeliveryPayload,
 	encryptDeliveryPayload,
 	fingerprintDestination,
+	MAX_DELIVERY_PAYLOAD_BYTES,
 	type DeliveryPayloadAad,
 } from "./keyring.js";
 import { redactedDeliveryJob, safeErrorClass, safeProviderValue } from "./redaction.js";
@@ -54,6 +55,21 @@ describe("delivery crypto and redaction", () => {
 		expect(() => createDeliveryKeyring({
 			currentKeyId: "current", keys: { current: "weak" }, fingerprintKey: randomBytes(32),
 		})).toThrowError(/32 bytes/);
+	});
+
+	it("rejects cyclic and oversized payloads before encryption", () => {
+		const keyring = ring();
+		const aad: DeliveryPayloadAad = {
+			version: 1, eventId: "evt_bound", kind: "email.verify", channel: "email",
+			projectId: "project_1", environmentId: "env_1",
+			destinationFingerprint: fingerprintDestination("person@example.test", keyring),
+			expiresAt: "2030-01-01T00:00:00.000Z",
+		};
+		const cyclic: { self?: unknown } = {};
+		cyclic.self = cyclic;
+		expect(() => encryptDeliveryPayload(cyclic, aad, keyring)).toThrowError(/JSON serializable/);
+		expect(() => encryptDeliveryPayload("x".repeat(MAX_DELIVERY_PAYLOAD_BYTES + 1), aad, keyring))
+			.toThrowError(/exceeds/);
 	});
 
 	it("returns public views and provider metadata without secret-bearing strings", () => {

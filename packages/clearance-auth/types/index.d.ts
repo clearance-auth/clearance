@@ -31,6 +31,19 @@ export type CreateClearanceAuthOptions = {
     strictSecrets?: boolean;
     onUserCreated?: (user: ClearanceRuntimeUser) => void | Promise<void>;
     socialProviders?: Record<string, SocialProviderConfig>;
+    durableDelivery?: {
+        projectId: string;
+        environmentId: string;
+        /** Build the application page URL a recipient clicks to accept an invitation. */
+        invitationUrl: (invitationId: string) => string;
+        keyring: {
+            currentKeyId: string;
+            keys: Record<string, string>;
+            fingerprintKey: string;
+        };
+        schema?: string;
+        prefix?: string;
+    };
 };
 export type ClearanceRuntimeMigrationPlan = {
     pendingTables: number;

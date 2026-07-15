@@ -23,6 +23,13 @@ export interface DeliveryTransactionAdapter {
 	): Promise<pg.QueryResult<Row>>;
 }
 
+export type DeliveryRawTransaction = {
+	rawTransactionQuery?: <Row extends Record<string, unknown> = Record<string, unknown>>(
+		text: string,
+		values?: readonly unknown[],
+	) => Promise<{ rows: Row[]; rowCount: number | null }>;
+};
+
 /**
  * Adapt an already checked-out Postgres client. The caller owns BEGIN/COMMIT/
  * ROLLBACK; enqueueDelivery never opens or commits a transaction itself.
@@ -33,6 +40,27 @@ export function createDeliveryTransactionAdapter(
 	return {
 		[transactionAdapterBrand]: true,
 		query: (text, params = []) => client.query(text, params),
+	};
+}
+
+function createDeliveryRawTransactionAdapter(
+	rawTransactionQuery: NonNullable<DeliveryRawTransaction["rawTransactionQuery"]>,
+): DeliveryTransactionAdapter {
+	return {
+		[transactionAdapterBrand]: true,
+		query: async <Row extends pg.QueryResultRow = pg.QueryResultRow>(
+			text: string,
+			params: unknown[] = [],
+		) => {
+			const result = await rawTransactionQuery<Row>(text, params);
+			return {
+				command: "",
+				rowCount: result.rowCount,
+				oid: 0,
+				fields: [],
+				rows: result.rows,
+			};
+		},
 	};
 }
 
@@ -67,6 +95,26 @@ export type EnqueuedDelivery = {
 	createdAt: string;
 	semanticExpiresAt: string;
 };
+
+export async function enqueueDeliveryInExistingTransaction(
+	transaction: DeliveryRawTransaction,
+	input: EnqueueDeliveryInput,
+	ring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<EnqueuedDelivery> {
+	if (!transaction.rawTransactionQuery) {
+		throw new DeliveryError(
+			"DELIVERY_TRANSACTION_REQUIRED",
+			"Durable delivery requires an active PostgreSQL transaction adapter",
+		);
+	}
+	return enqueueDelivery(
+		createDeliveryRawTransactionAdapter(transaction.rawTransactionQuery),
+		input,
+		ring,
+		options,
+	);
+}
 
 function required(value: string, label: string): string {
 	const normalized = value.trim();

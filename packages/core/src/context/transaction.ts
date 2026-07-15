@@ -77,12 +77,12 @@ export const runWithAdapter = async <
 				error = err;
 				hasError = true;
 			}
-			// Execute pending hooks after the function completes (even if it threw)
-			for (const hook of pendingHooks) {
-				await hook();
-			}
+			// Hooks describe successful work and run only after the operation returns.
 			if (hasError) {
 				throw error;
+			}
+			for (const hook of pendingHooks) {
+				await hook();
 			}
 			return result!;
 		})
@@ -128,11 +128,11 @@ export const runWithTransaction = async <
 				hasError = true;
 				error = e;
 			}
-			for (const hook of pendingHooks) {
-				await hook();
-			}
 			if (hasError) {
 				throw error;
+			}
+			for (const hook of pendingHooks) {
+				await hook();
 			}
 			return result!;
 		})

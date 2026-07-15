@@ -3,6 +3,7 @@ import pg from "pg";
 import { DeliveryError, StaleDeliveryLeaseError } from "./errors.js";
 import {
 	decryptDeliveryPayload,
+	fingerprintDestination,
 	type DeliveryKeyring,
 	type DeliveryPayloadAad,
 } from "./keyring.js";
@@ -33,6 +34,9 @@ type JobRow = {
 	available_at: Date | string;
 	semantic_expires_at: Date | string;
 	last_error_class: string | null;
+	provider_accepted_at: Date | string | null;
+	provider_status: string | null;
+	provider_request_id: string | null;
 	created_at: Date | string;
 	updated_at: Date | string;
 	delivered_at: Date | string | null;
@@ -174,9 +178,10 @@ export class DeliveryStore {
 					  AND semantic_expires_at > $1 AND attempt_count < max_attempts
 					ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1
 				)
-				UPDATE ${this.tables.job} j SET
-				 state='leased', lease_token=$2, lease_owner=$3, lease_expires_at=$4,
-				 attempt_count=j.attempt_count+1, updated_at=$1, cancel_requested=false
+					UPDATE ${this.tables.job} j SET
+					 state='leased', lease_token=$2, lease_owner=$3, lease_expires_at=$4,
+					 attempt_count=j.attempt_count+1, updated_at=$1, cancel_requested=false,
+					 provider_accepted_at=NULL, provider_status=NULL, provider_request_id=NULL
 				FROM candidate c, ${this.tables.event} e
 				WHERE j.id=c.id AND e.id=j.event_id
 				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id`,
@@ -238,6 +243,82 @@ export class DeliveryStore {
 			expiresAt: iso(row.expires_at)!,
 		};
 		return decryptDeliveryPayload<T>(row.envelope, aad, input.keyring);
+	}
+
+	/** Extend an active lease while preserving token and owner fencing. */
+	async renewLease(input: {
+		jobId: string;
+		leaseToken: string;
+		workerId: string;
+		leaseMs?: number;
+		now?: Date;
+	}): Promise<string> {
+		const now = validDate(input.now ?? new Date(), "now");
+		const workerId = validWorkerId(input.workerId);
+		const leaseMs = boundedInteger(input.leaseMs ?? 60_000, "leaseMs", 1_000, 600_000);
+		const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+		const result = await this.pool.query<{ lease_expires_at: Date | string }>(
+			`UPDATE ${this.tables.job} SET lease_expires_at=GREATEST(lease_expires_at,$5), updated_at=$4
+			 WHERE id=$1 AND state='leased' AND lease_token=$2 AND lease_owner=$3
+			   AND lease_expires_at > $4
+			 RETURNING lease_expires_at`,
+			[input.jobId, input.leaseToken, workerId, now, leaseExpiresAt],
+		);
+		const row = result.rows[0];
+		if (!row) throw new StaleDeliveryLeaseError();
+		return iso(row.lease_expires_at)!;
+	}
+
+	/** Fail closed if the decrypted recipient differs from the audited destination. */
+	async assertLeasedDestination(input: {
+		jobId: string;
+		leaseToken: string;
+		destination: string;
+		keyring: DeliveryKeyring;
+		now?: Date;
+	}): Promise<void> {
+		const now = validDate(input.now ?? new Date(), "now");
+		const result = await this.pool.query<{ destination_fingerprint: string }>(
+			`SELECT e.destination_fingerprint FROM ${this.tables.job} j
+			 JOIN ${this.tables.event} e ON e.id=j.event_id
+			 WHERE j.id=$1 AND j.state='leased' AND j.lease_token=$2
+			   AND j.lease_expires_at > $3`,
+			[input.jobId, input.leaseToken, now],
+		);
+		const expected = result.rows[0]?.destination_fingerprint;
+		if (!expected) throw new StaleDeliveryLeaseError();
+		if (fingerprintDestination(input.destination, input.keyring) !== expected) {
+			throw new DeliveryError(
+				"DELIVERY_DESTINATION_MISMATCH",
+				"Decrypted delivery recipient does not match the audited destination",
+			);
+		}
+	}
+
+	/** Persist provider acceptance before final completion to prevent blind resend. */
+	async markProviderAccepted(input: {
+		jobId: string;
+		leaseToken: string;
+		workerId: string;
+		providerStatus: string;
+		providerRequestId?: string;
+		now?: Date;
+	}): Promise<void> {
+		const now = validDate(input.now ?? new Date(), "now");
+		const workerId = validWorkerId(input.workerId);
+		const providerStatus = safeProviderValue(input.providerStatus, "status");
+		if (!providerStatus) {
+			throw new DeliveryError("DELIVERY_PROVIDER_STATUS_REQUIRED", "Provider acceptance status is required");
+		}
+		const providerRequestId = safeProviderValue(input.providerRequestId, "requestId");
+		const result = await this.pool.query(
+			`UPDATE ${this.tables.job} SET provider_accepted_at=$4, provider_status=$5,
+			 provider_request_id=$6, last_error_class='provider_accepted_unconfirmed', updated_at=$4
+			 WHERE id=$1 AND state='leased' AND lease_token=$2 AND lease_owner=$3
+			   AND lease_expires_at > $4`,
+			[input.jobId, input.leaseToken, workerId, now, providerStatus, providerRequestId],
+		);
+		if (!result.rowCount) throw new StaleDeliveryLeaseError();
 	}
 
 	async complete(input: {
@@ -375,32 +456,39 @@ export class DeliveryStore {
 		validDate(now, "now");
 		boundedInteger(limit, "reclaim limit", 1, 1_000);
 		return this.transaction(async (client) => {
-			const rows = await client.query<{
-				id: string; attempt_count: number; max_attempts: number; semantic_expires_at: Date | string;
-				lease_token: string; lease_owner: string; cancel_requested: boolean;
-			}>(
-				`SELECT id, attempt_count, max_attempts, semantic_expires_at, lease_token, lease_owner, cancel_requested
+				const rows = await client.query<{
+					id: string; attempt_count: number; max_attempts: number; semantic_expires_at: Date | string;
+					lease_token: string; lease_owner: string; cancel_requested: boolean;
+					provider_accepted_at: Date | string | null; provider_status: string | null;
+					provider_request_id: string | null;
+				}>(
+					`SELECT id, attempt_count, max_attempts, semantic_expires_at, lease_token, lease_owner,
+					 cancel_requested, provider_accepted_at, provider_status, provider_request_id
 				 FROM ${this.tables.job} WHERE state='leased' AND lease_expires_at <= $1
 				 ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2`,
 				[now, limit],
 			);
 			for (const row of rows.rows) {
-				const dead = Number(row.attempt_count) >= Number(row.max_attempts) || new Date(row.semantic_expires_at) <= now;
-				const state = row.cancel_requested ? "cancelled" : dead ? "dead" : "retry";
-				const phase = row.cancel_requested ? "cancelled" : "lease_expired";
+					const acceptedUnconfirmed = row.provider_accepted_at !== null;
+					const dead = acceptedUnconfirmed || Number(row.attempt_count) >= Number(row.max_attempts) || new Date(row.semantic_expires_at) <= now;
+					const state = row.cancel_requested ? "cancelled" : dead ? "dead" : "retry";
+					const phase = row.cancel_requested ? "cancelled" : acceptedUnconfirmed ? "dead" : "lease_expired";
+					const errorClass = acceptedUnconfirmed ? "provider_accepted_unconfirmed" : "lease_expired";
 				await client.query(
 					`UPDATE ${this.tables.job} SET state=$2, available_at=$1,
 					 lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL, cancel_requested=false,
 					 updated_at=$1, dead_at=CASE WHEN $2='dead' THEN $1 ELSE dead_at END,
 					 cancelled_at=CASE WHEN $2='cancelled' THEN $1 ELSE cancelled_at END,
-					 last_error_class='lease_expired' WHERE id=$3 AND lease_token=$4`,
-					[now, state, row.id, row.lease_token],
+						 last_error_class=$5 WHERE id=$3 AND lease_token=$4`,
+						[now, state, row.id, row.lease_token, errorClass],
 				);
 				await client.query(
 					`INSERT INTO ${this.tables.attempt}
-					 (id, job_id, attempt_number, lease_token, phase, worker_id, error_class, created_at)
-					 VALUES ($1,$2,$3,$4,$5,$6,'lease_expired',$7)`,
-					[randomUUID(), row.id, row.attempt_count, row.lease_token, phase, row.lease_owner, now],
+						 (id, job_id, attempt_number, lease_token, phase, worker_id,
+						  provider_status, provider_request_id, error_class, created_at)
+						 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+						[randomUUID(), row.id, row.attempt_count, row.lease_token, phase, row.lease_owner,
+						 row.provider_status, row.provider_request_id, errorClass, now],
 				);
 			}
 			return rows.rows.length;

@@ -16,7 +16,7 @@ import type {
 	RawBuilder,
 	UpdateQueryBuilder,
 } from "kysely";
-import { sql } from "kysely";
+import { CompiledQuery, sql } from "kysely";
 import {
 	insensitiveEq,
 	insensitiveIlike,
@@ -965,8 +965,26 @@ export const kyselyAdapter = (
 					}
 					return (await updateQuery.returningAll().executeTakeFirst()) ?? null;
 				},
-				options: config,
-			};
+			options: config,
+			...(inTransaction && config?.type === "postgres"
+				? {
+						rawTransactionQuery: async <
+							Row extends Record<string, unknown> = Record<string, unknown>,
+						>(text: string, values: readonly unknown[] = []) => {
+							const result = await db.executeQuery(
+								CompiledQuery.raw(text, [...values]),
+							);
+							return {
+								rows: result.rows as Row[],
+								rowCount:
+									result.numAffectedRows === undefined
+										? null
+										: Number(result.numAffectedRows),
+							};
+						},
+					}
+				: {}),
+		};
 		};
 	};
 	let adapterOptions: AdapterFactoryOptions | null = null;

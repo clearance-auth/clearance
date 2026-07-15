@@ -1,18 +1,15 @@
 {
-  "name": "@clearance/delivery",
+  "name": "@clearance/delivery-worker",
   "version": "0.2.1",
-  "description": "Postgres-native transactional delivery storage and worker core for Clearance",
+  "description": "Separately deployable SMTP delivery worker for Clearance",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/delivery" },
+  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/delivery-worker" },
+  "bin": { "clearance-delivery-worker": "./dist/cli.mjs" },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
-    ".": {
-      "dev-source": "./src/index.ts",
-      "types": "./dist/index.d.mts",
-      "default": "./dist/index.mjs"
-    }
+    ".": { "types": "./dist/index.d.mts", "default": "./dist/index.mjs" }
   },
   "files": ["dist"],
   "scripts": {
@@ -21,10 +18,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/delivery": "workspace:*",
+    "nodemailer": "^7.0.5",
     "pg": "^8.14.1"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
+    "@types/nodemailer": "^7.0.1",
     "@types/pg": "^8.11.11",
     "tsdown": "catalog:",
     "typescript": "catalog:",

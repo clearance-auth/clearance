@@ -1,5 +1,6 @@
 import type { AuthContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
@@ -87,7 +88,10 @@ export const requestPasswordReset = createAuthEndpoint(
 		use: [originCheck((ctx) => ctx.body.redirectTo)],
 	},
 	async (ctx) => {
-		if (!ctx.context.options.emailAndPassword?.sendResetPassword) {
+		if (
+			!ctx.context.options.durableDelivery &&
+			!ctx.context.options.emailAndPassword?.sendResetPassword
+		) {
 			ctx.context.logger.error(
 				"Reset password isn't enabled.Please pass an emailAndPassword.sendResetPassword function in your auth config!",
 			);
@@ -119,33 +123,52 @@ export const requestPasswordReset = createAuthEndpoint(
 		}
 		const defaultExpiresIn = 60 * 60 * 1;
 		const expiresAt = getDate(
-			ctx.context.options.emailAndPassword.resetPasswordTokenExpiresIn ||
+			ctx.context.options.emailAndPassword?.resetPasswordTokenExpiresIn ||
 				defaultExpiresIn,
 			"sec",
 		);
 		const verificationToken = generateId(24);
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: user.user.id,
-			identifier: `reset-password:${verificationToken}`,
-			expiresAt,
-		});
-		const callbackURL = redirectTo ? encodeURIComponent(redirectTo) : "";
-		const url = `${ctx.context.baseURL}/reset-password/${verificationToken}?callbackURL=${callbackURL}`;
-		await ctx.context.runInBackgroundOrAwait(
-			ctx.context.options.emailAndPassword.sendResetPassword(
-				{
-					user: user.user,
-					url,
-					token: verificationToken,
-				},
-				ctx.request,
-			),
-		);
-		return ctx.json({
-			status: true,
-			message:
-				"If this email exists in our system, check your email for the reset link",
-		});
+		const createResetGeneration = async () => {
+			await ctx.context.internalAdapter.createVerificationValue({
+				value: user.user.id,
+				identifier: `reset-password:${verificationToken}`,
+				expiresAt,
+			});
+			const callbackURL = redirectTo ? encodeURIComponent(redirectTo) : "";
+			const url = `${ctx.context.baseURL}/reset-password/${verificationToken}?callbackURL=${callbackURL}`;
+			if (ctx.context.options.durableDelivery) {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				await ctx.context.options.durableDelivery.enqueue(transaction, {
+					kind: "password.reset",
+					sourceKey: `reset-password:${verificationToken}`,
+					actorId: user.user.id,
+					channel: "email",
+					destination: user.user.email,
+					payload: {
+						template: "password-reset",
+						to: user.user.email,
+						userName: user.user.name,
+						url,
+					},
+					semanticExpiresAt: expiresAt,
+				});
+			} else {
+				await ctx.context.runInBackgroundOrAwait(
+					ctx.context.options.emailAndPassword!.sendResetPassword!(
+						{ user: user.user, url, token: verificationToken },
+						ctx.request,
+					),
+				);
+			}
+			return ctx.json({
+				status: true,
+				message:
+					"If this email exists in our system, check your email for the reset link",
+			});
+		};
+		return ctx.context.options.durableDelivery
+			? runWithTransaction(ctx.context.adapter, createResetGeneration)
+			: createResetGeneration();
 	},
 );
 

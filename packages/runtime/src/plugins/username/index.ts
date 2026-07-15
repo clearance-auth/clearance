@@ -5,8 +5,12 @@ import {
 } from "@clearance/core/api";
 import type { Account, User } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
-import { createEmailVerificationToken } from "../../api";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "../../api/routes/email-verification";
 import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema, parseUserOutput } from "../../db";
@@ -497,6 +501,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 						!user.emailVerified
 					) {
 						if (
+							!ctx.context.options.durableDelivery &&
 							!ctx.context.options?.emailVerification?.sendVerificationEmail
 						) {
 							throw APIError.from("FORBIDDEN", ERROR_CODES.EMAIL_NOT_VERIFIED);
@@ -508,20 +513,16 @@ export const username = (options?: UsernameOptions | undefined) => {
 								user.email,
 								undefined,
 								ctx.context.options.emailVerification?.expiresIn,
+								{ jti: generateId(16) },
 							);
 							const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
 								ctx.body.callbackURL || "/",
 							)}`;
-							await ctx.context.runInBackgroundOrAwait(
-								ctx.context.options.emailVerification.sendVerificationEmail(
-									{
-										user: user,
-										url,
-										token,
-									},
-									ctx.request,
-								),
-							);
+							await dispatchVerificationEmail(ctx, {
+								user,
+								url,
+								token,
+							});
 						}
 
 						throw APIError.from("FORBIDDEN", ERROR_CODES.EMAIL_NOT_VERIFIED);

@@ -81,4 +81,18 @@ describe("runWithTransaction", () => {
 		expect(hookRunsInsideTransaction).toBe(0);
 		expect(hookRuns).toBe(1);
 	});
+
+	it("discards after-transaction hooks when the transaction rolls back", async () => {
+		const { adapter } = createTransactionHarness();
+		let hookRuns = 0;
+
+		await expect(runWithTransaction(adapter, async () => {
+			await queueAfterTransactionHook(async () => {
+				hookRuns += 1;
+			});
+			throw new Error("force rollback");
+		})).rejects.toThrow("force rollback");
+
+		expect(hookRuns).toBe(0);
+	});
 });

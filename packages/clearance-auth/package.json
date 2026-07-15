@@ -32,10 +32,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/delivery": "workspace:*",
     "kysely": "catalog:",
     "pg": "^8.14.1"
   },
   "devDependencies": {
+    "@clearance/delivery-worker": "workspace:*",
     "@clearance/runtime": "workspace:*",
     "@clearance/sso": "workspace:*",
     "@clearance/scim": "workspace:*",

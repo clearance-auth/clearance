@@ -1,13 +1,18 @@
 import type { ClearanceOptions } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
 import { deleteSessionCookie, setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto";
 import { parseUserInput, parseUserOutput } from "../../db/schema";
 import type { AdditionalUserFieldsInput } from "../../types";
 import { originCheck } from "../middlewares";
-import { createEmailVerificationToken } from "./email-verification";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "./email-verification";
 import {
 	getSessionFromCtx,
 	isStateful,
@@ -745,12 +750,17 @@ export const changeEmail = createAuthEndpoint(
 		const canUpdateWithoutVerification =
 			ctx.context.session.user.emailVerified !== true &&
 			ctx.context.options.user.changeEmail.updateEmailWithoutVerification;
-		const canSendVerification =
-			ctx.context.options.emailVerification?.sendVerificationEmail;
-		const canSendConfirmation =
+		const canSendVerification = Boolean(
+			ctx.context.options.durableDelivery ||
+				ctx.context.options.emailVerification?.sendVerificationEmail,
+		);
+		const legacySendConfirmation =
+			ctx.context.options.user.changeEmail.sendChangeEmailConfirmation;
+		const canSendConfirmation = Boolean(
 			canSendVerification &&
 			ctx.context.session.user.emailVerified &&
-			ctx.context.options.user.changeEmail.sendChangeEmailConfirmation;
+			(ctx.context.options.durableDelivery || legacySendConfirmation),
+		);
 
 		if (
 			!canUpdateWithoutVerification &&
@@ -783,12 +793,39 @@ export const changeEmail = createAuthEndpoint(
 		 * If the email is not verified, we can update the email if the option is enabled
 		 */
 		if (canUpdateWithoutVerification) {
-			await ctx.context.internalAdapter.updateUserByEmail(
-				ctx.context.session.user.email,
-				{
-					email: newEmail,
-				},
-			);
+			let verification: { token: string; url: string } | undefined;
+			if (canSendVerification) {
+				const token = await createEmailVerificationToken(
+					ctx.context.secret,
+					newEmail,
+					undefined,
+					ctx.context.options.emailVerification?.expiresIn,
+					{ jti: generateId(16) },
+				);
+				verification = {
+					token,
+					url: `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
+						ctx.body.callbackURL || "/",
+					)}`,
+				};
+			}
+			const updateAndDispatch = async () => {
+				await ctx.context.internalAdapter.updateUserByEmail(
+					ctx.context.session.user.email,
+					{ email: newEmail },
+				);
+				if (verification) {
+					await dispatchVerificationEmail(ctx, {
+						user: { ...ctx.context.session.user, email: newEmail },
+						...verification,
+					});
+				}
+			};
+			if (ctx.context.options.durableDelivery) {
+				await runWithTransaction(ctx.context.adapter, updateAndDispatch);
+			} else {
+				await updateAndDispatch();
+			}
 			await setSessionCookie(ctx, {
 				session: ctx.context.session.session,
 				user: {
@@ -796,33 +833,6 @@ export const changeEmail = createAuthEndpoint(
 					email: newEmail,
 				},
 			});
-			if (canSendVerification) {
-				const token = await createEmailVerificationToken(
-					ctx.context.secret,
-					newEmail,
-					undefined,
-					ctx.context.options.emailVerification?.expiresIn,
-				);
-				const url = `${
-					ctx.context.baseURL
-				}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
-					ctx.body.callbackURL || "/",
-				)}`;
-				await ctx.context.runInBackgroundOrAwait(
-					canSendVerification(
-						{
-							user: {
-								...ctx.context.session.user,
-								email: newEmail,
-							},
-							url,
-							token,
-						},
-						ctx.request,
-					),
-				);
-			}
-
 			return ctx.json({
 				status: true,
 			});
@@ -839,6 +849,7 @@ export const changeEmail = createAuthEndpoint(
 				ctx.context.options.emailVerification?.expiresIn,
 				{
 					requestType: "change-email-confirmation",
+					jti: generateId(16),
 				},
 			);
 			const url = `${
@@ -846,17 +857,21 @@ export const changeEmail = createAuthEndpoint(
 			}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
 				ctx.body.callbackURL || "/",
 			)}`;
-			await ctx.context.runInBackgroundOrAwait(
-				canSendConfirmation(
-					{
-						user: ctx.context.session.user,
-						newEmail: newEmail,
-						url,
-						token,
-					},
-					ctx.request,
-				),
-			);
+			if (ctx.context.options.durableDelivery) {
+				await dispatchVerificationEmail(ctx, {
+					user: ctx.context.session.user,
+					url,
+					token,
+					template: "email-change-confirmation",
+				});
+			} else {
+				await ctx.context.runInBackgroundOrAwait(
+					legacySendConfirmation!(
+						{ user: ctx.context.session.user, newEmail, url, token },
+						ctx.request,
+					),
+				);
+			}
 			return ctx.json({
 				status: true,
 			});
@@ -876,6 +891,7 @@ export const changeEmail = createAuthEndpoint(
 			ctx.context.options.emailVerification?.expiresIn,
 			{
 				requestType: "change-email-verification",
+				jti: generateId(16),
 			},
 		);
 		const url = `${
@@ -883,19 +899,12 @@ export const changeEmail = createAuthEndpoint(
 		}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
 			ctx.body.callbackURL || "/",
 		)}`;
-		await ctx.context.runInBackgroundOrAwait(
-			canSendVerification(
-				{
-					user: {
-						...ctx.context.session.user,
-						email: newEmail,
-					},
-					url,
-					token,
-				},
-				ctx.request,
-			),
-		);
+		await dispatchVerificationEmail(ctx, {
+			user: { ...ctx.context.session.user, email: newEmail },
+			url,
+			token,
+			template: "email-change-verification",
+		});
 		return ctx.json({
 			status: true,
 		});

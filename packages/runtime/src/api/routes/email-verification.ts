@@ -1,8 +1,10 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import type { JWTPayload, JWTVerifyResult } from "jose";
-import { jwtVerify } from "jose";
+import { decodeJwt, jwtVerify } from "jose";
 import { JWTExpired } from "jose/errors";
 import * as z from "zod";
 import { setSessionCookie } from "../../cookies";
@@ -41,6 +43,62 @@ export async function createEmailVerificationToken(
 	return token;
 }
 
+export function getEmailVerificationExpiry(token: string): Date {
+	const expiresAt = decodeJwt(token).exp;
+	if (!expiresAt) {
+		throw new Error("Email verification token is missing an expiry");
+	}
+	return new Date(expiresAt * 1_000);
+}
+
+export async function dispatchVerificationEmail(
+	ctx: GenericEndpointContext,
+	input: {
+		user: User;
+		url: string;
+		token: string;
+		template?:
+			| "email-verification"
+			| "email-change-confirmation"
+			| "email-change-verification";
+	},
+): Promise<void> {
+	const durableDelivery = ctx.context.options.durableDelivery;
+	const legacySend = ctx.context.options.emailVerification?.sendVerificationEmail;
+	if (!durableDelivery && !legacySend) {
+		ctx.context.logger.error("Verification email isn't enabled.");
+		throw APIError.from(
+			"BAD_REQUEST",
+			BASE_ERROR_CODES.VERIFICATION_EMAIL_NOT_ENABLED,
+		);
+	}
+	if (durableDelivery) {
+		await runWithTransaction(ctx.context.adapter, async () => {
+			const template = input.template ?? "email-verification";
+			const transaction = await getCurrentAdapter(ctx.context.adapter);
+			await durableDelivery.enqueue(transaction, {
+				kind:
+					template === "email-verification"
+						? "email.verification"
+						: template.replaceAll("-", "."),
+				sourceKey: `${template}:${input.token}`,
+				actorId: input.user.id,
+				channel: "email",
+				destination: input.user.email,
+				payload: {
+					template,
+					to: input.user.email,
+					userName: input.user.name,
+					url: input.url,
+				},
+				semanticExpiresAt: getEmailVerificationExpiry(input.token),
+			});
+		});
+		return;
+	}
+	await legacySend!(input, safeCloneRequest(ctx.request));
+}
+
 /**
  * A function to send a verification email to the user
  */
@@ -48,7 +106,9 @@ export async function sendVerificationEmailFn(
 	ctx: GenericEndpointContext,
 	user: User,
 ) {
-	if (!ctx.context.options.emailVerification?.sendVerificationEmail) {
+	const durableDelivery = ctx.context.options.durableDelivery;
+	const legacySend = ctx.context.options.emailVerification?.sendVerificationEmail;
+	if (!durableDelivery && !legacySend) {
 		ctx.context.logger.error("Verification email isn't enabled.");
 		throw APIError.from(
 			"BAD_REQUEST",
@@ -60,6 +120,7 @@ export async function sendVerificationEmailFn(
 		user.email,
 		undefined,
 		ctx.context.options.emailVerification?.expiresIn,
+		{ jti: generateId(16) },
 	);
 	const callbackURL = ctx.body.callbackURL
 		? encodeURIComponent(ctx.body.callbackURL)
@@ -67,14 +128,7 @@ export async function sendVerificationEmailFn(
 	const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${callbackURL}`;
 	// Await directly: `runInBackgroundOrAwait` may defer work or swallow errors (see #8757).
 	// This path only runs once a real unverified user is known, so timing here does not weaken the unauthenticated anti-enumeration behavior above.
-	await ctx.context.options.emailVerification.sendVerificationEmail(
-		{
-			user: user,
-			url,
-			token,
-		},
-		ctx.request,
-	);
+	await dispatchVerificationEmail(ctx, { user, url, token });
 }
 export const sendVerificationEmail = createAuthEndpoint(
 	"/send-verification-email",
@@ -162,7 +216,10 @@ export const sendVerificationEmail = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		if (!ctx.context.options.emailVerification?.sendVerificationEmail) {
+		if (
+			!ctx.context.options.durableDelivery &&
+			!ctx.context.options.emailVerification?.sendVerificationEmail
+		) {
 			ctx.context.logger.error("Verification email isn't enabled.");
 			throw APIError.from(
 				"BAD_REQUEST",
@@ -341,23 +398,25 @@ export const verifyEmail = createAuthEndpoint(
 						parsed.email,
 						parsed.updateTo,
 						ctx.context.options.emailVerification?.expiresIn,
-						{ requestType: "change-email-verification" },
+						{
+							requestType: "change-email-verification",
+							jti: generateId(16),
+						},
 					);
 					const updateCallbackURL = ctx.query.callbackURL
 						? encodeURIComponent(ctx.query.callbackURL)
 						: encodeURIComponent("/");
 					const url = `${ctx.context.baseURL}/verify-email?token=${newToken}&callbackURL=${updateCallbackURL}`;
-					if (ctx.context.options.emailVerification?.sendVerificationEmail) {
-						await ctx.context.runInBackgroundOrAwait(
-							ctx.context.options.emailVerification.sendVerificationEmail(
-								{
-									user: { ...user.user, email: parsed.updateTo },
-									url,
-									token: newToken,
-								},
-								safeCloneRequest(ctx.request),
-							),
-						);
+					if (
+						ctx.context.options.durableDelivery ||
+						ctx.context.options.emailVerification?.sendVerificationEmail
+					) {
+						await dispatchVerificationEmail(ctx, {
+							user: { ...user.user, email: parsed.updateTo },
+							url,
+							token: newToken,
+							template: "email-change-verification",
+						});
 					}
 					if (ctx.query.callbackURL) {
 						throw ctx.redirect(ctx.query.callbackURL);
@@ -434,30 +493,38 @@ export const verifyEmail = createAuthEndpoint(
 							user: user.user,
 						};
 					}
-					const updatedUser =
-						await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
-							email: parsed.updateTo,
-							emailVerified: false,
-						});
 					const newToken = await createEmailVerificationToken(
 						ctx.context.secret,
 						parsed.updateTo,
+						undefined,
+						ctx.context.options.emailVerification?.expiresIn,
+						{ jti: generateId(16) },
 					);
 					const updateCallbackURL = ctx.query.callbackURL
 						? encodeURIComponent(ctx.query.callbackURL)
 						: encodeURIComponent("/");
-					if (ctx.context.options.emailVerification?.sendVerificationEmail) {
-						await ctx.context.runInBackgroundOrAwait(
-							ctx.context.options.emailVerification.sendVerificationEmail(
-								{
-									user: updatedUser,
-									url: `${ctx.context.baseURL}/verify-email?token=${newToken}&callbackURL=${updateCallbackURL}`,
-									token: newToken,
-								},
-								safeCloneRequest(ctx.request),
-							),
-						);
-					}
+					const updateAndDispatch = async () => {
+						const updated =
+							await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
+								email: parsed.updateTo,
+								emailVerified: false,
+							});
+						if (
+							ctx.context.options.durableDelivery ||
+							ctx.context.options.emailVerification?.sendVerificationEmail
+						) {
+							await dispatchVerificationEmail(ctx, {
+								user: updated,
+								url: `${ctx.context.baseURL}/verify-email?token=${newToken}&callbackURL=${updateCallbackURL}`,
+								token: newToken,
+								template: "email-change-verification",
+							});
+						}
+						return updated;
+					};
+					const updatedUser = ctx.context.options.durableDelivery
+						? await runWithTransaction(ctx.context.adapter, updateAndDispatch)
+						: await updateAndDispatch();
 					await setSessionCookie(ctx, {
 						session: activeSession.session,
 						user: {

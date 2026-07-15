@@ -22,6 +22,9 @@ export type {
 	ClearanceRateLimitRule,
 	ClearanceRateLimitStorage,
 	DynamicBaseURLConfig,
+	DurableDeliveryEnqueueInput,
+	DurableDeliveryRuntimeOptions,
+	DurableDeliveryTransaction,
 	GenerateIdFn,
 	StoreIdentifierOption,
 } from "./init-options";

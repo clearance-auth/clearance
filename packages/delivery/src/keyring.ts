@@ -9,6 +9,8 @@ import { DeliveryError } from "./errors.js";
 
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
+export const MAX_DELIVERY_PAYLOAD_BYTES = 10_485_760;
+const MAX_DELIVERY_CIPHERTEXT_BASE64URL_BYTES = Math.ceil(MAX_DELIVERY_PAYLOAD_BYTES * 4 / 3) + 4;
 const ENVELOPE_PREFIX = "clrd$v1$";
 const KEY_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -190,9 +192,20 @@ export function encryptDeliveryPayload(
 	aad: DeliveryPayloadAad,
 	ring: DeliveryKeyring,
 ): { envelope: string; keyId: string } {
-	const plaintext = JSON.stringify(payload);
+	let plaintext: string | undefined;
+	try {
+		plaintext = JSON.stringify(payload);
+	} catch {
+		throw new DeliveryError("DELIVERY_PAYLOAD_INVALID", "Delivery payload must be JSON serializable");
+	}
 	if (plaintext === undefined) {
 		throw new DeliveryError("DELIVERY_PAYLOAD_INVALID", "Delivery payload must be JSON serializable");
+	}
+	if (Buffer.byteLength(plaintext, "utf8") > MAX_DELIVERY_PAYLOAD_BYTES) {
+		throw new DeliveryError(
+			"DELIVERY_PAYLOAD_TOO_LARGE",
+			`Delivery payload exceeds ${MAX_DELIVERY_PAYLOAD_BYTES} bytes`,
+		);
 	}
 	const key = ring.keys.get(ring.currentKeyId);
 	if (!key) throw new DeliveryError("DELIVERY_CURRENT_KEY_MISSING", "Current delivery key is unavailable");
@@ -223,6 +236,9 @@ export function decryptDeliveryPayload<T = unknown>(
 	if (!keyId || !ivRaw || !tagRaw || ciphertextRaw === undefined) {
 		throw new DeliveryError("DELIVERY_ENVELOPE_INVALID", "Malformed delivery payload envelope");
 	}
+	if (Buffer.byteLength(ciphertextRaw, "utf8") > MAX_DELIVERY_CIPHERTEXT_BASE64URL_BYTES) {
+		throw new DeliveryError("DELIVERY_PAYLOAD_TOO_LARGE", "Encrypted delivery payload exceeds the supported size");
+	}
 	const key = ring.keys.get(keyId);
 	if (!key) throw new DeliveryError("DELIVERY_KEY_UNAVAILABLE", `Delivery key ${keyId} is unavailable`);
 	const iv = Buffer.from(ivRaw, "base64url");
@@ -238,6 +254,9 @@ export function decryptDeliveryPayload<T = unknown>(
 			decipher.update(Buffer.from(ciphertextRaw, "base64url")),
 			decipher.final(),
 		]);
+		if (plaintext.length > MAX_DELIVERY_PAYLOAD_BYTES) {
+			throw new DeliveryError("DELIVERY_PAYLOAD_TOO_LARGE", "Decrypted delivery payload exceeds the supported size");
+		}
 		return JSON.parse(plaintext.toString("utf8")) as T;
 	} catch (cause) {
 		throw new DeliveryError(

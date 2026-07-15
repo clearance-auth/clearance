@@ -37,6 +37,24 @@ describe("forgot password", async () => {
 		expect(token.length).toBeGreaterThan(10);
 	});
 
+	it("keeps legacy reset callbacks independent of adapter transactions", async () => {
+		let sent = false;
+		const { auth, testUser: legacyUser } = await getTestInstance({
+			emailAndPassword: {
+				enabled: true,
+				async sendResetPassword() {
+					sent = true;
+				},
+			},
+		});
+		const context = await auth.$context;
+		(context.adapter as unknown as { transaction: () => Promise<never> }).transaction = async () => {
+			throw new Error("legacy reset must not open a transaction");
+		};
+		await auth.api.requestPasswordReset({ body: { email: legacyUser.email } });
+		expect(sent).toBe(true);
+	});
+
 	it("should reject untrusted redirectTo", async () => {
 		const { client, testUser } = await getTestInstance({
 			emailAndPassword: {

@@ -1,4 +1,9 @@
 import { clearance, APIError, type ClearanceOptions } from "@clearance/runtime";
+import {
+	createDeliveryKeyring,
+	enqueueDeliveryInExistingTransaction,
+	migrateDeliverySchema,
+} from "@clearance/delivery";
 import { symmetricDecrypt, symmetricEncrypt } from "@clearance/runtime/crypto";
 import { organization } from "@clearance/runtime/plugins";
 import { getMigrations } from "@clearance/runtime/db/migration";
@@ -77,6 +82,32 @@ export async function decryptRuntimeCredential(
 	return symmetricDecrypt({ key: secret, data: ciphertext });
 }
 
+function validateDurableDeliveryUrl(
+	raw: string,
+	label: string,
+	requireHttps: boolean,
+): URL {
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error(`${label} must be an absolute URL`);
+	}
+	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+		throw new Error(`${label} must be an HTTP(S) URL`);
+	}
+	if (requireHttps && parsed.protocol !== "https:") {
+		throw new Error(`${label} must use HTTPS in strict mode`);
+	}
+	if (
+		parsed.protocol === "http:" &&
+		!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
+	) {
+		throw new Error(`${label} may use HTTP only on a loopback host`);
+	}
+	return parsed;
+}
+
 /**
  * Build a Clearance auth instance on the Clearance runtime.
  * Telemetry is always disabled. Rate limiting is enabled by default.
@@ -103,11 +134,58 @@ export function createClearanceAuth(
 	if (!options.databaseUrl) {
 		throw new Error("databaseUrl is required for createClearanceAuth");
 	}
+	if (options.durableDelivery) {
+		validateDurableDeliveryUrl(options.baseURL, "baseURL", strict);
+	}
 
 	const pool = new pg.Pool({ connectionString: options.databaseUrl });
 	const db = new Kysely({
 		dialect: new PostgresDialect({ pool }),
 	});
+	const deliveryKeyring = options.durableDelivery
+		? createDeliveryKeyring(options.durableDelivery.keyring)
+		: null;
+	const durableDelivery = options.durableDelivery && deliveryKeyring
+		? {
+				createInvitationUrl: (invitationId: string) => {
+					const raw = options.durableDelivery!.invitationUrl(invitationId);
+					const parsed = validateDurableDeliveryUrl(
+						raw,
+						"durableDelivery.invitationUrl",
+						strict,
+					);
+					return parsed.toString();
+				},
+				enqueue: async (
+					transaction: {
+						rawTransactionQuery?: <Row extends Record<string, unknown> = Record<string, unknown>>(
+							text: string,
+							values?: readonly unknown[],
+						) => Promise<{ rows: Row[]; rowCount: number | null }>;
+					},
+					input: Omit<Parameters<typeof enqueueDeliveryInExistingTransaction>[1], "projectId" | "environmentId">,
+				) => {
+					await enqueueDeliveryInExistingTransaction(
+						transaction,
+						{
+							...input,
+							projectId: options.durableDelivery!.projectId,
+							environmentId: options.durableDelivery!.environmentId,
+						},
+						deliveryKeyring,
+						{
+							schema: options.durableDelivery!.schema,
+							prefix: options.durableDelivery!.prefix,
+						},
+					);
+				},
+			}
+		: undefined;
+	const database = {
+		db,
+		type: "postgres" as const,
+		...(durableDelivery ? { transaction: true as const } : {}),
+	};
 
 	const plugins = [
 		organization(),
@@ -176,7 +254,11 @@ export function createClearanceAuth(
 		appName: "Clearance",
 		baseURL: options.baseURL,
 		secret: options.secret,
-		database: { db, type: "postgres" },
+		database,
+		durableDelivery,
+		emailVerification: durableDelivery
+			? { sendOnSignUp: true }
+			: undefined,
 		emailAndPassword: {
 			enabled: true,
 			minPasswordLength: 12,
@@ -235,7 +317,7 @@ export function createClearanceAuth(
 	});
 
 	const migrationConfig = {
-		database: { db, type: "postgres" },
+		database,
 		secret: options.secret,
 		baseURL: options.baseURL,
 		emailAndPassword: { enabled: true },
@@ -304,6 +386,12 @@ export function createClearanceAuth(
 			const plan = await planMigrations();
 			await plan.apply();
 			await ensureLifecycleCompatibility();
+			if (options.durableDelivery) {
+				await migrateDeliverySchema(pool, {
+					schema: options.durableDelivery.schema,
+					prefix: options.durableDelivery.prefix,
+				});
+			}
 			return {
 				appliedTables: plan.pendingTables,
 				appliedFields: plan.pendingFields,

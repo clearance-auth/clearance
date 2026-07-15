@@ -5,6 +5,40 @@ import { organizationClient } from "../client";
 import { organization } from "../organization";
 import type { OrganizationOptions } from "../types";
 
+describe("legacy invitation delivery", () => {
+	it("does not require adapter transaction support", async () => {
+		let sent = false;
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [
+				organization({
+					async sendInvitationEmail() {
+						sent = true;
+					},
+				}),
+			],
+		});
+		const { headers } = await signInWithTestUser();
+		const organizationRecord = await auth.api.createOrganization({
+			body: { name: "Legacy", slug: `legacy-${Date.now()}` },
+			headers,
+		});
+		const context = await auth.$context;
+		(context.adapter as unknown as { transaction: () => Promise<never> }).transaction = async () => {
+			throw new Error("legacy invitation must not open a transaction");
+		};
+		const invitation = await auth.api.createInvitation({
+			body: {
+				email: "legacy-invite@example.test",
+				role: "member",
+				organizationId: organizationRecord.id,
+			},
+			headers,
+		});
+		expect(invitation.email).toBe("legacy-invite@example.test");
+		expect(sent).toBe(true);
+	});
+});
+
 /**
  * @see https://github.com/clearance-auth/clearance
  */

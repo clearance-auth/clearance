@@ -3,6 +3,48 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { admin } from "../../plugins/admin/admin";
 import { getTestInstance } from "../../test-utils/test-instance";
 
+it("hashes the password before opening the durable signup transaction", async () => {
+	const order: string[] = [];
+	const { auth } = await getTestInstance(
+		{
+			durableDelivery: {
+				createInvitationUrl: (id) => `https://example.test/invitations/${id}`,
+				async enqueue() {
+					order.push("enqueue");
+				},
+			},
+			emailVerification: { sendOnSignUp: true },
+		},
+		{ disableTestUser: true },
+	);
+	const context = await auth.$context;
+	const originalHash = context.password.hash;
+	context.password.hash = async (password) => {
+		order.push("hash");
+		return originalHash(password);
+	};
+	const originalTransaction = context.adapter.transaction.bind(context.adapter);
+	(
+		context.adapter as unknown as {
+			transaction: typeof context.adapter.transaction;
+		}
+	).transaction = async (callback) => {
+		order.push("transaction");
+		return originalTransaction(callback);
+	};
+
+	await auth.api.signUpEmail({
+		body: {
+			email: "durable-order@example.test",
+			password: "password123",
+			name: "Durable Order",
+		},
+	});
+
+	expect(order.indexOf("hash")).toBeLessThan(order.indexOf("transaction"));
+	expect(order).toContain("enqueue");
+});
+
 describe("sign-up with custom fields", async () => {
 	const mockFn = vi.fn();
 

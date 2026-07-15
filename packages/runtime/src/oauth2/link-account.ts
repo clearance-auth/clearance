@@ -1,6 +1,11 @@
 import type { GenericEndpointContext } from "@clearance/core";
+import { runWithTransaction } from "@clearance/core/context";
 import { isDevelopment } from "@clearance/core/env";
-import { createEmailVerificationToken } from "../api";
+import { generateId } from "@clearance/core/utils/id";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "../api/routes/email-verification";
 import { setAccountCookie } from "../cookies/session-store";
 import { parseAdditionalUserInputFromProviderProfile } from "../db";
 import type { Account, User } from "../types";
@@ -224,8 +229,8 @@ export async function handleOAuthUserInfo(
 				providerId: account.providerId,
 				accountId: userInfo.id.toString(),
 			};
-			const { user: createdUser, account: createdAccount } =
-				await c.context.internalAdapter.createOAuthUser(
+			const createUserAndDelivery = async () => {
+				const result = await c.context.internalAdapter.createOAuthUser(
 					{
 						name,
 						image,
@@ -235,35 +240,40 @@ export async function handleOAuthUserInfo(
 					},
 					accountData,
 				);
+				if (
+					!userInfo.emailVerified &&
+					c.context.options.emailVerification?.sendOnSignUp &&
+					(c.context.options.durableDelivery ||
+						c.context.options.emailVerification?.sendVerificationEmail)
+				) {
+					const token = await createEmailVerificationToken(
+						c.context.secret,
+						result.user.email,
+						undefined,
+						c.context.options.emailVerification?.expiresIn,
+						{ jti: generateId(16) },
+					);
+					const url = `${c.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
+						callbackURL || "/",
+					)}`;
+					await dispatchVerificationEmail(c, {
+						user: result.user,
+						url,
+						token,
+					});
+				}
+				return result;
+			};
+			const { user: createdUser, account: createdAccount } =
+				c.context.options.durableDelivery
+					? await runWithTransaction(
+							c.context.adapter,
+							createUserAndDelivery,
+						)
+					: await createUserAndDelivery();
 			user = createdUser;
 			if (c.context.options.account?.storeAccountCookie) {
 				await setAccountCookie(c, createdAccount);
-			}
-			if (
-				!userInfo.emailVerified &&
-				user &&
-				c.context.options.emailVerification?.sendOnSignUp &&
-				c.context.options.emailVerification?.sendVerificationEmail
-			) {
-				const token = await createEmailVerificationToken(
-					c.context.secret,
-					user.email,
-					undefined,
-					c.context.options.emailVerification?.expiresIn,
-				);
-				const url = `${c.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
-					callbackURL || "/",
-				)}`;
-				await c.context.runInBackgroundOrAwait(
-					c.context.options.emailVerification.sendVerificationEmail(
-						{
-							user,
-							url,
-							token,
-						},
-						c.request,
-					),
-				);
 			}
 		} catch (e: any) {
 			c.context.logger.error(e);

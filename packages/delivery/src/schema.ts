@@ -1,9 +1,9 @@
 import type pg from "pg";
 import { DeliveryError } from "./errors.js";
 
-export const DELIVERY_SCHEMA_VERSION = 1 as const;
+export const DELIVERY_SCHEMA_VERSION = 2 as const;
 export const DELIVERY_SCHEMA_OWNER = "clearance.delivery" as const;
-const DELIVERY_SCHEMA_ASSET_MARKER = "clearance.delivery:v1";
+const deliverySchemaAssetMarker = (version: 1 | 2) => `clearance.delivery:v${version}`;
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
 const IDENTIFIER_MAX = 63;
@@ -133,6 +133,9 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			lease_expires_at timestamptz,
 			cancel_requested boolean NOT NULL DEFAULT false,
 			last_error_class text,
+			provider_accepted_at timestamptz,
+			provider_status text,
+			provider_request_id text,
 			created_at timestamptz NOT NULL,
 			updated_at timestamptz NOT NULL,
 			delivered_at timestamptz,
@@ -142,6 +145,8 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			CHECK (attempt_count <= max_attempts),
 			CHECK ((state = 'leased') = (lease_token IS NOT NULL AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
 			CHECK (state = 'leased' OR cancel_requested = false),
+			CONSTRAINT ${quoteIdentifier(`${names.job}_provider_check`)}
+				CHECK ((provider_accepted_at IS NULL) = (provider_status IS NULL)),
 			CHECK (state <> 'delivered' OR delivered_at IS NOT NULL),
 			CHECK (state <> 'dead' OR dead_at IS NOT NULL),
 			CHECK (state <> 'cancelled' OR cancelled_at IS NOT NULL)
@@ -173,8 +178,8 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			last_seen_at timestamptz NOT NULL
 		)`,
 		...([names.meta, names.event, names.payload, names.job, names.attempt, names.worker] as const)
-			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${DELIVERY_SCHEMA_ASSET_MARKER}'`),
-		`COMMENT ON FUNCTION ${rejectMutation}() IS '${DELIVERY_SCHEMA_ASSET_MARKER}'`,
+			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(2)}'`),
+		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(2)}'`,
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${names.event}_immutable' AND tgrelid = '${event}'::regclass) THEN
 				CREATE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}
@@ -196,10 +201,11 @@ function schemaDrift(message: string): never {
 	throw new DeliveryError("DELIVERY_SCHEMA_DRIFT", message);
 }
 
-async function verifyDeliverySchemaV1(
+async function verifyDeliverySchema(
 	client: pg.PoolClient,
 	schema: string,
 	names: DeliveryTableNames,
+	version: 1 | 2,
 ): Promise<void> {
 	const expectedColumns = new Map<string, string[]>([
 		[names.meta, ["key:text:true", "updated_at:timestamp with time zone:true", "value:jsonb:true"]],
@@ -220,6 +226,10 @@ async function verifyDeliverySchemaV1(
 			"destination_fingerprint:text:true", "event_id:text:true", "id:text:true", "last_error_class:text:false",
 			"lease_expires_at:timestamp with time zone:false", "lease_owner:text:false", "lease_token:text:false",
 			"max_attempts:integer:true", "semantic_expires_at:timestamp with time zone:true", "state:text:true",
+			...(version >= 2 ? [
+				"provider_accepted_at:timestamp with time zone:false", "provider_request_id:text:false",
+				"provider_status:text:false",
+			] : []),
 			"updated_at:timestamp with time zone:true",
 		]],
 		[names.attempt, [
@@ -252,7 +262,7 @@ async function verifyDeliverySchemaV1(
 			.map((row) => `${row.column_name}:${row.data_type}:${row.not_null}`)
 			.sort();
 		if (JSON.stringify(actual) !== JSON.stringify([...expected].sort())) {
-			schemaDrift(`Delivery table ${table} columns differ from schema v1`);
+			schemaDrift(`Delivery table ${table} columns differ from schema v${version}`);
 		}
 	}
 
@@ -282,6 +292,9 @@ async function verifyDeliverySchemaV1(
 		[names.attempt, ["PRIMARY KEY (ID)", "FOREIGN KEY (JOB_ID)", "UNIQUE (JOB_ID, ATTEMPT_NUMBER, PHASE)", "PHASE = ANY"]],
 		[names.worker, ["PRIMARY KEY (ID)", "STATE = ANY"]],
 	]);
+	if (version >= 2) {
+		requiredConstraintFragments.get(names.job)!.push("PROVIDER_ACCEPTED_AT IS NULL");
+	}
 	for (const [table, fragments] of requiredConstraintFragments) {
 		const actual = definitions(table);
 		for (const fragment of fragments) {
@@ -338,8 +351,29 @@ async function verifyDeliverySchemaV1(
 		!functionDefinition.includes("interval '30 days'") ||
 		!functionDefinition.includes(names.job)
 	) {
-		schemaDrift("Delivery history guard function differs from schema v1");
+		schemaDrift(`Delivery history guard function differs from schema v${version}`);
 	}
+}
+
+async function migrateDeliverySchemaV1ToV2(
+	client: pg.PoolClient,
+	schema: string,
+	names: DeliveryTableNames,
+): Promise<void> {
+	const job = fq(schema, names.job);
+	await client.query(`ALTER TABLE ${job}
+		ADD COLUMN provider_accepted_at timestamptz,
+		ADD COLUMN provider_status text,
+		ADD COLUMN provider_request_id text`);
+	await client.query(`ALTER TABLE ${job}
+		ADD CONSTRAINT ${quoteIdentifier(`${names.job}_provider_check`)}
+		CHECK ((provider_accepted_at IS NULL) = (provider_status IS NULL))`);
+	for (const name of [names.meta, names.event, names.payload, names.job, names.attempt, names.worker]) {
+		await client.query(`COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(2)}'`);
+	}
+	await client.query(
+		`COMMENT ON FUNCTION ${fq(schema, names.rejectMutationFunction)}() IS '${deliverySchemaAssetMarker(2)}'`,
+	);
 }
 
 export async function migrateDeliverySchema(
@@ -381,6 +415,7 @@ export async function migrateDeliverySchema(
 				"Refusing to adopt unowned delivery tables or functions",
 			);
 		}
+		let existingVersion: 1 | 2 | null = null;
 		if (metaExists) {
 			const metadata = await client.query<{ key: string; value: unknown }>(
 				`SELECT key, value FROM ${fq(schema, names.meta)} WHERE key IN ('owner', 'schema_version')`,
@@ -399,6 +434,7 @@ export async function migrateDeliverySchema(
 					`Delivery schema version ${version} is newer than supported version ${DELIVERY_SCHEMA_VERSION}`,
 				);
 			}
+			existingVersion = version as 1 | 2;
 			if (existing.rows.length !== targets.length || !functionExisting.rowCount) {
 				throw new DeliveryError(
 					"DELIVERY_SCHEMA_COLLISION",
@@ -417,19 +453,24 @@ export async function migrateDeliverySchema(
 				 WHERE n.nspname=$1 AND p.proname=$2`,
 				[schema, names.rejectMutationFunction],
 			);
+			const expectedMarker = deliverySchemaAssetMarker(existingVersion);
 			if (
-				tableOwnership.rows.some((row) => row.marker !== DELIVERY_SCHEMA_ASSET_MARKER) ||
-				functionOwnership.rows[0]?.marker !== DELIVERY_SCHEMA_ASSET_MARKER
+				tableOwnership.rows.some((row) => row.marker !== expectedMarker) ||
+				functionOwnership.rows[0]?.marker !== expectedMarker
 			) {
 				throw new DeliveryError(
 					"DELIVERY_SCHEMA_COLLISION",
 					"Delivery schema contains assets without Clearance ownership markers",
 				);
 			}
-			await verifyDeliverySchemaV1(client, schema, names);
+			await verifyDeliverySchema(client, schema, names, existingVersion);
 		}
-		for (const statement of schemaStatements(schema, names)) await client.query(statement);
-		await verifyDeliverySchemaV1(client, schema, names);
+		if (existingVersion === 1) {
+			await migrateDeliverySchemaV1ToV2(client, schema, names);
+		} else {
+			for (const statement of schemaStatements(schema, names)) await client.query(statement);
+		}
+		await verifyDeliverySchema(client, schema, names, DELIVERY_SCHEMA_VERSION);
 		const meta = fq(schema, names.meta);
 		await client.query(
 			`INSERT INTO ${meta} (key, value) VALUES ('owner', $1::jsonb), ('schema_version', $2::jsonb)

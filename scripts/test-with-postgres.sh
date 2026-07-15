@@ -15,7 +15,7 @@
 # start make a SIGKILLed previous run self-healing.
 #
 # Usage:
-#   scripts/test-with-postgres.sh                 # management + delivery suites + 0-skip asserts
+#   scripts/test-with-postgres.sh                 # management + delivery/runtime worker suites + 0-skip asserts
 #   scripts/test-with-postgres.sh -- <command...> # run any command in this env
 set -euo pipefail
 
@@ -77,7 +77,7 @@ if [[ "${1:-}" == "--" ]]; then
   exit $?
 fi
 
-# Default: run the management and delivery suites with machine-checked zero-skip results.
+# Default: run management and every Postgres-backed delivery surface with machine-checked zero-skip results.
 # The pg-gate tripwire already fails unreachable-DB suites; the reporter
 # assertion additionally catches any FUTURE suite that skips by some other
 # mechanism (belt and braces, per FOLLOW.md P1.1.4).
@@ -105,5 +105,7 @@ EOF
 
 run_zero_skip_suite packages/management management
 run_zero_skip_suite packages/delivery delivery
+run_zero_skip_suite packages/delivery-worker delivery-worker
+run_zero_skip_suite packages/clearance-auth clearance-auth
 
 echo "TEST_WITH_POSTGRES_OK"

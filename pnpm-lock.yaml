@@ -137,6 +137,9 @@ importers:
 
   packages/clearance-auth:
     dependencies:
+      '@clearance/delivery':
+        specifier: workspace:*
+        version: link:../delivery
       kysely:
         specifier: 'catalog:'
         version: 0.29.3
@@ -144,6 +147,9 @@ importers:
         specifier: ^8.14.1
         version: 8.22.0
     devDependencies:
+      '@clearance/delivery-worker':
+        specifier: workspace:*
+        version: link:../delivery-worker
       '@clearance/runtime':
         specifier: workspace:*
         version: link:../runtime
@@ -262,6 +268,37 @@ importers:
       '@types/node':
         specifier: ^22.20.1
         version: 22.20.1
+      '@types/pg':
+        specifier: ^8.11.11
+        version: 8.20.0
+      tsdown:
+        specifier: 'catalog:'
+        version: 0.22.7(tsx@4.23.1)(typescript@6.0.3)
+      typescript:
+        specifier: 'catalog:'
+        version: 6.0.3
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@22.20.1)(happy-dom@20.10.6)(msw@2.15.0(@types/node@22.20.1)(typescript@6.0.3))(vite@8.1.4(@types/node@22.20.1)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.1))
+
+  packages/delivery-worker:
+    dependencies:
+      '@clearance/delivery':
+        specifier: workspace:*
+        version: link:../delivery
+      nodemailer:
+        specifier: ^7.0.5
+        version: 7.0.13
+      pg:
+        specifier: ^8.14.1
+        version: 8.22.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.20.1
+        version: 22.20.1
+      '@types/nodemailer':
+        specifier: ^7.0.1
+        version: 7.0.12
       '@types/pg':
         specifier: ^8.11.11
         version: 8.20.0
@@ -2220,6 +2257,9 @@ packages:
   '@types/node@26.1.1':
     resolution: {integrity: sha512-nxAkRSVkN1Y0JC1W8ky/fTfkGsMmcrRsbx+3XoZE+rMOX71kLYTV7fLXpqud1GpbpP5TuffXFqfX7fH2GgZREw==}
 
+  '@types/nodemailer@7.0.12':
+    resolution: {integrity: sha512-80vKwiIsVSyFA1rRovH59jNPLBOuc6dRZIHEu40gXTkBkZnQv8vog1xSGEb9j5q/tdMAs5ivvDR2pLTU0hGHXA==}
+
   '@types/pg@8.20.0':
     resolution: {integrity: sha512-bEPFOaMAHTEP1EzpvHTbmwR8UsFyHSKsRisLIHVMXnpNefSbGA1bD6CVy+qKjGSqmZqNqBDV2azOBo8TgkcVow==}
 
@@ -3493,6 +3533,10 @@ packages:
 
   node-rsa@1.1.1:
     resolution: {integrity: sha512-Jd4cvbJMryN21r5HgxQOpMEqv+ooke/korixNNK3mGqfGJmy0M77WDDzo/05969+OkMy3XW1UuZsSmW9KQm7Fw==}
+
+  nodemailer@7.0.13:
+    resolution: {integrity: sha512-PNDFSJdP+KFgdsG3ZzMXCgquO7I6McjY2vlqILjtJd0hy8wEvtugS9xKRF2NWlPNGxvLCXlTNIae4serI7dinw==}
+    engines: {node: '>=6.0.0'}
 
   oauth2-mock-server@8.2.3:
     resolution: {integrity: sha512-Lgem1ZjVYG6NuzJ7J6MC2OchMkJWzwb1SFvwuGunQ1VPmQIU+/ydG3LzgBu/cnFWriYD8ZTd2CQpjHtvcVZy3A==}
@@ -5742,6 +5786,10 @@ snapshots:
     dependencies:
       undici-types: 8.3.0
 
+  '@types/nodemailer@7.0.12':
+    dependencies:
+      '@types/node': 22.20.1
+
   '@types/pg@8.20.0':
     dependencies:
       '@types/node': 26.1.1
@@ -6925,6 +6973,8 @@ snapshots:
   node-rsa@1.1.1:
     dependencies:
       asn1: 0.2.6
+
+  nodemailer@7.0.13: {}
 
   oauth2-mock-server@8.2.3:
     dependencies:

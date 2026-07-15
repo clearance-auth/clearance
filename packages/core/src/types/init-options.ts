@@ -47,6 +47,39 @@ export type GenerateIdFn = (options: {
 	size?: number | undefined;
 }) => string | false;
 
+export type DurableDeliveryEnqueueInput = {
+	eventId?: string;
+	jobId?: string;
+	kind: string;
+	sourceKey: string;
+	organizationId?: string;
+	actorId?: string;
+	correlationId?: string;
+	replayOf?: string;
+	channel: "email" | "webhook";
+	destination: string;
+	payload: unknown;
+	semanticExpiresAt: Date;
+	availableAt?: Date;
+	maxAttempts?: number;
+	now?: Date;
+};
+
+export type DurableDeliveryTransaction = {
+	rawTransactionQuery?: <Row extends Record<string, unknown> = Record<string, unknown>>(
+		text: string,
+		values?: readonly unknown[],
+	) => Promise<{ rows: Row[]; rowCount: number | null }>;
+};
+
+export type DurableDeliveryRuntimeOptions = {
+	createInvitationUrl(invitationId: string): string;
+	enqueue(
+		transaction: DurableDeliveryTransaction,
+		input: DurableDeliveryEnqueueInput,
+	): Promise<void>;
+};
+
 /**
  * Configuration for dynamic base URL resolution.
  * Allows Clearance to work with multiple domains (e.g., Vercel preview deployments).
@@ -427,6 +460,8 @@ export type ClearanceAdvancedOptions = {
 };
 
 export type ClearanceOptions = {
+	/** Internal bridge configured by a product wrapper with delivery-only keys. */
+	durableDelivery?: DurableDeliveryRuntimeOptions | undefined;
 	/**
 	 * The name of your application. Used as a display name in contexts
 	 * where your app needs to be identified — for example, as the default
