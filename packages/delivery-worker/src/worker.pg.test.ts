@@ -72,7 +72,13 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	const suffix = `${process.pid}_${randomUUID().slice(0, 8).replace(/-/g, "")}_`;
 	const prefix = `delivery_worker_${suffix}`;
 	const pool = new pg.Pool({ connectionString: DATABASE_URL });
-	const keyring = createDeliveryKeyring({ currentKeyId: "current", keys: { current: randomBytes(32) }, fingerprintKey: randomBytes(32) });
+	const keyring = createDeliveryKeyring({
+		currentKeyId: "current",
+		keys: { current: randomBytes(32) },
+		currentFingerprintKeyId: "fingerprint-current",
+		fingerprintKeys: { "fingerprint-current": randomBytes(32) },
+		sourceDedupeKey: randomBytes(32),
+	});
 	const smtp = new SmtpFixture();
 	const logs: string[] = [];
 	let config: WorkerConfig;
@@ -102,7 +108,7 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	async function enqueue(eventId: string, jobId: string, sourceKey: string, payload: unknown = {
 		template: "email-verification", to: "person@example.test", userName: "Test User",
 		url: "https://app.example.test/verify?token=verification-secret",
-	}) {
+	}, enqueueKeyring = keyring) {
 		const client = await pool.connect();
 		try {
 			await client.query("BEGIN");
@@ -111,7 +117,7 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 				channel: "email", destination: "person@example.test",
 				payload,
 				semanticExpiresAt: new Date(Date.now() + 60_000),
-			}, keyring, { prefix });
+			}, enqueueKeyring, { prefix });
 			await client.query("COMMIT");
 		} catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 	}
@@ -211,6 +217,45 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`);
 		}
 		await pool.query(`DROP FUNCTION IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(names.rejectMutationFunction)}()`);
+	});
+
+	it("rechecks referenced fingerprint keys on every readiness probe", async () => {
+		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });
+		const worker = new DeliveryWorker({
+			...config,
+			workerId: `fingerprint-ready-${suffix}`,
+		}, {
+			pool: workerPool,
+			sender: { async verify() {}, async send() { throw new Error("unused"); }, close() {} },
+		});
+		await worker.initialize();
+		expect((await worker.readiness()).ready).toBe(true);
+		const producerKeyring = createDeliveryKeyring({
+			currentKeyId: keyring.currentKeyId,
+			keys: Object.fromEntries(keyring.keys),
+			currentFingerprintKeyId: "fingerprint-next",
+			fingerprintKeys: {
+				...Object.fromEntries(keyring.fingerprintKeys),
+				"fingerprint-next": randomBytes(32),
+			},
+			sourceDedupeKey: keyring.sourceDedupeKey,
+		});
+		await enqueue(
+			"event-fingerprint-next",
+			"job-fingerprint-next",
+			"source-fingerprint-next",
+			undefined,
+			producerKeyring,
+		);
+		const missing = await worker.readiness();
+		expect(missing.schema).toBe(true);
+		expect(missing.keyring).toBe(false);
+		expect(missing.ready).toBe(false);
+		await worker.store.cancel("job-fingerprint-next");
+		const recovered = await worker.readiness();
+		expect(recovered.keyring).toBe(true);
+		expect(recovered.ready).toBe(true);
+		await worker.stop();
 	});
 
 	it("retries transient provider failure and fences stale lease ownership", async () => {

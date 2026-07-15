@@ -102,9 +102,9 @@ export class PgStore implements ManagementStore {
 			this.deliverySchemaOptions = {
 				...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
 				...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
-				legacyFingerprintKeyId:
-					opts.delivery.legacyFingerprintKeyId ??
-					this.deliveryKeyring.currentFingerprintKeyId,
+				...(opts.delivery.legacyFingerprintKeyId
+					? { legacyFingerprintKeyId: opts.delivery.legacyFingerprintKeyId }
+					: {}),
 			};
 		}
 		const normalizedPrefix =

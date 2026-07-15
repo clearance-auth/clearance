@@ -39,10 +39,14 @@ export type CreateClearanceAuthOptions = {
         keyring: {
             currentKeyId: string;
             keys: Record<string, string>;
-            fingerprintKey: string;
+            currentFingerprintKeyId: string;
+            fingerprintKeys: Record<string, string>;
+            sourceDedupeKey: string;
         };
         schema?: string;
         prefix?: string;
+        /** Required when upgrading non-empty delivery schema v1/v2; migrate before rotating this key. */
+        legacyFingerprintKeyId?: string;
     };
 };
 export type ClearanceRuntimeMigrationPlan = {

@@ -29,7 +29,9 @@ const delivery = {
 	keyring: {
 		currentKeyId: "current",
 		keys: { current: randomBytes(32) },
-		fingerprintKey: randomBytes(32),
+		currentFingerprintKeyId: "fingerprint-current",
+		fingerprintKeys: { "fingerprint-current": randomBytes(32) },
+		sourceDedupeKey: randomBytes(32),
 	},
 } satisfies PgStoreDeliveryOptions;
 

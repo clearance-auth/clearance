@@ -10,6 +10,7 @@ export type WorkerConfig = {
 	keyring: DeliveryKeyring;
 	schema: string;
 	prefix: string;
+	legacyFingerprintKeyId?: string;
 	smtp: {
 		host: string; port: number; secure: boolean; requireTls: boolean; allowInsecureLoopback: boolean; from: string;
 		user?: string; password?: string; connectionTimeoutMs: number;
@@ -57,6 +58,14 @@ function identifier(value: string, name: string): string {
 	return value;
 }
 
+function fingerprintKeyId(value: string, name: string): string {
+	const normalized = value.trim();
+	if (!/^[A-Za-z0-9._-]{1,64}$/.test(normalized)) {
+		throw new Error(`${name} must be a valid delivery fingerprint key id`);
+	}
+	return normalized;
+}
+
 function boundedLine(value: string, name: string, max: number): string {
 	const normalized = value.trim();
 	if (!normalized || normalized.length > max || /[\r\n]/.test(normalized)) {
@@ -96,6 +105,14 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 		keyring: resolveDeliveryKeyring(env),
 		schema: identifier(env.CLEARANCE_DELIVERY_SCHEMA?.trim() || "public", "CLEARANCE_DELIVERY_SCHEMA"),
 		prefix: identifier(env.CLEARANCE_DELIVERY_PREFIX?.trim() || "delivery_", "CLEARANCE_DELIVERY_PREFIX"),
+		...(env.CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID?.trim()
+			? {
+				legacyFingerprintKeyId: fingerprintKeyId(
+					env.CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID,
+					"CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID",
+				),
+			}
+			: {}),
 		smtp: {
 			host: smtpHost,
 			from: mailbox(required(env, "CLEARANCE_EMAIL_FROM"), "CLEARANCE_EMAIL_FROM"),

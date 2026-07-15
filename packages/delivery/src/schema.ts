@@ -317,6 +317,15 @@ async function verifyDeliverySchema(
 	if (version >= 2) {
 		requiredConstraintFragments.get(names.job)!.push("PROVIDER_ACCEPTED_AT IS NULL");
 	}
+	if (version >= 3) {
+		requiredConstraintFragments.get(names.event)!.push(
+			"SOURCE_FINGERPRINT_KEY_ID ~",
+			"SOURCE_DEDUPE_FINGERPRINT ~",
+			"SOURCE_DEDUPE_VERSION = ANY",
+			"DESTINATION_FINGERPRINT_KEY_ID ~",
+		);
+		requiredConstraintFragments.get(names.job)!.push("DESTINATION_FINGERPRINT_KEY_ID ~");
+	}
 	for (const [table, fragments] of requiredConstraintFragments) {
 		const actual = definitions(table);
 		for (const fragment of fragments) {

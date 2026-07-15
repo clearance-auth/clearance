@@ -39,6 +39,12 @@ type DeliveryEncryptionKeyInput = {
 };
 
 export type DeliveryKeyringInput = DeliveryEncryptionKeyInput & {
+	/**
+	 * Rotation procedure: migrate v1/v2 with its explicit legacy key id first;
+	 * add the new key while retaining old keys; switch this id; deploy producers
+	 * and workers; then use DeliveryStore.assertFingerprintKeysAvailable before
+	 * retiring keys. Keep sourceDedupeKey unchanged across these rotations.
+	 */
 	currentFingerprintKeyId: string;
 	fingerprintKeys: Record<string, string | Buffer>;
 	sourceDedupeKey: string | Buffer;

@@ -60,7 +60,9 @@ const deliveryOptions = { prefix: DELIVERY_PREFIX } as const;
 const deliveryKeyInput = {
 	currentKeyId: "org-lifecycle-current",
 	keys: { "org-lifecycle-current": randomBytes(32) },
-	fingerprintKey: randomBytes(32),
+	currentFingerprintKeyId: "org-lifecycle-fingerprint-current",
+	fingerprintKeys: { "org-lifecycle-fingerprint-current": randomBytes(32) },
+	sourceDedupeKey: randomBytes(32),
 };
 const deliveryKeyring = createDeliveryKeyring(deliveryKeyInput);
 const storeDeliveryOptions: PgStoreDeliveryOptions = {

@@ -12,7 +12,9 @@ function env(): NodeJS.ProcessEnv {
 		CLEARANCE_EMAIL_FROM: "support@example.test",
 		CLEARANCE_DELIVERY_KEY_ID: "current",
 		CLEARANCE_DELIVERY_KEYS_JSON: JSON.stringify({ current: key() }),
-		CLEARANCE_DELIVERY_FINGERPRINT_KEY: key(),
+		CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID: "fingerprint-current",
+		CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON: JSON.stringify({ "fingerprint-current": key() }),
+		CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY: key(),
 	};
 }
 
@@ -22,6 +24,12 @@ describe("delivery worker boundaries", () => {
 		expect(config.concurrency).toBe(64);
 		expect(config.smtp.requireTls).toBe(true);
 		expect(config.allowHttpLinks).toBe(false);
+		expect(parseWorkerConfig({
+			...env(), CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: "fingerprint.previous-1",
+		}).legacyFingerprintKeyId).toBe("fingerprint.previous-1");
+		expect(() => parseWorkerConfig({
+			...env(), CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: "invalid/key",
+		})).toThrow(/valid delivery fingerprint key id/);
 		expect(() => parseWorkerConfig({ ...env(), CLEARANCE_DELIVERY_CONCURRENCY: "65" })).toThrow(/between 1 and 64/);
 		expect(() => parseWorkerConfig({ ...env(), CLEARANCE_SMTP_PASSWORD: "secret" })).toThrow(/provided together/);
 		expect(() => parseWorkerConfig({ ...env(), CLEARANCE_SMTP_REQUIRE_TLS: "maybe" })).toThrow(/true or false/);

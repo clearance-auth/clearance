@@ -53,7 +53,9 @@ describe.sequential.skipIf(!available)(
 		const keys = {
 			currentKeyId: "current",
 			keys: { current: randomBytes(32).toString("base64") },
-			fingerprintKey: randomBytes(32).toString("base64"),
+			currentFingerprintKeyId: "fingerprint-current",
+			fingerprintKeys: { "fingerprint-current": randomBytes(32).toString("base64") },
+			sourceDedupeKey: randomBytes(32).toString("base64"),
 		};
 		const keyring = createDeliveryKeyring(keys);
 		const basePool = new pg.Pool({ connectionString: DATABASE_URL });

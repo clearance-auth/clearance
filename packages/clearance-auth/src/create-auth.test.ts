@@ -11,7 +11,9 @@ const databaseUrl =
 const durableKeyring = {
 	currentKeyId: "current",
 	keys: { current: Buffer.alloc(32, 1).toString("base64") },
-	fingerprintKey: Buffer.alloc(32, 2).toString("base64"),
+	currentFingerprintKeyId: "fingerprint-current",
+	fingerprintKeys: { "fingerprint-current": Buffer.alloc(32, 2).toString("base64") },
+	sourceDedupeKey: Buffer.alloc(32, 3).toString("base64"),
 };
 
 function durableDelivery(invitationUrl: (invitationId: string) => string) {
