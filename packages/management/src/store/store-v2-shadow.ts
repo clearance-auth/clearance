@@ -1205,6 +1205,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		before: DataStoreSnapshot,
 		after: DataStoreSnapshot,
 		revision: number,
+		appendedEvents?: readonly AuditEvent[],
 	): Promise<StoreV2SyncResult> {
 		const meta = await readMeta(client, this.tables);
 		const phase = phaseFromMeta(meta);
@@ -1232,25 +1233,54 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		if (phase === "shadow") {
 			await replaceStoreV2Events(client, this.tables, after.events, revision);
 		} else {
-			const beforeById = new Map(
-				before.events.map((event) => [event.id, stableJson(event)]),
-			);
-			if (new Set(after.events.map((event) => event.id)).size !== after.events.length) {
-				throw new StoreV2MigrationError(
-					"STORE_V2_EVENTS_HISTORY_MUTATION",
-					"Authoritative event mutations cannot contain duplicate historical ids.",
-				);
-			}
-			for (const event of before.events) {
-				const current = after.events.find((candidate) => candidate.id === event.id);
-				if (!current || stableJson(current) !== beforeById.get(event.id)) {
+			let appended: AuditEvent[];
+			if (appendedEvents !== undefined) {
+				appended = [...appendedEvents];
+				if (new Set(appended.map((event) => event.id)).size !== appended.length) {
 					throw new StoreV2MigrationError(
 						"STORE_V2_EVENTS_HISTORY_MUTATION",
-						"Authoritative event history is append-only.",
+						"Authoritative event mutations cannot contain duplicate appended ids.",
 					);
 				}
+			} else {
+				const prependedCount = after.events.length - before.events.length;
+				let canonicalPrepend = prependedCount >= 0;
+				for (let index = 0; canonicalPrepend && index < before.events.length; index++) {
+					canonicalPrepend =
+						after.events[prependedCount + index]?.id === before.events[index]?.id;
+				}
+				if (canonicalPrepend) {
+					appended = after.events.slice(0, prependedCount);
+					if (new Set(appended.map((event) => event.id)).size !== appended.length) {
+						throw new StoreV2MigrationError(
+							"STORE_V2_EVENTS_HISTORY_MUTATION",
+							"Authoritative event mutations cannot contain duplicate appended ids.",
+						);
+					}
+				} else {
+					const beforeById = new Map(
+						before.events.map((event) => [event.id, stableJson(event)]),
+					);
+					const afterById = new Map(
+						after.events.map((event) => [event.id, stableJson(event)]),
+					);
+					if (afterById.size !== after.events.length) {
+						throw new StoreV2MigrationError(
+							"STORE_V2_EVENTS_HISTORY_MUTATION",
+							"Authoritative event mutations cannot contain duplicate historical ids.",
+						);
+					}
+					for (const event of before.events) {
+						if (afterById.get(event.id) !== beforeById.get(event.id)) {
+							throw new StoreV2MigrationError(
+								"STORE_V2_EVENTS_HISTORY_MUTATION",
+								"Authoritative event history is append-only.",
+							);
+						}
+					}
+					appended = after.events.filter((event) => !beforeById.has(event.id));
+				}
 			}
-			const appended = after.events.filter((event) => !beforeById.has(event.id));
 			eventDelta = await appendStoreV2Events(
 				client,
 				this.tables,

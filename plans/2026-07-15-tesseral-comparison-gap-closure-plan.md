@@ -22,9 +22,9 @@
 
 | Dimension | Acceptance bar for Clearance to lead | Status | Evidence |
 |---|---|---|---|
-| Normalized persistence and query scale | Normalized relational management data, row-level concurrency, online verified migration, stable cursor queries, and measured 5k/50k performance ahead of the snapshot baseline | In progress | Audit events now have atomic reversible relational authority, append-only retained history, compact snapshot projection, repeatable-read refresh, and stable cursor reads; API/CLI cutover controls, 5k/50k production-path benchmarks, and remaining collection cutovers remain |
+| Normalized persistence and query scale | Normalized relational management data, row-level concurrency, online verified migration, stable cursor queries, and measured 5k/50k performance ahead of the snapshot baseline | In progress | Audit events now have atomic reversible relational authority, append-only retained history, compact snapshot projection, repeatable-read refresh, stable cursor reads, confirmed API/CLI controls, and passing 5k/50k production-path gates; remaining collection cutovers remain |
 | Credential authentication and authorization | Managed keys authenticate by digest; status, expiry, project, environment, and route scopes are enforced; key identity appears in audit; operator token is bootstrap/break-glass only | Proven ahead | Digest-only authentication, expiry/revocation, key-derived scope, route read/write scopes, operator-only topology/recovery/configuration/tests, audit attribution, CLI expiry, and API-key-aware CLI `whoami`; live CLI proof created an expiring key, authenticated `whoami`, listed users, and rejected `users:write` with exit 1 |
-| Durable jobs, email, and webhooks | Transactional outbox, separately deployable worker, retries, dead letters, signed delivery, replay, SES/SMTP, quotas, readiness, and complete CLI control | Queued | Runtime verification/reset/invitation delivery can land against the existing relational transaction; management-originated webhooks depend on the store-v2 delivery-intent seam |
+| Durable jobs, email, and webhooks | Transactional outbox, separately deployable worker, retries, dead letters, signed delivery, replay, SES/SMTP, quotas, readiness, and complete CLI control | In progress | Accepted Postgres delivery core enforces caller-owned transactions, encrypted payloads, tenant dedupe, fenced leases, retry/dead/cancel/reclaim, semantic expiry, crypto-erasure, bounded retention, redacted inspection, and guarded schema drift; runtime wiring, worker transports, webhooks, API/CLI, readiness, quotas, and deployment remain |
 | Authentication security | Supported passkeys, TOTP, recovery, factor policy, breached-password defense, account lockout, digest-stored refresh/session secrets, rotating asymmetric access tokens, purpose-separated keys, and KMS providers | Queued | Existing latent JWT, TOTP, HIBP, and management keyring capabilities will be productized |
 | Runtime auditability | Append-only login, recovery, factor, session, SSO, SCIM, API-key, invitation, webhook, and impersonation events with actor, target, outcome, network context, and correlation | Queued | Extend the existing redacted atomic management audit design |
 | RBAC and tenant credentials | Canonical many-to-many role/action assignments for people and organization service accounts, consistent runtime action claims, immediate revocation/version behavior, API/CLI/UI parity | Queued | Preserve simple built-in roles while supporting composed assignments |
@@ -47,8 +47,10 @@
 - [x] Record targeted verification and update dimension statuses for the first mergeable foundation unit.
 - [x] Land the first reversible relational-authority slice for audit events.
 - [x] Expose audit-event cutover and rollback through API, CLI, and doctor with explicit confirmation.
-- [ ] Prove the authoritative audit append path at 5k and 50k retained events against the ledger thresholds.
-- [ ] Close strict-review blockers in the delivery storage and worker core before accepting it.
+- [x] Prove the authoritative audit append path at 5k and 50k retained events against the ledger thresholds.
+- [x] Close strict-review blockers in the delivery storage and worker core before accepting it.
+- [ ] Wire signup, verification, reset, and invitation state plus delivery enqueue into one runtime transaction.
+- [ ] Ship the separately deployable SMTP worker, readiness, replay/cancel/retry controls, and CLI/API surface.
 
 ### Execution log
 
@@ -73,6 +75,8 @@
 | 2026-07-15 | Completed the audit-event relational-authority core | Hybrid cutover empties the snapshot event projection, relational appends and resource mutations share one transaction, cursor reads are stable, retention hides historical rows instead of deleting them, and rollback reverse-materializes the visible projection; management typecheck, focused unit 7/7, and canonical real-Postgres 35/35 passed |
 | 2026-07-15 | Rejected the initial delivery core at strict review | Active transactions, tenant-scoped dedupe, semantic-expiry completion, canonical verification inclusion, lease-owner binding, safe erasure, channel-bound AAD, schema-drift detection, structural retention, and provider-value redaction must close before commit |
 | 2026-07-15 | Completed audit-event authority control-plane integration | Added confirmed API and CLI cutover/rollback operations, operation-registry coverage, and hybrid-authority doctor evidence; management contracts 9/9, API operations 5/5, CLI transport 11/11, and all three package typechecks passed |
+| 2026-07-15 | Accepted the hardened delivery storage and worker core | Strict-review blockers closed: active transaction savepoint enforcement, tenant-scoped dedupe, channel-bound AEAD, owner-fenced leases, semantic-expiry dead-lettering, atomic erasure, bounded retention, schema-shape verification, opaque provider metadata, and fail-closed canonical Postgres/CI inclusion; delivery build and five-package typecheck passed; canonical Postgres gate passed management 250/250 and delivery 9/9 with zero skips |
+| 2026-07-15 | Proved authoritative audit scale on the production PgStore path | Manager rerun with five warmups and 50 samples: 5k p50/p95 6.35/6.75ms; 50k p50/p95 8.29/9.78ms; 50k flatness gate 9.78 <= 18.50ms; snapshot event projection remained 2 bytes with zero growth; normalized persistence remains in progress pending remaining collection cutovers |
 
 ### Current implementation decisions
 

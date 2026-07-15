@@ -143,6 +143,14 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 			).rejects.toThrow(/duplicate|unique/i);
 			await first.refresh();
 			expect(first.snapshot.projects[0]!.name).toBe(beforeAtomicFailure);
+			await expect(
+				first.mutateDurable((data) => {
+					data.projects[0]!.name = "must roll back with replaced history";
+					data.events = [];
+				}),
+			).rejects.toMatchObject({ code: "STORE_V2_EVENTS_HISTORY_ACCESS" });
+			await first.refresh();
+			expect(first.snapshot.projects[0]!.name).toBe(beforeAtomicFailure);
 
 			const second = await createPgStore(DATABASE_URL, {
 				tableName: EVENTS_TABLE,

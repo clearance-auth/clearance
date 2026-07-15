@@ -26,7 +26,10 @@ import {
 import type { DataStoreSnapshot } from "../types/resources.js";
 import { PgStoreV2Shadow, StoreV2MigrationError } from "./store-v2-shadow.js";
 import { applyStoreV2EventDelta } from "./store-v2-events.js";
-import { deferAuditRetentionForDraft } from "../services/audit.js";
+import {
+	consumeDeferredAuditEvents,
+	deferAuditRetentionForDraft,
+} from "../services/audit.js";
 import type {
 	ManagementStore,
 	StoreV2EventReader,
@@ -456,18 +459,22 @@ export class PgStore implements ManagementStore {
 						"Roll back authoritative events before replacing the management snapshot.",
 					);
 				}
-				base.events = structuredClone(
-					rev === this.revision
-						? this.data.events
-						: await this.storeV2Shadow!.materializeEvents(client),
-				);
-				deferAuditRetentionForDraft(base);
 			}
 
 			const before = cloneSnapshot(base);
+			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			// Apply on draft — if fn throws (e.g. USER_EXISTS), full ROLLBACK
 			const applied = fn(base);
 			const next = applied === undefined ? base : applied;
+			if (phase === "hybrid" && next !== base) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_REPLACE_REQUIRES_EVENTS_ROLLBACK",
+					"Roll back authoritative events before replacing the management snapshot.",
+				);
+			}
+			const appendedEvents = phase === "hybrid"
+				? consumeDeferredAuditEvents(next)
+				: undefined;
 			const newRevision = rev + 1;
 
 			const sync = await this.storeV2Shadow?.syncTransaction(
@@ -475,6 +482,7 @@ export class PgStore implements ManagementStore {
 				before,
 				next,
 				newRevision,
+				appendedEvents,
 			);
 			// Enforce uniqueness indexes from the committed snapshot draft
 			await this.syncUniqueness(client, next);
@@ -529,22 +537,19 @@ export class PgStore implements ManagementStore {
 			const phase = this.storeV2Shadow
 				? await this.storeV2Shadow.transactionPhase(client)
 				: "absent";
-			if (phase === "hybrid") {
-				base.events = structuredClone(
-					previousRevision === this.revision
-						? this.data.events
-						: await this.storeV2Shadow!.materializeEvents(client),
-				);
-				deferAuditRetentionForDraft(base);
-			}
 			const before = cloneSnapshot(base);
+			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			const revision = previousRevision + 1;
 			const value = fn(base);
+			const appendedEvents = phase === "hybrid"
+				? consumeDeferredAuditEvents(base)
+				: undefined;
 			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
 				before,
 				base,
 				revision,
+				appendedEvents,
 			);
 			await this.syncUniqueness(client, base);
 			const persisted = sync?.persistedSnapshot ?? base;
@@ -600,15 +605,8 @@ export class PgStore implements ManagementStore {
 			const phase = this.storeV2Shadow
 				? await this.storeV2Shadow.transactionPhase(client)
 				: "absent";
-			if (phase === "hybrid") {
-				base.events = structuredClone(
-					previousRevision === this.revision
-						? this.data.events
-						: await this.storeV2Shadow!.materializeEvents(client),
-				);
-				deferAuditRetentionForDraft(base);
-			}
 			const before = cloneSnapshot(base);
+			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			const revision = previousRevision + 1;
 
 			const query = async (sql: string, params?: unknown[]) => {
@@ -620,12 +618,16 @@ export class PgStore implements ManagementStore {
 			};
 
 			const value = await fn({ data: base, query });
+			const appendedEvents = phase === "hybrid"
+				? consumeDeferredAuditEvents(base)
+				: undefined;
 
 			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
 				before,
 				base,
 				revision,
+				appendedEvents,
 			);
 			await this.syncUniqueness(client, base);
 			const persisted = sync?.persistedSnapshot ?? base;

@@ -314,13 +314,38 @@ export function applyStoreV2EventDelta(
 	delta: StoreV2EventDelta,
 ): AuditEvent[] {
 	const removed = new Set(delta.removedIds);
-	const byId = new Map(
-		current.filter((event) => !removed.has(event.id)).map((event) => [event.id, event]),
-	);
-	for (const event of delta.inserted) byId.set(event.id, event);
-	return [...byId.values()].sort((left, right) =>
+	const retained = current.filter((event) => !removed.has(event.id));
+	const inserted = [...delta.inserted].sort((left, right) =>
 		left.createdAt === right.createdAt
 			? right.id.localeCompare(left.id)
 			: right.createdAt.localeCompare(left.createdAt),
 	);
+	const merged: AuditEvent[] = [];
+	let retainedIndex = 0;
+	let insertedIndex = 0;
+	while (retainedIndex < retained.length || insertedIndex < inserted.length) {
+		const existing = retained[retainedIndex];
+		const incoming = inserted[insertedIndex];
+		if (!incoming) {
+			merged.push(existing!);
+			retainedIndex++;
+			continue;
+		}
+		if (!existing) {
+			merged.push(incoming);
+			insertedIndex++;
+			continue;
+		}
+		const incomingFirst =
+			incoming.createdAt > existing.createdAt ||
+			(incoming.createdAt === existing.createdAt && incoming.id > existing.id);
+		if (incomingFirst) {
+			merged.push(incoming);
+			insertedIndex++;
+		} else {
+			merged.push(existing);
+			retainedIndex++;
+		}
+	}
+	return merged;
 }
