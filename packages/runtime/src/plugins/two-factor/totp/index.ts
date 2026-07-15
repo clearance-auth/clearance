@@ -1,20 +1,28 @@
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { createOTP } from "@clearance/utils/otp";
 import * as z from "zod";
 import { sessionMiddleware } from "../../../api";
-import { setSessionCookie } from "../../../cookies";
+import { expireCookie, setSessionCookie } from "../../../cookies";
 import { symmetricDecrypt } from "../../../crypto";
+import { generateRandomString } from "../../../crypto/random";
+import { parseUserOutput } from "../../../db/schema";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import type { BackupCodeOptions } from "../backup-codes";
-import { DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS } from "../constant";
+import {
+	DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS,
+	TRUST_DEVICE_COOKIE_MAX_AGE,
+	TRUST_DEVICE_COOKIE_NAME,
+} from "../constant";
 import { TWO_FACTOR_ERROR_CODES } from "../error-code";
 import type {
 	TwoFactorProvider,
 	TwoFactorTable,
 	UserWithTwoFactor,
 } from "../types";
+import { preserveSessionLifetime, revokeTrustGeneration } from "../utils";
 import {
 	assertTwoFactorNotLocked,
 	consumeTotpCounter,
@@ -297,9 +305,9 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 			const attempt = isSignIn
 				? await beginAttempt(DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS)
 				: null;
-			if (isSignIn) {
-				await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
-			}
+			const accountAttempt = isSignIn
+				? await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor)
+				: null;
 			const isPendingReplacement =
 				!isSignIn &&
 				twoFactor.verified !== false &&
@@ -320,35 +328,101 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 			} catch (error) {
 				// A server error before the code is checked must not spend the slot.
 				await attempt?.restore();
+				await accountAttempt?.restore();
 				throw error;
 			}
 			if (matchedCounter === null) {
 				await attempt?.recordFailure();
+				await accountAttempt?.recordFailure();
 				return invalid("INVALID_CODE");
 			}
 			if (isPendingReplacement) {
 				const pendingSecret = twoFactor.pendingSecret!;
 				const pendingBackupCodes = twoFactor.pendingBackupCodes!;
-				const replaced = await ctx.context.adapter.incrementOne<TwoFactorTable>({
-					model: twoFactorTable,
-					where: [
-						{ field: "id", value: twoFactor.id },
-						{ field: "pendingSecret", value: pendingSecret },
-					],
-					increment: {},
-					set: {
-						secret: pendingSecret,
-						backupCodes: pendingBackupCodes,
-						pendingSecret: null,
-						pendingBackupCodes: null,
-						verified: true,
-						lastUsedTotpCounter: matchedCounter,
-						failedVerificationCount: 0,
-						lockedUntil: null,
+				const activeSession = session.session!;
+				const replaced = await runWithTransaction(
+					ctx.context.adapter,
+					async () => {
+						const adapter = await getCurrentAdapter(ctx.context.adapter);
+						const replaced = await adapter.incrementOne<TwoFactorTable>({
+							model: twoFactorTable,
+							where: [
+								{ field: "id", value: twoFactor.id },
+								{ field: "pendingSecret", value: pendingSecret },
+								{
+									field: "pendingBackupCodes",
+									value: pendingBackupCodes,
+								},
+							],
+							increment: {},
+							set: {
+								secret: pendingSecret,
+								backupCodes: pendingBackupCodes,
+								pendingSecret: null,
+								pendingBackupCodes: null,
+								verified: true,
+								lastUsedTotpCounter: matchedCounter,
+								trustDeviceGeneration: generateRandomString(32),
+								failedVerificationCount: 0,
+								activeVerificationReservations: "[]",
+								lockedUntil: null,
+							},
+						});
+						if (!replaced) {
+							throw APIError.fromStatus("CONFLICT", {
+								message: "Two-factor state changed. Please try again.",
+							});
+						}
+						if (
+							twoFactor.trustDeviceGeneration &&
+							(!ctx.context.options.secondaryStorage ||
+								ctx.context.options.verification?.storeInDatabase === true)
+						) {
+							await adapter.deleteMany({
+								model: "verification",
+								where: [
+									{
+										field: "value",
+										value: `${user.id}!${twoFactor.trustDeviceGeneration}`,
+									},
+								],
+							});
+						}
+						await revokeTrustGeneration(
+							ctx,
+							user.id,
+							twoFactor.trustDeviceGeneration,
+						);
+						const updatedUser = await ctx.context.internalAdapter.updateUser(
+							user.id,
+							{
+								twoFactorSessionGeneration: generateRandomString(32),
+							},
+						);
+						await ctx.context.internalAdapter.deleteUserSessions(user.id);
+						const replacementSession =
+							await ctx.context.internalAdapter.createSession(
+								user.id,
+								false,
+								preserveSessionLifetime(activeSession),
+							);
+						return { replacementSession, updatedUser };
 					},
+				);
+				await setSessionCookie(ctx, {
+					session: replaced.replacementSession,
+					user: replaced.updatedUser,
 				});
-				if (!replaced) return invalid("INVALID_CODE");
-				return valid(ctx);
+				expireCookie(
+					ctx,
+					ctx.context.createAuthCookie(TRUST_DEVICE_COOKIE_NAME, {
+						maxAge: TRUST_DEVICE_COOKIE_MAX_AGE,
+					}),
+				);
+				return ctx.json({
+					token: replaced.replacementSession.token,
+					user: parseUserOutput(ctx.context.options, replaced.updatedUser),
+				});
 			}
 			if (
 				!(await consumeTotpCounter(
@@ -358,45 +432,97 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 					matchedCounter,
 				))
 			) {
-				await attempt?.recordFailure();
+				await attempt?.restore();
+				await accountAttempt?.restore();
 				return invalid("INVALID_CODE");
 			}
-			await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
+			if (accountAttempt) {
+				await accountAttempt.recordSuccess();
+			} else {
+				await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
+			}
 
 			// Enrollment mode: TOTP row exists but hasn't been verified yet.
 			// This covers fresh TOTP setup (twoFactorEnabled=false),
 			// adding TOTP to an OTP-only account (twoFactorEnabled=true),
 			// and pre-migration rows where verified is null/undefined.
+			const isEnrollmentActivation =
+				twoFactor.verified === false ||
+				(twoFactor.verified !== true && !user.twoFactorEnabled);
+			if (isEnrollmentActivation) {
+				const activeSession = session.session!;
+				const activated = await runWithTransaction(
+					ctx.context.adapter,
+					async () => {
+						const adapter = await getCurrentAdapter(ctx.context.adapter);
+						const factor = await adapter.incrementOne<TwoFactorTable>({
+							model: twoFactorTable,
+							where: [
+								{ field: "id", value: twoFactor.id },
+								{ field: "secret", value: twoFactor.secret },
+								{
+									field: "verified",
+									value: twoFactor.verified ?? null,
+								},
+								{
+									field: "lastUsedTotpCounter",
+									value: matchedCounter,
+								},
+							],
+							increment: {},
+							set: {
+								verified: true,
+								trustDeviceGeneration: generateRandomString(32),
+								failedVerificationCount: 0,
+								activeVerificationReservations: "[]",
+								lockedUntil: null,
+							},
+						});
+						if (!factor) {
+							throw APIError.fromStatus("CONFLICT", {
+								message: "Two-factor state changed. Please try again.",
+							});
+						}
+						const updatedUser = await ctx.context.internalAdapter.updateUser(
+							user.id,
+							{
+								twoFactorEnabled: true,
+								twoFactorSessionGeneration: generateRandomString(32),
+							},
+						);
+						await ctx.context.internalAdapter.deleteUserSessions(user.id);
+						const newSession = await ctx.context.internalAdapter.createSession(
+							user.id,
+							false,
+							preserveSessionLifetime(activeSession),
+						);
+						return { newSession, updatedUser };
+					},
+				);
+				await setSessionCookie(ctx, {
+					session: activated.newSession,
+					user: activated.updatedUser,
+				});
+				expireCookie(
+					ctx,
+					ctx.context.createAuthCookie(TRUST_DEVICE_COOKIE_NAME, {
+						maxAge: TRUST_DEVICE_COOKIE_MAX_AGE,
+					}),
+				);
+				return ctx.json({
+					token: activated.newSession.token,
+					user: parseUserOutput(ctx.context.options, activated.updatedUser),
+				});
+			}
 			if (twoFactor.verified !== true) {
-				if (!user.twoFactorEnabled) {
-					// session.session is guaranteed non-null here: the sign-in guard
-					// above already rejected isSignIn && verified === false.
-					const activeSession = session.session!;
-					const updatedUser = await ctx.context.internalAdapter.updateUser(
-						user.id,
-						{
-							twoFactorEnabled: true,
-						},
-					);
-					const newSession = await ctx.context.internalAdapter.createSession(
-						user.id,
-						false,
-						activeSession,
-					);
-
-					await setSessionCookie(ctx, {
-						session: newSession,
-						user: updatedUser,
-					});
-					await ctx.context.internalAdapter.deleteSession(activeSession.token);
-				}
-				// Mark verified only after all session operations succeed.
-				// This keeps the gate on twoFactorEnabled (retry-safe) and ensures
-				// a partial failure cannot leave verified=true with twoFactorEnabled=false.
-				await ctx.context.adapter.update({
+				await ctx.context.adapter.incrementOne<TwoFactorTable>({
 					model: twoFactorTable,
-					update: { verified: true },
-					where: [{ field: "id", value: twoFactor.id }],
+					where: [
+						{ field: "id", value: twoFactor.id },
+						{ field: "verified", value: null },
+					],
+					increment: {},
+					set: { verified: true },
 				});
 			}
 			return valid(ctx);

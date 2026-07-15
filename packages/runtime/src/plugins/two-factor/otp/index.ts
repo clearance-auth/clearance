@@ -360,20 +360,34 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 					TWO_FACTOR_ERROR_CODES.TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE,
 				);
 			}
-			if (twoFactor) {
-				await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
+			const accountAttempt = twoFactor
+				? await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor)
+				: null;
+			let storedValue: string;
+			let inputValue: string;
+			try {
+				[storedValue, inputValue] = await decryptOrHashForComparison(
+					ctx,
+					otp!,
+					ctx.body.code,
+				);
+			} catch (error) {
+				await accountAttempt?.restore();
+				await ctx.context.internalAdapter.createVerificationValue({
+					value: consumed.value,
+					identifier: `2fa-otp-${key}`,
+					expiresAt: consumed.expiresAt,
+				});
+				throw error;
 			}
-			const [storedValue, inputValue] = await decryptOrHashForComparison(
-				ctx,
-				otp!,
-				ctx.body.code,
-			);
 			const isCodeValid = constantTimeEqual(
 				new TextEncoder().encode(storedValue),
 				new TextEncoder().encode(inputValue),
 			);
 			if (isCodeValid) {
-				if (twoFactor) {
+				if (accountAttempt) {
+					await accountAttempt.recordSuccess();
+				} else if (twoFactor) {
 					await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
 				}
 				// Leave the row consumed: a valid OTP is single-use.
@@ -409,6 +423,7 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 				}
 				return valid(ctx);
 			}
+			await accountAttempt?.recordFailure();
 			// Wrong code within budget: re-arm the row with the incremented counter
 			// and the original expiry. The recreated counter is the durable record
 			// of the attempt, so the next submission either keeps guessing or hits

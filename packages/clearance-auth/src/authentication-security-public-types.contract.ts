@@ -20,9 +20,15 @@ async function assertAuthenticationSecurityPublicTypes(): Promise<void> {
 	void enrollment.data?.totpURI;
 	await twoFactorOnly.twoFactor.getTotpUri({ password: "password" });
 	await twoFactorOnly.twoFactor.verifyTotp({ code: "123456" });
-	await twoFactorOnly.twoFactor.generateBackupCodes({ password: "password" });
+	await twoFactorOnly.twoFactor.generateBackupCodes({
+		password: "password",
+		currentCode: "123456",
+	});
 	await twoFactorOnly.twoFactor.verifyBackupCode({ code: "backup-code" });
-	await twoFactorOnly.twoFactor.disable({ password: "password" });
+	await twoFactorOnly.twoFactor.disable({
+		password: "password",
+		recoveryCode: "backup-code",
+	});
 
 	const jwtOnly = clientModule.createAuthClient({
 		plugins: [clientModule.jwtClient()],
@@ -42,16 +48,20 @@ async function assertAuthenticationSecurityPublicTypes(): Promise<void> {
 	await bundle.auth.api.getTOTPURI({ body: { password: "password" }, headers });
 	await bundle.auth.api.verifyTOTP({ body: { code: "123456" }, headers });
 	await bundle.auth.api.generateBackupCodes({
-		body: { password: "password" },
+		body: { password: "password", currentCode: "123456" },
 		headers,
 	});
 	await bundle.auth.api.verifyBackupCode({
 		body: { code: "backup-code" },
 		headers,
 	});
-	await bundle.auth.api.disableTwoFactor({ body: { password: "password" }, headers });
+	await bundle.auth.api.disableTwoFactor({
+		body: { password: "password", recoveryCode: "backup-code" },
+		headers,
+	});
 	const token = await bundle.auth.api.getToken({ headers });
-	void (await bundle.auth.api.verifyJWT({ body: { token: token.token } })).payload;
+	void (await bundle.auth.api.verifyJWT({ body: { token: token.token } }))
+		.payload;
 	void (await bundle.auth.api.getJwks()).keys[0]?.alg;
 
 	const disabled = productModule.createClearanceAuth({

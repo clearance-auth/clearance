@@ -1,11 +1,5 @@
-import type {
-	ClearanceOptions,
-	GenericEndpointContext,
-} from "@clearance/core";
-import {
-	createAuthEndpoint,
-	createAuthMiddleware,
-} from "@clearance/core/api";
+import type { ClearanceOptions, GenericEndpointContext } from "@clearance/core";
+import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { base64Url } from "@clearance/utils/base64";
@@ -24,6 +18,7 @@ import {
 import { getSessionQuerySchema } from "../../cookies/session-store";
 import { symmetricDecodeJWT, verifyJWT } from "../../crypto";
 import { parseSessionOutput, parseUserOutput } from "../../db";
+import { hasTwoFactorSessionGeneration } from "../../db/two-factor-session-generation";
 import type { Prettify, Session, User } from "../../types";
 import { getDate } from "../../utils/date";
 import { isAPIError } from "../../utils/is-api-error";
@@ -222,6 +217,13 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					!ctx.query?.disableCookieCache
 				) {
 					const session = sessionDataPayload.session;
+					const cachedSessionIsCurrent =
+						!hasTwoFactorSessionGeneration(ctx.context.options) ||
+						Boolean(
+							await ctx.context.internalAdapter.findSession(
+								session.session.token,
+							),
+						);
 
 					const versionConfig =
 						ctx.context.options.session?.cookieCache?.version;
@@ -237,7 +239,9 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					}
 
 					const cookieVersion = session.version || "1";
-					if (cookieVersion !== expectedVersion) {
+					if (!cachedSessionIsCurrent) {
+						expireCookie(ctx, ctx.context.authCookies.sessionData);
+					} else if (cookieVersion !== expectedVersion) {
 						// Version mismatch - invalidate the cookie cache
 						expireCookie(ctx, ctx.context.authCookies.sessionData);
 					} else {

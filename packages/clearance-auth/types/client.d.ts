@@ -71,12 +71,26 @@ export interface ClearanceTwoFactorClientApi {
         }): Promise<ClearanceClientResponse<ClearanceTwoFactorVerification>>;
         disable(input: {
             password: string;
+            currentCode: string;
+            recoveryCode?: never;
+            fetchOptions?: ClearanceClientFetchOptions;
+        } | {
+            password: string;
+            currentCode?: never;
+            recoveryCode: string;
             fetchOptions?: ClearanceClientFetchOptions;
         }): Promise<ClearanceClientResponse<{
             status: true;
         }>>;
         generateBackupCodes(input: {
             password: string;
+            currentCode: string;
+            recoveryCode?: never;
+            fetchOptions?: ClearanceClientFetchOptions;
+        } | {
+            password: string;
+            currentCode?: never;
+            recoveryCode: string;
             fetchOptions?: ClearanceClientFetchOptions;
         }): Promise<ClearanceClientResponse<{
             status: true;

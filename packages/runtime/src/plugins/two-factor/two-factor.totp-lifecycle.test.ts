@@ -7,8 +7,47 @@ import type { Session, User } from "../../types";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { twoFactor } from ".";
 import type { TwoFactorTable } from "./types";
+import { consumeTotpCounter } from "./verify-two-factor";
 
 describe.sequential("TOTP replay and replacement lifecycle", () => {
+	it("restarts an unverified one-way enrollment after a lost response", async () => {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [
+				twoFactor({
+					backupCodeOptions: { storeBackupCodes: "hashed" },
+				}),
+			],
+		});
+		const { headers } = await signInWithTestUser();
+		const first = await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		const before = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [
+				{
+					field: "userId",
+					value: (await auth.api.getSession({ headers }))!.user.id,
+				},
+			],
+		});
+		const restarted = await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		const after = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "id", value: before!.id }],
+		});
+		expect(restarted.backupCodes).toHaveLength(10);
+		expect(restarted.backupCodes).not.toEqual(first.backupCodes);
+		expect(after?.secret).not.toBe(before?.secret);
+		expect(after?.backupCodes).not.toBe(before?.backupCodes);
+		expect(after?.verified).toBe(false);
+	});
+
 	it("allows only one concurrent fresh enrollment to establish factor state", async () => {
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
 			secret: DEFAULT_SECRET,
@@ -34,10 +73,13 @@ describe.sequential("TOTP replay and replacement lifecycle", () => {
 		]);
 		expect(responses.map((response) => response.status)).toEqual([200, 200]);
 		const enrollments = await Promise.all(
-			responses.map((response) => response.json() as Promise<{
-				backupCodes: string[];
-				totpURI: string;
-			}>),
+			responses.map(
+				(response) =>
+					response.json() as Promise<{
+						backupCodes: string[];
+						totpURI: string;
+					}>,
+			),
 		);
 		expect(enrollments[0]).toEqual(enrollments[1]);
 		const rows = await db.findMany<TwoFactorTable>({
@@ -88,7 +130,10 @@ describe.sequential("TOTP replay and replacement lifecycle", () => {
 			}
 
 			vi.advanceTimersByTime(30_000);
-			const challenges = await Promise.all([startChallenge(), startChallenge()]);
+			const challenges = await Promise.all([
+				startChallenge(),
+				startChallenge(),
+			]);
 			const replayedCode = await createOTP(secret).totp();
 			const results = await Promise.all(
 				challenges.map((challengeHeaders) =>
@@ -169,7 +214,9 @@ describe.sequential("TOTP replay and replacement lifecycle", () => {
 				asResponse: true,
 			});
 			expect(enrollmentResponse.status).toBe(200);
-			const activeHeaders = convertSetCookieToCookie(enrollmentResponse.headers);
+			const activeHeaders = convertSetCookieToCookie(
+				enrollmentResponse.headers,
+			);
 			await db.update({
 				model: "twoFactor",
 				where: [{ field: "id", value: original!.id }],
@@ -243,7 +290,7 @@ describe.sequential("TOTP replay and replacement lifecycle", () => {
 					asResponse: true,
 				}),
 			]);
-			expect(swapped.map((result) => result.status).sort()).toEqual([200, 401]);
+			expect(swapped.map((result) => result.status).sort()).toEqual([200, 409]);
 			const active = await db.findOne<TwoFactorTable>({
 				model: "twoFactor",
 				where: [{ field: "id", value: original!.id }],
@@ -256,5 +303,111 @@ describe.sequential("TOTP replay and replacement lifecycle", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("rejects a TOTP proof captured before the factor generation changes", async () => {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor()],
+		});
+		const { headers } = await signInWithTestUser();
+		const user = await auth.api.getSession({ headers });
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		const staleFactor = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user!.user.id }],
+		});
+		const priorCounter = staleFactor!.lastUsedTotpCounter ?? -1;
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: staleFactor!.id }],
+			update: {
+				secret: `${staleFactor!.secret}-rotated`,
+				trustDeviceGeneration: "rotated-generation",
+			},
+		});
+
+		const accepted = await consumeTotpCounter(
+			{ context: { adapter: db } } as never,
+			"twoFactor",
+			staleFactor!,
+			priorCounter + 1,
+		);
+		expect(accepted).toBe(false);
+		const current = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "id", value: staleFactor!.id }],
+		});
+		expect(current?.lastUsedTotpCounter ?? -1).toBe(priorCounter);
+	});
+
+	it("never extends the active session across factor lifecycle rotation", async () => {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			session: { expiresIn: 30 * 60 },
+			plugins: [twoFactor()],
+		});
+		const signedIn = await signInWithTestUser();
+		const original = await auth.api.getSession({ headers: signedIn.headers });
+		const expiryCap = new Date(original!.session.expiresAt);
+
+		const enrollment = await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers: signedIn.headers,
+		});
+		const factor = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: original!.user.id }],
+		});
+		const secret = await symmetricDecrypt({
+			key: DEFAULT_SECRET,
+			data: factor!.secret,
+		});
+		const activated = await auth.api.verifyTOTP({
+			body: { code: await createOTP(secret).totp() },
+			headers: signedIn.headers,
+			asResponse: true,
+		});
+		expect(activated.status).toBe(200);
+		let activeHeaders = convertSetCookieToCookie(activated.headers);
+
+		const assertCapped = async () => {
+			const current = await auth.api.getSession({ headers: activeHeaders });
+			expect(current).not.toBeNull();
+			expect(
+				new Date(current!.session.expiresAt).getTime(),
+			).toBeLessThanOrEqual(expiryCap.getTime());
+		};
+		await assertCapped();
+
+		const regenerated = await auth.api.generateBackupCodes({
+			body: {
+				password: testUser.password,
+				recoveryCode: enrollment.backupCodes[0]!,
+			},
+			headers: activeHeaders,
+			asResponse: true,
+		});
+		expect(regenerated.status).toBe(200);
+		activeHeaders = convertSetCookieToCookie(regenerated.headers);
+		const regeneratedBody = (await regenerated.json()) as {
+			backupCodes: string[];
+		};
+		await assertCapped();
+
+		const disabled = await auth.api.disableTwoFactor({
+			body: {
+				password: testUser.password,
+				recoveryCode: regeneratedBody.backupCodes[0]!,
+			},
+			headers: activeHeaders,
+			asResponse: true,
+		});
+		expect(disabled.status).toBe(200);
+		activeHeaders = convertSetCookieToCookie(disabled.headers);
+		await assertCapped();
 	});
 });

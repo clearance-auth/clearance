@@ -1,21 +1,36 @@
+import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
+import type { DBTransactionAdapter, Where } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { safeJSONParse } from "@clearance/core/utils/json";
+import { createHMAC } from "@clearance/utils/hmac";
+import { createOTP } from "@clearance/utils/otp";
 import * as z from "zod";
-import { sessionMiddleware } from "../../../api";
+import { sensitiveSessionMiddleware } from "../../../api";
+import { expireCookie, setSessionCookie } from "../../../cookies";
 import type { SecretConfig } from "../../../crypto";
-import { symmetricDecrypt, symmetricEncrypt } from "../../../crypto";
+import {
+	constantTimeEqual,
+	symmetricDecrypt,
+	symmetricEncrypt,
+} from "../../../crypto";
 import { generateRandomString } from "../../../crypto/random";
 import { parseUserOutput } from "../../../db/schema";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
-import { DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS } from "../constant";
+import {
+	DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS,
+	TRUST_DEVICE_COOKIE_MAX_AGE,
+	TRUST_DEVICE_COOKIE_NAME,
+} from "../constant";
 import { TWO_FACTOR_ERROR_CODES } from "../error-code";
 import type {
 	TwoFactorProvider,
 	TwoFactorTable,
 	UserWithTwoFactor,
 } from "../types";
+import { preserveSessionLifetime, revokeTrustGeneration } from "../utils";
 import {
 	assertTwoFactorNotLocked,
 	reserveTwoFactorAttempt,
@@ -41,12 +56,14 @@ export interface BackupCodeOptions {
 	 */
 	customBackupCodesGenerate?: (() => string[]) | undefined;
 	/**
-	 * How to store the backup codes in the database, whether encrypted or plain.
+	 * How to store the backup codes in the database. Hashed storage is one-way
+	 * and should be preferred for recovery credentials.
 	 */
 	storeBackupCodes?:
 		| (
 				| "plain"
 				| "encrypted"
+				| "hashed"
 				| {
 						encrypt: (token: string) => Promise<string>;
 						decrypt: (token: string) => Promise<string>;
@@ -62,6 +79,73 @@ export interface BackupCodeOptions {
 	allowPasswordless?: boolean | undefined;
 }
 
+const HASHED_BACKUP_CODES_PREFIX = "clr-recovery:v1:";
+const RECOVERY_CODE_DIGEST_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const MAX_RECOVERY_CODES = 100;
+
+type HashedBackupCodesEnvelope = {
+	version: 1;
+	encryptedPepper: string;
+	digests: string[];
+};
+
+function parseHashedBackupCodes(
+	value: string,
+): HashedBackupCodesEnvelope | null {
+	if (!value.startsWith(HASHED_BACKUP_CODES_PREFIX)) return null;
+	const envelope = safeJSONParse<HashedBackupCodesEnvelope>(
+		value.slice(HASHED_BACKUP_CODES_PREFIX.length),
+	);
+	if (
+		envelope?.version !== 1 ||
+		typeof envelope.encryptedPepper !== "string" ||
+		envelope.encryptedPepper.length === 0 ||
+		!Array.isArray(envelope.digests) ||
+		envelope.digests.length > MAX_RECOVERY_CODES ||
+		envelope.digests.some(
+			(digest) =>
+				typeof digest !== "string" ||
+				!RECOVERY_CODE_DIGEST_PATTERN.test(digest),
+		) ||
+		new Set(envelope.digests).size !== envelope.digests.length
+	) {
+		return null;
+	}
+	return envelope;
+}
+
+export function isOneWayBackupCodeEnvelope(value: string): boolean {
+	return parseHashedBackupCodes(value) !== null;
+}
+
+function assertValidRecoveryCodes(codes: string[]): void {
+	if (
+		codes.length > MAX_RECOVERY_CODES ||
+		codes.some((code) => code.length === 0 || code.length > 256) ||
+		new Set(codes).size !== codes.length
+	) {
+		throw new Error(
+			`Recovery codes must contain at most ${MAX_RECOVERY_CODES} unique non-empty values`,
+		);
+	}
+}
+
+function parseLegacyRecoveryCodes(value: string): string[] | null {
+	const parsed = safeJSONParse<unknown>(value);
+	if (
+		!Array.isArray(parsed) ||
+		parsed.some((code) => typeof code !== "string")
+	) {
+		return null;
+	}
+	try {
+		assertValidRecoveryCodes(parsed);
+		return parsed;
+	} catch {
+		return null;
+	}
+}
+
 function generateBackupCodesFn(options?: BackupCodeOptions | undefined) {
 	return Array.from({ length: options?.amount ?? 10 })
 		.fill(null)
@@ -74,7 +158,21 @@ export async function encodeBackupCodes(
 	secret: string | SecretConfig,
 	options?: BackupCodeOptions | undefined,
 ): Promise<string> {
+	assertValidRecoveryCodes(codes);
 	const json = JSON.stringify(codes);
+	if (options?.storeBackupCodes === "hashed") {
+		const pepper = generateRandomString(64, "a-z", "0-9", "A-Z");
+		const hmac = createHMAC("SHA-256", "base64urlnopad");
+		const digests = await Promise.all(
+			codes.map((code) => hmac.sign(pepper, code)),
+		);
+		const envelope: HashedBackupCodesEnvelope = {
+			version: 1,
+			encryptedPepper: await symmetricEncrypt({ data: pepper, key: secret }),
+			digests,
+		};
+		return `${HASHED_BACKUP_CODES_PREFIX}${JSON.stringify(envelope)}`;
+	}
 	if (options?.storeBackupCodes === "encrypted") {
 		return symmetricEncrypt({ data: json, key: secret });
 	}
@@ -94,6 +192,10 @@ export async function generateBackupCodes(
 	const backupCodes = options?.customBackupCodesGenerate
 		? options.customBackupCodesGenerate()
 		: generateBackupCodesFn(options);
+	if (backupCodes.length === 0) {
+		throw new Error("At least one recovery code must be generated");
+	}
+	assertValidRecoveryCodes(backupCodes);
 	return {
 		backupCodes,
 		encryptedBackupCodes: await encodeBackupCodes(backupCodes, secret, options),
@@ -108,6 +210,72 @@ export async function verifyBackupCode(
 	key: string | SecretConfig,
 	options?: BackupCodeOptions | undefined,
 ) {
+	if (options?.storeBackupCodes === "hashed") {
+		const envelope = parseHashedBackupCodes(data.backupCodes);
+		if (!envelope) {
+			if (data.backupCodes.startsWith("clr-recovery:")) {
+				return { status: false, updated: null };
+			}
+			let legacyCodes = parseLegacyRecoveryCodes(data.backupCodes);
+			if (!legacyCodes) {
+				try {
+					legacyCodes = parseLegacyRecoveryCodes(
+						await symmetricDecrypt({ key, data: data.backupCodes }),
+					);
+				} catch {
+					return { status: false, updated: null };
+				}
+			}
+			if (!legacyCodes) return { status: false, updated: null };
+			let legacyMatch = -1;
+			for (let index = 0; index < legacyCodes.length; index++) {
+				if (
+					constantTimeEqual(data.code, legacyCodes[index]!) &&
+					legacyMatch === -1
+				) {
+					legacyMatch = index;
+				}
+			}
+			if (legacyMatch === -1) return { status: false, updated: null };
+			return {
+				status: true,
+				updated: await encodeBackupCodes(
+					legacyCodes.filter((_, index) => index !== legacyMatch),
+					key,
+					options,
+				),
+			};
+		}
+		let pepper: string;
+		try {
+			pepper = await symmetricDecrypt({
+				key,
+				data: envelope.encryptedPepper,
+			});
+		} catch {
+			return { status: false, updated: null };
+		}
+		const hmac = createHMAC("SHA-256", "base64urlnopad");
+		let match = -1;
+		for (let index = 0; index < envelope.digests.length; index++) {
+			const matches = await hmac.verify(
+				pepper,
+				data.code,
+				envelope.digests[index]!,
+			);
+			if (matches && match === -1) match = index;
+		}
+		if (match === -1) return { status: false, updated: null };
+		const updated: HashedBackupCodesEnvelope = {
+			version: 1,
+			encryptedPepper: await symmetricEncrypt({ data: pepper, key }),
+			digests: envelope.digests.filter((_, index) => index !== match),
+		};
+		return {
+			status: true,
+			updated: `${HASHED_BACKUP_CODES_PREFIX}${JSON.stringify(updated)}`,
+		};
+	}
 	const codes = await getBackupCodes(data.backupCodes, key, options);
 	if (!codes) {
 		return {
@@ -117,7 +285,116 @@ export async function verifyBackupCode(
 	}
 	return {
 		status: codes.includes(data.code),
-		updated: codes.filter((code) => code !== data.code),
+		updated: await encodeBackupCodes(
+			codes.filter((code) => code !== data.code),
+			key,
+			options,
+		),
+	};
+}
+
+export async function proveFactorStepUp(
+	ctx: GenericEndpointContext,
+	adapter: DBTransactionAdapter,
+	twoFactorTable: string,
+	twoFactor: TwoFactorTable,
+	stepUp: {
+		currentCode?: string | undefined;
+		recoveryCode?: string | undefined;
+	},
+	options: {
+		backupCodeOptions?: BackupCodeOptions | undefined;
+		totpOptions?: { digits?: number | undefined; period?: number | undefined };
+	},
+): Promise<{
+	where: Where[];
+	set: Record<string, unknown>;
+	restoreAttempt: () => Promise<void>;
+}> {
+	if (Boolean(stepUp.currentCode) === Boolean(stepUp.recoveryCode)) {
+		throw APIError.from(
+			"BAD_REQUEST",
+			TWO_FACTOR_ERROR_CODES.FACTOR_STEP_UP_REQUIRED,
+		);
+	}
+	await assertTwoFactorNotLocked(ctx, twoFactorTable, twoFactor, adapter);
+	const accountAttempt = await reserveTwoFactorAttempt(
+		ctx,
+		twoFactorTable,
+		twoFactor,
+		adapter,
+	);
+
+	if (stepUp.currentCode) {
+		let counter: number | null;
+		try {
+			const secret = await symmetricDecrypt({
+				key: ctx.context.secretConfig,
+				data: twoFactor.secret,
+			});
+			counter = await createOTP(secret, {
+				digits: options.totpOptions?.digits ?? 6,
+				period: options.totpOptions?.period,
+			}).verifyWithCounter(stepUp.currentCode);
+		} catch (error) {
+			await accountAttempt.restore();
+			throw error;
+		}
+		if (counter === null) {
+			await accountAttempt.recordFailure();
+			throw APIError.from("UNAUTHORIZED", TWO_FACTOR_ERROR_CODES.INVALID_CODE);
+		}
+		if (twoFactor.lastUsedTotpCounter == null) {
+			await adapter.incrementOne<TwoFactorTable>({
+				model: twoFactorTable,
+				where: [
+					{ field: "id", value: twoFactor.id },
+					{ field: "secret", value: twoFactor.secret },
+					{ field: "lastUsedTotpCounter", value: null },
+				],
+				increment: {},
+				set: { lastUsedTotpCounter: -1 },
+			});
+		}
+		return {
+			where: [
+				{ field: "secret", value: twoFactor.secret },
+				{
+					field: "lastUsedTotpCounter",
+					operator: "lt",
+					value: counter,
+				},
+			],
+			set: { lastUsedTotpCounter: counter },
+			restoreAttempt: accountAttempt.restore,
+		};
+	}
+
+	let verified: Awaited<ReturnType<typeof verifyBackupCode>>;
+	try {
+		verified = await verifyBackupCode(
+			{
+				backupCodes: twoFactor.backupCodes,
+				code: stepUp.recoveryCode!,
+			},
+			ctx.context.secretConfig,
+			options.backupCodeOptions,
+		);
+	} catch (error) {
+		await accountAttempt.restore();
+		throw error;
+	}
+	if (!verified.status || !verified.updated) {
+		await accountAttempt.recordFailure();
+		throw APIError.from(
+			"UNAUTHORIZED",
+			TWO_FACTOR_ERROR_CODES.INVALID_BACKUP_CODE,
+		);
+	}
+	return {
+		where: [{ field: "backupCodes", value: twoFactor.backupCodes }],
+		set: { backupCodes: verified.updated },
+		restoreAttempt: accountAttempt.restore,
 	};
 }
 
@@ -126,6 +403,7 @@ export async function getBackupCodes(
 	key: string | SecretConfig,
 	options?: BackupCodeOptions | undefined,
 ) {
+	if (options?.storeBackupCodes === "hashed") return null;
 	if (options?.storeBackupCodes === "encrypted") {
 		const decrypted = await symmetricDecrypt({ key, data: backupCodes });
 		return safeJSONParse<string[]>(decrypted);
@@ -174,7 +452,10 @@ const viewBackupCodesBodySchema = z.object({
 	}),
 });
 
-export const backupCode2fa = (opts: BackupCodeOptions) => {
+export const backupCode2fa = (
+	opts: BackupCodeOptions,
+	totpOptions?: { digits?: number | undefined; period?: number | undefined },
+) => {
 	const twoFactorTable = "twoFactor";
 	const passwordSchema = z.string().meta({
 		description: "The users password.",
@@ -182,9 +463,13 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 	const generateBackupCodesBodySchema = opts.allowPasswordless
 		? z.object({
 				password: passwordSchema.optional(),
+				currentCode: z.string().optional(),
+				recoveryCode: z.string().optional(),
 			})
 		: z.object({
 				password: passwordSchema,
+				currentCode: z.string().optional(),
+				recoveryCode: z.string().optional(),
 			});
 
 	return {
@@ -350,9 +635,9 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 					const attempt = isSignIn
 						? await beginAttempt(DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS)
 						: null;
-					if (isSignIn) {
-						await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
-					}
+					const accountAttempt = isSignIn
+						? await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor)
+						: null;
 					let validate: Awaited<ReturnType<typeof verifyBackupCode>>;
 					try {
 						validate = await verifyBackupCode(
@@ -366,21 +651,17 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 					} catch (error) {
 						// A server error before the code is checked must not spend the slot.
 						await attempt?.restore();
+						await accountAttempt?.restore();
 						throw error;
 					}
 					if (!validate.status || !validate.updated) {
 						await attempt?.recordFailure();
+						await accountAttempt?.recordFailure();
 						throw APIError.from(
 							"UNAUTHORIZED",
 							TWO_FACTOR_ERROR_CODES.INVALID_BACKUP_CODE,
 						);
 					}
-					const updatedBackupCodes = await encodeBackupCodes(
-						validate.updated,
-						ctx.context.secretConfig,
-						opts,
-					);
-
 					const updated = await ctx.context.adapter.incrementOne({
 						model: twoFactorTable,
 						where: [
@@ -395,17 +676,19 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 						],
 						increment: {},
 						set: {
-							backupCodes: updatedBackupCodes,
+							backupCodes: validate.updated,
 						},
 					});
 					if (!updated) {
+						await attempt?.restore();
+						await accountAttempt?.restore();
 						throw APIError.fromStatus("CONFLICT", {
 							message: "Failed to verify backup code. Please try again.",
 						});
 					}
 
 					if (isSignIn) {
-						await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
+						await accountAttempt?.recordSuccess();
 					}
 					if (!ctx.body.disableSession) {
 						return valid(ctx);
@@ -436,7 +719,7 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 				{
 					method: "POST",
 					body: generateBackupCodesBodySchema,
-					use: [sessionMiddleware],
+					use: [sensitiveSessionMiddleware],
 					metadata: {
 						openapi: {
 							description:
@@ -494,45 +777,108 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 						await ctx.context.password.checkPassword(user.id, ctx);
 					}
 
-					// First, find the twoFactor record to get its id
 					const twoFactor = await ctx.context.adapter.findOne<TwoFactorTable>({
 						model: twoFactorTable,
-						where: [
-							{
-								field: "userId",
-								value: user.id,
-							},
-						],
+						where: [{ field: "userId", value: user.id }],
 					});
-
-					if (!twoFactor) {
+					if (!twoFactor || twoFactor.verified === false) {
 						throw APIError.from(
 							"BAD_REQUEST",
 							TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
 						);
 					}
-
-					const backupCodes = await generateBackupCodes(
-						ctx.context.secretConfig,
-						opts,
-					);
-
-					// Use the id to update the record
-					await ctx.context.adapter.update({
-						model: twoFactorTable,
-						update: {
-							backupCodes: backupCodes.encryptedBackupCodes,
+					// Keep a failed step-up reservation durable by performing it before
+					// the lifecycle transaction. The exact-old-value guards below still
+					// serialize recovery consumption and factor mutation.
+					const proof = await proveFactorStepUp(
+						ctx,
+						ctx.context.adapter,
+						twoFactorTable,
+						twoFactor,
+						{
+							currentCode: ctx.body.currentCode,
+							recoveryCode: ctx.body.recoveryCode,
 						},
-						where: [
-							{
-								field: "id",
-								value: twoFactor.id,
-							},
-						],
+						{ backupCodeOptions: opts, totpOptions },
+					);
+					const rotated = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							const adapter = await getCurrentAdapter(ctx.context.adapter);
+							const generated = await generateBackupCodes(
+								ctx.context.secretConfig,
+								opts,
+							);
+							const authorized = await adapter.incrementOne<TwoFactorTable>({
+								model: twoFactorTable,
+								where: [{ field: "id", value: twoFactor.id }, ...proof.where],
+								increment: {},
+								set: {
+									...proof.set,
+									backupCodes: generated.encryptedBackupCodes,
+									trustDeviceGeneration: generateRandomString(32),
+									failedVerificationCount: 0,
+									activeVerificationReservations: "[]",
+									lockedUntil: null,
+								},
+							});
+							if (!authorized) {
+								throw APIError.fromStatus("CONFLICT", {
+									message: "Two-factor state changed. Please try again.",
+								});
+							}
+							if (
+								twoFactor.trustDeviceGeneration &&
+								(!ctx.context.options.secondaryStorage ||
+									ctx.context.options.verification?.storeInDatabase === true)
+							) {
+								await adapter.deleteMany({
+									model: "verification",
+									where: [
+										{
+											field: "value",
+											value: `${user.id}!${twoFactor.trustDeviceGeneration}`,
+										},
+									],
+								});
+							}
+							await revokeTrustGeneration(
+								ctx,
+								user.id,
+								twoFactor.trustDeviceGeneration,
+							);
+							const updatedUser = await ctx.context.internalAdapter.updateUser(
+								user.id,
+								{
+									twoFactorSessionGeneration: generateRandomString(32),
+								},
+							);
+							await ctx.context.internalAdapter.deleteUserSessions(user.id);
+							const replacementSession =
+								await ctx.context.internalAdapter.createSession(
+									user.id,
+									false,
+									preserveSessionLifetime(ctx.context.session.session),
+								);
+							return { generated, replacementSession, updatedUser };
+						},
+					).catch(async (error) => {
+						await proof.restoreAttempt();
+						throw error;
 					});
+					await setSessionCookie(ctx, {
+						session: rotated.replacementSession,
+						user: rotated.updatedUser,
+					});
+					expireCookie(
+						ctx,
+						ctx.context.createAuthCookie(TRUST_DEVICE_COOKIE_NAME, {
+							maxAge: TRUST_DEVICE_COOKIE_MAX_AGE,
+						}),
+					);
 					return ctx.json({
 						status: true,
-						backupCodes: backupCodes.backupCodes,
+						backupCodes: rotated.generated.backupCodes,
 					});
 				},
 			),

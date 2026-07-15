@@ -20,6 +20,7 @@ import {
 	verifyJWT,
 } from "../crypto/jwt";
 import { parseUserOutput } from "../db/schema";
+import { TWO_FACTOR_SESSION_GENERATION_FIELD } from "../db/two-factor-session-generation";
 import type { Session, User } from "../types";
 import { getDate } from "../utils/date";
 import { isPromise } from "../utils/is-promise";
@@ -167,6 +168,22 @@ export async function setCookieCache(
 	);
 
 	const filteredUser = parseUserOutput(ctx.context.options, session.user);
+	const sessionGeneration = (
+		session.session as unknown as Record<string, unknown>
+	)[TWO_FACTOR_SESSION_GENERATION_FIELD];
+	if (typeof sessionGeneration === "string") {
+		(filteredSession as Record<string, unknown>)[
+			TWO_FACTOR_SESSION_GENERATION_FIELD
+		] = sessionGeneration;
+	}
+	const userGeneration = (session.user as unknown as Record<string, unknown>)[
+		TWO_FACTOR_SESSION_GENERATION_FIELD
+	];
+	if (typeof userGeneration === "string") {
+		(filteredUser as Record<string, unknown>)[
+			TWO_FACTOR_SESSION_GENERATION_FIELD
+		] = userGeneration;
+	}
 
 	const versionConfig = ctx.context.options.session?.cookieCache?.version;
 	let version = "1";

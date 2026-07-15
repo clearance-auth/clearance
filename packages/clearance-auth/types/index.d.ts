@@ -218,6 +218,12 @@ type ClearanceTwoFactorProductApi = {
     disableTwoFactor: ClearanceProductEndpoint<{
         body: {
             password: string;
+            currentCode: string;
+            recoveryCode?: never;
+        } | {
+            password: string;
+            currentCode?: never;
+            recoveryCode: string;
         };
         headers: HeadersInit;
     }, {
@@ -226,6 +232,12 @@ type ClearanceTwoFactorProductApi = {
     generateBackupCodes: ClearanceProductEndpoint<{
         body: {
             password: string;
+            currentCode: string;
+            recoveryCode?: never;
+        } | {
+            password: string;
+            currentCode?: never;
+            recoveryCode: string;
         };
         headers: HeadersInit;
     }, {

@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
 	createClearanceAuth,
 	decryptRuntimeCredential,
+	encryptRuntimeCredential,
 	type ClearanceAuthBundle,
 } from "./create-auth.js";
 
@@ -44,7 +45,10 @@ type JwksRow = {
 	crv: string | null;
 };
 
-function totp(secret: string, counter = Math.floor(Date.now() / 30_000)): string {
+function totp(
+	secret: string,
+	counter = Math.floor(Date.now() / 30_000),
+): string {
 	const message = Buffer.alloc(8);
 	message.writeBigUInt64BE(BigInt(counter));
 	const digest = createHmac("sha1", secret).update(message).digest();
@@ -66,9 +70,7 @@ function decodeJwtPart<T>(token: string, index: number): T {
 
 function signedSessionHeaders(token: string, secret: string): Headers {
 	const signedToken = encodeURIComponent(
-		`${token}.${createHmac("sha256", secret)
-			.update(token)
-			.digest("base64")}`,
+		`${token}.${createHmac("sha256", secret).update(token).digest("base64")}`,
 	);
 	return new Headers({
 		cookie: `clearance.session_token=${signedToken}`,
@@ -97,6 +99,7 @@ describe.sequential.skipIf(!available)(
 				baseURL,
 				secret,
 				databaseUrl: scopedDatabaseUrl,
+				rateLimitEnabled: false,
 				enableSso: false,
 				enableScim: false,
 				authenticationSecurity: {
@@ -108,6 +111,33 @@ describe.sequential.skipIf(!available)(
 					},
 				},
 			});
+		}
+
+		async function postAuth(
+			path: string,
+			body: Record<string, unknown>,
+			requestHeaders: Headers,
+		): Promise<Response> {
+			const requestHeadersWithContentType = new Headers(requestHeaders);
+			requestHeadersWithContentType.set("content-type", "application/json");
+			return bundle.auth.handler(
+				new Request(`${baseURL}${path}`, {
+					method: "POST",
+					headers: requestHeadersWithContentType,
+					body: JSON.stringify(body),
+				}),
+			);
+		}
+
+		function sessionHeadersFromResponse(response: Response): Headers {
+			const sessionCookie = response.headers
+				.getSetCookie()
+				.find((entry) => entry.startsWith("clearance.session_token="));
+			const pair = sessionCookie?.split(";")[0];
+			if (!pair || pair.endsWith("=")) {
+				throw new Error("Response did not rotate the authenticated session");
+			}
+			return new Headers({ cookie: pair });
 		}
 
 		beforeAll(async () => {
@@ -169,13 +199,10 @@ describe.sequential.skipIf(!available)(
 			const rawSecret = await decryptRuntimeCredential(row.secret, secret);
 			expect(row.verified).toBe(false);
 			expect(row.secret).not.toContain(rawSecret);
+			expect(row.backupCodes).toMatch(/^clr-recovery:v1:/);
 			for (const code of enrollment.backupCodes) {
 				expect(row.backupCodes).not.toContain(code);
 			}
-			const decryptedBackupCodes = JSON.parse(
-				await decryptRuntimeCredential(row.backupCodes, secret),
-			) as string[];
-			expect(decryptedBackupCodes).toEqual(enrollment.backupCodes);
 
 			const verified = await bundle.auth.api.verifyTOTP({
 				body: { code: totp(rawSecret) },
@@ -190,6 +217,204 @@ describe.sequential.skipIf(!available)(
 					)
 				).rows[0]?.verified,
 			).toBe(true);
+
+			const legacyEncryptedRecovery = await encryptRuntimeCredential(
+				JSON.stringify(enrollment.backupCodes),
+				secret,
+			);
+			await scopedPool.query(
+				`UPDATE "twoFactor" SET "backupCodes"=$2 WHERE id=$1`,
+				[row.id, legacyEncryptedRecovery],
+			);
+			await bundle.migrate();
+			const migratedRecovery = (
+				await scopedPool.query<{ backupCodes: string }>(
+					`SELECT "backupCodes" FROM "twoFactor" WHERE id=$1`,
+					[row.id],
+				)
+			).rows[0]!.backupCodes;
+			expect(migratedRecovery).toMatch(/^clr-recovery:v1:/);
+			for (const code of enrollment.backupCodes) {
+				expect(migratedRecovery).not.toContain(code);
+			}
+		});
+
+		it("enforces one-way recovery step-up with one race winner and lifecycle revocation", async () => {
+			const email = `recovery-${suffix}@example.test`;
+			const signup = await bundle.auth.api.signUpEmail({
+				body: { email, password, name: "Recovery Proof" },
+			});
+			const originalHeaders = signedSessionHeaders(signup.token, secret);
+			const additionalSession = await bundle.auth.api.signInEmail({
+				body: { email, password },
+			});
+			const user = (
+				await scopedPool.query<{ id: string }>(
+					`SELECT id FROM "user" WHERE email=$1`,
+					[email],
+				)
+			).rows[0]!;
+			const enrollment = await bundle.auth.api.enableTwoFactor({
+				body: { password },
+				headers: originalHeaders,
+			});
+			const factor = (
+				await scopedPool.query<
+					TwoFactorRow & { trustDeviceGeneration: string }
+				>(
+					`SELECT id, secret, "backupCodes", verified, "trustDeviceGeneration"
+					 FROM "twoFactor" WHERE "userId"=$1`,
+					[user.id],
+				)
+			).rows[0]!;
+			const rawSecret = await decryptRuntimeCredential(factor.secret, secret);
+			const activated = await bundle.auth.api.verifyTOTP({
+				body: { code: totp(rawSecret) },
+				headers: originalHeaders,
+			});
+			const activeHeaders = signedSessionHeaders(activated.token, secret);
+			const preRotationSessionGeneration = (
+				await scopedPool.query<{ twoFactorSessionGeneration: string }>(
+					`SELECT "twoFactorSessionGeneration" FROM "user" WHERE id=$1`,
+					[user.id],
+				)
+			).rows[0]!.twoFactorSessionGeneration;
+			const sessionsAfterActivation = await scopedPool.query<{
+				token: string;
+			}>(`SELECT token FROM session WHERE "userId"=$1`, [user.id]);
+			expect(sessionsAfterActivation.rows.map((row) => row.token)).toEqual([
+				activated.token,
+			]);
+			expect(
+				sessionsAfterActivation.rows.some(
+					(row) => row.token === additionalSession.token,
+				),
+			).toBe(false);
+
+			const passwordOnly = await postAuth(
+				"/two-factor/generate-backup-codes",
+				{ password },
+				activeHeaders,
+			);
+			expect(passwordOnly.status).toBe(400);
+
+			const staleSessionToken = `stale-${randomUUID()}`;
+			await scopedPool.query(
+				`INSERT INTO session
+				 (id, token, "userId", "expiresAt", "createdAt", "updatedAt")
+				 VALUES ($1, $2, $3, now()+interval '1 day', now(), now())`,
+				[randomUUID(), staleSessionToken, user.id],
+			);
+			const trustIdentifier = `trust-device-${randomUUID()}`;
+			const activeTrustGeneration = (
+				await scopedPool.query<{ trustDeviceGeneration: string }>(
+					`SELECT "trustDeviceGeneration" FROM "twoFactor" WHERE id=$1`,
+					[factor.id],
+				)
+			).rows[0]!.trustDeviceGeneration;
+			await scopedPool.query(
+				`INSERT INTO verification
+				 (id, identifier, value, "expiresAt", "createdAt", "updatedAt")
+				 VALUES ($1, $2, $3, now()+interval '1 day', now(), now())`,
+				[randomUUID(), trustIdentifier, `${user.id}!${activeTrustGeneration}`],
+			);
+
+			const recoveryCode = enrollment.backupCodes[0]!;
+			const racers = await Promise.all([
+				postAuth(
+					"/two-factor/generate-backup-codes",
+					{ password, recoveryCode },
+					activeHeaders,
+				),
+				postAuth(
+					"/two-factor/generate-backup-codes",
+					{ password, recoveryCode },
+					activeHeaders,
+				),
+			]);
+			const winner = racers.find((response) => response.status === 200);
+			const loser = racers.find((response) => response.status !== 200);
+			expect(winner).toBeDefined();
+			expect(loser?.status === 401 || loser?.status === 409).toBe(true);
+			const rotatedHeaders = sessionHeadersFromResponse(winner!);
+			const generated = (await winner!.json()) as {
+				status: true;
+				backupCodes: string[];
+			};
+			expect(generated.backupCodes).toHaveLength(10);
+			const sessionsAfterRegeneration = await scopedPool.query<{
+				token: string;
+			}>(`SELECT token FROM session WHERE "userId"=$1`, [user.id]);
+			expect(sessionsAfterRegeneration.rows).toHaveLength(1);
+			expect(
+				sessionsAfterRegeneration.rows.some(
+					(row) =>
+						row.token === activated.token || row.token === staleSessionToken,
+				),
+			).toBe(false);
+			const lateStaleToken = `late-stale-${randomUUID()}`;
+			await scopedPool.query(
+				`INSERT INTO session
+				 (id, token, "userId", "expiresAt", "createdAt", "updatedAt",
+				  "twoFactorSessionGeneration")
+				 VALUES ($1, $2, $3, now()+interval '1 day', now(), now(), $4)`,
+				[randomUUID(), lateStaleToken, user.id, preRotationSessionGeneration],
+			);
+			expect(
+				await bundle.auth.api.getSession({
+					headers: signedSessionHeaders(lateStaleToken, secret),
+				}),
+			).toBeNull();
+			expect(
+				(
+					await scopedPool.query<{ count: number }>(
+						`SELECT count(*)::int count FROM verification WHERE identifier=$1`,
+						[trustIdentifier],
+					)
+				).rows[0]?.count,
+			).toBe(0);
+
+			const replay = await postAuth(
+				"/two-factor/generate-backup-codes",
+				{ password, recoveryCode },
+				rotatedHeaders,
+			);
+			expect(replay.status).toBe(401);
+			const failedVerificationCount = (
+				await scopedPool.query<{ failedVerificationCount: number }>(
+					`SELECT "failedVerificationCount" FROM "twoFactor" WHERE id=$1`,
+					[factor.id],
+				)
+			).rows[0]!.failedVerificationCount;
+			expect(failedVerificationCount).toBeGreaterThanOrEqual(1);
+			expect(failedVerificationCount).toBeLessThanOrEqual(2);
+
+			const disabled = await postAuth(
+				"/two-factor/disable",
+				{ password, recoveryCode: generated.backupCodes[0] },
+				rotatedHeaders,
+			);
+			expect(disabled.status).toBe(200);
+			const disabledHeaders = sessionHeadersFromResponse(disabled);
+			expect(
+				await bundle.auth.api.getSession({ headers: disabledHeaders }),
+			).not.toBeNull();
+			expect(
+				(
+					await scopedPool.query<{ count: number }>(
+						`SELECT count(*)::int count FROM "twoFactor" WHERE "userId"=$1`,
+						[user.id],
+					)
+				).rows[0]?.count,
+			).toBe(0);
+			expect(
+				(
+					await scopedPool.query<{ twoFactorEnabled: boolean }>(
+						`SELECT "twoFactorEnabled" FROM "user" WHERE id=$1`,
+						[user.id],
+					)
+				).rows[0]?.twoFactorEnabled,
+			).toBe(false);
 		});
 
 		it("rotates encrypted Ed25519 signing keys with overlap and public-only JWKS", async () => {
@@ -225,7 +450,9 @@ describe.sequential.skipIf(!available)(
 			);
 			const concurrent = await Promise.all(
 				Array.from({ length: 8 }, (_, index) =>
-					(index % 2 === 0 ? bundle : peerBundle).auth.api.getToken({ headers }),
+					(index % 2 === 0 ? bundle : peerBundle).auth.api.getToken({
+						headers,
+					}),
 				),
 			);
 			const secondHeaders = concurrent.map((entry) =>
@@ -238,8 +465,11 @@ describe.sequential.skipIf(!available)(
 			expect(secondHeader.kid).not.toBe(firstHeader.kid);
 			expect(new Set(secondHeaders.map((entry) => entry.kid)).size).toBe(1);
 			expect(
-				(await scopedPool.query<{ count: number }>("SELECT count(*)::int count FROM jwks"))
-					.rows[0]?.count,
+				(
+					await scopedPool.query<{ count: number }>(
+						"SELECT count(*)::int count FROM jwks",
+					)
+				).rows[0]?.count,
 			).toBe(2);
 
 			const oldToken = await bundle.auth.api.verifyJWT({
@@ -294,9 +524,7 @@ describe.sequential.skipIf(!available)(
 				)
 			).rows[0]!;
 			expect(unknown.alg).toBeNull();
-			expect(unknown.expiresAt.getTime()).toBeLessThan(
-				Date.now() - 600 * 1000,
-			);
+			expect(unknown.expiresAt.getTime()).toBeLessThan(Date.now() - 600 * 1000);
 			const legacyRsa = (
 				await scopedPool.query<{ expiresAt: Date; alg: string }>(
 					`SELECT "expiresAt", alg FROM jwks WHERE id=$1`,
@@ -339,100 +567,108 @@ describe.sequential.skipIf(!available)(
 	},
 );
 
-describe.sequential.skipIf(!available)("authentication security schema upgrade", () => {
-	it("adds signing metadata to the legacy table shape and rotates its key", async () => {
-		const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
-		const schema = `auth_security_upgrade_${suffix}`;
-		const baseURL = "http://localhost:3300/api/auth";
-		const secret = "authentication-security-upgrade-proof-secret!!";
-		const basePool = new pg.Pool({ connectionString: DATABASE_URL });
-		let oldBundle: ClearanceAuthBundle | undefined;
-		let upgradeBundle: ClearanceAuthBundle | undefined;
-		let scopedPool: pg.Pool | undefined;
-		try {
-			await basePool.query(`CREATE SCHEMA "${schema}"`);
-			const url = new URL(DATABASE_URL);
-			url.searchParams.set("options", `-csearch_path=${schema}`);
-			const databaseUrl = url.toString();
-			scopedPool = new pg.Pool({ connectionString: databaseUrl });
-			const options = {
-				baseURL,
-				secret,
-				databaseUrl,
-				enableSso: false,
-				enableScim: false,
-				authenticationSecurity: {
-					breachedPassword: { enabled: false },
-					asymmetricAccessTokens: {
-						rotationIntervalSeconds: 300,
-						gracePeriodSeconds: 600,
+describe.sequential.skipIf(!available)(
+	"authentication security schema upgrade",
+	() => {
+		it("adds signing metadata to the legacy table shape and rotates its key", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_security_upgrade_${suffix}`;
+			const baseURL = "http://localhost:3300/api/auth";
+			const secret = "authentication-security-upgrade-proof-secret!!";
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let oldBundle: ClearanceAuthBundle | undefined;
+			let upgradeBundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				const options = {
+					baseURL,
+					secret,
+					databaseUrl,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: {
+							rotationIntervalSeconds: 300,
+							gracePeriodSeconds: 600,
+						},
 					},
-				},
-			} as const;
-			oldBundle = createClearanceAuth(options);
-			await oldBundle.migrate();
-			const signup = await oldBundle.auth.api.signUpEmail({
-				body: {
-					email: `upgrade-${suffix}@example.test`,
-					password: "correct-horse-battery-staple",
-					name: "Upgrade Proof",
-				},
-			});
-			const headers = signedSessionHeaders(signup.token, secret);
-			const legacyToken = await oldBundle.auth.api.getToken({ headers });
-			const legacyHeader = decodeJwtPart<{ kid: string }>(legacyToken.token, 0);
-			await oldBundle.destroy();
-			oldBundle = undefined;
+				} as const;
+				oldBundle = createClearanceAuth(options);
+				await oldBundle.migrate();
+				const signup = await oldBundle.auth.api.signUpEmail({
+					body: {
+						email: `upgrade-${suffix}@example.test`,
+						password: "correct-horse-battery-staple",
+						name: "Upgrade Proof",
+					},
+				});
+				const headers = signedSessionHeaders(signup.token, secret);
+				const legacyToken = await oldBundle.auth.api.getToken({ headers });
+				const legacyHeader = decodeJwtPart<{ kid: string }>(
+					legacyToken.token,
+					0,
+				);
+				await oldBundle.destroy();
+				oldBundle = undefined;
 
-			await scopedPool.query(
-				`ALTER TABLE jwks DROP COLUMN alg, DROP COLUMN crv`,
-			);
-			await scopedPool.query(`UPDATE jwks SET "expiresAt"=NULL`);
-			const before = await basePool.query<{ column_name: string }>(
-				`SELECT column_name FROM information_schema.columns
+				await scopedPool.query(
+					`ALTER TABLE jwks DROP COLUMN alg, DROP COLUMN crv`,
+				);
+				await scopedPool.query(`UPDATE jwks SET "expiresAt"=NULL`);
+				const before = await basePool.query<{ column_name: string }>(
+					`SELECT column_name FROM information_schema.columns
 				 WHERE table_schema=$1 AND table_name='jwks'`,
-				[schema],
-			);
-			expect(before.rows.map((row) => row.column_name)).not.toContain("alg");
-			expect(before.rows.map((row) => row.column_name)).not.toContain("crv");
+					[schema],
+				);
+				expect(before.rows.map((row) => row.column_name)).not.toContain("alg");
+				expect(before.rows.map((row) => row.column_name)).not.toContain("crv");
 
-			upgradeBundle = createClearanceAuth(options);
-			await upgradeBundle.migrate();
-			const after = await basePool.query<{ column_name: string }>(
-				`SELECT column_name FROM information_schema.columns
+				upgradeBundle = createClearanceAuth(options);
+				await upgradeBundle.migrate();
+				const after = await basePool.query<{ column_name: string }>(
+					`SELECT column_name FROM information_schema.columns
 				 WHERE table_schema=$1 AND table_name='jwks'`,
-				[schema],
-			);
-			expect(after.rows.map((row) => row.column_name)).toEqual(
-				expect.arrayContaining(["alg", "crv"]),
-			);
-			const upgraded = (
-				await scopedPool.query<JwksRow & { expiresAt: Date }>(
-					`SELECT id, "publicKey", "privateKey", "expiresAt", alg, crv
+					[schema],
+				);
+				expect(after.rows.map((row) => row.column_name)).toEqual(
+					expect.arrayContaining(["alg", "crv"]),
+				);
+				const upgraded = (
+					await scopedPool.query<JwksRow & { expiresAt: Date }>(
+						`SELECT id, "publicKey", "privateKey", "expiresAt", alg, crv
 					 FROM jwks WHERE id=$1`,
-					[legacyHeader.kid],
-				)
-			).rows[0]!;
-			expect(upgraded).toMatchObject({ alg: "EdDSA", crv: "Ed25519" });
-			expect(upgraded.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
+						[legacyHeader.kid],
+					)
+				).rows[0]!;
+				expect(upgraded).toMatchObject({ alg: "EdDSA", crv: "Ed25519" });
+				expect(upgraded.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
 
-			const replacement = await upgradeBundle.auth.api.getToken({ headers });
-			const replacementHeader = decodeJwtPart<{ kid: string }>(
-				replacement.token,
-				0,
-			);
-			expect(replacementHeader.kid).not.toBe(legacyHeader.kid);
-			expect(
-				(await upgradeBundle.auth.api.verifyJWT({
-					body: { token: legacyToken.token },
-				})).payload,
-			).not.toBeNull();
-		} finally {
-			await upgradeBundle?.destroy();
-			await oldBundle?.destroy();
-			await scopedPool?.end();
-			await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-			await basePool.end();
-		}
-	});
-});
+				const replacement = await upgradeBundle.auth.api.getToken({ headers });
+				const replacementHeader = decodeJwtPart<{ kid: string }>(
+					replacement.token,
+					0,
+				);
+				expect(replacementHeader.kid).not.toBe(legacyHeader.kid);
+				expect(
+					(
+						await upgradeBundle.auth.api.verifyJWT({
+							body: { token: legacyToken.token },
+						})
+					).payload,
+				).not.toBeNull();
+			} finally {
+				await upgradeBundle?.destroy();
+				await oldBundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+	},
+);

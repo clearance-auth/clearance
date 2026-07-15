@@ -7,8 +7,10 @@ import {
 } from "@clearance/delivery";
 import { symmetricDecrypt, symmetricEncrypt } from "@clearance/runtime/crypto";
 import {
+	encodeBackupCodes,
 	haveIBeenPwned,
 	jwt,
+	isOneWayBackupCodeEnvelope,
 	organization,
 	twoFactor,
 	type Jwk,
@@ -53,12 +55,18 @@ export function socialProvidersFromEnvironment(
 	env: Record<string, string | undefined> = process.env,
 ): Record<string, SocialProviderConfig> {
 	const providers: Record<string, SocialProviderConfig> = {};
-	if (Boolean(env.CLEARANCE_GITHUB_CLIENT_ID) !== Boolean(env.CLEARANCE_GITHUB_CLIENT_SECRET)) {
+	if (
+		Boolean(env.CLEARANCE_GITHUB_CLIENT_ID) !==
+		Boolean(env.CLEARANCE_GITHUB_CLIENT_SECRET)
+	) {
 		throw new Error(
 			"GitHub social login requires both CLEARANCE_GITHUB_CLIENT_ID and CLEARANCE_GITHUB_CLIENT_SECRET",
 		);
 	}
-	if (Boolean(env.CLEARANCE_GOOGLE_CLIENT_ID) !== Boolean(env.CLEARANCE_GOOGLE_CLIENT_SECRET)) {
+	if (
+		Boolean(env.CLEARANCE_GOOGLE_CLIENT_ID) !==
+		Boolean(env.CLEARANCE_GOOGLE_CLIENT_SECRET)
+	) {
 		throw new Error(
 			"Google social login requires both CLEARANCE_GOOGLE_CLIENT_ID and CLEARANCE_GOOGLE_CLIENT_SECRET",
 		);
@@ -200,8 +208,7 @@ function resolveAuthenticationSecurity(
 }
 
 function postgresJwksAdapter(pool: pg.Pool) {
-	const selectColumns =
-		`id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv`;
+	const selectColumns = `id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv`;
 	return {
 		async getJwks(): Promise<Jwk[]> {
 			const result = await pool.query<Jwk>(
@@ -313,9 +320,7 @@ function isSupportedJwkAlgorithm(
 	);
 }
 
-function isSupportedJwkCurve(
-	value: unknown,
-): value is NonNullable<Jwk["crv"]> {
+function isSupportedJwkCurve(value: unknown): value is NonNullable<Jwk["crv"]> {
 	return value === "Ed25519" || value === "P-256" || value === "P-521";
 }
 
@@ -338,9 +343,7 @@ function isCompatiblePublicJwk(
 	}
 	if (alg === "EdDSA") {
 		return (
-			key.kty === "OKP" &&
-			key.crv === "Ed25519" &&
-			typeof key.x === "string"
+			key.kty === "OKP" && key.crv === "Ed25519" && typeof key.x === "string"
 		);
 	}
 	if (alg === "ES256" || alg === "ES512") {
@@ -351,7 +354,35 @@ function isCompatiblePublicJwk(
 			typeof key.y === "string"
 		);
 	}
-	return key.kty === "RSA" && typeof key.n === "string" && typeof key.e === "string";
+	return (
+		key.kty === "RSA" && typeof key.n === "string" && typeof key.e === "string"
+	);
+}
+
+async function migrateRecoveryCodesToHashes(
+	stored: string,
+	secret: string,
+): Promise<string> {
+	if (stored.startsWith("clr-recovery:")) {
+		if (!isOneWayBackupCodeEnvelope(stored)) {
+			throw new Error("Cannot migrate invalid recovery-code envelope");
+		}
+		return stored;
+	}
+	let plaintext: string;
+	try {
+		plaintext = await decryptRuntimeCredential(stored, secret);
+	} catch {
+		plaintext = stored;
+	}
+	const codes = JSON.parse(plaintext) as unknown;
+	if (
+		!Array.isArray(codes) ||
+		codes.some((code) => typeof code !== "string" || code.length === 0)
+	) {
+		throw new Error("Cannot migrate invalid two-factor recovery-code storage");
+	}
+	return encodeBackupCodes(codes, secret, { storeBackupCodes: "hashed" });
 }
 
 export async function encryptRuntimeCredential(
@@ -401,9 +432,11 @@ function validateDurableDeliveryUrl(
  * Production (NODE_ENV=production) refuses default/weak secrets.
  */
 export function createClearanceAuth<
-	const Security extends
-		ClearanceAuthenticationSecurityOptions | undefined = undefined,
->(options: CreateClearanceAuthOptions<Security>): ClearanceAuthBundle<Security> {
+	const Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		undefined,
+>(
+	options: CreateClearanceAuthOptions<Security>,
+): ClearanceAuthBundle<Security> {
 	const nodeEnv = process.env.NODE_ENV ?? "development";
 	const strict =
 		options.strictSecrets === true ||
@@ -434,42 +467,48 @@ export function createClearanceAuth<
 	const deliveryKeyring = options.durableDelivery
 		? createDeliveryKeyring(options.durableDelivery.keyring)
 		: null;
-	const durableDelivery = options.durableDelivery && deliveryKeyring
-		? {
-				createInvitationUrl: (invitationId: string) => {
-					const raw = options.durableDelivery!.invitationUrl(invitationId);
-					const parsed = validateDurableDeliveryUrl(
-						raw,
-						"durableDelivery.invitationUrl",
-						strict,
-					);
-					return parsed.toString();
-				},
-				enqueue: async (
-					transaction: {
-						rawTransactionQuery?: <Row extends Record<string, unknown> = Record<string, unknown>>(
-							text: string,
-							values?: readonly unknown[],
-						) => Promise<{ rows: Row[]; rowCount: number | null }>;
+	const durableDelivery =
+		options.durableDelivery && deliveryKeyring
+			? {
+					createInvitationUrl: (invitationId: string) => {
+						const raw = options.durableDelivery!.invitationUrl(invitationId);
+						const parsed = validateDurableDeliveryUrl(
+							raw,
+							"durableDelivery.invitationUrl",
+							strict,
+						);
+						return parsed.toString();
 					},
-					input: Omit<Parameters<typeof enqueueDeliveryInExistingTransaction>[1], "projectId" | "environmentId">,
-				) => {
-					await enqueueDeliveryInExistingTransaction(
-						transaction,
-						{
-							...input,
-							projectId: options.durableDelivery!.projectId,
-							environmentId: options.durableDelivery!.environmentId,
+					enqueue: async (
+						transaction: {
+							rawTransactionQuery?: <
+								Row extends Record<string, unknown> = Record<string, unknown>,
+							>(
+								text: string,
+								values?: readonly unknown[],
+							) => Promise<{ rows: Row[]; rowCount: number | null }>;
 						},
-						deliveryKeyring,
-						{
-							schema: options.durableDelivery!.schema,
-							prefix: options.durableDelivery!.prefix,
-						},
-					);
-				},
-			}
-		: undefined;
+						input: Omit<
+							Parameters<typeof enqueueDeliveryInExistingTransaction>[1],
+							"projectId" | "environmentId"
+						>,
+					) => {
+						await enqueueDeliveryInExistingTransaction(
+							transaction,
+							{
+								...input,
+								projectId: options.durableDelivery!.projectId,
+								environmentId: options.durableDelivery!.environmentId,
+							},
+							deliveryKeyring,
+							{
+								schema: options.durableDelivery!.schema,
+								prefix: options.durableDelivery!.prefix,
+							},
+						);
+					},
+				}
+			: undefined;
 	const database = {
 		db,
 		type: "postgres" as const,
@@ -482,15 +521,14 @@ export function createClearanceAuth<
 			? [
 					twoFactor({
 						issuer: authenticationSecurity.twoFactor.issuer,
-						backupCodeOptions: { storeBackupCodes: "encrypted" },
+						backupCodeOptions: { storeBackupCodes: "hashed" },
 						trustDeviceMaxAge:
 							authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds,
 						accountLockout: {
 							enabled: true,
 							maxFailedAttempts:
 								authenticationSecurity.twoFactor.maxFailedAttempts,
-							durationSeconds:
-								authenticationSecurity.twoFactor.lockoutSeconds,
+							durationSeconds: authenticationSecurity.twoFactor.lockoutSeconds,
 						},
 					}),
 				]
@@ -508,9 +546,11 @@ export function createClearanceAuth<
 						jwks: {
 							keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
 							rotationInterval:
-								authenticationSecurity.asymmetricAccessTokens.rotationIntervalSeconds,
+								authenticationSecurity.asymmetricAccessTokens
+									.rotationIntervalSeconds,
 							gracePeriod:
-								authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds,
+								authenticationSecurity.asymmetricAccessTokens
+									.gracePeriodSeconds,
 						},
 						jwt: {
 							issuer: authenticationSecurity.asymmetricAccessTokens.issuer,
@@ -529,7 +569,8 @@ export function createClearanceAuth<
 							requireTimestamps: true,
 						},
 						storeOIDCClientSecret: {
-							encrypt: (secret) => encryptRuntimeCredential(secret, options.secret),
+							encrypt: (secret) =>
+								encryptRuntimeCredential(secret, options.secret),
 							decrypt: (ciphertext) =>
 								decryptRuntimeCredential(ciphertext, options.secret),
 						},
@@ -587,9 +628,7 @@ export function createClearanceAuth<
 		secret: options.secret,
 		database,
 		durableDelivery,
-		emailVerification: durableDelivery
-			? { sendOnSignUp: true }
-			: undefined,
+		emailVerification: durableDelivery ? { sendOnSignUp: true } : undefined,
 		emailAndPassword: {
 			enabled: true,
 			minPasswordLength: 12,
@@ -600,7 +639,8 @@ export function createClearanceAuth<
 		user: {
 			additionalFields: userAdditionalFields,
 		},
-		socialProviders: options.socialProviders as ClearanceOptions["socialProviders"],
+		socialProviders:
+			options.socialProviders as ClearanceOptions["socialProviders"],
 		trustedOrigins: options.trustedOrigins ?? [options.baseURL],
 		telemetry: { enabled: false },
 		rateLimit,
@@ -686,12 +726,17 @@ export function createClearanceAuth<
 			const providers = await pool.query<{
 				id: string;
 				oidcConfig: string | null;
-			}>(`select id, "oidcConfig" from "ssoProvider" where "oidcConfig" is not null`);
+			}>(
+				`select id, "oidcConfig" from "ssoProvider" where "oidcConfig" is not null`,
+			);
 			for (const provider of providers.rows) {
-				const config = JSON.parse(provider.oidcConfig ?? "null") as
-					| { clientSecret?: string }
-					| null;
-				if (config?.clientSecret && !config.clientSecret.startsWith("clr-sso:v1:")) {
+				const config = JSON.parse(provider.oidcConfig ?? "null") as {
+					clientSecret?: string;
+				} | null;
+				if (
+					config?.clientSecret &&
+					!config.clientSecret.startsWith("clr-sso:v1:")
+				) {
 					config.clientSecret = `clr-sso:v1:${await encryptRuntimeCredential(
 						config.clientSecret,
 						options.secret,
@@ -732,6 +777,85 @@ export function createClearanceAuth<
 				`UPDATE "twoFactor" SET "failedVerificationCount" = 0
 				 WHERE "failedVerificationCount" IS NULL`,
 			);
+			await pool.query(
+				`UPDATE "twoFactor" SET "activeVerificationReservations" = '[]'
+				 WHERE "activeVerificationReservations" IS NULL`,
+			);
+			const recoveryRows = await pool.query<{
+				id: string;
+				backupCodes: string;
+				pendingBackupCodes: string | null;
+				trustDeviceGeneration: string | null;
+			}>(
+				`SELECT id, "backupCodes", "pendingBackupCodes", "trustDeviceGeneration"
+				 FROM "twoFactor"`,
+			);
+			for (const row of recoveryRows.rows) {
+				const backupCodes = await migrateRecoveryCodesToHashes(
+					row.backupCodes,
+					options.secret,
+				);
+				const pendingBackupCodes = row.pendingBackupCodes
+					? await migrateRecoveryCodesToHashes(
+							row.pendingBackupCodes,
+							options.secret,
+						)
+					: null;
+				const trustDeviceGeneration = row.trustDeviceGeneration ?? randomUUID();
+				if (
+					backupCodes !== row.backupCodes ||
+					pendingBackupCodes !== row.pendingBackupCodes ||
+					trustDeviceGeneration !== row.trustDeviceGeneration
+				) {
+					const migrated = await pool.query(
+						`UPDATE "twoFactor"
+						 SET "backupCodes"=$2, "pendingBackupCodes"=$3,
+						     "trustDeviceGeneration"=$4
+						 WHERE id=$1 AND "backupCodes"=$5
+						   AND "pendingBackupCodes" IS NOT DISTINCT FROM $6
+						   AND "trustDeviceGeneration" IS NOT DISTINCT FROM $7`,
+						[
+							row.id,
+							backupCodes,
+							pendingBackupCodes,
+							trustDeviceGeneration,
+							row.backupCodes,
+							row.pendingBackupCodes,
+							row.trustDeviceGeneration,
+						],
+					);
+					if (migrated.rowCount !== 1) {
+						throw new Error(
+							"Two-factor recovery state changed during migration; retry migration",
+						);
+					}
+				}
+			}
+			await pool.query(
+				`WITH missing_users AS MATERIALIZED (
+					SELECT id, gen_random_uuid()::text AS generation
+					FROM "user"
+					WHERE "twoFactorSessionGeneration" IS NULL
+				), updated_users AS (
+					UPDATE "user" AS target
+					SET "twoFactorSessionGeneration" = missing_users.generation
+					FROM missing_users
+					WHERE target.id = missing_users.id
+					  AND target."twoFactorSessionGeneration" IS NULL
+					RETURNING target.id, target."twoFactorSessionGeneration" AS generation
+				)
+				UPDATE "session" AS session
+				SET "twoFactorSessionGeneration" =
+					COALESCE(updated_users.generation, owner."twoFactorSessionGeneration")
+				FROM "user" AS owner
+				LEFT JOIN updated_users ON updated_users.id = owner.id
+				WHERE session."userId" = owner.id
+				  AND session."twoFactorSessionGeneration" IS NULL
+				  AND COALESCE(
+					updated_users.generation,
+					owner."twoFactorSessionGeneration"
+				  ) IS NOT NULL`,
+			);
 		}
 		if (!authenticationSecurity.asymmetricAccessTokens.enabled) return;
 		const client = await pool.connect();
@@ -749,20 +873,18 @@ export function createClearanceAuth<
 				expiresAt: Date | null;
 				alg: string | null;
 				crv: string | null;
-			}>(
-				`SELECT id, "publicKey", "expiresAt", alg, crv FROM jwks FOR UPDATE`,
-			);
+			}>(`SELECT id, "publicKey", "expiresAt", alg, crv FROM jwks FOR UPDATE`);
 			const now = new Date();
 			const retiredBefore = new Date(
 				now.getTime() -
-					(authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds + 1) *
+					(authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds +
+						1) *
 						1000,
 			);
 			for (const row of rows.rows) {
 				const inferred = inferJwkMetadata(row.publicKey);
 				const alg =
-					inferred?.alg ??
-					(isSupportedJwkAlgorithm(row.alg) ? row.alg : null);
+					inferred?.alg ?? (isSupportedJwkAlgorithm(row.alg) ? row.alg : null);
 				const crv =
 					inferred?.crv ?? (isSupportedJwkCurve(row.crv) ? row.crv : null);
 				const metadataKnown =
@@ -822,7 +944,8 @@ export function createClearanceAuth<
 				await migrateDeliverySchema(pool, {
 					schema: options.durableDelivery.schema,
 					prefix: options.durableDelivery.prefix,
-					legacyFingerprintKeyId: options.durableDelivery.legacyFingerprintKeyId,
+					legacyFingerprintKeyId:
+						options.durableDelivery.legacyFingerprintKeyId,
 				});
 			}
 			return {

@@ -99,7 +99,9 @@ interface ClearanceProductEndpoint<Input, Output> {
 		status: number;
 		response: Output;
 	}>;
-	(input: Input & { returnHeaders: false; returnStatus: false }): Promise<Output>;
+	(
+		input: Input & { returnHeaders: false; returnStatus: false },
+	): Promise<Output>;
 	(input: Input & { returnHeaders: true }): Promise<{
 		headers: Headers;
 		response: Output;
@@ -159,9 +161,7 @@ export type ClearanceRuntimeMigrationResult = {
 
 export interface ClearanceAuthRuntime {
 	handler(request: Request): Promise<Response>;
-	readonly api: Readonly<
-		Record<string, (...args: any[]) => Promise<any>>
-	>;
+	readonly api: Readonly<Record<string, (...args: any[]) => Promise<any>>>;
 	readonly $context: Promise<unknown>;
 }
 
@@ -188,44 +188,72 @@ type ClearanceBaseProductApi = {
 };
 
 type ClearanceTwoFactorProductApi = {
-	enableTwoFactor: ClearanceProductEndpoint<{
-		body: { password: string; issuer?: string; currentCode?: string };
-		headers: HeadersInit;
-	}, ClearanceTwoFactorEnrollment>;
-	getTOTPURI: ClearanceProductEndpoint<{
-		body: { password: string };
-		headers: HeadersInit;
-	}, { totpURI: string }>;
-	verifyTOTP: ClearanceProductEndpoint<{
-		body: { code: string; trustDevice?: boolean };
-		headers: HeadersInit;
-	}, ClearanceTwoFactorVerification>;
-	disableTwoFactor: ClearanceProductEndpoint<{
-		body: { password: string };
-		headers: HeadersInit;
-	}, { status: true }>;
-	generateBackupCodes: ClearanceProductEndpoint<{
-		body: { password: string };
-		headers: HeadersInit;
-	}, { status: true; backupCodes: string[] }>;
-	verifyBackupCode: ClearanceProductEndpoint<{
-		body: {
-			code: string;
-			disableSession?: boolean;
-			trustDevice?: boolean;
-		};
-		headers: HeadersInit;
-	}, ClearanceTwoFactorVerification>;
+	enableTwoFactor: ClearanceProductEndpoint<
+		{
+			body: { password: string; issuer?: string; currentCode?: string };
+			headers: HeadersInit;
+		},
+		ClearanceTwoFactorEnrollment
+	>;
+	getTOTPURI: ClearanceProductEndpoint<
+		{
+			body: { password: string };
+			headers: HeadersInit;
+		},
+		{ totpURI: string }
+	>;
+	verifyTOTP: ClearanceProductEndpoint<
+		{
+			body: { code: string; trustDevice?: boolean };
+			headers: HeadersInit;
+		},
+		ClearanceTwoFactorVerification
+	>;
+	disableTwoFactor: ClearanceProductEndpoint<
+		{
+			body:
+				| { password: string; currentCode: string; recoveryCode?: never }
+				| { password: string; currentCode?: never; recoveryCode: string };
+			headers: HeadersInit;
+		},
+		{ status: true }
+	>;
+	generateBackupCodes: ClearanceProductEndpoint<
+		{
+			body:
+				| { password: string; currentCode: string; recoveryCode?: never }
+				| { password: string; currentCode?: never; recoveryCode: string };
+			headers: HeadersInit;
+		},
+		{ status: true; backupCodes: string[] }
+	>;
+	verifyBackupCode: ClearanceProductEndpoint<
+		{
+			body: {
+				code: string;
+				disableSession?: boolean;
+				trustDevice?: boolean;
+			};
+			headers: HeadersInit;
+		},
+		ClearanceTwoFactorVerification
+	>;
 };
 
 type ClearanceJwtProductApi = {
-	getToken: ClearanceProductEndpoint<{
-		headers: HeadersInit;
-	}, { token: string }>;
+	getToken: ClearanceProductEndpoint<
+		{
+			headers: HeadersInit;
+		},
+		{ token: string }
+	>;
 	getJwks(): Promise<ClearanceJsonWebKeySet>;
-	verifyJWT: ClearanceProductEndpoint<{
-		body: { token: string; issuer?: string };
-	}, { payload: ClearanceJwtPayload | null }>;
+	verifyJWT: ClearanceProductEndpoint<
+		{
+			body: { token: string; issuer?: string };
+		},
+		{ payload: ClearanceJwtPayload | null }
+	>;
 };
 
 type ClearanceAuthenticationSecurityApi<
@@ -250,7 +278,8 @@ type ClearanceAuthenticationSecurityApi<
 			: ClearanceJwtProductApi);
 
 export type ClearanceProductAuthRuntime<
-	Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+	Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		undefined,
 > = Omit<ClearanceAuthRuntime, "api"> & {
 	readonly api: ClearanceBaseProductApi &
 		ClearanceAuthenticationSecurityApi<Security>;
@@ -272,7 +301,8 @@ export interface ClearanceDatabasePool {
 }
 
 export type ClearanceAuthBundle<
-	Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+	Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		undefined,
 > = {
 	auth: ClearanceProductAuthRuntime<Security>;
 	pool: ClearanceDatabasePool;
@@ -298,8 +328,16 @@ export interface ClearancePlugin {
 }
 
 export type ClearanceMigrationSet = {
-	toBeCreated: ReadonlyArray<{ table: string; fields: Record<string, unknown>; order: number }>;
-	toBeAdded: ReadonlyArray<{ table: string; fields: Record<string, unknown>; order: number }>;
+	toBeCreated: ReadonlyArray<{
+		table: string;
+		fields: Record<string, unknown>;
+		order: number;
+	}>;
+	toBeAdded: ReadonlyArray<{
+		table: string;
+		fields: Record<string, unknown>;
+		order: number;
+	}>;
 	runMigrations(): Promise<void>;
 	compileMigrations(): Promise<string>;
 };
@@ -323,11 +361,12 @@ export declare function socialProvidersFromEnvironment(
 	env?: Record<string, string | undefined>,
 ): Record<string, SocialProviderConfig>;
 export declare function createClearanceAuth<
-	const Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+	const Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		undefined,
 >(options: CreateClearanceAuthOptions<Security>): ClearanceAuthBundle<Security>;
-export declare function withClearanceDefaults<T extends Record<string, unknown>>(
-	options: T,
-): T & { telemetry: { enabled: false } };
+export declare function withClearanceDefaults<
+	T extends Record<string, unknown>,
+>(options: T): T & { telemetry: { enabled: false } };
 
 export declare function clearance<Options extends Record<string, unknown>>(
 	options: Options,
@@ -335,9 +374,7 @@ export declare function clearance<Options extends Record<string, unknown>>(
 export declare function organization(
 	options?: Record<string, unknown>,
 ): ClearancePlugin;
-export declare function sso(
-	options?: Record<string, unknown>,
-): ClearancePlugin;
+export declare function sso(options?: Record<string, unknown>): ClearancePlugin;
 export declare function scim(
 	options?: Record<string, unknown>,
 ): ClearancePlugin;

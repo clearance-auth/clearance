@@ -110,7 +110,7 @@ describe("@clearance/auth runtime wrapper", () => {
 			const accessTokens = options.plugins.find((plugin) => plugin.id === "jwt");
 			expect(twoFactor?.options).toMatchObject({
 				issuer: "Clearance Test",
-				backupCodeOptions: { storeBackupCodes: "encrypted" },
+			backupCodeOptions: { storeBackupCodes: "hashed" },
 				accountLockout: {
 					enabled: true,
 					maxFailedAttempts: 7,

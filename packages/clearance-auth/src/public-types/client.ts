@@ -7,8 +7,7 @@ export type ClearanceClientError = {
 };
 
 export type ClearanceClientResponse<Data> =
-	| { data: Data; error: null }
-	| { data: null; error: ClearanceClientError };
+	{ data: Data; error: null } | { data: null; error: ClearanceClientError };
 
 export type ClearanceClientFetchOptions = {
 	headers?: HeadersInit;
@@ -71,14 +70,36 @@ export interface ClearanceTwoFactorClientApi {
 			trustDevice?: boolean;
 			fetchOptions?: ClearanceClientFetchOptions;
 		}): Promise<ClearanceClientResponse<ClearanceTwoFactorVerification>>;
-		disable(input: {
-			password: string;
-			fetchOptions?: ClearanceClientFetchOptions;
-		}): Promise<ClearanceClientResponse<{ status: true }>>;
-		generateBackupCodes(input: {
-			password: string;
-			fetchOptions?: ClearanceClientFetchOptions;
-		}): Promise<
+		disable(
+			input:
+				| {
+						password: string;
+						currentCode: string;
+						recoveryCode?: never;
+						fetchOptions?: ClearanceClientFetchOptions;
+				  }
+				| {
+						password: string;
+						currentCode?: never;
+						recoveryCode: string;
+						fetchOptions?: ClearanceClientFetchOptions;
+				  },
+		): Promise<ClearanceClientResponse<{ status: true }>>;
+		generateBackupCodes(
+			input:
+				| {
+						password: string;
+						currentCode: string;
+						recoveryCode?: never;
+						fetchOptions?: ClearanceClientFetchOptions;
+				  }
+				| {
+						password: string;
+						currentCode?: never;
+						recoveryCode: string;
+						fetchOptions?: ClearanceClientFetchOptions;
+				  },
+		): Promise<
 			ClearanceClientResponse<{ status: true; backupCodes: string[] }>
 		>;
 		verifyBackupCode(input: {
@@ -136,22 +157,23 @@ type ClearancePluginUnion<Options> = Options extends {
 	? Plugin
 	: never;
 
-type ClearanceAuthClientFor<Options> = Extract<
-	ClearancePluginUnion<Options>,
-	ClearanceTwoFactorClientPlugin
-> extends never
-	? Extract<
-			ClearancePluginUnion<Options>,
-			ClearanceJwtClientPlugin
-		> extends never
-		? ClearanceBaseAuthClient
-		: ClearanceBaseAuthClient & ClearanceJwtClientApi
-	: Extract<
-			ClearancePluginUnion<Options>,
-			ClearanceJwtClientPlugin
-		> extends never
-		? ClearanceBaseAuthClient & ClearanceTwoFactorClientApi
-		: ClearanceAuthClient;
+type ClearanceAuthClientFor<Options> =
+	Extract<
+		ClearancePluginUnion<Options>,
+		ClearanceTwoFactorClientPlugin
+	> extends never
+		? Extract<
+				ClearancePluginUnion<Options>,
+				ClearanceJwtClientPlugin
+			> extends never
+			? ClearanceBaseAuthClient
+			: ClearanceBaseAuthClient & ClearanceJwtClientApi
+		: Extract<
+					ClearancePluginUnion<Options>,
+					ClearanceJwtClientPlugin
+			  > extends never
+			? ClearanceBaseAuthClient & ClearanceTwoFactorClientApi
+			: ClearanceAuthClient;
 
 export declare function createAuthClient<
 	const Plugins extends ClearanceClientPlugin[],
@@ -162,9 +184,9 @@ export declare function createAuthClient<
 	Options extends ClearanceAuthClientOptions = ClearanceAuthClientOptions,
 >(options?: Options): ClearanceBaseAuthClient;
 
-export declare function organizationClient(
-	options?: { teams?: { enabled: boolean } },
-): ClearanceClientPlugin;
+export declare function organizationClient(options?: {
+	teams?: { enabled: boolean };
+}): ClearanceClientPlugin;
 
 export declare function twoFactorClient(options?: {
 	twoFactorPage?: string;

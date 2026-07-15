@@ -26,6 +26,11 @@ import {
 	getStorageOption,
 	processIdentifier,
 } from "./verification-token-storage";
+import {
+	hasTwoFactorSessionGeneration,
+	sessionMatchesTwoFactorGeneration,
+	TWO_FACTOR_SESSION_GENERATION_FIELD,
+} from "./two-factor-session-generation";
 import type { DatabaseHooksEntry } from "./with-hooks";
 import { getWithHooks } from "./with-hooks";
 
@@ -52,6 +57,8 @@ export const createInternalAdapter = (
 	// non-atomic secondary-storage fallback (see consumeVerificationValue).
 	let warnedNonAtomicConsume = false;
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
+	const bindsTwoFactorSessionGeneration =
+		hasTwoFactorSessionGeneration(options);
 	const {
 		createWithHooks,
 		updateWithHooks,
@@ -265,7 +272,9 @@ export const createInternalAdapter = (
 				| undefined,
 			where?: Where[] | undefined,
 		) => {
-			const users = await (await getCurrentAdapter(adapter)).findMany<User>({
+			const users = await (
+				await getCurrentAdapter(adapter)
+			).findMany<User>({
 				model: "user",
 				limit,
 				offset,
@@ -275,7 +284,9 @@ export const createInternalAdapter = (
 			return users;
 		},
 		countTotalUsers: async (where?: Where[] | undefined) => {
-			const total = await (await getCurrentAdapter(adapter)).count({
+			const total = await (
+				await getCurrentAdapter(adapter)
+			).count({
 				model: "user",
 				where,
 			});
@@ -333,6 +344,7 @@ export const createInternalAdapter = (
 			const {
 				// always ignore override id - new sessions must have new ids
 				id: _,
+				__preserveSessionExpiresAt,
 				...rest
 			} = override || {};
 
@@ -346,6 +358,87 @@ export const createInternalAdapter = (
 
 			// we're parsing default values for session additional fields
 			const defaultAdditionalFields = getSessionDefaultFields(options);
+			let twoFactorSessionGeneration: string | undefined;
+			if (bindsTwoFactorSessionGeneration && secondaryStorage && !storeInDb) {
+				const user = await (
+					await getCurrentAdapter(adapter)
+				).findOne<Record<string, unknown>>({
+					model: "user",
+					where: [{ field: "id", value: userId }],
+				});
+				const generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
+				if (typeof generation === "string") {
+					twoFactorSessionGeneration = generation;
+				}
+			} else if (bindsTwoFactorSessionGeneration) {
+				twoFactorSessionGeneration = await runWithTransaction(
+					adapter,
+					async () => {
+						const currentAdapter = await getCurrentAdapter(adapter);
+						let user = await currentAdapter.findOne<Record<string, unknown>>({
+							model: "user",
+							where: [{ field: "id", value: userId }],
+						});
+						let generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
+						if (typeof generation !== "string") {
+							const proposed = generateId(32);
+							const initialized = await currentAdapter.incrementOne<
+								Record<string, unknown>
+							>({
+								model: "user",
+								where: [
+									{ field: "id", value: userId },
+									{
+										field: TWO_FACTOR_SESSION_GENERATION_FIELD,
+										value: null,
+									},
+								],
+								increment: {},
+								set: {
+									[TWO_FACTOR_SESSION_GENERATION_FIELD]: proposed,
+								},
+							});
+							if (initialized) {
+								await currentAdapter.updateMany({
+									model: "session",
+									where: [
+										{ field: "userId", value: userId },
+										{
+											field: TWO_FACTOR_SESSION_GENERATION_FIELD,
+											value: null,
+										},
+									],
+									update: {
+										[TWO_FACTOR_SESSION_GENERATION_FIELD]: proposed,
+									},
+								});
+								user = initialized;
+							} else {
+								user = await currentAdapter.findOne<Record<string, unknown>>({
+									model: "user",
+									where: [{ field: "id", value: userId }],
+								});
+							}
+							generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
+						}
+						if (typeof generation !== "string") {
+							throw new Error("Could not bind the session security generation");
+						}
+						return generation;
+					},
+				);
+			}
+			const policyExpiresAt = dontRememberMe
+				? getDate(60 * 60 * 24, "sec")
+				: getDate(sessionExpiration, "sec");
+			const inheritedExpiresAt = new Date(rest.expiresAt ?? Number.NaN);
+			const expiresAt =
+				__preserveSessionExpiresAt === true &&
+				Number.isFinite(inheritedExpiresAt.getTime()) &&
+				inheritedExpiresAt > new Date() &&
+				inheritedExpiresAt < policyExpiresAt
+					? inheritedExpiresAt
+					: policyExpiresAt;
 			const data = {
 				...(sessionId ? { id: sessionId } : {}),
 				ipAddress: headers ? getIp(headers, options) || "" : "",
@@ -356,15 +449,18 @@ export const createInternalAdapter = (
 				 * set the session to expire in 1 day.
 				 * The cookie will be set to expire at the end of the session
 				 */
-				expiresAt: dontRememberMe
-					? getDate(60 * 60 * 24, "sec") // 1 day
-					: getDate(sessionExpiration, "sec"),
+				expiresAt,
 				userId,
 				token: generateId(32),
 				// todo: we should remove auto setting createdAt and updatedAt in the next major release, since the db generators already handle that
 				createdAt: new Date(),
 				updatedAt: new Date(),
 				...defaultAdditionalFields,
+				...(twoFactorSessionGeneration
+					? {
+							[TWO_FACTOR_SESSION_GENERATION_FIELD]: twoFactorSessionGeneration,
+						}
+					: {}),
 				...(overrideAll ? rest : {}),
 			} satisfies Partial<Session>;
 			const res = await createWithHooks(
@@ -465,6 +561,24 @@ export const createInternalAdapter = (
 						user: User;
 					}>(sessionStringified);
 					if (!s) return null;
+					if (bindsTwoFactorSessionGeneration) {
+						const currentUser = await (
+							await getCurrentAdapter(adapter)
+						).findOne<Record<string, unknown>>({
+							model: "user",
+							where: [{ field: "id", value: s.user.id }],
+						});
+						if (
+							!currentUser ||
+							!sessionMatchesTwoFactorGeneration(
+								s.session as unknown as Record<string, unknown>,
+								currentUser,
+							)
+						) {
+							await secondaryStorage.delete(token);
+							return null;
+						}
+					}
 					const parsedSession = parseSessionOutput(ctx.options, {
 						...s.session,
 						expiresAt: new Date(s.session.expiresAt),
@@ -502,6 +616,15 @@ export const createInternalAdapter = (
 
 			const { user, ...session } = result;
 			if (!user) return null;
+			if (
+				bindsTwoFactorSessionGeneration &&
+				!sessionMatchesTwoFactorGeneration(
+					session as Record<string, unknown>,
+					user as unknown as Record<string, unknown>,
+				)
+			) {
+				return null;
+			}
 			const parsedSession = parseSessionOutput(ctx.options, session);
 			const parsedUser = parseUserOutput(ctx.options, user);
 			return {
@@ -563,9 +686,9 @@ export const createInternalAdapter = (
 				return sessions;
 			}
 
-			const sessions = await (await getCurrentAdapter(adapter)).findMany<
-				Session & { user: User | null }
-			>({
+			const sessions = await (
+				await getCurrentAdapter(adapter)
+			).findMany<Session & { user: User | null }>({
 				model: "session",
 				where: [
 					{
@@ -847,9 +970,9 @@ export const createInternalAdapter = (
 			providerId: string,
 		) => {
 			// we need to find account first to avoid missing user if the email changed with the provider for the same account
-			const account = await (await getCurrentAdapter(adapter)).findOne<
-				Account & { user: User | null }
-			>({
+			const account = await (
+				await getCurrentAdapter(adapter)
+			).findOne<Account & { user: User | null }>({
 				model: "account",
 				where: [
 					{
@@ -873,7 +996,9 @@ export const createInternalAdapter = (
 						accounts: [account],
 					};
 				} else {
-					const user = await (await getCurrentAdapter(adapter)).findOne<User>({
+					const user = await (
+						await getCurrentAdapter(adapter)
+					).findOne<User>({
 						model: "user",
 						where: [
 							{
@@ -892,7 +1017,9 @@ export const createInternalAdapter = (
 					return null;
 				}
 			} else {
-				const user = await (await getCurrentAdapter(adapter)).findOne<User>({
+				const user = await (
+					await getCurrentAdapter(adapter)
+				).findOne<User>({
 					model: "user",
 					where: [
 						{
@@ -951,7 +1078,9 @@ export const createInternalAdapter = (
 		},
 		findUserById: async (userId: string) => {
 			if (!userId) return null;
-			const user = await (await getCurrentAdapter(adapter)).findOne<User>({
+			const user = await (
+				await getCurrentAdapter(adapter)
+			).findOne<User>({
 				model: "user",
 				where: [
 					{
@@ -1054,21 +1183,21 @@ export const createInternalAdapter = (
 			return accounts;
 		},
 		findAccountByProviderId: async (accountId: string, providerId: string) => {
-			const account = await (await getCurrentAdapter(adapter)).findOne<Account>(
-				{
-					model: "account",
-					where: [
-						{
-							field: "accountId",
-							value: accountId,
-						},
-						{
-							field: "providerId",
-							value: providerId,
-						},
-					],
-				},
-			);
+			const account = await (
+				await getCurrentAdapter(adapter)
+			).findOne<Account>({
+				model: "account",
+				where: [
+					{
+						field: "accountId",
+						value: accountId,
+					},
+					{
+						field: "providerId",
+						value: providerId,
+					},
+				],
+			});
 			return account;
 		},
 		findAccountByUserId: async (userId: string) => {

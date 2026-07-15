@@ -9,6 +9,22 @@ export const schema = {
 				defaultValue: false,
 				input: false,
 			},
+			twoFactorSessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			},
+		},
+	},
+	session: {
+		fields: {
+			twoFactorSessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			},
 		},
 	},
 	twoFactor: {
@@ -59,6 +75,13 @@ export const schema = {
 				input: false,
 				returned: false,
 			},
+			activeVerificationReservations: {
+				type: "string",
+				required: false,
+				defaultValue: "[]",
+				input: false,
+				returned: false,
+			},
 			lockedUntil: {
 				type: "date",
 				required: false,
@@ -69,6 +92,12 @@ export const schema = {
 				type: "number",
 				required: false,
 				defaultValue: -1,
+				input: false,
+				returned: false,
+			},
+			trustDeviceGeneration: {
+				type: "string",
+				required: false,
 				input: false,
 				returned: false,
 			},

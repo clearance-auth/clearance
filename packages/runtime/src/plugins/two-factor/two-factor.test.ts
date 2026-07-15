@@ -14,6 +14,7 @@ import type { TwoFactorTable, UserWithTwoFactor } from "./types";
 
 describe("two factor", async () => {
 	let OTP = "";
+	let enrollmentBackupCodes: string[] = [];
 	const { testUser, customFetchImpl, sessionSetter, db, auth } =
 		await getTestInstance({
 			secret: DEFAULT_SECRET,
@@ -60,6 +61,7 @@ describe("two factor", async () => {
 				headers,
 			},
 		});
+		enrollmentBackupCodes = res.data?.backupCodes ?? [];
 		expect(res.data?.backupCodes.length).toEqual(10);
 		expect(res.data?.totpURI).toBeDefined();
 		const dbUser = await db.findOne<UserWithTwoFactor>({
@@ -163,9 +165,7 @@ describe("two factor", async () => {
 					expect(parsed.get("clearance.dont_remember")?.value).toBeDefined();
 					headers.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 					headers.append(
 						"cookie",
@@ -271,8 +271,10 @@ describe("two factor", async () => {
 		const backupCodesRes = await client.twoFactor.generateBackupCodes({
 			fetchOptions: {
 				headers,
+				onSuccess: sessionSetter(headers),
 			},
 			password: testUser.password,
+			recoveryCode: enrollmentBackupCodes[0]!,
 		});
 		expect(backupCodesRes.data?.backupCodes).toBeDefined();
 		backupCodes = backupCodesRes.data?.backupCodes || [];
@@ -292,9 +294,7 @@ describe("two factor", async () => {
 					expect(token).toBe("");
 					headers.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 				},
 			},
@@ -335,9 +335,7 @@ describe("two factor", async () => {
 					);
 					headers2.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 				},
 			},
@@ -371,9 +369,7 @@ describe("two factor", async () => {
 					);
 					headers.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 				},
 			},
@@ -473,9 +469,7 @@ describe("two factor", async () => {
 					);
 					headers.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 				},
 			},
@@ -510,6 +504,7 @@ describe("two factor", async () => {
 	it("should disable two factor", async () => {
 		const res = await client.twoFactor.disable({
 			password: testUser.password,
+			recoveryCode: backupCodes[1]!,
 			fetchOptions: {
 				headers,
 			},
@@ -537,6 +532,7 @@ describe("two factor", async () => {
 
 describe("two factor auth API", async () => {
 	let OTP = "";
+	let enrollmentBackupCodes: string[] = [];
 	const sendOTP = vi.fn();
 	const { auth, signInWithTestUser, testUser } = await getTestInstance({
 		secret: DEFAULT_SECRET,
@@ -569,6 +565,7 @@ describe("two factor auth API", async () => {
 			backupCodes: string[];
 			totpURI: string;
 		};
+		enrollmentBackupCodes = json.backupCodes;
 		expect(json.backupCodes.length).toBe(10);
 		expect(json.totpURI).toBeDefined();
 		const session = await auth.api.getSession({
@@ -638,6 +635,7 @@ describe("two factor auth API", async () => {
 			headers,
 			body: {
 				password: testUser.password,
+				recoveryCode: enrollmentBackupCodes[0]!,
 			},
 			asResponse: true,
 		});
@@ -667,6 +665,7 @@ describe("view backup codes", async () => {
 			],
 		});
 	let { headers } = await signInWithTestUser();
+	let latestBackupCodes: string[] = [];
 
 	const session = await auth.api.getSession({ headers });
 	const userId = session?.user.id!;
@@ -678,6 +677,25 @@ describe("view backup codes", async () => {
 			baseURL: "http://localhost:3000/api/auth",
 		},
 	});
+
+	async function regenerateBackupCodes() {
+		const response = await auth.api.generateBackupCodes({
+			body: {
+				password: testUser.password,
+				recoveryCode: latestBackupCodes[0]!,
+			},
+			headers,
+			asResponse: true,
+		});
+		expect(response.status).toBe(200);
+		headers = convertSetCookieToCookie(response.headers);
+		const result = (await response.json()) as {
+			status: true;
+			backupCodes: string[];
+		};
+		latestBackupCodes = result.backupCodes;
+		return result;
+	}
 
 	it("should return parsed array of backup codes, not JSON string", async () => {
 		const enableRes = await auth.api.enableTwoFactor({
@@ -692,6 +710,7 @@ describe("view backup codes", async () => {
 		const enableJson = (await enableRes.json()) as {
 			backupCodes: string[];
 		};
+		latestBackupCodes = enableJson.backupCodes;
 
 		const viewResult = await auth.api.viewBackupCodes({
 			body: { userId },
@@ -709,10 +728,7 @@ describe("view backup codes", async () => {
 	});
 
 	it("should return array after generating new backup codes", async () => {
-		const generateResult = await auth.api.generateBackupCodes({
-			body: { password: testUser.password },
-			headers,
-		});
+		const generateResult = await regenerateBackupCodes();
 
 		expect(generateResult.backupCodes).toBeDefined();
 		expect(generateResult.backupCodes.length).toBe(10);
@@ -734,19 +750,13 @@ describe("view backup codes", async () => {
 
 	it("should successfully regenerate backup codes multiple times", async () => {
 		// First generation
-		const firstGeneration = await auth.api.generateBackupCodes({
-			body: { password: testUser.password },
-			headers,
-		});
+		const firstGeneration = await regenerateBackupCodes();
 		expect(firstGeneration.backupCodes).toBeDefined();
 		expect(firstGeneration.backupCodes.length).toBe(10);
 		expect(firstGeneration.status).toBe(true);
 
 		// Second generation - this should update the existing record using id
-		const secondGeneration = await auth.api.generateBackupCodes({
-			body: { password: testUser.password },
-			headers,
-		});
+		const secondGeneration = await regenerateBackupCodes();
 		expect(secondGeneration.backupCodes).toBeDefined();
 		expect(secondGeneration.backupCodes.length).toBe(10);
 		expect(secondGeneration.status).toBe(true);
@@ -757,10 +767,7 @@ describe("view backup codes", async () => {
 		);
 
 		// Third generation - ensure it still works
-		const thirdGeneration = await auth.api.generateBackupCodes({
-			body: { password: testUser.password },
-			headers,
-		});
+		const thirdGeneration = await regenerateBackupCodes();
 		expect(thirdGeneration.backupCodes).toBeDefined();
 		expect(thirdGeneration.backupCodes.length).toBe(10);
 		expect(thirdGeneration.status).toBe(true);
@@ -774,10 +781,7 @@ describe("view backup codes", async () => {
 
 	it("should correctly update backup codes after verification", async () => {
 		// Generate fresh backup codes for this test
-		const generation = await auth.api.generateBackupCodes({
-			body: { password: testUser.password },
-			headers,
-		});
+		const generation = await regenerateBackupCodes();
 		const backupCodes = generation.backupCodes;
 		expect(backupCodes.length).toBe(10);
 
@@ -793,9 +797,7 @@ describe("view backup codes", async () => {
 					);
 					verifyHeaders.append(
 						"cookie",
-						`clearance.two_factor=${
-							parsed.get("clearance.two_factor")?.value
-						}`,
+						`clearance.two_factor=${parsed.get("clearance.two_factor")?.value}`,
 					);
 				},
 			},
@@ -907,9 +909,7 @@ describe("trust device server-side validation", async () => {
 		const parsed = parseSetCookieHeader(
 			verifyRes.headers.get("Set-Cookie") || "",
 		);
-		const trustDeviceCookieValue = parsed.get(
-			"clearance.trust_device",
-		)?.value;
+		const trustDeviceCookieValue = parsed.get("clearance.trust_device")?.value;
 		expect(trustDeviceCookieValue).toBeDefined();
 
 		// The cookie value is signed: "value.signature" where value is "token!trustIdentifier"
@@ -1000,9 +1000,7 @@ describe("trust device server-side validation", async () => {
 		const parsed = parseSetCookieHeader(
 			verifyRes.headers.get("Set-Cookie") || "",
 		);
-		const trustDeviceCookieValue = parsed.get(
-			"clearance.trust_device",
-		)?.value;
+		const trustDeviceCookieValue = parsed.get("clearance.trust_device")?.value;
 		expect(trustDeviceCookieValue).toBeDefined();
 
 		// Extract trust identifier (cookie is signed: "value.signature")
@@ -1033,9 +1031,7 @@ describe("trust device server-side validation", async () => {
 		const signOutParsed = parseSetCookieHeader(
 			signOutRes.headers.get("Set-Cookie") || "",
 		);
-		const trustCookieAfterSignOut = signOutParsed.get(
-			"clearance.trust_device",
-		);
+		const trustCookieAfterSignOut = signOutParsed.get("clearance.trust_device");
 		// Cookie should either not be set (unchanged) or still have its value
 		expect(trustCookieAfterSignOut?.value || "preserved").not.toBe("");
 
@@ -1106,9 +1102,7 @@ describe("trust device server-side validation", async () => {
 		const parsed = parseSetCookieHeader(
 			verifyRes.headers.get("Set-Cookie") || "",
 		);
-		const trustDeviceCookieValue = parsed.get(
-			"clearance.trust_device",
-		)?.value;
+		const trustDeviceCookieValue = parsed.get("clearance.trust_device")?.value;
 		expect(trustDeviceCookieValue).toBeDefined();
 
 		// Extract trust identifier (cookie is signed: "value.signature")
@@ -1133,6 +1127,20 @@ describe("trust device server-side validation", async () => {
 			headers: sessionHeaders,
 			body: {
 				password: testUser.password,
+				currentCode: await (async () => {
+					const session = await auth.api.getSession({
+						headers: sessionHeaders,
+					});
+					const factor = await db.findOne<TwoFactorTable>({
+						model: "twoFactor",
+						where: [{ field: "userId", value: session!.user.id }],
+					});
+					const secret = await symmetricDecrypt({
+						key: DEFAULT_SECRET,
+						data: factor!.secret,
+					});
+					return createOTP(secret).totp();
+				})(),
 			},
 			asResponse: true,
 		});
@@ -1776,7 +1784,7 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 		expect(updatedRecord?.verified).toBe(true);
 	});
 
-		it("should stage and verify a replacement without dropping the active factor", async () => {
+	it("should stage and verify a replacement without dropping the active factor", async () => {
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
 			secret: DEFAULT_SECRET,
 			plugins: [
@@ -1812,47 +1820,47 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 		headers = convertSetCookieToCookie(verifyEnrollRes.headers);
 		expect(verifyEnrollRes.status).toBe(200);
 
-			await db.update({
-				model: "twoFactor",
-				where: [{ field: "id", value: record1!.id }],
-				update: { lastUsedTotpCounter: -1 },
-			});
-			// Re-enrollment requires proof of the active factor and stages the new one.
-			await auth.api.enableTwoFactor({
-				body: { password: testUser.password, currentCode: code },
-				headers,
-			});
-			const record2 = await db.findOne<TwoFactorTable>({
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: record1!.id }],
+			update: { lastUsedTotpCounter: -1 },
+		});
+		// Re-enrollment requires proof of the active factor and stages the new one.
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password, currentCode: code },
+			headers,
+		});
+		const record2 = await db.findOne<TwoFactorTable>({
 			model: "twoFactor",
 			where: [{ field: "userId", value: userId }],
-			});
-			expect(record2?.verified).toBe(true);
-			expect(record2?.secret).toBe(record1?.secret);
-			expect(record2?.pendingSecret).toBeTruthy();
-			const replacementSecret = await symmetricDecrypt({
-				key: DEFAULT_SECRET,
-				data: record2!.pendingSecret!,
-			});
-			const replacementCode = await createOTP(replacementSecret).totp();
-			const activateReplacement = await auth.api.verifyTOTP({
-				body: { code: replacementCode },
-				headers,
-				asResponse: true,
-			});
-			expect(activateReplacement.status).toBe(200);
-			const activeReplacement = await db.findOne<TwoFactorTable>({
-				model: "twoFactor",
-				where: [{ field: "userId", value: userId }],
-			});
-			expect(activeReplacement?.secret).toBe(record2?.pendingSecret);
-			expect(activeReplacement?.pendingSecret).toBeFalsy();
-			await db.update({
-				model: "twoFactor",
-				where: [{ field: "id", value: record1!.id }],
-				update: { lastUsedTotpCounter: -1 },
-			});
+		});
+		expect(record2?.verified).toBe(true);
+		expect(record2?.secret).toBe(record1?.secret);
+		expect(record2?.pendingSecret).toBeTruthy();
+		const replacementSecret = await symmetricDecrypt({
+			key: DEFAULT_SECRET,
+			data: record2!.pendingSecret!,
+		});
+		const replacementCode = await createOTP(replacementSecret).totp();
+		const activateReplacement = await auth.api.verifyTOTP({
+			body: { code: replacementCode },
+			headers,
+			asResponse: true,
+		});
+		expect(activateReplacement.status).toBe(200);
+		const activeReplacement = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+		});
+		expect(activeReplacement?.secret).toBe(record2?.pendingSecret);
+		expect(activeReplacement?.pendingSecret).toBeFalsy();
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: record1!.id }],
+			update: { lastUsedTotpCounter: -1 },
+		});
 
-			// Sign in with the new secret should work
+		// Sign in with the new secret should work
 		const signInRes = await auth.api.signInEmail({
 			body: {
 				email: testUser.email,
@@ -1861,8 +1869,8 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 			asResponse: true,
 		});
 		const signInHeaders = convertSetCookieToCookie(signInRes.headers);
-			const verifyRes = await auth.api.verifyTOTP({
-				body: { code: replacementCode },
+		const verifyRes = await auth.api.verifyTOTP({
+			body: { code: replacementCode },
 			headers: signInHeaders,
 			asResponse: true,
 		});
@@ -1955,6 +1963,7 @@ describe("two factor passwordless", async () => {
 
 	const signInRes = await auth.api.signInAnonymous({ asResponse: true });
 	let headers = applySetCookie(new Headers(), signInRes.headers);
+	let recoveryCodes: string[] = [];
 	const session = await auth.api.getSession({ headers });
 	const userId = session?.user.id as string;
 
@@ -1970,6 +1979,7 @@ describe("two factor passwordless", async () => {
 			backupCodes: string[];
 			totpURI: string;
 		};
+		recoveryCodes = json.backupCodes;
 		expect(json.backupCodes.length).toBe(10);
 		expect(json.totpURI).toBeDefined();
 
@@ -2009,16 +2019,20 @@ describe("two factor passwordless", async () => {
 	});
 
 	it("allows generating backup codes without password", async () => {
-		const res = await auth.api.generateBackupCodes({
-			body: {},
+		const response = await auth.api.generateBackupCodes({
+			body: { recoveryCode: recoveryCodes[0]! },
 			headers,
+			asResponse: true,
 		});
+		headers = applySetCookie(headers, response.headers);
+		const res = (await response.json()) as { backupCodes: string[] };
+		recoveryCodes = res.backupCodes;
 		expect(res.backupCodes.length).toBe(10);
 	});
 
 	it("allows disabling without password", async () => {
 		const res = await auth.api.disableTwoFactor({
-			body: {},
+			body: { recoveryCode: recoveryCodes[0]! },
 			headers,
 			asResponse: true,
 		});

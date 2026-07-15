@@ -10,6 +10,8 @@ export const TWO_FACTOR_ERROR_CODES = defineErrorCodes({
 	INVALID_CODE: "Invalid code",
 	TOTP_REPLACEMENT_REQUIRES_CURRENT_CODE:
 		"Replacing an existing TOTP factor requires a current TOTP code",
+	FACTOR_STEP_UP_REQUIRED:
+		"A current authenticator code or recovery code is required",
 	TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE:
 		"Too many attempts. Please request a new code.",
 	ACCOUNT_TEMPORARILY_LOCKED:
