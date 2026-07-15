@@ -54,7 +54,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(85);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(87);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -97,6 +97,12 @@ describe("management operation contracts", () => {
 		});
 		expect(STORE_V2_OPERATIONS.verify.mutation).toBe(false);
 		expect(STORE_V2_OPERATIONS.rollback.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.eventsCutover).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/events/cutover" },
+			mutation: true,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.eventsRollback.confirmation).toBe("server-required");
 	});
 
 	it("distinguishes readiness evidence writes from config inspection", () => {

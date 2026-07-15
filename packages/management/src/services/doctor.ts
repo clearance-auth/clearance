@@ -224,6 +224,21 @@ export async function runDoctor(
 					remediation:
 						"Run clearance schema store-v2 plan and reapply with --yes to reconcile and resume dual-write",
 				});
+			} else if (status.phase === "hybrid") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management store",
+					status: status.consistent ? "pass" : "fail",
+					detail: status.consistent
+						? `Relational authority verified for ${status.authoritativeCollections.join(", ")} at revision ${status.snapshotRevision}; ${collectionSummary}`
+						: `Relational-authority divergence detected across ${Object.entries(status.collections)
+								.filter(([, collection]) => !collection.consistent)
+								.map(([name]) => name)
+								.join(", ") || "revision metadata"}`,
+					remediation: status.consistent
+						? undefined
+						: "Stop mutations and run clearance schema store-v2 verify before rollback or reconciliation",
+				});
 			} else {
 				checks.push({
 					id: "store-v2-shadow",

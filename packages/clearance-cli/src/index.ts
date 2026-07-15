@@ -555,6 +555,9 @@ async function main() {
 	storeV2.command("apply").description("Backfill and enable verified dual-write").action(remoteCommandAction);
 	storeV2.command("verify").description("Fail unless snapshot and relational data match").action(remoteCommandAction);
 	storeV2.command("rollback").description("Disable dual-write while retaining relational data").action(remoteCommandAction);
+	const storeV2Events = storeV2.command("events").description("Relational audit-event authority");
+	storeV2Events.command("cutover").description("Make relational audit events authoritative").action(remoteCommandAction);
+	storeV2Events.command("rollback").description("Return audit-event authority to the snapshot").action(remoteCommandAction);
 
 	// config
 	const config = program.command("config").description("Config");

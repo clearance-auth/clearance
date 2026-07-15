@@ -46,7 +46,7 @@
 - [ ] Define the outbox transaction seam against store-v2 so job delivery never races product state.
 - [x] Record targeted verification and update dimension statuses for the first mergeable foundation unit.
 - [x] Land the first reversible relational-authority slice for audit events.
-- [ ] Expose audit-event cutover and rollback through API, CLI, and doctor with explicit confirmation.
+- [x] Expose audit-event cutover and rollback through API, CLI, and doctor with explicit confirmation.
 - [ ] Prove the authoritative audit append path at 5k and 50k retained events against the ledger thresholds.
 - [ ] Close strict-review blockers in the delivery storage and worker core before accepting it.
 
@@ -72,6 +72,7 @@
 | 2026-07-15 | Started delivery storage/worker-core implementation | New `@clearance/delivery` package is limited to guarded schema migration, purpose-specific AEAD/HMAC keyring, transaction-adapter enqueue, fenced leasing/retry/dead/cancel/reclaim, retention crypto-erasure, redacted views, and Postgres proof; SMTP/runtime/API/CLI/deploy wiring follows after core review |
 | 2026-07-15 | Completed the audit-event relational-authority core | Hybrid cutover empties the snapshot event projection, relational appends and resource mutations share one transaction, cursor reads are stable, retention hides historical rows instead of deleting them, and rollback reverse-materializes the visible projection; management typecheck, focused unit 7/7, and canonical real-Postgres 35/35 passed |
 | 2026-07-15 | Rejected the initial delivery core at strict review | Active transactions, tenant-scoped dedupe, semantic-expiry completion, canonical verification inclusion, lease-owner binding, safe erasure, channel-bound AAD, schema-drift detection, structural retention, and provider-value redaction must close before commit |
+| 2026-07-15 | Completed audit-event authority control-plane integration | Added confirmed API and CLI cutover/rollback operations, operation-registry coverage, and hybrid-authority doctor evidence; management contracts 9/9, API operations 5/5, CLI transport 11/11, and all three package typechecks passed |
 
 ### Current implementation decisions
 

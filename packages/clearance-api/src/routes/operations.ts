@@ -8,6 +8,7 @@ import {
 	UPGRADE_OPERATIONS,
 	applyUpgrade,
 	applyStoreV2,
+	cutoverStoreV2Events,
 	createBackup,
 	createPostgresBackup,
 	getRuntimeSchemaStatus,
@@ -25,6 +26,7 @@ import {
 	rollbackMigrationDurable,
 	rollbackUpgrade,
 	rollbackStoreV2,
+	rollbackStoreV2Events,
 	runMigrationDurable,
 	upgradeCheck,
 	upgradeCheckWithDb,
@@ -297,6 +299,28 @@ export function registerOperationRoutes({
 		try {
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
 			return c.json(await rollbackStoreV2(await storeForRequest(), {
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.post(STORE_V2_OPERATIONS.eventsCutover.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await cutoverStoreV2Events(await storeForRequest(), {
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.post(STORE_V2_OPERATIONS.eventsRollback.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await rollbackStoreV2Events(await storeForRequest(), {
 				confirm: body.confirm === true,
 			}));
 		} catch (error) {

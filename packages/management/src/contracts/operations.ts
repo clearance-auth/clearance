@@ -50,9 +50,11 @@ import type {
 } from "../services/runtime-schema.js";
 import type {
 	applyStoreV2,
+	cutoverStoreV2Events,
 	getStoreV2Status,
 	planStoreV2,
 	rollbackStoreV2,
+	rollbackStoreV2Events,
 	verifyStoreV2,
 } from "../services/store-v2.js";
 import type { restoreBackup, upgradeCheck } from "../services/backup.js";
@@ -421,6 +423,14 @@ export interface ManagementOperationTypes {
 	"schema.store-v2.rollback": {
 		input: { confirm?: boolean };
 		output: Awaited<ReturnType<typeof rollbackStoreV2>>;
+	};
+	"schema.store-v2.events.cutover": {
+		input: { confirm?: boolean };
+		output: Awaited<ReturnType<typeof cutoverStoreV2Events>>;
+	};
+	"schema.store-v2.events.rollback": {
+		input: { confirm?: boolean };
+		output: Awaited<ReturnType<typeof rollbackStoreV2Events>>;
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
@@ -1128,6 +1138,22 @@ export const STORE_V2_OPERATIONS = Object.freeze({
 		id: "schema.store-v2.rollback",
 		cliPath: "schema store-v2 rollback",
 		http: { method: "POST", path: "/v1/schema/store-v2/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	eventsCutover: defineOperation({
+		id: "schema.store-v2.events.cutover",
+		cliPath: "schema store-v2 events cutover",
+		http: { method: "POST", path: "/v1/schema/store-v2/events/cutover" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	eventsRollback: defineOperation({
+		id: "schema.store-v2.events.rollback",
+		cliPath: "schema store-v2 events rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/events/rollback" },
 		mutation: true,
 		supportsDryRun: false,
 		confirmation: "server-required",

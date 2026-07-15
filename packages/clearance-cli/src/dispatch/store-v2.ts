@@ -56,5 +56,29 @@ export async function dispatchStoreV2Command({
 				path: STORE_V2_OPERATIONS.rollback.http.path,
 				body: { confirm: true },
 			});
+		case STORE_V2_OPERATIONS.eventsCutover.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED",
+				"Store-v2 event cutover",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.eventsCutover.http.method,
+				path: STORE_V2_OPERATIONS.eventsCutover.http.path,
+				body: { confirm: true },
+			});
+		case STORE_V2_OPERATIONS.eventsRollback.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_EVENTS_ROLLBACK_CONFIRMATION_REQUIRED",
+				"Store-v2 event rollback",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.eventsRollback.http.method,
+				path: STORE_V2_OPERATIONS.eventsRollback.http.path,
+				body: { confirm: true },
+			});
 	}
 }

@@ -110,7 +110,7 @@ describe("CLI transport parity", () => {
 		});
 	});
 
-	it("routes store-v2 reads and gates apply and rollback", async () => {
+	it("routes store-v2 reads and gates apply, rollback, and event authority", async () => {
 		const calls: Array<[string, RequestInit]> = [];
 		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
 			calls.push([url, init]);
@@ -140,6 +140,26 @@ describe("CLI transport parity", () => {
 			{},
 			{ yes: true },
 		);
+		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 events cutover", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 events cutover",
+			[],
+			{},
+			{ yes: true },
+		);
+		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 events rollback", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_EVENTS_ROLLBACK_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 events rollback",
+			[],
+			{},
+			{ yes: true },
+		);
 
 		expect(calls.map(([url]) => url)).toEqual([
 			"https://api.clearance.test/v1/schema/store-v2",
@@ -147,9 +167,13 @@ describe("CLI transport parity", () => {
 			"https://api.clearance.test/v1/schema/store-v2/verify",
 			"https://api.clearance.test/v1/schema/store-v2/apply",
 			"https://api.clearance.test/v1/schema/store-v2/rollback",
+			"https://api.clearance.test/v1/schema/store-v2/events/cutover",
+			"https://api.clearance.test/v1/schema/store-v2/events/rollback",
 		]);
 		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ dryRun: true });
 		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({ confirm: true });
+		expect(JSON.parse(String(calls[5]?.[1].body))).toEqual({ confirm: true });
+		expect(JSON.parse(String(calls[6]?.[1].body))).toEqual({ confirm: true });
 	});
 
 	it("lets global dry-run override SCIM apply and rejects unsupported SSO test previews", async () => {

@@ -15,7 +15,9 @@ export interface StoreV2CommandEnvelope {
 		| "schema.store-v2.plan"
 		| "schema.store-v2.apply"
 		| "schema.store-v2.verify"
-		| "schema.store-v2.rollback";
+		| "schema.store-v2.rollback"
+		| "schema.store-v2.events.cutover"
+		| "schema.store-v2.events.rollback";
 	storeBackend: "postgres";
 	dryRun: boolean;
 	status?: StoreV2Status;
@@ -53,22 +55,40 @@ function envelope(
 
 function requireConfirmation(
 	confirm: boolean | undefined,
-	stage: "schema.store-v2.apply" | "schema.store-v2.rollback",
+	stage:
+		| "schema.store-v2.apply"
+		| "schema.store-v2.rollback"
+		| "schema.store-v2.events.cutover"
+		| "schema.store-v2.events.rollback",
 ): void {
 	if (confirm === true) return;
 	const applying = stage === "schema.store-v2.apply";
+	const cuttingOverEvents = stage === "schema.store-v2.events.cutover";
+	const rollingBackEvents = stage === "schema.store-v2.events.rollback";
 	throw new ClearanceError({
 		code: applying
 			? "STORE_V2_APPLY_CONFIRMATION_REQUIRED"
-			: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED",
+			: cuttingOverEvents
+				? "STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED"
+				: rollingBackEvents
+					? "STORE_V2_EVENTS_ROLLBACK_CONFIRMATION_REQUIRED"
+					: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED",
 		message: applying
 			? "Store-v2 apply requires explicit confirmation."
-			: "Store-v2 rollback requires explicit confirmation.",
+			: cuttingOverEvents
+				? "Store-v2 event cutover requires explicit confirmation."
+				: rollingBackEvents
+					? "Store-v2 event rollback requires explicit confirmation."
+					: "Store-v2 rollback requires explicit confirmation.",
 		stage,
 		status: 400,
 		remediation: applying
 			? "Review schema store-v2 apply --dry-run, then retry with --yes."
-			: "Review schema store-v2 status, then retry rollback with --yes.",
+			: cuttingOverEvents
+				? "Run schema store-v2 verify, then retry schema store-v2 events cutover with --yes."
+				: rollingBackEvents
+					? "Review schema store-v2 status, then retry schema store-v2 events rollback with --yes."
+					: "Review schema store-v2 status, then retry rollback with --yes.",
 	});
 }
 
@@ -193,6 +213,40 @@ export async function rollbackStoreV2(
 		return envelope(operation, {
 			dryRun: false,
 			status: await control.disable(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function cutoverStoreV2Events(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.events.cutover" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.cutoverEvents(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function rollbackStoreV2Events(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.events.rollback" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.rollbackEvents(),
 		});
 	} catch (error) {
 		return translateStoreError(error, operation);
