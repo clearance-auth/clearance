@@ -5,6 +5,7 @@ import {
 	encryptDeliveryPayload,
 	fingerprintDestination,
 	fingerprintSource,
+	fingerprintSourceDedupe,
 	type DeliveryKeyring,
 	type DeliveryPayloadAad,
 } from "./keyring.js";
@@ -156,14 +157,34 @@ export async function enqueueDelivery(
 	const kind = required(input.kind, "kind");
 	const projectId = required(input.projectId, "projectId");
 	const environmentId = required(input.environmentId, "environmentId");
-	const destinationFingerprint = fingerprintDestination(input.destination, ring);
+	const fingerprintKeyId = ring.currentFingerprintKeyId;
+	const destinationFingerprint = fingerprintDestination(input.destination, ring, fingerprintKeyId);
 	const sourceFingerprint = fingerprintSource(
 		projectId,
 		environmentId,
 		kind,
 		input.sourceKey,
 		ring,
+		fingerprintKeyId,
 	);
+	const sourceDedupeFingerprint = fingerprintSourceDedupe(
+		projectId,
+		environmentId,
+		kind,
+		input.sourceKey,
+		ring,
+	);
+	const legacySourceAliases = [...ring.fingerprintKeys.keys()].map((keyId) => ({
+		keyId,
+		fingerprint: fingerprintSource(
+			projectId,
+			environmentId,
+			kind,
+			input.sourceKey,
+			ring,
+			keyId,
+		),
+	}));
 	const createdAt = now.toISOString();
 	const semanticExpiresAt = expiresAt.toISOString();
 	const aad: DeliveryPayloadAad = {
@@ -177,6 +198,32 @@ export async function enqueueDelivery(
 		expiresAt: semanticExpiresAt,
 	};
 	const encrypted = encryptDeliveryPayload(input.payload, aad, ring);
+	const legacyKeyIds = await tx.query<{ source_fingerprint_key_id: string }>(
+		`SELECT DISTINCT source_fingerprint_key_id FROM ${tables.event}
+		 WHERE source_dedupe_version=1`,
+	);
+	const unavailableLegacyKeyId = legacyKeyIds.rows.find(
+		(row) => !ring.fingerprintKeys.has(row.source_fingerprint_key_id),
+	)?.source_fingerprint_key_id;
+	if (unavailableLegacyKeyId) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+			`Delivery fingerprint key ${unavailableLegacyKeyId} is unavailable`,
+		);
+	}
+	const legacyDuplicate = await tx.query(
+		`SELECT 1 FROM ${tables.event}
+		 WHERE (source_fingerprint_key_id, source_fingerprint) IN (
+			SELECT * FROM unnest($1::text[], $2::text[])
+		 ) LIMIT 1`,
+		[
+			legacySourceAliases.map((alias) => alias.keyId),
+			legacySourceAliases.map((alias) => alias.fingerprint),
+		],
+	);
+	if (legacyDuplicate.rowCount) {
+		throw new DeliveryError("DELIVERY_DUPLICATE", "A delivery for this source generation already exists");
+	}
 	const savepoint = `clearance_delivery_${randomUUID().replace(/-/g, "")}`;
 	let savepointCreated = false;
 	try {
@@ -184,19 +231,25 @@ export async function enqueueDelivery(
 		savepointCreated = true;
 		await tx.query(
 			`INSERT INTO ${tables.event}
-			 (id, kind, source_fingerprint, project_id, environment_id, organization_id,
-			  actor_id, correlation_id, destination_fingerprint, replay_of, created_at, semantic_expires_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			 (id, kind, source_fingerprint, source_fingerprint_key_id, source_dedupe_fingerprint,
+			  source_dedupe_version,
+			  project_id, environment_id, organization_id, actor_id, correlation_id,
+			  destination_fingerprint, destination_fingerprint_key_id, replay_of, created_at,
+			  semantic_expires_at)
+			 VALUES ($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 			[
 				eventId,
 				kind,
 				sourceFingerprint,
+				fingerprintKeyId,
+				sourceDedupeFingerprint,
 				projectId,
 				environmentId,
 				input.organizationId ?? null,
 				input.actorId ?? null,
 				input.correlationId ?? null,
 				destinationFingerprint,
+				fingerprintKeyId,
 				input.replayOf ?? null,
 				now,
 				expiresAt,
@@ -210,10 +263,20 @@ export async function enqueueDelivery(
 		);
 		await tx.query(
 			`INSERT INTO ${tables.job}
-			 (id, event_id, channel, destination_fingerprint, state, available_at,
-			  semantic_expires_at, max_attempts, created_at, updated_at)
-			 VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8,$8)`,
-			[jobId, eventId, input.channel, destinationFingerprint, availableAt, expiresAt, maxAttempts, now],
+			 (id, event_id, channel, destination_fingerprint, destination_fingerprint_key_id,
+			  state, available_at, semantic_expires_at, max_attempts, created_at, updated_at)
+			 VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9,$9)`,
+			[
+				jobId,
+				eventId,
+				input.channel,
+				destinationFingerprint,
+				fingerprintKeyId,
+				availableAt,
+				expiresAt,
+				maxAttempts,
+				now,
+			],
 		);
 		await tx.query(`RELEASE SAVEPOINT ${savepoint}`);
 	} catch (error) {

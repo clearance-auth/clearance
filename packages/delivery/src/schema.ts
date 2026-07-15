@@ -1,9 +1,9 @@
 import type pg from "pg";
 import { DeliveryError } from "./errors.js";
 
-export const DELIVERY_SCHEMA_VERSION = 2 as const;
+export const DELIVERY_SCHEMA_VERSION = 3 as const;
 export const DELIVERY_SCHEMA_OWNER = "clearance.delivery" as const;
-const deliverySchemaAssetMarker = (version: 1 | 2) => `clearance.delivery:v${version}`;
+const deliverySchemaAssetMarker = (version: 1 | 2 | 3) => `clearance.delivery:v${version}`;
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
 const IDENTIFIER_MAX = 63;
@@ -11,6 +11,11 @@ const IDENTIFIER_MAX = 63;
 export type DeliverySchemaOptions = {
 	schema?: string;
 	prefix?: string;
+	/**
+	 * Fingerprint key id active when an owned v1/v2 schema last accepted rows.
+	 * Required only while upgrading legacy rows; migrate before rotating that key.
+	 */
+	legacyFingerprintKeyId?: string;
 };
 
 export type DeliveryTableNames = {
@@ -97,13 +102,17 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 		`CREATE TABLE IF NOT EXISTS ${event} (
 			id text PRIMARY KEY,
 			kind text NOT NULL CHECK (length(kind) BETWEEN 1 AND 128),
-			source_fingerprint text NOT NULL UNIQUE CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+			source_fingerprint text NOT NULL CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+			source_fingerprint_key_id text NOT NULL CHECK (source_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
+			source_dedupe_fingerprint text NOT NULL UNIQUE CHECK (source_dedupe_fingerprint ~ '^[0-9a-f]{64}$'),
+			source_dedupe_version smallint NOT NULL CHECK (source_dedupe_version IN (1, 2)),
 			project_id text NOT NULL,
 			environment_id text NOT NULL,
 			organization_id text,
 			actor_id text,
 			correlation_id text,
 			destination_fingerprint text NOT NULL CHECK (destination_fingerprint ~ '^[0-9a-f]{64}$'),
+			destination_fingerprint_key_id text NOT NULL CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
 			replay_of text REFERENCES ${event}(id) ON DELETE RESTRICT,
 			created_at timestamptz NOT NULL,
 			semantic_expires_at timestamptz NOT NULL,
@@ -123,6 +132,7 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			event_id text NOT NULL REFERENCES ${event}(id) ON DELETE RESTRICT,
 			channel text NOT NULL CHECK (channel IN ('email', 'webhook')),
 			destination_fingerprint text NOT NULL CHECK (destination_fingerprint ~ '^[0-9a-f]{64}$'),
+			destination_fingerprint_key_id text NOT NULL CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
 			state text NOT NULL CHECK (state IN ('queued', 'leased', 'retry', 'delivered', 'dead', 'cancelled')),
 			available_at timestamptz NOT NULL,
 			semantic_expires_at timestamptz NOT NULL,
@@ -141,7 +151,7 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			delivered_at timestamptz,
 			dead_at timestamptz,
 			cancelled_at timestamptz,
-			UNIQUE (event_id, channel, destination_fingerprint),
+			UNIQUE (event_id, channel, destination_fingerprint_key_id, destination_fingerprint),
 			CHECK (attempt_count <= max_attempts),
 			CHECK ((state = 'leased') = (lease_token IS NOT NULL AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
 			CHECK (state = 'leased' OR cancel_requested = false),
@@ -178,8 +188,8 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			last_seen_at timestamptz NOT NULL
 		)`,
 		...([names.meta, names.event, names.payload, names.job, names.attempt, names.worker] as const)
-			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(2)}'`),
-		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(2)}'`,
+			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(3)}'`),
+		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(3)}'`,
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${names.event}_immutable' AND tgrelid = '${event}'::regclass) THEN
 				CREATE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}
@@ -205,7 +215,7 @@ async function verifyDeliverySchema(
 	client: pg.PoolClient,
 	schema: string,
 	names: DeliveryTableNames,
-	version: 1 | 2,
+	version: 1 | 2 | 3,
 ): Promise<void> {
 	const expectedColumns = new Map<string, string[]>([
 		[names.meta, ["key:text:true", "updated_at:timestamp with time zone:true", "value:jsonb:true"]],
@@ -214,6 +224,10 @@ async function verifyDeliverySchema(
 			"destination_fingerprint:text:true", "environment_id:text:true", "id:text:true", "kind:text:true",
 			"organization_id:text:false", "project_id:text:true", "replay_of:text:false",
 			"semantic_expires_at:timestamp with time zone:true", "source_fingerprint:text:true",
+			...(version >= 3 ? [
+				"destination_fingerprint_key_id:text:true", "source_dedupe_fingerprint:text:true",
+				"source_dedupe_version:smallint:true", "source_fingerprint_key_id:text:true",
+			] : []),
 		]],
 		[names.payload, [
 			"created_at:timestamp with time zone:true", "envelope:text:true", "envelope_version:smallint:true",
@@ -224,6 +238,7 @@ async function verifyDeliverySchema(
 			"cancelled_at:timestamp with time zone:false", "channel:text:true", "created_at:timestamp with time zone:true",
 			"dead_at:timestamp with time zone:false", "delivered_at:timestamp with time zone:false",
 			"destination_fingerprint:text:true", "event_id:text:true", "id:text:true", "last_error_class:text:false",
+			...(version >= 3 ? ["destination_fingerprint_key_id:text:true"] : []),
 			"lease_expires_at:timestamp with time zone:false", "lease_owner:text:false", "lease_token:text:false",
 			"max_attempts:integer:true", "semantic_expires_at:timestamp with time zone:true", "state:text:true",
 			...(version >= 2 ? [
@@ -282,11 +297,18 @@ async function verifyDeliverySchema(
 		.join("\n");
 	const requiredConstraintFragments = new Map<string, string[]>([
 		[names.meta, ["PRIMARY KEY (KEY)"]],
-		[names.event, ["PRIMARY KEY (ID)", "UNIQUE (SOURCE_FINGERPRINT)", "FOREIGN KEY (REPLAY_OF)", "SEMANTIC_EXPIRES_AT > CREATED_AT"]],
+		[names.event, [
+			"PRIMARY KEY (ID)",
+			version >= 3 ? "UNIQUE (SOURCE_DEDUPE_FINGERPRINT)" : "UNIQUE (SOURCE_FINGERPRINT)",
+			"FOREIGN KEY (REPLAY_OF)", "SEMANTIC_EXPIRES_AT > CREATED_AT",
+		]],
 		[names.payload, ["PRIMARY KEY (EVENT_ID)", "FOREIGN KEY (EVENT_ID)", "EXPIRES_AT > CREATED_AT"]],
 		[names.job, [
 			"PRIMARY KEY (ID)", "FOREIGN KEY (EVENT_ID)",
-			"UNIQUE (EVENT_ID, CHANNEL, DESTINATION_FINGERPRINT)", "STATE = ANY", "LEASE_TOKEN IS NOT NULL",
+			version >= 3
+				? "UNIQUE (EVENT_ID, CHANNEL, DESTINATION_FINGERPRINT_KEY_ID, DESTINATION_FINGERPRINT)"
+				: "UNIQUE (EVENT_ID, CHANNEL, DESTINATION_FINGERPRINT)",
+			"STATE = ANY", "LEASE_TOKEN IS NOT NULL",
 			"ATTEMPT_COUNT <= MAX_ATTEMPTS",
 		]],
 		[names.attempt, ["PRIMARY KEY (ID)", "FOREIGN KEY (JOB_ID)", "UNIQUE (JOB_ID, ATTEMPT_NUMBER, PHASE)", "PHASE = ANY"]],
@@ -376,6 +398,110 @@ async function migrateDeliverySchemaV1ToV2(
 	);
 }
 
+function migrationFingerprintKeyId(value: string | undefined): string | null {
+	if (value === undefined) return null;
+	if (!/^[A-Za-z0-9._-]{1,64}$/.test(value)) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_KEY_ID_INVALID",
+			"Legacy delivery fingerprint key id is invalid",
+		);
+	}
+	return value;
+}
+
+async function migrateDeliverySchemaV2ToV3(
+	client: pg.PoolClient,
+	schema: string,
+	names: DeliveryTableNames,
+	legacyFingerprintKeyId: string | undefined,
+): Promise<void> {
+	const event = fq(schema, names.event);
+	const job = fq(schema, names.job);
+	const legacyRowCount = Number((await client.query<{ count: string }>(
+		`SELECT count(*) count FROM ${event}`,
+	)).rows[0]?.count ?? "0");
+	const keyId = migrationFingerprintKeyId(legacyFingerprintKeyId);
+	if (legacyRowCount > 0 && keyId === null) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_MIGRATION_KEY_ID_REQUIRED",
+			"Set legacyFingerprintKeyId to the still-retained fingerprint key that created v1/v2 delivery rows, migrate, then rotate",
+		);
+	}
+
+	await client.query(`ALTER TABLE ${event}
+		ADD COLUMN source_fingerprint_key_id text,
+		ADD COLUMN source_dedupe_fingerprint text,
+		ADD COLUMN source_dedupe_version smallint,
+		ADD COLUMN destination_fingerprint_key_id text`);
+	await client.query(`ALTER TABLE ${job}
+		ADD COLUMN destination_fingerprint_key_id text`);
+	if (legacyRowCount > 0) {
+		await client.query(
+			`ALTER TABLE ${event} DISABLE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}`,
+		);
+		await client.query(
+			`UPDATE ${event} SET source_fingerprint_key_id=$1,
+			 source_dedupe_fingerprint=source_fingerprint,
+			 source_dedupe_version=1,
+			 destination_fingerprint_key_id=$1`,
+			[keyId],
+		);
+		await client.query(
+			`ALTER TABLE ${event} ENABLE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}`,
+		);
+		await client.query(
+			`UPDATE ${job} SET destination_fingerprint_key_id=$1`,
+			[keyId],
+		);
+	}
+
+	const sourceUnique = await client.query<{ conname: string }>(
+		`SELECT k.conname FROM pg_constraint k
+		 WHERE k.conrelid=$1::regclass AND k.contype='u'
+		   AND upper(pg_get_constraintdef(k.oid, true))='UNIQUE (SOURCE_FINGERPRINT)'`,
+		[event],
+	);
+	const sourceUniqueName = sourceUnique.rows[0]?.conname;
+	if (!sourceUniqueName) {
+		schemaDrift("Delivery v2 source fingerprint uniqueness constraint is missing");
+	}
+	await client.query(`ALTER TABLE ${event}
+		DROP CONSTRAINT ${quoteIdentifier(sourceUniqueName)},
+		ALTER COLUMN source_fingerprint_key_id SET NOT NULL,
+		ALTER COLUMN source_dedupe_fingerprint SET NOT NULL,
+		ALTER COLUMN source_dedupe_version SET NOT NULL,
+		ALTER COLUMN destination_fingerprint_key_id SET NOT NULL,
+		ADD UNIQUE (source_dedupe_fingerprint),
+		ADD CHECK (source_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
+		ADD CHECK (source_dedupe_fingerprint ~ '^[0-9a-f]{64}$'),
+		ADD CHECK (source_dedupe_version IN (1, 2)),
+		ADD CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$')`);
+
+	const jobDestinationUnique = await client.query<{ conname: string }>(
+		`SELECT k.conname FROM pg_constraint k
+		 WHERE k.conrelid=$1::regclass AND k.contype='u'
+		   AND upper(pg_get_constraintdef(k.oid, true))=
+		       'UNIQUE (EVENT_ID, CHANNEL, DESTINATION_FINGERPRINT)'`,
+		[job],
+	);
+	const jobDestinationUniqueName = jobDestinationUnique.rows[0]?.conname;
+	if (!jobDestinationUniqueName) {
+		schemaDrift("Delivery v2 job destination uniqueness constraint is missing");
+	}
+	await client.query(`ALTER TABLE ${job}
+		DROP CONSTRAINT ${quoteIdentifier(jobDestinationUniqueName)},
+		ALTER COLUMN destination_fingerprint_key_id SET NOT NULL,
+		ADD UNIQUE (event_id, channel, destination_fingerprint_key_id, destination_fingerprint),
+		ADD CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$')`);
+
+	for (const name of [names.meta, names.event, names.payload, names.job, names.attempt, names.worker]) {
+		await client.query(`COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(3)}'`);
+	}
+	await client.query(
+		`COMMENT ON FUNCTION ${fq(schema, names.rejectMutationFunction)}() IS '${deliverySchemaAssetMarker(3)}'`,
+	);
+}
+
 export async function migrateDeliverySchema(
 	pool: pg.Pool,
 	options: DeliverySchemaOptions = {},
@@ -415,7 +541,7 @@ export async function migrateDeliverySchema(
 				"Refusing to adopt unowned delivery tables or functions",
 			);
 		}
-		let existingVersion: 1 | 2 | null = null;
+		let existingVersion: 1 | 2 | 3 | null = null;
 		if (metaExists) {
 			const metadata = await client.query<{ key: string; value: unknown }>(
 				`SELECT key, value FROM ${fq(schema, names.meta)} WHERE key IN ('owner', 'schema_version')`,
@@ -434,7 +560,7 @@ export async function migrateDeliverySchema(
 					`Delivery schema version ${version} is newer than supported version ${DELIVERY_SCHEMA_VERSION}`,
 				);
 			}
-			existingVersion = version as 1 | 2;
+			existingVersion = version as 1 | 2 | 3;
 			if (existing.rows.length !== targets.length || !functionExisting.rowCount) {
 				throw new DeliveryError(
 					"DELIVERY_SCHEMA_COLLISION",
@@ -467,6 +593,19 @@ export async function migrateDeliverySchema(
 		}
 		if (existingVersion === 1) {
 			await migrateDeliverySchemaV1ToV2(client, schema, names);
+			await migrateDeliverySchemaV2ToV3(
+				client,
+				schema,
+				names,
+				options.legacyFingerprintKeyId,
+			);
+		} else if (existingVersion === 2) {
+			await migrateDeliverySchemaV2ToV3(
+				client,
+				schema,
+				names,
+				options.legacyFingerprintKeyId,
+			);
 		} else {
 			for (const statement of schemaStatements(schema, names)) await client.query(statement);
 		}

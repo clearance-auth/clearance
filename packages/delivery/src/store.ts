@@ -141,6 +141,29 @@ export class DeliveryStore {
 		return migrateDeliverySchema(this.pool, this.options);
 	}
 
+	/**
+	 * Readiness gate for fingerprint-key rotation. Active destinations require
+	 * their historical key for recipient verification; migrated v1/v2 source
+	 * authorities require theirs until those legacy event rows are retained.
+	 */
+	async assertFingerprintKeysAvailable(keyring: DeliveryKeyring): Promise<void> {
+		const referenced = await this.pool.query<{ key_id: string }>(
+			`SELECT DISTINCT e.destination_fingerprint_key_id key_id
+			 FROM ${this.tables.event} e JOIN ${this.tables.job} j ON j.event_id=e.id
+			 WHERE j.state IN ('queued','leased','retry')
+			 UNION
+			 SELECT DISTINCT e.source_fingerprint_key_id key_id
+			 FROM ${this.tables.event} e WHERE e.source_dedupe_version=1`,
+		);
+		const missing = referenced.rows.find((row) => !keyring.fingerprintKeys.has(row.key_id));
+		if (missing) {
+			throw new DeliveryError(
+				"DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+				`Delivery fingerprint key ${missing.key_id} is unavailable`,
+			);
+		}
+	}
+
 	private async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
 		const client = await this.pool.connect();
 		try {
@@ -278,16 +301,26 @@ export class DeliveryStore {
 		now?: Date;
 	}): Promise<void> {
 		const now = validDate(input.now ?? new Date(), "now");
-		const result = await this.pool.query<{ destination_fingerprint: string }>(
-			`SELECT e.destination_fingerprint FROM ${this.tables.job} j
+		const result = await this.pool.query<{
+			destination_fingerprint: string;
+			destination_fingerprint_key_id: string;
+		}>(
+			`SELECT e.destination_fingerprint, e.destination_fingerprint_key_id
+			 FROM ${this.tables.job} j
 			 JOIN ${this.tables.event} e ON e.id=j.event_id
 			 WHERE j.id=$1 AND j.state='leased' AND j.lease_token=$2
 			   AND j.lease_expires_at > $3`,
 			[input.jobId, input.leaseToken, now],
 		);
-		const expected = result.rows[0]?.destination_fingerprint;
-		if (!expected) throw new StaleDeliveryLeaseError();
-		if (fingerprintDestination(input.destination, input.keyring) !== expected) {
+		const row = result.rows[0];
+		if (!row) throw new StaleDeliveryLeaseError();
+		if (
+			fingerprintDestination(
+				input.destination,
+				input.keyring,
+				row.destination_fingerprint_key_id,
+			) !== row.destination_fingerprint
+		) {
 			throw new DeliveryError(
 				"DELIVERY_DESTINATION_MISMATCH",
 				"Decrypted delivery recipient does not match the audited destination",

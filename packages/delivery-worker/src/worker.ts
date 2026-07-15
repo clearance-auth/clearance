@@ -60,7 +60,11 @@ export class DeliveryWorker {
 			connectionTimeoutMillis: config.smtp.connectionTimeoutMs,
 			application_name: `clearance-delivery:${config.workerId}`,
 		});
-		this.store = new DeliveryStore(this.pool, { schema: config.schema, prefix: config.prefix });
+		this.store = new DeliveryStore(this.pool, {
+			schema: config.schema,
+			prefix: config.prefix,
+			legacyFingerprintKeyId: config.legacyFingerprintKeyId,
+		});
 		this.sender = dependencies.sender ?? createSmtpSender(config);
 		this.logger = dependencies.logger ?? createJsonLogger();
 	}
@@ -68,6 +72,7 @@ export class DeliveryWorker {
 	async initialize(options: { verifySmtp?: boolean } = {}): Promise<void> {
 		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state: "starting" }).catch(() => undefined);
 		const result = await this.store.migrate();
+		await this.store.assertFingerprintKeysAvailable(this.config.keyring);
 		this.schemaHealthy = result.version === DELIVERY_SCHEMA_VERSION;
 		if (options.verifySmtp !== false) {
 			try {
@@ -96,6 +101,7 @@ export class DeliveryWorker {
 
 	async readiness(): Promise<WorkerReadiness> {
 		let database = false;
+		let keyring = false;
 		try { await this.pool.query("SELECT 1"); database = true; } catch { database = false; }
 		if (database) {
 			try {
@@ -112,16 +118,24 @@ export class DeliveryWorker {
 				const row = result.rows[0];
 				this.schemaHealthy = Number(row?.version) === DELIVERY_SCHEMA_VERSION && row?.table_count === 6 && row?.function_count === 1;
 			} catch { this.schemaHealthy = false; }
+			if (this.schemaHealthy) {
+				try {
+					await this.store.assertFingerprintKeysAvailable(this.config.keyring);
+					keyring = true;
+				} catch {
+					keyring = false;
+				}
+			}
 		} else {
 			this.schemaHealthy = false;
 		}
 		const heartbeat = this.lastHeartbeatAt > 0 && Date.now() - this.lastHeartbeatAt <= this.config.heartbeatMs * 3;
 		return {
-			ready: this.initialized && !this.draining && database && this.schemaHealthy && heartbeat && this.smtpHealthy,
+			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && heartbeat && this.smtpHealthy,
 			draining: this.draining,
 			database,
 			schema: this.schemaHealthy,
-			keyring: this.config.keyring.keys.has(this.config.keyring.currentKeyId),
+			keyring,
 			heartbeat,
 			smtp: this.smtpHealthy,
 			workerId: this.config.workerId,

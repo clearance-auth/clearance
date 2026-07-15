@@ -14,7 +14,12 @@ function ring() {
 	return createDeliveryKeyring({
 		currentKeyId: "key-2",
 		keys: { "key-1": randomBytes(32), "key-2": randomBytes(32) },
-		fingerprintKey: randomBytes(32),
+		currentFingerprintKeyId: "fingerprint-2",
+		fingerprintKeys: {
+			"fingerprint-1": randomBytes(32),
+			"fingerprint-2": randomBytes(32),
+		},
+		sourceDedupeKey: randomBytes(32),
 	});
 }
 
@@ -50,11 +55,23 @@ describe("delivery crypto and redaction", () => {
 	it("requires explicit 32-byte purpose-separated keys", () => {
 		const shared = randomBytes(32);
 		expect(() => createDeliveryKeyring({
-			currentKeyId: "current", keys: { current: shared }, fingerprintKey: shared,
+			currentKeyId: "current", keys: { current: shared },
+			currentFingerprintKeyId: "fingerprint-current",
+			fingerprintKeys: { "fingerprint-current": shared },
+			sourceDedupeKey: randomBytes(32),
 		})).toThrowError(/different material/);
 		expect(() => createDeliveryKeyring({
-			currentKeyId: "current", keys: { current: "weak" }, fingerprintKey: randomBytes(32),
+			currentKeyId: "current", keys: { current: "weak" },
+			currentFingerprintKeyId: "fingerprint-current",
+			fingerprintKeys: { "fingerprint-current": randomBytes(32) },
+			sourceDedupeKey: randomBytes(32),
 		})).toThrowError(/32 bytes/);
+		expect(() => createDeliveryKeyring({
+			currentKeyId: "current", keys: { current: randomBytes(32) },
+			currentFingerprintKeyId: "missing",
+			fingerprintKeys: { retained: randomBytes(32) },
+			sourceDedupeKey: randomBytes(32),
+		})).toThrowError(/not present/);
 	});
 
 	it("rejects cyclic and oversized payloads before encryption", () => {

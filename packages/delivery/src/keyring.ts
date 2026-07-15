@@ -17,7 +17,9 @@ const KEY_ID = /^[A-Za-z0-9._-]{1,64}$/;
 export type DeliveryKeyring = {
 	currentKeyId: string;
 	keys: ReadonlyMap<string, Buffer>;
-	fingerprintKey: Buffer;
+	currentFingerprintKeyId: string;
+	fingerprintKeys: ReadonlyMap<string, Buffer>;
+	sourceDedupeKey: Buffer;
 };
 
 export type DeliveryPayloadAad = {
@@ -29,6 +31,17 @@ export type DeliveryPayloadAad = {
 	environmentId: string;
 	destinationFingerprint: string;
 	expiresAt: string;
+};
+
+type DeliveryEncryptionKeyInput = {
+	currentKeyId: string;
+	keys: Record<string, string | Buffer>;
+};
+
+export type DeliveryKeyringInput = DeliveryEncryptionKeyInput & {
+	currentFingerprintKeyId: string;
+	fingerprintKeys: Record<string, string | Buffer>;
+	sourceDedupeKey: string | Buffer;
 };
 
 function b64url(value: Buffer): string {
@@ -57,11 +70,7 @@ function decodeKey(raw: string, label: string): Buffer {
 	return decoded;
 }
 
-export function createDeliveryKeyring(input: {
-	currentKeyId: string;
-	keys: Record<string, string | Buffer>;
-	fingerprintKey: string | Buffer;
-}): DeliveryKeyring {
+export function createDeliveryKeyring(input: DeliveryKeyringInput): DeliveryKeyring {
 	if (!KEY_ID.test(input.currentKeyId)) {
 		throw new DeliveryError("DELIVERY_KEY_ID_INVALID", "Invalid current delivery key id");
 	}
@@ -90,21 +99,66 @@ export function createDeliveryKeyring(input: {
 			"Current delivery key id is not present in the keyring",
 		);
 	}
-	const fingerprintKey = Buffer.isBuffer(input.fingerprintKey)
-		? Buffer.from(input.fingerprintKey)
-		: decodeKey(input.fingerprintKey, "delivery fingerprint key");
-	if (fingerprintKey.length !== KEY_BYTES) {
-		throw new DeliveryError("DELIVERY_KEY_INVALID", "Delivery fingerprint key must be 32 bytes");
+	if (!KEY_ID.test(input.currentFingerprintKeyId)) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_KEY_ID_INVALID",
+			"Invalid current delivery fingerprint key id",
+		);
 	}
-	for (const key of keys.values()) {
-		if (timingSafeEqual(key, fingerprintKey)) {
+	const fingerprintKeys = new Map<string, Buffer>();
+	for (const [keyId, material] of Object.entries(input.fingerprintKeys)) {
+		if (!KEY_ID.test(keyId)) {
+			throw new DeliveryError(
+				"DELIVERY_FINGERPRINT_KEY_ID_INVALID",
+				`Invalid delivery fingerprint key id ${keyId}`,
+			);
+		}
+		if (!Buffer.isBuffer(material) && typeof material !== "string") {
+			throw new DeliveryError(
+				"DELIVERY_KEY_INVALID",
+				`Delivery fingerprint key ${keyId} must be encoded as hex or base64`,
+			);
+		}
+		const key = Buffer.isBuffer(material)
+			? Buffer.from(material)
+			: decodeKey(material, `delivery fingerprint key ${keyId}`);
+		if (key.length !== KEY_BYTES) {
+			throw new DeliveryError(
+				"DELIVERY_KEY_INVALID",
+				`Delivery fingerprint key ${keyId} must be 32 bytes`,
+			);
+		}
+		fingerprintKeys.set(keyId, key);
+	}
+	if (!fingerprintKeys.has(input.currentFingerprintKeyId)) {
+		throw new DeliveryError(
+			"DELIVERY_CURRENT_FINGERPRINT_KEY_MISSING",
+			"Current delivery fingerprint key id is not present in the fingerprint keyring",
+		);
+	}
+	const sourceDedupeKey = Buffer.isBuffer(input.sourceDedupeKey)
+		? Buffer.from(input.sourceDedupeKey)
+		: decodeKey(input.sourceDedupeKey, "delivery source dedupe key");
+	if (sourceDedupeKey.length !== KEY_BYTES) {
+		throw new DeliveryError("DELIVERY_KEY_INVALID", "Delivery source dedupe key must be 32 bytes");
+	}
+	const purposeKeys = [...keys.values(), ...fingerprintKeys.values(), sourceDedupeKey];
+	for (let left = 0; left < purposeKeys.length; left += 1) {
+		for (let right = left + 1; right < purposeKeys.length; right += 1) {
+			if (!timingSafeEqual(purposeKeys[left]!, purposeKeys[right]!)) continue;
 			throw new DeliveryError(
 				"DELIVERY_KEY_PURPOSE_REUSE",
-				"Delivery encryption and fingerprint keys must use different material",
+				"Delivery encryption, fingerprint, and source dedupe keys must use different material",
 			);
 		}
 	}
-	return { currentKeyId: input.currentKeyId, keys, fingerprintKey };
+	return {
+		currentKeyId: input.currentKeyId,
+		keys,
+		currentFingerprintKeyId: input.currentFingerprintKeyId,
+		fingerprintKeys,
+		sourceDedupeKey,
+	};
 }
 
 export function resolveDeliveryKeyring(
@@ -112,14 +166,17 @@ export function resolveDeliveryKeyring(
 ): DeliveryKeyring {
 	const currentKeyId = env.CLEARANCE_DELIVERY_KEY_ID?.trim();
 	const keysJson = env.CLEARANCE_DELIVERY_KEYS_JSON?.trim();
-	const fingerprintKey = env.CLEARANCE_DELIVERY_FINGERPRINT_KEY?.trim();
-	if (!currentKeyId || !keysJson || !fingerprintKey) {
+	const currentFingerprintKeyId = env.CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID?.trim();
+	const fingerprintKeysJson = env.CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON?.trim();
+	const sourceDedupeKey = env.CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY?.trim();
+	if (!currentKeyId || !keysJson || !currentFingerprintKeyId || !fingerprintKeysJson || !sourceDedupeKey) {
 		throw new DeliveryError(
 			"DELIVERY_KEYRING_REQUIRED",
-			"CLEARANCE_DELIVERY_KEY_ID, CLEARANCE_DELIVERY_KEYS_JSON, and CLEARANCE_DELIVERY_FINGERPRINT_KEY are required",
+			"CLEARANCE_DELIVERY_KEY_ID, CLEARANCE_DELIVERY_KEYS_JSON, CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID, CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON, and CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY are required",
 		);
 	}
 	let keys: Record<string, string>;
+	let fingerprintKeys: Record<string, string>;
 	try {
 		const parsed: unknown = JSON.parse(keysJson);
 		if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error();
@@ -130,7 +187,23 @@ export function resolveDeliveryKeyring(
 			"CLEARANCE_DELIVERY_KEYS_JSON must be an object mapping key ids to 32-byte keys",
 		);
 	}
-	return createDeliveryKeyring({ currentKeyId, keys, fingerprintKey });
+	try {
+		const parsed: unknown = JSON.parse(fingerprintKeysJson);
+		if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error();
+		fingerprintKeys = parsed as Record<string, string>;
+	} catch {
+		throw new DeliveryError(
+			"DELIVERY_KEYRING_INVALID",
+			"CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON must be an object mapping key ids to 32-byte keys",
+		);
+	}
+	return createDeliveryKeyring({
+		currentKeyId,
+		keys,
+		currentFingerprintKeyId,
+		fingerprintKeys,
+		sourceDedupeKey,
+	});
 }
 
 function aadBytes(aad: DeliveryPayloadAad): Buffer {
@@ -152,17 +225,63 @@ function aadBytes(aad: DeliveryPayloadAad): Buffer {
 export function fingerprintDestination(
 	destination: string,
 	ring: DeliveryKeyring,
+	keyId: string = ring.currentFingerprintKeyId,
 ): string {
 	if (!destination.trim()) {
 		throw new DeliveryError("DELIVERY_DESTINATION_REQUIRED", "Delivery destination is required");
 	}
-	return createHmac("sha256", ring.fingerprintKey)
+	const key = ring.fingerprintKeys.get(keyId);
+	if (!key) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+			`Delivery fingerprint key ${keyId} is unavailable`,
+		);
+	}
+	return createHmac("sha256", key)
 		.update("destination\0", "utf8")
 		.update(destination.trim(), "utf8")
 		.digest("hex");
 }
 
 export function fingerprintSource(
+	projectId: string,
+	environmentId: string,
+	kind: string,
+	sourceKey: string,
+	ring: DeliveryKeyring,
+	keyId: string = ring.currentFingerprintKeyId,
+): string {
+	if (!projectId.trim() || !environmentId.trim() || !kind.trim() || !sourceKey) {
+		throw new DeliveryError(
+			"DELIVERY_SOURCE_REQUIRED",
+			"Delivery project, environment, kind, and source key are required",
+		);
+	}
+	const key = ring.fingerprintKeys.get(keyId);
+	if (!key) {
+		throw new DeliveryError(
+			"DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+			`Delivery fingerprint key ${keyId} is unavailable`,
+		);
+	}
+	return createHmac("sha256", key)
+		.update("source\0", "utf8")
+		.update(projectId, "utf8")
+		.update("\0", "utf8")
+		.update(environmentId, "utf8")
+		.update("\0", "utf8")
+		.update(kind, "utf8")
+		.update("\0", "utf8")
+		.update(sourceKey, "utf8")
+		.digest("hex");
+}
+
+/**
+ * Stable source-generation authority. Keep this purpose-separated key stable
+ * across operational fingerprint-key rotations so a rotation cannot create a
+ * second delivery for the same logical source generation.
+ */
+export function fingerprintSourceDedupe(
 	projectId: string,
 	environmentId: string,
 	kind: string,
@@ -175,8 +294,8 @@ export function fingerprintSource(
 			"Delivery project, environment, kind, and source key are required",
 		);
 	}
-	return createHmac("sha256", ring.fingerprintKey)
-		.update("source\0", "utf8")
+	return createHmac("sha256", ring.sourceDedupeKey)
+		.update("source-dedupe\0", "utf8")
 		.update(projectId, "utf8")
 		.update("\0", "utf8")
 		.update(environmentId, "utf8")

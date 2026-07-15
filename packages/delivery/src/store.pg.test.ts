@@ -25,7 +25,11 @@ const mainOptions = { prefix: `delivery_${suffix}` } satisfies DeliverySchemaOpt
 const collisionOptions = { prefix: `delivery_collision_${suffix}` } satisfies DeliverySchemaOptions;
 const futureOptions = { prefix: `delivery_future_${suffix}` } satisfies DeliverySchemaOptions;
 const driftOptions = { prefix: `delivery_drift_${suffix}` } satisfies DeliverySchemaOptions;
-const migrationOptions = { prefix: `delivery_migration_${suffix}` } satisfies DeliverySchemaOptions;
+const migrationOptions = {
+	prefix: `delivery_migration_${suffix}`,
+	legacyFingerprintKeyId: "fingerprint-v2",
+} satisfies DeliverySchemaOptions;
+const rotationOptions = { prefix: `delivery_rotation_${suffix}` } satisfies DeliverySchemaOptions;
 
 const gate = new pg.Pool({ connectionString: DATABASE_URL, connectionTimeoutMillis: 500 });
 let available = false;
@@ -58,13 +62,20 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 	const keyring = createDeliveryKeyring({
 		currentKeyId: "current",
 		keys: { current: randomBytes(32), previous: randomBytes(32) },
-		fingerprintKey: randomBytes(32),
+		currentFingerprintKeyId: "fingerprint-current",
+		fingerprintKeys: {
+			"fingerprint-current": randomBytes(32),
+			"fingerprint-previous": randomBytes(32),
+		},
+		sourceDedupeKey: randomBytes(32),
 	});
 	const start = new Date(Date.now() + 5_000);
 	const expiry = new Date(start.getTime() + 60 * 60_000);
 
 	afterAll(async () => {
-		for (const options of [mainOptions, collisionOptions, futureOptions, driftOptions, migrationOptions]) {
+		for (const options of [
+			mainOptions, collisionOptions, futureOptions, driftOptions, migrationOptions, rotationOptions,
+		]) {
 			await dropSchemaAssets(pool, options).catch(() => undefined);
 		}
 		await pool.end();
@@ -85,7 +96,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await migrateDeliverySchema(pool, futureOptions);
 		const future = qualifiedDeliveryTables(futureOptions);
 		await pool.query(
-			`UPDATE ${future.meta} SET value='3'::jsonb WHERE key='schema_version'`,
+			`UPDATE ${future.meta} SET value='4'::jsonb WHERE key='schema_version'`,
 		);
 		await expect(migrateDeliverySchema(pool, futureOptions)).rejects.toMatchObject({
 			code: "DELIVERY_SCHEMA_VERSION_FUTURE",
@@ -99,7 +110,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		});
 	});
 
-	it("transactionally upgrades owned v1 storage to v2 without losing rows", async () => {
+	it("transactionally upgrades owned v1 storage through v3 without losing rows", async () => {
 		await migrateDeliverySchema(pool, migrationOptions);
 		const tables = qualifiedDeliveryTables(migrationOptions);
 		await pool.query(
@@ -107,7 +118,17 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			 DROP CONSTRAINT ${quoteIdentifier(`${tables.names.job}_provider_check`)},
 			 DROP COLUMN provider_accepted_at,
 			 DROP COLUMN provider_status,
-			 DROP COLUMN provider_request_id`,
+			 DROP COLUMN provider_request_id,
+			 DROP COLUMN destination_fingerprint_key_id CASCADE,
+			 ADD UNIQUE (event_id, channel, destination_fingerprint)`,
+		);
+		await pool.query(
+			`ALTER TABLE ${tables.event}
+			 DROP COLUMN source_fingerprint_key_id,
+			 DROP COLUMN source_dedupe_fingerprint CASCADE,
+			 DROP COLUMN source_dedupe_version,
+			 DROP COLUMN destination_fingerprint_key_id,
+			 ADD UNIQUE (source_fingerprint)`,
 		);
 		for (const name of [tables.names.meta, tables.names.event, tables.names.payload, tables.names.job, tables.names.attempt, tables.names.worker]) {
 			await pool.query(`COMMENT ON TABLE ${quoteIdentifier(tables.schema)}.${quoteIdentifier(name)} IS 'clearance.delivery:v1'`);
@@ -127,17 +148,33 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			["b".repeat(64), start, expiry],
 		);
 
+		await expect(migrateDeliverySchema(pool, {
+			prefix: migrationOptions.prefix,
+		})).rejects.toMatchObject({
+			code: "DELIVERY_FINGERPRINT_MIGRATION_KEY_ID_REQUIRED",
+		});
 		const migrated = await migrateDeliverySchema(pool, migrationOptions);
-		expect(migrated.version).toBe(2);
-		expect((await pool.query(`SELECT id, state, provider_accepted_at FROM ${tables.job} WHERE id='v1-job'`)).rows).toEqual([
-			{ id: "v1-job", state: "queued", provider_accepted_at: null },
+		expect(migrated.version).toBe(3);
+		expect((await pool.query(
+			`SELECT j.id, j.state, j.provider_accepted_at, j.destination_fingerprint_key_id,
+			 e.source_fingerprint_key_id, e.source_dedupe_version
+			 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id WHERE j.id='v1-job'`,
+		)).rows).toEqual([
+			{
+				id: "v1-job",
+				state: "queued",
+				provider_accepted_at: null,
+				destination_fingerprint_key_id: "fingerprint-v2",
+				source_fingerprint_key_id: "fingerprint-v2",
+				source_dedupe_version: 1,
+			},
 		]);
-		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(2);
+		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(3);
 	});
 
 	it("rolls enqueue back atomically and stores no plaintext", async () => {
 		await store.migrate();
-		expect((await store.migrate()).version).toBe(2);
+		expect((await store.migrate()).version).toBe(3);
 		const client = await pool.connect();
 		try {
 			await expect(enqueueDelivery(
@@ -206,6 +243,126 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		expect((await store.cancel("job-1", start))?.state).toBe("cancelled");
 		expect((await store.cancel("job-existing", start))?.state).toBe("cancelled");
 		expect((await store.cancel("job-tenant-2", start))?.state).toBe("cancelled");
+	});
+
+	it("processes queued work and preserves source-generation dedupe across fingerprint rotation", async () => {
+		const rotationStore = new DeliveryStore(pool, rotationOptions);
+		await rotationStore.migrate();
+		const encryptionKey = randomBytes(32);
+		const oldFingerprintKey = randomBytes(32);
+		const newFingerprintKey = randomBytes(32);
+		const sourceDedupeKey = randomBytes(32);
+		const oldKeyring = createDeliveryKeyring({
+			currentKeyId: "payload-current",
+			keys: { "payload-current": encryptionKey },
+			currentFingerprintKeyId: "fingerprint-old",
+			fingerprintKeys: { "fingerprint-old": oldFingerprintKey },
+			sourceDedupeKey,
+		});
+		const rotatedKeyring = createDeliveryKeyring({
+			currentKeyId: "payload-current",
+			keys: { "payload-current": encryptionKey },
+			currentFingerprintKeyId: "fingerprint-new",
+			fingerprintKeys: {
+				"fingerprint-old": oldFingerprintKey,
+				"fingerprint-new": newFingerprintKey,
+			},
+			sourceDedupeKey,
+		});
+		const retiredTooEarlyKeyring = createDeliveryKeyring({
+			currentKeyId: "payload-current",
+			keys: { "payload-current": encryptionKey },
+			currentFingerprintKeyId: "fingerprint-new",
+			fingerprintKeys: { "fingerprint-new": newFingerprintKey },
+			sourceDedupeKey,
+		});
+
+		const enqueueWith = async (
+			eventId: string,
+			jobId: string,
+			ring: typeof oldKeyring,
+		) => {
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
+				const result = await enqueueDelivery(
+					createDeliveryTransactionAdapter(client),
+					{
+						...baseInput(eventId, jobId, "rotation-source"),
+						payload: { to: "rotation@example.test", token: "rotation-secret" },
+						destination: "rotation@example.test",
+					},
+					ring,
+					rotationOptions,
+				);
+				await client.query("COMMIT");
+				return result;
+			} catch (error) {
+				await client.query("ROLLBACK").catch(() => undefined);
+				throw error;
+			} finally {
+				client.release();
+			}
+		};
+
+		await enqueueWith("rotation-event-old", "rotation-job-old", oldKeyring);
+		await expect(enqueueWith(
+			"rotation-event-duplicate",
+			"rotation-job-duplicate",
+			rotatedKeyring,
+		)).rejects.toMatchObject({ code: "DELIVERY_DUPLICATE" });
+
+		await rotationStore.assertFingerprintKeysAvailable(rotatedKeyring);
+		await expect(rotationStore.assertFingerprintKeysAvailable(retiredTooEarlyKeyring))
+			.rejects.toMatchObject({ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" });
+		const leased = await rotationStore.claimNext({ workerId: "worker-rotation", now: start });
+		expect(leased?.id).toBe("rotation-job-old");
+		const payload = await rotationStore.readLeasedPayload<{ to: string; token: string }>({
+			jobId: leased!.id,
+			leaseToken: leased!.leaseToken,
+			keyring: rotatedKeyring,
+			now: start,
+		});
+		expect(payload).toEqual({
+			to: "rotation@example.test",
+			token: "rotation-secret",
+		});
+		let retiredError: unknown;
+		try {
+			await rotationStore.assertLeasedDestination({
+				jobId: leased!.id,
+				leaseToken: leased!.leaseToken,
+				destination: payload.to,
+				keyring: retiredTooEarlyKeyring,
+				now: start,
+			});
+		} catch (error) {
+			retiredError = error;
+		}
+		expect(retiredError).toMatchObject({ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" });
+		expect(String(retiredError)).not.toContain(payload.to);
+		await rotationStore.assertLeasedDestination({
+			jobId: leased!.id,
+			leaseToken: leased!.leaseToken,
+			destination: payload.to,
+			keyring: rotatedKeyring,
+			now: start,
+		});
+		expect((await rotationStore.complete({
+			jobId: leased!.id,
+			leaseToken: leased!.leaseToken,
+			workerId: leased!.leaseOwner,
+			now: start,
+		})).state).toBe("delivered");
+		const tables = qualifiedDeliveryTables(rotationOptions);
+		const persisted = JSON.stringify((await pool.query(
+			`SELECT e.*, j.*, p.envelope FROM ${tables.event} e
+			 JOIN ${tables.job} j ON j.event_id=e.id
+			 JOIN ${tables.payload} p ON p.event_id=e.id`,
+		)).rows);
+		expect(persisted).not.toContain("rotation@example.test");
+		expect(persisted).not.toContain("rotation-secret");
+		expect(persisted).toContain("fingerprint-old");
 	});
 
 	it("claims concurrently, fences stale workers, and records retry/dead/cancel/reclaim", async () => {

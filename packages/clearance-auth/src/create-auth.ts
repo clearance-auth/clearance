@@ -390,6 +390,7 @@ export function createClearanceAuth(
 				await migrateDeliverySchema(pool, {
 					schema: options.durableDelivery.schema,
 					prefix: options.durableDelivery.prefix,
+					legacyFingerprintKeyId: options.durableDelivery.legacyFingerprintKeyId,
 				});
 			}
 			return {
