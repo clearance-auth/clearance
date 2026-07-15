@@ -310,6 +310,10 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		const readyResponse = await fetch(`http://${config.healthHost}:${config.healthPort}/ready`);
 		expect(readyResponse.status).toBe(200);
 		expect((await readyResponse.json() as { ready: boolean }).ready).toBe(true);
+		const initialMetrics = await fetch(`http://${config.healthHost}:${config.healthPort}/metrics`);
+		expect(initialMetrics.status).toBe(200);
+		expect(initialMetrics.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
+		expect(await initialMetrics.text()).toContain('clearance_delivery_jobs_claimed_total{channel="email"} 0');
 		await enqueue("event-send", "job-send", "source-send");
 		await enqueue("event-reset-template", "job-reset-template", "source-reset-template", {
 			template: "password-reset", to: "person@example.test", userName: "Reset User",
@@ -322,6 +326,11 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		});
 		expect(await worker.processOnce()).toBe(3);
 		expect(smtp.messages).toHaveLength(3);
+		const metrics = await (await fetch(`http://${config.healthHost}:${config.healthPort}/metrics`)).text();
+		expect(metrics).toContain('clearance_delivery_jobs_claimed_total{channel="email"} 3');
+		expect(metrics).toContain('clearance_delivery_jobs_outcomes_total{channel="email",outcome="delivered"} 3');
+		expect(metrics).not.toContain("job-send");
+		expect(metrics).not.toContain("event-send");
 		const renderedMessages = smtp.messages.join("\n");
 		expect(renderedMessages).toContain("verification-secret");
 		expect(renderedMessages).toContain("reset-secret");

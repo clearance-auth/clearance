@@ -4,6 +4,7 @@ import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleD
 import type { WorkerConfig } from "./config.js";
 import { classifyEmailError, configuredEmailTransport, createEmailSender } from "./email.js";
 import { createJsonLogger, type WorkerLogger } from "./logger.js";
+import { DeliveryWorkerMetrics, type DeliveryMetricOutcome } from "./metrics.js";
 import { renderEmailPayload, type EmailSender } from "./smtp.js";
 import {
 	classifyWebhookError,
@@ -59,6 +60,7 @@ export class DeliveryWorker {
 	private lastHeartbeatAt = 0;
 	private inFlight = new Set<Promise<unknown>>();
 	private healthServer?: Server;
+	private readonly metrics = new DeliveryWorkerMetrics();
 	private heartbeatTimer?: NodeJS.Timeout;
 	private maintenanceTimer?: NodeJS.Timeout;
 	private maintenanceRunning = false;
@@ -170,10 +172,14 @@ export class DeliveryWorker {
 		if (this.draining || this.stopping) return false;
 		const leased = await this.store.claimNext({ workerId: this.config.workerId, leaseMs: this.config.leaseMs });
 		if (!leased) return false;
+		const claimedAt = performance.now();
+		let metricOutcome: DeliveryMetricOutcome = "finish_failed";
+		this.metrics.recordClaim(leased.channel);
 		this.logger.log("info", "delivery.claimed", { jobId: leased.id, eventId: leased.eventId, kind: leased.kind, attempt: leased.attemptCount });
 		try {
 			if (leased.channel !== "email" && leased.channel !== "webhook") {
 				await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: "transport.unsupported" });
+				metricOutcome = "dead";
 				return true;
 			}
 			const payload = await this.store.readLeasedPayload<unknown>({ jobId: leased.id, leaseToken: leased.leaseToken, keyring: this.config.keyring });
@@ -214,8 +220,10 @@ export class DeliveryWorker {
 				throw new ProviderAcceptedUnconfirmedError(error);
 			}
 			this.logger.log("info", "delivery.delivered", { jobId: leased.id, eventId: leased.eventId, providerStatus: result.status });
+			metricOutcome = "delivered";
 		} catch (error) {
 			if (error instanceof ProviderAcceptedUnconfirmedError) {
+				metricOutcome = "accepted_unconfirmed";
 				this.logger.log("error", "delivery.provider_accepted_unconfirmed", {
 					jobId: leased.id,
 					eventId: leased.eventId,
@@ -224,6 +232,7 @@ export class DeliveryWorker {
 				return true;
 			}
 			if (error instanceof StaleDeliveryLeaseError) {
+				metricOutcome = "stale_lease";
 				this.logger.log("warn", "delivery.stale_lease", { jobId: leased.id, eventId: leased.eventId });
 				return true;
 			}
@@ -238,9 +247,14 @@ export class DeliveryWorker {
 					? await this.store.retry({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus })
 					: await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
 				this.logger.log(classified.retryable ? "warn" : "error", `delivery.${result.state}`, { jobId: leased.id, eventId: leased.eventId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
+				metricOutcome = result.state === "retry" ? "retry"
+					: result.state === "cancelled" ? "cancelled"
+					: "dead";
 			} catch (finishError) {
 				this.logger.log("error", "delivery.finish_failed", { jobId: leased.id, error: finishError });
 			}
+		} finally {
+			this.metrics.recordOutcome(leased.channel, metricOutcome, performance.now() - claimedAt);
 		}
 		return true;
 	}
@@ -359,11 +373,23 @@ export class DeliveryWorker {
 	async startHealthServer(): Promise<void> {
 		if (this.healthServer) return;
 		this.healthServer = http.createServer(async (request, response) => {
-			response.setHeader("content-type", "application/json");
 			response.setHeader("cache-control", "no-store");
-			if (request.method !== "GET") { response.statusCode = 405; response.end('{"error":"method_not_allowed"}'); return; }
-			if (request.url === "/live") { response.statusCode = this.stopping ? 503 : 200; response.end(JSON.stringify({ live: !this.stopping })); return; }
-			if (request.url === "/ready") { const state = await this.readiness(); response.statusCode = state.ready ? 200 : 503; response.end(JSON.stringify(state)); return; }
+			if (request.method !== "GET") { response.setHeader("content-type", "application/json"); response.statusCode = 405; response.end('{"error":"method_not_allowed"}'); return; }
+			if (request.url === "/live") { response.setHeader("content-type", "application/json"); response.statusCode = this.stopping ? 503 : 200; response.end(JSON.stringify({ live: !this.stopping })); return; }
+			if (request.url === "/ready") { response.setHeader("content-type", "application/json"); const state = await this.readiness(); response.statusCode = state.ready ? 200 : 503; response.end(JSON.stringify(state)); return; }
+			if (request.url === "/metrics") {
+				response.setHeader("content-type", "text/plain; version=0.0.4; charset=utf-8");
+				response.statusCode = 200;
+				response.end(this.metrics.render({
+					inFlight: this.inFlight.size,
+					draining: this.draining,
+					schemaHealthy: this.schemaHealthy,
+					emailHealthy: this.emailHealthy,
+					emailTransport: configuredEmailTransport(this.config),
+				}));
+				return;
+			}
+			response.setHeader("content-type", "application/json");
 			response.statusCode = 404; response.end('{"error":"not_found"}');
 		});
 		await new Promise<void>((resolve, reject) => { this.healthServer!.once("error", reject); this.healthServer!.listen(this.config.healthPort, this.config.healthHost, resolve); });
