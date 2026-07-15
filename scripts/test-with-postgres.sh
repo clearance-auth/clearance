@@ -15,7 +15,7 @@
 # start make a SIGKILLed previous run self-healing.
 #
 # Usage:
-#   scripts/test-with-postgres.sh                 # management suite + 0-skip assert
+#   scripts/test-with-postgres.sh                 # management + delivery suites + 0-skip asserts
 #   scripts/test-with-postgres.sh -- <command...> # run any command in this env
 set -euo pipefail
 
@@ -77,29 +77,33 @@ if [[ "${1:-}" == "--" ]]; then
   exit $?
 fi
 
-# Default: run the management suite with a machine-checked zero-skip result.
+# Default: run the management and delivery suites with machine-checked zero-skip results.
 # The pg-gate tripwire already fails unreachable-DB suites; the reporter
 # assertion additionally catches any FUTURE suite that skips by some other
 # mechanism (belt and braces, per FOLLOW.md P1.1.4).
-REPORT="$(mktemp -t clearance-mgmt-report.XXXXXX).json"
-rm_report() { rm -f "$REPORT"; }
-trap 'rm_report; cleanup' EXIT INT TERM
-
-(cd packages/management && npx vitest run --reporter=default --reporter=json --outputFile="$REPORT")
-
-node - "$REPORT" <<'EOF'
+run_zero_skip_suite() {
+  local package_dir="$1" label="$2" report
+  report="$(mktemp -t "clearance-${label}-report.XXXXXX").json"
+  (cd "$package_dir" && pnpm exec vitest run --reporter=default --reporter=json --outputFile="$report")
+  node - "$report" "$label" <<'EOF'
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const label = process.argv[3];
 const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
 if (!r.success) {
-  console.error(`management suite failed (${r.numFailedTests} failed)`);
+  console.error(`${label} suite failed (${r.numFailedTests} failed)`);
   process.exit(1);
 }
 if (skipped !== 0) {
-  console.error(`management suite skipped ${skipped} tests under the canonical gate — silent skip is a gate defect`);
+  console.error(`${label} suite skipped ${skipped} tests under the canonical gate — silent skip is a gate defect`);
   process.exit(1);
 }
-console.log(`management suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
+console.log(`${label} suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
 EOF
+  rm -f "$report"
+}
+
+run_zero_skip_suite packages/management management
+run_zero_skip_suite packages/delivery delivery
 
 echo "TEST_WITH_POSTGRES_OK"

@@ -384,6 +384,7 @@ describe("SCIM local HTTP protocol verification", () => {
 			});
 			const result = await checkScimConnection(store, conn.id, {
 				bearerToken: token,
+				fetchImpl: fetch,
 			});
 			expect(result.pass).toBe(true);
 			expect(result.mode).toBe("simulation");
@@ -405,7 +406,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: "wrong",
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: "wrong" }),
+				checkScimConnection(store, conn.id, {
+					bearerToken: "wrong",
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/unauthor|reject|credential/i);
 		} finally {
 			await unauth.close();
@@ -421,7 +425,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: token,
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: token }),
+				checkScimConnection(store, conn.id, {
+					bearerToken: token,
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/malformed|json/i);
 		} finally {
 			await mal.close();
@@ -437,7 +444,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: token,
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: token }),
+				checkScimConnection(store, conn.id, {
+					bearerToken: token,
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/non-success|503|failed/i);
 		} finally {
 			await down.close();

@@ -26,9 +26,9 @@ pnpm typecheck:clearance
 
 echo "### verification step 3: runtime and Clearance tests ###"
 pnpm test:runtime
-# Management suite runs against live disposable Postgres with the silent-skip
-# tripwire armed (CLEARANCE_REQUIRE_PG_TESTS=1) and a machine-checked 0-skip
-# result. Fails closed when Docker is unavailable.
+# Management and delivery suites run against live disposable Postgres with the
+# silent-skip tripwire armed (CLEARANCE_REQUIRE_PG_TESTS=1) and machine-checked
+# 0-skip results. Fails closed when Docker is unavailable.
 bash "$ROOT/scripts/test-with-postgres.sh"
 pnpm --filter @clearance/auth --filter @clearance/cli --filter @clearance/api --filter @clearance/sample-b2b --filter @clearance/console test
 
