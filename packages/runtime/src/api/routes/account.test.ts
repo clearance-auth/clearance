@@ -163,19 +163,23 @@ describe("account", async () => {
 		});
 	});
 
-	it("should encrypt access token and refresh token", async () => {
+	it("encrypts every persisted OAuth token class and decrypts API output", async () => {
 		const { runWithUser: runWithClient2 } = await signInWithTestUser();
 		const account = await ctx.adapter.findOne<Account>({
 			model: "account",
 			where: [{ field: "providerId", value: "google" }],
 		});
 		expect(account).toBeTruthy();
-		expect(account?.accessToken).not.toBe("test");
+		expect(account?.accessToken).toMatch(/^clr-oauth:v1:/);
+		expect(account?.refreshToken).toMatch(/^clr-oauth:v1:/);
+		expect(account?.idToken).toMatch(/^clr-oauth:v1:/);
 		await runWithClient2(async () => {
 			const accessToken = await client.getAccessToken({
 				providerId: "google",
 			});
 			expect(accessToken.data?.accessToken).toBe("test");
+			expect(accessToken.data?.idToken).not.toMatch(/^clr-oauth:/);
+			expect(accessToken.data?.idToken?.split(".")).toHaveLength(3);
 		});
 	});
 
@@ -1157,6 +1161,7 @@ describe("account", async () => {
 			},
 			account: {
 				storeAccountCookie: false,
+				encryptOAuthTokens: true,
 			},
 		});
 
@@ -1291,7 +1296,8 @@ describe("account", async () => {
 			where: [{ field: "providerId", value: "google" }],
 		});
 		expect(account).toBeTruthy();
-		expect(account?.idToken).toBe(newIdToken);
+		expect(account?.idToken).toMatch(/^clr-oauth:v1:/);
+		expect(account?.idToken).not.toContain(newIdToken);
 	});
 
 	it("should persist refreshed idToken in account cookie during getAccessToken auto-refresh in stateless mode", async () => {

@@ -447,6 +447,11 @@ describe("two-factor security: 2FA challenge is single-use and expiry-bounded", 
 	});
 	const enrollCode = await createOTP(secret).totp();
 	await auth.api.verifyTOTP({ body: { code: enrollCode }, headers });
+	await db.update({
+		model: "twoFactor",
+		where: [{ field: "id", value: row!.id }],
+		update: { lastUsedTotpCounter: -1 },
+	});
 	const verified = await db.findOne<UserWithTwoFactor>({
 		model: "user",
 		where: [{ field: "id", value: userId }],
@@ -517,6 +522,11 @@ describe("two-factor security: 2FA challenge is single-use and expiry-bounded", 
 	});
 
 	it("two concurrent verifications of the same challenge yield exactly one session", async () => {
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: row!.id }],
+			update: { lastUsedTotpCounter: -1 },
+		});
 		const challengeHeaders = await startChallenge();
 		const sessionsBefore = await countSessions();
 		const code = await createOTP(secret).totp();

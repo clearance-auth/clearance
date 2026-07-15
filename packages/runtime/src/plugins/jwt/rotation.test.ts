@@ -82,7 +82,9 @@ describe("jwt rotation", async () => {
 		});
 
 		// Create first key
-		await auth.api.signJWT({ body: { payload: { sub: "user1" } } });
+		const firstToken = await auth.api.signJWT({
+			body: { payload: { sub: "user1" } },
+		});
 
 		// Advance time past rotation interval but within grace period
 		vi.advanceTimersByTime(1100);
@@ -94,6 +96,9 @@ describe("jwt rotation", async () => {
 		// Check JWKS endpoint
 		const jwks = await auth.api.getJwks();
 		expect(jwks.keys.length).toBe(2); // Both keys should be present
+		expect(
+			(await auth.api.verifyJWT({ body: { token: firstToken.token } })).payload,
+		).not.toBeNull();
 
 		// Advance time past grace period
 		vi.advanceTimersByTime(1000);
@@ -101,6 +106,9 @@ describe("jwt rotation", async () => {
 		const jwksAfterGrace = await auth.api.getJwks();
 		expect(jwksAfterGrace.keys.length).toBe(1); // First key should be gone
 		expect(jwksAfterGrace.keys[0]?.kid).toBe(storage[1]!.id);
+		expect(
+			(await auth.api.verifyJWT({ body: { token: firstToken.token } })).payload,
+		).toBeNull();
 
 		vi.useRealTimers();
 	});

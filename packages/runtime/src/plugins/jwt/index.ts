@@ -10,6 +10,7 @@ import { APIError, sessionMiddleware } from "../../api";
 import { mergeSchema } from "../../db/schema";
 import { PACKAGE_VERSION } from "../../version";
 import { getJwksAdapter } from "./adapter";
+import { DEFAULT_JWKS_GRACE_PERIOD_SECONDS } from "./constant";
 import { schema } from "./schema";
 import { getJwtToken, signJWT } from "./sign";
 import type { JwtOptions } from "./types";
@@ -181,9 +182,9 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 					}
 
 					const now = Date.now();
-					const DEFAULT_GRACE_PERIOD = 60 * 60 * 24 * 30;
 					const gracePeriod =
-						(options?.jwks?.gracePeriod ?? DEFAULT_GRACE_PERIOD) * 1000;
+						(options?.jwks?.gracePeriod ?? DEFAULT_JWKS_GRACE_PERIOD_SECONDS) *
+						1000;
 
 					const keys = keySets.filter((key) => {
 						if (!key.expiresAt) {

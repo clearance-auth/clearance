@@ -4,6 +4,29 @@ export type SocialProviderConfig = {
 	[key: string]: unknown;
 };
 
+export type ClearanceAuthenticationSecurityOptions = {
+	twoFactor?: {
+		enabled?: boolean;
+		issuer?: string;
+		maxFailedAttempts?: number;
+		lockoutSeconds?: number;
+		trustDeviceMaxAgeSeconds?: number;
+	};
+	breachedPassword?: {
+		/** Defaults to enabled in strict/production mode. */
+		enabled?: boolean;
+		customMessage?: string;
+		timeoutMs?: number;
+	};
+	asymmetricAccessTokens?: {
+		enabled?: boolean;
+		issuer?: string;
+		audience?: string | string[];
+		rotationIntervalSeconds?: number;
+		gracePeriodSeconds?: number;
+	};
+};
+
 export type ClearanceRuntimeUser = {
 	id: string;
 	email: string;
@@ -23,7 +46,75 @@ export type ClearanceRuntimeOrganization = {
 	createdAt: Date;
 };
 
-export type CreateClearanceAuthOptions = {
+export type ClearanceTwoFactorRuntimeUser = ClearanceRuntimeUser & {
+	twoFactorEnabled: boolean;
+};
+
+export type ClearanceTwoFactorEnrollment = {
+	totpURI: string;
+	backupCodes: string[];
+};
+
+export type ClearanceTwoFactorVerification = {
+	token?: string;
+	user: ClearanceTwoFactorRuntimeUser;
+};
+
+export type ClearanceJwtPayload = Record<string, unknown> & {
+	sub?: string;
+	iss?: string;
+	aud?: string | string[];
+	iat?: number;
+	exp?: number;
+};
+
+export type ClearanceJsonWebKey = Record<string, unknown> & {
+	kid: string;
+	kty: string;
+	alg: string;
+	use?: string;
+	crv?: string;
+	x?: string;
+	y?: string;
+	n?: string;
+	e?: string;
+};
+
+export type ClearanceJsonWebKeySet = {
+	keys: ClearanceJsonWebKey[];
+};
+
+interface ClearanceProductEndpoint<Input, Output> {
+	(input: Input & { asResponse: true }): Promise<Response>;
+	(input: Input & { returnHeaders: true; returnStatus: true }): Promise<{
+		headers: Headers;
+		status: number;
+		response: Output;
+	}>;
+	(input: Input & { returnHeaders: true; returnStatus: false }): Promise<{
+		headers: Headers;
+		response: Output;
+	}>;
+	(input: Input & { returnHeaders: false; returnStatus: true }): Promise<{
+		status: number;
+		response: Output;
+	}>;
+	(input: Input & { returnHeaders: false; returnStatus: false }): Promise<Output>;
+	(input: Input & { returnHeaders: true }): Promise<{
+		headers: Headers;
+		response: Output;
+	}>;
+	(input: Input & { returnStatus: true }): Promise<{
+		status: number;
+		response: Output;
+	}>;
+	(input: Input): Promise<Output>;
+}
+
+export type CreateClearanceAuthOptions<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		ClearanceAuthenticationSecurityOptions,
+> = {
 	baseURL: string;
 	secret: string;
 	databaseUrl: string;
@@ -34,6 +125,7 @@ export type CreateClearanceAuthOptions = {
 	strictSecrets?: boolean;
 	onUserCreated?: (user: ClearanceRuntimeUser) => void | Promise<void>;
 	socialProviders?: Record<string, SocialProviderConfig>;
+	authenticationSecurity?: Security;
 	durableDelivery?: {
 		projectId: string;
 		environmentId: string;
@@ -73,26 +165,96 @@ export interface ClearanceAuthRuntime {
 	readonly $context: Promise<unknown>;
 }
 
-export interface ClearanceProductAuthRuntime extends ClearanceAuthRuntime {
-	readonly api: ClearanceAuthRuntime["api"] & {
-		signUpEmail(input: {
-			body: { email: string; password: string; name: string };
-		}): Promise<{ user: ClearanceRuntimeUser }>;
-		listOrganizations(input: {
-			headers: Headers;
-		}): Promise<ClearanceRuntimeOrganization[]>;
-		createOrganization(input: {
-			body: {
-				name: string;
-				slug: string;
-				logo?: string | null;
-				metadata?: Record<string, unknown>;
-				keepCurrentActiveOrganization?: boolean;
-			};
-			headers: Headers;
-		}): Promise<ClearanceRuntimeOrganization>;
-	};
-}
+type ClearanceBaseProductApi = {
+	signInEmail(input: Record<string, unknown>): Promise<unknown>;
+	getSession(input: Record<string, unknown>): Promise<unknown>;
+	resetPassword(input: Record<string, unknown>): Promise<unknown>;
+	signUpEmail(input: {
+		body: { email: string; password: string; name: string };
+	}): Promise<{ token: string; user: ClearanceRuntimeUser }>;
+	listOrganizations(input: {
+		headers: Headers;
+	}): Promise<ClearanceRuntimeOrganization[]>;
+	createOrganization(input: {
+		body: {
+			name: string;
+			slug: string;
+			logo?: string | null;
+			metadata?: Record<string, unknown>;
+			keepCurrentActiveOrganization?: boolean;
+		};
+		headers: Headers;
+	}): Promise<ClearanceRuntimeOrganization>;
+};
+
+type ClearanceTwoFactorProductApi = {
+	enableTwoFactor: ClearanceProductEndpoint<{
+		body: { password: string; issuer?: string; currentCode?: string };
+		headers: HeadersInit;
+	}, ClearanceTwoFactorEnrollment>;
+	getTOTPURI: ClearanceProductEndpoint<{
+		body: { password: string };
+		headers: HeadersInit;
+	}, { totpURI: string }>;
+	verifyTOTP: ClearanceProductEndpoint<{
+		body: { code: string; trustDevice?: boolean };
+		headers: HeadersInit;
+	}, ClearanceTwoFactorVerification>;
+	disableTwoFactor: ClearanceProductEndpoint<{
+		body: { password: string };
+		headers: HeadersInit;
+	}, { status: true }>;
+	generateBackupCodes: ClearanceProductEndpoint<{
+		body: { password: string };
+		headers: HeadersInit;
+	}, { status: true; backupCodes: string[] }>;
+	verifyBackupCode: ClearanceProductEndpoint<{
+		body: {
+			code: string;
+			disableSession?: boolean;
+			trustDevice?: boolean;
+		};
+		headers: HeadersInit;
+	}, ClearanceTwoFactorVerification>;
+};
+
+type ClearanceJwtProductApi = {
+	getToken: ClearanceProductEndpoint<{
+		headers: HeadersInit;
+	}, { token: string }>;
+	getJwks(): Promise<ClearanceJsonWebKeySet>;
+	verifyJWT: ClearanceProductEndpoint<{
+		body: { token: string; issuer?: string };
+	}, { payload: ClearanceJwtPayload | null }>;
+};
+
+type ClearanceAuthenticationSecurityApi<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined,
+> = (Security extends undefined
+	? ClearanceTwoFactorProductApi
+	: "twoFactor" extends keyof Security
+		? Security extends { twoFactor: { enabled: false } }
+			? Record<never, never>
+			: Security extends { twoFactor: { enabled: true } }
+				? ClearanceTwoFactorProductApi
+				: Partial<ClearanceTwoFactorProductApi>
+		: ClearanceTwoFactorProductApi) &
+	(Security extends undefined
+		? ClearanceJwtProductApi
+		: "asymmetricAccessTokens" extends keyof Security
+			? Security extends { asymmetricAccessTokens: { enabled: false } }
+				? Record<never, never>
+				: Security extends { asymmetricAccessTokens: { enabled: true } }
+					? ClearanceJwtProductApi
+					: Partial<ClearanceJwtProductApi>
+			: ClearanceJwtProductApi);
+
+export type ClearanceProductAuthRuntime<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+> = Omit<ClearanceAuthRuntime, "api"> & {
+	readonly api: ClearanceBaseProductApi &
+		ClearanceAuthenticationSecurityApi<Security>;
+};
 
 export interface ClearanceQueryResult<
 	Row extends Record<string, unknown> = Record<string, unknown>,
@@ -109,11 +271,20 @@ export interface ClearanceDatabasePool {
 	end(): Promise<void>;
 }
 
-export type ClearanceAuthBundle = {
-	auth: ClearanceProductAuthRuntime;
+export type ClearanceAuthBundle<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+> = {
+	auth: ClearanceProductAuthRuntime<Security>;
 	pool: ClearanceDatabasePool;
 	db: unknown;
-	plugins: { organization: true; sso: boolean; scim: boolean };
+	plugins: {
+		organization: true;
+		sso: boolean;
+		scim: boolean;
+		twoFactor: boolean;
+		breachedPassword: boolean;
+		asymmetricAccessTokens: boolean;
+	};
 	rateLimitEnabled: boolean;
 	planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
 	migrate(): Promise<ClearanceRuntimeMigrationResult>;
@@ -151,9 +322,9 @@ export declare function decryptRuntimeCredential(
 export declare function socialProvidersFromEnvironment(
 	env?: Record<string, string | undefined>,
 ): Record<string, SocialProviderConfig>;
-export declare function createClearanceAuth(
-	options: CreateClearanceAuthOptions,
-): ClearanceAuthBundle;
+export declare function createClearanceAuth<
+	const Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined,
+>(options: CreateClearanceAuthOptions<Security>): ClearanceAuthBundle<Security>;
 export declare function withClearanceDefaults<T extends Record<string, unknown>>(
 	options: T,
 ): T & { telemetry: { enabled: false } };

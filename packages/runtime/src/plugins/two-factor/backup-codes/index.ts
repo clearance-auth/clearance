@@ -18,7 +18,7 @@ import type {
 } from "../types";
 import {
 	assertTwoFactorNotLocked,
-	recordTwoFactorFailure,
+	reserveTwoFactorAttempt,
 	resetTwoFactorFailures,
 	verifyTwoFactor,
 } from "../verify-two-factor";
@@ -350,6 +350,9 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 					const attempt = isSignIn
 						? await beginAttempt(DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS)
 						: null;
+					if (isSignIn) {
+						await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
+					}
 					let validate: Awaited<ReturnType<typeof verifyBackupCode>>;
 					try {
 						validate = await verifyBackupCode(
@@ -367,9 +370,6 @@ export const backupCode2fa = (opts: BackupCodeOptions) => {
 					}
 					if (!validate.status || !validate.updated) {
 						await attempt?.recordFailure();
-						if (isSignIn) {
-							await recordTwoFactorFailure(ctx, twoFactorTable, twoFactor);
-						}
 						throw APIError.from(
 							"UNAUTHORIZED",
 							TWO_FACTOR_ERROR_CODES.INVALID_BACKUP_CODE,

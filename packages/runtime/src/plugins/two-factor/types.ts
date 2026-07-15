@@ -106,7 +106,10 @@ export interface TwoFactorTable {
 	userId: string;
 	secret: string;
 	backupCodes: string;
+	pendingSecret?: string | null;
+	pendingBackupCodes?: string | null;
 	verified: boolean;
-	failedVerificationCount?: number;
+	failedVerificationCount?: number | null;
 	lockedUntil?: Date | null;
+	lastUsedTotpCounter?: number | null;
 }

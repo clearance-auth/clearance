@@ -13,7 +13,7 @@ import {
 	expireCookie,
 	setSessionCookie,
 } from "../../cookies";
-import { symmetricEncrypt } from "../../crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "../../crypto";
 import { generateRandomString } from "../../crypto/random";
 import { mergeSchema } from "../../db/schema";
 import { shouldRequirePassword, validatePassword } from "../../utils/password";
@@ -34,6 +34,10 @@ import type {
 	TwoFactorTable,
 	UserWithTwoFactor,
 } from "./types";
+import {
+	assertTwoFactorNotLocked,
+	reserveTwoFactorAttempt,
+} from "./verify-two-factor";
 
 export * from "./error-code";
 
@@ -78,6 +82,7 @@ export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
 						description: "Custom issuer for the TOTP URI",
 					})
 					.optional(),
+				currentCode: z.string().optional(),
 			})
 		: z.object({
 				password: passwordSchema,
@@ -87,6 +92,7 @@ export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
 						description: "Custom issuer for the TOTP URI",
 					})
 					.optional(),
+				currentCode: z.string().optional(),
 			});
 	const disableTwoFactorBodySchema = allowPasswordless
 		? z.object({
@@ -159,7 +165,7 @@ export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
 				},
 				async (ctx) => {
 					const user = ctx.context.session.user as UserWithTwoFactor;
-					const { password, issuer } = ctx.body;
+					const { currentCode, password, issuer } = ctx.body;
 					const requirePassword = await shouldRequirePassword(
 						ctx,
 						user.id,
@@ -192,58 +198,181 @@ export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
 						ctx.context.secretConfig,
 						backupCodeOptions,
 					);
+					const existingTwoFactor =
+						await ctx.context.adapter.findOne<TwoFactorTable>({
+							model: opts.twoFactorTable,
+							where: [{ field: "userId", value: user.id }],
+						});
+					if (
+						existingTwoFactor != null &&
+						existingTwoFactor.verified !== false
+					) {
+						if (!currentCode) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								TWO_FACTOR_ERROR_CODES.TOTP_REPLACEMENT_REQUIRES_CURRENT_CODE,
+							);
+						}
+						await assertTwoFactorNotLocked(
+							ctx,
+							opts.twoFactorTable,
+							existingTwoFactor,
+						);
+						await reserveTwoFactorAttempt(
+							ctx,
+							opts.twoFactorTable,
+							existingTwoFactor,
+						);
+						const currentSecret = await symmetricDecrypt({
+							key: ctx.context.secretConfig,
+							data: existingTwoFactor.secret,
+						});
+						const currentCounter = await createOTP(currentSecret, {
+							digits: options?.totpOptions?.digits || 6,
+							period: options?.totpOptions?.period,
+						}).verifyWithCounter(currentCode);
+						if (currentCounter === null) {
+							throw APIError.from(
+								"UNAUTHORIZED",
+								TWO_FACTOR_ERROR_CODES.INVALID_CODE,
+							);
+						}
+						if (existingTwoFactor.lastUsedTotpCounter == null) {
+							await ctx.context.adapter.incrementOne<TwoFactorTable>({
+								model: opts.twoFactorTable,
+								where: [
+									{ field: "id", value: existingTwoFactor.id },
+									{ field: "secret", value: existingTwoFactor.secret },
+									{ field: "lastUsedTotpCounter", value: null },
+								],
+								increment: {},
+								set: { lastUsedTotpCounter: -1 },
+							});
+						}
+						const staged =
+							await ctx.context.adapter.incrementOne<TwoFactorTable>({
+							model: opts.twoFactorTable,
+							where: [
+								{ field: "id", value: existingTwoFactor.id },
+								{ field: "secret", value: existingTwoFactor.secret },
+								{
+									field: "lastUsedTotpCounter",
+									operator: "lt",
+									value: currentCounter,
+								},
+							],
+							increment: {},
+							set: {
+								pendingSecret: encryptedSecret,
+								pendingBackupCodes: backupCodes.encryptedBackupCodes,
+								lastUsedTotpCounter: currentCounter,
+								failedVerificationCount: 0,
+								lockedUntil: null,
+							},
+						});
+						if (!staged) {
+							throw APIError.fromStatus("CONFLICT", {
+								message: "Two-factor state changed. Please try again.",
+							});
+						}
+						const totpURI = createOTP(secret, {
+							digits: options?.totpOptions?.digits || 6,
+							period: options?.totpOptions?.period,
+						}).url(
+							issuer || options?.issuer || ctx.context.appName,
+							user.email,
+						);
+						return ctx.json({
+							totpURI,
+							backupCodes: backupCodes.backupCodes,
+						});
+					}
+					let persistedEnrollment: TwoFactorTable;
+					try {
+						persistedEnrollment = await ctx.context.adapter.transaction(
+							async (trx) => {
+								const current = await trx.findOne<TwoFactorTable>({
+									model: opts.twoFactorTable,
+									where: [{ field: "userId", value: user.id }],
+								});
+								if (current) {
+									return current;
+								}
+								return trx.create<TwoFactorTable>({
+									model: opts.twoFactorTable,
+									data: {
+										secret: encryptedSecret,
+										backupCodes: backupCodes.encryptedBackupCodes,
+										userId: user.id,
+										verified: !!options?.skipVerificationOnEnable,
+									},
+								});
+							},
+						);
+					} catch (error) {
+						if (
+							typeof error === "object" &&
+							error !== null &&
+							"code" in error &&
+							error.code === "23505"
+						) {
+							const concurrent =
+								await ctx.context.adapter.findOne<TwoFactorTable>({
+									model: opts.twoFactorTable,
+									where: [{ field: "userId", value: user.id }],
+								});
+							if (!concurrent || concurrent.verified !== false) {
+								throw APIError.fromStatus("CONFLICT", {
+									message: "Two-factor enrollment changed. Please try again.",
+								});
+							}
+							persistedEnrollment = concurrent;
+						} else {
+							throw error;
+						}
+					}
+					let enrollmentSecret = secret;
+					let enrollmentBackupCodes = backupCodes.backupCodes;
+					if (persistedEnrollment.secret !== encryptedSecret) {
+						if (persistedEnrollment.verified !== false) {
+							throw APIError.fromStatus("CONFLICT", {
+								message: "Two-factor enrollment changed. Please try again.",
+							});
+						}
+						enrollmentSecret = await symmetricDecrypt({
+							key: ctx.context.secretConfig,
+							data: persistedEnrollment.secret,
+						});
+						enrollmentBackupCodes = JSON.parse(
+							await symmetricDecrypt({
+								key: ctx.context.secretConfig,
+								data: persistedEnrollment.backupCodes,
+							}),
+						) as string[];
+					}
 					if (options?.skipVerificationOnEnable) {
 						const updatedUser = await ctx.context.internalAdapter.updateUser(
 							user.id,
-							{
-								twoFactorEnabled: true,
-							},
+							{ twoFactorEnabled: true },
 						);
 						const newSession = await ctx.context.internalAdapter.createSession(
 							updatedUser.id,
 							false,
 							ctx.context.session.session,
 						);
-						/**
-						 * Update the session cookie with the new user data
-						 */
 						await setSessionCookie(ctx, {
 							session: newSession,
 							user: updatedUser,
 						});
-
-						//remove current session
 						await ctx.context.internalAdapter.deleteSession(
 							ctx.context.session.session.token,
 						);
 					}
-					const existingTwoFactor =
-						await ctx.context.adapter.findOne<TwoFactorTable>({
-							model: opts.twoFactorTable,
-							where: [{ field: "userId", value: user.id }],
-						});
-					await ctx.context.adapter.deleteMany({
-						model: opts.twoFactorTable,
-						where: [{ field: "userId", value: user.id }],
-					});
-
-					await ctx.context.adapter.create({
-						model: opts.twoFactorTable,
-						data: {
-							secret: encryptedSecret,
-							backupCodes: backupCodes.encryptedBackupCodes,
-							userId: user.id,
-							verified:
-								(existingTwoFactor != null &&
-									existingTwoFactor.verified !== false) ||
-								!!options?.skipVerificationOnEnable,
-						},
-					});
-					const totpURI = createOTP(secret, {
+					const totpURI = createOTP(enrollmentSecret, {
 						digits: options?.totpOptions?.digits || 6,
 						period: options?.totpOptions?.period,
 					}).url(issuer || options?.issuer || ctx.context.appName, user.email);
-					return ctx.json({ totpURI, backupCodes: backupCodes.backupCodes });
+					return ctx.json({ totpURI, backupCodes: enrollmentBackupCodes });
 				},
 			),
 			/**

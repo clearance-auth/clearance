@@ -67,12 +67,100 @@ describe("@clearance/auth runtime wrapper", () => {
 			expect(bundle.plugins.sso).toBe(true);
 			expect(bundle.plugins.scim).toBe(true);
 			expect(bundle.plugins.organization).toBe(true);
+			expect(bundle.plugins.twoFactor).toBe(true);
+			expect(bundle.plugins.breachedPassword).toBe(false);
+			expect(bundle.plugins.asymmetricAccessTokens).toBe(true);
 			expect(bundle.rateLimitEnabled).toBe(true);
 			// do not migrate here if DB down
 			void bundle.destroy();
 		} finally {
 			process.env.NODE_ENV = prev;
 		}
+	});
+
+	it("installs encrypted two-factor, bounded HIBP, and rotating EdDSA defaults", async () => {
+		const bundle = createClearanceAuth({
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			authenticationSecurity: {
+				twoFactor: {
+					issuer: "Clearance Test",
+					maxFailedAttempts: 7,
+					lockoutSeconds: 600,
+				},
+				breachedPassword: { enabled: true, timeoutMs: 1_250 },
+				asymmetricAccessTokens: {
+					rotationIntervalSeconds: 3_600,
+					gracePeriodSeconds: 7_200,
+				},
+			},
+		});
+		try {
+			const options = (bundle.auth as unknown as {
+				options: {
+					plugins: Array<{ id: string; options?: Record<string, unknown> }>;
+					account?: { encryptOAuthTokens?: boolean };
+				};
+			}).options;
+			const twoFactor = options.plugins.find((plugin) => plugin.id === "two-factor");
+			const breached = options.plugins.find(
+				(plugin) => plugin.id === "have-i-been-pwned",
+			);
+			const accessTokens = options.plugins.find((plugin) => plugin.id === "jwt");
+			expect(twoFactor?.options).toMatchObject({
+				issuer: "Clearance Test",
+				backupCodeOptions: { storeBackupCodes: "encrypted" },
+				accountLockout: {
+					enabled: true,
+					maxFailedAttempts: 7,
+					durationSeconds: 600,
+				},
+			});
+			expect(breached?.options).toMatchObject({ enabled: true, timeoutMs: 1_250 });
+			expect(accessTokens?.options).toMatchObject({
+				jwks: {
+					keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+					rotationInterval: 3_600,
+					gracePeriod: 7_200,
+				},
+				jwt: {
+					issuer: "http://localhost:3300",
+					audience: "http://localhost:3300",
+					expirationTime: "5m",
+				},
+			});
+			expect(options.account?.encryptOAuthTokens).toBe(true);
+		} finally {
+			await bundle.destroy();
+		}
+	});
+
+	it("enables breached-password defense in strict mode and bounds key overlap", async () => {
+		const strict = createClearanceAuth({
+			baseURL: "https://auth.example.test",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			strictSecrets: true,
+		});
+		try {
+			expect(strict.plugins.breachedPassword).toBe(true);
+		} finally {
+			await strict.destroy();
+		}
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "http://localhost:3300",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				authenticationSecurity: {
+					asymmetricAccessTokens: {
+						rotationIntervalSeconds: 3_600,
+						gracePeriodSeconds: 86_401,
+					},
+				},
+			}),
+		).toThrow(/gracePeriodSeconds must be an integer between 300 and 86400/);
 	});
 
 	it("enforces production-safe SAML and SCIM defaults", async () => {

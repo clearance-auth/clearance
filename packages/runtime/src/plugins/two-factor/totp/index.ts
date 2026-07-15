@@ -17,7 +17,8 @@ import type {
 } from "../types";
 import {
 	assertTwoFactorNotLocked,
-	recordTwoFactorFailure,
+	consumeTotpCounter,
+	reserveTwoFactorAttempt,
 	resetTwoFactorFailures,
 	verifyTwoFactor,
 } from "../verify-two-factor";
@@ -296,31 +297,71 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 			const attempt = isSignIn
 				? await beginAttempt(DEFAULT_TWO_FACTOR_ALLOWED_ATTEMPTS)
 				: null;
-			let status: boolean;
+			if (isSignIn) {
+				await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
+			}
+			const isPendingReplacement =
+				!isSignIn &&
+				twoFactor.verified !== false &&
+				Boolean(twoFactor.pendingSecret) &&
+				Boolean(twoFactor.pendingBackupCodes);
+			let matchedCounter: number | null;
 			try {
 				const decrypted = await symmetricDecrypt({
 					key: ctx.context.secretConfig,
-					data: twoFactor.secret,
+					data: isPendingReplacement
+						? twoFactor.pendingSecret!
+						: twoFactor.secret,
 				});
-				status = await createOTP(decrypted, {
+				matchedCounter = await createOTP(decrypted, {
 					period: opts.period,
 					digits: opts.digits,
-				}).verify(ctx.body.code);
+				}).verifyWithCounter(ctx.body.code);
 			} catch (error) {
 				// A server error before the code is checked must not spend the slot.
 				await attempt?.restore();
 				throw error;
 			}
-			if (!status) {
+			if (matchedCounter === null) {
 				await attempt?.recordFailure();
-				if (isSignIn) {
-					await recordTwoFactorFailure(ctx, twoFactorTable, twoFactor);
-				}
 				return invalid("INVALID_CODE");
 			}
-			if (isSignIn) {
-				await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
+			if (isPendingReplacement) {
+				const pendingSecret = twoFactor.pendingSecret!;
+				const pendingBackupCodes = twoFactor.pendingBackupCodes!;
+				const replaced = await ctx.context.adapter.incrementOne<TwoFactorTable>({
+					model: twoFactorTable,
+					where: [
+						{ field: "id", value: twoFactor.id },
+						{ field: "pendingSecret", value: pendingSecret },
+					],
+					increment: {},
+					set: {
+						secret: pendingSecret,
+						backupCodes: pendingBackupCodes,
+						pendingSecret: null,
+						pendingBackupCodes: null,
+						verified: true,
+						lastUsedTotpCounter: matchedCounter,
+						failedVerificationCount: 0,
+						lockedUntil: null,
+					},
+				});
+				if (!replaced) return invalid("INVALID_CODE");
+				return valid(ctx);
 			}
+			if (
+				!(await consumeTotpCounter(
+					ctx,
+					twoFactorTable,
+					twoFactor,
+					matchedCounter,
+				))
+			) {
+				await attempt?.recordFailure();
+				return invalid("INVALID_CODE");
+			}
+			await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
 
 			// Enrollment mode: TOTP row exists but hasn't been verified yet.
 			// This covers fresh TOTP setup (twoFactorEnabled=false),

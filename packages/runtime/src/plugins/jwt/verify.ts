@@ -4,6 +4,7 @@ import { base64 } from "@clearance/utils/base64";
 import type { JWTPayload } from "jose";
 import { importJWK, jwtVerify } from "jose";
 import { getJwksAdapter } from "./adapter";
+import { DEFAULT_JWKS_GRACE_PERIOD_SECONDS } from "./constant";
 import type { JwtOptions } from "./types";
 
 /**
@@ -42,6 +43,16 @@ export async function verifyJWT<T extends JWTPayload = JWTPayload>(
 		const key = keys.find((k) => k.id === kid);
 		if (!key) {
 			ctx.context.logger.debug(`No JWKS key found for kid: ${kid}`);
+			return null;
+		}
+		const gracePeriodMs =
+			(options?.jwks?.gracePeriod ?? DEFAULT_JWKS_GRACE_PERIOD_SECONDS) *
+			1000;
+		if (
+			key.expiresAt &&
+			key.expiresAt.getTime() + gracePeriodMs <= Date.now()
+		) {
+			ctx.context.logger.debug(`JWKS key is retired: ${kid}`);
 			return null;
 		}
 

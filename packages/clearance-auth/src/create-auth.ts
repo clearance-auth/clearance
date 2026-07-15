@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { clearance, APIError, type ClearanceOptions } from "@clearance/runtime";
 import {
 	createDeliveryKeyring,
@@ -5,7 +6,13 @@ import {
 	migrateDeliverySchema,
 } from "@clearance/delivery";
 import { symmetricDecrypt, symmetricEncrypt } from "@clearance/runtime/crypto";
-import { organization } from "@clearance/runtime/plugins";
+import {
+	haveIBeenPwned,
+	jwt,
+	organization,
+	twoFactor,
+	type Jwk,
+} from "@clearance/runtime/plugins";
 import { getMigrations } from "@clearance/runtime/db/migration";
 import { sso } from "@clearance/sso";
 import { scim } from "@clearance/scim";
@@ -17,6 +24,8 @@ import {
 } from "./secret-policy.js";
 import type {
 	ClearanceAuthBundle,
+	ClearanceAuthenticationSecurityOptions,
+	ClearanceProductAuthRuntime,
 	ClearanceRuntimeMigrationPlan,
 	ClearanceRuntimeMigrationResult,
 	ClearanceRuntimeUser,
@@ -36,6 +45,7 @@ export type {
 	ClearanceRuntimeMigrationResult,
 	ClearanceRuntimeUser,
 	CreateClearanceAuthOptions,
+	ClearanceAuthenticationSecurityOptions,
 	SocialProviderConfig,
 } from "./public-types/index.js";
 
@@ -66,6 +76,282 @@ export function socialProvidersFromEnvironment(
 		};
 	}
 	return providers;
+}
+
+function boundedSecurityInteger(
+	value: number | undefined,
+	fallback: number,
+	input: { label: string; min: number; max: number },
+): number {
+	const resolved = value ?? fallback;
+	if (
+		!Number.isSafeInteger(resolved) ||
+		resolved < input.min ||
+		resolved > input.max
+	) {
+		throw new Error(
+			`${input.label} must be an integer between ${input.min} and ${input.max}`,
+		);
+	}
+	return resolved;
+}
+
+type ResolvedAuthenticationSecurity = {
+	twoFactor: {
+		enabled: boolean;
+		issuer: string;
+		maxFailedAttempts: number;
+		lockoutSeconds: number;
+		trustDeviceMaxAgeSeconds: number;
+	};
+	breachedPassword: {
+		enabled: boolean;
+		customMessage?: string;
+		timeoutMs: number;
+	};
+	asymmetricAccessTokens: {
+		enabled: boolean;
+		issuer: string;
+		audience: string | string[];
+		rotationIntervalSeconds: number;
+		gracePeriodSeconds: number;
+	};
+};
+
+function resolveAuthenticationSecurity(
+	options: CreateClearanceAuthOptions<
+		ClearanceAuthenticationSecurityOptions | undefined
+	>,
+	strict: boolean,
+): ResolvedAuthenticationSecurity {
+	const input = options.authenticationSecurity;
+	const rotationIntervalSeconds = boundedSecurityInteger(
+		input?.asymmetricAccessTokens?.rotationIntervalSeconds,
+		24 * 60 * 60,
+		{
+			label:
+				"authenticationSecurity.asymmetricAccessTokens.rotationIntervalSeconds",
+			min: 300,
+			max: 365 * 24 * 60 * 60,
+		},
+	);
+	const gracePeriodSeconds = boundedSecurityInteger(
+		input?.asymmetricAccessTokens?.gracePeriodSeconds,
+		15 * 60,
+		{
+			label: "authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds",
+			min: 300,
+			max: 24 * 60 * 60,
+		},
+	);
+	return {
+		twoFactor: {
+			enabled: input?.twoFactor?.enabled !== false,
+			issuer: input?.twoFactor?.issuer?.trim() || "Clearance",
+			maxFailedAttempts: boundedSecurityInteger(
+				input?.twoFactor?.maxFailedAttempts,
+				10,
+				{
+					label: "authenticationSecurity.twoFactor.maxFailedAttempts",
+					min: 3,
+					max: 100,
+				},
+			),
+			lockoutSeconds: boundedSecurityInteger(
+				input?.twoFactor?.lockoutSeconds,
+				15 * 60,
+				{
+					label: "authenticationSecurity.twoFactor.lockoutSeconds",
+					min: 30,
+					max: 24 * 60 * 60,
+				},
+			),
+			trustDeviceMaxAgeSeconds: boundedSecurityInteger(
+				input?.twoFactor?.trustDeviceMaxAgeSeconds,
+				30 * 24 * 60 * 60,
+				{
+					label: "authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds",
+					min: 60,
+					max: 365 * 24 * 60 * 60,
+				},
+			),
+		},
+		breachedPassword: {
+			enabled: input?.breachedPassword?.enabled ?? strict,
+			customMessage: input?.breachedPassword?.customMessage,
+			timeoutMs: boundedSecurityInteger(
+				input?.breachedPassword?.timeoutMs,
+				5_000,
+				{
+					label: "authenticationSecurity.breachedPassword.timeoutMs",
+					min: 100,
+					max: 30_000,
+				},
+			),
+		},
+		asymmetricAccessTokens: {
+			enabled: input?.asymmetricAccessTokens?.enabled !== false,
+			issuer: input?.asymmetricAccessTokens?.issuer ?? options.baseURL,
+			audience: input?.asymmetricAccessTokens?.audience ?? options.baseURL,
+			rotationIntervalSeconds,
+			gracePeriodSeconds,
+		},
+	};
+}
+
+function postgresJwksAdapter(pool: pg.Pool) {
+	const selectColumns =
+		`id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv`;
+	return {
+		async getJwks(): Promise<Jwk[]> {
+			const result = await pool.query<Jwk>(
+				`SELECT ${selectColumns} FROM jwks ORDER BY "createdAt" DESC`,
+			);
+			return result.rows;
+		},
+		async createJwk(data: Omit<Jwk, "id">): Promise<Jwk> {
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
+				await client.query(
+					`SELECT pg_advisory_xact_lock(
+						hashtext(current_database()),
+						hashtext(current_schema() || ':clearance:jwks-rotation')
+					)`,
+				);
+				const current = await client.query<Jwk>(
+					`SELECT ${selectColumns} FROM jwks
+					 WHERE ("expiresAt" IS NULL OR "expiresAt" > now())
+					   AND alg = 'EdDSA' AND crv = 'Ed25519'
+					 ORDER BY "createdAt" DESC FOR UPDATE`,
+				);
+				const activeEd25519 = current.rows.find(
+					(row) =>
+						row.alg === "EdDSA" &&
+						isCompatiblePublicJwk(row.publicKey, "EdDSA"),
+				);
+				if (activeEd25519) {
+					await client.query("COMMIT");
+					return activeEd25519;
+				}
+
+				const inserted = await client.query<Jwk>(
+					`INSERT INTO jwks
+					 (id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7)
+					 RETURNING ${selectColumns}`,
+					[
+						randomUUID(),
+						data.publicKey,
+						data.privateKey,
+						data.createdAt,
+						data.expiresAt ?? null,
+						data.alg ?? null,
+						data.crv ?? null,
+					],
+				);
+				await client.query("COMMIT");
+				if (!inserted.rows[0]) {
+					throw new Error("JWT signing key insert returned no row");
+				}
+				return inserted.rows[0];
+			} catch (error) {
+				await client.query("ROLLBACK").catch(() => {});
+				throw error;
+			} finally {
+				client.release();
+			}
+		},
+	};
+}
+
+function inferJwkMetadata(publicKey: string): {
+	alg: NonNullable<Jwk["alg"]>;
+	crv?: NonNullable<Jwk["crv"]>;
+} | null {
+	let key: { alg?: unknown; crv?: unknown; kty?: unknown };
+	try {
+		key = JSON.parse(publicKey) as typeof key;
+	} catch {
+		return null;
+	}
+	if (
+		key.alg === "EdDSA" ||
+		key.alg === "ES256" ||
+		key.alg === "ES512" ||
+		key.alg === "PS256" ||
+		key.alg === "RS256"
+	) {
+		return {
+			alg: key.alg,
+			...(key.crv === "Ed25519" || key.crv === "P-256" || key.crv === "P-521"
+				? { crv: key.crv }
+				: {}),
+		};
+	}
+	if (key.kty === "OKP" && key.crv === "Ed25519") {
+		return { alg: "EdDSA", crv: "Ed25519" };
+	}
+	if (key.kty === "EC" && key.crv === "P-256") {
+		return { alg: "ES256", crv: "P-256" };
+	}
+	if (key.kty === "EC" && key.crv === "P-521") {
+		return { alg: "ES512", crv: "P-521" };
+	}
+	return null;
+}
+
+function isSupportedJwkAlgorithm(
+	value: unknown,
+): value is NonNullable<Jwk["alg"]> {
+	return (
+		value === "EdDSA" ||
+		value === "ES256" ||
+		value === "ES512" ||
+		value === "PS256" ||
+		value === "RS256"
+	);
+}
+
+function isSupportedJwkCurve(
+	value: unknown,
+): value is NonNullable<Jwk["crv"]> {
+	return value === "Ed25519" || value === "P-256" || value === "P-521";
+}
+
+function isCompatiblePublicJwk(
+	publicKey: string,
+	alg: NonNullable<Jwk["alg"]>,
+): boolean {
+	let key: {
+		crv?: unknown;
+		e?: unknown;
+		kty?: unknown;
+		n?: unknown;
+		x?: unknown;
+		y?: unknown;
+	};
+	try {
+		key = JSON.parse(publicKey) as typeof key;
+	} catch {
+		return false;
+	}
+	if (alg === "EdDSA") {
+		return (
+			key.kty === "OKP" &&
+			key.crv === "Ed25519" &&
+			typeof key.x === "string"
+		);
+	}
+	if (alg === "ES256" || alg === "ES512") {
+		return (
+			key.kty === "EC" &&
+			key.crv === (alg === "ES256" ? "P-256" : "P-521") &&
+			typeof key.x === "string" &&
+			typeof key.y === "string"
+		);
+	}
+	return key.kty === "RSA" && typeof key.n === "string" && typeof key.e === "string";
 }
 
 export async function encryptRuntimeCredential(
@@ -114,9 +400,10 @@ function validateDurableDeliveryUrl(
  * Postgres is the data plane via Kysely.
  * Production (NODE_ENV=production) refuses default/weak secrets.
  */
-export function createClearanceAuth(
-	options: CreateClearanceAuthOptions,
-): ClearanceAuthBundle {
+export function createClearanceAuth<
+	const Security extends
+		ClearanceAuthenticationSecurityOptions | undefined = undefined,
+>(options: CreateClearanceAuthOptions<Security>): ClearanceAuthBundle<Security> {
 	const nodeEnv = process.env.NODE_ENV ?? "development";
 	const strict =
 		options.strictSecrets === true ||
@@ -137,8 +424,10 @@ export function createClearanceAuth(
 	if (options.durableDelivery) {
 		validateDurableDeliveryUrl(options.baseURL, "baseURL", strict);
 	}
+	const authenticationSecurity = resolveAuthenticationSecurity(options, strict);
 
 	const pool = new pg.Pool({ connectionString: options.databaseUrl });
+	const jwksAdapter = postgresJwksAdapter(pool);
 	const db = new Kysely({
 		dialect: new PostgresDialect({ pool }),
 	});
@@ -189,6 +478,48 @@ export function createClearanceAuth(
 
 	const plugins = [
 		organization(),
+		...(authenticationSecurity.twoFactor.enabled
+			? [
+					twoFactor({
+						issuer: authenticationSecurity.twoFactor.issuer,
+						backupCodeOptions: { storeBackupCodes: "encrypted" },
+						trustDeviceMaxAge:
+							authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds,
+						accountLockout: {
+							enabled: true,
+							maxFailedAttempts:
+								authenticationSecurity.twoFactor.maxFailedAttempts,
+							durationSeconds:
+								authenticationSecurity.twoFactor.lockoutSeconds,
+						},
+					}),
+				]
+			: []),
+		haveIBeenPwned({
+			enabled: authenticationSecurity.breachedPassword.enabled,
+			customPasswordCompromisedMessage:
+				authenticationSecurity.breachedPassword.customMessage,
+			timeoutMs: authenticationSecurity.breachedPassword.timeoutMs,
+		}),
+		...(authenticationSecurity.asymmetricAccessTokens.enabled
+			? [
+					jwt({
+						adapter: jwksAdapter,
+						jwks: {
+							keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+							rotationInterval:
+								authenticationSecurity.asymmetricAccessTokens.rotationIntervalSeconds,
+							gracePeriod:
+								authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds,
+						},
+						jwt: {
+							issuer: authenticationSecurity.asymmetricAccessTokens.issuer,
+							audience: authenticationSecurity.asymmetricAccessTokens.audience,
+							expirationTime: "5m",
+						},
+					}),
+				]
+			: []),
 		...(options.enableSso !== false
 			? [
 					sso({
@@ -262,6 +593,9 @@ export function createClearanceAuth(
 		emailAndPassword: {
 			enabled: true,
 			minPasswordLength: 12,
+		},
+		account: {
+			encryptOAuthTokens: true,
 		},
 		user: {
 			additionalFields: userAdditionalFields,
@@ -371,20 +705,118 @@ export function createClearanceAuth(
 		}
 	}
 
+	async function ensureAuthenticationSecurityCompatibility(): Promise<void> {
+		if (authenticationSecurity.twoFactor.enabled) {
+			const duplicates = await pool.query<{ userId: string }>(
+				`SELECT "userId" FROM "twoFactor"
+				 GROUP BY "userId" HAVING count(*) > 1 LIMIT 1`,
+			);
+			if (duplicates.rows[0]) {
+				throw new Error(
+					`Cannot enforce one two-factor record per user: duplicate records exist for user ${duplicates.rows[0].userId}`,
+				);
+			}
+			const uniqueUserIndex = await pool.query(
+				`SELECT 1 FROM pg_indexes
+				 WHERE schemaname=current_schema() AND tablename='twoFactor'
+				   AND indexdef ILIKE '%UNIQUE%'
+				   AND indexdef ILIKE '%("userId")%' LIMIT 1`,
+			);
+			if (uniqueUserIndex.rowCount === 0) {
+				await pool.query(
+					`CREATE UNIQUE INDEX "twoFactor_userId_unique"
+					 ON "twoFactor" ("userId")`,
+				);
+			}
+			await pool.query(
+				`UPDATE "twoFactor" SET "failedVerificationCount" = 0
+				 WHERE "failedVerificationCount" IS NULL`,
+			);
+		}
+		if (!authenticationSecurity.asymmetricAccessTokens.enabled) return;
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query(
+				`SELECT pg_advisory_xact_lock(
+					hashtext(current_database()),
+					hashtext(current_schema() || ':clearance:jwks-rotation')
+				)`,
+			);
+			const rows = await client.query<{
+				id: string;
+				publicKey: string;
+				expiresAt: Date | null;
+				alg: string | null;
+				crv: string | null;
+			}>(
+				`SELECT id, "publicKey", "expiresAt", alg, crv FROM jwks FOR UPDATE`,
+			);
+			const now = new Date();
+			const retiredBefore = new Date(
+				now.getTime() -
+					(authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds + 1) *
+						1000,
+			);
+			for (const row of rows.rows) {
+				const inferred = inferJwkMetadata(row.publicKey);
+				const alg =
+					inferred?.alg ??
+					(isSupportedJwkAlgorithm(row.alg) ? row.alg : null);
+				const crv =
+					inferred?.crv ?? (isSupportedJwkCurve(row.crv) ? row.crv : null);
+				const metadataKnown =
+					alg !== null && isCompatiblePublicJwk(row.publicKey, alg);
+				const persistedAlg = metadataKnown ? alg : null;
+				const persistedCrv = metadataKnown ? crv : null;
+				const isEd25519SigningKey =
+					metadataKnown && alg === "EdDSA" && crv === "Ed25519";
+				const retirementCeiling = metadataKnown ? now : retiredBefore;
+				const expiresAt =
+					isEd25519SigningKey && row.expiresAt !== null
+						? row.expiresAt
+						: row.expiresAt !== null && row.expiresAt < retirementCeiling
+							? row.expiresAt
+							: retirementCeiling;
+				if (
+					row.alg !== persistedAlg ||
+					row.crv !== persistedCrv ||
+					row.expiresAt?.getTime() !== expiresAt.getTime()
+				) {
+					await client.query(
+						`UPDATE jwks SET alg=$2, crv=$3, "expiresAt"=$4 WHERE id=$1`,
+						[row.id, persistedAlg, persistedCrv, expiresAt],
+					);
+				}
+			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => {});
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
 	return {
-		auth,
+		auth: auth as unknown as ClearanceProductAuthRuntime<Security>,
 		pool,
 		db,
 		plugins: {
 			organization: true,
 			sso: options.enableSso !== false,
 			scim: options.enableScim !== false,
+			twoFactor: authenticationSecurity.twoFactor.enabled,
+			breachedPassword: authenticationSecurity.breachedPassword.enabled,
+			asymmetricAccessTokens:
+				authenticationSecurity.asymmetricAccessTokens.enabled,
 		},
 		rateLimitEnabled,
 		planMigrations,
 		async migrate() {
 			const plan = await planMigrations();
 			await plan.apply();
+			await ensureAuthenticationSecurityCompatibility();
 			await ensureLifecycleCompatibility();
 			if (options.durableDelivery) {
 				await migrateDeliverySchema(pool, {

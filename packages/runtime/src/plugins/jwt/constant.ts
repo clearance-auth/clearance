@@ -1,0 +1,1 @@
+export const DEFAULT_JWKS_GRACE_PERIOD_SECONDS = 30 * 24 * 60 * 60;

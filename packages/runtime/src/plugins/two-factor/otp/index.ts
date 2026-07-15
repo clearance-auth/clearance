@@ -20,7 +20,7 @@ import type {
 import { defaultKeyHasher } from "../utils";
 import {
 	assertTwoFactorNotLocked,
-	recordTwoFactorFailure,
+	reserveTwoFactorAttempt,
 	resetTwoFactorFailures,
 	verifyTwoFactor,
 } from "../verify-two-factor";
@@ -360,6 +360,9 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 					TWO_FACTOR_ERROR_CODES.TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE,
 				);
 			}
+			if (twoFactor) {
+				await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor);
+			}
 			const [storedValue, inputValue] = await decryptOrHashForComparison(
 				ctx,
 				otp!,
@@ -415,9 +418,6 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 				identifier: `2fa-otp-${key}`,
 				expiresAt: consumed.expiresAt,
 			});
-			if (twoFactor) {
-				await recordTwoFactorFailure(ctx, twoFactorTable, twoFactor);
-			}
 			return invalid("INVALID_CODE");
 		},
 	);

@@ -8,6 +8,8 @@ export const TWO_FACTOR_ERROR_CODES = defineErrorCodes({
 	BACKUP_CODES_NOT_ENABLED: "Backup codes aren't enabled",
 	INVALID_BACKUP_CODE: "Invalid backup code",
 	INVALID_CODE: "Invalid code",
+	TOTP_REPLACEMENT_REQUIRES_CURRENT_CODE:
+		"Replacing an existing TOTP factor requires a current TOTP code",
 	TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE:
 		"Too many attempts. Please request a new code.",
 	ACCOUNT_TEMPORARILY_LOCKED:

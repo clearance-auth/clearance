@@ -40,6 +40,55 @@ describe("have-i-been-pwned", async () => {
 	);
 	const ctx = await auth.$context;
 
+	it("bounds the upstream request timeout", () => {
+		expect(() => haveIBeenPwned({ timeoutMs: 99 })).toThrow(
+			/haveIBeenPwned\.timeoutMs must be an integer between 100 and 30000/,
+		);
+		expect(() => haveIBeenPwned({ timeoutMs: 30_001 })).toThrow(
+			/haveIBeenPwned\.timeoutMs must be an integer between 100 and 30000/,
+		);
+		expect(haveIBeenPwned({ timeoutMs: 1_250 }).options).toMatchObject({
+			timeoutMs: 1_250,
+		});
+	});
+
+	it("fails closed when the upstream request exceeds its timeout", async () => {
+		let observedSignal: AbortSignal | undefined;
+		const realFetch = globalThis.fetch;
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async (input, init) => {
+				const url = input instanceof Request ? input.url : input.toString();
+				if (!url.startsWith("https://api.pwnedpasswords.com/range/")) {
+					return realFetch(input, init);
+				}
+				observedSignal = init?.signal ?? undefined;
+				return await new Promise<Response>((_resolve, reject) => {
+					observedSignal?.addEventListener(
+						"abort",
+						() => reject(observedSignal?.reason),
+						{ once: true },
+					);
+				});
+			});
+		try {
+			const { client: timeoutClient } = await getTestInstance(
+				{ plugins: [haveIBeenPwned({ timeoutMs: 100 })] },
+				{ disableTestUser: true },
+			);
+			const result = await timeoutClient.signUp.email({
+				email: `timeout-${Date.now()}@example.com`,
+				password: `Str0ng!Timeout-${Date.now()}`,
+				name: "Timeout Test",
+			});
+			expect(observedSignal).toBeInstanceOf(AbortSignal);
+			expect(observedSignal?.aborted).toBe(true);
+			expect(result.error?.status).toBe(500);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
 	it("should prevent account creation with compromised password", async () => {
 		const uniqueEmail = `test-${Date.now()}@example.com`;
 		const compromisedPassword = "123456789";

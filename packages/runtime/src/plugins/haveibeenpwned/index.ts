@@ -23,6 +23,7 @@ const ERROR_CODES = defineErrorCodes({
 async function checkPasswordCompromise(
 	password: string,
 	customMessage?: string | undefined,
+	timeoutMs = 5_000,
 ) {
 	if (!password) return;
 
@@ -35,6 +36,7 @@ async function checkPasswordCompromise(
 		const { data, error } = await betterFetch<string>(
 			`https://api.pwnedpasswords.com/range/${prefix}`,
 			{
+				signal: AbortSignal.timeout(timeoutMs),
 				headers: {
 					"Add-Padding": "true",
 					"User-Agent": "Clearance Password Checker",
@@ -83,9 +85,15 @@ export interface HaveIBeenPwnedOptions {
 	 * @default true
 	 */
 	enabled?: boolean | undefined;
+	/** Maximum HIBP request duration in milliseconds. @default 5000 */
+	timeoutMs?: number | undefined;
 }
 
 export const haveIBeenPwned = (options?: HaveIBeenPwnedOptions | undefined) => {
+	const timeoutMs = options?.timeoutMs ?? 5_000;
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) {
+		throw new Error("haveIBeenPwned.timeoutMs must be an integer between 100 and 30000");
+	}
 	const paths = options?.paths || [
 		"/sign-up/email",
 		"/change-password",
@@ -115,6 +123,7 @@ export const haveIBeenPwned = (options?: HaveIBeenPwnedOptions | undefined) => {
 							await checkPasswordCompromise(
 								password,
 								options?.customPasswordCompromisedMessage,
+								timeoutMs,
 							);
 							return originalHash(password);
 						},

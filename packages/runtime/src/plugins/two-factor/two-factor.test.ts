@@ -1776,7 +1776,7 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 		expect(updatedRecord?.verified).toBe(true);
 	});
 
-	it("should preserve verified state during re-enrollment", async () => {
+		it("should stage and verify a replacement without dropping the active factor", async () => {
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
 			secret: DEFAULT_SECRET,
 			plugins: [
@@ -1812,19 +1812,47 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 		headers = convertSetCookieToCookie(verifyEnrollRes.headers);
 		expect(verifyEnrollRes.status).toBe(200);
 
-		// Re-enroll — verified should be preserved
-		await auth.api.enableTwoFactor({
-			body: { password: testUser.password },
-			headers,
-			asResponse: true,
-		});
-		const record2 = await db.findOne<TwoFactorTable>({
+			await db.update({
+				model: "twoFactor",
+				where: [{ field: "id", value: record1!.id }],
+				update: { lastUsedTotpCounter: -1 },
+			});
+			// Re-enrollment requires proof of the active factor and stages the new one.
+			await auth.api.enableTwoFactor({
+				body: { password: testUser.password, currentCode: code },
+				headers,
+			});
+			const record2 = await db.findOne<TwoFactorTable>({
 			model: "twoFactor",
 			where: [{ field: "userId", value: userId }],
-		});
-		expect(record2?.verified).toBe(true);
+			});
+			expect(record2?.verified).toBe(true);
+			expect(record2?.secret).toBe(record1?.secret);
+			expect(record2?.pendingSecret).toBeTruthy();
+			const replacementSecret = await symmetricDecrypt({
+				key: DEFAULT_SECRET,
+				data: record2!.pendingSecret!,
+			});
+			const replacementCode = await createOTP(replacementSecret).totp();
+			const activateReplacement = await auth.api.verifyTOTP({
+				body: { code: replacementCode },
+				headers,
+				asResponse: true,
+			});
+			expect(activateReplacement.status).toBe(200);
+			const activeReplacement = await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: userId }],
+			});
+			expect(activeReplacement?.secret).toBe(record2?.pendingSecret);
+			expect(activeReplacement?.pendingSecret).toBeFalsy();
+			await db.update({
+				model: "twoFactor",
+				where: [{ field: "id", value: record1!.id }],
+				update: { lastUsedTotpCounter: -1 },
+			});
 
-		// Sign in with the new secret should work
+			// Sign in with the new secret should work
 		const signInRes = await auth.api.signInEmail({
 			body: {
 				email: testUser.email,
@@ -1833,13 +1861,8 @@ describe("OTP-only account adding TOTP (issue #8627)", async () => {
 			asResponse: true,
 		});
 		const signInHeaders = convertSetCookieToCookie(signInRes.headers);
-		const decrypted2 = await symmetricDecrypt({
-			key: DEFAULT_SECRET,
-			data: record2!.secret,
-		});
-		const code2 = await createOTP(decrypted2).totp();
-		const verifyRes = await auth.api.verifyTOTP({
-			body: { code: code2 },
+			const verifyRes = await auth.api.verifyTOTP({
+				body: { code: replacementCode },
 			headers: signInHeaders,
 			asResponse: true,
 		});

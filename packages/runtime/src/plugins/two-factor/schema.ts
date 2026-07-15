@@ -24,6 +24,16 @@ export const schema = {
 				required: true,
 				returned: false,
 			},
+			pendingSecret: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
+			pendingBackupCodes: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
 			userId: {
 				type: "string",
 				required: true,
@@ -32,7 +42,7 @@ export const schema = {
 					model: "user",
 					field: "id",
 				},
-				index: true,
+				unique: true,
 			},
 			verified: {
 				type: "boolean",
@@ -52,6 +62,13 @@ export const schema = {
 			lockedUntil: {
 				type: "date",
 				required: false,
+				input: false,
+				returned: false,
+			},
+			lastUsedTotpCounter: {
+				type: "number",
+				required: false,
+				defaultValue: -1,
 				input: false,
 				returned: false,
 			},

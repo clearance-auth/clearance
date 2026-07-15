@@ -70,7 +70,12 @@ async function setup(accountLockout?: TwoFactorOptions["accountLockout"]) {
 			asResponse: true,
 		});
 	}
-	function correctTotp() {
+	async function correctTotp() {
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+			update: { lastUsedTotpCounter: -1 },
+		});
 		return createOTP(secret).totp();
 	}
 	async function failOtpOnce(): Promise<Response> {
@@ -97,6 +102,31 @@ async function setup(accountLockout?: TwoFactorOptions["accountLockout"]) {
 }
 
 describe("two-factor: account-level lockout across challenges", () => {
+	it("atomically locks when concurrent failures reach the threshold", async () => {
+		const { db, userId, startChallenge, verifyTotp, correctTotp } = await setup({
+			maxFailedAttempts: 3,
+		});
+		const challenges = await Promise.all(
+			Array.from({ length: 5 }, () => startChallenge()),
+		);
+
+		const failures = await Promise.all(
+			challenges.map((headers) => verifyTotp(headers, "000000")),
+		);
+		expect(failures.map((response) => response.status).sort()).toEqual([
+			401, 401, 401, 429, 429,
+		]);
+		const row = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+		});
+		expect(row?.failedVerificationCount).toBe(3);
+		expect(row?.lockedUntil).toBeInstanceOf(Date);
+
+		const locked = await verifyTotp(await startChallenge(), await correctTotp());
+		expect(locked.status).toBe(429);
+	});
+
 	it("locks the account after failures accumulate across separate challenges", async () => {
 		const { startChallenge, verifyTotp, correctTotp } = await setup({
 			maxFailedAttempts: 3,

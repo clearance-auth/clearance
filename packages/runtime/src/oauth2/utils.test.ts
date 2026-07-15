@@ -16,6 +16,23 @@ function createMockContext(encryptOAuthTokens: boolean): AuthContext {
 	} as unknown as AuthContext;
 }
 
+function createRotatingMockContext(): AuthContext {
+	const secret = "test-secret-key-for-encryption";
+	return {
+		secret,
+		secretConfig: {
+			keys: new Map([[1, secret]]),
+			currentVersion: 1,
+			legacySecret: secret,
+		},
+		options: {
+			account: {
+				encryptOAuthTokens: true,
+			},
+		},
+	} as unknown as AuthContext;
+}
+
 describe("decryptOAuthToken", () => {
 	it("should return empty token as-is", async () => {
 		const ctx = createMockContext(true);
@@ -43,6 +60,20 @@ describe("decryptOAuthToken", () => {
 		// Decrypt should return original
 		const result = await decryptOAuthToken(encryptedToken, ctx);
 		expect(result).toBe(originalToken);
+	});
+
+	it("decrypts existing versioned symmetric envelopes", async () => {
+		const ctx = createRotatingMockContext();
+		const originalToken = "existing-oauth-token";
+		const encryptedToken = await symmetricEncrypt({
+			key: ctx.secretConfig,
+			data: originalToken,
+		});
+
+		expect(encryptedToken).toMatch(/^\$ba\$1\$/);
+		await expect(decryptOAuthToken(encryptedToken, ctx)).resolves.toBe(
+			originalToken,
+		);
 	});
 
 	it("should handle migration: return unencrypted token as-is when encryption is enabled", async () => {
@@ -76,6 +107,51 @@ describe("decryptOAuthToken", () => {
 
 		const result = await decryptOAuthToken(oddLengthToken, ctx);
 		expect(result).toBe(oddLengthToken);
+	});
+
+	it("returns legacy plaintext that is valid even-length hex unchanged", async () => {
+		const ctx = createRotatingMockContext();
+
+		await expect(decryptOAuthToken("deadbeef", ctx)).resolves.toBe("deadbeef");
+	});
+
+	it("fails closed when a prefixed ciphertext is corrupt", async () => {
+		const ctx = createRotatingMockContext();
+		const encrypted = await setTokenUtil("authenticated-token", ctx);
+		const ciphertext = encrypted as string;
+		const tampered = `${ciphertext.slice(0, -1)}${ciphertext.endsWith("0") ? "1" : "0"}`;
+
+		await expect(decryptOAuthToken(tampered, ctx)).rejects.toThrow();
+	});
+
+	it("fails closed for unsupported OAuth token envelope versions", async () => {
+		const ctx = createRotatingMockContext();
+
+		await expect(
+			decryptOAuthToken(`clr-oauth:v2:${"ab".repeat(40)}`, ctx),
+		).rejects.toThrow("Unsupported OAuth token encryption envelope");
+	});
+
+	it("preserves legacy plaintext that merely begins with the envelope namespace", async () => {
+		const ctx = createRotatingMockContext();
+
+		await expect(decryptOAuthToken("clr-oauth:legacy-provider-token", ctx)).resolves.toBe(
+			"clr-oauth:legacy-provider-token",
+		);
+	});
+
+	it("preserves short legacy plaintext that collides with the v1 namespace", async () => {
+		const ctx = createRotatingMockContext();
+
+		await expect(decryptOAuthToken("clr-oauth:v1:deadbeef", ctx)).resolves.toBe(
+			"clr-oauth:v1:deadbeef",
+		);
+	});
+
+	it("fails closed for ambiguous long bare-hex values", async () => {
+		const ctx = createRotatingMockContext();
+
+		await expect(decryptOAuthToken("ab".repeat(40), ctx)).rejects.toThrow();
 	});
 });
 
@@ -146,10 +222,15 @@ describe("setTokenUtil", () => {
 		const token = "test-token";
 		const result = await setTokenUtil(token, ctx);
 
-		// Result should be hex-encoded encrypted data
 		expect(result).not.toBe(token);
-		expect(result).toMatch(/^[0-9a-f]+$/i);
-		expect((result as string).length % 2).toBe(0);
+		expect(result).toMatch(/^clr-oauth:v1:[0-9a-f]+$/i);
+	});
+
+	it("wraps rotating-key ciphertext in the OAuth token envelope", async () => {
+		const ctx = createRotatingMockContext();
+		const encrypted = await setTokenUtil("test-token", ctx);
+
+		expect(encrypted).toMatch(/^clr-oauth:v1:\$ba\$1\$/);
 	});
 
 	it("should produce tokens that can be decrypted", async () => {

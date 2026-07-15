@@ -252,15 +252,8 @@ export async function assertTwoFactorNotLocked(
 	});
 }
 
-/**
- * Count one failed verification toward the account-level budget, and lock the
- * account once the budget is spent. The increment is atomic, so concurrent
- * failures cannot lose updates. It is unguarded so it still applies to a row
- * whose counter is null or absent (a row created before the migration, or a
- * document-store record predating the column), where a guarded comparison
- * would never match.
- */
-export async function recordTwoFactorFailure(
+/** Reserve one verification attempt before comparing attacker-controlled input. */
+export async function reserveTwoFactorAttempt(
 	ctx: GenericEndpointContext,
 	twoFactorTable: string,
 	twoFactor: TwoFactorTable,
@@ -268,18 +261,72 @@ export async function recordTwoFactorFailure(
 	const { enabled, maxFailedAttempts, durationMs } =
 		resolveAccountLockoutConfig(ctx);
 	if (!enabled) return;
-	const updated = await ctx.context.adapter.incrementOne<TwoFactorTable>({
-		model: twoFactorTable,
-		where: [{ field: "id", value: twoFactor.id }],
-		increment: { failedVerificationCount: 1 },
-	});
-	if ((updated?.failedVerificationCount ?? 0) >= maxFailedAttempts) {
-		await ctx.context.adapter.update({
+	if (twoFactor.failedVerificationCount == null) {
+		await ctx.context.adapter.incrementOne<TwoFactorTable>({
 			model: twoFactorTable,
-			where: [{ field: "id", value: twoFactor.id }],
-			update: { lockedUntil: new Date(Date.now() + durationMs) },
+			where: [
+				{ field: "id", value: twoFactor.id },
+				{ field: "failedVerificationCount", value: null },
+			],
+			increment: {},
+			set: { failedVerificationCount: 0 },
 		});
 	}
+
+	// A racer can move the count between the two guarded branches. Retry until
+	// this request either increments below the threshold or increments and locks
+	// in the same database statement.
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const locked = await ctx.context.adapter.incrementOne<TwoFactorTable>({
+			model: twoFactorTable,
+			where: [
+				{ field: "id", value: twoFactor.id },
+				{ field: "lockedUntil", value: null },
+				{
+					field: "failedVerificationCount",
+					operator: "gte",
+					value: maxFailedAttempts - 1,
+				},
+				{
+					field: "failedVerificationCount",
+					operator: "lt",
+					value: maxFailedAttempts,
+				},
+			],
+			increment: { failedVerificationCount: 1 },
+			set: { lockedUntil: new Date(Date.now() + durationMs) },
+		});
+		if (locked) return;
+
+		const incremented =
+			await ctx.context.adapter.incrementOne<TwoFactorTable>({
+				model: twoFactorTable,
+				where: [
+					{ field: "id", value: twoFactor.id },
+					{ field: "lockedUntil", value: null },
+					{
+						field: "failedVerificationCount",
+						operator: "lt",
+						value: maxFailedAttempts - 1,
+					},
+				],
+				increment: { failedVerificationCount: 1 },
+			});
+		if (incremented) return;
+	}
+	const current = await ctx.context.adapter.findOne<TwoFactorTable>({
+		model: twoFactorTable,
+		where: [{ field: "id", value: twoFactor.id }],
+	});
+	if (!current) {
+		throw APIError.fromStatus("CONFLICT", {
+			message: "Two-factor state changed. Please try again.",
+		});
+	}
+	await assertTwoFactorNotLocked(ctx, twoFactorTable, current);
+	throw APIError.fromStatus("CONFLICT", {
+		message: "Two-factor attempt budget changed. Please try again.",
+	});
 }
 
 /**
@@ -300,4 +347,34 @@ export async function resetTwoFactorFailures(
 		where: [{ field: "id", value: twoFactor.id }],
 		update: { failedVerificationCount: 0, lockedUntil: null },
 	});
+}
+
+export async function consumeTotpCounter(
+	ctx: GenericEndpointContext,
+	twoFactorTable: string,
+	twoFactor: TwoFactorTable,
+	counter: number,
+): Promise<boolean> {
+	if (counter <= (twoFactor.lastUsedTotpCounter ?? -1)) return false;
+	if (twoFactor.lastUsedTotpCounter == null) {
+		await ctx.context.adapter.incrementOne<TwoFactorTable>({
+			model: twoFactorTable,
+			where: [
+				{ field: "id", value: twoFactor.id },
+				{ field: "lastUsedTotpCounter", value: null },
+			],
+			increment: {},
+			set: { lastUsedTotpCounter: -1 },
+		});
+	}
+	const updated = await ctx.context.adapter.incrementOne<TwoFactorTable>({
+		model: twoFactorTable,
+		where: [
+			{ field: "id", value: twoFactor.id },
+			{ field: "lastUsedTotpCounter", operator: "lt", value: counter },
+		],
+		increment: {},
+		set: { lastUsedTotpCounter: counter },
+	});
+	return updated !== null;
 }

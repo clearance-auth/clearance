@@ -19,6 +19,14 @@ export const schema = {
 				type: "date",
 				required: false,
 			},
+			alg: {
+				type: "string",
+				required: false,
+			},
+			crv: {
+				type: "string",
+				required: false,
+			},
 		},
 	},
 } satisfies ClearancePluginDBSchema;
