@@ -54,7 +54,9 @@
 - [x] Version delivery fingerprint keys and prove rotation without losing queued jobs or weakening generation dedupe.
 - [x] Add exact-byte signed webhook delivery with event-bound HMAC, idempotency, DNS pinning, redirect refusal, bounded responses, and explicit loopback-only development HTTP.
 - [x] Ship scoped delivery inspection, readiness, quotas, retry/cancel/replay controls, and exact CLI/API parity.
-- [ ] Add SES transport, observability, and deployment manifests.
+- [ ] Ship encrypted customer-managed webhook endpoint resources, event subscriptions, secret rotation, test delivery, and exact API/CLI lifecycle control.
+- [ ] Add SES transport with readiness and failure classification.
+- [ ] Add delivery observability and deployment manifests.
 
 ### Execution log
 
