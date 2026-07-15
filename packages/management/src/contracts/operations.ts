@@ -71,6 +71,16 @@ import type {
 	testScimConnectionLive,
 	testSsoConnectionLive,
 } from "../services/live-conformance.js";
+import type {
+	DeliveryControlResult,
+	ScopedDeliveryJob,
+	ScopedDeliveryJobPage,
+} from "../services/delivery-control.js";
+import type {
+	DeliveryJobState,
+	DeliveryQuotaStatus,
+	DeliveryReadinessSummary,
+} from "@clearance/delivery";
 
 export type OperationConfirmation =
 	| "none"
@@ -292,6 +302,40 @@ export interface ManagementOperationTypes {
 	"readiness.report": {
 		input: { organizationId: string };
 		output: { report: ReadinessReport };
+	};
+	"delivery.jobs.list": {
+		input: {
+			limit?: number;
+			cursor?: string;
+			states?: DeliveryJobState[];
+			channel?: "email" | "webhook";
+			kind?: string;
+		};
+		output: ScopedDeliveryJobPage;
+	};
+	"delivery.jobs.inspect": {
+		input: { id: string };
+		output: ScopedDeliveryJob;
+	};
+	"delivery.readiness": {
+		input: { staleAfterMs?: number };
+		output: DeliveryReadinessSummary;
+	};
+	"delivery.quotas.get": {
+		input: Record<string, never>;
+		output: DeliveryQuotaStatus;
+	};
+	"delivery.jobs.cancel": {
+		input: { id: string; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlResult;
+	};
+	"delivery.jobs.retry": {
+		input: { id: string; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlResult;
+	};
+	"delivery.jobs.replay": {
+		input: { id: string; maxAttempts?: number; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlResult;
 	};
 	"config.get": {
 		input: { key?: string };
@@ -915,6 +959,65 @@ export const READINESS_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const DELIVERY_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "delivery.jobs.list",
+		cliPath: "delivery list",
+		http: { method: "GET", path: "/v1/delivery/jobs" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "delivery.jobs.inspect",
+		cliPath: "delivery inspect",
+		http: { method: "GET", path: "/v1/delivery/jobs/:id" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	readiness: defineOperation({
+		id: "delivery.readiness",
+		cliPath: "delivery readiness",
+		http: { method: "GET", path: "/v1/delivery/readiness" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	quotas: defineOperation({
+		id: "delivery.quotas.get",
+		cliPath: "delivery quotas",
+		http: { method: "GET", path: "/v1/delivery/quotas" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	cancel: defineOperation({
+		id: "delivery.jobs.cancel",
+		cliPath: "delivery cancel",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/cancel" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	retry: defineOperation({
+		id: "delivery.jobs.retry",
+		cliPath: "delivery retry",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/retry" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	replay: defineOperation({
+		id: "delivery.jobs.replay",
+		cliPath: "delivery replay",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/replay" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const CONFIG_OPERATIONS = Object.freeze({
 	get: defineOperation({
 		id: "config.get",
@@ -1316,6 +1419,7 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(SSO_OPERATIONS),
 	...Object.values(SCIM_OPERATIONS),
 	...Object.values(READINESS_OPERATIONS),
+	...Object.values(DELIVERY_OPERATIONS),
 	...Object.values(CONFIG_OPERATIONS),
 	...Object.values(IMPORT_OPERATIONS),
 	...Object.values(MIGRATION_OPERATIONS),

@@ -18,6 +18,7 @@ import {
 	validateAndSaveCredential,
 } from "./operator-auth.js";
 import { resolveApiSession } from "./api-client.js";
+import { registerDeliveryCommands } from "./delivery-command.js";
 import {
 	commandPath,
 	dispatchRemoteCommand,
@@ -294,6 +295,8 @@ async function main() {
 		)
 		.argument("<id>", "SCIM diagnostic trace id")
 		.action(remoteCommandAction);
+
+	registerDeliveryCommands(program, remoteCommandAction);
 
 	// keys — digest-only project/environment scoped API-key lifecycle
 	const keys = program.command("keys").description("Project and environment API keys");

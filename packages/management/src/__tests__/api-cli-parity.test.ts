@@ -146,6 +146,9 @@ describe("API/CLI canonical management parity", () => {
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SSO_OPERATIONS\.test\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SCIM_OPERATIONS\.replay\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(READINESS_OPERATIONS\.report\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(DELIVERY_OPERATIONS\.list\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(DELIVERY_OPERATIONS\.quotas\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(operation\.http\.path/);
 		expect(api).toMatch(/app\.route\("\/", registerConfigRoutes/);
 		expect(configRoutes).toMatch(/\.patch\(CONFIG_OPERATIONS\.set\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(IMPORT_OPERATIONS\.legacy\.http\.path/);
@@ -166,6 +169,9 @@ describe("API/CLI canonical management parity", () => {
 		expect(remoteDispatchers).toMatch(/case SSO_OPERATIONS\.setupLink\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case SCIM_OPERATIONS\.replay\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case READINESS_OPERATIONS\.check\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.list\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.quotas\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.replay\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case CONFIG_OPERATIONS\.diff\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case IMPORT_OPERATIONS\.legacy\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case MIGRATION_OPERATIONS\.verify\.cliPath/);

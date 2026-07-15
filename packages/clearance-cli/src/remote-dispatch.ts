@@ -3,6 +3,7 @@ import {
 	API_KEY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
+	DELIVERY_OPERATIONS,
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
@@ -25,6 +26,7 @@ import {
 import type { ApiSession } from "./api-client.js";
 import { dispatchAccessCommand } from "./dispatch/access.js";
 import { dispatchCoreCommand } from "./dispatch/core.js";
+import { dispatchDeliveryCommand } from "./dispatch/delivery.js";
 import { dispatchEnterpriseCommand } from "./dispatch/enterprise.js";
 import { dispatchEventCommand } from "./dispatch/events.js";
 import { dispatchMigrationCommand } from "./dispatch/migrations.js";
@@ -107,6 +109,14 @@ export async function dispatchRemoteCommand(
 		case EVENT_OPERATIONS.export.cliPath:
 		case EVENT_OPERATIONS.replay.cliPath:
 			return dispatchEventCommand({ session, path, args, opts, global });
+		case DELIVERY_OPERATIONS.list.cliPath:
+		case DELIVERY_OPERATIONS.inspect.cliPath:
+		case DELIVERY_OPERATIONS.readiness.cliPath:
+		case DELIVERY_OPERATIONS.quotas.cliPath:
+		case DELIVERY_OPERATIONS.cancel.cliPath:
+		case DELIVERY_OPERATIONS.retry.cliPath:
+		case DELIVERY_OPERATIONS.replay.cliPath:
+			return dispatchDeliveryCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
 		case API_KEY_OPERATIONS.rotate.cliPath:

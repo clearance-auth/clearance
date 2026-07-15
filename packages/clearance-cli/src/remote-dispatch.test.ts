@@ -11,6 +11,7 @@ vi.mock("@clearance/management", async (importOriginal) => {
 	const source = await import("../../management/src/contracts/operations.ts");
 	return {
 		...original,
+		DELIVERY_OPERATIONS: source.DELIVERY_OPERATIONS,
 		STORE_V2_OPERATIONS: source.STORE_V2_OPERATIONS,
 		MANAGEMENT_OPERATIONS: source.MANAGEMENT_OPERATIONS,
 	};

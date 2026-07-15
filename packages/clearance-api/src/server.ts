@@ -7,6 +7,7 @@ import {
 	assertProductionSecret,
 	ClearanceError,
 	createManagementStore,
+	deliveryStoreOptionsFromEnvironment,
 	createManagementApplication,
 	createAuthBridgeRuntimeGateway,
 	createScimConnectionReal,
@@ -32,6 +33,7 @@ import {
 } from "@clearance/management";
 import { registerAccessRoutes } from "./routes/access.js";
 import { registerConfigRoutes } from "./routes/config.js";
+import { registerDeliveryRoutes } from "./routes/delivery.js";
 import { registerEnterpriseRoutes } from "./routes/enterprise.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerOperationRoutes } from "./routes/operations.js";
@@ -95,9 +97,11 @@ let managementApplication: ManagementApplication | null = null;
 function getStore(): Promise<ManagementStore> {
 	if (!storePromise) {
 		const url = process.env.DATABASE_URL?.trim();
+		const delivery = url ? deliveryStoreOptionsFromEnvironment() : undefined;
 		storePromise = createManagementStore({
 			dataPath: process.env.CLEARANCE_DATA_PATH,
 			databaseUrl: url || undefined,
+			...(delivery ? { delivery } : {}),
 		});
 	}
 	return storePromise;
@@ -931,6 +935,8 @@ app.route(
 );
 
 app.route("/", registerConfigRoutes({ storeForRequest, scopeForRequest, handleError }));
+
+app.route("/", registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }));
 
 app.route(
 	"/",

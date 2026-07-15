@@ -20,10 +20,13 @@ import {
 	DEFAULT_DELIVERY_QUOTA_POLICY,
 	deliveryQuotaStatus,
 	deliveryReadiness,
+	deliverySchemaName,
+	deliveryTableNames,
 	enqueueDeliveryInExistingTransaction,
 	inspectDeliveryJobScoped,
 	listDeliveryJobs,
 	migrateDeliverySchema,
+	normalizeDeliveryQuotaPolicy,
 	previewDeliveryControl,
 	replayDeliveryInExistingTransaction,
 	retryDeliveryInExistingTransaction,
@@ -64,9 +67,32 @@ import type {
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
 
 export type PgStoreDeliveryOptions = DeliverySchemaOptions & {
-	keyring: DeliveryKeyringInput;
+	keyring: DeliveryKeyringInput | DeliveryKeyring;
 	quota?: DeliveryQuotaPolicy;
 };
+
+function normalizeDeliveryKeyring(
+	value: DeliveryKeyringInput | DeliveryKeyring,
+): DeliveryKeyring {
+	if (
+		value.keys instanceof Map &&
+		value.fingerprintKeys instanceof Map &&
+		Buffer.isBuffer(value.sourceDedupeKey)
+	) {
+		return createDeliveryKeyring({
+			currentKeyId: value.currentKeyId,
+			keys: Object.fromEntries(
+				[...value.keys].map(([keyId, key]) => [keyId, Buffer.from(key)]),
+			),
+			currentFingerprintKeyId: value.currentFingerprintKeyId,
+			fingerprintKeys: Object.fromEntries(
+				[...value.fingerprintKeys].map(([keyId, key]) => [keyId, Buffer.from(key)]),
+			),
+			sourceDedupeKey: Buffer.from(value.sourceDedupeKey),
+		});
+	}
+	return createDeliveryKeyring(value as DeliveryKeyringInput);
+}
 
 function safeTableName(value: string): string {
 	if (!/^[a-z_][a-z0-9_]*$/i.test(value)) {
@@ -107,6 +133,25 @@ export class PgStore implements ManagementStore {
 			delivery?: PgStoreDeliveryOptions;
 		},
 	) {
+		const normalizedDelivery = opts?.delivery
+			? {
+					keyring: normalizeDeliveryKeyring(opts.delivery.keyring),
+					quota: normalizeDeliveryQuotaPolicy(
+						opts.delivery.quota ?? DEFAULT_DELIVERY_QUOTA_POLICY,
+					),
+					options: {
+						...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
+						...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
+						...(opts.delivery.legacyFingerprintKeyId
+							? { legacyFingerprintKeyId: opts.delivery.legacyFingerprintKeyId }
+							: {}),
+					} satisfies DeliverySchemaOptions,
+				}
+			: undefined;
+		if (normalizedDelivery) {
+			deliverySchemaName(normalizedDelivery.options);
+			deliveryTableNames(normalizedDelivery.options);
+		}
 		this.path = resolve(opts?.backupDir ?? process.cwd(), ".clearance", "pg");
 		this.pool = new pg.Pool({ connectionString: databaseUrl });
 		this.table = safeTableName(opts?.tableName ?? SNAPSHOT_TABLE);
@@ -114,16 +159,10 @@ export class PgStore implements ManagementStore {
 		this.emailUniqueTable = safeTableName(`${this.table}_principal_email`);
 		this.slugUniqueTable = safeTableName(`${this.table}_organization_slug`);
 		this.idempotencyTable = safeTableName(`${this.table}_idempotency`);
-		if (opts?.delivery) {
-			this.deliveryKeyring = createDeliveryKeyring(opts.delivery.keyring);
-			this.deliveryQuotaPolicy = opts.delivery.quota ?? DEFAULT_DELIVERY_QUOTA_POLICY;
-			this.deliverySchemaOptions = {
-				...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
-				...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
-				...(opts.delivery.legacyFingerprintKeyId
-					? { legacyFingerprintKeyId: opts.delivery.legacyFingerprintKeyId }
-					: {}),
-			};
+		if (normalizedDelivery) {
+			this.deliveryKeyring = normalizedDelivery.keyring;
+			this.deliveryQuotaPolicy = normalizedDelivery.quota;
+			this.deliverySchemaOptions = normalizedDelivery.options;
 			this.deliveryControl = {
 				list: (input) => listDeliveryJobs(this.pool, input, this.deliverySchemaOptions),
 				inspect: (input) => inspectDeliveryJobScoped(

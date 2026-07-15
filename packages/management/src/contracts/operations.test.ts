@@ -5,6 +5,7 @@ import {
 	API_KEY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
+	DELIVERY_OPERATIONS,
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
@@ -54,7 +55,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(87);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(94);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -64,6 +65,37 @@ describe("management operation contracts", () => {
 		});
 		expect(MEMBER_OPERATIONS.remove.confirmation).toBe("client-required");
 		expect(MEMBER_OPERATIONS.import.confirmation).toBe("server-required");
+	});
+
+	it("defines the complete delivery transport and safety contract", () => {
+		expect(Object.values(DELIVERY_OPERATIONS)).toHaveLength(7);
+		expect(DELIVERY_OPERATIONS.list).toMatchObject({
+			id: "delivery.jobs.list",
+			cliPath: "delivery list",
+			http: { method: "GET", path: "/v1/delivery/jobs" },
+			mutation: false,
+		});
+		expect(DELIVERY_OPERATIONS.inspect.http.path).toBe("/v1/delivery/jobs/:id");
+		expect(DELIVERY_OPERATIONS.readiness.http.path).toBe("/v1/delivery/readiness");
+		expect(DELIVERY_OPERATIONS.quotas).toMatchObject({
+			id: "delivery.quotas.get",
+			cliPath: "delivery quotas",
+			http: { method: "GET", path: "/v1/delivery/quotas" },
+			mutation: false,
+		});
+		for (const action of ["cancel", "retry", "replay"] as const) {
+			expect(DELIVERY_OPERATIONS[action]).toMatchObject({
+				http: {
+					method: "POST",
+					path: `/v1/delivery/jobs/:id/${action}`,
+				},
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
+		expect(resolveOperationPath(DELIVERY_OPERATIONS.replay, { id: "job/a b" }))
+			.toBe("/v1/delivery/jobs/job%2Fa%20b/replay");
 	});
 
 	it("defines the complete operational registry and terminal safety policies", () => {

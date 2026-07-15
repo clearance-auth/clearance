@@ -31,7 +31,7 @@ export type ScopedDeliveryJob = {
 
 export type DeliveryControlResult = {
 	schemaVersion: typeof SCHEMA_VERSION;
-	operation: `delivery.${DeliveryControlAction}`;
+	operation: `delivery.jobs.${DeliveryControlAction}`;
 	storeBackend: "postgres";
 	scope: DeliveryControlScope;
 	jobId: string;
@@ -86,12 +86,16 @@ function translateDeliveryError(error: unknown, stage: string): never {
 		candidate.code.startsWith("DELIVERY_")
 		? candidate.code
 		: "DELIVERY_OPERATION_FAILED";
-	const status = typeof candidate?.httpStatus === "number"
+	const status = typeof candidate?.httpStatus === "number" &&
+		Number.isInteger(candidate.httpStatus) &&
+		candidate.httpStatus >= 400 &&
+		candidate.httpStatus <= 599
 		? candidate.httpStatus
 		: code === "DELIVERY_OPERATION_FAILED" ? 500 : 400;
 	throw new ClearanceError({
 		code,
-		message: typeof candidate?.message === "string"
+		message: code !== "DELIVERY_OPERATION_FAILED" &&
+			typeof candidate?.message === "string"
 			? candidate.message
 			: "Delivery operation failed.",
 		stage,
@@ -113,7 +117,7 @@ export async function listDeliveryJobsForManagement(
 		kind?: string;
 	},
 ): Promise<ScopedDeliveryJobPage> {
-	const stage = "delivery.list";
+	const stage = "delivery.jobs.list";
 	try {
 		const page = await requireDeliveryReader(store, stage).list(input);
 		return {
@@ -130,7 +134,7 @@ export async function inspectDeliveryJobForManagement(
 	store: ManagementStore,
 	input: DeliveryControlScope & { jobId: string },
 ): Promise<ScopedDeliveryJob> {
-	const stage = "delivery.inspect";
+	const stage = "delivery.jobs.inspect";
 	try {
 		const job = await requireDeliveryReader(store, stage).inspect(input);
 		if (!job) throw notFound(stage);
@@ -160,7 +164,7 @@ export async function getDeliveryQuotaForManagement(
 	store: ManagementStore,
 	input: DeliveryControlScope & { now?: Date },
 ): Promise<DeliveryQuotaStatus> {
-	const stage = "delivery.quota";
+	const stage = "delivery.quotas.get";
 	try {
 		return await requireDeliveryReader(store, stage).quota(input);
 	} catch (error) {
@@ -179,7 +183,7 @@ export async function controlDeliveryJob(
 		confirm?: boolean;
 	},
 ): Promise<DeliveryControlResult> {
-	const operation = `delivery.${input.action}` as const;
+	const operation = `delivery.jobs.${input.action}` as const;
 	try {
 		const reader = requireDeliveryReader(store, operation);
 		const preview = await reader.preview(input);

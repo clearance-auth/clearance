@@ -216,6 +216,7 @@ async function verifyDeliverySchema(
 	schema: string,
 	names: DeliveryTableNames,
 	version: 1 | 2 | 3,
+	allowMissingAdditiveIndexes = false,
 ): Promise<void> {
 	const expectedColumns = new Map<string, string[]>([
 		[names.meta, ["key:text:true", "updated_at:timestamp with time zone:true", "value:jsonb:true"]],
@@ -338,16 +339,28 @@ async function verifyDeliverySchema(
 		 WHERE schemaname=$1 AND indexname=ANY($2::text[])`,
 		[
 			schema,
-			[`${names.job}_claim_idx`, `${names.job}_lease_idx`, `${names.attempt}_job_idx`],
+			[
+				`${names.event}_scope_created_idx`,
+				`${names.job}_claim_idx`,
+				`${names.job}_lease_idx`,
+				`${names.attempt}_job_idx`,
+			],
 		],
 	);
 	const indexDefinitions = new Map(indexes.rows.map((row) => [row.indexname, row.indexdef.toUpperCase()]));
 	for (const [indexName, fragment] of [
+		[`${names.event}_scope_created_idx`, "(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT)"],
 		[`${names.job}_claim_idx`, "WHERE (STATE = ANY"],
 		[`${names.job}_lease_idx`, "WHERE (STATE = 'LEASED'"],
 		[`${names.attempt}_job_idx`, "(JOB_ID, ATTEMPT_NUMBER, CREATED_AT)"],
 	] as const) {
-		if (!indexDefinitions.get(indexName)?.includes(fragment)) {
+		const definition = indexDefinitions.get(indexName);
+		if (
+			!definition?.includes(fragment) &&
+			!(allowMissingAdditiveIndexes &&
+				indexName === `${names.event}_scope_created_idx` &&
+				definition === undefined)
+		) {
 			schemaDrift(`Delivery schema is missing or changed index ${indexName}`);
 		}
 	}
@@ -598,7 +611,10 @@ export async function migrateDeliverySchema(
 					"Delivery schema contains assets without Clearance ownership markers",
 				);
 			}
-			await verifyDeliverySchema(client, schema, names, existingVersion);
+			// Performance-only indexes are additive within a schema version. Permit
+			// them to be absent during preflight so schemaStatements can create them;
+			// changed definitions still fail closed, and final verification is strict.
+			await verifyDeliverySchema(client, schema, names, existingVersion, true);
 		}
 		if (existingVersion === 1) {
 			await migrateDeliverySchemaV1ToV2(client, schema, names);
@@ -618,6 +634,12 @@ export async function migrateDeliverySchema(
 		} else {
 			for (const statement of schemaStatements(schema, names)) await client.query(statement);
 		}
+		// This performance-only index is additive within schema v3. Create it for
+		// fresh installs and every supported upgrade path before strict verification.
+		await client.query(
+			`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${names.event}_scope_created_idx`)}
+			 ON ${fq(schema, names.event)} (project_id, environment_id, created_at)`,
+		);
 		await verifyDeliverySchema(client, schema, names, DELIVERY_SCHEMA_VERSION);
 		const meta = fq(schema, names.meta);
 		await client.query(

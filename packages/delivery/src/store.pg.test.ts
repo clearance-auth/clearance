@@ -174,7 +174,15 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 
 	it("rolls enqueue back atomically and stores no plaintext", async () => {
 		await store.migrate();
+		const mainTables = qualifiedDeliveryTables(mainOptions);
+		await pool.query(
+			`DROP INDEX ${quoteIdentifier(mainTables.schema)}.${quoteIdentifier(`${mainTables.names.event}_scope_created_idx`)}`,
+		);
 		expect((await store.migrate()).version).toBe(3);
+		expect((await pool.query<{ indexdef: string }>(
+			`SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname=$2`,
+			[mainTables.schema, `${mainTables.names.event}_scope_created_idx`],
+		)).rows[0]?.indexdef).toContain("(project_id, environment_id, created_at)");
 		const client = await pool.connect();
 		try {
 			await expect(enqueueDelivery(

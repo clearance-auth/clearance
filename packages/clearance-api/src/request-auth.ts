@@ -80,6 +80,7 @@ export function requiredApiKeyScope(method: string, path: string): string | null
 
 export function apiKeyRouteIsOperatorOnly(method: string, path: string): boolean {
 	if (path === "/v1/init") return true;
+	if (path === "/v1/delivery/readiness") return true;
 	if (method === "POST" && path === "/v1/projects") return true;
 	if (method === "POST" && path.startsWith("/v1/environments")) return true;
 	if (method !== "GET" && path.startsWith("/v1/keys")) return true;

@@ -78,7 +78,10 @@ function normalizeScope(input: DeliveryScope): DeliveryScope {
 	};
 }
 
-function normalizePolicy(value: DeliveryQuotaPolicy): DeliveryQuotaPolicy {
+/** Validate and clone a quota policy before any storage work begins. */
+export function normalizeDeliveryQuotaPolicy(
+	value: DeliveryQuotaPolicy,
+): DeliveryQuotaPolicy {
 	return {
 		maxActive: bounded(value.maxActive, "maxActive", 1, 10_000_000),
 		maxBacklog: bounded(value.maxBacklog, "maxBacklog", 1, 10_000_000),
@@ -102,7 +105,7 @@ async function statusWithQuery(
 	options: DeliverySchemaOptions,
 ): Promise<DeliveryQuotaStatus> {
 	const target = normalizeScope(input);
-	const policy = normalizePolicy(input.policy);
+	const policy = normalizeDeliveryQuotaPolicy(input.policy);
 	const now = date(input.now, "now");
 	const windowStartedAt = new Date(now.getTime() - policy.windowMs);
 	const tables = qualifiedDeliveryTables(options);
