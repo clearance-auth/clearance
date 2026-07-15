@@ -157,7 +157,6 @@ export function registerDeliveryRoutes({
 						? { maxAttempts: body.maxAttempts as number }
 						: {}),
 				});
-				if (!result.dryRun) await store.ready();
 				return c.json(result);
 			} catch (error) {
 				return handleError(c, error);

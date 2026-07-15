@@ -106,7 +106,6 @@ function fakeStore(input: {
 		createdAt: timestamp,
 		semanticExpiresAt: job.semanticExpiresAt,
 	}));
-	const ready = vi.fn(async () => undefined);
 	const store = {
 		backend: "postgres",
 		path: "/test/delivery",
@@ -114,7 +113,6 @@ function fakeStore(input: {
 		...(input.configured === false ? {} : {
 			deliveryControl: { list, inspect, preview, readiness, quota },
 		}),
-		ready,
 		mutateCoordinated: vi.fn(async (callback) => callback({
 			data: {},
 			query: vi.fn(),
@@ -123,7 +121,7 @@ function fakeStore(input: {
 	} as unknown as ManagementStore;
 	return {
 		store,
-		calls: { list, inspect, preview, readiness, quota, cancel, retry, replay, ready },
+		calls: { list, inspect, preview, readiness, quota, cancel, retry, replay },
 	};
 }
 
@@ -231,7 +229,6 @@ describe("delivery API routes", () => {
 			jobId: job.id,
 		});
 		expect(calls.cancel).not.toHaveBeenCalled();
-		expect(calls.ready).not.toHaveBeenCalled();
 
 		const confirmed = await app.request(`/v1/delivery/jobs/${job.id}/cancel`, {
 			method: "POST",
@@ -251,7 +248,6 @@ describe("delivery API routes", () => {
 			source: "api",
 			correlationId: "request_delivery_123",
 		}));
-		expect(calls.ready).toHaveBeenCalledOnce();
 	});
 
 	it("fails closed when delivery storage and keys are unconfigured", async () => {

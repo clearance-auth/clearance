@@ -162,7 +162,12 @@ describe("managed API key authentication", () => {
 
 	it("keeps project topology, key lifecycle, and operator configuration operator-only", async () => {
 		const { app } = await import("./server.js");
-		const created = await createKey(["projects:write", "keys:write", "config:write"]);
+		const created = await createKey([
+			"projects:write",
+			"keys:write",
+			"config:write",
+			"delivery:read",
+		]);
 		const attempts = [
 			app.request("/v1/projects", {
 				method: "POST",
@@ -188,6 +193,9 @@ describe("managed API key authentication", () => {
 				method: "POST",
 				headers: keyHeaders(created.secret),
 				body: JSON.stringify({ endpointOverride: "http://169.254.169.254" }),
+			}),
+			app.request("/v1/delivery/readiness", {
+				headers: keyHeaders(created.secret),
 			}),
 		];
 		for (const response of await Promise.all(attempts)) {
