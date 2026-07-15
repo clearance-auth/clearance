@@ -9,7 +9,6 @@ export {
 	createClearanceAuth,
 	CLEARANCE_AUTH_VERSION,
 	RUNTIME_BASELINE,
-	isForbiddenDefaultSecret,
 	encryptRuntimeCredential,
 	decryptRuntimeCredential,
 	socialProvidersFromEnvironment,
@@ -19,6 +18,11 @@ export {
 	type ClearanceRuntimeMigrationResult,
 	type ClearanceRuntimeUser,
 } from "./create-auth.js";
+export {
+	FORBIDDEN_DEFAULT_SECRETS,
+	MINIMUM_SECRET_LENGTH,
+	isForbiddenDefaultSecret,
+} from "./secret-policy.js";
 
 export { toNodeHandler, fromNodeHeaders } from "@clearance/runtime/node";
 

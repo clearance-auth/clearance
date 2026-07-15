@@ -1,31 +1,17 @@
 /**
  * Production secret policy for control plane and auth runtime.
  */
+import {
+	FORBIDDEN_DEFAULT_SECRETS,
+	MINIMUM_SECRET_LENGTH,
+	isForbiddenDefaultSecret,
+} from "@clearance/auth/secret-policy";
 
-/** Known-insecure defaults that production must refuse. */
-export const FORBIDDEN_DEFAULT_SECRETS = [
-	"dev-secret-change-me",
-	"dev-secret-change-me-please-32chars!!",
-	"secret",
-	"local-compose-secret-change-me-32",
-	"test-secret-value-32-characters",
-	"test-secret-value-that-is-long-enough",
-	"test-secret-value-that-is-long-enough-32",
-	"change-me",
-	"password",
-	"clearance",
-	"clearance-secret",
-] as const;
-
-export function isForbiddenDefaultSecret(secret: string | undefined | null): boolean {
-	if (!secret) return true;
-	const s = secret.trim();
-	if (s.length < 16) return true;
-	const lower = s.toLowerCase();
-	return FORBIDDEN_DEFAULT_SECRETS.some(
-		(d) => lower === d.toLowerCase() || lower.includes("change-me") || lower.includes("dev-secret"),
-	);
-}
+export {
+	FORBIDDEN_DEFAULT_SECRETS,
+	MINIMUM_SECRET_LENGTH,
+	isForbiddenDefaultSecret,
+};
 
 export function assertProductionSecret(
 	secret: string | undefined,
@@ -43,7 +29,7 @@ export function assertProductionSecret(
 export function requireOperatorToken(): string {
 	const token =
 		process.env.CLEARANCE_OPERATOR_TOKEN ?? process.env.CLEARANCE_API_TOKEN;
-	if (!token || token.length < 16) {
+	if (!token || token.length < MINIMUM_SECRET_LENGTH) {
 		throw new Error(
 			"CLEARANCE_OPERATOR_TOKEN (or CLEARANCE_API_TOKEN) required (≥16 chars) for management API",
 		);

@@ -7,15 +7,22 @@ const here = dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
 	test: { include: ["src/**/*.test.ts"] },
 	resolve: {
-		alias: {
-			"@clearance/management": resolve(
-				here,
-				"../../packages/management/src/index.ts",
-			),
-			"@clearance/auth": resolve(
-				here,
-				"../../packages/clearance-auth/src/index.ts",
-			),
-		},
+		alias: [
+			{
+				find: "@clearance/auth/secret-policy",
+				replacement: resolve(
+					here,
+					"../../packages/clearance-auth/src/secret-policy.ts",
+				),
+			},
+			{
+				find: "@clearance/management",
+				replacement: resolve(here, "../../packages/management/src/index.ts"),
+			},
+			{
+				find: "@clearance/auth",
+				replacement: resolve(here, "../../packages/clearance-auth/src/index.ts"),
+			},
+		],
 	},
 });

@@ -6,7 +6,7 @@
  * Client headers may only match principal scope (optional consistency check);
  * they may never broaden or select a different scope.
  */
-import type { ManagementStore } from "../store/types.js";
+import type { ManagementSnapshotReader } from "../store/types.js";
 import { ClearanceError } from "./errors.js";
 
 export type ResourceScope = {
@@ -30,7 +30,7 @@ export type ScopedResource = {
  * Rejects when scope cannot be determined — never invents foreign scope.
  */
 export function resolveOperatorScope(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	opts?: Partial<ResourceScope>,
 ): ResourceScope {
 	const projectId =

@@ -2,6 +2,16 @@
  * Shared CLI ↔ API ↔ Console surface registry.
  * Every management surface that reaches GA must appear here with all three contracts.
  */
+import {
+	ENVIRONMENT_OPERATIONS,
+	EVENT_OPERATIONS,
+	MEMBER_OPERATIONS,
+	ORGANIZATION_OPERATIONS,
+	READINESS_OPERATIONS,
+	SESSION_OPERATIONS,
+	SYSTEM_OPERATIONS,
+	USER_OPERATIONS,
+} from "./operations.js";
 export interface ManagementSurface {
 	id: string;
 	cliCommand: string;
@@ -10,126 +20,132 @@ export interface ManagementSurface {
 	consoleRoute: string;
 }
 
+function operationApiPath(operation: {
+	readonly http: { readonly method: string; readonly path: string };
+}): string {
+	return `${operation.http.method} ${operation.http.path}`;
+}
+
 export const MANAGEMENT_SURFACES: ManagementSurface[] = [
 	{
 		id: "overview",
 		cliCommand: "clearance overview --json",
-		apiPath: "GET /v1/overview",
+		apiPath: operationApiPath(SYSTEM_OPERATIONS.overview),
 		consoleRoute: "overview",
 	},
 	{
 		id: "users",
 		cliCommand: "clearance users list --json",
-		apiPath: "GET /v1/users",
+		apiPath: operationApiPath(USER_OPERATIONS.list),
 		consoleRoute: "users",
 	},
 	{
 		id: "users-export",
 		cliCommand: "clearance users export --output <path> --format json --json",
-		apiPath: "POST /v1/users/export",
+		apiPath: operationApiPath(USER_OPERATIONS.export),
 		consoleRoute: "users",
 	},
 	{
 		id: "organizations",
 		cliCommand: "clearance orgs list --json",
-		apiPath: "GET /v1/organizations",
+		apiPath: operationApiPath(ORGANIZATION_OPERATIONS.list),
 		consoleRoute: "organizations",
 	},
 	{
 		id: "organizations-update",
 		cliCommand: "clearance orgs update <id> --name <name> --json",
-		apiPath: "PATCH /v1/organizations/:id",
+		apiPath: operationApiPath(ORGANIZATION_OPERATIONS.update),
 		consoleRoute: "organizations",
 	},
 	{
 		id: "organizations-archive",
 		cliCommand: "clearance orgs archive <id> --yes --json",
-		apiPath: "POST /v1/organizations/:id/archive",
+		apiPath: operationApiPath(ORGANIZATION_OPERATIONS.archive),
 		consoleRoute: "organizations",
 	},
 	{
 		id: "members",
 		cliCommand: "clearance orgs members list --org <id> --json",
-		apiPath: "GET /v1/organizations/:id/members",
+		apiPath: operationApiPath(MEMBER_OPERATIONS.list),
 		consoleRoute: "members",
 	},
 	{
 		id: "members-add",
 		cliCommand: "clearance orgs members add --org <id> --user <id> --role member --json",
-		apiPath: "POST /v1/organizations/:id/members",
+		apiPath: operationApiPath(MEMBER_OPERATIONS.add),
 		consoleRoute: "members",
 	},
 	{
 		id: "members-update",
 		cliCommand:
 			"clearance orgs members update --org <id> --member <id> --role <role> --json",
-		apiPath: "PATCH /v1/organizations/:id/members/:memberId",
+		apiPath: operationApiPath(MEMBER_OPERATIONS.update),
 		consoleRoute: "members",
 	},
 	{
 		id: "members-remove",
 		cliCommand: "clearance orgs members remove --org <id> --member <id> --yes --json",
-		apiPath: "DELETE /v1/organizations/:id/members/:memberId",
+		apiPath: operationApiPath(MEMBER_OPERATIONS.remove),
 		consoleRoute: "members",
 	},
 	{
 		id: "sessions",
 		cliCommand: "clearance sessions list --json",
-		apiPath: "GET /v1/sessions",
+		apiPath: operationApiPath(SESSION_OPERATIONS.list),
 		consoleRoute: "sessions",
 	},
 	{
 		id: "sessions-revoke",
 		cliCommand: "clearance sessions revoke <id> --yes --json",
-		apiPath: "POST /v1/sessions/:id/revoke",
+		apiPath: operationApiPath(SESSION_OPERATIONS.revoke),
 		consoleRoute: "sessions",
 	},
 	{
 		id: "environments",
 		cliCommand: "clearance env list --json",
-		apiPath: "GET /v1/environments",
+		apiPath: operationApiPath(ENVIRONMENT_OPERATIONS.list),
 		consoleRoute: "settings",
 	},
 	{
 		id: "environments-inspect",
 		cliCommand: "clearance env inspect --json",
-		apiPath: "GET /v1/environments/:id",
+		apiPath: operationApiPath(ENVIRONMENT_OPERATIONS.inspect),
 		consoleRoute: "settings",
 	},
 	{
 		id: "environments-promote",
 		cliCommand: "clearance env promote --to <id> --json",
-		apiPath: "POST /v1/environments/promote",
+		apiPath: operationApiPath(ENVIRONMENT_OPERATIONS.promote),
 		consoleRoute: "settings",
 	},
 	{
 		id: "events",
 		cliCommand: "clearance events list --json",
-		apiPath: "GET /v1/events",
+		apiPath: operationApiPath(EVENT_OPERATIONS.list),
 		consoleRoute: "events",
 	},
 	{
 		id: "events-export",
 		cliCommand: "clearance events export --output <path> --format json --json",
-		apiPath: "POST /v1/events/export",
+		apiPath: operationApiPath(EVENT_OPERATIONS.export),
 		consoleRoute: "events",
 	},
 	{
 		id: "events-replay",
 		cliCommand: "clearance events replay <traceId> --json",
-		apiPath: "POST /v1/events/replay",
+		apiPath: operationApiPath(EVENT_OPERATIONS.replay),
 		consoleRoute: "events",
 	},
 	{
 		id: "settings",
 		cliCommand: "clearance doctor --json",
-		apiPath: "GET /v1/doctor",
+		apiPath: operationApiPath(SYSTEM_OPERATIONS.doctor),
 		consoleRoute: "settings",
 	},
 	{
 		id: "readiness",
-		cliCommand: "clearance readiness check --org <id> --json",
-		apiPath: "GET /v1/readiness/:orgId",
+		cliCommand: "clearance readiness report --org <id> --json",
+		apiPath: operationApiPath(READINESS_OPERATIONS.report),
 		consoleRoute: "readiness",
 	},
 ];

@@ -58,7 +58,7 @@ function runSync(
 	try {
 		const stdout = execFileSync(
 			process.execPath,
-			[entry, ...args, "--json", "--no-input", "--data-path", dataPath],
+			[entry, ...args, "--json", "--no-input"],
 			{ encoding: "utf8", env: { ...ENV, ...(apiEnv ?? authenticatedApiEnv(dataPath)) }, cwd, stdio: ["ignore", "pipe", "pipe"] },
 		);
 		return { stdout, stderr: "", status: 0 };
@@ -338,7 +338,7 @@ async function sweepRun(
 		const res = await withSpawnSlot(() =>
 			execFileAsync(
 				process.execPath,
-				[entry, ...args, ...extra, "--json", "--no-input", "--data-path", dataPath],
+				[entry, ...args, ...extra, "--json", "--no-input"],
 				{
 					encoding: "utf8",
 					env: { ...ENV, ...(apiEnv ?? authenticatedApiEnv(dataPath)) },

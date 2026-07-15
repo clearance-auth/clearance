@@ -32,6 +32,8 @@ describe("config service", () => {
 		expect(() => parseConfigJson('{"feature":"one","feature":"two"}')).toThrow(/duplicate/i);
 		expect(thrownCode(() => validateConfig(store, { apiKey: "safe-looking" }))).toBe("CONFIG_SECRET_FORBIDDEN");
 		expect(thrownCode(() => validateConfig(store, { projectId: "missing" }))).toBe("CONFIG_PROJECT_NOT_FOUND");
+		expect(thrownCode(() => validateConfig(store, ["not", "an", "object"]))).toBe("CONFIG_INVALID");
+		expect(thrownCode(() => validateConfig(store, { feature: true }))).toBe("CONFIG_INVALID");
 
 		const result = setConfig(store, "feature", "enabled");
 		expect(result.changed).toBe(true);

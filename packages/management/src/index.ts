@@ -1,6 +1,11 @@
 export * from "./types/resources.js";
+export * from "./application/context.js";
+export * from "./application/auth-runtime-gateway.js";
+export * from "./application/management-application.js";
+export * from "./adapters/auth-bridge-runtime-gateway.js";
 export * from "./store/json-store.js";
 export * from "./store/types.js";
+export * from "./store/unit-of-work.js";
 export * from "./store/pg-store.js";
 export * from "./store/create-store.js";
 export * from "./services/errors.js";
@@ -55,4 +60,5 @@ export * from "./services/backup.js";
 export * from "./services/backup-pg.js";
 export * from "./services/fixtures.js";
 export * from "./contracts/surfaces.js";
+export * from "./contracts/operations.js";
 export * from "./auth-bridge.js";

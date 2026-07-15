@@ -1,5 +1,19 @@
 import type { DataStoreSnapshot } from "../types/resources.js";
 
+/** Read-only view used by domain queries and validation. */
+export interface ManagementSnapshotReader {
+	readonly snapshot: DataStoreSnapshot;
+}
+
+/**
+ * One atomic management-snapshot transaction. Domain services may inspect the
+ * current draft and apply synchronous mutations; persistence is owned by the
+ * adapter that created the unit of work.
+ */
+export interface ManagementUnitOfWork extends ManagementSnapshotReader {
+	mutate(fn: (data: DataStoreSnapshot) => void): DataStoreSnapshot;
+}
+
 /**
  * Management control-plane store.
  * Json backend is for local dev without DATABASE_URL.
@@ -9,11 +23,10 @@ import type { DataStoreSnapshot } from "../types/resources.js";
  * row-locked snapshot with a monotonically increasing revision. Long-lived processes
  * must call refresh() before reads so CLI writes are visible to a running API.
  */
-export interface ManagementStore {
+export interface ManagementStore extends ManagementUnitOfWork {
 	/** Local path used for file-backed stores and backup directory resolution */
 	readonly path: string;
 	readonly backend: "json" | "postgres";
-	get snapshot(): DataStoreSnapshot;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */
@@ -30,7 +43,6 @@ export interface ManagementStore {
 	 * ops rather than last-write-wins full snapshot overwrite.
 	 * Await ready() before relying on snapshot for subsequent reads.
 	 */
-	mutate(fn: (data: DataStoreSnapshot) => void): DataStoreSnapshot;
 	/** Execute against the latest durable draft and resolve only after commit. */
 	mutateDurable<T>(fn: (data: DataStoreSnapshot) => T): Promise<T>;
 	/**

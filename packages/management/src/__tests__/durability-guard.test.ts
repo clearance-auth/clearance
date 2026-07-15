@@ -2,11 +2,9 @@
  * Structural durability guard (FOLLOW.md P2.2.2).
  *
  * PgStore.mutate() is fire-and-forget: a queued write's failure surfaces only
- * at the next ready(). Both operator surfaces follow a convention that makes
- * that safe — the CLI awaits flushStore(store) before printing a mutating
- * command's result, and the API awaits store.ready() before responding — but
- * until this test, forgetting the convention was a silent success-on-failed-
- * write. This guard makes it a red build instead.
+ * at the next ready(). The CLI is transport-only. Application use cases commit
+ * through withManagementUnitOfWork; remaining API-owned workflows must resolve
+ * durability before returning.
  *
  * How it works (static source walk, no DB required):
  *  1. Derive the known-mutating service list from the management package's own
@@ -17,11 +15,9 @@
  *     promise already rejects on write failure, so callers need no extra flush.
  *     New services are covered automatically — nothing here is a hardcoded
  *     service list.
- *  2. Walk packages/clearance-cli/src/index.ts: every `.command(...)` action
- *     that calls a queued-mutating service must `await flushStore(store)`
- *     after its last mutating call and must not printResult() between the
- *     mutating call and that flush.
- *  3. Walk packages/clearance-api/src/server.ts: every route handler that
+ *  2. Assert packages/clearance-cli/src/index.ts has no direct management
+ *     mutations; operational commands dispatch through the API.
+ *  3. Walk packages/clearance-api/src/server.ts and src/routes/*.ts: every route handler that
  *     calls a queued-mutating service must `await store.ready()` after its
  *     last mutating call (durable-only handlers are exempt by construction).
  *
@@ -37,9 +33,11 @@ import { describe, expect, it } from "vitest";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../../..");
 const servicesDir = resolve(here, "../services");
+const applicationDir = resolve(here, "../application");
 const authBridgePath = resolve(here, "../auth-bridge.ts");
 const cliPath = join(repoRoot, "packages/clearance-cli/src/index.ts");
 const apiPath = join(repoRoot, "packages/clearance-api/src/server.ts");
+const apiRoutesDir = join(repoRoot, "packages/clearance-api/src/routes");
 
 type FnInfo = {
 	file: string;
@@ -74,7 +72,7 @@ function exportedFunctionSegments(source: string): Map<string, string> {
 
 function classify(body: string): FnInfo["kind"] {
 	const durable =
-		/\.mutateDurable\b|\.mutateCoordinated\b|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
+		/\.mutateDurable\b|\.mutateCoordinated\b|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
 			body,
 		);
 	const queued = /\bstore\.mutate\(/.test(body);
@@ -88,6 +86,11 @@ function deriveMutatingServices(): Map<string, FnInfo> {
 	const files = readdirSync(servicesDir)
 		.filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
 		.map((f) => join(servicesDir, f));
+	files.push(
+		...readdirSync(applicationDir)
+			.filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+			.map((f) => join(applicationDir, f)),
+	);
 	files.push(authBridgePath);
 	for (const file of files) {
 		const source = readFileSync(file, "utf8");
@@ -106,7 +109,7 @@ function deriveMutatingServices(): Map<string, FnInfo> {
 				if (other.kind !== "queued" && other.kind !== "durable") continue;
 				if (!new RegExp(`\\b${otherName}\\(`).test(info.body)) continue;
 				const escape =
-					/\.mutateDurable\b|\.mutateCoordinated\b|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
+					/\.mutateDurable\b|\.mutateCoordinated\b|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
 						info.body,
 					);
 				const next =
@@ -139,13 +142,13 @@ function cliCommandBlocks(source: string): SurfaceBlock[] {
 	}));
 }
 
-/** API: one block per `app.<verb>(` route registration. */
+/** API: one block per root or feature-router verb registration. */
 function apiRouteBlocks(source: string): SurfaceBlock[] {
-	const re = /^app\.(get|post|patch|put|delete|all)\(\s*\n?\s*"([^"]+)"/gm;
+	const re = /^\s*(?:app|routes)?\.(get|post|patch|put|delete|all)\(\s*\n?\s*([^,\n]+)/gm;
 	const hits: { label: string; index: number }[] = [];
 	let m: RegExpExecArray | null = re.exec(source);
 	while (m) {
-		hits.push({ label: `${(m[1] as string).toUpperCase()} ${m[2]}`, index: m.index });
+		hits.push({ label: `${(m[1] as string).toUpperCase()} ${(m[2] as string).trim()}`, index: m.index });
 		m = re.exec(source);
 	}
 	return hits.map((hit, i) => ({
@@ -183,45 +186,40 @@ describe("durability structural guard (P2.2)", () => {
 		expect(durableNames.length).toBeGreaterThan(5);
 		// Migrated in P2.2: must stay durable, not regress to queued.
 		expect(durableNames).toContain("verifyPostgresBackup");
+		expect(durableNames).toContain("createUserUseCase");
+		expect(durableNames).toContain("updateUserUseCase");
+		expect(durableNames).toContain("disableUserUseCase");
+		expect(durableNames).toContain("deleteUserUseCase");
+		for (const file of ["users.ts", "organizations.ts", "members.ts", "sessions.ts"]) {
+			const source = readFileSync(join(applicationDir, file), "utf8");
+			expect(source).toMatch(/withManagementUnitOfWork/);
+			expect(source).not.toMatch(/store\.ready\(\)/);
+		}
 	});
 
-	it("every mutating CLI command flushes the store before printing its result", () => {
+	it("keeps the API-only CLI free of direct management mutations", () => {
 		const source = readFileSync(cliPath, "utf8");
 		const blocks = cliCommandBlocks(source);
 		expect(blocks.length).toBeGreaterThan(30);
-
-		const failures: string[] = [];
-		let mutatingBlocks = 0;
-		for (const block of blocks) {
-			const calls = queuedCallsIn(block.body, queuedNames);
-			if (calls.length === 0) continue;
-			mutatingBlocks += 1;
-			const last = lastCallIndex(block.body, calls);
-			const flushAt = block.body.indexOf("flushStore(", last);
-			if (flushAt === -1) {
-				failures.push(
-					`CLI command "${block.label}" calls ${calls.join(", ")} but never awaits flushStore afterwards — on Postgres a failed write would print as success`,
-				);
-				continue;
-			}
-			const printedBeforeFlush = block.body
-				.slice(last, flushAt)
-				.includes("printResult(");
-			if (printedBeforeFlush) {
-				failures.push(
-					`CLI command "${block.label}" prints its result before flushStore — flush must come first so write failures fail the command`,
-				);
-			}
-		}
-		// Sanity: the CLI genuinely has many mutating commands; a parsing
-		// regression that found none must fail rather than pass vacuously.
-		expect(mutatingBlocks).toBeGreaterThan(10);
-		expect(failures).toEqual([]);
+		const directCalls = blocks.flatMap((block) => [
+			...queuedCallsIn(block.body, queuedNames),
+			...queuedCallsIn(block.body, durableNames),
+		]);
+		expect(directCalls).toEqual([]);
+		expect(source).toMatch(/dispatchRemoteCommand/);
+		expect(source).not.toMatch(/flushStore|openStore|DATABASE_URL/);
 	});
 
 	it("every mutating API route awaits store.ready() (or is durable-only) before responding", () => {
-		const source = readFileSync(apiPath, "utf8");
-		const blocks = apiRouteBlocks(source);
+		const sources = [
+			{ file: "server.ts", source: readFileSync(apiPath, "utf8") },
+			...readdirSync(apiRoutesDir)
+				.filter((file) => file.endsWith(".ts"))
+				.map((file) => ({ file: `routes/${file}`, source: readFileSync(join(apiRoutesDir, file), "utf8") })),
+		];
+		const blocks = sources.flatMap(({ file, source }) =>
+			apiRouteBlocks(source).map((block) => ({ ...block, label: `${file}: ${block.label}` })),
+		);
 		expect(blocks.length).toBeGreaterThan(20);
 
 		const failures: string[] = [];

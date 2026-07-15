@@ -19,11 +19,15 @@
     "./node": {
       "types": "./types/node.d.ts",
       "default": "./dist/node.mjs"
+    },
+    "./secret-policy": {
+      "types": "./types/secret-policy.d.ts",
+      "default": "./dist/secret-policy.mjs"
     }
   },
   "files": ["dist", "types"],
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && tsc -p tsconfig.types.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

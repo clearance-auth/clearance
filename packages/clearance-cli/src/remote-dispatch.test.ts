@@ -77,6 +77,20 @@ describe("CLI transport parity", () => {
 		for (const [, init] of calls) expect(JSON.parse(String(init.body)).dryRun).toBe(true);
 	});
 
+	it("lets global dry-run override SCIM apply and rejects unsupported SSO test previews", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
+		}));
+		await dispatchRemoteCommand(session, "scim test", ["scim_1"], { apply: true }, { dryRun: true });
+		expect(JSON.parse(String(calls[0]?.[1].body)).dryRun).toBe(true);
+		await expect(
+			dispatchRemoteCommand(session, "sso test", ["sso_1"], { fixture: "ok" }, { dryRun: true }),
+		).rejects.toMatchObject({ code: "CLI_REMOTE_DRY_RUN_UNSUPPORTED" });
+		expect(calls).toHaveLength(1);
+	});
+
 	it("uses server-managed backup storage and rejects host paths", async () => {
 		const fetchMock = vi.fn(async () =>
 			new Response(JSON.stringify({ backup: { id: "bak_1" } }), { status: 201 }),

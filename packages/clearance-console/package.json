@@ -10,7 +10,9 @@
     "start": "node src/server.js",
     "test": "node --test src/server.test.js src/ui.test.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@clearance/auth": "workspace:*"
+  },
   "devDependencies": {
     "happy-dom": "^20.10.6"
   }

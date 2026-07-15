@@ -12,8 +12,15 @@ export default defineConfig({
 	},
 	// Exercise TypeScript sources for workspace packages without a build step
 	resolve: {
-		alias: {
-			"@clearance/auth": resolve(here, "../clearance-auth/src/index.ts"),
-		},
+		alias: [
+			{
+				find: "@clearance/auth/secret-policy",
+				replacement: resolve(here, "../clearance-auth/src/secret-policy.ts"),
+			},
+			{
+				find: "@clearance/auth",
+				replacement: resolve(here, "../clearance-auth/src/index.ts"),
+			},
+		],
 	},
 });

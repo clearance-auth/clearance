@@ -19,7 +19,7 @@ const required = [
 	"deploy/helm/clearance/values.yaml",
 	"deploy/terraform/variables.tf",
 	"packages/clearance-auth/src/create-auth.ts",
-	"packages/management/src/store/json-store.ts",
+	"packages/management/src/store/snapshot.ts",
 	"packages/clearance-api/src/server.ts",
 ];
 

@@ -1,5 +1,9 @@
 import { existsSync } from "node:fs";
-import type { ManagementStore } from "../store/types.js";
+import type {
+	ManagementSnapshotReader,
+	ManagementStore,
+	ManagementUnitOfWork,
+} from "../store/types.js";
 import {
 	CLEARANCE_RELEASE_VERSION,
 	correlationId,
@@ -140,7 +144,7 @@ export function createProject(
 }
 
 function resolveCreateScope(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	input: { projectId?: string; environmentId?: string },
 ): ResourceScope {
 	return resolveOperatorScope(store, {
@@ -674,7 +678,7 @@ export function promoteEnvironment(
 }
 
 export function createUser(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	input: {
 		email: string;
 		name: string;
@@ -684,7 +688,7 @@ export function createUser(
 		environmentId?: string;
 		externalId?: string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "scim";
+		source?: AuditEvent["source"] | "import";
 	},
 ): Principal {
 	const scope = resolveCreateScope(store, input);
@@ -884,7 +888,7 @@ export function parseUserStatusInput(
  * With DATABASE_URL prefer updateUserInAuth for runtime parity.
  */
 export function updateUser(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input: {
 		name?: string;
@@ -892,7 +896,7 @@ export function updateUser(
 		/** Re-enable or set disabled without soft-delete. */
 		status?: "active" | "disabled" | string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "scim" | "system";
+		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
 ): Principal {
@@ -1011,11 +1015,11 @@ export function updateUser(
  * the same audited mutation.
  */
 export function disableUser(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input?: {
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "scim" | "system";
+		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
 ): Principal {
@@ -1088,11 +1092,11 @@ export function disableUser(
  * Cross-scope ids fail closed as NOT_FOUND. Active sessions are revoked atomically.
  */
 export function deleteUser(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input?: {
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "scim" | "system";
+		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
 ): Principal {
@@ -1166,7 +1170,7 @@ export function deleteUser(
 }
 
 export function createOrganization(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	input: {
 		name: string;
 		slug?: string;
@@ -1175,7 +1179,7 @@ export function createOrganization(
 		environmentId?: string;
 		externalId?: string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import";
+		source?: AuditEvent["source"] | "import";
 	},
 ): Organization {
 	const scope = resolveCreateScope(store, input);
@@ -1346,13 +1350,13 @@ const ORG_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * Audits only when at least one field actually changes.
  */
 export function updateOrganization(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input: {
 		name?: string;
 		slug?: string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "system";
+		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
 ): Organization {
@@ -1488,14 +1492,14 @@ export type ArchiveOrganizationResult = {
  * and org inspect remain fail-closed for archived orgs (recovery via audit + row).
  */
 export function archiveOrganization(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input?: {
 		dryRun?: boolean;
 		/** Required for mutation. CLI maps --yes → confirm=true. */
 		confirm?: boolean;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "import" | "system";
+		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
 ): ArchiveOrganizationResult {

@@ -322,348 +322,99 @@ export const drizzleAdapter = (db: DB, config: DrizzleAdapterConfig) => {
 					? fetchInserted(db)
 					: db.transaction(fetchInserted);
 			};
+			function compilePredicate(
+				condition: Where,
+				schemaModel: Record<string, any>,
+				model: string,
+			): SQL<unknown> {
+				const field = getFieldName({ model, field: condition.field });
+				const column = schemaModel[field];
+				if (!column) {
+					throw new ClearanceError(
+						`The field "${condition.field}" does not exist in the schema for the model "${model}". Please update your schema.`,
+					);
+				}
+				const isInsensitive =
+					(condition.mode ?? "sensitive") === "insensitive" &&
+					(typeof condition.value === "string" ||
+						(Array.isArray(condition.value) &&
+							condition.value.every((value) => typeof value === "string")));
+
+				switch (condition.operator) {
+					case "in":
+						if (!Array.isArray(condition.value)) {
+							throw new ClearanceError(
+								`The value for the field "${condition.field}" must be an array when using the "in" operator.`,
+							);
+						}
+						return isInsensitive
+							? insensitiveInArray(column, condition.value as string[])
+							: inArray(column, condition.value);
+					case "not_in":
+						if (!Array.isArray(condition.value)) {
+							throw new ClearanceError(
+								`The value for the field "${condition.field}" must be an array when using the "not_in" operator.`,
+							);
+						}
+						return isInsensitive
+							? insensitiveNotInArray(column, condition.value as string[])
+							: notInArray(column, condition.value);
+					case "contains":
+						return isInsensitive && typeof condition.value === "string"
+							? insensitiveIlike(column, `%${condition.value}%`, config.provider)
+							: like(column, `%${condition.value}%`);
+					case "starts_with":
+						return isInsensitive && typeof condition.value === "string"
+							? insensitiveIlike(column, `${condition.value}%`, config.provider)
+							: like(column, `${condition.value}%`);
+					case "ends_with":
+						return isInsensitive && typeof condition.value === "string"
+							? insensitiveIlike(column, `%${condition.value}`, config.provider)
+							: like(column, `%${condition.value}`);
+					case "lt":
+						return lt(column, condition.value);
+					case "lte":
+						return lte(column, condition.value);
+					case "gt":
+						return gt(column, condition.value);
+					case "gte":
+						return gte(column, condition.value);
+					case "ne":
+						if (condition.value === null) return isNotNull(column);
+						return isInsensitive && typeof condition.value === "string"
+							? insensitiveNe(column, condition.value)
+							: ne(column, condition.value);
+					default:
+						if (condition.value === null) return isNull(column);
+						return isInsensitive && typeof condition.value === "string"
+							? insensitiveEq(column, condition.value)
+							: eq(column, condition.value);
+				}
+			}
+
 			function convertWhereClause(where: Where[], model: string) {
+				if (!where?.length) return [];
 				const schemaModel = getSchema(model);
-				if (!where) return [];
 				if (where.length === 1) {
-					const w = where[0];
-					if (!w) {
-						return [];
-					}
-					const field = getFieldName({ model, field: w.field });
-					if (!schemaModel[field]) {
-						throw new ClearanceError(
-							`The field "${w.field}" does not exist in the schema for the model "${model}". Please update your schema.`,
-						);
-					}
-					const mode = w.mode ?? "sensitive";
-					const isInsensitive =
-						mode === "insensitive" &&
-						(typeof w.value === "string" ||
-							(Array.isArray(w.value) &&
-								w.value.every((v) => typeof v === "string")));
-
-					if (w.operator === "in") {
-						if (!Array.isArray(w.value)) {
-							throw new ClearanceError(
-								`The value for the field "${w.field}" must be an array when using the "in" operator.`,
-							);
-						}
-						if (isInsensitive) {
-							return [
-								insensitiveInArray(schemaModel[field], w.value as string[]),
-							];
-						}
-						return [inArray(schemaModel[field], w.value)];
-					}
-					if (w.operator === "not_in") {
-						if (!Array.isArray(w.value)) {
-							throw new ClearanceError(
-								`The value for the field "${w.field}" must be an array when using the "not_in" operator.`,
-							);
-						}
-						if (isInsensitive) {
-							return [
-								insensitiveNotInArray(schemaModel[field], w.value as string[]),
-							];
-						}
-						return [notInArray(schemaModel[field], w.value)];
-					}
-					if (w.operator === "contains") {
-						if (isInsensitive && typeof w.value === "string") {
-							return [
-								insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}%`,
-									config.provider,
-								),
-							];
-						}
-						return [like(schemaModel[field], `%${w.value}%`)];
-					}
-					if (w.operator === "starts_with") {
-						if (isInsensitive && typeof w.value === "string") {
-							return [
-								insensitiveIlike(
-									schemaModel[field],
-									`${w.value}%`,
-									config.provider,
-								),
-							];
-						}
-						return [like(schemaModel[field], `${w.value}%`)];
-					}
-					if (w.operator === "ends_with") {
-						if (isInsensitive && typeof w.value === "string") {
-							return [
-								insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}`,
-									config.provider,
-								),
-							];
-						}
-						return [like(schemaModel[field], `%${w.value}`)];
-					}
-
-					if (w.operator === "lt") {
-						return [lt(schemaModel[field], w.value)];
-					}
-
-					if (w.operator === "lte") {
-						return [lte(schemaModel[field], w.value)];
-					}
-
-					if (w.operator === "ne") {
-						if (w.value === null) {
-							return [isNotNull(schemaModel[field])];
-						}
-						if (isInsensitive && typeof w.value === "string") {
-							return [insensitiveNe(schemaModel[field], w.value)];
-						}
-						return [ne(schemaModel[field], w.value)];
-					}
-
-					if (w.operator === "gt") {
-						return [gt(schemaModel[field], w.value)];
-					}
-
-					if (w.operator === "gte") {
-						return [gte(schemaModel[field], w.value)];
-					}
-
-					// eq operator
-
-					if (w.value === null) {
-						return [isNull(schemaModel[field])];
-					}
-					if (isInsensitive && typeof w.value === "string") {
-						return [insensitiveEq(schemaModel[field], w.value)];
-					}
-					return [eq(schemaModel[field], w.value)];
+					const condition = where[0];
+					if (!condition) return [];
+					return [compilePredicate(condition, schemaModel, model)];
 				}
-				const andGroup = where.filter(
-					(w) => w.connector === "AND" || !w.connector,
-				);
-				const orGroup = where.filter((w) => w.connector === "OR");
 
-				const andClause = and(
-					...andGroup.map((w) => {
-						const field = getFieldName({ model, field: w.field });
-						const mode = w.mode ?? "sensitive";
-						const isInsensitive =
-							mode === "insensitive" &&
-							(typeof w.value === "string" ||
-								(Array.isArray(w.value) &&
-									w.value.every((v) => typeof v === "string")));
-
-						if (w.operator === "in") {
-							if (!Array.isArray(w.value)) {
-								throw new ClearanceError(
-									`The value for the field "${w.field}" must be an array when using the "in" operator.`,
-								);
-							}
-							if (isInsensitive) {
-								return insensitiveInArray(
-									schemaModel[field],
-									w.value as string[],
-								);
-							}
-							return inArray(schemaModel[field], w.value);
-						}
-						if (w.operator === "not_in") {
-							if (!Array.isArray(w.value)) {
-								throw new ClearanceError(
-									`The value for the field "${w.field}" must be an array when using the "not_in" operator.`,
-								);
-							}
-							if (isInsensitive) {
-								return insensitiveNotInArray(
-									schemaModel[field],
-									w.value as string[],
-								);
-							}
-							return notInArray(schemaModel[field], w.value);
-						}
-						if (w.operator === "contains") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}%`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `%${w.value}%`);
-						}
-						if (w.operator === "starts_with") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`${w.value}%`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `${w.value}%`);
-						}
-						if (w.operator === "ends_with") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `%${w.value}`);
-						}
-						if (w.operator === "lt") {
-							return lt(schemaModel[field], w.value);
-						}
-						if (w.operator === "lte") {
-							return lte(schemaModel[field], w.value);
-						}
-						if (w.operator === "gt") {
-							return gt(schemaModel[field], w.value);
-						}
-						if (w.operator === "gte") {
-							return gte(schemaModel[field], w.value);
-						}
-						if (w.operator === "ne") {
-							if (w.value === null) {
-								return isNotNull(schemaModel[field]);
-							}
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveNe(schemaModel[field], w.value);
-							}
-							return ne(schemaModel[field], w.value);
-						}
-
-						// eq operator
-
-						if (w.value === null) {
-							return isNull(schemaModel[field]);
-						}
-
-						if (isInsensitive && typeof w.value === "string") {
-							return insensitiveEq(schemaModel[field], w.value);
-						}
-
-						return eq(schemaModel[field], w.value);
-					}),
-				);
-				const orClause = or(
-					...orGroup.map((w) => {
-						const field = getFieldName({ model, field: w.field });
-						if (!schemaModel[field]) {
-							throw new ClearanceError(
-								`The field "${w.field}" does not exist in the schema for the model "${model}". Please update your schema.`,
-							);
-						}
-						const mode = w.mode ?? "sensitive";
-						const isInsensitive =
-							mode === "insensitive" &&
-							(typeof w.value === "string" ||
-								(Array.isArray(w.value) &&
-									w.value.every((v) => typeof v === "string")));
-
-						if (w.operator === "in") {
-							if (!Array.isArray(w.value)) {
-								throw new ClearanceError(
-									`The value for the field "${w.field}" must be an array when using the "in" operator.`,
-								);
-							}
-							if (isInsensitive) {
-								return insensitiveInArray(
-									schemaModel[field],
-									w.value as string[],
-								);
-							}
-							return inArray(schemaModel[field], w.value);
-						}
-						if (w.operator === "not_in") {
-							if (!Array.isArray(w.value)) {
-								throw new ClearanceError(
-									`The value for the field "${w.field}" must be an array when using the "not_in" operator.`,
-								);
-							}
-							if (isInsensitive) {
-								return insensitiveNotInArray(
-									schemaModel[field],
-									w.value as string[],
-								);
-							}
-							return notInArray(schemaModel[field], w.value);
-						}
-						if (w.operator === "contains") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}%`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `%${w.value}%`);
-						}
-						if (w.operator === "starts_with") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`${w.value}%`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `${w.value}%`);
-						}
-						if (w.operator === "ends_with") {
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveIlike(
-									schemaModel[field],
-									`%${w.value}`,
-									config.provider,
-								);
-							}
-							return like(schemaModel[field], `%${w.value}`);
-						}
-						if (w.operator === "lt") {
-							return lt(schemaModel[field], w.value);
-						}
-						if (w.operator === "lte") {
-							return lte(schemaModel[field], w.value);
-						}
-						if (w.operator === "gt") {
-							return gt(schemaModel[field], w.value);
-						}
-						if (w.operator === "gte") {
-							return gte(schemaModel[field], w.value);
-						}
-						if (w.operator === "ne") {
-							if (w.value === null) {
-								return isNotNull(schemaModel[field]);
-							}
-							if (isInsensitive && typeof w.value === "string") {
-								return insensitiveNe(schemaModel[field], w.value);
-							}
-							return ne(schemaModel[field], w.value);
-						}
-
-						// eq operator
-
-						if (w.value === null) {
-							return isNull(schemaModel[field]);
-						}
-
-						if (isInsensitive && typeof w.value === "string") {
-							return insensitiveEq(schemaModel[field], w.value);
-						}
-						return eq(schemaModel[field], w.value);
-					}),
-				);
-
-				if (andGroup.length && orGroup.length) {
-					return [and(andClause!, orClause!)!];
+				const andConditions: SQL<unknown>[] = [];
+				const orConditions: SQL<unknown>[] = [];
+				for (const condition of where) {
+					const compiled = compilePredicate(condition, schemaModel, model);
+					if (condition.connector === "OR") orConditions.push(compiled);
+					else andConditions.push(compiled);
 				}
-				if (andGroup.length) return [andClause!];
-				if (orGroup.length) return [orClause!];
-				return [];
+
+				const andClause = and(...andConditions);
+				const orClause = or(...orConditions);
+				const compiled = andClause && orClause
+					? and(andClause, orClause)
+					: andClause ?? orClause;
+				return compiled ? [compiled] : [];
 			}
 			function checkMissingFields(
 				schema: Record<string, any>,
