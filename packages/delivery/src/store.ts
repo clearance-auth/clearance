@@ -43,8 +43,10 @@ type JobRow = {
 	project_id: string;
 	environment_id: string;
 	organization_id: string | null;
+	webhook_endpoint_id: string | null;
 	channel: "email" | "webhook";
 	state: DeliveryJobState;
+	cancel_requested: boolean;
 	attempt_count: number;
 	max_attempts: number;
 	available_at: Date | string;
@@ -111,8 +113,10 @@ function jobRecord(row: JobRow): DeliveryJobRecord {
 		projectId: row.project_id,
 		environmentId: row.environment_id,
 		organizationId: row.organization_id,
+		webhookEndpointId: row.webhook_endpoint_id,
 		channel: row.channel,
 		state: row.state,
+		cancelRequested: row.cancel_requested,
 		attemptCount: Number(row.attempt_count),
 		maxAttempts: Number(row.max_attempts),
 		availableAt: iso(row.available_at)!,
@@ -158,26 +162,49 @@ export class DeliveryStore {
 	}
 
 	/**
-	 * Readiness gate for fingerprint-key rotation. Active destinations require
-	 * their historical key for recipient verification; migrated v1/v2 source
-	 * authorities require theirs until those legacy event rows are retained.
+	 * Worker/readiness gate for every retained delivery key reference: unexpired
+	 * payload encryption, live endpoint config and URL fingerprints, active-job
+	 * destination fingerprints, and legacy source-dedupe aliases.
 	 */
-	async assertFingerprintKeysAvailable(keyring: DeliveryKeyring): Promise<void> {
-		const referenced = await this.pool.query<{ key_id: string }>(
-			`SELECT DISTINCT e.destination_fingerprint_key_id key_id
-			 FROM ${this.tables.event} e JOIN ${this.tables.job} j ON j.event_id=e.id
-			 WHERE j.state IN ('queued','leased','retry')
+	async assertDeliveryKeysAvailable(keyring: DeliveryKeyring, now = new Date()): Promise<void> {
+		validDate(now, "now");
+		const referenced = await this.pool.query<{ key_kind: "encryption" | "fingerprint"; key_id: string }>(
+			`SELECT DISTINCT p.key_id, 'encryption' key_kind
+			 FROM ${this.tables.payload} p WHERE p.expires_at > $1
 			 UNION
-			 SELECT DISTINCT e.source_fingerprint_key_id key_id
-			 FROM ${this.tables.event} e WHERE e.source_dedupe_version=1`,
+			 SELECT DISTINCT e.destination_fingerprint_key_id key_id, 'fingerprint' key_kind
+			 FROM ${this.tables.event} e JOIN ${this.tables.job} j ON j.event_id=e.id
+			 LEFT JOIN ${this.tables.payload} p ON p.event_id=e.id
+			 WHERE j.state IN ('queued','leased','retry')
+			    OR (j.state IN ('delivered','dead','cancelled')
+			        AND p.expires_at > $1 AND e.semantic_expires_at > $1)
+			 UNION
+			 SELECT DISTINCT e.source_fingerprint_key_id key_id, 'fingerprint' key_kind
+			 FROM ${this.tables.event} e WHERE e.source_dedupe_version=1
+			 UNION
+			 SELECT DISTINCT w.config_key_id key_id, 'encryption' key_kind
+			 FROM ${this.tables.webhookEndpoint} w WHERE w.status <> 'deleted'
+			 UNION
+			 SELECT DISTINCT w.url_fingerprint_key_id key_id, 'fingerprint' key_kind
+			 FROM ${this.tables.webhookEndpoint} w WHERE w.status <> 'deleted'`,
+			[now],
 		);
-		const missing = referenced.rows.find((row) => !keyring.fingerprintKeys.has(row.key_id));
+		const missing = referenced.rows.find((row) => row.key_kind === "encryption"
+			? !keyring.keys.has(row.key_id)
+			: !keyring.fingerprintKeys.has(row.key_id));
 		if (missing) {
 			throw new DeliveryError(
-				"DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
-				`Delivery fingerprint key ${missing.key_id} is unavailable`,
+				missing.key_kind === "encryption"
+					? "DELIVERY_KEY_UNAVAILABLE"
+					: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE",
+				"A retained delivery key reference is unavailable",
 			);
 		}
+	}
+
+	/** Backward-compatible worker entry point; now checks encryption and fingerprint keys. */
+	assertFingerprintKeysAvailable(keyring: DeliveryKeyring, now = new Date()): Promise<void> {
+		return this.assertDeliveryKeysAvailable(keyring, now);
 	}
 
 	private async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -223,7 +250,7 @@ export class DeliveryStore {
 					 provider_accepted_at=NULL, provider_status=NULL, provider_request_id=NULL
 				FROM candidate c, ${this.tables.event} e
 				WHERE j.id=c.id AND e.id=j.event_id
-				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id`,
+				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id`,
 				[now, leaseToken, workerId, leaseExpiresAt],
 			);
 			const row = claimed.rows[0];
@@ -419,7 +446,7 @@ export class DeliveryStore {
 		const workerId = validWorkerId(input.workerId);
 		return this.transaction(async (client) => {
 			const locked = await client.query<JobRow & { cancel_requested: boolean }>(
-				`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id
+				`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id
 				 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
 				 WHERE j.id=$1 AND j.state='leased' AND j.lease_token=$2
 				   AND j.lease_owner=$3 AND j.lease_expires_at > $4 FOR UPDATE OF j`,
@@ -477,7 +504,8 @@ export class DeliveryStore {
 				],
 			);
 			return jobRecord({ ...updated.rows[0]!, kind: row.kind, project_id: row.project_id,
-				environment_id: row.environment_id, organization_id: row.organization_id });
+				environment_id: row.environment_id, organization_id: row.organization_id,
+				webhook_endpoint_id: row.webhook_endpoint_id });
 		});
 	}
 
@@ -494,8 +522,9 @@ export class DeliveryStore {
 		);
 		const row = result.rows[0];
 		if (!row) return null;
-		const event = await this.pool.query<Pick<JobRow, "kind" | "project_id" | "environment_id" | "organization_id">>(
-			`SELECT kind, project_id, environment_id, organization_id FROM ${this.tables.event} WHERE id=$1`,
+		const event = await this.pool.query<Pick<JobRow, "kind" | "project_id" | "environment_id" | "organization_id" | "webhook_endpoint_id">>(
+			`SELECT kind, project_id, environment_id, organization_id, webhook_endpoint_id
+			 FROM ${this.tables.event} WHERE id=$1`,
 			[row.event_id],
 		);
 		return jobRecord({ ...row, ...event.rows[0]! });
@@ -739,7 +768,7 @@ export class DeliveryStore {
 
 	async inspectJob(jobId: string) {
 		const result = await this.pool.query<JobRow>(
-			`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id
+			`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id
 			 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
 			 WHERE j.id=$1`,
 			[jobId],

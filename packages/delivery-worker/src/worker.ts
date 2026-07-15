@@ -9,7 +9,7 @@ import { renderEmailPayload, type EmailSender } from "./smtp.js";
 import {
 	classifyWebhookError,
 	createWebhookSender,
-	parseOrganizationUpdatedPayload,
+	webhookDestination,
 	type WebhookSender,
 } from "./webhook.js";
 
@@ -129,6 +129,9 @@ export class DeliveryWorker {
 		if (database) {
 			try {
 				const tables = qualifiedDeliveryTables(this.store.options);
+				const expectedTableNames = Object.values(tables.names).filter(
+					(name) => name !== tables.names.rejectMutationFunction,
+				);
 				const result = await this.pool.query<{ version: unknown; table_count: number; function_count: number }>(
 					`SELECT
 					 (SELECT value FROM ${tables.meta} WHERE key='schema_version') version,
@@ -136,10 +139,11 @@ export class DeliveryWorker {
 					  WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p')) table_count,
 					 (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
 					  WHERE n.nspname=$1 AND p.proname=$3) function_count`,
-					[tables.schema, Object.values(tables.names).filter((name) => name !== tables.names.rejectMutationFunction), tables.names.rejectMutationFunction],
+					[tables.schema, expectedTableNames, tables.names.rejectMutationFunction],
 				);
 				const row = result.rows[0];
-				this.schemaHealthy = Number(row?.version) === DELIVERY_SCHEMA_VERSION && row?.table_count === 6 && row?.function_count === 1;
+				this.schemaHealthy = Number(row?.version) === DELIVERY_SCHEMA_VERSION &&
+					row?.table_count === expectedTableNames.length && row?.function_count === 1;
 			} catch { this.schemaHealthy = false; }
 			if (this.schemaHealthy) {
 				try {
@@ -187,7 +191,7 @@ export class DeliveryWorker {
 				? renderEmailPayload(payload, this.config)
 				: undefined;
 			const destination = email?.to ??
-				parseOrganizationUpdatedPayload(payload).endpoint.url;
+				webhookDestination(payload);
 			await this.store.assertLeasedDestination({
 				jobId: leased.id,
 				leaseToken: leased.leaseToken,

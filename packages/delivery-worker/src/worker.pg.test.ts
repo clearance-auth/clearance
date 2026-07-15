@@ -6,10 +6,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
 	createDeliveryKeyring,
 	createDeliveryTransactionAdapter,
+	createWebhookEndpoint,
 	deliveryTableNames,
 	enqueueDelivery,
+	enqueueWebhookEndpointTestInExistingTransaction,
 	qualifiedDeliveryTables,
 	quoteIdentifier,
+	type DeliveryRawTransaction,
 } from "@clearance/delivery";
 import type { WorkerConfig } from "./config.js";
 import type { EmailSender } from "./smtp.js";
@@ -103,6 +106,18 @@ async function unusedPort(): Promise<number> {
 	return port;
 }
 
+function rawTransaction(client: pg.PoolClient): DeliveryRawTransaction {
+	return {
+		rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+			text: string,
+			values: readonly unknown[] = [],
+		) => {
+			const result = await client.query<Row>(text, [...values]);
+			return { rows: result.rows, rowCount: result.rowCount };
+		},
+	};
+}
+
 describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	const suffix = `${process.pid}_${randomUUID().slice(0, 8).replace(/-/g, "")}_`;
 	const prefix = `delivery_worker_${suffix}`;
@@ -143,7 +158,7 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		await smtp.stop();
 		await webhooks.stop();
 		const names = deliveryTableNames({ prefix });
-		for (const name of [names.attempt, names.job, names.payload, names.event, names.worker, names.meta]) {
+		for (const name of [names.attempt, names.job, names.payload, names.event, names.webhookEndpoint, names.worker, names.meta]) {
 			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`).catch(() => undefined);
 		}
 		await pool.query(`DROP FUNCTION IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(names.rejectMutationFunction)}()`).catch(() => undefined);
@@ -300,6 +315,80 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		await worker.stop();
 	});
 
+	it("delivers an atomically enqueued endpoint test with event-bound signing", async () => {
+		webhooks.status = 204;
+		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });
+		const worker = new DeliveryWorker({
+			...config,
+			workerId: `webhook-test-${suffix}`,
+		}, { pool: workerPool });
+		await worker.initialize();
+		const scope = { projectId: "project-endpoint-test", environmentId: "env-endpoint-test" };
+		const destination = `http://127.0.0.1:${webhooks.port}/endpoint-test`;
+		const created = await createWebhookEndpoint(pool, {
+			...scope,
+			id: "endpoint-test",
+			name: "Endpoint test",
+			url: destination,
+			allowInsecureLoopback: true,
+		}, keyring, { prefix });
+		const client = await pool.connect();
+		let enqueued: Awaited<ReturnType<typeof enqueueWebhookEndpointTestInExistingTransaction>>;
+		try {
+			await client.query("BEGIN");
+			enqueued = await enqueueWebhookEndpointTestInExistingTransaction(
+				rawTransaction(client),
+				{
+					...scope,
+					endpointId: created.endpoint.id,
+					expectedVersion: 1,
+					actorId: "operator-endpoint-test",
+					correlationId: "correlation-endpoint-test",
+				},
+				keyring,
+				{ prefix },
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		expect(enqueued).toMatchObject({
+			endpoint: { id: "endpoint-test", status: "disabled", resourceVersion: 2 },
+			delivery: { kind: "webhook.endpoint.test", state: "queued" },
+		});
+
+		const before = webhooks.requests.length;
+		expect(await worker.processOnce(1)).toBe(1);
+		expect((await worker.store.inspectJob(enqueued!.delivery.jobId))?.state).toBe("delivered");
+		expect(webhooks.requests).toHaveLength(before + 1);
+		const request = webhooks.requests.at(-1)!;
+		const body = JSON.parse(request.body.toString("utf8")) as {
+			event: { id: string; type: string; data: { endpointId: string } };
+		};
+		expect(body.event).toMatchObject({
+			id: enqueued!.delivery.eventId,
+			type: "webhook.endpoint.test",
+			data: { endpointId: "endpoint-test" },
+		});
+		expect(request.body.toString("utf8")).not.toContain(destination);
+		expect(request.body.toString("utf8")).not.toContain(created.signingSecret);
+		const timestamp = String(request.headers["webhook-timestamp"]);
+		const signature = String(request.headers["webhook-signature"]);
+		expect(request.headers["webhook-id"]).toBe(enqueued!.delivery.eventId);
+		expect(request.headers["idempotency-key"]).toBe(enqueued!.delivery.jobId);
+		expect(verifyWebhookSignature(
+			created.signingSecret,
+			enqueued!.delivery.eventId,
+			timestamp,
+			request.body,
+			signature,
+		)).toBe(true);
+		await worker.stop();
+	});
+
 	it("migrates, reports ready, sends through SMTP, records status, and persists/logs no plaintext", async () => {
 		const workerPool = new pg.Pool({ connectionString: DATABASE_URL });
 		const worker = new DeliveryWorker(config, { pool: workerPool, logger: { log(level, event, fields) { logs.push(JSON.stringify({ level, event, fields })); } } });
@@ -391,7 +480,7 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		expect(state.schema).toBe(false);
 		expect(state.ready).toBe(false);
 		await worker.stop();
-		for (const name of [names.attempt, names.payload, names.event, names.worker, names.meta]) {
+		for (const name of [names.attempt, names.payload, names.event, names.webhookEndpoint, names.worker, names.meta]) {
 			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`);
 		}
 		await pool.query(`DROP FUNCTION IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(names.rejectMutationFunction)}()`);
@@ -429,7 +518,13 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		expect(missing.schema).toBe(true);
 		expect(missing.keyring).toBe(false);
 		expect(missing.ready).toBe(false);
-		await worker.store.cancel("job-fingerprint-next");
+		const terminalAt = new Date();
+		await worker.store.cancel("job-fingerprint-next", terminalAt);
+		expect((await worker.readiness()).keyring).toBe(false);
+		expect(await worker.store.eraseTerminalPayloads({
+			terminalBefore: terminalAt,
+			now: terminalAt,
+		})).toBeGreaterThanOrEqual(1);
 		const recovered = await worker.readiness();
 		expect(recovered.keyring).toBe(true);
 		expect(recovered.ready).toBe(true);

@@ -3,11 +3,15 @@ import { describe, expect, it } from "vitest";
 import {
 	createDeliveryKeyring,
 	decryptDeliveryPayload,
+	decryptWebhookEndpointConfig,
 	encryptDeliveryPayload,
+	encryptWebhookEndpointConfig,
 	fingerprintDestination,
 	MAX_DELIVERY_PAYLOAD_BYTES,
 	type DeliveryPayloadAad,
+	type WebhookEndpointConfigAad,
 } from "./keyring.js";
+import { normalizeWebhookEndpointUrl } from "./webhook-endpoints.js";
 import { redactedDeliveryJob, safeErrorClass, safeProviderValue } from "./redaction.js";
 
 function ring() {
@@ -74,6 +78,43 @@ describe("delivery crypto and redaction", () => {
 		})).toThrowError(/not present/);
 	});
 
+	it("purpose-derives endpoint config encryption and binds every identity field", () => {
+		const keyring = ring();
+		const aad: WebhookEndpointConfigAad = {
+			version: 1,
+			endpointId: "endpoint_1",
+			projectId: "project_1",
+			environmentId: "env_1",
+			secretVersion: 1,
+		};
+		const config = { url: "https://hooks.example.test/events", signingSecret: `whsec_${"a".repeat(43)}` };
+		const encrypted = encryptWebhookEndpointConfig(config, aad, keyring);
+		expect(encrypted.envelope.startsWith("clrwe$v1$")).toBe(true);
+		expect(encrypted.envelope).not.toContain(config.url);
+		expect(encrypted.envelope).not.toContain(config.signingSecret);
+		expect(decryptWebhookEndpointConfig(encrypted.envelope, aad, keyring, encrypted.keyId)).toEqual(config);
+		for (const patch of [
+			{ endpointId: "endpoint_2" }, { projectId: "project_2" },
+			{ environmentId: "env_2" }, { secretVersion: 2 },
+		]) {
+			expect(() => decryptWebhookEndpointConfig(encrypted.envelope, { ...aad, ...patch }, keyring))
+				.toThrowError(/authentication failed/);
+		}
+	});
+
+	it("normalizes only HTTPS endpoints unless loopback HTTP is explicitly enabled", () => {
+		expect(normalizeWebhookEndpointUrl("https://EXAMPLE.test:443/hooks?b=2&a=1"))
+			.toBe("https://example.test/hooks?b=2&a=1");
+		expect(() => normalizeWebhookEndpointUrl("http://example.test/hooks")).toThrowError(/invalid/);
+		expect(normalizeWebhookEndpointUrl("http://127.0.0.1:3000/hooks", { allowInsecureLoopback: true }))
+			.toBe("http://127.0.0.1:3000/hooks");
+		for (const unsafe of [
+			"https://user:password@example.test/hooks",
+			"https://example.test/hooks#secret",
+			"https://example.test/\nheader",
+		]) expect(() => normalizeWebhookEndpointUrl(unsafe)).toThrowError(/invalid/);
+	});
+
 	it("rejects cyclic and oversized payloads before encryption", () => {
 		const keyring = ring();
 		const aad: DeliveryPayloadAad = {
@@ -93,6 +134,7 @@ describe("delivery crypto and redaction", () => {
 		const view = redactedDeliveryJob({
 			id: "job_1", eventId: "event_1", kind: "password.reset",
 			projectId: "project_1", environmentId: "env_1", organizationId: null,
+			webhookEndpointId: null,
 			channel: "email", state: "queued", attemptCount: 0, maxAttempts: 8,
 			availableAt: "2030-01-01T00:00:00.000Z", semanticExpiresAt: "2030-01-01T01:00:00.000Z",
 			lastErrorClass: null, createdAt: "2030-01-01T00:00:00.000Z",

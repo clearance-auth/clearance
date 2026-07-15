@@ -1,7 +1,9 @@
 import {
 	createCipheriv,
 	createDecipheriv,
+	createHash,
 	createHmac,
+	hkdfSync,
 	randomBytes,
 	timingSafeEqual,
 } from "node:crypto";
@@ -12,6 +14,8 @@ const IV_BYTES = 12;
 export const MAX_DELIVERY_PAYLOAD_BYTES = 10_485_760;
 const MAX_DELIVERY_CIPHERTEXT_BASE64URL_BYTES = Math.ceil(MAX_DELIVERY_PAYLOAD_BYTES * 4 / 3) + 4;
 const ENVELOPE_PREFIX = "clrd$v1$";
+const WEBHOOK_ENDPOINT_ENVELOPE_PREFIX = "clrwe$v1$";
+const WEBHOOK_ENDPOINT_CONFIG_MAX_BYTES = 16_384;
 const KEY_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
 export type DeliveryKeyring = {
@@ -31,6 +35,19 @@ export type DeliveryPayloadAad = {
 	environmentId: string;
 	destinationFingerprint: string;
 	expiresAt: string;
+};
+
+export type WebhookEndpointConfig = {
+	url: string;
+	signingSecret: string;
+};
+
+export type WebhookEndpointConfigAad = {
+	version: 1;
+	endpointId: string;
+	projectId: string;
+	environmentId: string;
+	secretVersion: number;
 };
 
 type DeliveryEncryptionKeyInput = {
@@ -226,6 +243,117 @@ function aadBytes(aad: DeliveryPayloadAad): Buffer {
 		}),
 		"utf8",
 	);
+}
+
+function webhookEndpointAadBytes(aad: WebhookEndpointConfigAad): Buffer {
+	return Buffer.from(JSON.stringify({
+		purpose: "webhook-endpoint-config",
+		version: aad.version,
+		endpointId: aad.endpointId,
+		projectId: aad.projectId,
+		environmentId: aad.environmentId,
+		secretVersion: aad.secretVersion,
+	}), "utf8");
+}
+
+function webhookEndpointKey(key: Buffer): Buffer {
+	return Buffer.from(hkdfSync(
+		"sha256",
+		key,
+		Buffer.from("clearance-delivery-webhook-endpoint-v1", "utf8"),
+		Buffer.from("aes-256-gcm-config", "utf8"),
+		KEY_BYTES,
+	));
+}
+
+function validWebhookEndpointConfig(value: unknown): value is WebhookEndpointConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return Object.keys(record).length === 2 &&
+		typeof record.url === "string" && record.url.length > 0 && record.url.length <= 8_192 &&
+		typeof record.signingSecret === "string" &&
+		/^whsec_[A-Za-z0-9_-]{40,128}$/.test(record.signingSecret);
+}
+
+export function webhookEndpointSecretFingerprint(secret: string): string {
+	if (!/^whsec_[A-Za-z0-9_-]{40,128}$/.test(secret)) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_SECRET_INVALID", "Webhook endpoint secret is invalid");
+	}
+	return createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+export function encryptWebhookEndpointConfig(
+	config: WebhookEndpointConfig,
+	aad: WebhookEndpointConfigAad,
+	ring: DeliveryKeyring,
+): { envelope: string; keyId: string; envelopeVersion: 1 } {
+	if (!validWebhookEndpointConfig(config)) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_CONFIG_INVALID", "Webhook endpoint configuration is invalid");
+	}
+	const plaintext = JSON.stringify({ url: config.url, signingSecret: config.signingSecret });
+	if (Buffer.byteLength(plaintext, "utf8") > WEBHOOK_ENDPOINT_CONFIG_MAX_BYTES) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_CONFIG_TOO_LARGE", "Webhook endpoint configuration is too large");
+	}
+	const rootKey = ring.keys.get(ring.currentKeyId);
+	if (!rootKey) throw new DeliveryError("DELIVERY_CURRENT_KEY_MISSING", "Current delivery key is unavailable");
+	const iv = randomBytes(IV_BYTES);
+	const cipher = createCipheriv("aes-256-gcm", webhookEndpointKey(rootKey), iv);
+	cipher.setAAD(webhookEndpointAadBytes(aad));
+	const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+	const tag = cipher.getAuthTag();
+	return {
+		envelope: `${WEBHOOK_ENDPOINT_ENVELOPE_PREFIX}${ring.currentKeyId}$${b64url(iv)}$${b64url(tag)}$${b64url(ciphertext)}`,
+		keyId: ring.currentKeyId,
+		envelopeVersion: 1,
+	};
+}
+
+export function decryptWebhookEndpointConfig(
+	envelope: string,
+	aad: WebhookEndpointConfigAad,
+	ring: DeliveryKeyring,
+	expectedKeyId?: string,
+): WebhookEndpointConfig {
+	if (!envelope.startsWith(WEBHOOK_ENDPOINT_ENVELOPE_PREFIX)) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_ENVELOPE_INVALID", "Unknown webhook endpoint envelope");
+	}
+	const parts = envelope.slice(WEBHOOK_ENDPOINT_ENVELOPE_PREFIX.length).split("$");
+	if (parts.length !== 4) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_ENVELOPE_INVALID", "Malformed webhook endpoint envelope");
+	}
+	const [keyId, ivRaw, tagRaw, ciphertextRaw] = parts;
+	if (!keyId || !ivRaw || !tagRaw || ciphertextRaw === undefined ||
+		Buffer.byteLength(ciphertextRaw, "utf8") > Math.ceil(WEBHOOK_ENDPOINT_CONFIG_MAX_BYTES * 4 / 3) + 4) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_ENVELOPE_INVALID", "Malformed webhook endpoint envelope");
+	}
+	if (expectedKeyId !== undefined && keyId !== expectedKeyId) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_ENVELOPE_INVALID", "Webhook endpoint envelope key reference differs");
+	}
+	const rootKey = ring.keys.get(keyId);
+	if (!rootKey) throw new DeliveryError("DELIVERY_KEY_UNAVAILABLE", `Delivery key ${keyId} is unavailable`);
+	const iv = Buffer.from(ivRaw, "base64url");
+	const tag = Buffer.from(tagRaw, "base64url");
+	if (iv.length !== IV_BYTES || tag.length !== 16) {
+		throw new DeliveryError("WEBHOOK_ENDPOINT_ENVELOPE_INVALID", "Malformed webhook endpoint envelope");
+	}
+	try {
+		const decipher = createDecipheriv("aes-256-gcm", webhookEndpointKey(rootKey), iv);
+		decipher.setAAD(webhookEndpointAadBytes(aad));
+		decipher.setAuthTag(tag);
+		const plaintext = Buffer.concat([
+			decipher.update(Buffer.from(ciphertextRaw, "base64url")),
+			decipher.final(),
+		]);
+		if (plaintext.length > WEBHOOK_ENDPOINT_CONFIG_MAX_BYTES) throw new Error("oversized");
+		const parsed: unknown = JSON.parse(plaintext.toString("utf8"));
+		if (!validWebhookEndpointConfig(parsed)) throw new Error("invalid");
+		return parsed;
+	} catch {
+		throw new DeliveryError(
+			"WEBHOOK_ENDPOINT_CONFIG_AUTH_FAILED",
+			"Webhook endpoint configuration authentication failed",
+		);
+	}
 }
 
 export function fingerprintDestination(

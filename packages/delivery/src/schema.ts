@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import type pg from "pg";
 import { DeliveryError } from "./errors.js";
 
-export const DELIVERY_SCHEMA_VERSION = 3 as const;
+export const DELIVERY_SCHEMA_VERSION = 4 as const;
 export const DELIVERY_SCHEMA_OWNER = "clearance.delivery" as const;
-const deliverySchemaAssetMarker = (version: 1 | 2 | 3) => `clearance.delivery:v${version}`;
+const deliverySchemaAssetMarker = (version: 1 | 2 | 3 | 4) => `clearance.delivery:v${version}`;
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
 const IDENTIFIER_MAX = 63;
@@ -20,6 +21,7 @@ export type DeliverySchemaOptions = {
 
 export type DeliveryTableNames = {
 	meta: string;
+	webhookEndpoint: string;
 	event: string;
 	payload: string;
 	job: string;
@@ -45,8 +47,9 @@ export function deliverySchemaName(options: DeliverySchemaOptions = {}): string 
 
 export function deliveryTableNames(options: DeliverySchemaOptions = {}): DeliveryTableNames {
 	const prefix = identifier(options.prefix ?? "delivery_");
-	return {
+	const names = {
 		meta: identifier(`${prefix}meta`),
+		webhookEndpoint: identifier(`${prefix}webhook_endpoint`),
 		event: identifier(`${prefix}event`),
 		payload: identifier(`${prefix}payload`),
 		job: identifier(`${prefix}job`),
@@ -54,14 +57,36 @@ export function deliveryTableNames(options: DeliverySchemaOptions = {}): Deliver
 		worker: identifier(`${prefix}worker`),
 		rejectMutationFunction: identifier(`${prefix}reject_mutation`),
 	};
+	// PostgreSQL silently truncates overlong derived identifiers. Validate every
+	// constraint, index, and trigger name before any connection or DDL work.
+	for (const derived of [
+		`${names.event}_scope_created_idx`,
+		`${names.job}_provider_check`,
+		`${names.job}_claim_idx`,
+		`${names.job}_lease_idx`,
+		`${names.attempt}_job_idx`,
+		`${names.event}_immutable`,
+		`${names.attempt}_immutable`,
+	]) {
+		identifier(derived);
+	}
+	return names;
 }
 
 function fq(schema: string, name: string): string {
 	return `${quoteIdentifier(schema)}.${quoteIdentifier(name)}`;
 }
 
+function deliveryIndexName(base: string, suffix: string): string {
+	const candidate = `${base}_${suffix}`;
+	if (candidate.length <= IDENTIFIER_MAX) return identifier(candidate);
+	const digest = createHash("sha256").update(candidate, "utf8").digest("hex").slice(0, 8);
+	return identifier(`${base.slice(0, IDENTIFIER_MAX - digest.length - 1)}_${digest}`);
+}
+
 function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 	const meta = fq(schema, names.meta);
+	const webhookEndpoint = fq(schema, names.webhookEndpoint);
 	const event = fq(schema, names.event);
 	const payload = fq(schema, names.payload);
 	const job = fq(schema, names.job);
@@ -99,6 +124,45 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			RAISE EXCEPTION 'delivery history rows are immutable' USING ERRCODE = '55000';
 		END
 		$$`,
+		`CREATE TABLE IF NOT EXISTS ${webhookEndpoint} (
+			id text PRIMARY KEY,
+			project_id text NOT NULL,
+			environment_id text NOT NULL,
+			UNIQUE (id, project_id, environment_id),
+			name text NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+			status text NOT NULL CHECK (status IN ('active', 'disabled', 'deleted')),
+			event_kinds text[] NOT NULL,
+			config_envelope_version smallint,
+			config_key_id text,
+			config_envelope text,
+			url_fingerprint_key_id text,
+			url_fingerprint text,
+			secret_fingerprint text CHECK (secret_fingerprint IS NULL OR secret_fingerprint ~ '^[0-9a-f]{64}$'),
+			secret_version integer NOT NULL CHECK (secret_version >= 1),
+			resource_version bigint NOT NULL CHECK (resource_version >= 1),
+			last_test_job_id text,
+			last_test_requested_at timestamptz,
+			created_at timestamptz NOT NULL,
+			updated_at timestamptz NOT NULL,
+			deleted_at timestamptz,
+			CHECK (event_kinds = ARRAY['organization.updated']::text[]),
+			CHECK ((last_test_job_id IS NULL) = (last_test_requested_at IS NULL)),
+			CHECK (
+				(status = 'deleted' AND deleted_at IS NOT NULL
+				 AND config_envelope_version IS NULL AND config_key_id IS NULL AND config_envelope IS NULL
+				 AND url_fingerprint_key_id IS NULL AND url_fingerprint IS NULL)
+				OR
+				(status <> 'deleted' AND deleted_at IS NULL AND config_envelope_version = 1
+				 AND config_key_id ~ '^[A-Za-z0-9._-]{1,64}$' AND config_envelope IS NOT NULL
+				 AND url_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'
+				 AND url_fingerprint ~ '^[0-9a-f]{64}$' AND secret_fingerprint IS NOT NULL)
+			)
+		)`,
+		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.webhookEndpoint, "scope_idx"))}
+		ON ${webhookEndpoint} (project_id, environment_id, created_at DESC, id DESC)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.webhookEndpoint, "url_idx"))}
+		ON ${webhookEndpoint} (project_id, environment_id, url_fingerprint_key_id, url_fingerprint)
+		WHERE status <> 'deleted'`,
 		`CREATE TABLE IF NOT EXISTS ${event} (
 			id text PRIMARY KEY,
 			kind text NOT NULL CHECK (length(kind) BETWEEN 1 AND 128),
@@ -113,10 +177,13 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			correlation_id text,
 			destination_fingerprint text NOT NULL CHECK (destination_fingerprint ~ '^[0-9a-f]{64}$'),
 			destination_fingerprint_key_id text NOT NULL CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
+			webhook_endpoint_id text,
 			replay_of text REFERENCES ${event}(id) ON DELETE RESTRICT,
 			created_at timestamptz NOT NULL,
 			semantic_expires_at timestamptz NOT NULL,
-			CHECK (semantic_expires_at > created_at)
+			CHECK (semantic_expires_at > created_at),
+			FOREIGN KEY (webhook_endpoint_id, project_id, environment_id)
+				REFERENCES ${webhookEndpoint}(id, project_id, environment_id) ON DELETE RESTRICT
 		)`,
 		`CREATE TABLE IF NOT EXISTS ${payload} (
 			event_id text PRIMARY KEY REFERENCES ${event}(id) ON DELETE CASCADE,
@@ -187,9 +254,9 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			started_at timestamptz NOT NULL,
 			last_seen_at timestamptz NOT NULL
 		)`,
-		...([names.meta, names.event, names.payload, names.job, names.attempt, names.worker] as const)
-			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(3)}'`),
-		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(3)}'`,
+		...([names.meta, names.webhookEndpoint, names.event, names.payload, names.job, names.attempt, names.worker] as const)
+			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(4)}'`),
+		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(4)}'`,
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${names.event}_immutable' AND tgrelid = '${event}'::regclass) THEN
 				CREATE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}
@@ -215,11 +282,21 @@ async function verifyDeliverySchema(
 	client: pg.PoolClient,
 	schema: string,
 	names: DeliveryTableNames,
-	version: 1 | 2 | 3,
+	version: 1 | 2 | 3 | 4,
 	allowMissingAdditiveIndexes = false,
 ): Promise<void> {
 	const expectedColumns = new Map<string, string[]>([
 		[names.meta, ["key:text:true", "updated_at:timestamp with time zone:true", "value:jsonb:true"]],
+		...(version >= 4 ? [[names.webhookEndpoint, [
+			"config_envelope:text:false", "config_envelope_version:smallint:false", "config_key_id:text:false",
+			"created_at:timestamp with time zone:true", "deleted_at:timestamp with time zone:false",
+			"environment_id:text:true", "event_kinds:text[]:true", "id:text:true",
+			"last_test_job_id:text:false", "last_test_requested_at:timestamp with time zone:false",
+			"name:text:true", "project_id:text:true", "resource_version:bigint:true",
+			"secret_fingerprint:text:false", "secret_version:integer:true", "status:text:true",
+			"updated_at:timestamp with time zone:true", "url_fingerprint:text:false",
+			"url_fingerprint_key_id:text:false",
+		]] as [string, string[]]] : []),
 		[names.event, [
 			"actor_id:text:false", "correlation_id:text:false", "created_at:timestamp with time zone:true",
 			"destination_fingerprint:text:true", "environment_id:text:true", "id:text:true", "kind:text:true",
@@ -229,6 +306,7 @@ async function verifyDeliverySchema(
 				"destination_fingerprint_key_id:text:true", "source_dedupe_fingerprint:text:true",
 				"source_dedupe_version:smallint:true", "source_fingerprint_key_id:text:true",
 			] : []),
+			...(version >= 4 ? ["webhook_endpoint_id:text:false"] : []),
 		]],
 		[names.payload, [
 			"created_at:timestamp with time zone:true", "envelope:text:true", "envelope_version:smallint:true",
@@ -296,6 +374,27 @@ async function verifyDeliverySchema(
 		.filter((row) => row.table_name === table)
 		.map((row) => row.definition.toUpperCase())
 		.join("\n");
+	if (version >= 4) {
+		const endpointDefinitions = constraints.rows
+			.filter((row) => row.table_name === names.webhookEndpoint)
+			.map((row) => row.definition.replace(/\s+/g, " ").trim().toUpperCase())
+			.sort();
+		const expectedEndpointDefinitions = [
+			"CHECK ((LAST_TEST_JOB_ID IS NULL) = (LAST_TEST_REQUESTED_AT IS NULL))",
+			"CHECK (EVENT_KINDS = ARRAY['ORGANIZATION.UPDATED'::TEXT])",
+			"CHECK (LENGTH(NAME) >= 1 AND LENGTH(NAME) <= 128)",
+			"CHECK (RESOURCE_VERSION >= 1)",
+			"CHECK (SECRET_FINGERPRINT IS NULL OR SECRET_FINGERPRINT ~ '^[0-9A-F]{64}$'::TEXT)",
+			"CHECK (SECRET_VERSION >= 1)",
+			"CHECK (STATUS = 'DELETED'::TEXT AND DELETED_AT IS NOT NULL AND CONFIG_ENVELOPE_VERSION IS NULL AND CONFIG_KEY_ID IS NULL AND CONFIG_ENVELOPE IS NULL AND URL_FINGERPRINT_KEY_ID IS NULL AND URL_FINGERPRINT IS NULL OR STATUS <> 'DELETED'::TEXT AND DELETED_AT IS NULL AND CONFIG_ENVELOPE_VERSION = 1 AND CONFIG_KEY_ID ~ '^[A-ZA-Z0-9._-]{1,64}$'::TEXT AND CONFIG_ENVELOPE IS NOT NULL AND URL_FINGERPRINT_KEY_ID ~ '^[A-ZA-Z0-9._-]{1,64}$'::TEXT AND URL_FINGERPRINT ~ '^[0-9A-F]{64}$'::TEXT AND SECRET_FINGERPRINT IS NOT NULL)",
+			"CHECK (STATUS = ANY (ARRAY['ACTIVE'::TEXT, 'DISABLED'::TEXT, 'DELETED'::TEXT]))",
+			"PRIMARY KEY (ID)",
+			"UNIQUE (ID, PROJECT_ID, ENVIRONMENT_ID)",
+		].sort();
+		if (JSON.stringify(endpointDefinitions) !== JSON.stringify(expectedEndpointDefinitions)) {
+			schemaDrift(`Delivery table ${names.webhookEndpoint} constraints differ from schema v${version}`);
+		}
+	}
 	const requiredConstraintFragments = new Map<string, string[]>([
 		[names.meta, ["PRIMARY KEY (KEY)"]],
 		[names.event, [
@@ -327,10 +426,48 @@ async function verifyDeliverySchema(
 		);
 		requiredConstraintFragments.get(names.job)!.push("DESTINATION_FINGERPRINT_KEY_ID ~");
 	}
+	if (version >= 4) {
+		requiredConstraintFragments.get(names.event)!.push(
+			"FOREIGN KEY (WEBHOOK_ENDPOINT_ID, PROJECT_ID, ENVIRONMENT_ID)",
+		);
+	}
 	for (const [table, fragments] of requiredConstraintFragments) {
 		const actual = definitions(table);
 		for (const fragment of fragments) {
 			if (!actual.includes(fragment)) schemaDrift(`Delivery table ${table} lost required constraint ${fragment}`);
+		}
+	}
+	if (version >= 4) {
+		const provenance = await client.query<{
+			referenced_schema: string;
+			referenced_table: string;
+			delete_action: string;
+			source_columns: string[];
+			target_columns: string[];
+		}>(
+			`SELECT rn.nspname referenced_schema, rc.relname referenced_table,
+			 k.confdeltype delete_action,
+			 ARRAY(SELECT a.attname::text FROM unnest(k.conkey) WITH ORDINALITY ck(attnum,ordinality)
+			       JOIN pg_attribute a ON a.attrelid=k.conrelid AND a.attnum=ck.attnum
+			       ORDER BY ck.ordinality) source_columns,
+			 ARRAY(SELECT a.attname::text FROM unnest(k.confkey) WITH ORDINALITY fk(attnum,ordinality)
+			       JOIN pg_attribute a ON a.attrelid=k.confrelid AND a.attnum=fk.attnum
+			       ORDER BY fk.ordinality) target_columns
+			 FROM pg_constraint k
+			 JOIN pg_class rc ON rc.oid=k.confrelid
+			 JOIN pg_namespace rn ON rn.oid=rc.relnamespace
+			 WHERE k.conrelid=$1::regclass AND k.contype='f'`,
+			[fq(schema, names.event)],
+		);
+		const candidates = provenance.rows.filter((row) => row.source_columns.includes("webhook_endpoint_id"));
+		const expectedSource = ["webhook_endpoint_id", "project_id", "environment_id"];
+		const expectedTarget = ["id", "project_id", "environment_id"];
+		const row = candidates[0];
+		if (candidates.length !== 1 || row?.referenced_schema !== schema ||
+			row.referenced_table !== names.webhookEndpoint || row.delete_action !== "r" ||
+			JSON.stringify(row.source_columns) !== JSON.stringify(expectedSource) ||
+			JSON.stringify(row.target_columns) !== JSON.stringify(expectedTarget)) {
+			schemaDrift("Delivery event webhook endpoint provenance foreign key differs from schema v4");
 		}
 	}
 
@@ -341,6 +478,10 @@ async function verifyDeliverySchema(
 			schema,
 			[
 				`${names.event}_scope_created_idx`,
+				...(version >= 4 ? [
+					deliveryIndexName(names.webhookEndpoint, "scope_idx"),
+					deliveryIndexName(names.webhookEndpoint, "url_idx"),
+				] : []),
 				`${names.job}_claim_idx`,
 				`${names.job}_lease_idx`,
 				`${names.attempt}_job_idx`,
@@ -348,15 +489,25 @@ async function verifyDeliverySchema(
 		],
 	);
 	const indexDefinitions = new Map(indexes.rows.map((row) => [row.indexname, row.indexdef.toUpperCase()]));
-	for (const [indexName, fragment] of [
-		[`${names.event}_scope_created_idx`, "(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT)"],
-		[`${names.job}_claim_idx`, "WHERE (STATE = ANY"],
-		[`${names.job}_lease_idx`, "WHERE (STATE = 'LEASED'"],
-		[`${names.attempt}_job_idx`, "(JOB_ID, ATTEMPT_NUMBER, CREATED_AT)"],
+	for (const [indexName, fragments] of [
+		[`${names.event}_scope_created_idx`, ["(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT)"]],
+		...(version >= 4 ? [
+			[deliveryIndexName(names.webhookEndpoint, "scope_idx"), [
+				"(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT DESC, ID DESC)",
+			]],
+			[deliveryIndexName(names.webhookEndpoint, "url_idx"), [
+				"CREATE UNIQUE INDEX",
+				"(PROJECT_ID, ENVIRONMENT_ID, URL_FINGERPRINT_KEY_ID, URL_FINGERPRINT)",
+				"WHERE (STATUS <> 'DELETED'::TEXT)",
+			]],
+		] as const : []),
+		[`${names.job}_claim_idx`, ["WHERE (STATE = ANY"]],
+		[`${names.job}_lease_idx`, ["WHERE (STATE = 'LEASED'"]],
+		[`${names.attempt}_job_idx`, ["(JOB_ID, ATTEMPT_NUMBER, CREATED_AT)"]],
 	] as const) {
 		const definition = indexDefinitions.get(indexName);
 		if (
-			!definition?.includes(fragment) &&
+			(!definition || fragments.some((fragment) => !definition.includes(fragment))) &&
 			!(allowMissingAdditiveIndexes &&
 				indexName === `${names.event}_scope_created_idx` &&
 				definition === undefined)
@@ -524,13 +675,78 @@ async function migrateDeliverySchemaV2ToV3(
 	);
 }
 
+async function migrateDeliverySchemaV3ToV4(
+	client: pg.PoolClient,
+	schema: string,
+	names: DeliveryTableNames,
+): Promise<void> {
+	const endpoint = fq(schema, names.webhookEndpoint);
+	const event = fq(schema, names.event);
+	await client.query(`CREATE TABLE ${endpoint} (
+		id text PRIMARY KEY,
+		project_id text NOT NULL,
+		environment_id text NOT NULL,
+		UNIQUE (id, project_id, environment_id),
+		name text NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+		status text NOT NULL CHECK (status IN ('active', 'disabled', 'deleted')),
+		event_kinds text[] NOT NULL CHECK (event_kinds = ARRAY['organization.updated']::text[]),
+		config_envelope_version smallint,
+		config_key_id text,
+		config_envelope text,
+		url_fingerprint_key_id text,
+		url_fingerprint text,
+		secret_fingerprint text CHECK (secret_fingerprint IS NULL OR secret_fingerprint ~ '^[0-9a-f]{64}$'),
+		secret_version integer NOT NULL CHECK (secret_version >= 1),
+		resource_version bigint NOT NULL CHECK (resource_version >= 1),
+		last_test_job_id text,
+		last_test_requested_at timestamptz,
+		created_at timestamptz NOT NULL,
+		updated_at timestamptz NOT NULL,
+		deleted_at timestamptz,
+		CHECK ((last_test_job_id IS NULL) = (last_test_requested_at IS NULL)),
+		CHECK (
+			(status = 'deleted' AND deleted_at IS NOT NULL
+			 AND config_envelope_version IS NULL AND config_key_id IS NULL AND config_envelope IS NULL
+			 AND url_fingerprint_key_id IS NULL AND url_fingerprint IS NULL)
+			OR
+			(status <> 'deleted' AND deleted_at IS NULL AND config_envelope_version = 1
+			 AND config_key_id ~ '^[A-Za-z0-9._-]{1,64}$' AND config_envelope IS NOT NULL
+			 AND url_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'
+			 AND url_fingerprint ~ '^[0-9a-f]{64}$' AND secret_fingerprint IS NOT NULL)
+		)
+	)`);
+	await client.query(`ALTER TABLE ${event}
+		ADD COLUMN webhook_endpoint_id text,
+		ADD FOREIGN KEY (webhook_endpoint_id, project_id, environment_id)
+			REFERENCES ${endpoint}(id, project_id, environment_id) ON DELETE RESTRICT`);
+	await client.query(
+		`CREATE INDEX ${quoteIdentifier(deliveryIndexName(names.webhookEndpoint, "scope_idx"))}
+		 ON ${endpoint} (project_id, environment_id, created_at DESC, id DESC)`,
+	);
+	await client.query(
+		`CREATE UNIQUE INDEX ${quoteIdentifier(deliveryIndexName(names.webhookEndpoint, "url_idx"))}
+		 ON ${endpoint} (project_id, environment_id, url_fingerprint_key_id, url_fingerprint)
+		 WHERE status <> 'deleted'`,
+	);
+	for (const name of [
+		names.meta, names.webhookEndpoint, names.event, names.payload,
+		names.job, names.attempt, names.worker,
+	]) {
+		await client.query(`COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(4)}'`);
+	}
+	await client.query(
+		`COMMENT ON FUNCTION ${fq(schema, names.rejectMutationFunction)}() IS '${deliverySchemaAssetMarker(4)}'`,
+	);
+}
+
 export async function migrateDeliverySchema(
 	pool: pg.Pool,
 	options: DeliverySchemaOptions = {},
 ): Promise<{ schema: string; version: number; tables: DeliveryTableNames }> {
 	const schema = deliverySchemaName(options);
 	const names = deliveryTableNames(options);
-	const targets = [names.meta, names.event, names.payload, names.job, names.attempt, names.worker];
+	const legacyTargets = [names.meta, names.event, names.payload, names.job, names.attempt, names.worker];
+	const targets = [names.meta, names.webhookEndpoint, names.event, names.payload, names.job, names.attempt, names.worker];
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN");
@@ -563,7 +779,7 @@ export async function migrateDeliverySchema(
 				"Refusing to adopt unowned delivery tables or functions",
 			);
 		}
-		let existingVersion: 1 | 2 | 3 | null = null;
+		let existingVersion: 1 | 2 | 3 | 4 | null = null;
 		if (metaExists) {
 			const metadata = await client.query<{ key: string; value: unknown }>(
 				`SELECT key, value FROM ${fq(schema, names.meta)} WHERE key IN ('owner', 'schema_version')`,
@@ -582,8 +798,9 @@ export async function migrateDeliverySchema(
 					`Delivery schema version ${version} is newer than supported version ${DELIVERY_SCHEMA_VERSION}`,
 				);
 			}
-			existingVersion = version as 1 | 2 | 3;
-			if (existing.rows.length !== targets.length || !functionExisting.rowCount) {
+			existingVersion = version as 1 | 2 | 3 | 4;
+			const versionTargets = existingVersion >= 4 ? targets : legacyTargets;
+			if (existing.rows.length !== versionTargets.length || !functionExisting.rowCount) {
 				throw new DeliveryError(
 					"DELIVERY_SCHEMA_COLLISION",
 					"Owned delivery schema is missing required tables or functions",
@@ -593,7 +810,7 @@ export async function migrateDeliverySchema(
 				`SELECT c.relname, obj_description(c.oid, 'pg_class') marker
 				 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 				 WHERE n.nspname=$1 AND c.relname=ANY($2::text[])`,
-				[schema, targets],
+				[schema, versionTargets],
 			);
 			const functionOwnership = await client.query<{ marker: string | null }>(
 				`SELECT obj_description(p.oid, 'pg_proc') marker
@@ -616,25 +833,25 @@ export async function migrateDeliverySchema(
 			// changed definitions still fail closed, and final verification is strict.
 			await verifyDeliverySchema(client, schema, names, existingVersion, true);
 		}
-		if (existingVersion === 1) {
-			await migrateDeliverySchemaV1ToV2(client, schema, names);
-			await migrateDeliverySchemaV2ToV3(
-				client,
-				schema,
-				names,
-				options.legacyFingerprintKeyId,
-			);
-		} else if (existingVersion === 2) {
-			await migrateDeliverySchemaV2ToV3(
-				client,
-				schema,
-				names,
-				options.legacyFingerprintKeyId,
-			);
-		} else {
+		if (existingVersion === null) {
 			for (const statement of schemaStatements(schema, names)) await client.query(statement);
+		} else {
+			if (existingVersion === 1) {
+			await migrateDeliverySchemaV1ToV2(client, schema, names);
+			}
+			if (existingVersion <= 2) {
+			await migrateDeliverySchemaV2ToV3(
+				client,
+				schema,
+				names,
+				options.legacyFingerprintKeyId,
+			);
+			}
+			if (existingVersion <= 3) {
+				await migrateDeliverySchemaV3ToV4(client, schema, names);
+			}
 		}
-		// This performance-only index is additive within schema v3. Create it for
+		// This performance-only index is additive within the current schema. Create it for
 		// fresh installs and every supported upgrade path before strict verification.
 		await client.query(
 			`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${names.event}_scope_created_idx`)}
@@ -664,7 +881,7 @@ export async function assertDeliverySchemaCurrent(
 ): Promise<{ schema: string; version: typeof DELIVERY_SCHEMA_VERSION; tables: DeliveryTableNames }> {
 	const schema = deliverySchemaName(options);
 	const names = deliveryTableNames(options);
-	const targets = [names.meta, names.event, names.payload, names.job, names.attempt, names.worker];
+	const targets = [names.meta, names.webhookEndpoint, names.event, names.payload, names.job, names.attempt, names.worker];
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -737,6 +954,7 @@ export function qualifiedDeliveryTables(options: DeliverySchemaOptions = {}) {
 		schema,
 		names,
 		meta: fq(schema, names.meta),
+		webhookEndpoint: fq(schema, names.webhookEndpoint),
 		event: fq(schema, names.event),
 		payload: fq(schema, names.payload),
 		job: fq(schema, names.job),

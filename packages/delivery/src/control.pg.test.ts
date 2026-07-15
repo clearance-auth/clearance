@@ -182,7 +182,7 @@ describe.skipIf(!available)("delivery control Postgres primitives", () => {
 			projectId: "project-1", environmentId: "env-1", jobId: "retry-job",
 			now: new Date(start.getTime() + 4),
 		}, options));
-		expect(cancelledLease?.state).toBe("leased");
+		expect(cancelledLease).toMatchObject({ state: "leased", cancelRequested: true });
 		expect((await pool.query(`SELECT cancel_requested FROM ${tables.job} WHERE id='retry-job'`)).rows[0]).toEqual({ cancel_requested: true });
 		expect(await transaction((tx) => cancelDeliveryInExistingTransaction(tx, {
 			projectId: "wrong", environmentId: "env-1", jobId: "retry-job", now: start,
@@ -281,19 +281,83 @@ describe.skipIf(!available)("delivery control Postgres primitives", () => {
 			sourceKey: accepted.value.eventId,
 			quota,
 		})).rejects.toMatchObject({ code: "DELIVERY_DUPLICATE" });
+
+		const retryScope = { projectId: "quota-retry-project", environmentId: "env-1" };
+		const looseQuota = { ...quota, maxActive: 10, maxBacklog: 10 };
+		await enqueue({
+			eventId: "quota-dead-event",
+			jobId: "quota-dead-job",
+			projectId: retryScope.projectId,
+			quota: looseQuota,
+		});
+		const tables = qualifiedDeliveryTables(options);
+		await pool.query(
+			`UPDATE ${tables.job} SET state='dead', dead_at=$2, updated_at=$2 WHERE id=$1`,
+			["quota-dead-job", new Date(start.getTime() + 1)],
+		);
+		await enqueue({
+			eventId: "quota-active-event",
+			jobId: "quota-active-job",
+			projectId: retryScope.projectId,
+			quota: looseQuota,
+			now: new Date(start.getTime() + 2),
+		});
+		await expect(transaction((tx) => retryDeliveryInExistingTransaction(tx, {
+			...retryScope,
+			jobId: "quota-dead-job",
+			quota,
+			now: new Date(start.getTime() + 3),
+		}, options))).rejects.toMatchObject({
+			code: "DELIVERY_QUOTA_EXCEEDED",
+			httpStatus: 429,
+			quota: "active",
+		});
 	});
 
 	it("returns structured unready summaries for stale workers and schema drift", async () => {
 		await store.heartbeat({ workerId: "ready-worker", version: "0.2.1", state: "ready", now: start });
+		const historicalRing = ring({ current: "enc-historical", fingerprint: "fp-historical" });
+		await enqueue({
+			eventId: "readiness-terminal-event",
+			jobId: "readiness-terminal-job",
+			projectId: "readiness-project",
+		}, historicalRing);
+		await transaction((tx) => cancelDeliveryInExistingTransaction(tx, {
+			projectId: "readiness-project",
+			environmentId: "env-1",
+			jobId: "readiness-terminal-job",
+			now: new Date(start.getTime() + 1),
+		}, options));
 		const readinessKeyring = createDeliveryKeyring({
 			currentKeyId: keyring.currentKeyId,
-			keys: Object.fromEntries([...keyring.keys, ...(replayKeyring?.keys ?? [])]),
+			keys: Object.fromEntries([
+				...keyring.keys,
+				...(replayKeyring?.keys ?? []),
+				...historicalRing.keys,
+			]),
 			currentFingerprintKeyId: keyring.currentFingerprintKeyId,
 			fingerprintKeys: Object.fromEntries([
 				...keyring.fingerprintKeys,
 				...(replayKeyring?.fingerprintKeys ?? []),
+				...historicalRing.fingerprintKeys,
 			]),
 			sourceDedupeKey: keyring.sourceDedupeKey,
+		});
+		const withoutHistoricalFingerprint = createDeliveryKeyring({
+			currentKeyId: readinessKeyring.currentKeyId,
+			keys: Object.fromEntries(readinessKeyring.keys),
+			currentFingerprintKeyId: readinessKeyring.currentFingerprintKeyId,
+			fingerprintKeys: Object.fromEntries(
+				[...readinessKeyring.fingerprintKeys].filter(([keyId]) => keyId !== "fp-historical"),
+			),
+			sourceDedupeKey: readinessKeyring.sourceDedupeKey,
+		});
+		expect(await store.readiness({
+			now: new Date(start.getTime() + 1), staleAfterMs: 60_000,
+		}, withoutHistoricalFingerprint)).toMatchObject({
+			ready: false,
+			keys: { checked: true, available: false },
+			reasons: expect.arrayContaining(["key_unavailable"]),
 		});
 		expect(await store.readiness({
 			now: new Date(start.getTime() + 1), staleAfterMs: 60_000,

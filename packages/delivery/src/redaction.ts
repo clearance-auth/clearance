@@ -13,8 +13,10 @@ export type DeliveryJobRecord = {
 	projectId: string;
 	environmentId: string;
 	organizationId: string | null;
+	webhookEndpointId: string | null;
 	channel: "email" | "webhook";
 	state: DeliveryJobState;
+	cancelRequested: boolean;
 	attemptCount: number;
 	maxAttempts: number;
 	availableAt: string;

@@ -18,6 +18,7 @@ import {
 	lockDeliveryQuotaScopeInExistingTransaction,
 	type DeliveryQuotaPolicy,
 } from "./quota.js";
+import { parseWebhookDeliveryPayload } from "./webhook-payload.js";
 
 const transactionAdapterBrand: unique symbol = Symbol("delivery-transaction-adapter");
 
@@ -104,6 +105,8 @@ export type EnqueuedDelivery = {
 	semanticExpiresAt: string;
 };
 
+type InternalEnqueueDeliveryInput = EnqueueDeliveryInput & { webhookEndpointId?: string };
+
 export async function enqueueDeliveryInExistingTransaction(
 	transaction: DeliveryRawTransaction,
 	input: EnqueueDeliveryInput,
@@ -130,9 +133,9 @@ function required(value: string, label: string): string {
 	return normalized;
 }
 
-export async function enqueueDelivery(
+async function enqueueDeliveryInternal(
 	tx: DeliveryTransactionAdapter,
-	input: EnqueueDeliveryInput,
+	input: InternalEnqueueDeliveryInput,
 	ring: DeliveryKeyring,
 	options: DeliverySchemaOptions = {},
 ): Promise<EnqueuedDelivery> {
@@ -164,6 +167,27 @@ export async function enqueueDelivery(
 	const kind = required(input.kind, "kind");
 	const projectId = required(input.projectId, "projectId");
 	const environmentId = required(input.environmentId, "environmentId");
+	const webhookEndpointId = input.webhookEndpointId === undefined
+		? null
+		: required(input.webhookEndpointId, "webhookEndpointId");
+	if (webhookEndpointId !== null &&
+		(webhookEndpointId.length > 4_096 || /[\u0000-\u001f]/.test(webhookEndpointId))) {
+		throw new DeliveryError("DELIVERY_WEBHOOK_ENDPOINT_INVALID", "Webhook endpoint provenance is invalid");
+	}
+	if (webhookEndpointId !== null && input.channel !== "webhook") {
+		throw new DeliveryError(
+			"DELIVERY_WEBHOOK_ENDPOINT_INVALID",
+			"Webhook endpoint provenance is valid only for webhook delivery",
+		);
+	}
+	if (input.channel === "webhook") {
+		const payload = parseWebhookDeliveryPayload(input.payload);
+		if (payload.event.id !== eventId || payload.event.type !== kind ||
+			payload.endpoint.url !== input.destination.trim() ||
+			(webhookEndpointId !== null && payload.endpoint.id !== webhookEndpointId)) {
+			throw new DeliveryError("WEBHOOK_PAYLOAD_INVALID", "Webhook payload authority is invalid");
+		}
+	}
 	const fingerprintKeyId = ring.currentFingerprintKeyId;
 	const destinationFingerprint = fingerprintDestination(input.destination, ring, fingerprintKeyId);
 	const sourceFingerprint = fingerprintSource(
@@ -265,10 +289,10 @@ export async function enqueueDelivery(
 			`INSERT INTO ${tables.event}
 			 (id, kind, source_fingerprint, source_fingerprint_key_id, source_dedupe_fingerprint,
 			  source_dedupe_version,
-			  project_id, environment_id, organization_id, actor_id, correlation_id,
-			  destination_fingerprint, destination_fingerprint_key_id, replay_of, created_at,
-			  semantic_expires_at)
-			 VALUES ($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+				  project_id, environment_id, organization_id, actor_id, correlation_id, webhook_endpoint_id,
+				  destination_fingerprint, destination_fingerprint_key_id, replay_of, created_at,
+				  semantic_expires_at)
+				 VALUES ($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 			[
 				eventId,
 				kind,
@@ -280,6 +304,7 @@ export async function enqueueDelivery(
 				input.organizationId ?? null,
 				input.actorId ?? null,
 				input.correlationId ?? null,
+				webhookEndpointId,
 				destinationFingerprint,
 				fingerprintKeyId,
 				input.replayOf ?? null,
@@ -343,4 +368,40 @@ export async function enqueueDelivery(
 		createdAt,
 		semanticExpiresAt,
 	};
+}
+
+export async function enqueueDelivery(
+	tx: DeliveryTransactionAdapter,
+	input: EnqueueDeliveryInput,
+	ring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<EnqueuedDelivery> {
+	if (Object.prototype.hasOwnProperty.call(input, "webhookEndpointId")) {
+		throw new DeliveryError(
+			"DELIVERY_WEBHOOK_ENDPOINT_AUTHORITY_REQUIRED",
+			"Managed webhook delivery requires endpoint authority",
+		);
+	}
+	return enqueueDeliveryInternal(tx, input, ring, options);
+}
+
+/** Package-internal authority used only after endpoint locking and config derivation. */
+export async function enqueueManagedDeliveryInExistingTransactionInternal(
+	transaction: DeliveryRawTransaction,
+	input: EnqueueDeliveryInput & { webhookEndpointId: string },
+	ring: DeliveryKeyring,
+	options: DeliverySchemaOptions = {},
+): Promise<EnqueuedDelivery> {
+	if (!transaction.rawTransactionQuery) {
+		throw new DeliveryError(
+			"DELIVERY_TRANSACTION_REQUIRED",
+			"Durable delivery requires an active PostgreSQL transaction adapter",
+		);
+	}
+	return enqueueDeliveryInternal(
+		createDeliveryRawTransactionAdapter(transaction.rawTransactionQuery),
+		input,
+		ring,
+		options,
+	);
 }

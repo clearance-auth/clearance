@@ -5,6 +5,8 @@ import {
 	type DeliveryRawTransaction,
 	type EnqueuedDelivery,
 } from "./enqueue.js";
+import { enqueueWebhookEndpointDeliveryInExistingTransaction } from "./webhook-endpoints.js";
+import { parseOrganizationUpdatedWebhookPayload } from "./webhook-payload.js";
 import {
 	DeliveryControlConflictError,
 	DeliveryError,
@@ -23,6 +25,7 @@ import {
 } from "./redaction.js";
 import {
 	DEFAULT_DELIVERY_QUOTA_POLICY,
+	enforceDeliveryQuotaInExistingTransaction,
 	type DeliveryQuotaPolicy,
 	type DeliveryScope,
 } from "./quota.js";
@@ -44,6 +47,7 @@ export type DeliveryControlPreview = {
 	job: PublicDeliveryJob;
 	effect: {
 		state: DeliveryJobState | null;
+		cancelRequested: boolean | null;
 		maxAttempts: number | null;
 		createsEvent: boolean;
 		createsJob: boolean;
@@ -89,8 +93,10 @@ type ControlJobRow = {
 	project_id: string;
 	environment_id: string;
 	organization_id: string | null;
+	webhook_endpoint_id: string | null;
 	channel: "email" | "webhook";
 	state: DeliveryJobState;
+	cancel_requested: boolean;
 	attempt_count: number;
 	max_attempts: number;
 	available_at: Date | string;
@@ -165,8 +171,10 @@ function record(row: ControlJobRow): PublicDeliveryJob {
 		projectId: row.project_id,
 		environmentId: row.environment_id,
 		organizationId: row.organization_id,
+		webhookEndpointId: row.webhook_endpoint_id,
 		channel: row.channel,
 		state: row.state,
+		cancelRequested: row.cancel_requested,
 		attemptCount: Number(row.attempt_count),
 		maxAttempts: Number(row.max_attempts),
 		availableAt: iso(row.available_at)!,
@@ -265,7 +273,7 @@ export async function listDeliveryJobs(
 	}
 	const tables = qualifiedDeliveryTables(options);
 	const result = await pool.query<ControlJobRow>(
-		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id
+		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id
 		 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
 		 WHERE e.project_id=$1 AND e.environment_id=$2 AND j.state=ANY($3::text[])
 		   AND ($4::text IS NULL OR j.channel=$4)
@@ -293,7 +301,7 @@ export async function inspectDeliveryJobScoped(
 	const target = scope(input);
 	const tables = qualifiedDeliveryTables(options);
 	const result = await pool.query<ControlJobRow>(
-		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id
+		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id
 		 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
 		 WHERE j.id=$1 AND e.project_id=$2 AND e.environment_id=$3`,
 		[jobId(input.jobId), target.projectId, target.environmentId],
@@ -311,12 +319,13 @@ function effectFor(
 		(row.payload_expires_at !== null && new Date(row.payload_expires_at) <= now);
 	if (action === "cancel") {
 		const allowed = ["queued", "retry", "leased"].includes(row.state);
-		return {
-			action, allowed,
-			reason: allowed ? null : "already_terminal",
-			effect: {
-				state: allowed ? (row.state === "leased" ? "leased" : "cancelled") : null,
-				maxAttempts: null,
+			return {
+				action, allowed,
+				reason: allowed ? null : "already_terminal",
+				effect: {
+					state: allowed ? (row.state === "leased" ? "leased" : "cancelled") : null,
+					cancelRequested: allowed ? row.state === "leased" : null,
+					maxAttempts: null,
 				createsEvent: false,
 				createsJob: false,
 			},
@@ -334,6 +343,7 @@ function effectFor(
 			action, allowed: reason === null, reason,
 			effect: {
 				state: reason === null ? "retry" : null,
+				cancelRequested: reason === null ? false : null,
 				maxAttempts: reason === null
 					? dead ? Number(row.attempt_count) + 1 : Number(row.max_attempts)
 					: null,
@@ -353,6 +363,7 @@ function effectFor(
 		action, allowed: reason === null, reason,
 		effect: {
 			state: reason === null ? "queued" : null,
+			cancelRequested: reason === null ? false : null,
 			maxAttempts: reason === null ? replayMaxAttempts : null,
 			createsEvent: reason === null,
 			createsJob: reason === null,
@@ -377,7 +388,7 @@ export async function previewDeliveryControl(
 		payload_exists: boolean;
 		payload_expires_at: Date | string | null;
 	}>(
-		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id,
+		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id,
 		 (p.event_id IS NOT NULL) payload_exists, p.expires_at payload_expires_at
 		 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
 		 LEFT JOIN ${tables.payload} p ON p.event_id=e.id
@@ -399,7 +410,7 @@ async function lockedScopedJob(
 	const target = scope(input);
 	const tables = qualifiedDeliveryTables(options);
 	const result = await rawQuery<LockedControlJobRow>(
-		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id,
+		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id,
 		 (p.event_id IS NOT NULL) payload_exists, p.expires_at payload_expires_at
 		 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
 		 LEFT JOIN ${tables.payload} p ON p.event_id=e.id
@@ -407,6 +418,24 @@ async function lockedScopedJob(
 		[jobId(input.jobId), target.projectId, target.environmentId],
 	);
 	return result.rows[0] ?? null;
+}
+
+/** Preview against the same locked row that a confirmed control will mutate. */
+export async function previewDeliveryControlInExistingTransaction(
+	transaction: DeliveryRawTransaction,
+	input: DeliveryScope & {
+		jobId: string;
+		action: DeliveryControlAction;
+		now?: Date;
+		maxAttempts?: number;
+	},
+	options: DeliverySchemaOptions = {},
+): Promise<DeliveryControlPreview | null> {
+	const now = date(input.now, "now");
+	const row = await lockedScopedJob(transaction, input, options);
+	return row
+		? { ...effectFor(input.action, row, now, input.maxAttempts), job: record(row) }
+		: null;
 }
 
 export async function cancelDeliveryInExistingTransaction(
@@ -431,12 +460,17 @@ export async function cancelDeliveryInExistingTransaction(
 		[row.id, now],
 	);
 	return record({ ...updated.rows[0]!, kind: row.kind, project_id: row.project_id,
-		environment_id: row.environment_id, organization_id: row.organization_id });
+		environment_id: row.environment_id, organization_id: row.organization_id,
+		webhook_endpoint_id: row.webhook_endpoint_id });
 }
 
 export async function retryDeliveryInExistingTransaction(
 	transaction: DeliveryRawTransaction,
-	input: DeliveryScope & { jobId: string; now?: Date },
+	input: DeliveryScope & {
+		jobId: string;
+		now?: Date;
+		quota?: DeliveryQuotaPolicy;
+	},
 	options: DeliverySchemaOptions = {},
 ): Promise<PublicDeliveryJob | null> {
 	const rawQuery = requireRawTransaction(transaction);
@@ -461,6 +495,18 @@ export async function retryDeliveryInExistingTransaction(
 	if (Number(row.attempt_count) >= 100) {
 		throw new DeliveryControlConflictError("Delivery job reached the hard attempt limit", row.state);
 	}
+	if (row.state === "dead") {
+		await enforceDeliveryQuotaInExistingTransaction(
+			transaction,
+			{
+				projectId: row.project_id,
+				environmentId: row.environment_id,
+				policy: input.quota ?? DEFAULT_DELIVERY_QUOTA_POLICY,
+				now,
+			},
+			options,
+		);
+	}
 	const tables = qualifiedDeliveryTables(options);
 	const nextMaxAttempts = row.state === "dead"
 		? Number(row.attempt_count) + 1
@@ -473,7 +519,8 @@ export async function retryDeliveryInExistingTransaction(
 		[row.id, now, nextMaxAttempts],
 	);
 	return record({ ...updated.rows[0]!, kind: row.kind, project_id: row.project_id,
-		environment_id: row.environment_id, organization_id: row.organization_id });
+		environment_id: row.environment_id, organization_id: row.organization_id,
+		webhook_endpoint_id: row.webhook_endpoint_id });
 }
 
 function replayDestination(channel: "email" | "webhook", payload: unknown): string {
@@ -523,9 +570,10 @@ export async function replayDeliveryInExistingTransaction(
 		destination_fingerprint_key_id: string;
 		actor_id: string | null;
 		correlation_id: string | null;
+		webhook_endpoint_id: string | null;
 	}>(
 		`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id,
-		 e.actor_id, e.correlation_id, e.destination_fingerprint,
+		 e.actor_id, e.correlation_id, e.webhook_endpoint_id, e.destination_fingerprint,
 		 e.destination_fingerprint_key_id, p.envelope, p.expires_at payload_expires_at
 		 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
 		 LEFT JOIN ${tables.payload} p ON p.event_id=e.id
@@ -555,6 +603,44 @@ export async function replayDeliveryInExistingTransaction(
 		expiresAt: expiresAt.toISOString(),
 	};
 	const payload = decryptDeliveryPayload<unknown>(row.envelope, aad, keyring);
+	if (row.webhook_endpoint_id !== null) {
+		if (row.channel !== "webhook" || row.kind !== "organization.updated") {
+			throw new DeliveryControlConflictError("Managed webhook delivery cannot be replayed", row.state);
+		}
+		const original = parseOrganizationUpdatedWebhookPayload(payload);
+		const eventId = randomUUID();
+		const managed = await enqueueWebhookEndpointDeliveryInExistingTransaction(
+			transaction,
+			{
+				eventId,
+				endpointId: row.webhook_endpoint_id,
+				projectId: target.projectId,
+				environmentId: target.environmentId,
+				eventKind: "organization.updated",
+				sourceKey: `managed-control-replay:${JSON.stringify([row.event_id, eventId])}`,
+				event: {
+					occurredAt: original.event.occurredAt,
+					data: original.event.data,
+				},
+				organizationId: original.event.context.organizationId,
+				...(original.event.context.actor === null ? {} : { actorId: original.event.context.actor }),
+				...(original.event.context.correlationId === null
+					? {}
+					: { correlationId: original.event.context.correlationId }),
+				replayOf: row.event_id,
+				semanticExpiresAt: expiresAt,
+				maxAttempts: input.maxAttempts ?? Number(row.max_attempts),
+				quota: input.quota ?? DEFAULT_DELIVERY_QUOTA_POLICY,
+				now,
+			},
+			keyring,
+			options,
+		);
+		if (!managed) {
+			throw new DeliveryControlConflictError("Managed webhook endpoint is unavailable", row.state);
+		}
+		return managed.delivery;
+	}
 	const destination = replayDestination(row.channel, payload);
 	if (
 		fingerprintDestination(destination, keyring, row.destination_fingerprint_key_id) !==
@@ -640,12 +726,22 @@ export async function deliveryReadiness(
 				`SELECT DISTINCT 'encryption' key_kind, p.key_id
 				 FROM ${tables.payload} p WHERE p.expires_at > $1
 				 UNION
-				 SELECT DISTINCT 'fingerprint' key_kind, e.destination_fingerprint_key_id key_id
-				 FROM ${tables.event} e JOIN ${tables.job} j ON j.event_id=e.id
-				 WHERE j.state IN ('queued','leased','retry')
+			 SELECT DISTINCT 'fingerprint' key_kind, e.destination_fingerprint_key_id key_id
+			 FROM ${tables.event} e
+			 JOIN ${tables.job} j ON j.event_id=e.id
+			 LEFT JOIN ${tables.payload} p ON p.event_id=e.id
+			 WHERE j.state IN ('queued','leased','retry')
+			    OR (j.state IN ('delivered','dead','cancelled')
+			        AND p.expires_at > $1 AND e.semantic_expires_at > $1)
 				 UNION
 				 SELECT DISTINCT 'fingerprint' key_kind, e.source_fingerprint_key_id key_id
-				 FROM ${tables.event} e WHERE e.source_dedupe_version=1`,
+				 FROM ${tables.event} e WHERE e.source_dedupe_version=1
+				 UNION
+				 SELECT DISTINCT 'encryption' key_kind, w.config_key_id key_id
+				 FROM ${tables.webhookEndpoint} w WHERE w.status <> 'deleted'
+				 UNION
+				 SELECT DISTINCT 'fingerprint' key_kind, w.url_fingerprint_key_id key_id
+				 FROM ${tables.webhookEndpoint} w WHERE w.status <> 'deleted'`,
 				[now],
 			);
 			const missingReferences = referenced.rows.filter((reference) =>

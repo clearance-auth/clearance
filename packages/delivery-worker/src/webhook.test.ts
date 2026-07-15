@@ -9,6 +9,8 @@ import {
 	classifyWebhookError,
 	createWebhookSender,
 	parseOrganizationUpdatedPayload,
+	parseWebhookEndpointTestPayload,
+	parseWebhookPayload,
 	pinnedWebhookRequest,
 	verifyWebhookSignature,
 	webhookSignature,
@@ -51,6 +53,26 @@ function payload(url = "https://hooks.example.test/events") {
 				organization: { id: "organization-1", name: "Updated\nOrg\t\u0000", slug: "updated-org", status: "active" },
 				previous: { name: "Old\r\nOrg", slug: "old-org" },
 			},
+		},
+	};
+}
+
+function endpointTestPayload(url = "https://hooks.example.test/events") {
+	return {
+		version: 1,
+		endpoint: { id: "endpoint-1", url, signingSecret: secret },
+		event: {
+			id: "event-test-1",
+			type: "webhook.endpoint.test",
+			occurredAt: "2026-07-15T00:00:00.000Z",
+			context: {
+				projectId: "project-1",
+				environmentId: "environment-1",
+				organizationId: null,
+				actor: "operator-1",
+				correlationId: "correlation-1",
+			},
+			data: { endpointId: "endpoint-1" },
 		},
 	};
 }
@@ -103,6 +125,55 @@ describe("signed webhook transport", () => {
 		)).toBe(true);
 	});
 
+	it("validates and signs endpoint tests as the only additional event kind", async () => {
+		const requests: Parameters<PinnedWebhookRequest>[0][] = [];
+		const sender = createWebhookSender(config(), {
+			lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+			request: async (input) => { requests.push(input); return 204; },
+			now: () => 1_784_073_600_000,
+		});
+		const input = endpointTestPayload();
+		await sender.send(input, { jobId: "job-test-1", eventId: "event-test-1" });
+
+		const request = requests[0]!;
+		const parsed = parseWebhookEndpointTestPayload(input);
+		expect(parseWebhookPayload(input)).toEqual(parsed);
+		expect(request.body.equals(canonicalWebhookBytes(parsed))).toBe(true);
+		expect(JSON.parse(request.body.toString("utf8"))).toEqual({
+			event: parsed.event,
+			version: 1,
+		});
+		expect(request.body.toString("utf8")).not.toContain(secret);
+		expect(request.body.toString("utf8")).not.toContain("https://hooks.example.test");
+		expect(request.headers["webhook-id"]).toBe("event-test-1");
+		expect(request.headers["idempotency-key"]).toBe("job-test-1");
+		expect(verifyWebhookSignature(
+			secret,
+			"event-test-1",
+			request.headers["webhook-timestamp"]!,
+			request.body,
+			request.headers["webhook-signature"]!,
+		)).toBe(true);
+
+		const arbitrary = structuredClone(input) as Record<string, any>;
+		arbitrary.event.type = "user.created";
+		const mismatched = structuredClone(input) as Record<string, any>;
+		mismatched.event.data.endpointId = "endpoint-other";
+		const extraContext = structuredClone(input) as Record<string, any>;
+		extraContext.event.context.tenantId = "tenant-1";
+		const extraEvent = structuredClone(input) as Record<string, any>;
+		extraEvent.event.unbounded = "field";
+		const missingContext = structuredClone(input) as Record<string, any>;
+		delete missingContext.event.context.actor;
+		for (const invalid of [arbitrary, mismatched, extraContext, extraEvent, missingContext]) {
+			await expect(sender.send(invalid, {
+				jobId: "job-test-invalid",
+				eventId: "event-test-1",
+			})).rejects.toMatchObject({ code: "WEBHOOK_PAYLOAD_INVALID" });
+		}
+		expect(requests).toHaveLength(1);
+	});
+
 	it("rejects the entire DNS result when any answer is non-global", async () => {
 		let requestCalled = false;
 		const sender = createWebhookSender(config(), {
@@ -145,6 +216,7 @@ describe("signed webhook transport", () => {
 		for (const url of [
 			"https://user:password@hooks.example.test/events",
 			"https://hooks.example.test/events#fragment",
+			"https://hooks.example.test:8443/events",
 			"http://hooks.example.test/events",
 		]) {
 			await expect(createWebhookSender(config()).send(payload(url), {

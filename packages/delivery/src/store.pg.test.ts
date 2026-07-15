@@ -4,10 +4,12 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
 	createDeliveryTransactionAdapter,
 	enqueueDelivery,
+	type DeliveryRawTransaction,
 	type EnqueueDeliveryInput,
 } from "./enqueue.js";
 import { createDeliveryKeyring } from "./keyring.js";
 import {
+	assertDeliverySchemaCurrent,
 	deliveryTableNames,
 	migrateDeliverySchema,
 	qualifiedDeliveryTables,
@@ -15,6 +17,21 @@ import {
 	type DeliverySchemaOptions,
 } from "./schema.js";
 import { DeliveryStore } from "./store.js";
+import { replayDeliveryInExistingTransaction } from "./control.js";
+import {
+	createWebhookEndpoint,
+	createWebhookEndpointInExistingTransaction,
+	enqueueWebhookEndpointDeliveryInExistingTransaction,
+	enqueueWebhookEndpointTestInExistingTransaction,
+	fanoutOrganizationUpdatedWebhookInExistingTransaction,
+	inspectWebhookEndpointScoped,
+	listWebhookEndpoints,
+	rotateWebhookEndpointSecret,
+	softDeleteWebhookEndpoint,
+	softDeleteWebhookEndpointInExistingTransaction,
+	updateWebhookEndpoint,
+	updateWebhookEndpointInExistingTransaction,
+} from "./webhook-endpoints.js";
 
 const DATABASE_URL =
 	process.env.CLEARANCE_TEST_DATABASE_URL ??
@@ -25,6 +42,10 @@ const mainOptions = { prefix: `delivery_${suffix}` } satisfies DeliverySchemaOpt
 const collisionOptions = { prefix: `delivery_collision_${suffix}` } satisfies DeliverySchemaOptions;
 const futureOptions = { prefix: `delivery_future_${suffix}` } satisfies DeliverySchemaOptions;
 const driftOptions = { prefix: `delivery_drift_${suffix}` } satisfies DeliverySchemaOptions;
+const endpointConstraintDriftOptions = { prefix: `delivery_epc_${suffix}` } satisfies DeliverySchemaOptions;
+const endpointFkDriftOptions = { prefix: `delivery_epfk_${suffix}` } satisfies DeliverySchemaOptions;
+const endpointIndexDriftOptions = { prefix: `delivery_epi_${suffix}` } satisfies DeliverySchemaOptions;
+const endpointKeyOptions = { prefix: `delivery_endpoint_keys_${suffix}` } satisfies DeliverySchemaOptions;
 const migrationOptions = {
 	prefix: `delivery_migration_${suffix}`,
 	legacyFingerprintKeyId: "fingerprint-v2",
@@ -48,12 +69,24 @@ try {
 async function dropSchemaAssets(pool: pg.Pool, options: DeliverySchemaOptions) {
 	const schema = options.schema ?? "public";
 	const names = deliveryTableNames(options);
-	for (const name of [names.attempt, names.job, names.payload, names.event, names.worker, names.meta]) {
+	for (const name of [names.attempt, names.job, names.payload, names.event, names.webhookEndpoint, names.worker, names.meta]) {
 		await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier(schema)}.${quoteIdentifier(name)} CASCADE`);
 	}
 	await pool.query(
 		`DROP FUNCTION IF EXISTS ${quoteIdentifier(schema)}.${quoteIdentifier(names.rejectMutationFunction)}()`,
 	);
+}
+
+function rawTransaction(client: pg.PoolClient): DeliveryRawTransaction {
+	return {
+		rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+			text: string,
+			values: readonly unknown[] = [],
+		) => {
+			const result = await client.query<Row>(text, [...values]);
+			return { rows: result.rows, rowCount: result.rowCount };
+		},
+	};
 }
 
 describe.skipIf(!available)("delivery Postgres storage", () => {
@@ -74,7 +107,9 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 
 	afterAll(async () => {
 		for (const options of [
-			mainOptions, collisionOptions, futureOptions, driftOptions, migrationOptions, rotationOptions,
+			mainOptions, collisionOptions, futureOptions, driftOptions, endpointConstraintDriftOptions,
+			endpointFkDriftOptions,
+			endpointIndexDriftOptions, endpointKeyOptions, migrationOptions, rotationOptions,
 		]) {
 			await dropSchemaAssets(pool, options).catch(() => undefined);
 		}
@@ -96,7 +131,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await migrateDeliverySchema(pool, futureOptions);
 		const future = qualifiedDeliveryTables(futureOptions);
 		await pool.query(
-			`UPDATE ${future.meta} SET value='4'::jsonb WHERE key='schema_version'`,
+			`UPDATE ${future.meta} SET value='5'::jsonb WHERE key='schema_version'`,
 		);
 		await expect(migrateDeliverySchema(pool, futureOptions)).rejects.toMatchObject({
 			code: "DELIVERY_SCHEMA_VERSION_FUTURE",
@@ -110,7 +145,60 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		});
 	});
 
-	it("transactionally upgrades owned v1 storage through v3 without losing rows", async () => {
+	it("fails closed when endpoint privacy constraints or URL uniqueness drift", async () => {
+		await migrateDeliverySchema(pool, endpointConstraintDriftOptions);
+		const constraintTables = qualifiedDeliveryTables(endpointConstraintDriftOptions);
+		const constraint = (await pool.query<{ conname: string }>(
+			`SELECT conname FROM pg_constraint
+			 WHERE conrelid=$1::regclass
+			   AND pg_get_constraintdef(oid,true) ILIKE '%last_test_job_id%'`,
+			[constraintTables.webhookEndpoint],
+		)).rows[0]?.conname;
+		expect(constraint).toBeTruthy();
+		await pool.query(
+			`ALTER TABLE ${constraintTables.webhookEndpoint} DROP CONSTRAINT ${quoteIdentifier(constraint!)}`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, endpointConstraintDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+
+		await migrateDeliverySchema(pool, endpointIndexDriftOptions);
+		const indexTables = qualifiedDeliveryTables(endpointIndexDriftOptions);
+		const index = (await pool.query<{ indexname: string }>(
+			`SELECT indexname FROM pg_indexes WHERE schemaname=$1 AND tablename=$2
+			   AND indexdef ILIKE '%url_fingerprint_key_id%'`,
+			[indexTables.schema, indexTables.names.webhookEndpoint],
+		)).rows[0]?.indexname;
+		expect(index).toBeTruthy();
+		await pool.query(
+			`DROP INDEX ${quoteIdentifier(indexTables.schema)}.${quoteIdentifier(index!)}`,
+		);
+		await pool.query(
+			`CREATE INDEX ${quoteIdentifier(index!)} ON ${indexTables.webhookEndpoint} (project_id)
+			 WHERE status <> 'deleted'`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, endpointIndexDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+	});
+
+	it("rejects a hostile substituted endpoint provenance foreign key", async () => {
+		await migrateDeliverySchema(pool, endpointFkDriftOptions);
+		const tables = qualifiedDeliveryTables(endpointFkDriftOptions);
+		const constraint = (await pool.query<{ conname: string }>(
+			`SELECT conname FROM pg_constraint
+			 WHERE conrelid=$1::regclass AND contype='f'
+			   AND pg_get_constraintdef(oid,true) ILIKE '%webhook_endpoint_id%'`,
+			[tables.event],
+		)).rows[0]?.conname;
+		expect(constraint).toBeTruthy();
+		await pool.query(
+			`ALTER TABLE ${tables.event} DROP CONSTRAINT ${quoteIdentifier(constraint!)},
+			 ADD FOREIGN KEY (webhook_endpoint_id) REFERENCES ${tables.webhookEndpoint}(id) ON DELETE CASCADE`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, endpointFkDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+	});
+
+	it("transactionally upgrades owned v1 storage through v4 without losing rows", async () => {
 		await migrateDeliverySchema(pool, migrationOptions);
 		const tables = qualifiedDeliveryTables(migrationOptions);
 		await pool.query(
@@ -124,12 +212,14 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		);
 		await pool.query(
 			`ALTER TABLE ${tables.event}
+			 DROP COLUMN webhook_endpoint_id,
 			 DROP COLUMN source_fingerprint_key_id,
 			 DROP COLUMN source_dedupe_fingerprint CASCADE,
 			 DROP COLUMN source_dedupe_version,
 			 DROP COLUMN destination_fingerprint_key_id,
 			 ADD UNIQUE (source_fingerprint)`,
 		);
+		await pool.query(`DROP TABLE ${tables.webhookEndpoint}`);
 		for (const name of [tables.names.meta, tables.names.event, tables.names.payload, tables.names.job, tables.names.attempt, tables.names.worker]) {
 			await pool.query(`COMMENT ON TABLE ${quoteIdentifier(tables.schema)}.${quoteIdentifier(name)} IS 'clearance.delivery:v1'`);
 		}
@@ -154,7 +244,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			code: "DELIVERY_FINGERPRINT_MIGRATION_KEY_ID_REQUIRED",
 		});
 		const migrated = await migrateDeliverySchema(pool, migrationOptions);
-		expect(migrated.version).toBe(3);
+		expect(migrated.version).toBe(4);
 		expect((await pool.query(
 			`SELECT j.id, j.state, j.provider_accepted_at, j.destination_fingerprint_key_id,
 			 e.source_fingerprint_key_id, e.source_dedupe_version
@@ -169,7 +259,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 				source_dedupe_version: 1,
 			},
 		]);
-		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(3);
+		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(4);
 	});
 
 	it("rolls enqueue back atomically and stores no plaintext", async () => {
@@ -178,7 +268,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await pool.query(
 			`DROP INDEX ${quoteIdentifier(mainTables.schema)}.${quoteIdentifier(`${mainTables.names.event}_scope_created_idx`)}`,
 		);
-		expect((await store.migrate()).version).toBe(3);
+		expect((await store.migrate()).version).toBe(4);
 		expect((await pool.query<{ indexdef: string }>(
 			`SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname=$2`,
 			[mainTables.schema, `${mainTables.names.event}_scope_created_idx`],
@@ -253,23 +343,679 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		expect((await store.cancel("job-tenant-2", start))?.state).toBe("cancelled");
 	});
 
+	it("stores scoped webhook endpoints with one-time secrets and crypto-erasing lifecycle", async () => {
+		await store.migrate();
+		const scope = { projectId: "project-webhooks", environmentId: "environment-webhooks" };
+		const rollbackClient = await pool.connect();
+		try {
+			await rollbackClient.query("BEGIN");
+			await createWebhookEndpointInExistingTransaction(rawTransaction(rollbackClient), {
+				...scope,
+				id: "endpoint-rolled-back",
+				name: "Rolled back",
+				url: "https://rolled-back.example.test/events",
+				now: start,
+			}, keyring, mainOptions);
+			await rollbackClient.query("ROLLBACK");
+		} finally {
+			rollbackClient.release();
+		}
+		expect(await inspectWebhookEndpointScoped(pool, {
+			...scope, endpointId: "endpoint-rolled-back",
+		}, keyring, mainOptions)).toBeNull();
+		const created = await createWebhookEndpoint(pool, {
+			...scope,
+			id: "endpoint-1",
+			name: "Primary",
+			url: "https://hooks.example.test/events",
+			now: start,
+		}, keyring, mainOptions);
+		expect(created.endpoint).toMatchObject({
+			status: "disabled",
+			url: "https://hooks.example.test/events",
+			resourceVersion: 1,
+			secretVersion: 1,
+		});
+		expect(created.signingSecret).toMatch(/^whsec_/);
+		const publicJson = JSON.stringify(created.endpoint);
+		expect(publicJson).not.toContain(created.signingSecret);
+		expect(publicJson).not.toContain("envelope");
+		expect(publicJson).not.toContain("configKeyId");
+		await expect(createWebhookEndpoint(pool, {
+			...scope,
+			id: "endpoint-port-rejected",
+			name: "Port rejected",
+			url: "https://hooks.example.test:8443/events",
+			now: start,
+		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_URL_INVALID" });
+		await expect(updateWebhookEndpoint(pool, {
+			...scope,
+			endpointId: "endpoint-1",
+			expectedVersion: 1,
+			url: "https://hooks.example.test:8443/events",
+			now: start,
+		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_URL_INVALID" });
+		await expect(createWebhookEndpoint(pool, {
+			...scope,
+			id: "endpoint-duplicate",
+			name: "Duplicate",
+			url: "https://hooks.example.test/events",
+			now: start,
+		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_DUPLICATE" });
+
+		const activated = await updateWebhookEndpoint(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 1, status: "active", now: start,
+		}, keyring, mainOptions);
+		expect(activated).toMatchObject({ status: "active", resourceVersion: 2 });
+		await expect(updateWebhookEndpoint(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 1, name: "Stale", now: start,
+		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_VERSION_CONFLICT" });
+		const rotated = await rotateWebhookEndpointSecret(pool, {
+			...scope, endpointId: "endpoint-1", expectedVersion: 2, now: start,
+		}, keyring, mainOptions);
+		expect(rotated?.endpoint).toMatchObject({ resourceVersion: 3, secretVersion: 2 });
+		expect(rotated?.signingSecret).not.toBe(created.signingSecret);
+		const urlChanged = await updateWebhookEndpoint(pool, {
+			...scope,
+			endpointId: "endpoint-1",
+			expectedVersion: 3,
+			url: "https://hooks.example.test/v2",
+			now: start,
+		}, keyring, mainOptions);
+		expect(urlChanged).toMatchObject({ status: "disabled", resourceVersion: 4 });
+		const reactivated = await updateWebhookEndpoint(pool, {
+			...scope,
+			endpointId: "endpoint-1",
+			expectedVersion: 4,
+			status: "active",
+			now: start,
+		}, keyring, mainOptions);
+		expect(reactivated).toMatchObject({ status: "active", resourceVersion: 5 });
+		const testClient = await pool.connect();
+		let tested: Awaited<ReturnType<typeof enqueueWebhookEndpointTestInExistingTransaction>>;
+		try {
+			await testClient.query("BEGIN");
+			tested = await enqueueWebhookEndpointTestInExistingTransaction(
+				rawTransaction(testClient),
+				{ ...scope, endpointId: "endpoint-1", expectedVersion: 5, now: start },
+				keyring,
+				mainOptions,
+			);
+			await enqueueWebhookEndpointDeliveryInExistingTransaction(rawTransaction(testClient), {
+				eventId: "event-delete-queued",
+				jobId: "job-delete-queued",
+				endpointId: "endpoint-1",
+				expectedVersion: 6,
+				eventKind: "organization.updated",
+				sourceKey: "endpoint-delete-queued",
+				...scope,
+				organizationId: "organization-delete",
+				event: {
+					occurredAt: start.toISOString(),
+					data: {
+						organization: {
+							id: "organization-delete",
+							name: "Delete Org",
+							slug: "delete-org",
+							status: "active",
+						},
+						previous: { name: "Old Delete Org", slug: "old-delete-org" },
+					},
+				},
+				semanticExpiresAt: expiry,
+				now: start,
+			}, keyring, mainOptions);
+			await testClient.query("COMMIT");
+		} catch (error) {
+			await testClient.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			testClient.release();
+		}
+		expect(tested).toMatchObject({
+			endpoint: { resourceVersion: 6 },
+			delivery: { kind: "webhook.endpoint.test", state: "queued" },
+		});
+		const tables = qualifiedDeliveryTables(mainOptions);
+		const testLink = (await pool.query(
+			`SELECT e.id event_id,e.kind,e.webhook_endpoint_id,j.id job_id
+			 FROM ${tables.event} e JOIN ${tables.job} j ON j.event_id=e.id
+			 WHERE j.id=$1`,
+			[tested!.delivery.jobId],
+		)).rows[0];
+		expect(testLink).toEqual({
+			event_id: tested!.delivery.eventId,
+			kind: "webhook.endpoint.test",
+			webhook_endpoint_id: "endpoint-1",
+			job_id: tested!.delivery.jobId,
+		});
+		await pool.query(
+			`UPDATE ${tables.job} SET state='leased',lease_token='lease-test',lease_owner='worker-test',
+			 lease_expires_at=$2,updated_at=$1 WHERE id=$3`,
+			[start, new Date(start.getTime() + 60_000), tested!.delivery.jobId],
+		);
+		const deleteClient = await pool.connect();
+		let deleted: Awaited<ReturnType<typeof softDeleteWebhookEndpoint>>;
+		try {
+			await deleteClient.query("BEGIN");
+			deleted = await softDeleteWebhookEndpointInExistingTransaction(
+				rawTransaction(deleteClient),
+				{ ...scope, endpointId: "endpoint-1", expectedVersion: 6, now: start },
+				mainOptions,
+			);
+			await deleteClient.query("COMMIT");
+		} catch (error) {
+			await deleteClient.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			deleteClient.release();
+		}
+		expect(deleted).toMatchObject({
+			endpoint: { status: "deleted", resourceVersion: 7, urlFingerprint: null },
+			erasedPayloads: 2,
+			jobs: {
+				queuedOrRetryCancelled: 1,
+				leasedCancellationRequested: 1,
+				leasedDeliveryOutcomeAmbiguous: true,
+			},
+		});
+		expect((await pool.query(
+			`SELECT j.id,j.state,j.cancel_requested,e.webhook_endpoint_id
+			 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id
+			 WHERE j.id = ANY($1::text[]) ORDER BY j.id`,
+			[[tested!.delivery.jobId, "job-delete-queued"]],
+		)).rows).toEqual(expect.arrayContaining([
+			{ id: "job-delete-queued", state: "cancelled", cancel_requested: false, webhook_endpoint_id: "endpoint-1" },
+			{ id: tested!.delivery.jobId, state: "leased", cancel_requested: true, webhook_endpoint_id: "endpoint-1" },
+		]));
+		expect((await pool.query(
+			`SELECT count(*)::int count FROM ${tables.payload} p
+			 JOIN ${tables.event} e ON e.id=p.event_id WHERE e.webhook_endpoint_id='endpoint-1'`,
+		)).rows[0]?.count).toBe(0);
+		expect(await inspectWebhookEndpointScoped(pool, {
+			...scope, endpointId: "endpoint-1",
+		}, keyring, mainOptions)).toBeNull();
+		expect(await inspectWebhookEndpointScoped(pool, {
+			...scope, endpointId: "endpoint-1", includeDeleted: true,
+		}, keyring, mainOptions)).toMatchObject({ status: "deleted", url: null, secretFingerprint: null });
+		expect((await pool.query(
+			`SELECT config_key_id,config_envelope,url_fingerprint_key_id,url_fingerprint
+			 FROM ${tables.webhookEndpoint} WHERE id='endpoint-1'`,
+		)).rows[0]).toEqual({
+			config_key_id: null, config_envelope: null,
+			url_fingerprint_key_id: null, url_fingerprint: null,
+		});
+	});
+
+	it("keeps managed endpoint selection and enqueue atomic across lifecycle races", async () => {
+		await store.migrate();
+		const scope = { projectId: "project-webhook-routing", environmentId: "environment-webhook-routing" };
+		const created = await createWebhookEndpoint(pool, {
+			...scope, id: "endpoint-routing", name: "Routing endpoint",
+			url: "https://routing.example.test/events", now: start,
+		}, keyring, mainOptions);
+		await updateWebhookEndpoint(pool, {
+			...scope, endpointId: created.endpoint.id, expectedVersion: 1,
+			status: "active", now: start,
+		}, keyring, mainOptions);
+		const forgedClient = await pool.connect();
+		try {
+			await forgedClient.query("BEGIN");
+			await expect(enqueueDelivery(
+				createDeliveryTransactionAdapter(forgedClient),
+				{
+					eventId: "event-forged-managed",
+					kind: "organization.updated",
+					sourceKey: "forged-managed",
+					...scope,
+					channel: "webhook",
+					destination: "https://routing.example.test/events",
+					payload: {},
+					semanticExpiresAt: expiry,
+					webhookEndpointId: created.endpoint.id,
+				} as EnqueueDeliveryInput,
+				keyring,
+				mainOptions,
+			)).rejects.toMatchObject({ code: "DELIVERY_WEBHOOK_ENDPOINT_AUTHORITY_REQUIRED" });
+			await forgedClient.query("ROLLBACK");
+		} finally {
+			forgedClient.release();
+		}
+
+		const deliveryInput = {
+			...scope,
+			endpointId: created.endpoint.id,
+			expectedVersion: 2,
+			eventKind: "organization.updated" as const,
+			sourceKey: "atomic-routing",
+			event: {
+				occurredAt: start.toISOString(),
+				data: {
+					organization: {
+						id: "org-routing", name: "Routing Org", slug: "routing-org", status: "active",
+					},
+					previous: { name: "Old Routing Org", slug: "old-routing-org" },
+				},
+			},
+			organizationId: "org-routing",
+			semanticExpiresAt: expiry,
+			now: start,
+		};
+		const wrongScopeClient = await pool.connect();
+		try {
+			await wrongScopeClient.query("BEGIN");
+			expect(await enqueueWebhookEndpointDeliveryInExistingTransaction(
+				rawTransaction(wrongScopeClient),
+				{ ...deliveryInput, projectId: "wrong-project", sourceKey: "wrong-scope" },
+				keyring,
+				mainOptions,
+			)).toBeNull();
+			await wrongScopeClient.query("COMMIT");
+		} finally {
+			wrongScopeClient.release();
+		}
+
+		const staleClient = await pool.connect();
+		try {
+			await staleClient.query("BEGIN");
+			await expect(enqueueWebhookEndpointDeliveryInExistingTransaction(
+				rawTransaction(staleClient),
+				{ ...deliveryInput, expectedVersion: 1, sourceKey: "stale-version" },
+				keyring,
+				mainOptions,
+			)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_VERSION_CONFLICT" });
+			await staleClient.query("ROLLBACK");
+		} finally {
+			staleClient.release();
+		}
+
+		const enqueueClient = await pool.connect();
+		let enqueued: Awaited<ReturnType<typeof enqueueWebhookEndpointDeliveryInExistingTransaction>>;
+		try {
+			await enqueueClient.query("BEGIN");
+			enqueued = await enqueueWebhookEndpointDeliveryInExistingTransaction(
+				rawTransaction(enqueueClient), deliveryInput, keyring, mainOptions,
+			);
+			expect(enqueued).toMatchObject({
+				endpoint: { id: "endpoint-routing", resourceVersion: 2 },
+				delivery: { kind: "organization.updated", state: "queued" },
+			});
+
+			for (const action of ["update", "delete"] as const) {
+				const contender = await pool.connect();
+				try {
+					await contender.query("BEGIN");
+					await contender.query("SET LOCAL lock_timeout='100ms'");
+					const operation = action === "update"
+						? updateWebhookEndpointInExistingTransaction(
+							rawTransaction(contender),
+							{ ...scope, endpointId: created.endpoint.id, expectedVersion: 2, name: "Raced", now: start },
+							keyring,
+							mainOptions,
+						)
+						: softDeleteWebhookEndpointInExistingTransaction(
+							rawTransaction(contender),
+							{ ...scope, endpointId: created.endpoint.id, expectedVersion: 2, now: start },
+							mainOptions,
+						);
+					await expect(operation).rejects.toMatchObject({ code: "55P03" });
+					await contender.query("ROLLBACK");
+				} finally {
+					contender.release();
+				}
+			}
+			await enqueueClient.query("COMMIT");
+		} catch (error) {
+			await enqueueClient.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			enqueueClient.release();
+		}
+
+		const tables = qualifiedDeliveryTables(mainOptions);
+		const persisted = JSON.stringify((await pool.query(
+			`SELECT e.*,j.*,p.envelope FROM ${tables.event} e
+			 JOIN ${tables.job} j ON j.event_id=e.id
+			 JOIN ${tables.payload} p ON p.event_id=e.id WHERE j.id=$1`,
+			[enqueued!.delivery.jobId],
+		)).rows);
+		expect(persisted).not.toContain("routing.example.test");
+		expect(persisted).not.toContain(created.signingSecret);
+		expect((await updateWebhookEndpoint(pool, {
+			...scope, endpointId: created.endpoint.id, expectedVersion: 2,
+			name: "Routing endpoint updated", now: start,
+		}, keyring, mainOptions))?.resourceVersion).toBe(3);
+		expect((await store.cancel(enqueued!.delivery.jobId, start))?.state).toBe("cancelled");
+		expect((await updateWebhookEndpoint(pool, {
+			...scope, endpointId: created.endpoint.id, expectedVersion: 3,
+			status: "disabled", now: start,
+		}, keyring, mainOptions))?.resourceVersion).toBe(4);
+		const replayClient = await pool.connect();
+		try {
+			await replayClient.query("BEGIN");
+			await expect(replayDeliveryInExistingTransaction(
+				rawTransaction(replayClient),
+				{ ...scope, jobId: enqueued!.delivery.jobId, now: start },
+				keyring,
+				mainOptions,
+			)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_NOT_ACTIVE" });
+		} finally {
+			await replayClient.query("ROLLBACK").catch(() => undefined);
+			replayClient.release();
+		}
+	});
+
+	it("fans out the complete active subscription set deterministically and atomically", async () => {
+		await store.migrate();
+		const scope = { projectId: "project-webhook-fanout", environmentId: "environment-webhook-fanout" };
+		for (const id of ["endpoint-fanout-b", "endpoint-fanout-a", "endpoint-fanout-disabled"]) {
+			await createWebhookEndpoint(pool, {
+				...scope, id, name: id, url: `https://${id}.example.test/events`, now: start,
+			}, keyring, mainOptions);
+			if (id !== "endpoint-fanout-disabled") {
+				await updateWebhookEndpoint(pool, {
+					...scope, endpointId: id, expectedVersion: 1, status: "active", now: start,
+				}, keyring, mainOptions);
+			}
+		}
+		const event = {
+			occurredAt: start.toISOString(),
+			data: {
+				organization: { id: "org-fanout", name: "Fanout Org", slug: "fanout-org", status: "active" },
+				previous: { name: "Old Fanout Org", slug: "old-fanout-org" },
+			},
+		};
+		const transactFanout = async (sourceKey: string, candidateEvent: typeof event) => {
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
+				const result = await fanoutOrganizationUpdatedWebhookInExistingTransaction(
+					rawTransaction(client),
+					{
+						...scope, sourceKey, event: candidateEvent,
+						organizationId: "org-fanout", semanticExpiresAt: expiry, now: start,
+					},
+					keyring,
+					mainOptions,
+				);
+				await client.query("COMMIT");
+				return result;
+			} catch (error) {
+				await client.query("ROLLBACK").catch(() => undefined);
+				throw error;
+			} finally {
+				client.release();
+			}
+		};
+
+		const deliveries = await transactFanout("organization-update-1", event);
+		expect(deliveries.map((entry) => entry.endpoint.id)).toEqual([
+			"endpoint-fanout-a", "endpoint-fanout-b",
+		]);
+		const tables = qualifiedDeliveryTables(mainOptions);
+		const count = async () => Number((await pool.query(
+			`SELECT count(*) count FROM ${tables.event}
+			 WHERE project_id=$1 AND environment_id=$2 AND organization_id='org-fanout'`,
+			[scope.projectId, scope.environmentId],
+		)).rows[0]?.count);
+		expect(await count()).toBe(2);
+		await expect(transactFanout("organization-update-1", event))
+			.rejects.toMatchObject({ code: "DELIVERY_DUPLICATE" });
+		expect(await count()).toBe(2);
+		const poison = {
+			...event,
+			data: { ...event.data, previous: { ...event.data.previous, extra: "poison" } },
+		} as unknown as typeof event;
+		await expect(transactFanout("organization-update-poison", poison))
+			.rejects.toMatchObject({ code: "WEBHOOK_PAYLOAD_INVALID" });
+		expect(await count()).toBe(2);
+
+		const emptyClient = await pool.connect();
+		try {
+			await emptyClient.query("BEGIN");
+			expect(await fanoutOrganizationUpdatedWebhookInExistingTransaction(
+				rawTransaction(emptyClient),
+				{
+					projectId: "project-with-no-endpoints", environmentId: "environment-with-no-endpoints",
+					sourceKey: "empty", event, organizationId: "org-fanout",
+					semanticExpiresAt: expiry, now: start,
+				},
+				keyring,
+				mainOptions,
+			)).toEqual([]);
+			await emptyClient.query("COMMIT");
+		} finally {
+			emptyClient.release();
+		}
+		await Promise.all(deliveries.map((entry) => store.cancel(entry.delivery.jobId, start)));
+	});
+
+	it("applies caller quota policy to managed endpoint delivery, fanout, and tests", async () => {
+		await store.migrate();
+		const scope = { projectId: "project-webhook-quota", environmentId: "environment-webhook-quota" };
+		const created = await createWebhookEndpoint(pool, {
+			...scope,
+			id: "endpoint-quota",
+			name: "Quota endpoint",
+			url: "https://quota.example.test/events",
+			now: start,
+		}, keyring, mainOptions);
+		await updateWebhookEndpoint(pool, {
+			...scope,
+			endpointId: created.endpoint.id,
+			expectedVersion: 1,
+			status: "active",
+			now: start,
+		}, keyring, mainOptions);
+		await enqueue("event-webhook-quota-seed", "job-webhook-quota-seed", "webhook-quota-seed", expiry, {
+			...scope,
+			now: start,
+		});
+		const quota = {
+			maxActive: 1,
+			maxBacklog: 10,
+			maxEnqueuesPerWindow: 10,
+			windowMs: 60_000,
+		};
+		const event = {
+			occurredAt: start.toISOString(),
+			data: {
+				organization: { id: "org-quota", name: "Quota Org", slug: "quota-org", status: "active" },
+				previous: { name: "Old Quota Org", slug: "old-quota-org" },
+			},
+		};
+		const operations = [
+			(transaction: DeliveryRawTransaction) => enqueueWebhookEndpointDeliveryInExistingTransaction(
+				transaction,
+				{
+					...scope,
+					endpointId: created.endpoint.id,
+					expectedVersion: 2,
+					eventKind: "organization.updated",
+					sourceKey: "webhook-quota-direct",
+					event,
+					organizationId: "org-quota",
+					semanticExpiresAt: expiry,
+					quota,
+					now: start,
+				},
+				keyring,
+				mainOptions,
+			),
+			(transaction: DeliveryRawTransaction) => fanoutOrganizationUpdatedWebhookInExistingTransaction(
+				transaction,
+				{
+					...scope,
+					sourceKey: "webhook-quota-fanout",
+					event,
+					organizationId: "org-quota",
+					semanticExpiresAt: expiry,
+					quota,
+					now: start,
+				},
+				keyring,
+				mainOptions,
+			),
+			(transaction: DeliveryRawTransaction) => enqueueWebhookEndpointTestInExistingTransaction(
+				transaction,
+				{
+					...scope,
+					endpointId: created.endpoint.id,
+					expectedVersion: 2,
+					quota,
+					now: start,
+				},
+				keyring,
+				mainOptions,
+			),
+		];
+		for (const operation of operations) {
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
+				await expect(operation(rawTransaction(client))).rejects.toMatchObject({
+					code: "DELIVERY_QUOTA_EXCEEDED",
+					quota: "active",
+					limit: 1,
+				});
+				await client.query("ROLLBACK");
+			} finally {
+				client.release();
+			}
+		}
+		expect((await store.cancel("job-webhook-quota-seed", start))?.state).toBe("cancelled");
+	});
+
+	it("lists endpoint resources with scoped stable keysets and status filters", async () => {
+		await store.migrate();
+		const scope = { projectId: "project-webhook-list", environmentId: "environment-webhook-list" };
+		for (const [id, offset] of [["endpoint-list-a", 1], ["endpoint-list-b", 2], ["endpoint-list-c", 3]] as const) {
+			await createWebhookEndpoint(pool, {
+				...scope, id, name: id, url: `https://${id}.example.test/events`,
+				now: new Date(start.getTime() + offset),
+			}, keyring, mainOptions);
+		}
+		await updateWebhookEndpoint(pool, {
+			...scope, endpointId: "endpoint-list-b", expectedVersion: 1,
+			status: "active", now: new Date(start.getTime() + 4),
+		}, keyring, mainOptions);
+		expect((await listWebhookEndpoints(pool, {
+			...scope, statuses: ["active"],
+		}, keyring, mainOptions)).items).toEqual([
+			expect.objectContaining({
+				id: "endpoint-list-b",
+				url: "https://endpoint-list-b.example.test/events",
+			}),
+		]);
+		const disabledClient = await pool.connect();
+		try {
+			await disabledClient.query("BEGIN");
+			await expect(enqueueWebhookEndpointDeliveryInExistingTransaction(
+				rawTransaction(disabledClient),
+				{
+					...scope,
+					endpointId: "endpoint-list-a",
+					expectedVersion: 1,
+					eventKind: "organization.updated",
+					sourceKey: "disabled-endpoint",
+					event: { occurredAt: start.toISOString(), context: {}, data: {} },
+					semanticExpiresAt: expiry,
+					now: start,
+				},
+				keyring,
+				mainOptions,
+			)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_NOT_ACTIVE" });
+			await disabledClient.query("ROLLBACK");
+		} finally {
+			disabledClient.release();
+		}
+
+		const first = await listWebhookEndpoints(pool, { ...scope, limit: 1 }, keyring, mainOptions);
+		const second = await listWebhookEndpoints(pool, {
+			...scope, limit: 1, cursor: first.nextCursor!,
+		}, keyring, mainOptions);
+		expect(first.items).toHaveLength(1);
+		expect(second.items).toHaveLength(1);
+		expect(second.items[0]?.id).not.toBe(first.items[0]?.id);
+		await expect(listWebhookEndpoints(pool, {
+			projectId: "wrong-project", environmentId: scope.environmentId,
+			limit: 1, cursor: first.nextCursor!,
+		}, keyring, mainOptions)).rejects.toMatchObject({ code: "WEBHOOK_ENDPOINT_CURSOR_INVALID" });
+		expect(await inspectWebhookEndpointScoped(pool, {
+			projectId: "wrong-project", environmentId: scope.environmentId,
+			endpointId: "endpoint-list-a",
+		}, keyring, mainOptions)).toBeNull();
+		expect(await updateWebhookEndpoint(pool, {
+			projectId: "wrong-project", environmentId: scope.environmentId,
+			endpointId: "endpoint-list-a", expectedVersion: 1,
+			name: "Wrong scope", now: start,
+		}, keyring, mainOptions)).toBeNull();
+	});
+
+	it("requires every live endpoint encryption and fingerprint key", async () => {
+		const keyStore = new DeliveryStore(pool, endpointKeyOptions);
+		await keyStore.migrate();
+		const oldEncryption = randomBytes(32);
+		const newEncryption = randomBytes(32);
+		const oldFingerprint = randomBytes(32);
+		const newFingerprint = randomBytes(32);
+		const sourceDedupeKey = randomBytes(32);
+		const oldRing = createDeliveryKeyring({
+			currentKeyId: "endpoint-encryption-old", keys: { "endpoint-encryption-old": oldEncryption },
+			currentFingerprintKeyId: "endpoint-fingerprint-old",
+			fingerprintKeys: { "endpoint-fingerprint-old": oldFingerprint }, sourceDedupeKey,
+		});
+		const retainedRing = createDeliveryKeyring({
+			currentKeyId: "endpoint-encryption-new",
+			keys: { "endpoint-encryption-old": oldEncryption, "endpoint-encryption-new": newEncryption },
+			currentFingerprintKeyId: "endpoint-fingerprint-new",
+			fingerprintKeys: {
+				"endpoint-fingerprint-old": oldFingerprint, "endpoint-fingerprint-new": newFingerprint,
+			}, sourceDedupeKey,
+		});
+		const missingEncryption = createDeliveryKeyring({
+			currentKeyId: "endpoint-encryption-new", keys: { "endpoint-encryption-new": newEncryption },
+			currentFingerprintKeyId: "endpoint-fingerprint-new",
+			fingerprintKeys: {
+				"endpoint-fingerprint-old": oldFingerprint, "endpoint-fingerprint-new": newFingerprint,
+			}, sourceDedupeKey,
+		});
+		const missingFingerprint = createDeliveryKeyring({
+			currentKeyId: "endpoint-encryption-new",
+			keys: { "endpoint-encryption-old": oldEncryption, "endpoint-encryption-new": newEncryption },
+			currentFingerprintKeyId: "endpoint-fingerprint-new",
+			fingerprintKeys: { "endpoint-fingerprint-new": newFingerprint }, sourceDedupeKey,
+		});
+		await createWebhookEndpoint(pool, {
+			projectId: "project-endpoint-keys", environmentId: "environment-endpoint-keys",
+			id: "endpoint-key-history", name: "Historical keys",
+			url: "https://historical-keys.example.test/events", now: start,
+		}, oldRing, endpointKeyOptions);
+		await keyStore.assertDeliveryKeysAvailable(retainedRing, start);
+		await expect(keyStore.assertDeliveryKeysAvailable(missingEncryption, start))
+			.rejects.toMatchObject({ code: "DELIVERY_KEY_UNAVAILABLE" });
+		await expect(keyStore.assertDeliveryKeysAvailable(missingFingerprint, start))
+			.rejects.toMatchObject({ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" });
+	});
+
 	it("processes queued work and preserves source-generation dedupe across fingerprint rotation", async () => {
 		const rotationStore = new DeliveryStore(pool, rotationOptions);
 		await rotationStore.migrate();
 		const encryptionKey = randomBytes(32);
+		const nextEncryptionKey = randomBytes(32);
 		const oldFingerprintKey = randomBytes(32);
 		const newFingerprintKey = randomBytes(32);
 		const sourceDedupeKey = randomBytes(32);
 		const oldKeyring = createDeliveryKeyring({
-			currentKeyId: "payload-current",
-			keys: { "payload-current": encryptionKey },
+			currentKeyId: "payload-old",
+			keys: { "payload-old": encryptionKey },
 			currentFingerprintKeyId: "fingerprint-old",
 			fingerprintKeys: { "fingerprint-old": oldFingerprintKey },
 			sourceDedupeKey,
 		});
 		const rotatedKeyring = createDeliveryKeyring({
-			currentKeyId: "payload-current",
-			keys: { "payload-current": encryptionKey },
+			currentKeyId: "payload-new",
+			keys: { "payload-old": encryptionKey, "payload-new": nextEncryptionKey },
 			currentFingerprintKeyId: "fingerprint-new",
 			fingerprintKeys: {
 				"fingerprint-old": oldFingerprintKey,
@@ -278,10 +1024,20 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			sourceDedupeKey,
 		});
 		const retiredTooEarlyKeyring = createDeliveryKeyring({
-			currentKeyId: "payload-current",
-			keys: { "payload-current": encryptionKey },
+			currentKeyId: "payload-new",
+			keys: { "payload-old": encryptionKey, "payload-new": nextEncryptionKey },
 			currentFingerprintKeyId: "fingerprint-new",
 			fingerprintKeys: { "fingerprint-new": newFingerprintKey },
+			 sourceDedupeKey,
+		});
+		const retiredPayloadTooEarlyKeyring = createDeliveryKeyring({
+			currentKeyId: "payload-new",
+			keys: { "payload-new": nextEncryptionKey },
+			currentFingerprintKeyId: "fingerprint-new",
+			fingerprintKeys: {
+				"fingerprint-old": oldFingerprintKey,
+				"fingerprint-new": newFingerprintKey,
+			},
 			sourceDedupeKey,
 		});
 
@@ -321,6 +1077,8 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		)).rejects.toMatchObject({ code: "DELIVERY_DUPLICATE" });
 
 		await rotationStore.assertFingerprintKeysAvailable(rotatedKeyring);
+		await expect(rotationStore.assertFingerprintKeysAvailable(retiredPayloadTooEarlyKeyring, start))
+			.rejects.toMatchObject({ code: "DELIVERY_KEY_UNAVAILABLE" });
 		await expect(rotationStore.assertFingerprintKeysAvailable(retiredTooEarlyKeyring))
 			.rejects.toMatchObject({ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" });
 		const leased = await rotationStore.claimNext({ workerId: "worker-rotation", now: start });
@@ -362,6 +1120,8 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			workerId: leased!.leaseOwner,
 			now: start,
 		})).state).toBe("delivered");
+		await expect(rotationStore.assertDeliveryKeysAvailable(retiredTooEarlyKeyring, start))
+			.rejects.toMatchObject({ code: "DELIVERY_FINGERPRINT_KEY_UNAVAILABLE" });
 		const tables = qualifiedDeliveryTables(rotationOptions);
 		const persisted = JSON.stringify((await pool.query(
 			`SELECT e.*, j.*, p.envelope FROM ${tables.event} e

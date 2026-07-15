@@ -3,6 +3,14 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { BlockList, isIP } from "node:net";
+import {
+	parseOrganizationUpdatedWebhookPayload,
+	parseWebhookDeliveryPayload,
+	parseWebhookEndpointTestPayload as parseDeliveryWebhookEndpointTestPayload,
+	webhookEndpointUsesSupportedPort,
+	type WebhookDeliveryPayload,
+	type WebhookEndpointTestPayload,
+} from "@clearance/delivery";
 import type { WorkerConfig } from "./config.js";
 import type { SendResult } from "./smtp.js";
 
@@ -10,15 +18,7 @@ export type WebhookSendContext = { jobId: string; eventId: string };
 export type WebhookSender = { send(payload: unknown, context: WebhookSendContext): Promise<SendResult> };
 export type WebhookErrorInfo = { retryable: boolean; errorClass: string; providerStatus?: string };
 
-type OrganizationUpdatedPayload = {
-	version: 1;
-	endpoint: { id: string; url: string; signingSecret: string };
-	event: {
-		id: string; type: "organization.updated"; occurredAt: string;
-		context: { projectId: string; environmentId: string; organizationId: string; actor: string; correlationId: string };
-		data: { organization: { id: string; name: string; slug: string; status: string }; previous: { name: string; slug: string } };
-	};
-};
+type WebhookPayload = WebhookDeliveryPayload;
 
 const blocked = new BlockList();
 const publicIpv6 = new BlockList();
@@ -33,67 +33,14 @@ for (const [network, prefix] of [
 	["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8], ["2001:db8::", 32],
 ] as const) blocked.addSubnet(network, prefix, "ipv6");
 
-function exactObject(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
-	if (!value || Array.isArray(value) || typeof value !== "object") throw webhookError("WEBHOOK_PAYLOAD_INVALID", `${label} must be an object`);
-	const record = value as Record<string, unknown>;
-	const actual = Object.keys(record).sort();
-	const expected = [...keys].sort();
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) throw webhookError("WEBHOOK_PAYLOAD_INVALID", `${label} fields are invalid`);
-	return record;
-}
-
-function jsonText(value: unknown, label: string, max = 512): string {
-	if (typeof value !== "string" || !value || value.length > max) {
-		throw webhookError("WEBHOOK_PAYLOAD_INVALID", `${label} is invalid`);
-	}
-	return value;
-}
-
-function singleLineText(value: unknown, label: string, max = 512): string {
-	const raw = jsonText(value, label, max);
-	if (/[\r\n]/.test(raw)) throw webhookError("WEBHOOK_PAYLOAD_INVALID", `${label} is invalid`);
-	return raw;
-}
-
-function iso(value: unknown, label: string): string {
-	const raw = singleLineText(value, label, 64);
-	const date = new Date(raw);
-	if (!Number.isFinite(date.getTime()) || date.toISOString() !== raw) throw webhookError("WEBHOOK_PAYLOAD_INVALID", `${label} is invalid`);
-	return raw;
-}
-
 function webhookError(code: string, message: string, extra: Record<string, unknown> = {}): Error {
 	return Object.assign(new Error(message), { code, ...extra });
 }
 
-export function parseOrganizationUpdatedPayload(value: unknown): OrganizationUpdatedPayload {
-	const root = exactObject(value, ["version", "endpoint", "event"], "payload");
-	if (root.version !== 1) throw webhookError("WEBHOOK_PAYLOAD_INVALID", "Webhook payload version is invalid");
-	const endpoint = exactObject(root.endpoint, ["id", "url", "signingSecret"], "endpoint");
-	const event = exactObject(root.event, ["id", "type", "occurredAt", "context", "data"], "event");
-	if (event.type !== "organization.updated") throw webhookError("WEBHOOK_PAYLOAD_INVALID", "Webhook event type is invalid");
-	const context = exactObject(event.context, ["projectId", "environmentId", "organizationId", "actor", "correlationId"], "context");
-	const data = exactObject(event.data, ["organization", "previous"], "data");
-	const organization = exactObject(data.organization, ["id", "name", "slug", "status"], "organization");
-	const previous = exactObject(data.previous, ["name", "slug"], "previous");
-	const signingSecret = jsonText(endpoint.signingSecret, "signingSecret", 4_096);
-	if (signingSecret.length < 32) throw webhookError("WEBHOOK_PAYLOAD_INVALID", "Webhook signing secret is too short");
-	return {
-		version: 1,
-		endpoint: { id: singleLineText(endpoint.id, "endpoint.id", 128), url: singleLineText(endpoint.url, "endpoint.url", 8_192), signingSecret },
-		event: {
-			id: singleLineText(event.id, "event.id", 128), type: "organization.updated", occurredAt: iso(event.occurredAt, "event.occurredAt"),
-			context: {
-				projectId: singleLineText(context.projectId, "context.projectId"), environmentId: singleLineText(context.environmentId, "context.environmentId"),
-				organizationId: singleLineText(context.organizationId, "context.organizationId"), actor: singleLineText(context.actor, "context.actor"),
-				correlationId: singleLineText(context.correlationId, "context.correlationId"),
-			},
-			data: {
-				organization: { id: singleLineText(organization.id, "organization.id"), name: jsonText(organization.name, "organization.name", 1_024), slug: singleLineText(organization.slug, "organization.slug"), status: jsonText(organization.status, "organization.status", 64) },
-				previous: { name: jsonText(previous.name, "previous.name", 1_024), slug: singleLineText(previous.slug, "previous.slug") },
-			},
-		},
-	};
+export const parseOrganizationUpdatedPayload = parseOrganizationUpdatedWebhookPayload;
+export const parseWebhookPayload = parseWebhookDeliveryPayload;
+export function parseWebhookEndpointTestPayload(value: unknown): WebhookEndpointTestPayload {
+	return parseDeliveryWebhookEndpointTestPayload(value);
 }
 
 function canonical(value: unknown): string {
@@ -103,7 +50,7 @@ function canonical(value: unknown): string {
 }
 
 export function canonicalWebhookBytes(
-	payload: OrganizationUpdatedPayload,
+	payload: WebhookPayload,
 	maxBytes = 1_048_576,
 ): Buffer {
 	const bytes = Buffer.from(canonical({ version: payload.version, event: payload.event }), "utf8");
@@ -174,11 +121,12 @@ function validateEndpoint(raw: string, allowInsecureLoopback: boolean): { url: U
 	if (url.username || url.password || url.hash) throw webhookError("WEBHOOK_ENDPOINT_INVALID", "Webhook endpoint credentials and fragments are refused");
 	const loopback = url.protocol === "http:" && allowInsecureLoopback && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname.toLowerCase());
 	if (url.protocol !== "https:" && !loopback) throw webhookError("WEBHOOK_ENDPOINT_INVALID", "Webhook endpoint requires HTTPS");
+	if (!webhookEndpointUsesSupportedPort(url)) throw webhookError("WEBHOOK_ENDPOINT_INVALID", "Webhook HTTPS endpoint requires port 443");
 	return { url, loopback };
 }
 
 export function webhookDestination(value: unknown): string {
-	return parseOrganizationUpdatedPayload(value).endpoint.url;
+	return parseWebhookPayload(value).endpoint.url;
 }
 
 export type PinnedWebhookRequest = (input: {
@@ -257,7 +205,7 @@ export function createWebhookSender(config: WorkerConfig, dependencies: {
 	lookup?: DnsLookup; request?: PinnedWebhookRequest; now?: () => number;
 } = {}): WebhookSender {
 	return { async send(value, context) {
-		const payload = parseOrganizationUpdatedPayload(value);
+		const payload = parseWebhookPayload(value);
 		if (payload.event.id !== context.eventId) throw webhookError("WEBHOOK_PAYLOAD_INVALID", "Webhook event identity differs from delivery identity");
 		const { url, loopback } = validateEndpoint(payload.endpoint.url, config.webhook.allowInsecureLoopback);
 		const pinned = await resolvePinned(url.hostname, loopback, dependencies.lookup ?? dnsLookup as DnsLookup, config.webhook.dnsTimeoutMs);
