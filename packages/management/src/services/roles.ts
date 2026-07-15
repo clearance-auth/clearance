@@ -5,7 +5,7 @@
  * are virtual system definitions — always listed, never created/updated.
  * Custom roles persist in DataStoreSnapshot.roles.
  */
-import type { ManagementStore } from "../store/types.js";
+import type { ManagementSnapshotReader, ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { CustomRole } from "../types/resources.js";
 import { appendAuditEvent } from "./audit.js";
@@ -114,7 +114,7 @@ export type AssignableRole = {
  * Fail closed with stable structured errors for missing/foreign/disabled/archived.
  */
 export function resolveAssignableRole(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	roleInput: unknown,
 	opts: {
 		scope: ResourceScope;

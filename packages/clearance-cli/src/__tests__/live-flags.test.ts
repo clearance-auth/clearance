@@ -18,7 +18,7 @@ function run(args: string[], dataPath: string): { stdout: string; status: number
 	try {
 		const stdout = execFileSync(
 			process.execPath,
-			[entry, ...args, "--json", "--no-input", "--data-path", dataPath],
+			[entry, ...args, "--json", "--no-input"],
 			{
 				encoding: "utf8",
 				env: {

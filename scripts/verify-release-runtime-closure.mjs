@@ -109,7 +109,8 @@ const bundledRuntimePackages = new Set([
 	"@clearance/drizzle-adapter",
 	"@clearance/prisma-adapter",
 ]);
-const forbiddenDependency = Object.keys(declaredDependencies)
+const declaredDependencyNames = Object.keys(declaredDependencies);
+const forbiddenDependency = declaredDependencyNames
 	.find((name) => bundledRuntimePackages.has(name));
 if (forbiddenDependency) throw new Error(`Published auth runtime still depends on substitutable package ${forbiddenDependency}.`);
 const localDependency = Object.entries(declaredDependencies).find(([, metadata]) =>
@@ -120,7 +121,11 @@ if (localDependency) {
 	throw new Error(`Published package has unresolved local ${metadata.section} entry ${name}@${metadata.version}.`);
 }
 
-const allowedBare = new Set([...dependencies, ...builtinModules, ...builtinModules.map((name) => `node:${name}`)]);
+const allowedBare = new Set([
+	...declaredDependencyNames,
+	...builtinModules,
+	...builtinModules.map((name) => `node:${name}`),
+]);
 const runtimeFiles = entries.filter((entry) => /^package\/dist\/.*\.(?:mjs|cjs|js)$/.test(entry));
 if (runtimeFiles.length === 0) throw new Error("Auth tarball contains no runtime files.");
 function collectBareImports(files) {

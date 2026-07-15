@@ -36,7 +36,7 @@ clearance login --profile production --url https://clearance.example.com
 clearance --profile production users list
 ```
 
-Every operational command uses the authenticated `/v1/*` management API and its server-derived project/environment scope. The CLI reads or writes explicitly named local artifacts for import, export, schema, backup, and upgrade workflows while all validation and state changes stay behind the API:
+Every operational command uses the authenticated `/v1/*` management API and its server-derived project/environment scope. The CLI reads or writes explicitly named local artifacts for import, export, and schema workflows. Backup and upgrade storage remains server-controlled, and all validation and state changes stay behind the API:
 
 ```bash
 clearance --profile production init --name my-app

@@ -57,12 +57,24 @@ export const WRITE_ONLY_SECRET_FIELDS = [
 	"bearerTokenEncrypted",
 ] as const;
 
+export type PublicIdentityConnection = Omit<
+	IdentityConnection,
+	"clientSecretEncrypted" | "clientSecretKeyId"
+> & {
+	hasClientSecret: boolean;
+};
+
+export type PublicDirectoryConnection = Omit<
+	DirectoryConnection,
+	"bearerTokenEncrypted" | "bearerTokenKeyId"
+> & {
+	hasBearerToken: boolean;
+};
+
 /** Public domain view of SSO connection — encrypted material stripped. */
 export function publicIdentityConnection(
 	conn: IdentityConnection,
-): Omit<IdentityConnection, "clientSecretEncrypted" | "clientSecretKeyId"> & {
-	hasClientSecret: boolean;
-} {
+): PublicIdentityConnection {
 	const {
 		clientSecretEncrypted: _e,
 		clientSecretKeyId: _k,
@@ -77,10 +89,7 @@ export function publicIdentityConnection(
 /** Public domain view of SCIM connection — encrypted material stripped. */
 export function publicDirectoryConnection(
 	conn: DirectoryConnection,
-): Omit<
-	DirectoryConnection,
-	"bearerTokenEncrypted" | "bearerTokenKeyId"
-> & { hasBearerToken: boolean } {
+): PublicDirectoryConnection {
 	const { bearerTokenEncrypted: _e, bearerTokenKeyId: _k, ...rest } = conn;
 	return {
 		...rest,

@@ -112,7 +112,10 @@ export function parseConfigJson(input: string): ConfigRecord {
 	return result;
 }
 
-function validateRecordShape(config: ConfigRecord): void {
+export function assertConfigRecord(config: unknown): asserts config is ConfigRecord {
+	if (!config || typeof config !== "object" || Array.isArray(config)) {
+		invalid("Config must be a JSON object with string values.");
+	}
 	for (const [key, value] of Object.entries(config)) {
 		if (
 			!key.trim() ||
@@ -123,6 +126,9 @@ function validateRecordShape(config: ConfigRecord): void {
 			key === "prototype"
 		) {
 			invalid("Config keys must be non-empty, printable, and within the maximum length.");
+		}
+		if (typeof value !== "string") {
+			invalid("Config values must be JSON strings.");
 		}
 		if (value.length > MAX_VALUE_LENGTH || CONTROL_CHARACTERS.test(value)) {
 			invalid("Config values must be printable and within the maximum length.");
@@ -138,8 +144,8 @@ function validateRecordShape(config: ConfigRecord): void {
 	}
 }
 
-export function validateConfig(store: ManagementStore, config: ConfigRecord): ConfigRecord {
-	validateRecordShape(config);
+export function validateConfig(store: ManagementStore, config: unknown): ConfigRecord {
+	assertConfigRecord(config);
 	const hasProjectId = hasOwn(config, "projectId");
 	const hasEnvironmentId = hasOwn(config, "environmentId");
 	const projectId = config.projectId;

@@ -9,6 +9,7 @@ import {
 	rotateCredential,
 } from "./credentials.js";
 import { ClearanceError } from "./errors.js";
+import { resolveEnterpriseConnection } from "./enterprise-connection-lifecycle.js";
 import { addMember, createUser, inspectOrganization } from "./core.js";
 import {
 	probeOutcomeToError,
@@ -37,46 +38,14 @@ export function resolveScimConnection(
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
 ): DirectoryConnection {
-	const stage = opts?.stage ?? "scim.resolve";
-	const connectionId = id?.trim();
-	if (!connectionId) {
-		throw new ClearanceError({
-			code: "SCIM_ID_REQUIRED",
-			message: "SCIM connection id is required",
-			stage,
-			status: 400,
-		});
-	}
-	const conn = store.snapshot.directoryConnections.find(
-		(c) => c.id === connectionId,
-	);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SCIM_NOT_FOUND",
-			message: `SCIM connection ${connectionId} not found`,
-			stage,
-			status: 404,
-		});
-	}
-	const scope = opts?.scope ?? resolveOperatorScope(store);
-	// Fail closed: missing/cross-scope org must not leak as ORG_NOT_FOUND.
-	try {
-		inspectOrganization(store, conn.organizationId, scope);
-	} catch (error) {
-		if (
-			error instanceof ClearanceError &&
-			(error.code === "ORG_NOT_FOUND" || error.status === 404)
-		) {
-			throw new ClearanceError({
-				code: "SCIM_NOT_FOUND",
-				message: `SCIM connection ${connectionId} not found`,
-				stage,
-				status: 404,
-			});
-		}
-		throw error;
-	}
-	return conn;
+	return resolveEnterpriseConnection(store, id, {
+		connections: store.snapshot.directoryConnections,
+		scope: opts?.scope,
+		stage: opts?.stage ?? "scim.resolve",
+		label: "SCIM",
+		idRequiredCode: "SCIM_ID_REQUIRED",
+		notFoundCode: "SCIM_NOT_FOUND",
+	});
 }
 
 /** Public inspect — never returns encrypted bearer material. */

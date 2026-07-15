@@ -6,6 +6,7 @@ import { appendAuditEvent, recordEvent } from "./audit.js";
 import { encryptCredential, rotateCredential } from "./credentials.js";
 import { ClearanceError } from "./errors.js";
 import { inspectOrganization } from "./core.js";
+import { resolveEnterpriseConnection } from "./enterprise-connection-lifecycle.js";
 import { publicIdentityConnection } from "./redact.js";
 import {
 	resolveOperatorScope,
@@ -31,44 +32,14 @@ export function resolveSsoConnection(
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
 ): IdentityConnection {
-	const stage = opts?.stage ?? "sso.resolve";
-	const connectionId = id?.trim();
-	if (!connectionId) {
-		throw new ClearanceError({
-			code: "SSO_ID_REQUIRED",
-			message: "SSO connection id is required",
-			stage,
-			status: 400,
-		});
-	}
-	const conn = store.snapshot.identityConnections.find((c) => c.id === connectionId);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SSO_NOT_FOUND",
-			message: `SSO connection ${connectionId} not found`,
-			stage,
-			status: 404,
-		});
-	}
-	const scope = opts?.scope ?? resolveOperatorScope(store);
-	// Fail closed: missing/cross-scope org must not leak as ORG_NOT_FOUND.
-	try {
-		inspectOrganization(store, conn.organizationId, scope);
-	} catch (error) {
-		if (
-			error instanceof ClearanceError &&
-			(error.code === "ORG_NOT_FOUND" || error.status === 404)
-		) {
-			throw new ClearanceError({
-				code: "SSO_NOT_FOUND",
-				message: `SSO connection ${connectionId} not found`,
-				stage,
-				status: 404,
-			});
-		}
-		throw error;
-	}
-	return conn;
+	return resolveEnterpriseConnection(store, id, {
+		connections: store.snapshot.identityConnections,
+		scope: opts?.scope,
+		stage: opts?.stage ?? "sso.resolve",
+		label: "SSO",
+		idRequiredCode: "SSO_ID_REQUIRED",
+		notFoundCode: "SSO_NOT_FOUND",
+	});
 }
 
 /** Public inspect — never returns encrypted secret material. */

@@ -6,6 +6,18 @@ import { sso } from "@clearance/sso";
 import { scim } from "@clearance/scim";
 import { Kysely, PostgresDialect } from "kysely";
 import pg from "pg";
+import {
+	MINIMUM_SECRET_LENGTH,
+	isForbiddenDefaultSecret,
+} from "./secret-policy.js";
+import type {
+	ClearanceAuthBundle,
+	ClearanceRuntimeMigrationPlan,
+	ClearanceRuntimeMigrationResult,
+	ClearanceRuntimeUser,
+	CreateClearanceAuthOptions,
+	SocialProviderConfig,
+} from "./public-types/index.js";
 
 export const CLEARANCE_AUTH_VERSION = "0.2.1";
 export const RUNTIME_BASELINE = {
@@ -13,81 +25,19 @@ export const RUNTIME_BASELINE = {
 	version: "1.6.23",
 } as const;
 
-/** Secrets production must refuse (mirrored in @clearance/management secrets policy). */
-const FORBIDDEN_DEFAULT_SECRETS = [
-	"dev-secret-change-me",
-	"dev-secret-change-me-please-32chars!!",
-	"secret",
-	"local-compose-secret-change-me-32",
-	"test-secret-value-32-characters",
-	"test-secret-value-that-is-long-enough",
-	"test-secret-value-that-is-long-enough-32",
-	"change-me",
-	"password",
-	"clearance",
-	"clearance-secret",
-];
-
-export function isForbiddenDefaultSecret(secret: string): boolean {
-	const s = secret.trim();
-	if (s.length < 16) return true;
-	const lower = s.toLowerCase();
-	return FORBIDDEN_DEFAULT_SECRETS.some(
-		(d) => lower === d.toLowerCase() || lower.includes("change-me") || lower.includes("dev-secret"),
-	);
-}
-
-/** Runtime user shape passed to management identity bridge hooks. */
-export type ClearanceRuntimeUser = {
-	id: string;
-	email: string;
-	name: string;
-	createdAt: Date;
-	updatedAt: Date;
-	emailVerified: boolean;
-	image?: string | null;
-};
-
-export type CreateClearanceAuthOptions = {
-	baseURL: string;
-	secret: string;
-	databaseUrl: string;
-	/** Enable the @clearance/sso SAML/OIDC plugin. */
-	enableSso?: boolean;
-	/** Enable the @clearance/scim provisioning plugin. */
-	enableScim?: boolean;
-	trustedOrigins?: string[];
-	/** Override rate limiting (default: enabled) */
-	rateLimitEnabled?: boolean;
-	/** When true, refuse default secrets even outside production */
-	strictSecrets?: boolean;
-	/**
-	 * Called after a runtime user row is created (signup). Wire this to
-	 * syncRuntimeUserToManagementDurable so management surfaces share the
-	 * same stable id. Failures must not be swallowed by the caller.
-	 */
-	onUserCreated?: (user: ClearanceRuntimeUser) => void | Promise<void>;
-	/** Configured OAuth providers; omitted providers do not appear as sign-in options. */
-	socialProviders?: ClearanceOptions["socialProviders"];
-};
-
-/** A compiled Clearance migration plan for the configured Postgres runtime. */
-export type ClearanceRuntimeMigrationPlan = {
-	pendingTables: number;
-	pendingFields: number;
-	compileSql: () => Promise<string>;
-	apply: () => Promise<void>;
-};
-
-export type ClearanceRuntimeMigrationResult = {
-	appliedTables: number;
-	appliedFields: number;
-};
+export type {
+	ClearanceAuthBundle,
+	ClearanceRuntimeMigrationPlan,
+	ClearanceRuntimeMigrationResult,
+	ClearanceRuntimeUser,
+	CreateClearanceAuthOptions,
+	SocialProviderConfig,
+} from "./public-types/index.js";
 
 export function socialProvidersFromEnvironment(
 	env: Record<string, string | undefined> = process.env,
-): NonNullable<ClearanceOptions["socialProviders"]> {
-	const providers: NonNullable<ClearanceOptions["socialProviders"]> = {};
+): Record<string, SocialProviderConfig> {
+	const providers: Record<string, SocialProviderConfig> = {};
 	if (Boolean(env.CLEARANCE_GITHUB_CLIENT_ID) !== Boolean(env.CLEARANCE_GITHUB_CLIENT_SECRET)) {
 		throw new Error(
 			"GitHub social login requires both CLEARANCE_GITHUB_CLIENT_ID and CLEARANCE_GITHUB_CLIENT_SECRET",
@@ -133,7 +83,9 @@ export async function decryptRuntimeCredential(
  * Postgres is the data plane via Kysely.
  * Production (NODE_ENV=production) refuses default/weak secrets.
  */
-export function createClearanceAuth(options: CreateClearanceAuthOptions) {
+export function createClearanceAuth(
+	options: CreateClearanceAuthOptions,
+): ClearanceAuthBundle {
 	const nodeEnv = process.env.NODE_ENV ?? "development";
 	const strict =
 		options.strictSecrets === true ||
@@ -145,7 +97,7 @@ export function createClearanceAuth(options: CreateClearanceAuthOptions) {
 			"Production refuses default/weak CLEARANCE_SECRET. Set a strong random secret (openssl rand -base64 32).",
 		);
 	}
-	if (!options.secret || options.secret.length < 16) {
+	if (!options.secret || options.secret.length < MINIMUM_SECRET_LENGTH) {
 		throw new Error("CLEARANCE_SECRET must be at least 16 characters");
 	}
 	if (!options.databaseUrl) {
@@ -232,7 +184,7 @@ export function createClearanceAuth(options: CreateClearanceAuthOptions) {
 		user: {
 			additionalFields: userAdditionalFields,
 		},
-		socialProviders: options.socialProviders,
+		socialProviders: options.socialProviders as ClearanceOptions["socialProviders"],
 		trustedOrigins: options.trustedOrigins ?? [options.baseURL],
 		telemetry: { enabled: false },
 		rateLimit,
@@ -362,5 +314,3 @@ export function createClearanceAuth(options: CreateClearanceAuthOptions) {
 		},
 	};
 }
-
-export type ClearanceAuthBundle = ReturnType<typeof createClearanceAuth>;

@@ -9,6 +9,7 @@ import {
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isForbiddenDefaultSecret } from "@clearance/auth/secret-policy";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const publicDir = join(__dirname, "..", "public");
@@ -118,18 +119,6 @@ export function parseOperatorAccounts(env = process.env) {
 	return [...byName.values()];
 }
 
-function isWeakSecret(value) {
-	if (!value || value.length < 16) return true;
-	const lower = value.toLowerCase();
-	return (
-		lower.includes("change-me") ||
-		lower.includes("dev-secret") ||
-		lower === "secret" ||
-		lower === "password" ||
-		lower === "clearance"
-	);
-}
-
 /**
  * Resolve console runtime config from env or explicit options.
  * Operator token (upstream management API) and session material are server-only.
@@ -163,6 +152,9 @@ export function resolveConfig(overrides = {}) {
 			process.env.CLEARANCE_CONSOLE_SESSION_SECRET ??
 			"",
 	);
+	const operatorToken = String(
+		overrides.operatorToken ?? process.env.CLEARANCE_OPERATOR_TOKEN ?? "",
+	);
 
 	const nodeEnv =
 		overrides.nodeEnv ?? process.env.NODE_ENV ?? "development";
@@ -175,15 +167,12 @@ export function resolveConfig(overrides = {}) {
 				"Production console requires CLEARANCE_CONSOLE_OPERATORS (or ADMIN_USER/PASSWORD)",
 			);
 		}
-		if (!sessionSecret || isWeakSecret(sessionSecret)) {
+		if (isForbiddenDefaultSecret(sessionSecret)) {
 			throw new Error(
 				"Production console requires strong CLEARANCE_CONSOLE_SESSION_SECRET (≥16 chars)",
 			);
 		}
-		const operatorToken = String(
-			overrides.operatorToken ?? process.env.CLEARANCE_OPERATOR_TOKEN ?? "",
-		);
-		if (!operatorToken || isWeakSecret(operatorToken)) {
+		if (isForbiddenDefaultSecret(operatorToken)) {
 			throw new Error(
 				"Production console requires strong CLEARANCE_OPERATOR_TOKEN (upstream, server-only)",
 			);
@@ -205,9 +194,7 @@ export function resolveConfig(overrides = {}) {
 			overrides.apiBase ?? process.env.CLEARANCE_API_URL ?? DEFAULT_API_BASE,
 		).replace(/\/$/, ""),
 		/** Upstream management API credential — never sent to browser */
-		operatorToken: String(
-			overrides.operatorToken ?? process.env.CLEARANCE_OPERATOR_TOKEN ?? "",
-		),
+		operatorToken,
 		projectId: String(projectId || ""),
 		environmentId: String(environmentId || ""),
 		publicDir: overrides.publicDir ?? publicDir,
@@ -242,10 +229,10 @@ export function assertConsoleProductionConfig(config = resolveConfig()) {
 	if (!config.operators?.length) {
 		throw new Error("Console production: no operator accounts configured");
 	}
-	if (!config.sessionSecret || isWeakSecret(config.sessionSecret)) {
+	if (isForbiddenDefaultSecret(config.sessionSecret)) {
 		throw new Error("Console production: unsafe session secret");
 	}
-	if (!config.operatorToken || isWeakSecret(config.operatorToken)) {
+	if (isForbiddenDefaultSecret(config.operatorToken)) {
 		throw new Error("Console production: missing/unsafe upstream operator token");
 	}
 	return config;

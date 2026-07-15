@@ -5,7 +5,6 @@ export interface GlobalOpts {
 	noInput?: boolean;
 	yes?: boolean;
 	dryRun?: boolean;
-	dataPath?: string;
 	profile?: string;
 	apiUrl?: string;
 }

@@ -35,7 +35,7 @@ SHIPPING=(
 
 required_dist_for() {
   case "$1" in
-    "@clearance/auth") echo "dist/index.mjs dist/client.mjs dist/node.mjs types/index.d.ts types/client.d.ts types/node.d.ts" ;;
+    "@clearance/auth") echo "dist/index.mjs dist/client.mjs dist/node.mjs dist/secret-policy.mjs types/index.d.ts types/client.d.ts types/node.d.ts types/secret-policy.d.ts" ;;
     "@clearance/management") echo "dist/index.mjs" ;;
     "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
     "@clearance/api") echo "dist/server.js" ;;
@@ -138,6 +138,7 @@ import { createClearanceAuth, type CreateClearanceAuthOptions } from "@clearance
 import { JsonStore, type ManagementStore } from "@clearance/management";
 import type {} from "@clearance/auth/client";
 import type {} from "@clearance/auth/node";
+import { isForbiddenDefaultSecret } from "@clearance/auth/secret-policy";
 
 declare const options: CreateClearanceAuthOptions;
 declare const store: ManagementStore;
@@ -145,6 +146,7 @@ void createClearanceAuth;
 void JsonStore;
 void options;
 void store;
+void isForbiddenDefaultSecret;
 `);
 fs.writeFileSync("tsconfig.json", `${JSON.stringify({
   compilerOptions: {
@@ -268,6 +270,7 @@ const { JsonStore } = management;
 
 const client = await import("@clearance/auth/client");
 const node = await import("@clearance/auth/node");
+const secretPolicy = await import("@clearance/auth/secret-policy");
 
 const apiPort = await new Promise((resolve, reject) => {
   const probe = net.createServer();
@@ -305,6 +308,9 @@ const checks = [
   ["JsonStore", typeof JsonStore === "function"],
   ["auth/client", client != null && typeof client === "object"],
   ["auth/node", node != null && typeof node === "object"],
+  ["auth/secret-policy", typeof secretPolicy.isForbiddenDefaultSecret === "function"],
+  ["auth/secret-policy rejects default", secretPolicy.isForbiddenDefaultSecret("clearance-secret")],
+  ["auth/secret-policy accepts strong value", !secretPolicy.isForbiddenDefaultSecret("nF9vQ2mL8xT4sR7pK3wZ6cY1")],
   ["api.start", typeof api.start === "function"],
   ["api.app", api.app != null],
 ];

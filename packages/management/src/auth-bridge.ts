@@ -26,6 +26,7 @@ import {
 } from "@clearance/auth";
 import { randomBytes } from "node:crypto";
 import type {
+	AuditEvent,
 	DataStoreSnapshot,
 	Membership,
 	Organization,
@@ -69,11 +70,32 @@ import {
 	encodePageCursor,
 } from "./services/pagination.js";
 import type { ManagementStore } from "./store/types.js";
+import type { OperationContext } from "./application/context.js";
+import type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
+
+export type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
 
 export {
 	syncRuntimeUserToManagement,
 	syncRuntimeUserToManagementDurable,
 } from "./services/identity.js";
+
+function managementSyncOptions(
+	context: OperationContext | undefined,
+): {
+	projectId?: string;
+	environmentId?: string;
+	actor?: string;
+	source: AuditEvent["source"];
+} {
+	if (!context) return { source: "system" };
+	return {
+		projectId: context.scope.projectId,
+		environmentId: context.scope.environmentId,
+		actor: context.actor,
+		source: context.source,
+	};
+}
 
 let bundle: ClearanceAuthBundle | null = null;
 
@@ -158,6 +180,7 @@ export async function createUserInAuth(input: {
 	password: string;
 	/** When set, persists the runtime user into management with the same stable id */
 	managementStore?: ManagementStore;
+	operationContext?: OperationContext;
 }): Promise<Principal> {
 	const b = getAuthBundle();
 	const result = await b.auth.api.signUpEmail({
@@ -196,24 +219,17 @@ export async function createUserInAuth(input: {
 
 	if (input.managementStore) {
 		// Durable canonical bridge — failures propagate (not swallowed)
-		return syncRuntimeUserToManagementDurable(input.managementStore, {
-			id: user.id,
-			email: user.email,
-			name: user.name,
-			createdAt: user.createdAt,
-			updatedAt: user.updatedAt,
-		}, { source: "system" });
+		return syncRuntimeUserToManagementDurable(
+			input.managementStore,
+			user,
+			managementSyncOptions(input.operationContext),
+		);
 	}
 
 	return principal;
 }
 
 export const PASSWORD_SETUP_TTL_SECONDS = 60 * 60;
-
-export type PasswordSetupGrant = {
-	token: string;
-	expiresAt: string;
-};
 
 /**
  * Provision a user without issuing a reusable temporary credential.
@@ -226,6 +242,7 @@ export async function createUserWithPasswordSetupInAuth(input: {
 	email: string;
 	name: string;
 	managementStore?: ManagementStore;
+	operationContext?: OperationContext;
 }): Promise<{ user: Principal; passwordSetup: PasswordSetupGrant }> {
 	const b = getAuthBundle();
 	const inaccessiblePassword = `Clr!${randomBytes(32).toString("base64url")}aA1`;
@@ -256,13 +273,11 @@ export async function createUserWithPasswordSetupInAuth(input: {
 			expiresAt,
 		});
 		const durableUser = input.managementStore
-			? await syncRuntimeUserToManagementDurable(input.managementStore, {
-					id: user.id,
-					email: user.email,
-					name: user.name,
-					createdAt: user.createdAt,
-					updatedAt: user.updatedAt,
-				}, { source: "system" })
+			? await syncRuntimeUserToManagementDurable(
+					input.managementStore,
+					user,
+					managementSyncOptions(input.operationContext),
+				)
 			: user;
 		return {
 			user: durableUser,
@@ -382,7 +397,9 @@ export async function countAuthTables(): Promise<Record<string, number>> {
 	const out: Record<string, number> = {};
 	for (const t of tables) {
 		try {
-			const r = await b.pool.query(`select count(*)::int as c from "${t}"`);
+			const r = await b.pool.query<{ c: number }>(
+				`select count(*)::int as c from "${t}"`,
+			);
 			out[t] = r.rows[0]?.c ?? 0;
 		} catch {
 			out[t] = -1;
@@ -1207,7 +1224,7 @@ type CoordinatedQuery = (
 	params?: unknown[],
 ) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
 
-type LifecycleSource = "cli" | "console" | "api" | "import" | "scim" | "system";
+type LifecycleSource = AuditEvent["source"] | "import";
 
 function requireCoordinatedStore(
 	store: ManagementStore,
@@ -2178,7 +2195,7 @@ export async function removeMemberInAuth(
 /** Matches management core ORG_SLUG_RE — keep in lockstep. */
 const ORG_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
-type OrgLifecycleSource = "cli" | "console" | "api" | "import" | "system";
+type OrgLifecycleSource = AuditEvent["source"] | "import";
 
 /**
  * Update organization name and/or slug with identical values in Clearance

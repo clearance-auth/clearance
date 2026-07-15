@@ -14,13 +14,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import pg from "pg";
-import type { DataStoreSnapshot } from "../types/resources.js";
 import {
 	CLEARANCE_RELEASE_VERSION,
+	cloneSnapshot,
 	emptySnapshot,
 	normalizeSnapshot,
+	snapshotResourceCounts,
 	STORE_SCHEMA_VERSION,
-} from "./json-store.js";
+} from "./snapshot.js";
+import type { DataStoreSnapshot } from "../types/resources.js";
 import type { ManagementStore } from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
@@ -30,10 +32,6 @@ function safeTableName(value: string): string {
 		throw new Error(`Invalid Postgres snapshot table name: ${value}`);
 	}
 	return value;
-}
-
-function cloneSnapshot(data: DataStoreSnapshot): DataStoreSnapshot {
-	return JSON.parse(JSON.stringify(data)) as DataStoreSnapshot;
 }
 
 export class PgStore implements ManagementStore {
@@ -237,22 +235,7 @@ export class PgStore implements ManagementStore {
 	}
 
 	resourceCounts(): Record<string, number> {
-		const d = this.data;
-		return {
-			projects: d.projects.length,
-			environments: d.environments.length,
-			principals: d.principals.length,
-			organizations: d.organizations.length,
-			memberships: d.memberships.length,
-			identityConnections: d.identityConnections.length,
-			directoryConnections: d.directoryConnections.length,
-			roles: (d.roles ?? []).length,
-			events: d.events.length,
-			traces: d.traces.length,
-			migrations: d.migrations.length,
-			sessions: d.sessions.filter((s) => s.status === "active").length,
-			apiKeys: (d.apiKeys ?? []).length,
-		};
+		return snapshotResourceCounts(this.data);
 	}
 
 	async destroy(): Promise<void> {
@@ -363,7 +346,7 @@ export class PgStore implements ManagementStore {
 			let base: DataStoreSnapshot;
 			let rev: number;
 			if (result.rows[0]?.data) {
-				base = cloneSnapshot(result.rows[0].data);
+				base = normalizeSnapshot(cloneSnapshot(result.rows[0].data));
 				rev = Number(result.rows[0].revision ?? 0);
 			} else {
 				base = emptySnapshot({ storeBackend: "postgres" });
@@ -413,7 +396,7 @@ export class PgStore implements ManagementStore {
 				revision: string | number;
 			}>(`SELECT data, revision FROM ${this.table} WHERE id = 1 FOR UPDATE`);
 			const base = result.rows[0]?.data
-				? cloneSnapshot(result.rows[0].data)
+				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
 			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
 			const value = fn(base);
@@ -456,7 +439,7 @@ export class PgStore implements ManagementStore {
 				revision: string | number;
 			}>(`SELECT data, revision FROM ${this.table} WHERE id = 1 FOR UPDATE`);
 			const base = result.rows[0]?.data
-				? cloneSnapshot(result.rows[0].data)
+				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
 			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
 

@@ -2,7 +2,7 @@
  * CLI and API use runtime-first lifecycle operations with Postgres and retain
  * the management-only fallback for JSON development stores.
  */
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,63 @@ import {
 const dirs: string[] = [];
 const here = dirname(fileURLToPath(import.meta.url));
 const cliSource = join(here, "..", "..", "..", "clearance-cli", "src", "index.ts");
+const remoteDispatchSource = join(
+	here,
+	"..",
+	"..",
+	"..",
+	"clearance-cli",
+	"src",
+	"remote-dispatch.ts",
+);
+const dispatchDir = join(here, "..", "..", "..", "clearance-cli", "src", "dispatch");
+const organizationDispatchSource = join(
+	here,
+	"..",
+	"..",
+	"..",
+	"clearance-cli",
+	"src",
+	"dispatch",
+	"organizations.ts",
+);
+const accessDispatchSource = join(dispatchDir, "access.ts");
+const usersApplicationSource = join(here, "..", "application", "users.ts");
+const applicationFactorySource = join(
+	here,
+	"..",
+	"application",
+	"management-application.ts",
+);
+const authRuntimeAdapterSource = join(
+	here,
+	"..",
+	"adapters",
+	"auth-bridge-runtime-gateway.ts",
+);
+const apiSource = join(
+	here,
+	"..",
+	"..",
+	"..",
+	"clearance-api",
+	"src",
+	"server.ts",
+);
+const apiRoutesDir = join(here, "..", "..", "..", "clearance-api", "src", "routes");
+const configRoutesSource = join(
+	here,
+	"..",
+	"..",
+	"..",
+	"clearance-api",
+	"src",
+	"routes",
+	"config.ts",
+);
+const usersRoutesSource = join(apiRoutesDir, "users.ts");
+const organizationRoutesSource = join(apiRoutesDir, "organizations.ts");
+const accessRoutesSource = join(apiRoutesDir, "access.ts");
 
 afterEach(() => {
 	for (const d of dirs.splice(0)) {
@@ -27,82 +84,142 @@ afterEach(() => {
 });
 
 describe("API/CLI canonical management parity", () => {
-	it("CLI uses runtime-first create plus canonical bridge when Postgres is configured", () => {
-		const src = readFileSync(cliSource, "utf8");
-		expect(src).toMatch(/createUserInAuth/);
-		expect(src).not.toMatch(/listUsersFromDb/);
-		expect(src).toMatch(/createOrgInAuth/);
-		expect(src).toMatch(/syncRuntimeOrganizationToManagementDurable/);
-		expect(src).not.toMatch(/listOrgsFromDb/);
-		// Lifecycle mutations also prefer runtime-coordinated paths with DATABASE_URL.
-		expect(src).toMatch(/updateUserInAuth/);
-		expect(src).toMatch(/disableUserInAuth/);
-		expect(src).toMatch(/deleteUserInAuth/);
-		// Sessions: runtime-first when DATABASE_URL, snapshot fallback otherwise.
-		// (P2.3.1 moved listing to the cursor-paginated variants; the
-		// runtime-vs-snapshot branch invariant is unchanged.)
-		expect(src).toMatch(/listSessionsPageInAuth/);
-		expect(src).toMatch(/revokeSessionInAuth/);
-		expect(src).toMatch(/listSessionsPage\(/);
-		expect(src).toMatch(/revokeSession\(/);
-		// Membership: runtime-coordinated when DATABASE_URL, management-only otherwise.
-		expect(src).toMatch(/addMemberInAuth/);
-		expect(src).toMatch(/updateMemberInAuth/);
-		expect(src).toMatch(/removeMemberInAuth/);
-		expect(src).toMatch(/addMember\(/);
-		expect(src).toMatch(/updateMember\(/);
-		expect(src).toMatch(/removeMember\(/);
-		// Organization update/archive: coordinated when DATABASE_URL.
-		expect(src).toMatch(/updateOrganizationInAuth/);
-		expect(src).toMatch(/archiveOrganizationInAuth/);
-		// JSON development fallback remains supported.
-		expect(src).toMatch(/createUser\(/);
-		expect(src).toMatch(/listUsers\(/);
-		expect(src).toMatch(/createOrganization\(/);
-		expect(src).toMatch(/listOrganizations\(/);
-		expect(src).toMatch(/updateUser\(/);
-		expect(src).toMatch(/disableUser\(/);
-		expect(src).toMatch(/deleteUser\(/);
-		// Enterprise connection ops share canonical management services.
-		expect(src).toMatch(/rotateSsoCredential/);
-		expect(src).toMatch(/disableSsoConnection/);
-		expect(src).toMatch(/disableSsoConnectionReal/);
-		expect(src).toMatch(/rotateScimCredential/);
-		expect(src).toMatch(/disableScimConnection/);
-		expect(src).toMatch(/disableScimConnectionReal/);
-		expect(src).toMatch(/replayDiagnosticTrace/);
-		// env inspect/promote, orgs update/archive, users export share management services
-		expect(src).toMatch(/inspectEnvironment/);
-		expect(src).toMatch(/promoteEnvironment/);
-		expect(src).toMatch(/listEnvironments/);
-		expect(src).toMatch(/updateOrganization/);
-		expect(src).toMatch(/archiveOrganization/);
-		expect(src).toMatch(/exportUsers/);
+	it("keeps CLI transport-only and user creation runtime-first in the application layer", () => {
+		const cli = readFileSync(cliSource, "utf8");
+		expect(cli).toMatch(/dispatchRemoteCommand/);
+		expect(cli).toMatch(/\.action\(remoteCommandAction\)/);
+		expect(cli).not.toMatch(/createUserInAuth|createUser\(|openStore|DATABASE_URL/);
+
+		const application = readFileSync(usersApplicationSource, "utf8");
+		const applicationFactory = readFileSync(applicationFactorySource, "utf8");
+		const authRuntimeAdapter = readFileSync(authRuntimeAdapterSource, "utf8");
+		expect(applicationFactory).toMatch(/store\.backend/);
+		expect(applicationFactory).toMatch(/AuthRuntimeGateway/);
+		expect(application).not.toMatch(/auth-bridge|\w+InAuth/);
+		expect(authRuntimeAdapter).toMatch(/createUserInAuth/);
+		expect(authRuntimeAdapter).toMatch(/createUserWithPasswordSetupInAuth/);
+		expect(authRuntimeAdapter).toMatch(/updateUserInAuth/);
+		expect(authRuntimeAdapter).toMatch(/disableUserInAuth/);
+		expect(authRuntimeAdapter).toMatch(/deleteUserInAuth/);
+		expect(application).toMatch(/withManagementUnitOfWork/);
+		expect(application).not.toMatch(/store\.ready\(\)/);
+
+		const api = readFileSync(apiSource, "utf8");
+		const remoteDispatch = readFileSync(remoteDispatchSource, "utf8");
+		const apiRoutes = [api, ...readdirSync(apiRoutesDir)
+			.filter((file) => file.endsWith(".ts"))
+			.map((file) => readFileSync(join(apiRoutesDir, file), "utf8"))]
+			.join("\n");
+		const remoteDispatchers = [remoteDispatch, ...readdirSync(dispatchDir)
+			.filter((file) => file.endsWith(".ts"))
+			.map((file) => readFileSync(join(dispatchDir, file), "utf8"))]
+			.join("\n");
+		const organizationDispatch = readFileSync(organizationDispatchSource, "utf8");
+		const accessDispatch = readFileSync(accessDispatchSource, "utf8");
+		const configRoutes = readFileSync(configRoutesSource, "utf8");
+		const usersRoutes = readFileSync(usersRoutesSource, "utf8");
+		expect(usersRoutes).not.toMatch(/DATABASE_URL|runtimeDatabaseConfigured|\w+InAuth|auth-bridge/);
+		expect(usersRoutes).toMatch(/applicationFor\(store\)\.users\.update/);
+		expect(usersRoutes).toMatch(/applicationFor\(store\)\.users\.disable/);
+		expect(usersRoutes).toMatch(/applicationFor\(store\)\.users\.delete/);
+		const createRoute = usersRoutes.slice(
+			usersRoutes.indexOf("routes.post(USER_OPERATIONS.create.http.path"),
+			usersRoutes.indexOf("routes.patch(USER_OPERATIONS.update.http.path"),
+		);
+		expect(createRoute).toMatch(/applicationFor\(store\)\.users\.create/);
+		expect(createRoute).not.toMatch(/DATABASE_URL|createUserInAuth|createUser\(|store\.ready/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerPlatformRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerUserRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerOrganizationRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerEventRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerAccessRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerEnterpriseRoutes/);
+		expect(api).toMatch(/app\.route\([\s\S]{0,100}registerOperationRoutes/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(ORGANIZATION_OPERATIONS\.list\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(MEMBER_OPERATIONS\.import\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(PROJECT_OPERATIONS\.inspect\.http\.currentPath/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(ENVIRONMENT_OPERATIONS\.promote\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(EVENT_OPERATIONS\.export\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(API_KEY_OPERATIONS\.rotate\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(SESSION_OPERATIONS\.list\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.patch\(ROLE_OPERATIONS\.update\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SSO_OPERATIONS\.test\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SCIM_OPERATIONS\.replay\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(READINESS_OPERATIONS\.report\.http\.path/);
+		expect(api).toMatch(/app\.route\("\/", registerConfigRoutes/);
+		expect(configRoutes).toMatch(/\.patch\(CONFIG_OPERATIONS\.set\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(IMPORT_OPERATIONS\.legacy\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(MIGRATION_OPERATIONS\.rollback\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(BACKUP_OPERATIONS\.restore\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(UPGRADE_OPERATIONS\.apply\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SCHEMA_OPERATIONS\.migrate\.http\.path/);
+		expect(remoteDispatch).toMatch(/dispatchOrganizationCommand/);
+		expect(organizationDispatch).toMatch(/case ORGANIZATION_OPERATIONS\.archive\.cliPath/);
+		expect(organizationDispatch).toMatch(/case MEMBER_OPERATIONS\.remove\.cliPath/);
+		expect(organizationDispatch).toMatch(/resolveOperationPath/);
+		expect(remoteDispatchers).toMatch(/case SYSTEM_OPERATIONS\.doctor\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case PROJECT_OPERATIONS\.inspect\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case EVENT_OPERATIONS\.tail\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case API_KEY_OPERATIONS\.revoke\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case SESSION_OPERATIONS\.revoke\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case ROLE_OPERATIONS\.validate\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case SSO_OPERATIONS\.setupLink\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case SCIM_OPERATIONS\.replay\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case READINESS_OPERATIONS\.check\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case CONFIG_OPERATIONS\.diff\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case IMPORT_OPERATIONS\.legacy\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case MIGRATION_OPERATIONS\.verify\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case BACKUP_OPERATIONS\.create\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case UPGRADE_OPERATIONS\.rollback\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case SCHEMA_OPERATIONS\.generate\.cliPath/);
+		expect(remoteDispatch).toMatch(/new Set<string>\(\s*MANAGEMENT_OPERATIONS\.map/);
+		const sessionListDispatch = accessDispatch.slice(
+			accessDispatch.indexOf("case SESSION_OPERATIONS.list.cliPath"),
+			accessDispatch.indexOf("case SESSION_OPERATIONS.revoke.cliPath"),
+		);
+		expect(sessionListDispatch).not.toMatch(/userId|status/);
+		expect(remoteDispatchers).not.toMatch(/return \{ validation \}/);
+		expect(remoteDispatchers).toMatch(/dryRun: global\.dryRun \|\| !opts\.apply/);
 	});
 
-	it("API wires coordinated org update/archive when DATABASE_URL is set", () => {
-		const apiSource = join(
-			here,
-			"..",
-			"..",
-			"..",
-			"clearance-api",
-			"src",
-			"server.ts",
+	it("authenticated resource routes delegate runtime policy to the application gateway", () => {
+		const api = readFileSync(apiSource, "utf8");
+		const organizations = readFileSync(organizationRoutesSource, "utf8");
+		const access = readFileSync(accessRoutesSource, "utf8");
+		const adapter = readFileSync(authRuntimeAdapterSource, "utf8");
+
+		expect(organizations).not.toMatch(
+			/auth-bridge|\w+InAuth|ensureAuthMigrated|runtimeDatabaseConfigured/,
 		);
-		const src = readFileSync(apiSource, "utf8");
-		expect(src).toMatch(/updateOrganizationInAuth/);
-		expect(src).toMatch(/archiveOrganizationInAuth/);
-		// Fallbacks for JsonStore offline path remain.
-		expect(src).toMatch(/updateOrganization\(/);
-		expect(src).toMatch(/archiveOrganization\(/);
-		// Branch on DATABASE_URL for org lifecycle (not management-only only).
-		expect(src).toMatch(
-			/process\.env\.DATABASE_URL[\s\S]*?updateOrganizationInAuth/,
+		expect(access).not.toMatch(
+			/auth-bridge|\w+InAuth|ensureAuthMigrated|runtimeDatabaseConfigured/,
 		);
-		expect(src).toMatch(
-			/process\.env\.DATABASE_URL[\s\S]*?archiveOrganizationInAuth/,
-		);
+		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.create/);
+		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.update/);
+		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.archive/);
+		expect(organizations).toMatch(/applicationFor\(store\)\.members\.add/);
+		expect(organizations).toMatch(/applicationFor\(store\)\.members\.update/);
+		expect(organizations).toMatch(/applicationFor\(store\)\.members\.remove/);
+		expect(access).toMatch(/applicationFor\(store\)\.sessions\.list/);
+		expect(access).toMatch(/applicationFor\(store\)\.sessions\.inspect/);
+		expect(access).toMatch(/applicationFor\(store\)\.sessions\.revoke/);
+
+		for (const operation of [
+			"listSessionsPageInAuth",
+			"inspectSessionInAuth",
+			"revokeSessionInAuth",
+			"createOrgInAuth",
+			"updateOrganizationInAuth",
+			"archiveOrganizationInAuth",
+			"addMemberInAuth",
+			"updateMemberInAuth",
+			"removeMemberInAuth",
+		]) {
+			expect(adapter).toContain(operation);
+		}
+		expect(api).toMatch(/createAuthBridgeRuntimeGateway\(\{ store \}\)/);
+		expect(api).toMatch(/registerOrganizationRoutes\([\s\S]*?applicationFor/);
+		expect(api).toMatch(/registerAccessRoutes\([\s\S]*?applicationFor/);
 	});
 
 	it("same store yields identical user/org IDs for CLI-style and API-style calls", () => {

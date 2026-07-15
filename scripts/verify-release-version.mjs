@@ -109,7 +109,7 @@ if (authVersion !== version) {
 	fail(`CLEARANCE_AUTH_VERSION is ${authVersion ?? "missing"}; expected ${version}`);
 }
 
-const managementSource = readFileSync(resolve(root, "packages/management/src/store/json-store.ts"), "utf8");
+const managementSource = readFileSync(resolve(root, "packages/management/src/store/snapshot.ts"), "utf8");
 const managementVersion = managementSource.match(/export const CLEARANCE_RELEASE_VERSION = ["']([^"']+)["']/)?.[1];
 if (managementVersion !== version) {
 	fail(`CLEARANCE_RELEASE_VERSION is ${managementVersion ?? "missing"}; expected ${version}`);

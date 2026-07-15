@@ -10,7 +10,7 @@
  * / use the durable helper for Postgres).
  */
 import type { ManagementStore } from "../store/types.js";
-import type { Organization, Principal } from "../types/resources.js";
+import type { AuditEvent, Organization, Principal } from "../types/resources.js";
 import { newId, nowIso } from "../store/json-store.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
@@ -58,7 +58,7 @@ export function syncRuntimeUserToManagement(
 		projectId?: string;
 		environmentId?: string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "system" | "scim";
+		source?: AuditEvent["source"];
 	},
 ): Principal {
 	if (!runtimeUser.id?.trim()) {
@@ -183,7 +183,7 @@ export async function syncRuntimeUserToManagementDurable(
 		projectId?: string;
 		environmentId?: string;
 		actor?: string;
-		source?: "cli" | "console" | "api" | "system" | "scim";
+		source?: AuditEvent["source"];
 	},
 ): Promise<Principal> {
 	const principal = syncRuntimeUserToManagement(store, runtimeUser, opts);

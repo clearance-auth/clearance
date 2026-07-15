@@ -12,7 +12,7 @@ const dirs: string[] = [];
 
 function run(args: string[], dataPath: string): { stdout: string; status: number } {
 	try {
-		const stdout = execFileSync(process.execPath, [entry, ...args, "--json", "--no-input", "--data-path", dataPath], {
+		const stdout = execFileSync(process.execPath, [entry, ...args, "--json", "--no-input"], {
 			encoding: "utf8",
 			env: {
 				...process.env,
@@ -1124,7 +1124,7 @@ describe("clearance CLI binary", () => {
 			data,
 		);
 		expect(validation.status).toBe(0);
-		expect(JSON.parse(validation.stdout).validation).toMatchObject({
+		expect(JSON.parse(validation.stdout)).toMatchObject({
 			ok: true,
 			slug: "billing-analyst",
 			permissions: ["billing:read", "invoice:read"],

@@ -8,8 +8,11 @@
  * Scope is always principal-derived (projectId + environmentId). Request headers
  * are never authority — callers pass the already-resolved ResourceScope.
  */
-import type { ManagementStore } from "../store/types.js";
-import type { SessionRecord } from "../types/resources.js";
+import type {
+	ManagementSnapshotReader,
+	ManagementUnitOfWork,
+} from "../store/types.js";
+import type { AuditEvent, SessionRecord } from "../types/resources.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import {
@@ -38,7 +41,7 @@ export type SessionView = {
 	userAgent?: string;
 };
 
-export type SessionSource = "cli" | "console" | "api" | "system";
+export type SessionSource = AuditEvent["source"];
 
 export type RevokeSessionResult = {
 	session: SessionView;
@@ -93,7 +96,7 @@ export function sanitizeSessionView(
 }
 
 function principalForSession(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	principalId: string,
 	scope: ResourceScope,
 	stage: string,
@@ -137,7 +140,7 @@ export function toSessionView(
  * Defaults to active only. Does not audit (list is not privileged-write).
  */
 export function listSessions(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	opts?: {
 		scope?: ResourceScope;
 		/** When true, include revoked tombstones */
@@ -156,7 +159,7 @@ export function listSessions(
 
 /** Shared scoped selection for listSessions / listSessionsPage (unbounded). */
 function selectSessionViews(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	scope: ResourceScope,
 	includeRevoked: boolean,
 ): SessionView[] {
@@ -190,7 +193,7 @@ function selectSessionViews(
  * Postgres runtime sessions paginate via listSessionsPageInAuth (auth-bridge).
  */
 export function listSessionsPage(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	opts?: {
 		scope?: ResourceScope;
 		/** When true, include revoked tombstones */
@@ -217,7 +220,7 @@ export function listSessionsPage(
 
 /** Load one safe session view under scope without changing state. */
 export function inspectSession(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	id: string,
 	opts?: { scope?: ResourceScope },
 ): SessionView {
@@ -256,7 +259,7 @@ export function inspectSession(
  * Always writes an audit event (including idempotent re-revoke).
  */
 export function revokeSession(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input?: {
 		actor?: string;
@@ -353,7 +356,7 @@ export function revokeSession(
 
 /** Test/helper: ensure principal exists in scope (re-export pattern). */
 export function assertSessionPrincipalInScope(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	principalId: string,
 	scope?: ResourceScope,
 ): void {

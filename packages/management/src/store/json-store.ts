@@ -7,58 +7,21 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { DataStoreSnapshot } from "../types/resources.js";
 import type { ManagementStore } from "./types.js";
+import type { DataStoreSnapshot } from "../types/resources.js";
+import {
+	cloneSnapshot,
+	emptySnapshot,
+	normalizeSnapshot,
+	snapshotResourceCounts,
+} from "./snapshot.js";
 
-export const STORE_SCHEMA_VERSION = 1;
-export const CLEARANCE_RELEASE_VERSION = "0.2.1";
-
-export function emptySnapshot(
-	config: Record<string, string> = {},
-): DataStoreSnapshot {
-	return {
-		version: STORE_SCHEMA_VERSION,
-		releaseVersion: CLEARANCE_RELEASE_VERSION,
-		projects: [],
-		environments: [],
-		principals: [],
-		organizations: [],
-		memberships: [],
-		identityConnections: [],
-		directoryConnections: [],
-		roles: [],
-		events: [],
-		traces: [],
-		readinessReports: [],
-		migrations: [],
-		backups: [],
-		sessions: [],
-		apiKeys: [],
-		setupLinks: [],
-		meta: {
-			schemaVersion: STORE_SCHEMA_VERSION,
-			config,
-		},
-	};
-}
-
-/** Normalize older snapshots missing newer collections. */
-export function normalizeSnapshot(data: DataStoreSnapshot): DataStoreSnapshot {
-	if (!Array.isArray(data.setupLinks)) {
-		data.setupLinks = [];
-	}
-	if (!Array.isArray(data.roles)) {
-		data.roles = [];
-	}
-	if (!Array.isArray(data.apiKeys)) {
-		data.apiKeys = [];
-	}
-	return data;
-}
-
-function cloneSnapshot(data: DataStoreSnapshot): DataStoreSnapshot {
-	return JSON.parse(JSON.stringify(data)) as DataStoreSnapshot;
-}
+export {
+	CLEARANCE_RELEASE_VERSION,
+	emptySnapshot,
+	normalizeSnapshot,
+	STORE_SCHEMA_VERSION,
+} from "./snapshot.js";
 
 export function defaultDataPath(): string {
 	const fromEnv = process.env.CLEARANCE_DATA_PATH;
@@ -139,23 +102,7 @@ export class JsonStore implements ManagementStore {
 	}
 
 	resourceCounts(): Record<string, number> {
-		const d = this.data;
-		return {
-			projects: d.projects.length,
-			environments: d.environments.length,
-			principals: d.principals.length,
-			organizations: d.organizations.length,
-			memberships: d.memberships.length,
-			identityConnections: d.identityConnections.length,
-			directoryConnections: d.directoryConnections.length,
-			roles: (d.roles ?? []).length,
-			setupLinks: (d.setupLinks ?? []).length,
-			events: d.events.length,
-			traces: d.traces.length,
-			migrations: d.migrations.length,
-			sessions: d.sessions.filter((s) => s.status === "active").length,
-			apiKeys: (d.apiKeys ?? []).length,
-		};
+		return snapshotResourceCounts(this.data);
 	}
 }
 

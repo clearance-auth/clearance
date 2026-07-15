@@ -324,6 +324,25 @@ describe("resolveConfig / buildUpstreamHeaders", () => {
 				),
 			/operator|session|token/i,
 		);
+		const operators = [{ username: "admin", password: "strong-password", role: "admin" }];
+		assert.throws(
+			() => resolveConfig({
+				nodeEnv: "production",
+				operators,
+				sessionSecret: "clearance-secret",
+				operatorToken: "strong-operator-token-value-32chars",
+			}),
+			/session/i,
+		);
+		assert.throws(
+			() => resolveConfig({
+				nodeEnv: "production",
+				operators,
+				sessionSecret: "strong-session-secret-value-32chars",
+				operatorToken: "test-secret-value-that-is-long-enough",
+			}),
+			/operator.*token/i,
+		);
 	});
 
 	it("rejects console body limits above the bounded production maximum", () => {

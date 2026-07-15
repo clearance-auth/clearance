@@ -1,7 +1,7 @@
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
-	entry: ["src/index.ts", "src/client.ts", "src/node.ts"],
+	entry: ["src/index.ts", "src/client.ts", "src/node.ts", "src/secret-policy.ts"],
 	format: "esm",
 	platform: "node",
 	target: "es2022",
@@ -13,6 +13,6 @@ export default defineConfig({
 		// Keeping them out of production dependencies forces the published runtime
 		// and declarations to contain the reviewed code instead of resolving npm's
 		// same-version Clearance packages at install time.
-		onlyAllowBundle: false,
+		onlyBundle: false,
 	},
 });

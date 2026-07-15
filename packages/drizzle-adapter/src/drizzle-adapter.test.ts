@@ -1,8 +1,75 @@
 import { is, SQL } from "drizzle-orm";
+import { integer, PgDialect, pgTable, text } from "drizzle-orm/pg-core";
 import { describe, expect, it, vi } from "vitest";
 import { drizzleAdapter } from "./drizzle-adapter";
 
 describe("drizzle-adapter", () => {
+	describe("where compilation", () => {
+		const user = pgTable("user", {
+			id: text("id"),
+			email: text("email"),
+			age: integer("age"),
+		});
+		const secret = "test-secret-that-is-at-least-32-chars-long!!";
+
+		function createCountAdapter() {
+			const where = vi.fn().mockResolvedValue([{ count: 0 }]);
+			const db = {
+				_: { fullSchema: { user } },
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({ where }),
+				}),
+			} as any;
+			return {
+				adapter: drizzleAdapter(db, { provider: "pg" })({ secret }),
+				where,
+			};
+		}
+
+		it("preserves AND plus grouped-OR semantics through one compiler", async () => {
+			const harness = createCountAdapter();
+			await harness.adapter.count({
+				model: "user",
+				where: [
+					{ field: "id", operator: "gte", value: "a" },
+					{ field: "email", operator: "contains", value: "@example.test" },
+					{ field: "email", operator: "eq", value: "owner@example.test", connector: "OR" },
+					{ field: "email", operator: "eq", value: "admin@example.test", connector: "OR" },
+				],
+			});
+
+			const expression = harness.where.mock.calls[0]?.[0] as SQL;
+			const query = new PgDialect().sqlToQuery(expression);
+			expect(query.sql).toContain("and");
+			expect(query.sql).toContain("or");
+			expect(query.params).toEqual([
+				"a",
+				"%@example.test%",
+				"owner@example.test",
+				"admin@example.test",
+			]);
+		});
+
+		it("fails consistently for missing fields in every connector group", async () => {
+			const harness = createCountAdapter();
+			await expect(harness.adapter.count({
+				model: "user",
+				where: [
+					{ field: "email", value: "known@example.test" },
+					{ field: "name", value: "value", connector: "AND" },
+				],
+			})).rejects.toThrow('The field "name" does not exist');
+
+			await expect(harness.adapter.count({
+				model: "user",
+				where: [
+					{ field: "email", value: "known@example.test" },
+					{ field: "name", value: "value", connector: "OR" },
+				],
+			})).rejects.toThrow('The field "name" does not exist');
+		});
+	});
+
 	it("should create drizzle adapter", () => {
 		const db = {
 			_: {

@@ -9,9 +9,12 @@
  *
  * Intentionally does not import core.ts (core re-exports these helpers).
  */
-import type { ManagementStore } from "../store/types.js";
+import type {
+	ManagementSnapshotReader,
+	ManagementUnitOfWork,
+} from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { Membership, Organization, Principal } from "../types/resources.js";
+import type { AuditEvent, Membership, Organization, Principal } from "../types/resources.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
@@ -21,16 +24,10 @@ import {
 } from "./scope.js";
 
 export type MembershipSource = Membership["source"];
-export type MembershipActorSource =
-	| "cli"
-	| "console"
-	| "api"
-	| "import"
-	| "scim"
-	| "system";
+export type MembershipActorSource = AuditEvent["source"] | "import";
 
 function requireOrganization(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	id: string,
 	scope: ResourceScope | undefined,
 	stage: string,
@@ -55,7 +52,7 @@ function requireOrganization(
 }
 
 function requirePrincipal(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	id: string,
 	scope: ResourceScope | undefined,
 	stage: string,
@@ -127,7 +124,7 @@ export function assertOwnerInvariant(
 }
 
 export function listMembers(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	organizationId: string,
 	opts?: { scope?: ResourceScope; includeRemoved?: boolean },
 ): Membership[] {
@@ -145,7 +142,7 @@ export function listMembers(
 }
 
 export function inspectMembership(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	id: string,
 	scope?: ResourceScope,
 ): Membership {
@@ -181,7 +178,7 @@ export function inspectMembership(
  * when scope is provided.
  */
 export function findActiveMembership(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	organizationId: string,
 	principalId: string,
 	scope?: ResourceScope,
@@ -221,7 +218,7 @@ function assertPrincipalOrgScope(
  * Invalid roles fail closed with no write.
  */
 export function addMember(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	input: {
 		organizationId: string;
 		principalId: string;
@@ -311,7 +308,7 @@ export function addMember(
  * DATABASE_URL + PgStore.
  */
 export function updateMember(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input: {
 		role: string;
@@ -412,7 +409,7 @@ export function updateMember(
  * DATABASE_URL + PgStore. Destructive; CLI requires --yes.
  */
 export function removeMember(
-	store: ManagementStore,
+	store: ManagementUnitOfWork,
 	id: string,
 	input?: {
 		actor?: string;
@@ -485,7 +482,7 @@ export function removeMember(
  * Fails closed when membership missing (same as inspect).
  */
 export function resolveMembershipId(
-	store: ManagementStore,
+	store: ManagementSnapshotReader,
 	input: {
 		organizationId: string;
 		principalId?: string;
