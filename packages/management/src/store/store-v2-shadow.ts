@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import pg from "pg";
 import type {
+	AuditEvent,
 	Environment,
 	Organization,
 	Principal,
 	Project,
 	DataStoreSnapshot,
 } from "../types/resources.js";
+import type { StoreV2EventReader } from "./types.js";
 import { cloneSnapshot, normalizeSnapshot } from "./snapshot.js";
 import {
 	STORE_V2_COLLECTIONS,
@@ -24,6 +26,13 @@ import {
 	storeV2TableNames,
 	type StoreV2TableNames,
 } from "./store-v2-schema.js";
+import {
+	appendStoreV2Events,
+	listStoreV2EventsPage,
+	readStoreV2Events,
+	replaceStoreV2Events,
+	type StoreV2EventDelta,
+} from "./store-v2-events.js";
 
 const MAX_DIFFERING_IDS = 20;
 const META_SCHEMA_VERSION = "store_v2_schema_version";
@@ -31,9 +40,16 @@ const META_PHASE = "store_v2_phase";
 const META_SNAPSHOT_REVISION = "store_v2_snapshot_revision";
 const META_COLLECTIONS = "store_v2_collections";
 const META_ENABLED_AT = "store_v2_enabled_at";
+const META_AUTHORITATIVE_COLLECTIONS = "store_v2_authoritative_collections";
 
-type StoreV2Resource = Project | Environment | Principal | Organization;
+type StoreV2Resource = Project | Environment | Principal | Organization | AuditEvent;
 type Queryable = pg.Pool | pg.PoolClient;
+
+export interface StoreV2SyncResult {
+	phase: StoreV2Phase;
+	persistedSnapshot: DataStoreSnapshot;
+	eventDelta?: StoreV2EventDelta;
+}
 
 interface SnapshotRow {
 	data: DataStoreSnapshot;
@@ -106,7 +122,7 @@ function canonicalResource(resource: StoreV2Resource): StoreV2Resource {
 	return {
 		...resource,
 		createdAt: iso(resource.createdAt),
-		updatedAt: iso(resource.updatedAt),
+		...( "updatedAt" in resource ? { updatedAt: iso(resource.updatedAt) } : {}),
 	};
 }
 
@@ -320,6 +336,7 @@ export function planStoreV2Snapshot(
 			environments: snapshot.environments.length,
 			principals: snapshot.principals.length,
 			organizations: snapshot.organizations.length,
+			events: snapshot.events.length,
 		},
 		blockerCount: blockers.length,
 		blockers: blockers.slice(0, 50),
@@ -397,6 +414,7 @@ function selectedCollections(snapshot: DataStoreSnapshot): Record<
 		environments: snapshot.environments,
 		principals: snapshot.principals,
 		organizations: snapshot.organizations,
+		events: snapshot.events,
 	};
 }
 
@@ -433,7 +451,7 @@ async function existingStoreV2Tables(
 function phaseFromMeta(meta: Map<string, unknown>): StoreV2Phase {
 	const phase = meta.get(META_PHASE);
 	if (phase === undefined) return "absent";
-	if (phase === "shadow" || phase === "disabled") return phase;
+	if (phase === "shadow" || phase === "hybrid" || phase === "disabled") return phase;
 	throw new StoreV2MigrationError(
 		"STORE_V2_PHASE_INVALID",
 		"The store-v2 phase marker is invalid.",
@@ -487,11 +505,13 @@ async function relationalCollections(
 	const organizations = await queryable.query<OrganizationRow>(
 		`SELECT * FROM ${tables.organizations}`,
 	);
+	const events = await readStoreV2Events(queryable, tables);
 	return {
 		projects: projects.rows.map(mapProject),
 		environments: environments.rows.map(mapEnvironment),
 		principals: principals.rows.map(mapPrincipal),
 		organizations: organizations.rows.map(mapOrganization),
+		events,
 	};
 }
 
@@ -505,7 +525,11 @@ async function buildStatus(
 	const phase = phaseFromMeta(meta);
 	const relational =
 		phase === "absent" ? null : await relationalCollections(queryable, tables);
-	const selected = selectedCollections(snapshot);
+	const selected = selectedCollections(
+		phase === "hybrid" && relational
+			? { ...snapshot, events: relational.events as AuditEvent[] }
+			: snapshot,
+	);
 	const collections = Object.fromEntries(
 		STORE_V2_COLLECTIONS.map((collection) => [
 			collection,
@@ -532,7 +556,8 @@ async function buildStatus(
 			relationalRevision === revision &&
 			STORE_V2_COLLECTIONS.every(
 				(collection) => collections[collection].consistent,
-			),
+			) && (phase !== "hybrid" || snapshot.events.length === 0),
+		authoritativeCollections: phase === "hybrid" ? ["events"] : [],
 		collections,
 	};
 }
@@ -556,6 +581,7 @@ async function replaceAll(
 	client: pg.PoolClient,
 	tables: StoreV2TableNames,
 	snapshot: DataStoreSnapshot,
+	revision: number,
 ): Promise<void> {
 	await client.query(`DELETE FROM ${tables.principals}`);
 	await client.query(`DELETE FROM ${tables.organizations}`);
@@ -656,6 +682,7 @@ async function replaceAll(
 			),
 		],
 	);
+	await replaceStoreV2Events(client, tables, snapshot.events, revision);
 }
 
 function changedResources<T extends { id: string }>(
@@ -902,6 +929,68 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		return this.readStatus();
 	}
 
+	async loadSnapshot(): Promise<{
+		snapshot: DataStoreSnapshot;
+		storedSnapshot: DataStoreSnapshot;
+		revision: number;
+		phase: StoreV2Phase;
+	}> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+			const { snapshot: storedSnapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+			);
+			const meta = await readMeta(client, this.tables);
+			const phase = phaseFromMeta(meta);
+			if (
+				phase === "hybrid" &&
+				numberFromMeta(meta.get(META_SNAPSHOT_REVISION)) !== revision
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_REVISION_DIVERGED",
+					"Store-v2 revision does not match the management snapshot.",
+				);
+			}
+			const snapshot = phase === "hybrid"
+				? { ...cloneSnapshot(storedSnapshot), events: await readStoreV2Events(client, this.tables) }
+				: storedSnapshot;
+			await client.query("COMMIT");
+			return { snapshot, storedSnapshot, revision, phase };
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	async eventsAreAuthoritative(): Promise<boolean> {
+		const meta = await readMeta(this.pool, this.tables);
+		return phaseFromMeta(meta) === "hybrid";
+	}
+
+	async transactionPhase(queryable: Queryable): Promise<StoreV2Phase> {
+		return phaseFromMeta(await readMeta(queryable, this.tables));
+	}
+
+	async materializeEvents(queryable: Queryable): Promise<AuditEvent[]> {
+		return readStoreV2Events(queryable, this.tables);
+	}
+
+	async listEventsPage(
+		input: Parameters<StoreV2EventReader["listPage"]>[0],
+	): Promise<{ events: AuditEvent[]; hasMore: boolean }> {
+		if (!(await this.eventsAreAuthoritative())) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_EVENTS_NOT_AUTHORITATIVE",
+				"Store-v2 events are not relational-authoritative.",
+			);
+		}
+		return listStoreV2EventsPage(this.pool, this.tables, input);
+	}
+
 	async verify(): Promise<StoreV2Status> {
 		return this.readStatus();
 	}
@@ -967,7 +1056,12 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			for (const statement of storeV2SchemaStatements(this.tables)) {
 				await client.query(statement);
 			}
-			await replaceAll(client, this.tables, snapshot);
+			if (existingPhase === "hybrid") {
+				const status = await buildStatus(client, this.tables, this.snapshotTable);
+				await client.query("COMMIT");
+				return status;
+			}
+			await replaceAll(client, this.tables, snapshot, revision);
 			await writeMeta(
 				client,
 				this.tables,
@@ -1007,9 +1101,95 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			await client.query("BEGIN");
 			await readSnapshot(client, this.snapshotTable, true);
 			const meta = await readMeta(client, this.tables);
+			if (phaseFromMeta(meta) === "hybrid") {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_ROLLBACK_REQUIRED",
+					"Roll back authoritative events before disabling store-v2.",
+				);
+			}
 			if (phaseFromMeta(meta) !== "absent") {
 				await writeMeta(client, this.tables, META_PHASE, "disabled");
 			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
+	async cutoverEvents(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			if (phaseFromMeta(meta) !== "shadow") {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_CUTOVER_PHASE_INVALID",
+					"Event cutover requires an active verified shadow.",
+				);
+			}
+			const status = await buildStatus(client, this.tables, this.snapshotTable);
+			if (!status.consistent) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_DIVERGENCE",
+					"Store-v2 shadow data diverged before event cutover.",
+				);
+			}
+			const nextRevision = revision + 1;
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[JSON.stringify({ ...snapshot, events: [] }), nextRevision],
+			);
+			await writeMeta(client, this.tables, META_PHASE, "hybrid");
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await writeMeta(client, this.tables, META_AUTHORITATIVE_COLLECTIONS, ["events"]);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
+	async rollbackEvents(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			if (phaseFromMeta(meta) !== "hybrid") {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_ROLLBACK_PHASE_INVALID",
+					"Event rollback requires relational-authoritative events.",
+				);
+			}
+			const events = await readStoreV2Events(client, this.tables);
+			const nextRevision = revision + 1;
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[JSON.stringify({ ...snapshot, events }), nextRevision],
+			);
+			await writeMeta(client, this.tables, META_PHASE, "shadow");
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await writeMeta(client, this.tables, META_AUTHORITATIVE_COLLECTIONS, []);
 			await client.query("COMMIT");
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -1025,9 +1205,12 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		before: DataStoreSnapshot,
 		after: DataStoreSnapshot,
 		revision: number,
-	): Promise<void> {
+	): Promise<StoreV2SyncResult> {
 		const meta = await readMeta(client, this.tables);
-		if (phaseFromMeta(meta) !== "shadow") return;
+		const phase = phaseFromMeta(meta);
+		if (phase !== "shadow" && phase !== "hybrid") {
+			return { phase, persistedSnapshot: after };
+		}
 		if (
 			numberFromMeta(meta.get(META_SCHEMA_VERSION)) !== STORE_V2_SCHEMA_VERSION
 		) {
@@ -1044,6 +1227,39 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 		}
 		await syncDiff(client, this.tables, before, after);
+		let eventDelta: StoreV2EventDelta | undefined;
+		let persistedSnapshot = after;
+		if (phase === "shadow") {
+			await replaceStoreV2Events(client, this.tables, after.events, revision);
+		} else {
+			const beforeById = new Map(
+				before.events.map((event) => [event.id, stableJson(event)]),
+			);
+			if (new Set(after.events.map((event) => event.id)).size !== after.events.length) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_HISTORY_MUTATION",
+					"Authoritative event mutations cannot contain duplicate historical ids.",
+				);
+			}
+			for (const event of before.events) {
+				const current = after.events.find((candidate) => candidate.id === event.id);
+				if (!current || stableJson(current) !== beforeById.get(event.id)) {
+					throw new StoreV2MigrationError(
+						"STORE_V2_EVENTS_HISTORY_MUTATION",
+						"Authoritative event history is append-only.",
+					);
+				}
+			}
+			const appended = after.events.filter((event) => !beforeById.has(event.id));
+			eventDelta = await appendStoreV2Events(
+				client,
+				this.tables,
+				appended,
+				revision,
+			);
+			persistedSnapshot = { ...after, events: [] };
+		}
 		await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, revision);
+		return { phase, persistedSnapshot, ...(eventDelta ? { eventDelta } : {}) };
 	}
 }

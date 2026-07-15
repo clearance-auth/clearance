@@ -22,7 +22,7 @@
 
 | Dimension | Acceptance bar for Clearance to lead | Status | Evidence |
 |---|---|---|---|
-| Normalized persistence and query scale | Normalized relational management data, row-level concurrency, online verified migration, stable cursor queries, and measured 5k/50k performance ahead of the snapshot baseline | In progress | Slice 1 storage core landed: default-off core-identity schema, transactional backfill, verified dual writes, fail-closed refresh verification, explicit disable/reconcile, schema-collision and future-version guards; API/CLI/doctor integration and authoritative cutover remain |
+| Normalized persistence and query scale | Normalized relational management data, row-level concurrency, online verified migration, stable cursor queries, and measured 5k/50k performance ahead of the snapshot baseline | In progress | Audit events now have atomic reversible relational authority, append-only retained history, compact snapshot projection, repeatable-read refresh, and stable cursor reads; API/CLI cutover controls, 5k/50k production-path benchmarks, and remaining collection cutovers remain |
 | Credential authentication and authorization | Managed keys authenticate by digest; status, expiry, project, environment, and route scopes are enforced; key identity appears in audit; operator token is bootstrap/break-glass only | Proven ahead | Digest-only authentication, expiry/revocation, key-derived scope, route read/write scopes, operator-only topology/recovery/configuration/tests, audit attribution, CLI expiry, and API-key-aware CLI `whoami`; live CLI proof created an expiring key, authenticated `whoami`, listed users, and rejected `users:write` with exit 1 |
 | Durable jobs, email, and webhooks | Transactional outbox, separately deployable worker, retries, dead letters, signed delivery, replay, SES/SMTP, quotas, readiness, and complete CLI control | Queued | Runtime verification/reset/invitation delivery can land against the existing relational transaction; management-originated webhooks depend on the store-v2 delivery-intent seam |
 | Authentication security | Supported passkeys, TOTP, recovery, factor policy, breached-password defense, account lockout, digest-stored refresh/session secrets, rotating asymmetric access tokens, purpose-separated keys, and KMS providers | Queued | Existing latent JWT, TOTP, HIBP, and management keyring capabilities will be productized |
@@ -45,6 +45,10 @@
 - [x] Make managed API keys real `/v1` authenticators with route-scope enforcement and attribution.
 - [ ] Define the outbox transaction seam against store-v2 so job delivery never races product state.
 - [x] Record targeted verification and update dimension statuses for the first mergeable foundation unit.
+- [x] Land the first reversible relational-authority slice for audit events.
+- [ ] Expose audit-event cutover and rollback through API, CLI, and doctor with explicit confirmation.
+- [ ] Prove the authoritative audit append path at 5k and 50k retained events against the ledger thresholds.
+- [ ] Close strict-review blockers in the delivery storage and worker core before accepting it.
 
 ### Execution log
 
@@ -66,6 +70,8 @@
 | 2026-07-15 | Selected first relational-authority cutover | Audit events move first into a hybrid authoritative store: immutable append cost becomes O(1), the JSON backend remains unchanged, rollback reverse-materializes the visible projection, and 5k/50k production-path append benchmarks gate acceptance; storage implementation started |
 | 2026-07-15 | Froze the delivery-plane transaction and security boundary | Runtime email only in Slice 1; product state plus immutable event, encrypted payload, and initial job must use the ambient runtime adapter transaction; no pool, second Kysely instance, background helper, or post-commit hook; management webhooks remain deferred |
 | 2026-07-15 | Started delivery storage/worker-core implementation | New `@clearance/delivery` package is limited to guarded schema migration, purpose-specific AEAD/HMAC keyring, transaction-adapter enqueue, fenced leasing/retry/dead/cancel/reclaim, retention crypto-erasure, redacted views, and Postgres proof; SMTP/runtime/API/CLI/deploy wiring follows after core review |
+| 2026-07-15 | Completed the audit-event relational-authority core | Hybrid cutover empties the snapshot event projection, relational appends and resource mutations share one transaction, cursor reads are stable, retention hides historical rows instead of deleting them, and rollback reverse-materializes the visible projection; management typecheck, focused unit 7/7, and canonical real-Postgres 35/35 passed |
+| 2026-07-15 | Rejected the initial delivery core at strict review | Active transactions, tenant-scoped dedupe, semantic-expiry completion, canonical verification inclusion, lease-owner binding, safe erasure, channel-bound AAD, schema-drift detection, structural retention, and provider-value redaction must close before commit |
 
 ### Current implementation decisions
 
@@ -77,6 +83,7 @@
 - Delivery semantics are at-least-once with stable event IDs, bounded full-jitter retries, dead-letter state, CLI retry/cancel/replay, exact-byte HMAC signatures, and production SSRF controls.
 - Runtime delivery uses a distinct durable enqueue capability. Signup uses its existing adapter transaction; reset and invitation state changes must be wrapped with `runWithTransaction` and enqueue through `getCurrentAdapter`. Legacy background email callbacks and `queueAfterTransactionHook` are prohibited because they leave post-commit loss windows.
 - Delivery persistence separates immutable event metadata, encrypted expiring payloads, jobs, append-only attempts, and worker heartbeats. Recipient, subject, body, URLs, reset/verification tokens, and invitation details remain inside a purpose-specific AES-256-GCM envelope; keyed fingerprints support quotas and deduplication without plaintext PII.
+- Relational audit retention is logical: rows removed from the visible retained window are tombstoned with `visible = false`, preserving the append-only archive. Rollback materializes the visible projection into the snapshot and requires a fresh verified cutover before relational authority resumes.
 
 ### Terminal PR and `0.3.0` release gate
 

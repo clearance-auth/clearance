@@ -2,6 +2,7 @@ import pg from "pg";
 import { afterAll, describe, expect, it } from "vitest";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { initProject } from "../services/core.js";
+import { appendAuditEvent, AUDIT_PRUNED_ACTION } from "../services/audit.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
 const DATABASE_URL =
@@ -13,6 +14,8 @@ const NORMALIZED_PREFIX = `${TEST_TABLE}_n_`;
 const DEFAULT_OFF_TABLE = `${TEST_TABLE}_off`;
 const GUARD_TABLE = `${TEST_TABLE}_guard`;
 const GUARD_PREFIX = `${GUARD_TABLE}_n_`;
+const EVENTS_TABLE = `${TEST_TABLE}_events_authority`;
+const EVENTS_PREFIX = `${EVENTS_TABLE}_n_`;
 
 const available = await gatePostgresSuite(DATABASE_URL, "store-v2-shadow-pg");
 
@@ -24,6 +27,17 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			for (const table of [
+				`${EVENTS_PREFIX}events`,
+				`${EVENTS_PREFIX}principals`,
+				`${EVENTS_PREFIX}organizations`,
+				`${EVENTS_PREFIX}environments`,
+				`${EVENTS_PREFIX}projects`,
+				`${EVENTS_PREFIX}meta`,
+				`${EVENTS_TABLE}_principal_email`,
+				`${EVENTS_TABLE}_organization_slug`,
+				`${EVENTS_TABLE}_idempotency`,
+				EVENTS_TABLE,
+				`${NORMALIZED_PREFIX}events`,
 				`${NORMALIZED_PREFIX}principals`,
 				`${NORMALIZED_PREFIX}organizations`,
 				`${NORMALIZED_PREFIX}environments`,
@@ -37,6 +51,7 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 				`${DEFAULT_OFF_TABLE}_organization_slug`,
 					`${DEFAULT_OFF_TABLE}_idempotency`,
 					DEFAULT_OFF_TABLE,
+					`${GUARD_PREFIX}events`,
 					`${GUARD_PREFIX}principals`,
 					`${GUARD_PREFIX}organizations`,
 					`${GUARD_PREFIX}environments`,
@@ -51,6 +66,147 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 			}
 		} finally {
 			await pool.end();
+		}
+	});
+
+	it("cuts events over atomically, retains and refreshes them, then reverses losslessly", async () => {
+		const previousMax = process.env.CLEARANCE_AUDIT_MAX_EVENTS;
+		process.env.CLEARANCE_AUDIT_MAX_EVENTS = "10";
+		const first = await createPgStore(DATABASE_URL, {
+			tableName: EVENTS_TABLE,
+			normalizedPrefix: EVENTS_PREFIX,
+		});
+		stores.push(first);
+		const initialized = initProject(first, {
+			name: "Event Authority",
+			source: "cli",
+		});
+		await first.ready();
+		const applied = await first.storeV2!.apply();
+		expect(applied.collections.events.relationalCount).toBe(
+			first.snapshot.events.length,
+		);
+		expect(applied.consistent).toBe(true);
+
+		const beforeCutoverChecksum = first.checksum();
+		const cutover = await first.storeV2!.cutoverEvents();
+		expect(cutover.phase).toBe("hybrid");
+		expect(cutover.authoritativeCollections).toEqual(["events"]);
+		expect(first.storeV2Events?.authoritative).toBe(true);
+		expect(first.checksum()).toBe(beforeCutoverChecksum);
+
+		const pool = new pg.Pool({ connectionString: DATABASE_URL });
+		try {
+			const compact = await pool.query<{ event_count: number }>(
+				`SELECT jsonb_array_length(data->'events') AS event_count FROM ${EVENTS_TABLE} WHERE id = 1`,
+			);
+			expect(compact.rows[0]?.event_count).toBe(0);
+
+			await first.mutateDurable((data) => {
+				data.projects[0]!.name = "Atomic event mutation";
+				for (let index = 0; index < 12; index++) {
+					appendAuditEvent(data, {
+						actor: "operator",
+						action: `events.authority.${index}`,
+						subjectType: "store",
+						outcome: "success",
+						source: "cli",
+						projectId: initialized.project.id,
+						environmentId: initialized.environment.id,
+						message: "event authority test",
+					});
+				}
+			});
+			expect(first.snapshot.events).toHaveLength(10);
+			expect(
+				first.snapshot.events.filter((event) => event.action === AUDIT_PRUNED_ACTION),
+			).toHaveLength(1);
+			const rows = await pool.query<{ count: string; archived: string }>(
+				`SELECT count(*) FILTER (WHERE visible)::text AS count,
+				        count(*) FILTER (WHERE NOT visible)::text AS archived
+				 FROM ${EVENTS_PREFIX}events`,
+			);
+			expect(Number(rows.rows[0]?.count)).toBe(10);
+			expect(Number(rows.rows[0]?.archived)).toBeGreaterThan(0);
+			const compactAfter = await pool.query<{ event_count: number }>(
+				`SELECT jsonb_array_length(data->'events') AS event_count FROM ${EVENTS_TABLE} WHERE id = 1`,
+			);
+			expect(compactAfter.rows[0]?.event_count).toBe(0);
+
+			const beforeAtomicFailure = first.snapshot.projects[0]!.name;
+			const duplicateEvent = structuredClone(first.snapshot.events[0]!);
+			await expect(
+				first.mutateDurable((data) => {
+					data.projects[0]!.name = "must roll back with duplicate audit";
+					data.events.unshift(duplicateEvent);
+				}),
+			).rejects.toThrow(/duplicate|unique/i);
+			await first.refresh();
+			expect(first.snapshot.projects[0]!.name).toBe(beforeAtomicFailure);
+
+			const second = await createPgStore(DATABASE_URL, {
+				tableName: EVENTS_TABLE,
+				normalizedPrefix: EVENTS_PREFIX,
+			});
+			stores.push(second);
+			expect(second.snapshot.events).toEqual(first.snapshot.events);
+			await first.mutateDurable((data) => {
+				appendAuditEvent(data, {
+					actor: "operator",
+					action: "events.authority.cross_process",
+					subjectType: "store",
+					outcome: "success",
+					source: "cli",
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+					message: "cross process",
+				});
+			});
+			await second.refresh();
+			expect(second.snapshot.events).toEqual(first.snapshot.events);
+
+			const firstPage = await first.storeV2Events!.listPage({
+				scope: {
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+				},
+				limit: 2,
+			});
+			expect(firstPage.events).toHaveLength(2);
+			expect(firstPage.hasMore).toBe(true);
+			const last = firstPage.events[1]!;
+			const secondPage = await first.storeV2Events!.listPage({
+				scope: {
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+				},
+				limit: 2,
+				cursor: { createdAt: last.createdAt, id: last.id },
+			});
+			expect(secondPage.events.map((event) => event.id)).not.toContain(
+				firstPage.events[0]!.id,
+			);
+
+			const replacement = structuredClone(first.snapshot);
+			first.replace(replacement);
+			await expect(first.ready()).rejects.toMatchObject({
+				code: "STORE_V2_REPLACE_REQUIRES_EVENTS_ROLLBACK",
+			});
+
+			const beforeRollbackChecksum = first.checksum();
+			const rolledBack = await first.storeV2!.rollbackEvents();
+			expect(rolledBack.phase).toBe("shadow");
+			expect(first.storeV2Events?.authoritative).toBe(false);
+			expect(first.checksum()).toBe(beforeRollbackChecksum);
+			const restored = await pool.query<{ event_count: number }>(
+				`SELECT jsonb_array_length(data->'events') AS event_count FROM ${EVENTS_TABLE} WHERE id = 1`,
+			);
+			expect(restored.rows[0]?.event_count).toBe(10);
+			expect((await first.storeV2!.verify()).consistent).toBe(true);
+		} finally {
+			await pool.end();
+			if (previousMax === undefined) delete process.env.CLEARANCE_AUDIT_MAX_EVENTS;
+			else process.env.CLEARANCE_AUDIT_MAX_EVENTS = previousMax;
 		}
 	});
 

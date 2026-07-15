@@ -43,6 +43,13 @@ export const AUDIT_PRUNED_ACTION = "system.audit.pruned";
 let auditMaxCacheRaw: string | undefined | symbol = Symbol("unset");
 let auditMaxCacheValue = AUDIT_MAX_EVENTS_DEFAULT;
 
+const deferredRetentionDrafts = new WeakSet<DataStoreSnapshot>();
+
+/** Internal PgStore hook: authoritative event retention is applied in SQL. */
+export function deferAuditRetentionForDraft(data: DataStoreSnapshot): void {
+	deferredRetentionDrafts.add(data);
+}
+
 export function auditMaxEvents(
 	env: Record<string, string | undefined> = process.env,
 ): number {
@@ -117,6 +124,7 @@ export function buildAuditEvent(input: AuditEventInput): AuditEvent {
  * never re-triggering itself (no recursion, no cap overshoot).
  */
 export function enforceAuditRetention(data: DataStoreSnapshot): void {
+	if (deferredRetentionDrafts.has(data)) return;
 	const max = auditMaxEvents();
 	if (data.events.length <= max) return;
 	let carriedDropped = 0;

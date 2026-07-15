@@ -20,13 +20,18 @@ import {
 	emptySnapshot,
 	normalizeSnapshot,
 	snapshotResourceCounts,
+	stableSnapshotJson,
 	STORE_SCHEMA_VERSION,
 } from "./snapshot.js";
 import type { DataStoreSnapshot } from "../types/resources.js";
 import { PgStoreV2Shadow, StoreV2MigrationError } from "./store-v2-shadow.js";
+import { applyStoreV2EventDelta } from "./store-v2-events.js";
+import { deferAuditRetentionForDraft } from "../services/audit.js";
 import type {
 	ManagementStore,
+	StoreV2EventReader,
 	StoreV2MigrationControl,
+	StoreV2Phase,
 } from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
@@ -42,6 +47,7 @@ export class PgStore implements ManagementStore {
 	readonly backend = "postgres" as const;
 	readonly path: string;
 	readonly storeV2?: StoreV2MigrationControl;
+	readonly storeV2Events?: StoreV2EventReader;
 	private data: DataStoreSnapshot;
 	private revision = 0;
 	private pool: pg.Pool;
@@ -50,6 +56,7 @@ export class PgStore implements ManagementStore {
 	private slugUniqueTable: string;
 	private idempotencyTable: string;
 	private storeV2Shadow?: PgStoreV2Shadow;
+	private storeV2Phase: StoreV2Phase = "absent";
 	private pending: Promise<void> = Promise.resolve();
 	/** Set when a queued write fails; rethrown from ready() so the chain never rejects. */
 	private writeError: unknown = null;
@@ -100,6 +107,25 @@ export class PgStore implements ManagementStore {
 					await this.ready();
 					return this.storeV2Shadow!.disable();
 				},
+				cutoverEvents: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.cutoverEvents();
+					await this.refresh();
+					return status;
+				},
+				rollbackEvents: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.rollbackEvents();
+					await this.refresh();
+					return status;
+				},
+			};
+			const owner = this;
+			this.storeV2Events = {
+				get authoritative() {
+					return owner.storeV2Phase === "hybrid";
+				},
+				listPage: (input) => this.storeV2Shadow!.listEventsPage(input),
 			};
 		}
 		this.data = emptySnapshot();
@@ -174,6 +200,12 @@ export class PgStore implements ManagementStore {
 			await this.persistLocked(this.data, 0);
 			this.revision = 1;
 		}
+		if (this.storeV2Shadow) {
+			const loaded = await this.storeV2Shadow.loadSnapshot();
+			this.data = loaded.snapshot;
+			this.revision = loaded.revision;
+			this.storeV2Phase = loaded.phase;
+		}
 		this.initialized = true;
 		return this;
 	}
@@ -210,6 +242,22 @@ export class PgStore implements ManagementStore {
 	 */
 	async refresh(): Promise<void> {
 		await this.ready();
+		if (this.storeV2Shadow) {
+			const loaded = await this.storeV2Shadow.loadSnapshot();
+			this.data = loaded.snapshot;
+			this.revision = loaded.revision;
+			this.storeV2Phase = loaded.phase;
+			if (process.env.CLEARANCE_STORE_V2_VERIFY === "1") {
+				const status = await this.storeV2Shadow.verify();
+				if ((status.phase === "shadow" || status.phase === "hybrid") && !status.consistent) {
+					throw new StoreV2MigrationError(
+						"STORE_V2_DIVERGENCE",
+						"Store-v2 data diverged from the authoritative representation.",
+					);
+				}
+			}
+			return;
+		}
 		const result = await this.pool.query<{
 			data: DataStoreSnapshot;
 			revision: string | number;
@@ -220,23 +268,11 @@ export class PgStore implements ManagementStore {
 			this.data = normalizeSnapshot(result.rows[0].data);
 			this.revision = rev;
 		}
-		if (
-			process.env.CLEARANCE_STORE_V2_VERIFY === "1" &&
-			this.storeV2Shadow
-		) {
-			const status = await this.storeV2Shadow.verify();
-			if (status.phase === "shadow" && !status.consistent) {
-				throw new StoreV2MigrationError(
-					"STORE_V2_DIVERGENCE",
-					"Store-v2 shadow data diverged from the authoritative snapshot.",
-				);
-			}
-		}
 	}
 
 	replace(snapshot: DataStoreSnapshot): void {
 		const next = cloneSnapshot(snapshot);
-		this.queueWrite(() => next);
+		this.queueWrite(() => next, true);
 	}
 
 	mutate(fn: (data: DataStoreSnapshot) => void): DataStoreSnapshot {
@@ -285,7 +321,7 @@ export class PgStore implements ManagementStore {
 	}
 
 	checksum(): string {
-		return createHash("sha256").update(JSON.stringify(this.data)).digest("hex");
+		return createHash("sha256").update(stableSnapshotJson(this.data)).digest("hex");
 	}
 
 	resourceCounts(): Record<string, number> {
@@ -372,10 +408,13 @@ export class PgStore implements ManagementStore {
 	 * The chain never rejects (errors are stashed and rethrown from ready()) so
 	 * concurrent writers cannot strand later ops or emit unhandledRejection.
 	 */
-	private queueWrite(fn: (data: DataStoreSnapshot) => DataStoreSnapshot | void): void {
+	private queueWrite(
+		fn: (data: DataStoreSnapshot) => DataStoreSnapshot | void,
+		replacing = false,
+	): void {
 		this.pending = this.pending.then(async () => {
 			try {
-				await this.transactReplay(fn);
+				await this.transactReplay(fn, replacing);
 			} catch (e) {
 				// Preserve the first unobserved failure until ready() reports it. A later
 				// successful queued write must never erase evidence of a failed mutation.
@@ -386,6 +425,7 @@ export class PgStore implements ManagementStore {
 
 	private async transactReplay(
 		fn: (data: DataStoreSnapshot) => DataStoreSnapshot | void,
+		replacing = false,
 	): Promise<void> {
 		const client = await this.pool.connect();
 		try {
@@ -406,6 +446,23 @@ export class PgStore implements ManagementStore {
 				base = emptySnapshot({ storeBackend: "postgres" });
 				rev = 0;
 			}
+			const phase = this.storeV2Shadow
+				? await this.storeV2Shadow.transactionPhase(client)
+				: "absent";
+			if (phase === "hybrid") {
+				if (replacing) {
+					throw new StoreV2MigrationError(
+						"STORE_V2_REPLACE_REQUIRES_EVENTS_ROLLBACK",
+						"Roll back authoritative events before replacing the management snapshot.",
+					);
+				}
+				base.events = structuredClone(
+					rev === this.revision
+						? this.data.events
+						: await this.storeV2Shadow!.materializeEvents(client),
+				);
+				deferAuditRetentionForDraft(base);
+			}
 
 			const before = cloneSnapshot(base);
 			// Apply on draft — if fn throws (e.g. USER_EXISTS), full ROLLBACK
@@ -413,7 +470,7 @@ export class PgStore implements ManagementStore {
 			const next = applied === undefined ? base : applied;
 			const newRevision = rev + 1;
 
-			await this.storeV2Shadow?.syncTransaction(
+			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
 				before,
 				next,
@@ -422,6 +479,14 @@ export class PgStore implements ManagementStore {
 			// Enforce uniqueness indexes from the committed snapshot draft
 			await this.syncUniqueness(client, next);
 
+			const persisted = sync?.persistedSnapshot ?? next;
+			let materialized = next;
+			if (sync?.phase === "hybrid" && sync.eventDelta) {
+				const events = rev === this.revision
+					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
+					: await this.storeV2Shadow!.materializeEvents(client);
+				materialized = { ...next, events };
+			}
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -429,11 +494,12 @@ export class PgStore implements ManagementStore {
          SET data = EXCLUDED.data,
              revision = EXCLUDED.revision,
              updated_at = now()`,
-				[JSON.stringify(next), newRevision],
+				[JSON.stringify(persisted), newRevision],
 			);
 			await client.query("COMMIT");
-			this.data = next;
+			this.data = materialized;
 			this.revision = newRevision;
+			this.storeV2Phase = sync?.phase ?? phase;
 		} catch (e) {
 			try {
 				await client.query("ROLLBACK");
@@ -459,16 +525,36 @@ export class PgStore implements ManagementStore {
 			const base = result.rows[0]?.data
 				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
+			const previousRevision = Number(result.rows[0]?.revision ?? 0);
+			const phase = this.storeV2Shadow
+				? await this.storeV2Shadow.transactionPhase(client)
+				: "absent";
+			if (phase === "hybrid") {
+				base.events = structuredClone(
+					previousRevision === this.revision
+						? this.data.events
+						: await this.storeV2Shadow!.materializeEvents(client),
+				);
+				deferAuditRetentionForDraft(base);
+			}
 			const before = cloneSnapshot(base);
-			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
+			const revision = previousRevision + 1;
 			const value = fn(base);
-			await this.storeV2Shadow?.syncTransaction(
+			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
 				before,
 				base,
 				revision,
 			);
 			await this.syncUniqueness(client, base);
+			const persisted = sync?.persistedSnapshot ?? base;
+			let materialized = base;
+			if (sync?.phase === "hybrid" && sync.eventDelta) {
+				const events = previousRevision === this.revision
+					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
+					: await this.storeV2Shadow!.materializeEvents(client);
+				materialized = { ...base, events };
+			}
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -476,11 +562,12 @@ export class PgStore implements ManagementStore {
          SET data = EXCLUDED.data,
              revision = EXCLUDED.revision,
              updated_at = now()`,
-				[JSON.stringify(base), revision],
+				[JSON.stringify(persisted), revision],
 			);
 			await client.query("COMMIT");
-			this.data = base;
+			this.data = materialized;
 			this.revision = revision;
+			this.storeV2Phase = sync?.phase ?? phase;
 			return value;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -509,8 +596,20 @@ export class PgStore implements ManagementStore {
 			const base = result.rows[0]?.data
 				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
+			const previousRevision = Number(result.rows[0]?.revision ?? 0);
+			const phase = this.storeV2Shadow
+				? await this.storeV2Shadow.transactionPhase(client)
+				: "absent";
+			if (phase === "hybrid") {
+				base.events = structuredClone(
+					previousRevision === this.revision
+						? this.data.events
+						: await this.storeV2Shadow!.materializeEvents(client),
+				);
+				deferAuditRetentionForDraft(base);
+			}
 			const before = cloneSnapshot(base);
-			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
+			const revision = previousRevision + 1;
 
 			const query = async (sql: string, params?: unknown[]) => {
 				const r = await client.query(sql, params);
@@ -522,13 +621,21 @@ export class PgStore implements ManagementStore {
 
 			const value = await fn({ data: base, query });
 
-			await this.storeV2Shadow?.syncTransaction(
+			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
 				before,
 				base,
 				revision,
 			);
 			await this.syncUniqueness(client, base);
+			const persisted = sync?.persistedSnapshot ?? base;
+			let materialized = base;
+			if (sync?.phase === "hybrid" && sync.eventDelta) {
+				const events = previousRevision === this.revision
+					? applyStoreV2EventDelta(this.data.events, sync.eventDelta)
+					: await this.storeV2Shadow!.materializeEvents(client);
+				materialized = { ...base, events };
+			}
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -536,11 +643,12 @@ export class PgStore implements ManagementStore {
          SET data = EXCLUDED.data,
              revision = EXCLUDED.revision,
              updated_at = now()`,
-				[JSON.stringify(base), revision],
+				[JSON.stringify(persisted), revision],
 			);
 			await client.query("COMMIT");
-			this.data = base;
+			this.data = materialized;
 			this.revision = revision;
+			this.storeV2Phase = sync?.phase ?? phase;
 			return value;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);

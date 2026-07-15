@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const STORE_V2_SCHEMA_VERSION = 1 as const;
 
 export interface StoreV2TableNames {
@@ -6,6 +8,7 @@ export interface StoreV2TableNames {
 	environments: string;
 	principals: string;
 	organizations: string;
+	events: string;
 }
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
@@ -18,6 +21,14 @@ function safeIdentifier(value: string): string {
 	return value;
 }
 
+function derivedIdentifier(value: string): string {
+	if (value.length <= POSTGRES_IDENTIFIER_MAX) return safeIdentifier(value);
+	const digest = createHash("sha256").update(value, "utf8").digest("hex").slice(0, 12);
+	return safeIdentifier(
+		`${value.slice(0, POSTGRES_IDENTIFIER_MAX - digest.length - 1)}_${digest}`,
+	);
+}
+
 export function storeV2TableNames(prefix: string): StoreV2TableNames {
 	const safePrefix = safeIdentifier(prefix);
 	return {
@@ -26,27 +37,34 @@ export function storeV2TableNames(prefix: string): StoreV2TableNames {
 		environments: safeIdentifier(`${safePrefix}environments`),
 		principals: safeIdentifier(`${safePrefix}principals`),
 		organizations: safeIdentifier(`${safePrefix}organizations`),
+		events: safeIdentifier(`${safePrefix}events`),
 	};
 }
 
 export function storeV2SchemaStatements(
 	tables: StoreV2TableNames,
 ): string[] {
-	const projectNameIndex = safeIdentifier(`${tables.projects}_name_unique`);
-	const projectSlugIndex = safeIdentifier(`${tables.projects}_slug_unique`);
-	const environmentCursorIndex = safeIdentifier(
+	const projectNameIndex = derivedIdentifier(`${tables.projects}_name_unique`);
+	const projectSlugIndex = derivedIdentifier(`${tables.projects}_slug_unique`);
+	const environmentCursorIndex = derivedIdentifier(
 		`${tables.environments}_cursor`,
 	);
-	const principalEmailIndex = safeIdentifier(
+	const principalEmailIndex = derivedIdentifier(
 		`${tables.principals}_email_unique`,
 	);
-	const principalCursorIndex = safeIdentifier(`${tables.principals}_cursor`);
-	const organizationSlugIndex = safeIdentifier(
+	const principalCursorIndex = derivedIdentifier(`${tables.principals}_cursor`);
+	const organizationSlugIndex = derivedIdentifier(
 		`${tables.organizations}_slug_unique`,
 	);
-	const organizationCursorIndex = safeIdentifier(
+	const organizationCursorIndex = derivedIdentifier(
 		`${tables.organizations}_cursor`,
 	);
+	const eventCursorIndex = derivedIdentifier(`${tables.events}_cursor`);
+	const eventScopeCursorIndex = derivedIdentifier(`${tables.events}_scope_cursor`);
+	const eventOrganizationCursorIndex = derivedIdentifier(
+		`${tables.events}_organization_cursor`,
+	);
+	const eventActionCursorIndex = derivedIdentifier(`${tables.events}_action_cursor`);
 
 	return [
 		`CREATE TABLE IF NOT EXISTS ${tables.meta} (
@@ -115,5 +133,33 @@ export function storeV2SchemaStatements(
 		`CREATE INDEX IF NOT EXISTS ${organizationCursorIndex}
 			ON ${tables.organizations}
 				(project_id, environment_id, created_at DESC, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS ${tables.events} (
+			id text PRIMARY KEY,
+			correlation_id text NOT NULL,
+			project_id text,
+			environment_id text,
+			organization_id text,
+			actor text NOT NULL,
+			action text NOT NULL,
+			subject_type text NOT NULL,
+			subject_id text,
+			outcome text NOT NULL CHECK (outcome IN ('success', 'failure', 'pending')),
+			source text NOT NULL CHECK (source IN ('cli', 'console', 'api', 'system', 'migration', 'sso', 'scim')),
+			message text NOT NULL,
+			metadata jsonb,
+			created_at timestamptz NOT NULL,
+			committed_revision bigint NOT NULL,
+			retention_marker boolean NOT NULL DEFAULT false,
+			visible boolean NOT NULL DEFAULT true
+		)`,
+		`CREATE INDEX IF NOT EXISTS ${eventCursorIndex}
+			ON ${tables.events} (created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${eventScopeCursorIndex}
+			ON ${tables.events}
+				(project_id, environment_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${eventOrganizationCursorIndex}
+			ON ${tables.events} (organization_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${eventActionCursorIndex}
+			ON ${tables.events} (action, created_at DESC, id DESC)`,
 	];
 }

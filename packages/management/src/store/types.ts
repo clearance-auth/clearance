@@ -1,14 +1,20 @@
-import type { DataStoreSnapshot } from "../types/resources.js";
+import type {
+	AuditEvent,
+	DataStoreSnapshot,
+} from "../types/resources.js";
+import type { PageCursorKey } from "../services/pagination.js";
+import type { ResourceScope } from "../services/scope.js";
 
 export const STORE_V2_COLLECTIONS = [
 	"projects",
 	"environments",
 	"principals",
 	"organizations",
+	"events",
 ] as const;
 
 export type StoreV2Collection = (typeof STORE_V2_COLLECTIONS)[number];
-export type StoreV2Phase = "absent" | "shadow" | "disabled";
+export type StoreV2Phase = "absent" | "shadow" | "hybrid" | "disabled";
 
 export interface StoreV2CollectionStatus {
 	snapshotCount: number;
@@ -25,6 +31,7 @@ export interface StoreV2Status {
 	snapshotRevision: number;
 	relationalRevision: number | null;
 	consistent: boolean;
+	authoritativeCollections: StoreV2Collection[];
 	collections: Record<StoreV2Collection, StoreV2CollectionStatus>;
 }
 
@@ -51,6 +58,20 @@ export interface StoreV2MigrationControl {
 	apply(): Promise<StoreV2Status>;
 	verify(): Promise<StoreV2Status>;
 	disable(): Promise<StoreV2Status>;
+	cutoverEvents(): Promise<StoreV2Status>;
+	rollbackEvents(): Promise<StoreV2Status>;
+}
+
+/** Postgres event reads once store-v2 events are relational-authoritative. */
+export interface StoreV2EventReader {
+	readonly authoritative: boolean;
+	listPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		action?: string;
+		organizationId?: string;
+	}): Promise<{ events: AuditEvent[]; hasMore: boolean }>;
 }
 
 /** Read-only view used by domain queries and validation. */
@@ -82,6 +103,7 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	readonly backend: "json" | "postgres";
 	/** Postgres-only, explicitly activated normalized shadow-store migration. */
 	readonly storeV2?: StoreV2MigrationControl;
+	readonly storeV2Events?: StoreV2EventReader;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */

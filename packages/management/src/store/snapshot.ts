@@ -45,6 +45,24 @@ export function cloneSnapshot(data: DataStoreSnapshot): DataStoreSnapshot {
 	return JSON.parse(JSON.stringify(data)) as DataStoreSnapshot;
 }
 
+function stableValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stableValue);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>)
+				.filter(([, child]) => child !== undefined)
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([key, child]) => [key, stableValue(child)]),
+		);
+	}
+	return value;
+}
+
+/** Stable across JSON text, JSONB, and relational materialization key order. */
+export function stableSnapshotJson(data: DataStoreSnapshot): string {
+	return JSON.stringify(stableValue(data));
+}
+
 export function snapshotResourceCounts(
 	data: DataStoreSnapshot,
 ): Record<string, number> {

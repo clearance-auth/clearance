@@ -14,6 +14,7 @@ import {
 	emptySnapshot,
 	normalizeSnapshot,
 	snapshotResourceCounts,
+	stableSnapshotJson,
 } from "./snapshot.js";
 
 export {
@@ -97,7 +98,7 @@ export class JsonStore implements ManagementStore {
 	}
 
 	checksum(): string {
-		const body = JSON.stringify(this.data);
+		const body = stableSnapshotJson(this.data);
 		return createHash("sha256").update(body).digest("hex");
 	}
 

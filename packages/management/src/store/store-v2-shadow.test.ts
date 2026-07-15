@@ -115,6 +115,8 @@ describe("store-v2 shadow helpers", () => {
 		expect(tables.projects).toBe("test_v2_projects");
 		expect(sql).toContain("test_v2_principals");
 		expect(sql).toContain("test_v2_organizations");
+		expect(sql).toContain("test_v2_events");
+		expect(sql).toContain("committed_revision bigint NOT NULL");
 		expect(sql).not.toContain("api_key");
 		expect(() => storeV2TableNames("unsafe-prefix-")).toThrow(
 			/Invalid store-v2 Postgres identifier/,
