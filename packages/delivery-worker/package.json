@@ -1,7 +1,7 @@
 {
   "name": "@clearance/delivery-worker",
   "version": "0.2.1",
-  "description": "Separately deployable SMTP delivery worker for Clearance",
+  "description": "Separately deployable SMTP and AWS SES delivery worker for Clearance",
   "type": "module",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/delivery-worker" },

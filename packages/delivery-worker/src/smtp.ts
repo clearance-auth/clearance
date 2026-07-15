@@ -67,7 +67,9 @@ export function renderEmailPayload(value: unknown, config: WorkerConfig): EmailP
 		// Concrete payloads support explicit operator-authored delivery while
 		// all first-party auth workflows use the canonical templates below.
 		const rendered = validateEmailPayload(value, config.maxBodyBytes);
-		return { ...rendered, from: config.smtp.from };
+		const from = config.emailFrom ?? config.smtp?.from;
+		if (!from) throw new Error("invalid_from");
+		return { ...rendered, from };
 	}
 	const template = boundedText(raw.template, "template", 64);
 	const to = mailbox(raw.to, "to");
@@ -108,18 +110,24 @@ export function renderEmailPayload(value: unknown, config: WorkerConfig): EmailP
 	} else {
 		throw new Error("invalid_template");
 	}
-	return validateEmailPayload({ to, from: config.smtp.from, subject, text, html }, config.maxBodyBytes);
+	const from = config.emailFrom ?? config.smtp?.from;
+	if (!from) throw new Error("invalid_from");
+	return validateEmailPayload({ to, from, subject, text, html }, config.maxBodyBytes);
 }
 
 export function createSmtpSender(config: WorkerConfig): EmailSender {
+	const smtp = config.smtp;
+	if (!smtp || (config.emailTransport ?? "smtp") !== "smtp") {
+		throw new Error("SMTP sender requires validated SMTP worker configuration");
+	}
 	const transport: Transporter = nodemailer.createTransport({
-		host: config.smtp.host, port: config.smtp.port, secure: config.smtp.secure,
-		requireTLS: config.smtp.requireTls, opportunisticTLS: false,
-		connectionTimeout: config.smtp.connectionTimeoutMs,
-		greetingTimeout: config.smtp.greetingTimeoutMs,
-		socketTimeout: config.smtp.socketTimeoutMs,
+		host: smtp.host, port: smtp.port, secure: smtp.secure,
+		requireTLS: smtp.requireTls, opportunisticTLS: false,
+		connectionTimeout: smtp.connectionTimeoutMs,
+		greetingTimeout: smtp.greetingTimeoutMs,
+		socketTimeout: smtp.socketTimeoutMs,
 		disableFileAccess: true, disableUrlAccess: true,
-		...(config.smtp.user ? { auth: { user: config.smtp.user, pass: config.smtp.password } } : {}),
+		...(smtp.user ? { auth: { user: smtp.user, pass: smtp.password } } : {}),
 	});
 	return {
 		async verify() { await transport.verify(); },

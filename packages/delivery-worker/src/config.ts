@@ -3,6 +3,7 @@ import type { DeliveryKeyring } from "@clearance/delivery";
 import { resolveDeliveryKeyring } from "@clearance/delivery";
 
 export type WorkerMode = "run" | "once" | "ready";
+export type EmailTransport = "smtp" | "ses";
 export type WorkerConfig = {
 	mode: WorkerMode;
 	databaseUrl: string;
@@ -11,10 +12,20 @@ export type WorkerConfig = {
 	schema: string;
 	prefix: string;
 	legacyFingerprintKeyId?: string;
-	smtp: {
+	/** Omitted by older programmatic callers; SMTP remains the compatibility default. */
+	emailTransport?: EmailTransport;
+	emailFrom?: string;
+	smtp?: {
 		host: string; port: number; secure: boolean; requireTls: boolean; allowInsecureLoopback: boolean; from: string;
 		user?: string; password?: string; connectionTimeoutMs: number;
 		socketTimeoutMs: number; greetingTimeoutMs: number;
+	};
+	ses?: {
+		region: string;
+		accessKeyId: string;
+		secretAccessKey: string;
+		sessionToken?: string;
+		requestTimeoutMs: number;
 	};
 	concurrency: number;
 	pollMs: number;
@@ -89,21 +100,88 @@ function mailbox(value: string, name: string): string {
 	return normalized;
 }
 
+function oneOf<T extends string>(
+	env: NodeJS.ProcessEnv,
+	name: string,
+	fallback: T,
+	allowed: readonly T[],
+): T {
+	const value = (env[name]?.trim().toLowerCase() || fallback) as T;
+	if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
+	return value;
+}
+
+function awsRegion(value: string): string {
+	const normalized = value.trim().toLowerCase();
+	if (!/^[a-z]{2}(?:-gov)?-[a-z0-9-]{2,24}-[1-9]$/.test(normalized)) {
+		throw new Error("CLEARANCE_SES_REGION must be a valid AWS region");
+	}
+	return normalized;
+}
+
+function awsCredential(value: string, name: string, minimum: number, maximum: number): string {
+	if (value.length < minimum || value.length > maximum || /[\u0000-\u001f\u007f]/.test(value)) {
+		throw new Error(`${name} must be a bounded AWS credential value`);
+	}
+	return value;
+}
+
+function awsAccessKeyId(value: string): string {
+	if (!/^[A-Za-z0-9]{16,128}$/.test(value)) {
+		throw new Error("CLEARANCE_SES_ACCESS_KEY_ID must be a bounded AWS access key id");
+	}
+	return value;
+}
+
 export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: WorkerMode = "run"): WorkerConfig {
-	const user = env.CLEARANCE_SMTP_USER?.trim() || undefined;
-	const password = env.CLEARANCE_SMTP_PASSWORD;
-	if ((user && !password) || (!user && password)) throw new Error("CLEARANCE_SMTP_USER and CLEARANCE_SMTP_PASSWORD must be provided together");
+	const emailTransport = oneOf(env, "CLEARANCE_EMAIL_TRANSPORT", "smtp", ["smtp", "ses"] as const);
+	const emailFrom = mailbox(required(env, "CLEARANCE_EMAIL_FROM"), "CLEARANCE_EMAIL_FROM");
 	const workerId = (env.CLEARANCE_DELIVERY_WORKER_ID?.trim() || `delivery-${randomUUID()}`);
 	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) throw new Error("CLEARANCE_DELIVERY_WORKER_ID is invalid");
-	const smtpHost = required(env, "CLEARANCE_SMTP_HOST");
-	const smtpSecure = boolean(env, "CLEARANCE_SMTP_SECURE", false);
-	const smtpRequireTls = boolean(env, "CLEARANCE_SMTP_REQUIRE_TLS", true);
-	const allowInsecureLoopback = boolean(env, "CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK", false);
-	if (!smtpSecure && !smtpRequireTls) {
-		if (user) throw new Error("SMTP authentication requires implicit TLS or STARTTLS");
-		if (!allowInsecureLoopback || !["localhost", "127.0.0.1", "::1", "[::1]"].includes(smtpHost.toLowerCase())) {
-			throw new Error("Plaintext SMTP requires CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK=true and a loopback host");
+	let smtp: WorkerConfig["smtp"];
+	let ses: WorkerConfig["ses"];
+	if (emailTransport === "smtp") {
+		const user = env.CLEARANCE_SMTP_USER?.trim() || undefined;
+		const password = env.CLEARANCE_SMTP_PASSWORD;
+		if ((user && !password) || (!user && password)) throw new Error("CLEARANCE_SMTP_USER and CLEARANCE_SMTP_PASSWORD must be provided together");
+		const smtpHost = required(env, "CLEARANCE_SMTP_HOST");
+		const smtpSecure = boolean(env, "CLEARANCE_SMTP_SECURE", false);
+		const smtpRequireTls = boolean(env, "CLEARANCE_SMTP_REQUIRE_TLS", true);
+		const allowInsecureLoopback = boolean(env, "CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK", false);
+		if (!smtpSecure && !smtpRequireTls) {
+			if (user) throw new Error("SMTP authentication requires implicit TLS or STARTTLS");
+			if (!allowInsecureLoopback || !["localhost", "127.0.0.1", "::1", "[::1]"].includes(smtpHost.toLowerCase())) {
+				throw new Error("Plaintext SMTP requires CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK=true and a loopback host");
+			}
 		}
+		smtp = {
+			host: smtpHost,
+			from: emailFrom,
+			port: integer(env, "CLEARANCE_SMTP_PORT", 587, 1, 65_535),
+			secure: smtpSecure,
+			requireTls: smtpRequireTls,
+			allowInsecureLoopback,
+			...(user ? { user, password } : {}),
+			connectionTimeoutMs: integer(env, "CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS", 10_000, 1_000, 120_000),
+			socketTimeoutMs: integer(env, "CLEARANCE_SMTP_SOCKET_TIMEOUT_MS", 30_000, 1_000, 300_000),
+			greetingTimeoutMs: integer(env, "CLEARANCE_SMTP_GREETING_TIMEOUT_MS", 10_000, 1_000, 120_000),
+		};
+	} else {
+		const accessKeyId = env.CLEARANCE_SES_ACCESS_KEY_ID ?? env.AWS_ACCESS_KEY_ID ?? "";
+		const secretAccessKey = env.CLEARANCE_SES_SECRET_ACCESS_KEY ?? env.AWS_SECRET_ACCESS_KEY ?? "";
+		const sessionToken = env.CLEARANCE_SES_SESSION_TOKEN ?? env.AWS_SESSION_TOKEN;
+		const region = env.CLEARANCE_SES_REGION ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION;
+		if (!accessKeyId || !secretAccessKey) {
+			throw new Error("SES requires CLEARANCE_SES_ACCESS_KEY_ID and CLEARANCE_SES_SECRET_ACCESS_KEY (or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)");
+		}
+		if (!region?.trim()) throw new Error("SES requires CLEARANCE_SES_REGION (or AWS_REGION/AWS_DEFAULT_REGION)");
+		ses = {
+			region: awsRegion(region),
+			accessKeyId: awsAccessKeyId(accessKeyId),
+			secretAccessKey: awsCredential(secretAccessKey, "CLEARANCE_SES_SECRET_ACCESS_KEY", 20, 256),
+			...(sessionToken ? { sessionToken: awsCredential(sessionToken, "CLEARANCE_SES_SESSION_TOKEN", 16, 8_192) } : {}),
+			requestTimeoutMs: integer(env, "CLEARANCE_SES_REQUEST_TIMEOUT_MS", 10_000, 1_000, 120_000),
+		};
 	}
 	return {
 		mode,
@@ -120,18 +198,10 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 				),
 			}
 			: {}),
-		smtp: {
-			host: smtpHost,
-			from: mailbox(required(env, "CLEARANCE_EMAIL_FROM"), "CLEARANCE_EMAIL_FROM"),
-			port: integer(env, "CLEARANCE_SMTP_PORT", 587, 1, 65_535),
-			secure: smtpSecure,
-			requireTls: smtpRequireTls,
-			allowInsecureLoopback,
-			...(user ? { user, password } : {}),
-			connectionTimeoutMs: integer(env, "CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS", 10_000, 1_000, 120_000),
-			socketTimeoutMs: integer(env, "CLEARANCE_SMTP_SOCKET_TIMEOUT_MS", 30_000, 1_000, 300_000),
-			greetingTimeoutMs: integer(env, "CLEARANCE_SMTP_GREETING_TIMEOUT_MS", 10_000, 1_000, 120_000),
-		},
+		emailTransport,
+		emailFrom,
+		...(smtp ? { smtp } : {}),
+		...(ses ? { ses } : {}),
 		concurrency: integer(env, "CLEARANCE_DELIVERY_CONCURRENCY", 4, 1, 64),
 		pollMs: integer(env, "CLEARANCE_DELIVERY_POLL_MS", 500, 25, 60_000),
 		leaseMs: integer(env, "CLEARANCE_DELIVERY_LEASE_MS", 60_000, 5_000, 600_000),

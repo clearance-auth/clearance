@@ -2,8 +2,9 @@ import http, { type Server } from "node:http";
 import pg from "pg";
 import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleDeliveryLeaseError } from "@clearance/delivery";
 import type { WorkerConfig } from "./config.js";
+import { classifyEmailError, configuredEmailTransport, createEmailSender } from "./email.js";
 import { createJsonLogger, type WorkerLogger } from "./logger.js";
-import { classifySmtpError, createSmtpSender, renderEmailPayload, type EmailSender } from "./smtp.js";
+import { renderEmailPayload, type EmailSender } from "./smtp.js";
 import {
 	classifyWebhookError,
 	createWebhookSender,
@@ -35,7 +36,10 @@ export type WorkerReadiness = {
 	schema: boolean;
 	keyring: boolean;
 	heartbeat: boolean;
+	email: boolean;
+	emailTransport: "smtp" | "ses";
 	smtp: boolean;
+	ses: boolean;
 	workerId: string;
 };
 
@@ -51,7 +55,7 @@ export class DeliveryWorker {
 	private draining = false;
 	private initialized = false;
 	private schemaHealthy = false;
-	private smtpHealthy = false;
+	private emailHealthy = false;
 	private lastHeartbeatAt = 0;
 	private inFlight = new Set<Promise<unknown>>();
 	private healthServer?: Server;
@@ -69,7 +73,7 @@ export class DeliveryWorker {
 		this.pool = dependencies.pool ?? new pg.Pool({
 			connectionString: config.databaseUrl,
 			max: Math.max(4, config.concurrency + 2),
-			connectionTimeoutMillis: config.smtp.connectionTimeoutMs,
+			connectionTimeoutMillis: config.smtp?.connectionTimeoutMs ?? config.ses?.requestTimeoutMs ?? 10_000,
 			application_name: `clearance-delivery:${config.workerId}`,
 		});
 		this.store = new DeliveryStore(this.pool, {
@@ -77,33 +81,36 @@ export class DeliveryWorker {
 			prefix: config.prefix,
 			legacyFingerprintKeyId: config.legacyFingerprintKeyId,
 		});
-		this.sender = dependencies.sender ?? createSmtpSender(config);
+		this.sender = dependencies.sender ?? createEmailSender(config);
 		this.webhookSender = dependencies.webhookSender ?? createWebhookSender(config);
 		this.logger = dependencies.logger ?? createJsonLogger();
 	}
 
-	async initialize(options: { verifySmtp?: boolean } = {}): Promise<void> {
+	async initialize(options: { verifyEmail?: boolean; verifySmtp?: boolean } = {}): Promise<void> {
 		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state: "starting" }).catch(() => undefined);
 		const result = await this.store.migrate();
 		await this.store.assertFingerprintKeysAvailable(this.config.keyring);
 		this.schemaHealthy = result.version === DELIVERY_SCHEMA_VERSION;
-		if (options.verifySmtp !== false) {
+		const shouldVerifyEmail = options.verifyEmail ?? options.verifySmtp ?? true;
+		if (shouldVerifyEmail) {
 			try {
 				await this.sender.verify();
-				this.smtpHealthy = true;
+				this.emailHealthy = true;
 			} catch (error) {
-				this.smtpHealthy = false;
+				this.emailHealthy = false;
 				await this.writeHeartbeat("failed").catch(() => undefined);
 				throw error;
 			}
 		} else {
-			this.smtpHealthy = false;
+			this.emailHealthy = false;
 		}
-		await this.writeHeartbeat(this.smtpHealthy ? "ready" : "failed");
+		await this.writeHeartbeat(this.emailHealthy ? "ready" : "failed");
 		this.initialized = true;
-		this.logger.log(this.smtpHealthy ? "info" : "warn", this.smtpHealthy ? "worker.ready" : "worker.smtp_unverified", {
+		const transport = configuredEmailTransport(this.config);
+		this.logger.log(this.emailHealthy ? "info" : "warn", this.emailHealthy ? "worker.ready" : `worker.${transport}_unverified`, {
 			workerId: this.config.workerId,
 			schemaVersion: result.version,
+			emailTransport: transport,
 		});
 	}
 
@@ -113,6 +120,7 @@ export class DeliveryWorker {
 	}
 
 	async readiness(): Promise<WorkerReadiness> {
+		const transport = configuredEmailTransport(this.config);
 		let database = false;
 		let keyring = false;
 		try { await this.pool.query("SELECT 1"); database = true; } catch { database = false; }
@@ -144,13 +152,16 @@ export class DeliveryWorker {
 		}
 		const heartbeat = this.lastHeartbeatAt > 0 && Date.now() - this.lastHeartbeatAt <= this.config.heartbeatMs * 3;
 		return {
-			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && heartbeat && this.smtpHealthy,
+			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && heartbeat && this.emailHealthy,
 			draining: this.draining,
 			database,
 			schema: this.schemaHealthy,
 			keyring,
 			heartbeat,
-			smtp: this.smtpHealthy,
+			email: this.emailHealthy,
+			emailTransport: transport,
+			smtp: transport === "smtp" && this.emailHealthy,
+			ses: transport === "ses" && this.emailHealthy,
 			workerId: this.config.workerId,
 		};
 	}
@@ -189,7 +200,7 @@ export class DeliveryWorker {
 							eventId: leased.eventId,
 						}),
 			);
-			if (leased.channel === "email") this.smtpHealthy = true;
+			if (leased.channel === "email") this.emailHealthy = true;
 			try {
 				await this.store.markProviderAccepted({
 					jobId: leased.id,
@@ -218,9 +229,9 @@ export class DeliveryWorker {
 			}
 			const classified = leased.channel === "webhook"
 				? classifyWebhookError(error)
-				: classifySmtpError(error);
-			if (leased.channel === "email" && classified.errorClass === "smtp.transport") {
-				this.smtpHealthy = false;
+				: classifyEmailError(this.config, error);
+			if (leased.channel === "email" && /^(?:smtp|ses)\.(?:transport|timeout)$/.test(classified.errorClass)) {
+				this.emailHealthy = false;
 			}
 			try {
 				const result = classified.retryable
@@ -308,19 +319,20 @@ export class DeliveryWorker {
 			this.schemaHealthy = false;
 			this.logger.log("error", "worker.maintenance_failed", { error });
 		}
-		const wasHealthy = this.smtpHealthy;
+		const wasHealthy = this.emailHealthy;
+		const transport = configuredEmailTransport(this.config);
 		try {
 			await this.sender.verify();
-			this.smtpHealthy = true;
-			if (!wasHealthy) this.logger.log("info", "worker.smtp_recovered");
+			this.emailHealthy = true;
+			if (!wasHealthy) this.logger.log("info", `worker.${transport}_recovered`);
 		} catch (error) {
-			this.smtpHealthy = false;
-			this.logger.log(wasHealthy ? "error" : "warn", "worker.smtp_unavailable", { error });
+			this.emailHealthy = false;
+			this.logger.log(wasHealthy ? "error" : "warn", `worker.${transport}_unavailable`, { error });
 		}
 		await this.writeHeartbeat(
 			this.draining
 				? "draining"
-				: this.smtpHealthy && this.schemaHealthy
+				: this.emailHealthy && this.schemaHealthy
 					? "ready"
 					: "failed",
 		)
@@ -333,7 +345,7 @@ export class DeliveryWorker {
 			void this.writeHeartbeat(
 				this.draining
 					? "draining"
-					: this.smtpHealthy && this.schemaHealthy
+					: this.emailHealthy && this.schemaHealthy
 						? "ready"
 						: "failed",
 			)

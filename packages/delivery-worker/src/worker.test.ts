@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseWorkerConfig } from "./config.js";
 import { createJsonLogger } from "./logger.js";
+import { classifySesError, createSesSender, SesDeliveryError } from "./ses.js";
 import { classifySmtpError, renderEmailPayload, validateEmailPayload } from "./smtp.js";
 import {
 	canonicalWebhookBytes,
@@ -25,11 +26,24 @@ function env(): NodeJS.ProcessEnv {
 	};
 }
 
+function sesEnv(): NodeJS.ProcessEnv {
+	return {
+		...env(),
+		CLEARANCE_EMAIL_TRANSPORT: "ses",
+		CLEARANCE_SMTP_HOST: undefined,
+		CLEARANCE_SES_REGION: "us-east-1",
+		CLEARANCE_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+		CLEARANCE_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		CLEARANCE_SES_SESSION_TOKEN: "bounded-session-token-value",
+	};
+}
+
 describe("delivery worker boundaries", () => {
 	it("strictly parses bounded environment configuration", () => {
 		const config = parseWorkerConfig({ ...env(), CLEARANCE_DELIVERY_CONCURRENCY: "64", CLEARANCE_SMTP_REQUIRE_TLS: "true" });
 		expect(config.concurrency).toBe(64);
-		expect(config.smtp.requireTls).toBe(true);
+		expect(config.smtp!.requireTls).toBe(true);
+		expect(config.emailTransport).toBe("smtp");
 		expect(config.allowHttpLinks).toBe(false);
 		expect(parseWorkerConfig({
 			...env(), CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: "fingerprint.previous-1",
@@ -49,7 +63,7 @@ describe("delivery worker boundaries", () => {
 			...env(), CLEARANCE_SMTP_HOST: "127.0.0.1", CLEARANCE_SMTP_REQUIRE_TLS: "false",
 			CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK: "true",
 		});
-		expect(localPlaintext.smtp.allowInsecureLoopback).toBe(true);
+		expect(localPlaintext.smtp!.allowInsecureLoopback).toBe(true);
 		expect(() => parseWorkerConfig({
 			...env(), CLEARANCE_SMTP_REQUIRE_TLS: "false", CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK: "true",
 		})).toThrow(/loopback host/);
@@ -58,6 +72,20 @@ describe("delivery worker boundaries", () => {
 			CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK: "true", CLEARANCE_SMTP_USER: "user",
 			CLEARANCE_SMTP_PASSWORD: "password",
 		})).toThrow(/authentication requires/);
+	});
+
+	it("selects SES explicitly and validates its bounded regional credentials", () => {
+		const config = parseWorkerConfig(sesEnv());
+		expect(config.emailTransport).toBe("ses");
+		expect(config.smtp).toBeUndefined();
+		expect(config.ses).toMatchObject({ region: "us-east-1", requestTimeoutMs: 10_000 });
+		expect(config.emailFrom).toBe("support@example.test");
+		expect(() => parseWorkerConfig({ ...sesEnv(), CLEARANCE_EMAIL_TRANSPORT: "queue" })).toThrow(/smtp, ses/);
+		expect(() => parseWorkerConfig({ ...sesEnv(), CLEARANCE_SES_REGION: "metadata.internal" })).toThrow(/valid AWS region/);
+		expect(() => parseWorkerConfig({ ...sesEnv(), CLEARANCE_SES_SECRET_ACCESS_KEY: "short" })).toThrow(/bounded AWS credential/);
+		expect(() => parseWorkerConfig({
+			...sesEnv(), CLEARANCE_SES_ACCESS_KEY_ID: undefined, CLEARANCE_SES_SECRET_ACCESS_KEY: undefined,
+		})).toThrow(/SES requires/);
 	});
 
 	it("validates headers and bounded message bodies", () => {
@@ -110,6 +138,87 @@ describe("delivery worker boundaries", () => {
 		expect(classifySmtpError({ code: "ETLS" })).toEqual({ retryable: true, errorClass: "smtp.transport" });
 		expect(classifySmtpError({ responseCode: 250 })).toEqual({ retryable: false, errorClass: "smtp.protocol", providerStatus: "250" });
 		expect(classifySmtpError(new Error("body_too_large"))).toEqual({ retryable: false, errorClass: "payload.invalid" });
+	});
+
+	it("sends through SES with SigV4, bounded provider identity, and a stable delivery header", async () => {
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const responses = [
+			new Response(JSON.stringify({ SendingEnabled: true }), { status: 200 }),
+			new Response(JSON.stringify({ MessageId: "provider-message-id-sensitive" }), { status: 200 }),
+		];
+		const sender = createSesSender(parseWorkerConfig(sesEnv()), {
+			now: () => new Date("2026-07-15T00:00:00.000Z"),
+			fetchImpl: async (input, init) => {
+				requests.push({ url: String(input), init: init! });
+				return responses.shift()!;
+			},
+		});
+		await sender.verify();
+		const result = await sender.send({
+			to: "person@example.test", from: "support@example.test", subject: "Reset",
+			text: "one-time-secret", html: "<p>one-time-secret</p>",
+		}, { jobId: "job-stable-1", eventId: "event-1" });
+		expect(requests.map((request) => [request.init.method, request.url])).toEqual([
+			["GET", "https://email.us-east-1.amazonaws.com/v2/email/account"],
+			["POST", "https://email.us-east-1.amazonaws.com/v2/email/outbound-emails"],
+		]);
+		const authorization = new Headers(requests[1]!.init.headers).get("authorization")!;
+		expect(authorization).toMatch(/^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20260715\/us-east-1\/ses\/aws4_request,/);
+		expect(authorization).not.toContain("wJalrXUtnFEMI");
+		const body = JSON.parse(String(requests[1]!.init.body)) as {
+			Destination: { ToAddresses: string[] };
+			Content: { Simple: { Headers: Array<{ Name: string; Value: string }> } };
+		};
+		expect(body.Destination.ToAddresses).toEqual(["person@example.test"]);
+		expect(body.Content.Simple.Headers).toEqual([{
+			Name: "X-Clearance-Delivery-ID",
+			Value: "13d9a542dbe78652d1cf6b2f092afaa06f2be13a8100d44d8140d96cd6043c46",
+		}]);
+		expect(result).toEqual({
+			status: "200",
+			requestId: "86008d69e474d48759c352d754586344192b26b4cb99c682f7ea36e8430b3978",
+		});
+	});
+
+	it("checks SES readiness without sending and fails when account sending is disabled", async () => {
+		const methods: string[] = [];
+		const sender = createSesSender(parseWorkerConfig(sesEnv()), {
+			fetchImpl: async (_input, init) => {
+				methods.push(init!.method!);
+				return new Response(JSON.stringify({ SendingEnabled: false }), { status: 200 });
+			},
+		});
+		await expect(sender.verify()).rejects.toMatchObject({ code: "SES_SENDING_DISABLED", retryable: false });
+		expect(methods).toEqual(["GET"]);
+	});
+
+	it("classifies SES transient and permanent failures without retaining raw responses", async () => {
+		for (const scenario of [
+			{ status: 429, body: { name: "TooManyRequestsException", message: "recipient-and-token-secret" }, retryable: true, errorClass: "ses.transient" },
+			{ status: 400, body: { name: "MessageRejected", message: "recipient-and-token-secret" }, retryable: false, errorClass: "ses.rejected" },
+		] as const) {
+			const sender = createSesSender(parseWorkerConfig(sesEnv()), {
+				fetchImpl: async () => new Response(JSON.stringify(scenario.body), { status: scenario.status }),
+			});
+			let thrown: unknown;
+			try {
+				await sender.send({
+					to: "person@example.test", from: "support@example.test", subject: "Reset", text: "token-secret",
+				}, { jobId: "job-1", eventId: "event-1" });
+			} catch (error) { thrown = error; }
+			expect(thrown).toBeInstanceOf(SesDeliveryError);
+			expect(JSON.stringify(thrown)).not.toContain("recipient-and-token-secret");
+			expect(String((thrown as Error).message)).not.toContain("recipient-and-token-secret");
+			expect(classifySesError(thrown)).toEqual({
+				retryable: scenario.retryable,
+				errorClass: scenario.errorClass,
+				providerStatus: String(scenario.status),
+			});
+		}
+		expect(classifySesError(new Error("network response with secret"))).toEqual({
+			retryable: true,
+			errorClass: "ses.transport",
+		});
 	});
 
 	it("canonicalizes and verifies exact webhook bytes with terminal redirect handling", () => {
