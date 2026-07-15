@@ -28,6 +28,7 @@ export * from "./services/members.js";
 export * from "./services/members-import.js";
 export * from "./services/identity.js";
 export * from "./services/doctor.js";
+export * from "./services/delivery-control.js";
 export * from "./services/store-v2.js";
 export * from "./services/sso.js";
 export * from "./services/scim.js";

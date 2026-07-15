@@ -11,6 +11,12 @@ import pg from "pg";
 import { afterAll, describe, expect, it } from "vitest";
 import { appendAuditEvent } from "../services/audit.js";
 import { initProject } from "../services/core.js";
+import {
+	controlDeliveryJob,
+	getDeliveryQuotaForManagement,
+	inspectDeliveryJobForManagement,
+	listDeliveryJobsForManagement,
+} from "../services/delivery-control.js";
 import { JsonStore } from "../store/json-store.js";
 import { createPgStore, type PgStoreDeliveryOptions } from "../store/pg-store.js";
 import type { ManagementStore } from "../store/types.js";
@@ -80,6 +86,19 @@ function requireDelivery(
 		throw new Error("Transactional delivery outbox is required");
 	}
 	return context.enqueueDelivery;
+}
+
+function requireControl(
+	context: Parameters<NonNullable<ManagementStore["mutateCoordinated"]>>[0] extends (
+		context: infer Context,
+	) => unknown
+		? Context
+		: never,
+) {
+	if (!context.controlDelivery) {
+		throw new Error("Transactional delivery control is required");
+	}
+	return context.controlDelivery;
 }
 
 describe.skipIf(!available)("PgStore coordinated delivery atomicity", () => {
@@ -263,9 +282,158 @@ describe.skipIf(!available)("PgStore coordinated delivery atomicity", () => {
 		).rejects.toThrow("Transactional delivery outbox is required");
 		await store.refresh();
 		expect(store.snapshot.projects[0]!.name).toBe(beforeName);
+		await expect(listDeliveryJobsForManagement(store, {
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		})).rejects.toMatchObject({ code: "DELIVERY_NOT_CONFIGURED" });
 
 		const json = new JsonStore(join(tmpdir(), `clearance-json-delivery-${suffix}.json`));
 		expect(json.backend).toBe("json");
 		expect(json.mutateCoordinated).toBeUndefined();
+		await expect(listDeliveryJobsForManagement(json, {
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		})).rejects.toMatchObject({ code: "DELIVERY_POSTGRES_REQUIRED" });
+	});
+
+	it("provides scoped redacted reads, quota status, and preview-by-default control", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		const project = store.snapshot.projects[0]!;
+		const environment = store.snapshot.environments[0]!;
+		const now = new Date();
+		const eventId = `delivery-control-preview-${suffix}`;
+		const jobId = `delivery-control-preview-job-${suffix}`;
+		await store.mutateCoordinated!((context) =>
+			requireDelivery(context)(deliveryInput({
+				eventId,
+				jobId,
+				projectId: project.id,
+				environmentId: environment.id,
+				sourceKey: `control-preview:${suffix}`,
+				now,
+			})),
+		);
+
+		const page = await listDeliveryJobsForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			limit: 20,
+		});
+		expect(page.scope).toEqual({ projectId: project.id, environmentId: environment.id });
+		expect(page.items.some((job) => job.id === jobId)).toBe(true);
+		const inspected = await inspectDeliveryJobForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId,
+		});
+		expect(inspected.job).toMatchObject({ id: jobId, state: "queued" });
+		expect(JSON.stringify(inspected)).not.toContain("signingSecret");
+		await expect(inspectDeliveryJobForManagement(store, {
+			projectId: project.id,
+			environmentId: "wrong-environment",
+			jobId,
+		})).rejects.toMatchObject({ code: "DELIVERY_JOB_NOT_FOUND", status: 404 });
+		const quota = await getDeliveryQuotaForManagement(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			now,
+		});
+		expect(quota.scope).toEqual({ projectId: project.id, environmentId: environment.id });
+
+		const auditBefore = store.snapshot.events.length;
+		const preview = await controlDeliveryJob(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId,
+			action: "cancel",
+			actor: "operator",
+			source: "cli",
+			now,
+		});
+		expect(preview).toMatchObject({ dryRun: true, preview: { allowed: true } });
+		expect(store.snapshot.events).toHaveLength(auditBefore);
+		expect((await store.deliveryControl!.inspect({
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId,
+		}))?.state).toBe("queued");
+
+		const controlled = await controlDeliveryJob(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId,
+			action: "cancel",
+			actor: "operator",
+			source: "cli",
+			now,
+			confirm: true,
+		});
+		expect(controlled).toMatchObject({ dryRun: false, result: { id: jobId, state: "cancelled" } });
+		expect(store.snapshot.events[0]).toMatchObject({
+			action: "delivery.job.cancel",
+			subjectId: jobId,
+			projectId: project.id,
+			environmentId: environment.id,
+		});
+	});
+
+	it("rolls audited control back and awaits a dropped control promise before commit", async () => {
+		const store = stores[0] as Awaited<ReturnType<typeof createPgStore>>;
+		const project = store.snapshot.projects[0]!;
+		const environment = store.snapshot.environments[0]!;
+		const now = new Date();
+		const createJob = async (label: string) => {
+			const eventId = `delivery-control-${label}-${suffix}`;
+			const jobId = `delivery-control-${label}-job-${suffix}`;
+			await store.mutateCoordinated!((context) => requireDelivery(context)(deliveryInput({
+				eventId,
+				jobId,
+				projectId: project.id,
+				environmentId: environment.id,
+				sourceKey: `control-${label}:${suffix}`,
+				now,
+			})));
+			return jobId;
+		};
+		const rollbackJobId = await createJob("rollback");
+		const auditIdsBefore = store.snapshot.events.map((event) => event.id);
+		await expect(store.mutateCoordinated!(async (context) => {
+			await requireControl(context).cancel({
+				projectId: project.id,
+				environmentId: environment.id,
+				jobId: rollbackJobId,
+				actor: "operator",
+				source: "api",
+				now,
+			});
+			throw new Error("forced control rollback");
+		})).rejects.toThrow("forced control rollback");
+		await store.refresh();
+		expect((await store.deliveryControl!.inspect({
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId: rollbackJobId,
+		}))?.state).toBe("queued");
+		expect(store.snapshot.events.map((event) => event.id)).toEqual(auditIdsBefore);
+
+		const droppedJobId = await createJob("dropped");
+		await store.mutateCoordinated!((context) => {
+			void requireControl(context).cancel({
+				projectId: project.id,
+				environmentId: environment.id,
+				jobId: droppedJobId,
+				actor: "operator",
+				source: "api",
+				now,
+			});
+		});
+		expect((await store.deliveryControl!.inspect({
+			projectId: project.id,
+			environmentId: environment.id,
+			jobId: droppedJobId,
+		}))?.state).toBe("cancelled");
+		expect(store.snapshot.events.some((event) =>
+			event.action === "delivery.job.cancel" && event.subjectId === droppedJobId,
+		)).toBe(true);
 	});
 });

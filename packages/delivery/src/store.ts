@@ -2,6 +2,16 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { DeliveryError, StaleDeliveryLeaseError } from "./errors.js";
 import {
+	deliveryReadiness,
+	inspectDeliveryJobScoped,
+	listDeliveryJobs,
+	previewDeliveryControl,
+	type DeliveryControlAction,
+	type DeliveryControlPreview,
+	type DeliveryJobPage,
+	type DeliveryReadinessSummary,
+} from "./control.js";
+import {
 	decryptDeliveryPayload,
 	fingerprintDestination,
 	type DeliveryKeyring,
@@ -19,6 +29,12 @@ import {
 	qualifiedDeliveryTables,
 	type DeliverySchemaOptions,
 } from "./schema.js";
+import {
+	deliveryQuotaStatus,
+	type DeliveryQuotaPolicy,
+	type DeliveryQuotaStatus,
+	type DeliveryScope,
+} from "./quota.js";
 
 type JobRow = {
 	id: string;
@@ -729,5 +745,40 @@ export class DeliveryStore {
 			[jobId],
 		);
 		return result.rows[0] ? redactedDeliveryJob(jobRecord(result.rows[0])) : null;
+	}
+
+	listJobs(input: DeliveryScope & {
+		limit?: number;
+		cursor?: string;
+		states?: readonly DeliveryJobState[];
+		channel?: "email" | "webhook";
+		kind?: string;
+	}): Promise<DeliveryJobPage> {
+		return listDeliveryJobs(this.pool, input, this.options);
+	}
+
+	inspectJobScoped(
+		input: DeliveryScope & { jobId: string },
+	): Promise<ReturnType<typeof redactedDeliveryJob> | null> {
+		return inspectDeliveryJobScoped(this.pool, input, this.options);
+	}
+
+	previewControl(
+		input: DeliveryScope & { jobId: string; action: DeliveryControlAction; now?: Date },
+	): Promise<DeliveryControlPreview | null> {
+		return previewDeliveryControl(this.pool, input, this.options);
+	}
+
+	quotaStatus(
+		input: DeliveryScope & { policy?: DeliveryQuotaPolicy; now?: Date },
+	): Promise<DeliveryQuotaStatus> {
+		return deliveryQuotaStatus(this.pool, input, this.options);
+	}
+
+	readiness(
+		input: { now?: Date; staleAfterMs?: number } = {},
+		keyring?: DeliveryKeyring,
+	): Promise<DeliveryReadinessSummary> {
+		return deliveryReadiness(this.pool, input, this.options, keyring);
 	}
 }

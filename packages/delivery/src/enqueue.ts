@@ -13,6 +13,11 @@ import {
 	qualifiedDeliveryTables,
 	type DeliverySchemaOptions,
 } from "./schema.js";
+import {
+	enforceDeliveryQuotaInExistingTransaction,
+	lockDeliveryQuotaScopeInExistingTransaction,
+	type DeliveryQuotaPolicy,
+} from "./quota.js";
 
 const transactionAdapterBrand: unique symbol = Symbol("delivery-transaction-adapter");
 
@@ -84,6 +89,8 @@ export type EnqueueDeliveryInput = {
 	semanticExpiresAt: Date;
 	availableAt?: Date;
 	maxAttempts?: number;
+	/** Per-scope server policy; defaults to Clearance's bounded production policy. */
+	quota?: DeliveryQuotaPolicy;
 	now?: Date;
 };
 
@@ -198,6 +205,19 @@ export async function enqueueDelivery(
 		expiresAt: semanticExpiresAt,
 	};
 	const encrypted = encryptDeliveryPayload(input.payload, aad, ring);
+	const quotaTransaction: DeliveryRawTransaction = {
+		rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+			text: string,
+			values: readonly unknown[] = [],
+		) => {
+			const result = await tx.query<Row>(text, [...values]);
+			return { rows: result.rows, rowCount: result.rowCount };
+		},
+	};
+	await lockDeliveryQuotaScopeInExistingTransaction(
+		quotaTransaction,
+		{ projectId, environmentId },
+	);
 	const legacyKeyIds = await tx.query<{ source_fingerprint_key_id: string }>(
 		`SELECT DISTINCT source_fingerprint_key_id FROM ${tables.event}
 		 WHERE source_dedupe_version=1`,
@@ -211,19 +231,31 @@ export async function enqueueDelivery(
 			`Delivery fingerprint key ${unavailableLegacyKeyId} is unavailable`,
 		);
 	}
-	const legacyDuplicate = await tx.query(
+	const duplicate = await tx.query(
 		`SELECT 1 FROM ${tables.event}
-		 WHERE (source_fingerprint_key_id, source_fingerprint) IN (
-			SELECT * FROM unnest($1::text[], $2::text[])
+		 WHERE source_dedupe_fingerprint=$1
+		    OR (source_fingerprint_key_id, source_fingerprint) IN (
+			SELECT * FROM unnest($2::text[], $3::text[])
 		 ) LIMIT 1`,
 		[
+			sourceDedupeFingerprint,
 			legacySourceAliases.map((alias) => alias.keyId),
 			legacySourceAliases.map((alias) => alias.fingerprint),
 		],
 	);
-	if (legacyDuplicate.rowCount) {
+	if (duplicate.rowCount) {
 		throw new DeliveryError("DELIVERY_DUPLICATE", "A delivery for this source generation already exists");
 	}
+	await enforceDeliveryQuotaInExistingTransaction(
+		quotaTransaction,
+		{
+			projectId,
+			environmentId,
+			...(input.quota ? { policy: input.quota } : {}),
+			now,
+		},
+		options,
+	);
 	const savepoint = `clearance_delivery_${randomUUID().replace(/-/g, "")}`;
 	let savepointCreated = false;
 	try {

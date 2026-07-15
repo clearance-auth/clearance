@@ -635,6 +635,79 @@ export async function migrateDeliverySchema(
 	}
 }
 
+/** Read-only production readiness assertion, including owned asset and drift checks. */
+export async function assertDeliverySchemaCurrent(
+	pool: pg.Pool,
+	options: DeliverySchemaOptions = {},
+): Promise<{ schema: string; version: typeof DELIVERY_SCHEMA_VERSION; tables: DeliveryTableNames }> {
+	const schema = deliverySchemaName(options);
+	const names = deliveryTableNames(options);
+	const targets = [names.meta, names.event, names.payload, names.job, names.attempt, names.worker];
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+		const schemaResult = await client.query(
+			"SELECT 1 FROM information_schema.schemata WHERE schema_name=$1",
+			[schema],
+		);
+		if (!schemaResult.rowCount) {
+			throw new DeliveryError("DELIVERY_SCHEMA_MISSING", `Postgres schema ${schema} does not exist`);
+		}
+		const existing = await client.query<{ relname: string; marker: string | null }>(
+			`SELECT c.relname, obj_description(c.oid, 'pg_class') marker
+			 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+			 WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p')`,
+			[schema, targets],
+		);
+		const fn = await client.query<{ marker: string | null }>(
+			`SELECT obj_description(p.oid, 'pg_proc') marker
+			 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+			 WHERE n.nspname=$1 AND p.proname=$2`,
+			[schema, names.rejectMutationFunction],
+		);
+		if (existing.rows.length !== targets.length || fn.rows.length !== 1) {
+			throw new DeliveryError(
+				"DELIVERY_SCHEMA_DRIFT",
+				"Owned delivery schema is missing required tables or functions",
+			);
+		}
+		const metadata = await client.query<{ key: string; value: unknown }>(
+			`SELECT key, value FROM ${fq(schema, names.meta)} WHERE key IN ('owner','schema_version')`,
+		);
+		const values = new Map(metadata.rows.map((row) => [row.key, row.value]));
+		if (values.get("owner") !== DELIVERY_SCHEMA_OWNER) {
+			throw new DeliveryError("DELIVERY_SCHEMA_COLLISION", "Delivery metadata owner is missing or invalid");
+		}
+		const version = Number(values.get("schema_version"));
+		if (version !== DELIVERY_SCHEMA_VERSION) {
+			throw new DeliveryError(
+				version > DELIVERY_SCHEMA_VERSION
+					? "DELIVERY_SCHEMA_VERSION_FUTURE"
+					: "DELIVERY_SCHEMA_VERSION_OUTDATED",
+				`Delivery schema version ${version} is not current version ${DELIVERY_SCHEMA_VERSION}`,
+			);
+		}
+		const marker = deliverySchemaAssetMarker(DELIVERY_SCHEMA_VERSION);
+		if (
+			existing.rows.some((row) => row.marker !== marker) ||
+			fn.rows[0]?.marker !== marker
+		) {
+			throw new DeliveryError(
+				"DELIVERY_SCHEMA_COLLISION",
+				"Delivery schema contains assets without current Clearance ownership markers",
+			);
+		}
+		await verifyDeliverySchema(client, schema, names, DELIVERY_SCHEMA_VERSION);
+		await client.query("COMMIT");
+		return { schema, version: DELIVERY_SCHEMA_VERSION, tables: names };
+	} catch (error) {
+		await client.query("ROLLBACK").catch(() => undefined);
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
 export function qualifiedDeliveryTables(options: DeliverySchemaOptions = {}) {
 	const schema = deliverySchemaName(options);
 	const names = deliveryTableNames(options);

@@ -15,11 +15,21 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import pg from "pg";
 import {
+	cancelDeliveryInExistingTransaction,
 	createDeliveryKeyring,
+	DEFAULT_DELIVERY_QUOTA_POLICY,
+	deliveryQuotaStatus,
+	deliveryReadiness,
 	enqueueDeliveryInExistingTransaction,
+	inspectDeliveryJobScoped,
+	listDeliveryJobs,
 	migrateDeliverySchema,
+	previewDeliveryControl,
+	replayDeliveryInExistingTransaction,
+	retryDeliveryInExistingTransaction,
 	type DeliveryKeyring,
 	type DeliveryKeyringInput,
+	type DeliveryQuotaPolicy,
 	type DeliverySchemaOptions,
 	type EnqueuedDelivery,
 	type EnqueueDeliveryInput,
@@ -37,10 +47,14 @@ import type { DataStoreSnapshot } from "../types/resources.js";
 import { PgStoreV2Shadow, StoreV2MigrationError } from "./store-v2-shadow.js";
 import { applyStoreV2EventDelta } from "./store-v2-events.js";
 import {
+	appendAuditEvent,
 	consumeDeferredAuditEvents,
 	deferAuditRetentionForDraft,
 } from "../services/audit.js";
 import type {
+	DeliveryControlMutationInput,
+	ManagementDeliveryControlMutation,
+	ManagementDeliveryControlReader,
 	ManagementStore,
 	StoreV2EventReader,
 	StoreV2MigrationControl,
@@ -51,6 +65,7 @@ const SNAPSHOT_TABLE = "clearance_management_snapshot";
 
 export type PgStoreDeliveryOptions = DeliverySchemaOptions & {
 	keyring: DeliveryKeyringInput;
+	quota?: DeliveryQuotaPolicy;
 };
 
 function safeTableName(value: string): string {
@@ -65,6 +80,7 @@ export class PgStore implements ManagementStore {
 	readonly path: string;
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	readonly deliveryControl?: ManagementDeliveryControlReader;
 	private data: DataStoreSnapshot;
 	private revision = 0;
 	private pool: pg.Pool;
@@ -74,6 +90,7 @@ export class PgStore implements ManagementStore {
 	private idempotencyTable: string;
 	private deliveryKeyring?: DeliveryKeyring;
 	private deliverySchemaOptions?: DeliverySchemaOptions;
+	private deliveryQuotaPolicy: DeliveryQuotaPolicy = DEFAULT_DELIVERY_QUOTA_POLICY;
 	private storeV2Shadow?: PgStoreV2Shadow;
 	private storeV2Phase: StoreV2Phase = "absent";
 	private pending: Promise<void> = Promise.resolve();
@@ -99,12 +116,37 @@ export class PgStore implements ManagementStore {
 		this.idempotencyTable = safeTableName(`${this.table}_idempotency`);
 		if (opts?.delivery) {
 			this.deliveryKeyring = createDeliveryKeyring(opts.delivery.keyring);
+			this.deliveryQuotaPolicy = opts.delivery.quota ?? DEFAULT_DELIVERY_QUOTA_POLICY;
 			this.deliverySchemaOptions = {
 				...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
 				...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
 				...(opts.delivery.legacyFingerprintKeyId
 					? { legacyFingerprintKeyId: opts.delivery.legacyFingerprintKeyId }
 					: {}),
+			};
+			this.deliveryControl = {
+				list: (input) => listDeliveryJobs(this.pool, input, this.deliverySchemaOptions),
+				inspect: (input) => inspectDeliveryJobScoped(
+					this.pool,
+					input,
+					this.deliverySchemaOptions,
+				),
+				preview: (input) => previewDeliveryControl(
+					this.pool,
+					input,
+					this.deliverySchemaOptions,
+				),
+				readiness: (input) => deliveryReadiness(
+					this.pool,
+					input,
+					this.deliverySchemaOptions,
+					this.deliveryKeyring,
+				),
+				quota: (input) => deliveryQuotaStatus(
+					this.pool,
+					{ ...input, policy: this.deliveryQuotaPolicy },
+					this.deliverySchemaOptions,
+				),
 			};
 		}
 		const normalizedPrefix =
@@ -174,6 +216,17 @@ export class PgStore implements ManagementStore {
 		`);
 		if (this.deliveryKeyring) {
 			await migrateDeliverySchema(this.pool, this.deliverySchemaOptions);
+			// Resolve and validate the effective quota during initialization so a
+			// malformed production policy cannot survive until the first mutation.
+			await deliveryQuotaStatus(
+				this.pool,
+				{
+					projectId: "__clearance_config_validation__",
+					environmentId: "__clearance_config_validation__",
+					policy: this.deliveryQuotaPolicy,
+				},
+				this.deliverySchemaOptions,
+			);
 		}
 		// Existing installs created before revision column
 		await this.pool.query(`
@@ -343,6 +396,7 @@ export class PgStore implements ManagementStore {
 			enqueueDelivery?: (
 				input: EnqueueDeliveryInput,
 			) => Promise<EnqueuedDelivery>;
+			controlDelivery?: ManagementDeliveryControlMutation;
 		}) => Promise<T> | T,
 	): Promise<T> {
 		return new Promise<T>((resolvePromise, rejectPromise) => {
@@ -625,6 +679,7 @@ export class PgStore implements ManagementStore {
 			enqueueDelivery?: (
 				input: EnqueueDeliveryInput,
 			) => Promise<EnqueuedDelivery>;
+			controlDelivery?: ManagementDeliveryControlMutation;
 		}) => Promise<T> | T,
 	): Promise<T> {
 		const client = await this.pool.connect();
@@ -653,25 +708,26 @@ export class PgStore implements ManagementStore {
 				};
 			};
 
+			const rawTransaction = {
+				rawTransactionQuery: async <
+					Row extends Record<string, unknown> = Record<string, unknown>,
+				>(text: string, values?: readonly unknown[]) => {
+					const result = await query(text, values ? [...values] : undefined);
+					return {
+						rows: result.rows as Row[],
+						rowCount: result.rowCount,
+					};
+				},
+			};
 			const pendingDeliveryEnqueues: Promise<EnqueuedDelivery>[] = [];
 			const enqueueDelivery = this.deliveryKeyring
 				? (input: EnqueueDeliveryInput) => {
 						const pending = enqueueDeliveryInExistingTransaction(
+							rawTransaction,
 							{
-								rawTransactionQuery: async <
-									Row extends Record<string, unknown> = Record<string, unknown>,
-								>(text: string, values?: readonly unknown[]) => {
-									const result = await query(
-										text,
-										values ? [...values] : undefined,
-									);
-									return {
-										rows: result.rows as Row[],
-										rowCount: result.rowCount,
-									};
-								},
+								...input,
+								quota: input.quota ?? this.deliveryQuotaPolicy,
 							},
-							input,
 							this.deliveryKeyring!,
 							this.deliverySchemaOptions,
 						);
@@ -680,16 +736,93 @@ export class PgStore implements ManagementStore {
 					}
 				: undefined;
 
-			const value = await fn({
-				data: base,
-				query,
-				...(enqueueDelivery ? { enqueueDelivery } : {}),
-			});
+			const pendingDeliveryControls: Promise<unknown>[] = [];
+			const trackedControl = <T>(
+				action: "cancel" | "retry" | "replay",
+				input: DeliveryControlMutationInput,
+				operation: () => Promise<T | null>,
+			): Promise<T | null> => {
+				const pending = (async () => {
+					const controlled = await operation();
+					if (controlled !== null) {
+						const result = controlled as Record<string, unknown>;
+						appendAuditEvent(base, {
+							actor: input.actor,
+							action: `delivery.job.${action}`,
+							subjectType: "delivery_job",
+							subjectId: input.jobId,
+							outcome: "success",
+							source: input.source,
+							projectId: input.projectId,
+							environmentId: input.environmentId,
+							...(input.correlationId ? { correlationId: input.correlationId } : {}),
+							message: `Delivery job ${action} completed`,
+							metadata: {
+								action,
+								resultJobId: result.jobId ?? result.id,
+								resultEventId: result.eventId,
+								state: result.state,
+							},
+						});
+					}
+					return controlled;
+				})();
+				pendingDeliveryControls.push(pending);
+				return pending;
+			};
+			const controlDelivery: ManagementDeliveryControlMutation | undefined =
+				this.deliveryKeyring
+					? {
+							cancel: (input) => trackedControl("cancel", input, () =>
+								cancelDeliveryInExistingTransaction(
+									rawTransaction,
+									input,
+									this.deliverySchemaOptions,
+								)),
+							retry: (input) => trackedControl("retry", input, () =>
+								retryDeliveryInExistingTransaction(
+									rawTransaction,
+									input,
+									this.deliverySchemaOptions,
+								)),
+							replay: (input) => trackedControl("replay", input, () =>
+								replayDeliveryInExistingTransaction(
+									rawTransaction,
+									{
+										...input,
+										quota: this.deliveryQuotaPolicy,
+									},
+									this.deliveryKeyring!,
+									this.deliverySchemaOptions,
+								)),
+						}
+					: undefined;
+
+			let value!: T;
+			let callbackError: unknown;
+			try {
+				value = await fn({
+					data: base,
+					query,
+					...(enqueueDelivery ? { enqueueDelivery } : {}),
+					...(controlDelivery ? { controlDelivery } : {}),
+				});
+			} catch (error) {
+				callbackError = error;
+			}
 			// A caller cannot accidentally commit product state before an issued
-			// outbox write settles by forgetting to await the returned promise.
-			// Any issued enqueue failure remains transaction-fatal even if a caller
-			// catches or drops its individual promise.
-			await Promise.all(pendingDeliveryEnqueues);
+			// outbox/control write settles by forgetting to await the returned
+			// promise. Settle issued work even when the callback throws so no query or
+			// rejection can escape after this transaction starts rolling back.
+			const issued = await Promise.allSettled([
+				...pendingDeliveryEnqueues,
+				...pendingDeliveryControls,
+			]);
+			if (callbackError !== undefined) throw callbackError;
+			const failed = issued.find(
+				(result): result is PromiseRejectedResult => result.status === "rejected",
+			);
+			if (failed) throw failed.reason;
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
 				: undefined;

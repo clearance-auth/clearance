@@ -5,8 +5,14 @@ import type {
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
 import type {
+	DeliveryControlPreview,
+	DeliveryJobPage,
+	DeliveryJobState,
+	DeliveryQuotaStatus,
+	DeliveryReadinessSummary,
 	EnqueuedDelivery,
 	EnqueueDeliveryInput,
+	PublicDeliveryJob,
 } from "@clearance/delivery";
 
 export const STORE_V2_COLLECTIONS = [
@@ -83,6 +89,52 @@ export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
 }
 
+export type DeliveryControlScope = {
+	projectId: string;
+	environmentId: string;
+};
+
+/** PostgreSQL-only, redacted delivery reads bound to the configured schema. */
+export interface ManagementDeliveryControlReader {
+	list(input: DeliveryControlScope & {
+		limit?: number;
+		cursor?: string;
+		states?: readonly DeliveryJobState[];
+		channel?: "email" | "webhook";
+		kind?: string;
+	}): Promise<DeliveryJobPage>;
+	inspect(input: DeliveryControlScope & { jobId: string }): Promise<PublicDeliveryJob | null>;
+	preview(input: DeliveryControlScope & {
+		jobId: string;
+		action: "cancel" | "retry" | "replay";
+		now?: Date;
+	}): Promise<DeliveryControlPreview | null>;
+	readiness(input?: { now?: Date; staleAfterMs?: number }): Promise<DeliveryReadinessSummary>;
+	quota(input: DeliveryControlScope & { now?: Date }): Promise<DeliveryQuotaStatus>;
+}
+
+export type DeliveryControlAuditContext = {
+	actor: string;
+	source: AuditEvent["source"];
+	correlationId?: string;
+};
+
+export type DeliveryControlMutationInput = DeliveryControlScope &
+	DeliveryControlAuditContext & {
+		jobId: string;
+		now?: Date;
+	};
+
+/**
+ * Same-transaction delivery mutations. Implementations own the management
+ * audit append; callers cannot obtain the underlying unaudited SQL primitive.
+ */
+export interface ManagementDeliveryControlMutation {
+	cancel(input: DeliveryControlMutationInput): Promise<PublicDeliveryJob | null>;
+	retry(input: DeliveryControlMutationInput): Promise<PublicDeliveryJob | null>;
+	replay(input: DeliveryControlMutationInput & { maxAttempts?: number }): Promise<EnqueuedDelivery | null>;
+}
+
 /**
  * One atomic management-snapshot transaction. Domain services may inspect the
  * current draft and apply synchronous mutations; persistence is owned by the
@@ -108,6 +160,8 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Postgres-only, explicitly activated normalized shadow-store migration. */
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	/** Present only when PostgreSQL delivery storage and keys are configured. */
+	readonly deliveryControl?: ManagementDeliveryControlReader;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */
@@ -142,6 +196,8 @@ export interface ManagementStore extends ManagementUnitOfWork {
 			enqueueDelivery?: (
 				input: EnqueueDeliveryInput,
 			) => Promise<EnqueuedDelivery>;
+			/** Audited same-transaction delivery controls when configured. */
+			controlDelivery?: ManagementDeliveryControlMutation;
 		}) => Promise<T> | T,
 	): Promise<T>;
 	checksum(): string;
