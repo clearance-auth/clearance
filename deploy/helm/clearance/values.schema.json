@@ -190,12 +190,22 @@
                 "maxResponseBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 }
               }
             },
-            "resources": { "type": "object" },
+            "resources": { "$ref": "#/definitions/workerResources" },
             "podDisruptionBudget": { "$ref": "#/definitions/pdb" },
             "networkPolicy": {
               "type": "object",
-              "required": ["smtpEgress", "metrics"],
+              "required": ["dnsPeers", "databasePeers", "smtpEgress", "metrics"],
               "properties": {
+                "dnsPeers": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": { "$ref": "#/definitions/networkPolicyPeer" }
+                },
+                "databasePeers": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": { "$ref": "#/definitions/networkPolicyPeer" }
+                },
                 "smtpEgress": {
                   "type": "array",
                   "maxItems": 32,
@@ -315,6 +325,24 @@
         }
       }
     },
+    "workerResources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "$ref": "#/definitions/cpuMemoryResources" },
+        "limits": { "$ref": "#/definitions/cpuMemoryResources" }
+      }
+    },
+    "cpuMemoryResources": {
+      "type": "object",
+      "required": ["cpu", "memory"],
+      "additionalProperties": false,
+      "properties": {
+        "cpu": { "type": "string", "minLength": 1 },
+        "memory": { "type": "string", "minLength": 1 }
+      }
+    },
     "networkPolicyPeer": {
       "type": "object",
       "minProperties": 1,
@@ -327,10 +355,18 @@
           "required": ["cidr"],
           "additionalProperties": false,
           "properties": {
-            "cidr": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$" },
+            "cidr": {
+              "type": "string",
+              "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$",
+              "not": { "pattern": "/0+$" }
+            },
             "except": {
               "type": "array",
-              "items": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$" }
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$",
+                "not": { "pattern": "/0+$" }
+              }
             }
           }
         }
@@ -399,6 +435,87 @@
               "worker": {
                 "properties": {
                   "email": { "properties": { "from": { "minLength": 1, "pattern": "^[^\\s@<>]+@[^\\s@<>]+$" } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "delivery": { "properties": { "enabled": { "const": true } } },
+          "networkPolicy": { "properties": { "enabled": { "const": true } } }
+        }
+      },
+      "then": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "worker": {
+                "properties": {
+                  "networkPolicy": {
+                    "properties": {
+                      "dnsPeers": { "minItems": 1 },
+                      "databasePeers": { "minItems": 1 }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "enabled": { "const": true },
+              "worker": {
+                "properties": {
+                  "metrics": {
+                    "properties": {
+                      "serviceMonitor": { "properties": { "enabled": { "const": true } } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": { "properties": { "networkPolicy": { "properties": { "enabled": { "const": true } } } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "enabled": { "const": true },
+              "worker": {
+                "properties": {
+                  "email": {
+                    "properties": {
+                      "transport": { "const": "smtp" },
+                      "smtp": { "properties": { "secure": { "const": false } } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "delivery": {
+            "properties": {
+              "worker": {
+                "properties": {
+                  "email": { "properties": { "smtp": { "properties": { "requireTls": { "const": true } } } } }
                 }
               }
             }

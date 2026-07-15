@@ -104,8 +104,9 @@ For Compose, invoke the one-shot `backup` profile from cron or systemd:
 
 Before any production Compose command, set `CLEARANCE_IMAGE_REPOSITORY` and
 `CLEARANCE_IMAGE_DIGEST` plus their `CLEARANCE_BACKUP_IMAGE_*` equivalents from
-the signed release evidence. The overlay disables local image builds and
-accepts only `repository@sha256:...` references.
+the immutable release evidence. The overlay validates digest-reference syntax;
+the release gate separately verifies signatures and provenance. Local image
+builds are disabled and only `repository@sha256:...` references are accepted.
 
 ```bash
 docker compose -f docker-compose.yml \

@@ -13,7 +13,7 @@ When the console is enabled, also supply `console-admin-user`,
 ```bash
 helm lint deploy/helm/clearance \
   --set image.repository=ghcr.io/owner/clearance/clearance \
-  --set-string image.digest=sha256:<signed-release-digest> \
+  --set-string image.digest=sha256:<immutable-release-digest> \
   --set secrets.existingSecret=clearance-secrets \
   --set console.secrets.existingSecret=clearance-secrets \
   --set env.CLEARANCE_BASE_URL=https://auth.example.com \
@@ -22,14 +22,14 @@ helm lint deploy/helm/clearance \
 helm upgrade --install clearance deploy/helm/clearance \
   --namespace clearance --create-namespace -f production-values.yaml \
   --set image.repository=ghcr.io/owner/clearance/clearance \
-  --set-string image.digest=sha256:<signed-release-digest>
+  --set-string image.digest=sha256:<immutable-release-digest>
 ```
 
 `image.repository` and `image.digest` are required and have no placeholder
-defaults. Copy the `sha256:` digest from the signed release bundle and verify
-its keyless cosign identity before deployment. Workloads render
-`repository@sha256:...`; the console inherits the same immutable reference
-unless explicitly given another signed digest.
+defaults. The chart validates immutable `sha256:` reference syntax. The release
+gate separately verifies the bundle signature and keyless cosign identity
+before deployment. Workloads render `repository@sha256:...`; the console
+inherits the same immutable reference unless explicitly given another digest.
 
 Ingress is disabled until hosts and existing TLS Secret names are supplied.
 Enable `ingress.api` and `ingress.console` independently. TLS defaults on for
@@ -61,14 +61,18 @@ non-secret chart configuration changes.
 ## Transactional delivery worker
 
 Set `delivery.enabled=true` to deploy the separately scalable delivery worker.
-The API and worker then share the delivery schema, prefix, quotas, and one
-external keyring. Add these keys to `delivery.existingSecret`, or to
-`secrets.existingSecret` when the delivery-specific name is empty:
+The API and worker then share the delivery schema, prefix, quotas, and keyring.
+The worker always reads `database-url` from `secrets.existingSecret`, the same
+database authority used by the API. Add the following keys to
+`delivery.existingSecret`, or to `secrets.existingSecret` when the
+delivery-specific name is empty:
 
-- `database-url`
 - `delivery-key-id` and `delivery-keys-json`
 - `delivery-fingerprint-key-id` and `delivery-fingerprint-keys-json`
 - `delivery-source-dedupe-key`
+
+The delivery-specific Secret may also contain provider credentials such as
+SMTP or SES keys. It does not become a second authority for `database-url`.
 
 Each encryption, fingerprint, and source-dedupe value must decode to 32 bytes,
 and every purpose must use different material. The JSON values map retained key
@@ -79,7 +83,8 @@ readiness` reports that queued and leased jobs no longer reference them.
 SMTP requires `delivery.worker.email.from`, `smtp.host`, and an explicit
 destination-scoped rule in `delivery.worker.networkPolicy.smtpEgress`. Each
 rule must include at least one non-empty destination selector or CIDR and TCP
-ports exactly matching `smtp.port`; empty and allow-all rules are rejected.
+ports exactly matching `smtp.port`; empty rules and IPv4 or IPv6 `/0` CIDRs are
+rejected.
 The SMTP port must not overlap the worker's DNS, database, or HTTPS egress
 ports, because such an overlap would bypass destination scoping. Put
 optional authenticated SMTP credentials in `smtp-user` and `smtp-password`;
@@ -98,6 +103,14 @@ delivery:
         secure: false
         requireTls: true
     networkPolicy:
+      dnsPeers:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      databasePeers:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: postgresql }
       smtpEgress:
         - to:
             - ipBlock: { cidr: 203.0.113.0/24 }
@@ -119,12 +132,25 @@ delivery:
       from: auth@example.com
       ses:
         region: us-east-1
+    networkPolicy:
+      dnsPeers:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      databasePeers:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: postgresql }
 ```
 
 The worker Service is ClusterIP-only and has no Ingress. It serves `/live`,
 `/ready`, and `/metrics` on the internal health port. Enabling its
-ServiceMonitor requires exact Prometheus namespace and pod selectors under
-`delivery.worker.networkPolicy.metrics`. Kubernetes probes remain node-local.
+ServiceMonitor requires `networkPolicy.enabled=true` and exact Prometheus
+namespace and pod selectors under `delivery.worker.networkPolicy.metrics`.
+When the worker and NetworkPolicy are enabled, non-empty `dnsPeers` and
+`databasePeers` render as the `to` selectors for those egress rules. Set all
+four worker CPU/memory requests and limits to concrete Kubernetes quantities.
+Kubernetes probes remain node-local.
 The PodDisruptionBudget assumes the default two replicas, and the 45-second
 termination grace exceeds the default 30-second drain deadline.
 
@@ -139,7 +165,7 @@ switch the current IDs everywhere.
 ## Scheduled off-host backup
 
 Enable `backup.enabled`, provide a writable `ReadWriteMany` PVC (or let the chart create one),
-set the published backup-runtime repository and signed digest in
+set the published backup-runtime repository and immutable digest in
 `backup.image.repository` and `backup.image.digest`, and put
 `database-url` plus `backup-copy-command` in `backup.existingSecret`.
 The copy command receives the four exact artifact paths through environment

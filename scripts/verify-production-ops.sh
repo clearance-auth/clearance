@@ -244,6 +244,34 @@ else
   bad "validate-production-env rejected strong env: $(head -5 "$SCRATCH/val-ok.txt" | tr '\n' ' ')"
 fi
 
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="missing-retained-key"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a legacy fingerprint key id absent from the retained ring"
+else
+  bad "validate-production-env accepted a legacy fingerprint key id absent from the retained ring"
+fi
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="invalid key id"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects malformed legacy fingerprint key ids"
+else
+  bad "validate-production-env accepted a malformed legacy fingerprint key id"
+fi
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="fp-v1"
+if bash scripts/validate-production-env.sh >/dev/null 2>&1; then
+  ok "validate-production-env accepts a retained legacy fingerprint key id"
+else
+  bad "validate-production-env rejected a retained legacy fingerprint key id"
+fi
+unset CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID
+
 export CLEARANCE_EMAIL_TRANSPORT="ses"
 export CLEARANCE_SES_REGION="us-east-1"
 export CLEARANCE_SES_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
@@ -374,9 +402,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         if(!m || !m[1].includes(`image: ${image}`) || /^    build:/m.test(m[1])) process.exit(1);
       }
     ' "$SCRATCH/compose-ok.yml"; then
-      ok "production Compose deploys signed digest references with local builds disabled"
+      ok "production Compose deploys immutable digest references with local builds disabled"
     else
-      bad "production Compose did not resolve exclusively to signed digest references"
+      bad "production Compose did not resolve exclusively to immutable digest references"
     fi
     if node -e '
       const fs=require("fs");
@@ -457,6 +485,10 @@ if command -v helm >/dev/null 2>&1; then
     --set env.CLEARANCE_BASE_URL=https://auth.example.test
     --set env.CLEARANCE_CORS_ORIGINS=https://console.example.test
   )
+  DELIVERY_NETWORK_ARGS=(
+    --set-json 'delivery.worker.networkPolicy.dnsPeers=[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}]'
+    --set-json 'delivery.worker.networkPolicy.databasePeers=[{"podSelector":{"matchLabels":{"app.kubernetes.io/name":"postgresql"}}}]'
+  )
   if helm lint deploy/helm/clearance "${HELM_ARGS[@]}" >/dev/null \
     && helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" >"$SCRATCH/helm-default.yml"; then
     ok "Helm lint and default render"
@@ -511,7 +543,9 @@ if command -v helm >/dev/null 2>&1; then
     bad "trusted-proxy ServiceMonitor accepted empty scraper selectors"
   fi
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
     --set delivery.enabled=true \
+    --set delivery.existingSecret=delivery-secrets \
     --set delivery.worker.email.from=auth@example.test \
     --set delivery.worker.email.smtp.host=smtp.example.test \
     --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
@@ -522,6 +556,17 @@ if command -v helm >/dev/null 2>&1; then
     && grep -q 'path: /ready' "$SCRATCH/helm-delivery-smtp.yml" \
     && grep -q 'name: CLEARANCE_SMTP_HOST' "$SCRATCH/helm-delivery-smtp.yml" \
     && grep -q 'name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE' "$SCRATCH/helm-delivery-smtp.yml" \
+    && node -e '
+      const y=require("fs").readFileSync(process.argv[1],"utf8");
+      const docs=y.split(/^---$/m);
+      const worker=docs.find(d=>/kind: Deployment/.test(d)&&/name: beta-delivery-worker/.test(d));
+      const policy=docs.find(d=>/kind: NetworkPolicy/.test(d)&&/name: beta-delivery-worker/.test(d));
+      if(!worker||!policy) process.exit(1);
+      if(!/- name: DATABASE_URL[\s\S]*?secretKeyRef: \{ name: clearance-secrets, key: database-url \}/.test(worker)) process.exit(1);
+      if(!/- name: CLEARANCE_DELIVERY_KEY_ID[\s\S]*?secretKeyRef: \{ name: delivery-secrets, key: delivery-key-id \}/.test(worker)) process.exit(1);
+      if(!policy.includes("kubernetes.io/metadata.name: kube-system")||!policy.includes("app.kubernetes.io/name: postgresql")) process.exit(1);
+      if((policy.match(/^\s+- to:$/gm)||[]).length<2) process.exit(1);
+    ' "$SCRATCH/helm-delivery-smtp.yml" \
     && awk 'BEGIN{RS="---"} /kind: NetworkPolicy/ && /name: beta-delivery-worker/{found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-delivery-smtp.yml" \
     && awk 'BEGIN{RS="---"} /kind: Ingress/ && /name: beta-delivery-worker/{found=1} END{exit found ? 1 : 0}' "$SCRATCH/helm-delivery-smtp.yml"; then
     ok "Helm renders hardened SMTP delivery worker with API producer configuration and scoped egress"
@@ -529,6 +574,7 @@ if command -v helm >/dev/null 2>&1; then
     bad "Helm SMTP delivery worker render is incomplete"
   fi
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
     --set delivery.enabled=true \
     --set delivery.worker.email.transport=ses \
     --set delivery.worker.email.from=auth@example.test \
@@ -550,6 +596,7 @@ if command -v helm >/dev/null 2>&1; then
   fi
   set +e
   helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
     --set delivery.enabled=true \
     --set delivery.worker.email.from=auth@example.test \
     --set delivery.worker.email.smtp.host=smtp.example.test \
@@ -562,6 +609,69 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "Helm SMTP delivery accepted missing egress"
   fi
+  expect_helm_delivery_reject() {
+    local slug="$1"
+    local accepted_message="$2"
+    local rejected_message="$3"
+    shift 3
+    set +e
+    helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      "${DELIVERY_NETWORK_ARGS[@]}" \
+      --set delivery.enabled=true \
+      --set delivery.worker.email.from=auth@example.test \
+      --set delivery.worker.email.smtp.host=smtp.example.test \
+      --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
+      "$@" >"$SCRATCH/${slug}.out" 2>"$SCRATCH/${slug}.err"
+    local render_ec=$?
+    set -e
+    if [[ $render_ec -ne 0 ]]; then
+      ok "$rejected_message"
+    else
+      bad "$accepted_message"
+    fi
+  }
+  expect_helm_delivery_reject \
+    helm-delivery-ipv4-allow-all \
+    "Helm SMTP egress accepted IPv4 /0" \
+    "Helm SMTP egress rejects IPv4 /0" \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"0.0.0.0/0"}}],"ports":[{"protocol":"TCP","port":587}]}]'
+  expect_helm_delivery_reject \
+    helm-delivery-ipv6-allow-all \
+    "Helm SMTP egress accepted IPv6 /0" \
+    "Helm SMTP egress rejects IPv6 /0" \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"::/0"}}],"ports":[{"protocol":"TCP","port":587}]}]'
+  expect_helm_delivery_reject \
+    helm-delivery-insecure-smtp \
+    "Helm accepted SMTP with implicit TLS and STARTTLS both disabled" \
+    "Helm requires implicit TLS or STARTTLS for SMTP" \
+    --set delivery.worker.email.smtp.secure=false \
+    --set delivery.worker.email.smtp.requireTls=false
+  expect_helm_delivery_reject \
+    helm-delivery-empty-dns-peers \
+    "Helm accepted delivery NetworkPolicy without DNS peers" \
+    "Helm requires destination-scoped DNS peers" \
+    --set-json 'delivery.worker.networkPolicy.dnsPeers=[]'
+  expect_helm_delivery_reject \
+    helm-delivery-empty-database-peers \
+    "Helm accepted delivery NetworkPolicy without database peers" \
+    "Helm requires destination-scoped database peers" \
+    --set-json 'delivery.worker.networkPolicy.databasePeers=[]'
+  expect_helm_delivery_reject \
+    helm-delivery-unbounded-resources \
+    "Helm accepted delivery without concrete CPU requests" \
+    "Helm requires concrete worker CPU and memory resources" \
+    --set-string delivery.worker.resources.requests.cpu=
+  expect_helm_delivery_reject \
+    helm-delivery-monitor-without-policy \
+    "Helm accepted the delivery ServiceMonitor without NetworkPolicy" \
+    "Helm requires NetworkPolicy for delivery ServiceMonitor ingress" \
+    --set networkPolicy.enabled=false \
+    --set delivery.worker.email.transport=ses \
+    --set delivery.worker.email.ses.region=us-east-1 \
+    --set delivery.worker.metrics.enabled=false \
+    --set delivery.worker.metrics.serviceMonitor.enabled=true \
+    --set-string 'delivery.worker.networkPolicy.metrics.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=monitoring' \
+    --set-string 'delivery.worker.networkPolicy.metrics.podSelector.matchLabels.app\.kubernetes\.io/name=prometheus'
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
     --set backup.enabled=true \
     --set backup.image.repository=ghcr.io/example/clearance-backup \

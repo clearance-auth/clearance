@@ -35,7 +35,7 @@ services:
 
   api:
     build: !reset null
-    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
     environment:
       NODE_ENV: production
       CLEARANCE_STRICT_SECRETS: "1"
@@ -79,7 +79,7 @@ services:
     # compatibility boundary.
     profiles: !reset []
     build: !reset null
-    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
     command: ["node", "packages/delivery-worker/dist/cli.mjs"]
     environment:
       NODE_ENV: production
@@ -138,7 +138,7 @@ services:
 
   console:
     build: !reset null
-    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
     environment:
       NODE_ENV: production
       CLEARANCE_STRICT_SECRETS: "1"
@@ -156,7 +156,7 @@ services:
 
   sample-b2b:
     build: !reset null
-    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set signed CLEARANCE_IMAGE_DIGEST}"
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
     environment:
       NODE_ENV: production
       CLEARANCE_STRICT_SECRETS: "1"
@@ -180,7 +180,7 @@ services:
   backup:
     profiles: ["backup"]
     build: !reset null
-    image: "${CLEARANCE_BACKUP_IMAGE_REPOSITORY:?set CLEARANCE_BACKUP_IMAGE_REPOSITORY}@${CLEARANCE_BACKUP_IMAGE_DIGEST:?set signed CLEARANCE_BACKUP_IMAGE_DIGEST}"
+    image: "${CLEARANCE_BACKUP_IMAGE_REPOSITORY:?set CLEARANCE_BACKUP_IMAGE_REPOSITORY}@${CLEARANCE_BACKUP_IMAGE_DIGEST:?set immutable CLEARANCE_BACKUP_IMAGE_DIGEST}"
     command: ["bash", "scripts/backup-scheduled.sh", "--dir", "/backups"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}

@@ -1,5 +1,5 @@
 {{- $apiRepository := required "image.repository is required" .Values.image.repository }}
-{{- $apiDigest := required "image.digest is required; deploy the signed release digest" .Values.image.digest }}
+{{- $apiDigest := required "image.digest is required; deploy an immutable release digest" .Values.image.digest }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

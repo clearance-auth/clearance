@@ -44,9 +44,9 @@ Required (strong secrets, no defaults):
   CLEARANCE_PG_VOLUME
   CLEARANCE_BACKUP_VOLUME
   CLEARANCE_IMAGE_REPOSITORY
-  CLEARANCE_IMAGE_DIGEST          # sha256:... from the signed release
+  CLEARANCE_IMAGE_DIGEST          # immutable sha256:...; signature is a release gate
   CLEARANCE_BACKUP_IMAGE_REPOSITORY
-  CLEARANCE_BACKUP_IMAGE_DIGEST   # sha256:... from the signed release
+  CLEARANCE_BACKUP_IMAGE_DIGEST   # immutable sha256:...; signature is a release gate
 
 Optional:
   CLEARANCE_POSTGRES_PORT  # only if intentionally publishing Postgres to the host
@@ -164,7 +164,9 @@ if node -e '
   const id=/^[A-Za-z0-9._-]{1,64}$/;
   const current=process.env.CLEARANCE_DELIVERY_KEY_ID||"";
   const fingerprint=process.env.CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID||"";
+  const legacyFingerprint=(process.env.CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID||"").trim();
   if(!id.test(current)||!id.test(fingerprint)) throw new Error();
+  if(legacyFingerprint&&!id.test(legacyFingerprint)) throw new Error();
   const keys=JSON.parse(process.env.CLEARANCE_DELIVERY_KEYS_JSON||"");
   const fingerprints=JSON.parse(process.env.CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON||"");
   if(!keys||Array.isArray(keys)||typeof keys!=="object"||!fingerprints||Array.isArray(fingerprints)||typeof fingerprints!=="object") throw new Error();
@@ -173,12 +175,13 @@ if node -e '
     return decode(value);
   });
   if(!Object.hasOwn(keys,current)||!Object.hasOwn(fingerprints,fingerprint)) throw new Error();
+  if(legacyFingerprint&&!Object.hasOwn(fingerprints,legacyFingerprint)) throw new Error();
   decoded.push(decode(process.env.CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY||""));
   if(new Set(decoded).size!==decoded.length) throw new Error();
 ' 2>/dev/null; then
-  note "delivery keyring is complete, decodable, and purpose-separated"
+  note "delivery keyring and optional legacy fingerprint key id are valid"
 else
-  fail "delivery keyring must contain distinct 32-byte encryption, fingerprint, and source-dedupe keys"
+  fail "delivery keyring must contain distinct 32-byte purpose keys and every configured fingerprint key id"
 fi
 
 if [[ "${CLEARANCE_DELIVERY_SCHEMA-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]; then

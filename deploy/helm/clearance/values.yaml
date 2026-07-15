@@ -4,7 +4,7 @@
 image:
   # Required at install time, for example ghcr.io/owner/clearance/clearance.
   repository: ""
-  # Required immutable digest from the signed release bundle (sha256:...).
+  # Required immutable digest (sha256:...). Signature proof is a release gate.
   digest: ""
   # Informational release version; workloads deploy repository@digest.
   tag: "0.2.1"
@@ -149,9 +149,13 @@ delivery:
       enabled: true
       minAvailable: 1
     networkPolicy:
-      # The worker has a dedicated DNS/database/HTTPS egress policy. When SMTP
-      # is selected, every rule here must contain a destination and TCP port
-      # exactly matching email.smtp.port; empty and allow-all rules are rejected.
+      # Match the labels used by cluster DNS and Postgres. External databases
+      # may use a narrow ipBlock. Both peer lists are required when the global
+      # NetworkPolicy and delivery worker are enabled.
+      dnsPeers: []
+      databasePeers: []
+      # SMTP rules must contain a destination and TCP port exactly matching
+      # email.smtp.port; empty and IPv4/IPv6 allow-all CIDRs are rejected.
       smtpEgress: []
       metrics:
         namespaceSelector: {}

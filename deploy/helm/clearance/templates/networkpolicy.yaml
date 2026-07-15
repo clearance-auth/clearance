@@ -42,10 +42,14 @@ spec:
   # transport contract is explicit here: cluster DNS, the configured database
   # port, HTTPS for SES/webhooks, plus destination-scoped SMTP rules when used.
   egress:
-    - ports:
+    - to:
+{{ toYaml .Values.delivery.worker.networkPolicy.dnsPeers | indent 8 }}
+      ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
-    - ports:
+    - to:
+{{ toYaml .Values.delivery.worker.networkPolicy.databasePeers | indent 8 }}
+      ports:
         - { protocol: TCP, port: {{ .Values.postgres.port }} }
     - ports:
         - { protocol: TCP, port: 443 }

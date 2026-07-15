@@ -1,13 +1,22 @@
 {{- if .Values.delivery.enabled }}
 {{- $deliverySecret := required "delivery.existingSecret or secrets.existingSecret is required when delivery.enabled" (.Values.delivery.existingSecret | default .Values.secrets.existingSecret) }}
+{{- $databaseSecret := required "secrets.existingSecret is required when delivery.enabled" .Values.secrets.existingSecret }}
 {{- $worker := .Values.delivery.worker }}
 {{- if le (mul (int $worker.terminationGracePeriodSeconds) 1000) (int $worker.drainTimeoutMs) }}{{ fail "delivery.worker.terminationGracePeriodSeconds must exceed delivery.worker.drainTimeoutMs" }}{{- end }}
 {{- if and $worker.podDisruptionBudget.enabled (ge (int $worker.podDisruptionBudget.minAvailable) (int $worker.replicaCount)) }}{{ fail "delivery worker PDB minAvailable must be less than replicaCount" }}{{- end }}
+{{- if or (empty $worker.resources.requests.cpu) (empty $worker.resources.requests.memory) (empty $worker.resources.limits.cpu) (empty $worker.resources.limits.memory) }}{{ fail "delivery worker requires non-empty CPU and memory requests and limits" }}{{- end }}
+{{- if and $worker.metrics.serviceMonitor.enabled (not .Values.networkPolicy.enabled) }}{{ fail "delivery worker ServiceMonitor requires networkPolicy.enabled=true" }}{{- end }}
+{{- if and .Values.networkPolicy.enabled (empty $worker.networkPolicy.dnsPeers) }}{{ fail "delivery worker with networkPolicy.enabled requires delivery.worker.networkPolicy.dnsPeers" }}{{- end }}
+{{- if and .Values.networkPolicy.enabled (empty $worker.networkPolicy.databasePeers) }}{{ fail "delivery worker with networkPolicy.enabled requires delivery.worker.networkPolicy.databasePeers" }}{{- end }}
+{{- if and (eq $worker.email.transport "smtp") (not $worker.email.smtp.secure) (not $worker.email.smtp.requireTls) }}{{ fail "SMTP delivery requires secure=true or requireTls=true" }}{{- end }}
 {{- if and .Values.networkPolicy.enabled (eq $worker.email.transport "smtp") (empty $worker.networkPolicy.smtpEgress) }}{{ fail "SMTP delivery with networkPolicy.enabled requires delivery.worker.networkPolicy.smtpEgress" }}{{- end }}
 {{- if and .Values.networkPolicy.enabled (eq $worker.email.transport "smtp") }}
 {{- if or (eq (int $worker.email.smtp.port) 53) (eq (int $worker.email.smtp.port) 443) (eq (int $worker.email.smtp.port) (int .Values.postgres.port)) }}{{ fail "delivery.worker.email.smtp.port must not overlap the worker DNS, database, or HTTPS egress ports" }}{{- end }}
 {{- range $rule := $worker.networkPolicy.smtpEgress }}
 {{- if or (empty $rule.to) (empty $rule.ports) }}{{ fail "every delivery.worker.networkPolicy.smtpEgress rule requires non-empty to and ports" }}{{- end }}
+{{- range $peer := $rule.to }}
+{{- if and $peer.ipBlock (regexMatch "/0+$" $peer.ipBlock.cidr) }}{{ fail "delivery.worker.networkPolicy.smtpEgress rejects IPv4 and IPv6 /0 CIDRs" }}{{- end }}
+{{- end }}
 {{- range $port := $rule.ports }}
 {{- if ne (toString $port.protocol) "TCP" }}{{ fail "delivery.worker.networkPolicy.smtpEgress permits TCP only" }}{{- end }}
 {{- if ne (int $port.port) (int $worker.email.smtp.port) }}{{ fail "every delivery.worker.networkPolicy.smtpEgress port must equal delivery.worker.email.smtp.port" }}{{- end }}
@@ -35,7 +44,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/runtime-config: {{ printf "%s|%s|%s|%s" $deliverySecret (toJson .Values.delivery) $worker.restartToken .Values.restartToken | sha256sum }}
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s" $databaseSecret $deliverySecret (toJson .Values.delivery) $worker.restartToken .Values.restartToken | sha256sum }}
       labels:
         app: clearance-delivery-worker
         app.kubernetes.io/name: clearance
@@ -54,7 +63,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: delivery-worker
-          image: "{{ required "image.repository is required" .Values.image.repository }}@{{ required "image.digest is required; deploy the signed release digest" .Values.image.digest }}"
+          image: "{{ required "image.repository is required" .Values.image.repository }}@{{ required "image.digest is required; deploy an immutable release digest" .Values.image.digest }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["node", "packages/delivery-worker/dist/cli.mjs"]
           securityContext:
@@ -91,7 +100,7 @@ spec:
               value: production
             - name: DATABASE_URL
               valueFrom:
-                secretKeyRef: { name: {{ $deliverySecret }}, key: database-url }
+                secretKeyRef: { name: {{ $databaseSecret }}, key: database-url }
             - name: CLEARANCE_DELIVERY_WORKER_ID
               valueFrom:
                 fieldRef: { fieldPath: metadata.name }
