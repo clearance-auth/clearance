@@ -51,6 +51,7 @@ describe("authenticated operational API contracts", () => {
 			["POST", "/v1/backups", {}],
 			["GET", "/v1/upgrades/check", undefined],
 			["GET", "/v1/schema/status", undefined],
+			["GET", "/v1/schema/store-v2", undefined],
 			["POST", "/v1/migrations/plan", { source: "legacy", fixture: {} }],
 		] as const) {
 			const response = await app.request(path, {
@@ -61,6 +62,29 @@ describe("authenticated operational API contracts", () => {
 				}),
 			});
 			expect(response.status, `${method} ${path}`).toBe(401);
+		}
+	});
+
+	it("exposes every store-v2 route and rejects the JSON backend structurally", async () => {
+		for (const [method, path, body] of [
+			["GET", "/v1/schema/store-v2", undefined],
+			["GET", "/v1/schema/store-v2/plan", undefined],
+			["POST", "/v1/schema/store-v2/apply", { dryRun: true }],
+			["GET", "/v1/schema/store-v2/verify", undefined],
+			["POST", "/v1/schema/store-v2/rollback", { confirm: true }],
+		] as const) {
+			const response = await app.request(path, {
+				method,
+				headers,
+				...(body === undefined ? {} : { body: JSON.stringify(body) }),
+			});
+			expect(response.status, `${method} ${path}`).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: {
+					code: "STORE_V2_POSTGRES_REQUIRED",
+					stage: expect.stringMatching(/^schema\.store-v2\./),
+				},
+			});
 		}
 	});
 

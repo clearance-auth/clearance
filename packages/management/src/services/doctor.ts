@@ -197,6 +197,61 @@ export async function runDoctor(
 				: `JSON file at ${store.path}`,
 	});
 
+	if (store.storeV2) {
+		try {
+			const status = await store.storeV2.status();
+			const collectionSummary = Object.entries(status.collections)
+				.map(
+					([name, collection]) =>
+						`${name}=${collection.snapshotCount}/${collection.relationalCount ?? 0}`,
+				)
+				.join(", ");
+			if (status.phase === "absent") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: "warn",
+					detail: "Store-v2 has not been applied; the JSONB snapshot remains authoritative",
+					remediation:
+						"Run clearance schema store-v2 plan, then apply with --yes after review",
+				});
+			} else if (status.phase === "disabled") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: "warn",
+					detail: `Store-v2 dual-write is disabled; parity=${status.consistent}; ${collectionSummary}`,
+					remediation:
+						"Run clearance schema store-v2 plan and reapply with --yes to reconcile and resume dual-write",
+				});
+			} else {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: status.consistent ? "pass" : "fail",
+					detail: status.consistent
+						? `Shadow parity verified at revision ${status.snapshotRevision}; ${collectionSummary}`
+						: `Shadow divergence detected across ${Object.entries(status.collections)
+								.filter(([, collection]) => !collection.consistent)
+								.map(([name]) => name)
+								.join(", ") || "revision metadata"}`,
+					remediation: status.consistent
+						? undefined
+						: "Stop mutations and run clearance schema store-v2 verify before reconciling",
+				});
+			}
+		} catch {
+			checks.push({
+				id: "store-v2-shadow",
+				name: "Normalized management shadow",
+				status: "fail",
+				detail: "Store-v2 status could not be verified",
+				remediation:
+					"Run clearance schema store-v2 status and inspect the Postgres schema",
+			});
+		}
+	}
+
 	if (secrets.DATABASE_URL?.startsWith("postgres")) {
 		try {
 			const u = new URL(secrets.DATABASE_URL);

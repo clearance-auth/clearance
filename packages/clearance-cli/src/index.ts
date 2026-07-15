@@ -299,8 +299,9 @@ async function main() {
 	const keys = program.command("keys").description("Project and environment API keys");
 	keys.command("list").option("--include-revoked", "Include revoked keys", false).action(remoteCommandAction);
 	keys.command("create").requiredOption("--name <name>", "Human-readable key name")
-		.option("--scope <scope>", "Repeatable resource:action scope", (value, previous: string[] = []) => [...previous, value], [])
-		.action(remoteCommandAction);
+			.option("--scope <scope>", "Repeatable resource:action scope", (value, previous: string[] = []) => [...previous, value], [])
+			.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+			.action(remoteCommandAction);
 	keys.command("rotate").argument("<id>", "API key id").action(remoteCommandAction);
 	keys.command("revoke").argument("<id>", "API key id").action(remoteCommandAction);
 
@@ -546,6 +547,14 @@ async function main() {
 		.command("migrate")
 		.description("Apply pending Clearance migrations and lifecycle compatibility ensures")
 		.action(remoteCommandAction);
+	const storeV2 = schema
+		.command("store-v2")
+		.description("Normalized management-store migration");
+	storeV2.command("status").description("Show store-v2 phase and parity").action(remoteCommandAction);
+	storeV2.command("plan").description("Preflight the store-v2 backfill").action(remoteCommandAction);
+	storeV2.command("apply").description("Backfill and enable verified dual-write").action(remoteCommandAction);
+	storeV2.command("verify").description("Fail unless snapshot and relational data match").action(remoteCommandAction);
+	storeV2.command("rollback").description("Disable dual-write while retaining relational data").action(remoteCommandAction);
 
 	// config
 	const config = program.command("config").description("Config");
@@ -645,13 +654,16 @@ async function main() {
 				if (session) {
 					const whoami = await fetchWhoami(session.apiUrl, session.token);
 					const via = session.credentialSource === "saved" ? session.profile : "environment";
+					const principal = whoami.operator.type === "api_key"
+						? `api-key ${whoami.operator.id}`
+						: "operator";
 					printResult(g, {
 						authenticated: true,
 						credentialSource: session.credentialSource,
 						...(session.credentialSource === "saved" ? { profile: session.profile } : {}),
 						apiUrl: session.apiUrl,
 						...whoami,
-					}, `operator ${whoami.projectId}/${whoami.environmentId} via ${via} (${session.apiUrl})`);
+					}, `${principal} ${whoami.projectId}/${whoami.environmentId} via ${via} (${session.apiUrl})`);
 					return;
 				}
 				throw new ClearanceError({

@@ -68,6 +68,7 @@ export interface SsoCreateInput {
 	samlCertificate?: string;
 	domains?: string[];
 	actor?: string;
+	source?: SsoActorSource;
 }
 
 export function createSsoConnection(
@@ -124,7 +125,7 @@ export function createSsoConnection(
 		subjectType: "identity_connection",
 		subjectId: conn.id,
 		outcome: "success",
-		source: "cli",
+		source: input.source ?? "cli",
 		organizationId: org.id,
 		projectId: org.projectId,
 		environmentId: org.environmentId,
@@ -493,6 +494,8 @@ export interface SsoTestOptions {
 		| "replay";
 	assertionIssuer?: string;
 	assertionAudience?: string;
+	actor?: string;
+	source?: SsoActorSource;
 }
 
 /** All fixture-driven SSO tests are simulation (not live conformance). */
@@ -570,12 +573,12 @@ export function testSsoConnection(
 			checks: [{ name: "parse", pass: false, detail: "invalid token structure" }],
 		});
 		recordEvent(store, {
-			actor: "system",
+			actor: opts.actor ?? "system",
 			action: "sso.test",
 			subjectType: "identity_connection",
 			subjectId: id,
 			outcome: "failure",
-			source: "sso",
+			source: opts.source ?? "sso",
 			organizationId: conn.organizationId,
 			correlationId: corr,
 			message: "SSO test failed at assertion.parse",
@@ -607,12 +610,12 @@ export function testSsoConnection(
 			redactedRequest: { issuer: effectiveIssuer },
 		});
 		recordEvent(store, {
-			actor: "system",
+			actor: opts.actor ?? "system",
 			action: "sso.test",
 			subjectType: "identity_connection",
 			subjectId: id,
 			outcome: "failure",
-			source: "sso",
+			source: opts.source ?? "sso",
 			organizationId: conn.organizationId,
 			correlationId: corr,
 			message: "SSO test failed at assertion.issuer",
@@ -642,12 +645,12 @@ export function testSsoConnection(
 			],
 		});
 		recordEvent(store, {
-			actor: "system",
+			actor: opts.actor ?? "system",
 			action: "sso.test",
 			subjectType: "identity_connection",
 			subjectId: id,
 			outcome: "failure",
-			source: "sso",
+			source: opts.source ?? "sso",
 			organizationId: conn.organizationId,
 			correlationId: corr,
 			message: "SSO test failed at assertion.audience",
@@ -754,14 +757,19 @@ export function testSsoConnection(
 		],
 	});
 
-	const updated = configureSsoConnection(store, id, { status: "testing" });
+	const updated = configureSsoConnection(
+		store,
+		id,
+		{ status: "testing" },
+		{ actor: opts.actor, source: opts.source },
+	);
 	recordEvent(store, {
-		actor: "system",
+		actor: opts.actor ?? "system",
 		action: "sso.test",
 		subjectType: "identity_connection",
 		subjectId: id,
 		outcome: "success",
-		source: "sso",
+		source: opts.source ?? "sso",
 		organizationId: conn.organizationId,
 		correlationId: corr,
 		message: "SSO simulation test passed (not live IdP conformance)",

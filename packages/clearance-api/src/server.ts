@@ -40,6 +40,13 @@ import { registerPlatformRoutes } from "./routes/platform.js";
 import { registerUserRoutes } from "./routes/users.js";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import {
+	authenticateManagementApiKey,
+	apiKeyRouteIsOperatorOnly,
+	requiredApiKeyScope,
+	requestPrincipal,
+	setRequestPrincipal,
+} from "./request-auth.js";
 
 const port = Number(process.env.CLEARANCE_API_PORT ?? 3200);
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024;
@@ -212,12 +219,17 @@ function safeEqualToken(a: string, b: string): boolean {
  * Resource routes reject with SCOPE_REQUIRED when principal scope is absent.
  * Init and health remain usable without scope (bootstrapping).
  */
-function principalScope(store: ManagementStore): ResourceScope {
+
+function principalScope(store: ManagementStore, c?: Context): ResourceScope {
+	if (c) {
+		const principal = requestPrincipal(c);
+		if (principal.kind === "api_key") return principal.scope;
+	}
 	return resolveOperatorScope(store);
 }
 
 function scopeForRequest(store: ManagementStore, c: Context): ResourceScope {
-	const scope = principalScope(store);
+	const scope = principalScope(store, c);
 	assertClientScopeHeaders(
 		scope,
 		c.req.header("x-clearance-project-id"),
@@ -340,46 +352,87 @@ app.use("*", async (c, next) => {
 	return next();
 });
 
-async function requireOperator(c: Context, next: Next) {
-	// Health is public
-	if (c.req.path === "/health") return next();
-	let expected: string;
+async function requireManagementPrincipal(c: Context, next: Next) {
+	let expected: string | undefined;
 	try {
 		expected = requireOperatorToken();
-	} catch (e) {
-		return c.json(
-			{
-				error: {
-					code: "OPERATOR_TOKEN_UNCONFIGURED",
-					message: e instanceof Error ? e.message : "Operator token required",
-					stage: "api.auth",
-					retryable: false,
-					remediation: "Set CLEARANCE_OPERATOR_TOKEN (≥16 chars)",
-				},
-			},
-			503,
-		);
+	} catch {
+		expected = undefined;
 	}
 	const auth = c.req.header("authorization") ?? "";
 	const match = /^Bearer\s+(.+)$/i.exec(auth);
-	if (!match || !safeEqualToken(match[1]!, expected)) {
+	if (match && expected && safeEqualToken(match[1]!, expected)) {
+		setRequestPrincipal(c, { kind: "operator", id: "operator" });
+		return next();
+	}
+
+	if (match) {
+		const store = await storeForRequest();
+		const result = authenticateManagementApiKey(store, match[1]!);
+		if (result.ok) {
+			if (apiKeyRouteIsOperatorOnly(c.req.method, c.req.path)) {
+				return c.json({
+					error: {
+						code: "OPERATOR_REQUIRED",
+						message: "This management operation requires the bootstrap operator credential",
+						stage: "api.auth",
+						retryable: false,
+					},
+				}, 403);
+			}
+			const requiredScope = requiredApiKeyScope(c.req.method, c.req.path);
+			if (requiredScope && !result.apiKey.scopes.includes(requiredScope)) {
+				return c.json({
+					error: {
+						code: "API_KEY_SCOPE_FORBIDDEN",
+						message: `API key requires scope ${requiredScope}`,
+						stage: "api.auth",
+						retryable: false,
+						requiredScope,
+						apiKeyId: result.apiKey.id,
+					},
+				}, 403);
+			}
+			setRequestPrincipal(c, {
+				kind: "api_key",
+				id: result.apiKey.id,
+				scope: result.scope,
+				scopes: result.apiKey.scopes,
+				apiKey: result.apiKey,
+			});
+			return next();
+		}
+	}
+
+	if (!expected) {
+		return c.json({
+			error: {
+				code: "OPERATOR_TOKEN_UNCONFIGURED",
+				message: "CLEARANCE_OPERATOR_TOKEN (or CLEARANCE_API_TOKEN) required (≥16 chars) for management API",
+				stage: "api.auth",
+				retryable: false,
+				remediation: "Set CLEARANCE_OPERATOR_TOKEN (≥16 chars)",
+			},
+		}, 503);
+	}
+
+	{
 		return c.json(
 			{
 				error: {
 					code: "UNAUTHORIZED",
-					message: "Bearer operator token required",
+					message: "Valid bearer operator token or API key required",
 					stage: "api.auth",
 					retryable: false,
-					remediation: "Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN>",
+					remediation: "Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN|API_KEY>",
 				},
 			},
 			401,
 		);
 	}
-	return next();
 }
 
-app.use("/v1/*", requireOperator);
+app.use("/v1/*", requireManagementPrincipal);
 
 app.use("/v1/*", async (c, next) => {
 	if (!["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) return next();
@@ -836,7 +889,7 @@ app.route(
 	"/",
 	registerPlatformRoutes({
 		storeForRequest,
-		principalScope,
+		principalScope: (store, c) => principalScope(store, c),
 		scopeForRequest,
 		handleError,
 	}),

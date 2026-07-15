@@ -5,6 +5,7 @@ import type {
 	ResourceScope,
 } from "@clearance/management";
 import type { Context } from "hono";
+import { requestActor } from "../request-auth.js";
 
 export interface BaseRouteDependencies {
 	storeForRequest(): Promise<ManagementStore>;
@@ -23,10 +24,10 @@ export interface ApplicationRouteDependencies extends ScopedRouteDependencies {
 }
 
 type ApiOperationContext = OperationContext & {
-	readonly actor: "api";
+	readonly actor: string;
 	readonly source: "api";
 };
 
-export function apiOperationContext(scope: ResourceScope): ApiOperationContext {
-	return { scope, actor: "api", source: "api" };
+export function apiOperationContext(scope: ResourceScope, context: Context): ApiOperationContext {
+	return { scope, actor: requestActor(context), source: "api" };
 }

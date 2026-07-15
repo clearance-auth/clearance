@@ -37,7 +37,12 @@ export async function dispatchAccessCommand({
 			return requestManagementApi(session, {
 				method: API_KEY_OPERATIONS.create.http.method,
 				path: API_KEY_OPERATIONS.create.http.path,
-				body: { name: opts.name, scopes: opts.scope, dryRun: global.dryRun },
+					body: {
+						name: opts.name,
+						scopes: opts.scope,
+						expiresAt: opts.expiresAt,
+						dryRun: global.dryRun,
+					},
 			});
 		case API_KEY_OPERATIONS.rotate.cliPath:
 			requireConfirmation(global, "API_KEY_CONFIRMATION_REQUIRED", "API key rotation");

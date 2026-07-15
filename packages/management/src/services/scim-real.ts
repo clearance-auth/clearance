@@ -86,6 +86,7 @@ export async function createScimConnectionReal(
 		organizationId: string;
 		provider: string;
 		actor?: string;
+		source?: "cli" | "console" | "api" | "system";
 		/**
 		 * External SCIM base URL. Defaults to the local setup endpoint;
 		 * a real tenant URL is required for live conformance probes.
@@ -226,7 +227,7 @@ export async function createScimConnectionReal(
 				subjectType: "directory_connection",
 				subjectId: conn.id,
 				outcome: "success",
-				source: "cli",
+				source: input.source ?? "cli",
 				organizationId: org.id,
 				message: `Created SCIM provider ${providerId} in scimProvider table`,
 				metadata: {
@@ -268,6 +269,8 @@ export async function testScimConnectionReal(
 		endpointOverride?: string;
 		bearerToken?: string;
 		fetchImpl?: typeof fetch;
+		actor?: string;
+		source?: "cli" | "console" | "api" | "system";
 	} = {},
 ): Promise<{
 	pass: boolean;
@@ -374,6 +377,8 @@ export async function testScimConnectionReal(
 		const check = await checkScimConnection(store, id, {
 			bearerToken: opts.bearerToken,
 			fetchImpl: opts.fetchImpl,
+			actor: opts.actor,
+			source: opts.source,
 		});
 		const users = opts.users ?? [];
 		const proposed = users.map((u) => ({
@@ -535,12 +540,12 @@ export async function testScimConnectionReal(
 		};
 	});
 	recordEvent(store, {
-		actor: "system",
+		actor: opts.actor ?? "system",
 		action: "scim.test",
 		subjectType: "directory_connection",
 		subjectId: id,
 		outcome: "success",
-		source: "scim",
+		source: opts.source ?? "scim",
 		organizationId: conn.organizationId,
 		correlationId: corr,
 		message: `SCIM ${dryRun ? "dry-run" : "apply"} — ${SCIM_LOCAL_PROTOCOL_EVIDENCE}`,

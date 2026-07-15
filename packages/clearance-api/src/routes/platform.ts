@@ -18,10 +18,12 @@ import {
 	type ResourceScope,
 } from "@clearance/management";
 import { Hono } from "hono";
+import type { Context } from "hono";
+import { requestActor, requestPrincipal } from "../request-auth.js";
 import type { ScopedRouteDependencies } from "./shared.js";
 
 export interface PlatformRouteDependencies extends ScopedRouteDependencies {
-	principalScope(store: ManagementStore): ResourceScope;
+	principalScope(store: ManagementStore, context: Context): ResourceScope;
 }
 
 export function registerPlatformRoutes({
@@ -34,9 +36,12 @@ export function registerPlatformRoutes({
 		.get("/v1/whoami", async (c) => {
 			try {
 				const store = await storeForRequest();
-				const scope = principalScope(store);
+				const scope = principalScope(store, c);
+				const principal = requestPrincipal(c);
 				return c.json({
-					operator: { id: "operator", type: "operator", authenticated: true },
+					operator: principal.kind === "api_key"
+						? { id: principal.id, type: "api_key", authenticated: true, scopes: principal.scopes }
+						: { id: "operator", type: "operator", authenticated: true },
 					projectId: scope.projectId,
 					environmentId: scope.environmentId,
 					storeBackend: store.backend,
@@ -141,7 +146,7 @@ export function registerPlatformRoutes({
 						project: planProjectCreate({ name: body.name }, store.snapshot.projects),
 					});
 				}
-				const project = createProject(store, { name: body.name, actor: "api", source: "api" });
+				const project = createProject(store, { name: body.name, actor: requestActor(c), source: "api" });
 				await store.ready();
 				return c.json({ project }, 201);
 			} catch (error) {
@@ -195,7 +200,7 @@ export function registerPlatformRoutes({
 					projectId,
 					name: body.name,
 					kind: body.kind,
-					actor: "api",
+					actor: requestActor(c),
 				});
 				await store.ready();
 				return c.json({ environment, scope }, 201);
@@ -258,7 +263,7 @@ export function registerPlatformRoutes({
 					...(dryRun !== undefined ? { dryRun } : {}),
 					...(confirm !== undefined ? { confirm } : {}),
 					scope,
-					actor: "api",
+					actor: requestActor(c),
 					source: "api",
 				});
 				if (!result.dryRun) {

@@ -48,6 +48,13 @@ import type {
 	migrateRuntimeSchema,
 	planRuntimeSchema,
 } from "../services/runtime-schema.js";
+import type {
+	applyStoreV2,
+	getStoreV2Status,
+	planStoreV2,
+	rollbackStoreV2,
+	verifyStoreV2,
+} from "../services/store-v2.js";
 import type { restoreBackup, upgradeCheck } from "../services/backup.js";
 import type {
 	restorePostgresBackup,
@@ -148,10 +155,10 @@ export interface ManagementOperationTypes {
 		output: { apiKeys: ApiKeyView[]; scope: ResourceScope };
 	};
 	"keys.create": {
-		input: { name: string; scopes?: string[]; dryRun?: boolean };
+		input: { name: string; scopes?: string[]; expiresAt?: string; dryRun?: boolean };
 		output:
 			| (CreatedApiKey & { scope: ResourceScope })
-			| { dryRun: true; apiKey: { name: string; scopes: string[] }; secretGenerated: false; scope: ResourceScope };
+			| { dryRun: true; apiKey: { name: string; scopes: string[]; expiresAt?: string }; secretGenerated: false; scope: ResourceScope };
 	};
 	"keys.rotate": {
 		input: { id: string; dryRun?: boolean };
@@ -394,6 +401,26 @@ export interface ManagementOperationTypes {
 	"schema.migrate": {
 		input: { dryRun?: boolean; confirm?: boolean };
 		output: Awaited<ReturnType<typeof migrateRuntimeSchema>>;
+	};
+	"schema.store-v2.status": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof getStoreV2Status>>;
+	};
+	"schema.store-v2.plan": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof planStoreV2>>;
+	};
+	"schema.store-v2.apply": {
+		input: { dryRun?: boolean; confirm?: boolean };
+		output: Awaited<ReturnType<typeof applyStoreV2>>;
+	};
+	"schema.store-v2.verify": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof verifyStoreV2>>;
+	};
+	"schema.store-v2.rollback": {
+		input: { confirm?: boolean };
+		output: Awaited<ReturnType<typeof rollbackStoreV2>>;
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
@@ -1064,6 +1091,49 @@ export const SCHEMA_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const STORE_V2_OPERATIONS = Object.freeze({
+	status: defineOperation({
+		id: "schema.store-v2.status",
+		cliPath: "schema store-v2 status",
+		http: { method: "GET", path: "/v1/schema/store-v2" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "schema.store-v2.plan",
+		cliPath: "schema store-v2 plan",
+		http: { method: "GET", path: "/v1/schema/store-v2/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "schema.store-v2.apply",
+		cliPath: "schema store-v2 apply",
+		http: { method: "POST", path: "/v1/schema/store-v2/apply" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	verify: defineOperation({
+		id: "schema.store-v2.verify",
+		cliPath: "schema store-v2 verify",
+		http: { method: "GET", path: "/v1/schema/store-v2/verify" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	rollback: defineOperation({
+		id: "schema.store-v2.rollback",
+		cliPath: "schema store-v2 rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+});
+
 export const USER_OPERATIONS = Object.freeze({
 	list: defineOperation({
 		id: "users.list",
@@ -1226,6 +1296,7 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(BACKUP_OPERATIONS),
 	...Object.values(UPGRADE_OPERATIONS),
 	...Object.values(SCHEMA_OPERATIONS),
+	...Object.values(STORE_V2_OPERATIONS),
 	...Object.values(USER_OPERATIONS),
 	...Object.values(ORGANIZATION_OPERATIONS),
 	...Object.values(MEMBER_OPERATIONS),

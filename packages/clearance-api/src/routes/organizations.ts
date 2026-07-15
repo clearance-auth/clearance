@@ -76,7 +76,7 @@ export function registerOrganizationRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
 			const organization = await applicationFor(store).organizations.create(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{ name: body.name, slug: body.slug, ownerUserId: body.ownerUserId },
 			);
 			return c.json({ organization }, 201);
@@ -143,7 +143,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, id: c.req.param("id"), name, slug, scope });
 			}
 			const organization = await applicationFor(store).organizations.update(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 				{
 					...(name !== undefined ? { name } : {}),
@@ -191,7 +191,7 @@ export function registerOrganizationRoutes({
 				});
 			}
 			const result = await applicationFor(store).organizations.archive(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 				{
 					...(dryRun !== undefined ? { dryRun } : {}),
@@ -242,7 +242,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, organizationId: c.req.param("id"), principalId, role, scope });
 			}
 			const membership = await applicationFor(store).members.add(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{
 					organizationId: c.req.param("id"),
 					principalId,
@@ -290,7 +290,7 @@ export function registerOrganizationRoutes({
 			}
 			const result = await executeMemberImportPlan(plan, async (row) => {
 				return applicationFor(store).members.add(
-					apiOperationContext(scope),
+					apiOperationContext(scope, c),
 					{
 						organizationId: plan.organizationId,
 						principalId: row.principalId,
@@ -337,7 +337,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, organizationId: orgId, membershipId: memberId, role: body.role, scope });
 			}
 			const membership = await applicationFor(store).members.update(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				memberId,
 				{ role: body.role, auditSource: "api" },
 			);
@@ -368,7 +368,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, organizationId: orgId, membershipId: memberId, membership: existing, scope });
 			}
 			const membership = await applicationFor(store).members.remove(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				memberId,
 				{ auditSource: "api" },
 			);

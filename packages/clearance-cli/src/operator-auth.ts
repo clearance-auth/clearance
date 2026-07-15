@@ -26,7 +26,9 @@ export type OperatorCredential = {
 };
 
 export type OperatorWhoami = {
-	operator: { id: string; type: "operator"; authenticated: true };
+	operator:
+		| { id: "operator"; type: "operator"; authenticated: true }
+		| { id: string; type: "api_key"; authenticated: true; scopes: string[] };
 	projectId: string;
 	environmentId: string;
 	storeBackend: "json" | "postgres";
@@ -331,8 +333,13 @@ function parseWhoami(value: unknown): OperatorWhoami {
 	const operator = response.operator as Record<string, unknown> | undefined;
 	if (
 		!operator ||
-		operator.id !== "operator" ||
-		operator.type !== "operator" ||
+		typeof operator.id !== "string" ||
+		!operator.id ||
+		(operator.type !== "operator" && operator.type !== "api_key") ||
+		(operator.type === "operator" && operator.id !== "operator") ||
+		(operator.type === "api_key" &&
+			(!Array.isArray(operator.scopes) ||
+				operator.scopes.some((scope) => typeof scope !== "string"))) ||
 		operator.authenticated !== true ||
 		typeof response.projectId !== "string" ||
 		!response.projectId ||
@@ -343,7 +350,14 @@ function parseWhoami(value: unknown): OperatorWhoami {
 		throw error("CLI_WHOAMI_INVALID_RESPONSE", "Clearance API returned an invalid whoami response.", "Upgrade the Clearance API or check the configured API URL.");
 	}
 	return {
-		operator: { id: "operator", type: "operator", authenticated: true },
+		operator: operator.type === "api_key"
+			? {
+					id: operator.id,
+					type: "api_key",
+					authenticated: true,
+					scopes: [...(operator.scopes as string[])],
+				}
+			: { id: "operator", type: "operator", authenticated: true },
 		projectId: response.projectId,
 		environmentId: response.environmentId,
 		storeBackend: response.storeBackend,
@@ -384,6 +398,13 @@ export async function validateAndSaveCredential(
 	profile?: string,
 ): Promise<OperatorWhoami> {
 	const whoami = await fetchWhoami(apiUrl, token);
+	if (whoami.operator.type !== "operator") {
+		throw error(
+			"CLI_LOGIN_OPERATOR_REQUIRED",
+			"Saved profiles require an operator credential.",
+			"Use managed API keys through CLEARANCE_API_TOKEN with an explicit CLEARANCE_API_URL.",
+		);
+	}
 	await writeSavedCredential({ apiUrl, token }, env, profile);
 	return whoami;
 }

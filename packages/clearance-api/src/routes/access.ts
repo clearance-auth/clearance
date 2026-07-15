@@ -9,6 +9,7 @@ import {
 	listApiKeys,
 	listRoles,
 	normalizeAndValidateApiKeyScopes,
+	publicConfig,
 	revokeApiKey,
 	rotateApiKey,
 	updateRole,
@@ -16,6 +17,7 @@ import {
 	validateRole,
 } from "@clearance/management";
 import { Hono } from "hono";
+import { requestActor } from "../request-auth.js";
 import {
 	apiOperationContext,
 	type ApplicationRouteDependencies,
@@ -48,12 +50,43 @@ export function registerAccessRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
+			let expiresAt: string | undefined;
+			if (body.expiresAt !== undefined) {
+				if (
+					typeof body.expiresAt !== "string" ||
+					!Number.isFinite(Date.parse(body.expiresAt))
+				) {
+					throw new ClearanceError({
+						code: "API_KEY_EXPIRY_INVALID",
+						message: "API key expiry must be an ISO-8601 timestamp",
+						stage: "keys.create",
+						status: 400,
+					});
+				}
+				expiresAt = new Date(body.expiresAt).toISOString();
+				if (Date.parse(expiresAt) <= Date.now()) {
+					throw new ClearanceError({
+						code: "API_KEY_EXPIRY_INVALID",
+						message: "API key expiry must be in the future",
+						stage: "keys.create",
+						status: 400,
+					});
+				}
+			}
 			if (body.dryRun === true) {
 				const name = validateApiKeyName(body.name, "keys.create");
 				const scopes = normalizeAndValidateApiKeyScopes(body.scopes, "keys.create");
-				return c.json({ dryRun: true, apiKey: { name, scopes }, secretGenerated: false, scope });
+				return c.json({ dryRun: true, apiKey: { name, scopes, ...(expiresAt ? { expiresAt } : {}) }, secretGenerated: false, scope });
 			}
-			const result = await createApiKey(store, { name: body.name, scopes: body.scopes, scope, actor: "api", source: "api" });
+			const createInput: Parameters<typeof createApiKey>[1] & { expiresAt?: string } = {
+				name: body.name,
+				scopes: body.scopes,
+				...(expiresAt ? { expiresAt } : {}),
+				scope,
+				actor: requestActor(c),
+				source: "api",
+			};
+			const result = await createApiKey(store, createInput);
 			await store.ready();
 			return c.json({ ...result, scope }, 201);
 		} catch (e) {
@@ -69,9 +102,10 @@ export function registerAccessRoutes({
 			if (body.dryRun === true) {
 				const apiKey = inspectApiKey(store, c.req.param("id"), { scope });
 				if (apiKey.status === "revoked") throw new ClearanceError({ code: "API_KEY_REVOKED", message: "Revoked API keys cannot be rotated", stage: "keys.rotate", status: 409 });
+				if (apiKey.expiresAt && Date.parse(apiKey.expiresAt) <= Date.now()) throw new ClearanceError({ code: "API_KEY_EXPIRED", message: "Expired API keys cannot be rotated", stage: "keys.rotate", status: 409 });
 				return c.json({ dryRun: true, apiKey, secretGenerated: false, scope });
 			}
-			const result = await rotateApiKey(store, c.req.param("id"), apiOperationContext(scope));
+			const result = await rotateApiKey(store, c.req.param("id"), apiOperationContext(scope, c));
 			await store.ready();
 			return c.json({ ...result, scope });
 		} catch (e) {
@@ -88,7 +122,7 @@ export function registerAccessRoutes({
 				const apiKey = inspectApiKey(store, c.req.param("id"), { scope });
 				return c.json({ dryRun: true, apiKey, wouldChange: apiKey.status === "active", scope });
 			}
-			const result = await revokeApiKey(store, c.req.param("id"), apiOperationContext(scope));
+			const result = await revokeApiKey(store, c.req.param("id"), apiOperationContext(scope, c));
 			await store.ready();
 			return c.json({ ...result, scope });
 		} catch (e) {
@@ -112,7 +146,7 @@ export function registerAccessRoutes({
 			const cursor = c.req.query("cursor");
 			const limit = Number(limitRaw ?? 100);
 			const page = await applicationFor(store).sessions.list(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{ limit, ...(cursor !== undefined ? { cursor } : {}) },
 			);
 			return c.json({
@@ -132,13 +166,13 @@ export function registerAccessRoutes({
 			const body = await c.req.json().catch(() => ({}));
 			if (body.dryRun === true) {
 				const session = await applicationFor(store).sessions.inspect(
-					apiOperationContext(scope),
+					apiOperationContext(scope, c),
 					c.req.param("id"),
 				);
 				return c.json({ dryRun: true, session, wouldChange: session.status === "active", scope });
 			}
 			const result = await applicationFor(store).sessions.revoke(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 			);
 			return c.json({ ...result, scope });
@@ -191,7 +225,7 @@ export function registerAccessRoutes({
 				description: body.description,
 				permissions: body.permissions,
 				scope,
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 			});
 			await store.ready();
@@ -214,7 +248,7 @@ export function registerAccessRoutes({
 				description: body.description,
 				permissions: body.permissions,
 				scope,
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 			});
 			await store.ready();
@@ -229,7 +263,7 @@ export function registerAccessRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			return c.json({
-				config: store.snapshot.meta.config,
+				...publicConfig(store.snapshot.meta.config),
 				schemaVersion: store.snapshot.meta.schemaVersion,
 				releaseVersion: store.snapshot.releaseVersion,
 				resourceCounts: store.resourceCounts(),
@@ -238,7 +272,7 @@ export function registerAccessRoutes({
 				/** Principal scope is server-configured; headers are not authority. */
 				tokenBoundary: "principal-derived-scope",
 				telemetry: { remoteSinks: [], default: "disabled" },
-				auth: { mode: "bearer-operator" },
+				auth: { mode: "bearer-operator-or-managed-api-key" },
 			});
 		} catch (e) {
 			return handleError(c, e);

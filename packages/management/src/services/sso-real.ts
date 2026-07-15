@@ -191,6 +191,7 @@ export async function createSsoConnectionReal(
 		matrix?: "okta" | "entra";
 		fixturePath?: string;
 		actor?: string;
+		source?: "cli" | "console" | "api" | "system";
 		/**
 		 * Setup reservation/attempt id. When set, derives stable runtime +
 		 * management ids and reuses them across retries after lease expiry.
@@ -406,7 +407,7 @@ export async function createSsoConnectionReal(
 				subjectType: "identity_connection",
 				subjectId: conn.id,
 				outcome: "success",
-				source: "cli",
+				source: input.source ?? "cli",
 				organizationId: org.id,
 				message: `Created SSO provider ${providerId} (matrix=${fixture?.matrix ?? "custom"}) via ssoProvider + @clearance/sso discovery validation`,
 				metadata: {
@@ -441,7 +442,11 @@ export async function createSsoConnectionReal(
 export function testSsoConnectionReal(
 	store: ManagementStore,
 	id: string,
-	opts: { fixture?: SsoTestFixture } = {},
+	opts: {
+		fixture?: SsoTestFixture;
+		actor?: string;
+		source?: "cli" | "console" | "api" | "system" | "sso";
+	} = {},
 ): {
 	pass: boolean;
 	trace: DiagnosticTrace;
@@ -582,12 +587,12 @@ export function testSsoConnectionReal(
 			}
 		});
 		recordEvent(store, {
-			actor: "system",
+			actor: opts.actor ?? "system",
 			action: "sso.test",
 			subjectType: "identity_connection",
 			subjectId: id,
 			outcome: "success",
-			source: "sso",
+			source: opts.source ?? "sso",
 			organizationId: conn.organizationId,
 			correlationId: corr,
 			message: `SSO simulation via @clearance/sso (${matrix} shape) — ${SSO_LOCAL_EVIDENCE_LABEL}`,
@@ -659,12 +664,12 @@ export function testSsoConnectionReal(
 				],
 			});
 			recordEvent(store, {
-				actor: "system",
+				actor: opts.actor ?? "system",
 				action: "sso.test",
 				subjectType: "identity_connection",
 				subjectId: id,
 				outcome: "failure",
-				source: "sso",
+				source: opts.source ?? "sso",
 				organizationId: conn.organizationId,
 				correlationId: corr,
 				message: `SSO test failed at ${stage}`,

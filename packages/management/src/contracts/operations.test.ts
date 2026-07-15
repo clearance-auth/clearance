@@ -18,6 +18,7 @@ import {
 	ROLE_OPERATIONS,
 	SCIM_OPERATIONS,
 	SCHEMA_OPERATIONS,
+	STORE_V2_OPERATIONS,
 	SESSION_OPERATIONS,
 	SSO_OPERATIONS,
 	USER_OPERATIONS,
@@ -53,7 +54,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(80);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(85);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -88,6 +89,14 @@ describe("management operation contracts", () => {
 			supportsDryRun: true,
 		});
 		expect(SCHEMA_OPERATIONS.migrate.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.apply).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/apply" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.verify.mutation).toBe(false);
+		expect(STORE_V2_OPERATIONS.rollback.confirmation).toBe("server-required");
 	});
 
 	it("distinguishes readiness evidence writes from config inspection", () => {

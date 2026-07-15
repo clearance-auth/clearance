@@ -33,6 +33,7 @@ import {
 } from "@clearance/management";
 import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
+import { requestActor } from "../request-auth.js";
 import {
 	apiOperationContext,
 	type ScopedRouteDependencies,
@@ -73,6 +74,8 @@ export function registerEnterpriseRoutes({
 				...body,
 				protocol: body.protocol ?? "oidc",
 				domains: body.domains ?? (body.domain ? [body.domain] : undefined),
+				actor: requestActor(c),
+				source: "api" as const,
 			};
 			// Fail closed if organizationId is outside principal scope
 			inspectOrganization(store, input.organizationId, scope);
@@ -108,7 +111,7 @@ export function registerEnterpriseRoutes({
 				issuer: request.issuer,
 				audience: request.audience,
 				domains: request.domain ? [request.domain] : request.domains,
-			}, apiOperationContext(scope));
+			}, apiOperationContext(scope, c));
 			await store.ready();
 			return c.json({ connection, scope });
 		} catch (e) {
@@ -122,7 +125,7 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const request = await c.req.json();
 			inspectOrganization(store, request.organizationId, scope);
-			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "sso", actor: "api" });
+			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "sso", actor: requestActor(c) });
 			await store.ready();
 			return c.json({ ...link, scope }, 201);
 		} catch (e) {
@@ -145,11 +148,16 @@ export function registerEnterpriseRoutes({
 			}
 			inspectOrganization(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			const testInput = {
+				...body,
+				actor: requestActor(c),
+				source: "api" as const,
+			};
 			const result = body.live === true
 				? await testSsoConnectionLive(store, c.req.param("id"))
 				: runtimeDatabaseConfigured()
-					? await testSsoConnectionReal(store, c.req.param("id"), body)
-					: testSsoConnection(store, c.req.param("id"), body);
+					? await testSsoConnectionReal(store, c.req.param("id"), testInput)
+					: testSsoConnection(store, c.req.param("id"), testInput);
 			await store.ready();
 			return c.json(result);
 		} catch (e) {
@@ -171,7 +179,7 @@ export function registerEnterpriseRoutes({
 				return c.json({ dryRun: true, connection: current, wouldChange: true, scope });
 			}
 			const connection = rotateSsoCredential(store, c.req.param("id"), {
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 				scope,
 			});
@@ -193,12 +201,12 @@ export function registerEnterpriseRoutes({
 			}
 			const result = runtimeDatabaseConfigured()
 				? await disableSsoConnectionReal(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					})
 				: disableSsoConnection(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					});
@@ -218,10 +226,15 @@ export function registerEnterpriseRoutes({
 			const developmentBearerToken = runtimeDatabaseConfigured()
 				? undefined
 				: `scimtok_${randomBytes(24).toString("base64url")}`;
+			const input = {
+				...body,
+				actor: requestActor(c),
+				source: "api" as const,
+			};
 			const connection = runtimeDatabaseConfigured()
-				? await createScimConnectionReal(store, body)
+				? await createScimConnectionReal(store, input)
 				: {
-						...createScimConnection(store, { ...body, bearerToken: developmentBearerToken }),
+						...createScimConnection(store, { ...input, bearerToken: developmentBearerToken }),
 						bearerTokenOnce: developmentBearerToken,
 					};
 			await store.ready();
@@ -249,7 +262,7 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const request = await c.req.json();
 			inspectOrganization(store, request.organizationId, scope);
-			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "scim", actor: "api" });
+			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "scim", actor: requestActor(c) });
 			await store.ready();
 			return c.json({ ...link, scope }, 201);
 		} catch (e) {
@@ -278,11 +291,18 @@ export function registerEnterpriseRoutes({
 			}
 			inspectOrganization(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			const testInput = {
+				dryRun: body.dryRun === true,
+				fixture: body.fixture,
+				users: body.users,
+				actor: requestActor(c),
+				source: "api" as const,
+			};
 			const result = body.live === true
 				? await testScimConnectionLive(store, c.req.param("id"))
 				: runtimeDatabaseConfigured()
-					? await testScimConnectionReal(store, c.req.param("id"), body)
-					: testScimConnection(store, c.req.param("id"), body);
+					? await testScimConnectionReal(store, c.req.param("id"), testInput)
+					: testScimConnection(store, c.req.param("id"), testInput);
 			await store.ready();
 			return c.json(result);
 		} catch (e) {
@@ -303,7 +323,7 @@ export function registerEnterpriseRoutes({
 				return c.json({ dryRun: true, connection: current, wouldChange: true, scope });
 			}
 			const connection = rotateScimCredential(store, c.req.param("id"), {
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 				scope,
 			});
@@ -325,12 +345,12 @@ export function registerEnterpriseRoutes({
 			}
 			const result = runtimeDatabaseConfigured()
 				? await disableScimConnectionReal(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					})
 				: disableScimConnection(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					});
@@ -350,7 +370,7 @@ export function registerEnterpriseRoutes({
 			const result = replayDiagnosticTrace(store, c.req.param("traceId"), {
 				dryRun,
 				confirm: body.confirm === true && !dryRun,
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 				scope,
 			});

@@ -23,6 +23,7 @@ function publicView(key: ApiKey): ApiKeyView {
 		status: key.status,
 		createdAt: key.createdAt,
 		updatedAt: key.updatedAt,
+		...(key.expiresAt ? { expiresAt: key.expiresAt } : {}),
 		...(key.revokedAt ? { revokedAt: key.revokedAt } : {}),
 		...(key.replacedById ? { replacedById: key.replacedById } : {}),
 	};
@@ -30,6 +31,28 @@ function publicView(key: ApiKey): ApiKeyView {
 
 function digest(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+export function validateApiKeyExpiry(value: unknown, stage: string): string | undefined {
+	if (value === undefined || value === null || value === "") return undefined;
+	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+		throw new ClearanceError({
+			code: "API_KEY_EXPIRY_INVALID",
+			message: "API key expiry must be an ISO-8601 timestamp",
+			stage,
+			status: 400,
+		});
+	}
+	const normalized = new Date(value).toISOString();
+	if (Date.parse(normalized) <= Date.now()) {
+		throw new ClearanceError({
+			code: "API_KEY_EXPIRY_INVALID",
+			message: "API key expiry must be in the future",
+			stage,
+			status: 400,
+		});
+	}
+	return normalized;
 }
 
 /** Strict normalized scope validation: lowercase, no empty/malformed/duplicates. */
@@ -73,13 +96,13 @@ function newSecret(): string {
 	return `clr_${randomBytes(32).toString("base64url")}`;
 }
 
-function newRecord(scope: ResourceScope, name: string, scopes: string[], secret: string): ApiKey {
+function newRecord(scope: ResourceScope, name: string, scopes: string[], secret: string, expiresAt?: string): ApiKey {
 	const fullDigest = digest(secret);
 	const now = nowIso();
 	return {
 		id: newId("key"), projectId: scope.projectId, environmentId: scope.environmentId,
 		name, scopes, digest: fullDigest, prefix: secret.slice(0, 12), fingerprint: fullDigest.slice(0, 16),
-		status: "active", createdAt: now, updatedAt: now,
+		status: "active", createdAt: now, updatedAt: now, ...(expiresAt ? { expiresAt } : {}),
 	};
 }
 
@@ -102,12 +125,13 @@ export function inspectApiKey(store: ManagementStore, id: string, input?: { scop
 	return publicView(key);
 }
 
-export async function createApiKey(store: ManagementStore, input: { name: unknown; scopes?: unknown; projectId?: string; environmentId?: string; scope?: ResourceScope; actor?: string; source?: "cli" | "console" | "api" }): Promise<CreatedApiKey> {
+export async function createApiKey(store: ManagementStore, input: { name: unknown; scopes?: unknown; expiresAt?: unknown; projectId?: string; environmentId?: string; scope?: ResourceScope; actor?: string; source?: "cli" | "console" | "api" }): Promise<CreatedApiKey> {
 	const scope = input.scope ?? resolveOperatorScope(store, { projectId: input.projectId, environmentId: input.environmentId });
 	const name = validateApiKeyName(input.name, "keys.create");
 	const scopes = normalizeAndValidateApiKeyScopes(input.scopes, "keys.create");
+	const expiresAt = validateApiKeyExpiry(input.expiresAt, "keys.create");
 	const secret = newSecret();
-	const key = newRecord(scope, name, scopes, secret);
+	const key = newRecord(scope, name, scopes, secret, expiresAt);
 	return store.mutateDurable((data) => {
 		data.apiKeys ??= [];
 		data.apiKeys.push(key);
@@ -123,8 +147,17 @@ export async function rotateApiKey(store: ManagementStore, id: string, input: { 
 		const original = data.apiKeys.find((key) => key.id === id);
 		assertResourceInScope(original, scope, { code: "API_KEY_NOT_FOUND", stage: "keys.rotate", label: "API key" });
 		if (original.status === "revoked") throw new ClearanceError({ code: "API_KEY_REVOKED", message: "Revoked API keys cannot be rotated", stage: "keys.rotate", status: 409 });
+		if (original.expiresAt && Date.parse(original.expiresAt) <= Date.now()) {
+			throw new ClearanceError({
+				code: "API_KEY_EXPIRED",
+				message: "Expired API keys cannot be rotated",
+				stage: "keys.rotate",
+				status: 409,
+				remediation: "Create a new API key with a future expiry",
+			});
+		}
 		const secret = newSecret();
-		const replacement = newRecord(scope, original.name, [...original.scopes], secret);
+		const replacement = newRecord(scope, original.name, [...original.scopes], secret, original.expiresAt);
 		const now = nowIso();
 		original.status = "revoked"; original.revokedAt = now; original.updatedAt = now; original.replacedById = replacement.id;
 		data.apiKeys.push(replacement);

@@ -369,6 +369,8 @@ export interface ApiKey {
 	status: "active" | "revoked";
 	createdAt: string;
 	updatedAt: string;
+	/** Optional absolute expiry. Authentication rejects the key at or after this instant. */
+	expiresAt?: string;
 	revokedAt?: string;
 	replacedById?: string;
 }

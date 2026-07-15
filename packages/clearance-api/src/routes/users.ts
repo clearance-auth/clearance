@@ -7,6 +7,7 @@ import {
 	listUsersPage,
 } from "@clearance/management";
 import { Hono } from "hono";
+import { requestActor } from "../request-auth.js";
 import {
 	apiOperationContext,
 	type ApplicationRouteDependencies,
@@ -66,7 +67,7 @@ export function registerUserRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
 			const result = await applicationFor(store).users.create(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{
 					email: body.email,
 					name: body.name,
@@ -100,7 +101,7 @@ export function registerUserRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			const result = await applicationFor(store).users.update(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{
 					id: c.req.param("id"),
 					name: body.name,
@@ -123,7 +124,7 @@ export function registerUserRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			const result = await applicationFor(store).users.disable(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{ id: c.req.param("id"), dryRun: body.dryRun },
 			);
 			return result.dryRun
@@ -139,7 +140,7 @@ export function registerUserRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const user = await applicationFor(store).users.delete(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 			);
 			return c.json({ user, scope });
@@ -194,7 +195,7 @@ export function registerUserRoutes({
 				format,
 				limit,
 				...(status ? { status } : {}),
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 			});
 			await store.ready();

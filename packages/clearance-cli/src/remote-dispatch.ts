@@ -14,6 +14,7 @@ import {
 	READINESS_OPERATIONS,
 	ROLE_OPERATIONS,
 	SCHEMA_OPERATIONS,
+	STORE_V2_OPERATIONS,
 	SCIM_OPERATIONS,
 	SESSION_OPERATIONS,
 	SSO_OPERATIONS,
@@ -29,6 +30,7 @@ import { dispatchEventCommand } from "./dispatch/events.js";
 import { dispatchMigrationCommand } from "./dispatch/migrations.js";
 import { dispatchOperationsCommand } from "./dispatch/operations.js";
 import { dispatchOrganizationCommand } from "./dispatch/organizations.js";
+import { dispatchStoreV2Command } from "./dispatch/store-v2.js";
 import { error } from "./dispatch/shared.js";
 import { dispatchUserCommand } from "./dispatch/users.js";
 import type { GlobalOpts } from "./output.js";
@@ -156,6 +158,12 @@ export async function dispatchRemoteCommand(
 		case CONFIG_OPERATIONS.validate.cliPath:
 		case CONFIG_OPERATIONS.diff.cliPath:
 			return dispatchOperationsCommand({ session, path, args, opts, global });
+		case STORE_V2_OPERATIONS.status.cliPath:
+		case STORE_V2_OPERATIONS.plan.cliPath:
+		case STORE_V2_OPERATIONS.apply.cliPath:
+		case STORE_V2_OPERATIONS.verify.cliPath:
+		case STORE_V2_OPERATIONS.rollback.cliPath:
+			return dispatchStoreV2Command({ session, path, args, opts, global });
 		default:
 			throw error(
 				"CLI_REMOTE_COMMAND_UNAVAILABLE",

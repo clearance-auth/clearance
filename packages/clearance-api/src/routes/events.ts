@@ -6,6 +6,7 @@ import {
 	replayDiagnosticTrace,
 } from "@clearance/management";
 import { Hono } from "hono";
+import { requestActor } from "../request-auth.js";
 import type { ScopedRouteDependencies } from "./shared.js";
 
 export interface EventRouteDependencies extends ScopedRouteDependencies {}
@@ -82,7 +83,7 @@ export function registerEventRoutes({
 					...(action ? { action } : {}),
 					...(organizationId ? { organizationId } : {}),
 					...(before ? { before } : {}),
-					actor: "api",
+					actor: requestActor(c),
 					source: "api",
 				});
 				await store.ready();
@@ -109,7 +110,7 @@ export function registerEventRoutes({
 					scope,
 					dryRun,
 					confirm: confirm && !bodyDryRun,
-					actor: "api",
+					actor: requestActor(c),
 					source: "api",
 				});
 				if (!result.dryRun) {

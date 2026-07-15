@@ -2,6 +2,19 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The CLI suite resolves workspace dependencies from their last built dist.
+// Supply the source-change registry additions here so transport tests remain
+// build-free; management's contract suite owns the canonical definitions.
+vi.mock("@clearance/management", async (importOriginal) => {
+	const original = await importOriginal<typeof import("@clearance/management")>();
+	const source = await import("../../management/src/contracts/operations.ts");
+	return {
+		...original,
+		STORE_V2_OPERATIONS: source.STORE_V2_OPERATIONS,
+		MANAGEMENT_OPERATIONS: source.MANAGEMENT_OPERATIONS,
+	};
+});
 import {
 	classifyCommandPath,
 	dispatchRemoteCommand,
@@ -75,6 +88,68 @@ describe("CLI transport parity", () => {
 		await dispatchRemoteCommand(session, "sso rotate", ["sso_1"], {}, { dryRun: true });
 		await dispatchRemoteCommand(session, "scim rotate", ["scim_1"], {}, { dryRun: true });
 		for (const [, init] of calls) expect(JSON.parse(String(init.body)).dryRun).toBe(true);
+	});
+
+	it("forwards API-key expiry through the CLI transport", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ apiKey: { id: "key_1" } }), { status: 201 });
+		}));
+		await dispatchRemoteCommand(
+			session,
+			"keys create",
+			[],
+			{ name: "automation", scope: ["users:read"], expiresAt: "2030-01-01T00:00:00Z" },
+			{},
+		);
+		expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({
+			name: "automation",
+			scopes: ["users:read"],
+			expiresAt: "2030-01-01T00:00:00Z",
+		});
+	});
+
+	it("routes store-v2 reads and gates apply and rollback", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ schemaVersion: "v1" }), { status: 200 });
+		}));
+
+		await dispatchRemoteCommand(session, "schema store-v2 status", [], {}, {});
+		await dispatchRemoteCommand(session, "schema store-v2 plan", [], {}, {});
+		await dispatchRemoteCommand(session, "schema store-v2 verify", [], {}, {});
+		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 apply", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_APPLY_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 apply",
+			[],
+			{},
+			{ dryRun: true },
+		);
+		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 rollback", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 rollback",
+			[],
+			{},
+			{ yes: true },
+		);
+
+		expect(calls.map(([url]) => url)).toEqual([
+			"https://api.clearance.test/v1/schema/store-v2",
+			"https://api.clearance.test/v1/schema/store-v2/plan",
+			"https://api.clearance.test/v1/schema/store-v2/verify",
+			"https://api.clearance.test/v1/schema/store-v2/apply",
+			"https://api.clearance.test/v1/schema/store-v2/rollback",
+		]);
+		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ dryRun: true });
+		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({ confirm: true });
 	});
 
 	it("lets global dry-run override SCIM apply and rejects unsupported SSO test previews", async () => {

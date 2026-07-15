@@ -4,22 +4,27 @@ import {
 	IMPORT_OPERATIONS,
 	MIGRATION_OPERATIONS,
 	SCHEMA_OPERATIONS,
+	STORE_V2_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	applyUpgrade,
+	applyStoreV2,
 	createBackup,
 	createPostgresBackup,
 	getRuntimeSchemaStatus,
+	getStoreV2Status,
 	migrateRuntimeSchema,
 	migrationStatus,
 	parseLegacyFixture,
 	planMigration,
 	planRuntimeSchema,
+	planStoreV2,
 	planUpgrade,
 	previewMigration,
 	restoreBackup,
 	restorePostgresBackup,
 	rollbackMigrationDurable,
 	rollbackUpgrade,
+	rollbackStoreV2,
 	runMigrationDurable,
 	upgradeCheck,
 	upgradeCheckWithDb,
@@ -27,6 +32,7 @@ import {
 	verifyMigrationDurable,
 	verifyPostgresBackup,
 	verifyUpgrade,
+	verifyStoreV2,
 } from "@clearance/management";
 import { Hono } from "hono";
 import type { BaseRouteDependencies } from "./shared.js";
@@ -248,6 +254,53 @@ export function registerOperationRoutes({
 			return c.json(await migrateRuntimeSchema({ dryRun }));
 		} catch (e) {
 			return handleError(c, e);
+		}
+	});
+
+	routes.get(STORE_V2_OPERATIONS.status.http.path, async (c) => {
+		try {
+			return c.json(await getStoreV2Status(await storeForRequest()));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.get(STORE_V2_OPERATIONS.plan.http.path, async (c) => {
+		try {
+			return c.json(await planStoreV2(await storeForRequest()));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.post(STORE_V2_OPERATIONS.apply.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await applyStoreV2(await storeForRequest(), {
+				dryRun: body.dryRun === true,
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.get(STORE_V2_OPERATIONS.verify.http.path, async (c) => {
+		try {
+			return c.json(await verifyStoreV2(await storeForRequest()));
+		} catch (error) {
+			return handleError(c, error);
+		}
+	});
+
+	routes.post(STORE_V2_OPERATIONS.rollback.http.path, async (c) => {
+		try {
+			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			return c.json(await rollbackStoreV2(await storeForRequest(), {
+				confirm: body.confirm === true,
+			}));
+		} catch (error) {
+			return handleError(c, error);
 		}
 	});
 

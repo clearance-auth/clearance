@@ -1,5 +1,58 @@
 import type { DataStoreSnapshot } from "../types/resources.js";
 
+export const STORE_V2_COLLECTIONS = [
+	"projects",
+	"environments",
+	"principals",
+	"organizations",
+] as const;
+
+export type StoreV2Collection = (typeof STORE_V2_COLLECTIONS)[number];
+export type StoreV2Phase = "absent" | "shadow" | "disabled";
+
+export interface StoreV2CollectionStatus {
+	snapshotCount: number;
+	relationalCount: number | null;
+	snapshotChecksum: string;
+	relationalChecksum: string | null;
+	consistent: boolean;
+	differingIds: string[];
+}
+
+export interface StoreV2Status {
+	schemaVersion: 1 | null;
+	phase: StoreV2Phase;
+	snapshotRevision: number;
+	relationalRevision: number | null;
+	consistent: boolean;
+	collections: Record<StoreV2Collection, StoreV2CollectionStatus>;
+}
+
+export interface StoreV2PlanBlocker {
+	code: string;
+	collection: StoreV2Collection;
+	resourceIds: string[];
+}
+
+export interface StoreV2Plan {
+	schemaVersion: 1;
+	phase: StoreV2Phase;
+	snapshotRevision: number;
+	collections: readonly StoreV2Collection[];
+	rowCounts: Record<StoreV2Collection, number>;
+	blockerCount: number;
+	blockers: StoreV2PlanBlocker[];
+	canApply: boolean;
+}
+
+export interface StoreV2MigrationControl {
+	plan(): Promise<StoreV2Plan>;
+	status(): Promise<StoreV2Status>;
+	apply(): Promise<StoreV2Status>;
+	verify(): Promise<StoreV2Status>;
+	disable(): Promise<StoreV2Status>;
+}
+
 /** Read-only view used by domain queries and validation. */
 export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
@@ -27,6 +80,8 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Local path used for file-backed stores and backup directory resolution */
 	readonly path: string;
 	readonly backend: "json" | "postgres";
+	/** Postgres-only, explicitly activated normalized shadow-store migration. */
+	readonly storeV2?: StoreV2MigrationControl;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */

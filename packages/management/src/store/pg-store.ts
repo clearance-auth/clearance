@@ -23,7 +23,11 @@ import {
 	STORE_SCHEMA_VERSION,
 } from "./snapshot.js";
 import type { DataStoreSnapshot } from "../types/resources.js";
-import type { ManagementStore } from "./types.js";
+import { PgStoreV2Shadow, StoreV2MigrationError } from "./store-v2-shadow.js";
+import type {
+	ManagementStore,
+	StoreV2MigrationControl,
+} from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
 
@@ -37,6 +41,7 @@ function safeTableName(value: string): string {
 export class PgStore implements ManagementStore {
 	readonly backend = "postgres" as const;
 	readonly path: string;
+	readonly storeV2?: StoreV2MigrationControl;
 	private data: DataStoreSnapshot;
 	private revision = 0;
 	private pool: pg.Pool;
@@ -44,6 +49,7 @@ export class PgStore implements ManagementStore {
 	private emailUniqueTable: string;
 	private slugUniqueTable: string;
 	private idempotencyTable: string;
+	private storeV2Shadow?: PgStoreV2Shadow;
 	private pending: Promise<void> = Promise.resolve();
 	/** Set when a queued write fails; rethrown from ready() so the chain never rejects. */
 	private writeError: unknown = null;
@@ -51,7 +57,11 @@ export class PgStore implements ManagementStore {
 
 	constructor(
 		databaseUrl: string,
-		opts?: { backupDir?: string; tableName?: string },
+		opts?: {
+			backupDir?: string;
+			tableName?: string;
+			normalizedPrefix?: string;
+		},
 	) {
 		this.path = resolve(opts?.backupDir ?? process.cwd(), ".clearance", "pg");
 		this.pool = new pg.Pool({ connectionString: databaseUrl });
@@ -60,6 +70,38 @@ export class PgStore implements ManagementStore {
 		this.emailUniqueTable = safeTableName(`${this.table}_principal_email`);
 		this.slugUniqueTable = safeTableName(`${this.table}_organization_slug`);
 		this.idempotencyTable = safeTableName(`${this.table}_idempotency`);
+		const normalizedPrefix =
+			opts?.normalizedPrefix ??
+			(this.table === SNAPSHOT_TABLE ? "mgmt_" : undefined);
+		if (normalizedPrefix) {
+			this.storeV2Shadow = new PgStoreV2Shadow(
+				this.pool,
+				this.table,
+				normalizedPrefix,
+			);
+			this.storeV2 = {
+				plan: async () => {
+					await this.ready();
+					return this.storeV2Shadow!.plan();
+				},
+				status: async () => {
+					await this.ready();
+					return this.storeV2Shadow!.status();
+				},
+				apply: async () => {
+					await this.ready();
+					return this.storeV2Shadow!.apply();
+				},
+				verify: async () => {
+					await this.ready();
+					return this.storeV2Shadow!.verify();
+				},
+				disable: async () => {
+					await this.ready();
+					return this.storeV2Shadow!.disable();
+				},
+			};
+		}
 		this.data = emptySnapshot();
 	}
 
@@ -177,6 +219,18 @@ export class PgStore implements ManagementStore {
 		if (rev !== this.revision) {
 			this.data = normalizeSnapshot(result.rows[0].data);
 			this.revision = rev;
+		}
+		if (
+			process.env.CLEARANCE_STORE_V2_VERIFY === "1" &&
+			this.storeV2Shadow
+		) {
+			const status = await this.storeV2Shadow.verify();
+			if (status.phase === "shadow" && !status.consistent) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_DIVERGENCE",
+					"Store-v2 shadow data diverged from the authoritative snapshot.",
+				);
+			}
 		}
 	}
 
@@ -353,11 +407,18 @@ export class PgStore implements ManagementStore {
 				rev = 0;
 			}
 
+			const before = cloneSnapshot(base);
 			// Apply on draft — if fn throws (e.g. USER_EXISTS), full ROLLBACK
 			const applied = fn(base);
 			const next = applied === undefined ? base : applied;
 			const newRevision = rev + 1;
 
+			await this.storeV2Shadow?.syncTransaction(
+				client,
+				before,
+				next,
+				newRevision,
+			);
 			// Enforce uniqueness indexes from the committed snapshot draft
 			await this.syncUniqueness(client, next);
 
@@ -398,8 +459,15 @@ export class PgStore implements ManagementStore {
 			const base = result.rows[0]?.data
 				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
+			const before = cloneSnapshot(base);
 			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
 			const value = fn(base);
+			await this.storeV2Shadow?.syncTransaction(
+				client,
+				before,
+				base,
+				revision,
+			);
 			await this.syncUniqueness(client, base);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
@@ -441,6 +509,7 @@ export class PgStore implements ManagementStore {
 			const base = result.rows[0]?.data
 				? normalizeSnapshot(cloneSnapshot(result.rows[0].data))
 				: emptySnapshot({ storeBackend: "postgres" });
+			const before = cloneSnapshot(base);
 			const revision = Number(result.rows[0]?.revision ?? 0) + 1;
 
 			const query = async (sql: string, params?: unknown[]) => {
@@ -453,6 +522,12 @@ export class PgStore implements ManagementStore {
 
 			const value = await fn({ data: base, query });
 
+			await this.storeV2Shadow?.syncTransaction(
+				client,
+				before,
+				base,
+				revision,
+			);
 			await this.syncUniqueness(client, base);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
@@ -551,7 +626,11 @@ export class PgStore implements ManagementStore {
 
 export async function createPgStore(
 	databaseUrl: string,
-	opts?: { backupDir?: string; tableName?: string },
+	opts?: {
+		backupDir?: string;
+		tableName?: string;
+		normalizedPrefix?: string;
+	},
 ): Promise<PgStore> {
 	const store = new PgStore(databaseUrl, opts);
 	await store.init();

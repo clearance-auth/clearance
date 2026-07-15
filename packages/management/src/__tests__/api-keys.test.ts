@@ -29,12 +29,18 @@ describe("API key lifecycle", () => {
 	it("returns a raw secret once while persisting and listing safe metadata only", async () => {
 		const store = storeForTest();
 		const { project, environment } = initProject(store, { name: "Keys" });
-		const created = await createApiKey(store, { name: " CI deploy ", scopes: ["Users:Read", "deploy:write"], source: "cli" });
+		const created = await createApiKey(store, {
+			name: " CI deploy ",
+			scopes: ["Users:Read", "deploy:write"],
+			expiresAt: "2100-01-01T00:00:00Z",
+			source: "cli",
+		});
 		expect(created.secret).toMatch(/^clr_/);
 		expect(Buffer.from(created.secret.slice(4), "base64url").length).toBeGreaterThanOrEqual(32);
 		expect(created.apiKey.scopes).toEqual(["deploy:write", "users:read"]);
 		expect(created.apiKey.projectId).toBe(project.id);
 		expect(created.apiKey.environmentId).toBe(environment.id);
+		expect(created.apiKey.expiresAt).toBe("2100-01-01T00:00:00.000Z");
 		expect(created.apiKey).not.toHaveProperty("digest");
 		const persisted = readFileSync(store.path, "utf8");
 		expect(persisted).not.toContain(created.secret);
@@ -57,6 +63,16 @@ describe("API key lifecycle", () => {
 		}
 	});
 
+	it("rejects malformed and already-expired expiry timestamps", async () => {
+		const store = storeForTest();
+		initProject(store, { name: "Keys" });
+		for (const expiresAt of ["not-a-date", "2000-01-01T00:00:00Z"]) {
+			await expect(createApiKey(store, { name: "Expired", expiresAt })).rejects.toMatchObject({
+				code: "API_KEY_EXPIRY_INVALID",
+			});
+		}
+	});
+
 	it("isolates scope, rotates atomically, rejects revoked rotations, and revokes idempotently", async () => {
 		const store = storeForTest();
 		const { project, environment } = initProject(store, { name: "Keys" });
@@ -73,6 +89,25 @@ describe("API key lifecycle", () => {
 		expect(first.idempotent).toBe(false);
 		expect(second.idempotent).toBe(true);
 		expect(JSON.stringify(store.snapshot.events)).not.toContain(rotated.secret);
+	});
+
+	it("rejects rotation after the source key has expired", async () => {
+		const store = storeForTest();
+		initProject(store, { name: "Keys" });
+		const created = await createApiKey(store, {
+			name: "Short lived",
+			expiresAt: "2100-01-01T00:00:00Z",
+		});
+		await store.mutateDurable((data) => {
+			const key = data.apiKeys.find((candidate) => candidate.id === created.apiKey.id);
+			if (!key) throw new Error("seeded API key missing");
+			key.expiresAt = "2000-01-01T00:00:00.000Z";
+		});
+		await expect(rotateApiKey(store, created.apiKey.id)).rejects.toMatchObject({
+			code: "API_KEY_EXPIRED",
+		});
+		expect(store.snapshot.apiKeys).toHaveLength(1);
+		expect(store.snapshot.apiKeys[0]?.status).toBe("active");
 	});
 
 	it("normalizes legacy snapshots and reports API key resource counts", async () => {

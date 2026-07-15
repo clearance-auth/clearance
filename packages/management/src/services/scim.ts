@@ -70,6 +70,7 @@ export function createScimConnection(
 		bearerToken?: string;
 		deprovisioningPolicy?: DirectoryConnection["deprovisioningPolicy"];
 		actor?: string;
+		source?: ScimActorSource;
 	},
 ): DirectoryConnection {
 	const org = inspectOrganization(store, input.organizationId);
@@ -100,7 +101,7 @@ export function createScimConnection(
 		subjectType: "directory_connection",
 		subjectId: conn.id,
 		outcome: "success",
-		source: "cli",
+		source: input.source ?? "cli",
 		organizationId: org.id,
 		projectId: org.projectId,
 		environmentId: org.environmentId,
@@ -384,6 +385,8 @@ export async function checkScimConnection(
 		bearerToken?: string;
 		path?: string;
 		fetchImpl?: typeof fetch;
+		actor?: string;
+		source?: ScimActorSource;
 	} = {},
 ): Promise<{
 	pass: boolean;
@@ -491,12 +494,12 @@ export async function checkScimConnection(
 			d.traces.unshift(trace);
 		});
 		recordEvent(store, {
-			actor: "system",
+			actor: opts.actor ?? "system",
 			action: "scim.check",
 			subjectType: "directory_connection",
 			subjectId: id,
 			outcome: "failure",
-			source: "scim",
+			source: opts.source ?? "scim",
 			organizationId: conn.organizationId,
 			correlationId: corr,
 			message: `SCIM connection check failed: ${outcome.reason}`,
@@ -554,12 +557,12 @@ export async function checkScimConnection(
 		};
 	});
 	recordEvent(store, {
-		actor: "system",
+		actor: opts.actor ?? "system",
 		action: "scim.check",
 		subjectType: "directory_connection",
 		subjectId: id,
 		outcome: "success",
-		source: "scim",
+		source: opts.source ?? "scim",
 		organizationId: conn.organizationId,
 		correlationId: corr,
 		message: SCIM_LOCAL_PROTOCOL_EVIDENCE,
@@ -589,6 +592,8 @@ export function testScimConnection(
 		dryRun?: boolean;
 		users?: ScimUserPayload[];
 		fixture?: "ok" | "malformed" | "unauthorized";
+		actor?: string;
+		source?: ScimActorSource;
 	} = {},
 ): {
 	pass: boolean;
@@ -741,12 +746,12 @@ export function testScimConnection(
 		};
 	});
 	recordEvent(store, {
-		actor: "system",
+		actor: opts.actor ?? "system",
 		action: "scim.test",
 		subjectType: "directory_connection",
 		subjectId: id,
 		outcome: "success",
-		source: "scim",
+		source: opts.source ?? "scim",
 		organizationId: conn.organizationId,
 		correlationId: corr,
 		message: `SCIM simulation ${dryRun ? "dry-run" : "apply"} passed (not live directory conformance)`,
