@@ -198,6 +198,47 @@ async function credentialRows(runtime: ManagedRuntime) {
 	});
 }
 
+async function setupManagedDeletionRuntime(input: {
+	namespace: string;
+	credentialAuthority?: "legacy-v1";
+	options?: Omit<ClearanceOptions, "baseURL" | "secret" | "database">;
+	set?: (key: string, value: string) => Promise<void>;
+	delete?: (key: string) => Promise<void>;
+}) {
+	const store = new Map<string, string>();
+	const secondarySet = vi.fn(
+		input.set ??
+			(async (key: string, value: string) => {
+				store.set(key, value);
+			}),
+	);
+	const secondaryDelete = vi.fn(
+		input.delete ??
+			(async (key: string) => {
+				store.delete(key);
+			}),
+	);
+	const runtime = await setupManagedRuntime({
+		...(input.credentialAuthority
+			? { credentialAuthority: input.credentialAuthority }
+			: {}),
+		options: {
+			...input.options,
+			session: {
+				...input.options?.session,
+				storeSessionInDatabase: true,
+			},
+			secondaryStorage: {
+				namespace: input.namespace,
+				get: async (key) => store.get(key) ?? null,
+				set: secondarySet,
+				delete: secondaryDelete,
+			},
+		},
+	});
+	return { runtime, store, secondarySet, secondaryDelete };
+}
+
 afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
@@ -3637,5 +3678,564 @@ describe("managed stored session authority", () => {
 		expect(store).toEqual(stableStore);
 		expect(secondarySet).not.toHaveBeenCalled();
 		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+});
+
+describe("managed single-session authoritative revocation", () => {
+	it.each(["active", "consumed", "revoked"] as const)(
+		"deletes a modern session presented by an exact %s bearer",
+		async (status) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-delete-modern-${status}-test`,
+			});
+			const session = await issuePasswordSession(runtime);
+			const stableStore = new Map(store);
+			await runtime.context.internalAdapter.deleteSession("unknown-bearer");
+			expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+			expect(store).toEqual(stableStore);
+			if (status !== "active") {
+				const now = new Date();
+				await runtime.context.adapter.updateMany({
+					model: "sessionCredential",
+					where: [{ field: "sessionId", value: session.id }],
+					update: {
+						status,
+						consumedAt: status === "consumed" ? now : null,
+						revokedAt: status === "revoked" ? now : null,
+					},
+				});
+			}
+
+			await runtime.context.internalAdapter.deleteSession(session.token);
+			expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+			expect(await credentialRows(runtime)).toEqual([
+				expect.objectContaining({
+					sessionId: null,
+					status: "revoked",
+					rotationNonceDigest: null,
+					recoverySecretCiphertext: null,
+					recoveryExpiresAt: null,
+				}),
+			]);
+			expect(store).toEqual(new Map());
+		},
+	);
+
+	it.each([
+		{ label: "modern handle", legacy: false, operation: "handle" },
+		{ label: "modern exact id", legacy: false, operation: "id" },
+		{ label: "legacy bearer", legacy: true, operation: "bearer" },
+		{ label: "legacy handle", legacy: true, operation: "handle" },
+		{ label: "legacy exact id", legacy: true, operation: "id" },
+	] as const)("deletes by $label authority", async (testCase) => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: `managed-delete-${testCase.label.replaceAll(" ", "-")}-test`,
+			...(testCase.legacy ? { credentialAuthority: "legacy-v1" as const } : {}),
+		});
+		const session = await issuePasswordSession(runtime);
+		if (testCase.operation === "id") {
+			await runtime.context.internalAdapter.deleteSessionById(session.id);
+		} else {
+			await runtime.context.internalAdapter.deleteSession(
+				testCase.operation === "handle"
+					? createSessionHandle(session.id)
+					: session.token,
+			);
+		}
+
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(store).toEqual(new Map());
+	});
+
+	it("uses only DB authority and canonically rewrites corrupted secondary state", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-corrupt-secondary-test",
+		});
+		const target = await issuePasswordSession(runtime);
+		const survivor = await issuePasswordSession(runtime);
+		const targetHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${target.id}`),
+		)!;
+		const survivorHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${survivor.id}`),
+		)!;
+		const targetCredentialKey = (
+			JSON.parse(store.get(targetHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const survivorCredentialKey = (
+			JSON.parse(store.get(survivorHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const survivorEnvelope = store.get(survivorCredentialKey)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const survivorEntry = (
+			JSON.parse(store.get(indexKey)!) as Array<{
+				sessionId: string;
+				credentialKey: string;
+				expiresAt: number;
+			}>
+		).find((entry) => entry.sessionId === survivor.id)!;
+		const futureEarlier = {
+			sessionId: "future-earlier",
+			credentialKey: "future-earlier-key",
+			expiresAt: Date.now() + 300_000,
+		};
+		const futureLater = {
+			sessionId: "future-later",
+			credentialKey: "future-later-key",
+			expiresAt: Date.now() + 900_000,
+		};
+		store.set(targetHandleKey, JSON.stringify({ credentialKey: survivorCredentialKey }));
+		store.set(
+			indexKey,
+			JSON.stringify([
+				futureLater,
+				{
+					sessionId: target.id,
+					credentialKey: targetCredentialKey,
+					expiresAt: target.expiresAt.getTime(),
+				},
+				{
+					sessionId: target.id,
+					credentialKey: "duplicate-target-key",
+					expiresAt: target.expiresAt.getTime(),
+				},
+				{
+					sessionId: "expired-other",
+					credentialKey: "expired-other-key",
+					expiresAt: Date.now() - 1,
+				},
+				futureEarlier,
+				survivorEntry,
+			]),
+		);
+
+		await runtime.context.internalAdapter.deleteSession(
+			createSessionHandle(target.id),
+		);
+		expect(
+			await runtime.context.adapter.findOne({
+				model: "session",
+				where: [{ field: "id", value: target.id }],
+			}),
+		).toBeNull();
+		expect(
+			await runtime.context.adapter.findOne({
+				model: "session",
+				where: [{ field: "id", value: survivor.id }],
+			}),
+		).not.toBeNull();
+		expect(store.has(targetCredentialKey)).toBe(false);
+		expect(store.get(survivorCredentialKey)).toBe(survivorEnvelope);
+		expect(store.has(targetHandleKey)).toBe(false);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			futureEarlier,
+			futureLater,
+			survivorEntry,
+		]);
+	});
+
+	it.each(["missing", "malformed"] as const)(
+		"deletes the expected owned envelope with a %s handle",
+		async (handleState) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-delete-${handleState}-handle-test`,
+			});
+			const session = await issuePasswordSession(runtime);
+			const handleKey = [...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${session.id}`),
+			)!;
+			const credentialKey = (
+				JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+			).credentialKey;
+			if (handleState === "missing") store.delete(handleKey);
+			else store.set(handleKey, "not-json");
+
+			await runtime.context.internalAdapter.deleteSession(session.token);
+			expect(store.has(credentialKey)).toBe(false);
+			expect(store.has(handleKey)).toBe(false);
+		},
+	);
+
+	it("preserves a malformed mapped envelope while deleting owned authority", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-malformed-mapped-test",
+		});
+		const session = await issuePasswordSession(runtime);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const expectedKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const malformedKey =
+			"clearance:managed-delete-malformed-mapped-test:session-credential:malformed";
+		store.set(malformedKey, "not-json");
+		store.set(handleKey, JSON.stringify({ credentialKey: malformedKey }));
+
+		await runtime.context.internalAdapter.deleteSessionById(session.id);
+		expect(store.has(expectedKey)).toBe(false);
+		expect(store.get(malformedKey)).toBe("not-json");
+		expect(store.has(handleKey)).toBe(false);
+	});
+
+	it("preserves database and cache authority across an outer rollback", async () => {
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-delete-outer-rollback-test",
+			});
+		const session = await issuePasswordSession(runtime);
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.deleteSession(session.token);
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("delete outer rollback");
+			}),
+		).rejects.toThrow("delete outer rollback");
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it.each(["veto", "before_throw", "rollback_after"] as const)(
+		"fully rolls back delete hook mode %s",
+		async (mode) => {
+			const before = vi.fn(async () => {
+				if (mode === "veto") return false;
+				if (mode === "before_throw") throw new Error("delete before failed");
+			});
+			const after = vi.fn(async () => {
+				if (mode === "rollback_after") {
+					throw new Error("delete rollback after failed");
+				}
+			});
+			const { runtime, store, secondarySet, secondaryDelete } =
+				await setupManagedDeletionRuntime({
+					namespace: `managed-delete-${mode}-test`,
+					options: {
+						databaseHookFailureMode:
+							mode === "rollback_after" ? "rollback" : undefined,
+						databaseHooks: {
+							session: { delete: { before, after } },
+						},
+					},
+				});
+			const session = await issuePasswordSession(runtime);
+			const stableSessions = structuredClone(
+				await authorityRows(runtime.context),
+			);
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+			const stableStore = new Map(store);
+			secondarySet.mockClear();
+			secondaryDelete.mockClear();
+
+			const deletion = runtime.context.internalAdapter.deleteSession(session.token);
+			if (mode === "veto") await expect(deletion).resolves.toBeUndefined();
+			else if (mode === "before_throw") {
+				await expect(deletion).rejects.toThrow("delete before failed");
+			} else {
+				await expect(deletion).rejects.toThrow("delete rollback after failed");
+			}
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+			expect(store).toEqual(stableStore);
+			expect(secondarySet).not.toHaveBeenCalled();
+			expect(secondaryDelete).not.toHaveBeenCalled();
+			expect(before).toHaveBeenCalledTimes(1);
+			expect(after).toHaveBeenCalledTimes(mode === "rollback_after" ? 1 : 0);
+		},
+	);
+
+	it("preserves observe-mode after-hook semantics and then cleans cache", async () => {
+		const after = vi.fn(async () => {
+			throw new Error("observed delete hook failure");
+		});
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-observe-after-test",
+			options: {
+				databaseHooks: { session: { delete: { after } } },
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+
+		await expect(
+			runtime.context.internalAdapter.deleteSession(session.token),
+		).resolves.toBeUndefined();
+		expect(after).toHaveBeenCalledTimes(1);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(store).toEqual(new Map());
+	});
+
+	it("reports cleanup failure after retaining the committed DB delete", async () => {
+		const secondaryDelete = vi.fn(async () => {
+			throw new Error("delete cleanup failed");
+		});
+		const { runtime } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-cleanup-failure-test",
+			delete: secondaryDelete,
+		});
+		const session = await issuePasswordSession(runtime);
+
+		await expect(
+			runtime.context.internalAdapter.deleteSession(session.token),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(await credentialRows(runtime)).toEqual([
+			expect.objectContaining({ status: "revoked", sessionId: null }),
+		]);
+		expect(secondaryDelete).toHaveBeenCalled();
+	});
+
+	it("revokes modern credentials while preserving the configured session row", async () => {
+		const before = vi.fn(async () => {});
+		const after = vi.fn(async () => {});
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-preserve-session-test",
+			options: {
+				session: { preserveSessionInDatabase: true },
+				databaseHooks: { session: { delete: { before, after } } },
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: session.id }],
+			update: {
+				rotationNonceDigest: "pending-recovery",
+				recoverySecretCiphertext: "ciphertext",
+				recoveryExpiresAt: new Date(Date.now() + 60_000),
+			},
+		});
+
+		await runtime.context.internalAdapter.deleteSession(session.token);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+		expect(await credentialRows(runtime)).toEqual([
+			expect.objectContaining({
+				sessionId: session.id,
+				status: "revoked",
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+			}),
+		]);
+		expect(store).toEqual(new Map());
+		expect(before).not.toHaveBeenCalled();
+		expect(after).not.toHaveBeenCalled();
+	});
+
+	it.each(["intact", "missing", "malformed"] as const)(
+		"cleans zero-credential preserved authority with an %s handle",
+		async (handleState) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-delete-zero-credential-${handleState}-test`,
+				options: { session: { preserveSessionInDatabase: true } },
+			});
+			const session = await issuePasswordSession(runtime);
+			const handleKey = [...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${session.id}`),
+			)!;
+			const credentialKey = (
+				JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+			).credentialKey;
+			await runtime.context.adapter.deleteMany({
+				model: "sessionCredential",
+				where: [{ field: "sessionId", value: session.id }],
+			});
+			if (handleState === "missing") store.delete(handleKey);
+			else if (handleState === "malformed") store.set(handleKey, "not-json");
+
+			await runtime.context.internalAdapter.deleteSession(
+				createSessionHandle(session.id),
+			);
+			expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+			expect(await credentialRows(runtime)).toEqual([]);
+			expect(store.has(credentialKey)).toBe(false);
+			expect(store.has(handleKey)).toBe(false);
+			expect(
+				[...store.keys()].some((key) => key.includes(":active-sessions:")),
+			).toBe(false);
+		},
+	);
+
+	it("defers zero-credential preserved cleanup through an outer rollback", async () => {
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-delete-zero-credential-rollback-test",
+				options: { session: { preserveSessionInDatabase: true } },
+			});
+		const session = await issuePasswordSession(runtime);
+		await runtime.context.adapter.deleteMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: session.id }],
+		});
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.deleteSession(
+					createSessionHandle(session.id),
+				);
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("zero-credential cleanup rollback");
+			}),
+		).rejects.toThrow("zero-credential cleanup rollback");
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+		expect(await credentialRows(runtime)).toEqual([]);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("preserves unrelated and cross-session authority during zero-credential cleanup", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-zero-credential-ownership-test",
+			options: { session: { preserveSessionInDatabase: true } },
+		});
+		const target = await issuePasswordSession(runtime);
+		const survivor = await issuePasswordSession(runtime);
+		const targetHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${target.id}`),
+		)!;
+		const survivorHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${survivor.id}`),
+		)!;
+		const targetCredentialKey = (
+			JSON.parse(store.get(targetHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const survivorCredentialKey = (
+			JSON.parse(store.get(survivorHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const expiredTargetCredentialKey =
+			"clearance:managed-delete-zero-credential-ownership-test:session-credential:expired-target";
+		store.set(expiredTargetCredentialKey, store.get(targetCredentialKey)!);
+		const survivorEnvelope = store.get(survivorCredentialKey)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const survivorEntry = (
+			JSON.parse(store.get(indexKey)!) as Array<{
+				sessionId: string;
+				credentialKey: string;
+				expiresAt: number;
+			}>
+		).find((entry) => entry.sessionId === survivor.id)!;
+		const unrelated = {
+			sessionId: "unrelated-session",
+			credentialKey: "unrelated-credential",
+			expiresAt: Date.now() + 60_000,
+		};
+		await runtime.context.adapter.deleteMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: target.id }],
+		});
+		store.set(
+			targetHandleKey,
+			JSON.stringify({ credentialKey: survivorCredentialKey }),
+		);
+		store.set(
+			indexKey,
+			JSON.stringify([
+				{
+					sessionId: target.id,
+					credentialKey: targetCredentialKey,
+					expiresAt: target.expiresAt.getTime(),
+				},
+				{
+					sessionId: target.id,
+					credentialKey: survivorCredentialKey,
+					expiresAt: target.expiresAt.getTime(),
+				},
+				{
+					sessionId: target.id,
+					credentialKey: expiredTargetCredentialKey,
+					expiresAt: Date.now() - 1,
+				},
+				unrelated,
+				survivorEntry,
+			]),
+		);
+
+		await runtime.context.internalAdapter.deleteSessionById(target.id);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(2);
+		expect(store.has(targetCredentialKey)).toBe(false);
+		expect(store.has(expiredTargetCredentialKey)).toBe(false);
+		expect(store.get(survivorCredentialKey)).toBe(survivorEnvelope);
+		expect(store.has(targetHandleKey)).toBe(false);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			unrelated,
+			survivorEntry,
+		]);
+	});
+
+	it("deletes legacy bearer authority even when session preservation is configured", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-legacy-preserve-test",
+			credentialAuthority: "legacy-v1",
+			options: { session: { preserveSessionInDatabase: true } },
+		});
+		const session = await issuePasswordSession(runtime);
+
+		await runtime.context.internalAdapter.deleteSession(session.token);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(store).toEqual(new Map());
+	});
+
+	it("cleans secondary authority after replay-triggered family revocation", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-replay-cleanup-test",
+		});
+		const session = await issuePasswordSession(runtime);
+		await runtime.context.internalAdapter.rotateSessionCredential(
+			session.token,
+			generateCredentialOperationKey(),
+		);
+		const root = (await credentialRows(runtime))[0]!;
+		await runtime.context.adapter.update({
+			model: "sessionCredential",
+			where: [{ field: "id", value: String(root.id) }],
+			update: { recoveryExpiresAt: new Date(Date.now() - 1_000) },
+		});
+
+		await expect(
+			runtime.context.internalAdapter.findSession(session.token),
+		).resolves.toBeNull();
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(
+			(await credentialRows(runtime)).every(
+				(credential) =>
+					credential.status === "revoked" && credential.sessionId === null,
+			),
+		).toBe(true);
+		expect(store).toEqual(new Map());
+	});
+
+	it("cleans an exact administrative-ID orphan without a DB target", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-delete-orphan-id-test",
+		});
+		const orphanId = "orphan-session-id";
+		const envelopeKey =
+			"clearance:managed-delete-orphan-id-test:session-credential:orphan";
+		const handleKey =
+			`clearance:managed-delete-orphan-id-test:session-handle:${orphanId}`;
+		store.set(envelopeKey, JSON.stringify({ session: { id: orphanId } }));
+		store.set(handleKey, JSON.stringify({ credentialKey: envelopeKey }));
+
+		await runtime.context.internalAdapter.deleteSessionById(orphanId);
+		expect(store.has(envelopeKey)).toBe(false);
+		expect(store.has(handleKey)).toBe(false);
 	});
 });
