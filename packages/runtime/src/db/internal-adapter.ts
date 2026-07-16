@@ -7,6 +7,7 @@ import type {
 import {
 	getCurrentAdapter,
 	getCurrentAuthContext,
+	isTransactionActive,
 	queueAfterTransactionHook,
 	queueBeforeTransactionCommitHook,
 	runWithTransaction,
@@ -142,6 +143,8 @@ export const createInternalAdapter = (
 		rotationCounter: number;
 		oldDigest: string;
 		successorDigest: string;
+		parentCredential: SessionCredential;
+		successorCredential: SessionCredential;
 	};
 	const recoveryCredentialRejected = Symbol("recovery-credential-rejected");
 	type SessionRecoveryAttempt =
@@ -149,6 +152,7 @@ export const createInternalAdapter = (
 		| typeof recoveryCredentialRejected
 		| null;
 	class ManagedSessionUpdateRejected extends Error {}
+	class ManagedSessionRotationRejected extends Error {}
 
 	const sessionMatchesSecurityGenerations = (
 		session: Record<string, unknown>,
@@ -479,6 +483,7 @@ export const createInternalAdapter = (
 		session: Session & Record<string, unknown>;
 		user: User & Record<string, unknown>;
 		credentialKey: string;
+		previousCredentialKeys?: readonly string[] | undefined;
 	}): Promise<void> {
 		if (!secondaryStorage) return;
 		const credentialKey = input.credentialKey;
@@ -498,6 +503,23 @@ export const createInternalAdapter = (
 			(entry) =>
 				entry.sessionId !== input.session.id && entry.expiresAt > now,
 		);
+		const deleteOwnedPreviousCredentials = async () => {
+			for (const previousCredentialKey of new Set([
+				oldCredentialKey,
+				...(input.previousCredentialKeys ?? []),
+			])) {
+				if (
+					previousCredentialKey &&
+					previousCredentialKey !== credentialKey &&
+					(await secondaryCredentialBelongsToSession(
+						previousCredentialKey,
+						input.session.id,
+					))
+				) {
+					await secondaryStorage.delete(previousCredentialKey);
+				}
+			}
+		};
 		if (ttl > 0) {
 			const next = [
 				...remaining,
@@ -530,29 +552,11 @@ export const createInternalAdapter = (
 				JSON.stringify(next),
 				indexTTL,
 			);
-			if (
-				oldCredentialKey &&
-				oldCredentialKey !== credentialKey &&
-				(await secondaryCredentialBelongsToSession(
-					oldCredentialKey,
-					input.session.id,
-				))
-			) {
-				await secondaryStorage.delete(oldCredentialKey);
-			}
+			await deleteOwnedPreviousCredentials();
 			return;
 		}
 		await secondaryStorage.delete(credentialKey);
-		if (
-			oldCredentialKey &&
-			oldCredentialKey !== credentialKey &&
-			(await secondaryCredentialBelongsToSession(
-				oldCredentialKey,
-				input.session.id,
-			))
-		) {
-			await secondaryStorage.delete(oldCredentialKey);
-		}
+		await deleteOwnedPreviousCredentials();
 		await secondaryStorage.delete(handleKey);
 		if (remaining.length > 0) {
 			const indexTTL = getTTLSeconds(remaining.at(-1)!.expiresAt, now);
@@ -579,6 +583,51 @@ export const createInternalAdapter = (
 			await secondaryStorage.get(credentialKey),
 		);
 		return envelope?.session?.id === sessionId;
+	}
+
+	async function cleanupInvalidRotationSecondary(
+		rotation: SessionRotationResult,
+	): Promise<void> {
+		if (!secondaryStorage) return;
+		const sessionId = rotation.session.id;
+		const handleKey = secondaryHandleKey(sessionId);
+		const mappedCredentialKey = parseSecondaryHandle(
+			await secondaryStorage.get(handleKey),
+		);
+		for (const credentialKey of new Set([
+			secondaryCredentialKey(rotation.oldDigest),
+			secondaryCredentialKey(rotation.successorDigest),
+			mappedCredentialKey,
+		])) {
+			if (
+				credentialKey &&
+				(await secondaryCredentialBelongsToSession(credentialKey, sessionId))
+			) {
+				await secondaryStorage.delete(credentialKey);
+			}
+		}
+		await secondaryStorage.delete(handleKey);
+		const listKey = secondaryActiveSessionsKey(rotation.session.userId);
+		const list = safeJSONParse<SecondarySessionIndexEntry[]>(
+			await secondaryStorage.get(listKey),
+		);
+		if (!Array.isArray(list)) return;
+		const remaining = list.filter((entry) => entry.sessionId !== sessionId);
+		if (remaining.length === list.length) return;
+		if (remaining.length === 0) {
+			await secondaryStorage.delete(listKey);
+			return;
+		}
+		const now = Date.now();
+		const ttl = getTTLSeconds(
+			Math.max(...remaining.map((entry) => entry.expiresAt)),
+			now,
+		);
+		if (ttl > 0) {
+			await secondaryStorage.set(listKey, JSON.stringify(remaining), ttl);
+		} else {
+			await secondaryStorage.delete(listKey);
+		}
 	}
 
 	async function allSessionCredentialExpiriesMatch(
@@ -918,7 +967,9 @@ export const createInternalAdapter = (
 				successor.sessionId !== parent.sessionId ||
 				successor.familyId !== parent.familyId ||
 				successor.rotationCounter !== parent.rotationCounter + 1 ||
-				!successor.secretDigest
+				!successor.secretDigest ||
+				successor.expiresAt.getTime() !== parent.expiresAt.getTime() ||
+				parent.expiresAt.getTime() !== authority.session.expiresAt.getTime()
 			) {
 				return recoveryCredentialRejected;
 			}
@@ -961,7 +1012,192 @@ export const createInternalAdapter = (
 			rotationCounter: currentCredentials.successor.rotationCounter,
 			oldDigest,
 			successorDigest: recovered.digest,
+			parentCredential: currentCredentials.parent,
+			successorCredential: currentCredentials.successor,
 		};
+	}
+
+	async function queueManagedRotationPublication(
+		rotation: SessionRotationResult,
+	): Promise<void> {
+		if (!secondaryStorage) return;
+		await queueAfterTransactionHook(
+			async () => {
+				await runWithTransaction(adapter, async () => {
+					const sessionId = rotation.parentCredential.sessionId;
+					const currentAdapter = await getCurrentAdapter(adapter);
+					const initial = sessionId
+						? await findSessionRecordById(sessionId)
+						: null;
+					const activeUser = initial?.user
+						? await lockAndReadActiveUser(currentAdapter, initial.user.id)
+						: null;
+					const reread = sessionId
+						? await findSessionRecordById(sessionId)
+						: null;
+					let authority: ValidatedSessionAuthority | null = null;
+					if (
+						activeUser &&
+						reread?.user?.id === activeUser.id
+					) {
+						const { user: _, ...session } = reread;
+						if (
+							await validateRawSessionAuthority(
+								session as Record<string, unknown>,
+								activeUser as User & Record<string, unknown>,
+							)
+						) {
+							authority = {
+								session: session as Session & Record<string, unknown>,
+								user: activeUser as User & Record<string, unknown>,
+							};
+						}
+					}
+					const parent = await rereadExactCredential(
+						rotation.parentCredential,
+					);
+					const successor = await rereadExactCredential(
+						rotation.successorCredential,
+					);
+					const activeCredentials = sessionId
+						? await currentAdapter.findMany<SessionCredential>({
+								model: SESSION_CREDENTIAL_MODEL,
+								where: [
+									{ field: "sessionId", value: sessionId },
+									{ field: "status", value: "active" },
+								],
+							})
+						: [];
+					const uniqueActive =
+						activeCredentials.length === 1 &&
+						activeCredentials[0]!.expiresAt > new Date()
+							? activeCredentials[0]!
+							: null;
+					const expectedIsCanonical = Boolean(
+						authority &&
+							parent &&
+							successor &&
+							uniqueActive?.id === successor.id &&
+							parent.status === "consumed" &&
+							successor.status === "active" &&
+							parent.sessionId === authority.session.id &&
+							successor.sessionId === authority.session.id &&
+							successor.parentCredentialId === parent.id &&
+							successor.familyId === parent.familyId &&
+							successor.rotationCounter === parent.rotationCounter + 1 &&
+							constantTimeEqual(parent.secretDigest, rotation.oldDigest) &&
+							constantTimeEqual(
+								successor.secretDigest,
+								rotation.successorDigest,
+							) &&
+							parent.expiresAt > new Date() &&
+							successor.expiresAt > new Date() &&
+							parent.expiresAt.getTime() === successor.expiresAt.getTime() &&
+							parent.expiresAt.getTime() ===
+								authority.session.expiresAt.getTime(),
+					);
+					if (expectedIsCanonical) {
+						await publishSecondarySessionUpdate({
+							...authority!,
+							credentialKey: secondaryCredentialKey(successor!.secretDigest),
+							previousCredentialKeys: [
+								secondaryCredentialKey(parent!.secretDigest),
+							],
+						});
+						return;
+					}
+
+					const capturedConsumedLineageIsExact = Boolean(
+						authority &&
+							parent &&
+							successor &&
+							parent.status === "consumed" &&
+							successor.status === "consumed" &&
+							parent.sessionId === authority.session.id &&
+							successor.sessionId === authority.session.id &&
+							successor.familyId === parent.familyId &&
+							successor.parentCredentialId === parent.id &&
+							successor.rotationCounter === parent.rotationCounter + 1 &&
+							constantTimeEqual(parent.secretDigest, rotation.oldDigest) &&
+							constantTimeEqual(
+								successor.secretDigest,
+								rotation.successorDigest,
+							) &&
+							parent.expiresAt.getTime() ===
+								authority.session.expiresAt.getTime() &&
+							successor.expiresAt.getTime() ===
+								authority.session.expiresAt.getTime(),
+					);
+					const consumedChain: SessionCredential[] = [];
+					let newerLineageIsExact = Boolean(
+						capturedConsumedLineageIsExact &&
+							authority &&
+							uniqueActive &&
+							uniqueActive.sessionId === authority.session.id &&
+							uniqueActive.familyId === successor?.familyId &&
+							uniqueActive.rotationCounter > successor.rotationCounter &&
+							uniqueActive.expiresAt.getTime() ===
+								authority.session.expiresAt.getTime(),
+					);
+					if (newerLineageIsExact) {
+						consumedChain.push(parent!, successor!);
+						let child = uniqueActive!;
+						const visited = new Set<string>([String(child.id)]);
+						let reachedCapturedSuccessor = false;
+						for (let depth = 0; depth < 1_024; depth += 1) {
+							const parentCredentialId = child.parentCredentialId;
+							if (!parentCredentialId || visited.has(String(parentCredentialId))) {
+								newerLineageIsExact = false;
+								break;
+							}
+							const chainParent =
+								parentCredentialId === successor!.id
+									? successor!
+									: await currentAdapter.findOne<SessionCredential>({
+											model: SESSION_CREDENTIAL_MODEL,
+											where: [{ field: "id", value: parentCredentialId }],
+										});
+							if (
+								!chainParent ||
+								chainParent.status !== "consumed" ||
+								chainParent.sessionId !== child.sessionId ||
+								chainParent.familyId !== child.familyId ||
+								child.rotationCounter !== chainParent.rotationCounter + 1 ||
+								chainParent.expiresAt.getTime() !==
+									authority!.session.expiresAt.getTime()
+							) {
+								newerLineageIsExact = false;
+								break;
+							}
+							if (chainParent.id === successor!.id) {
+								reachedCapturedSuccessor = true;
+								break;
+							}
+							visited.add(String(chainParent.id));
+							consumedChain.push(chainParent);
+							child = chainParent;
+						}
+						newerLineageIsExact &&= reachedCapturedSuccessor;
+					}
+					if (newerLineageIsExact && authority && uniqueActive) {
+						await publishSecondarySessionUpdate({
+							...authority,
+							credentialKey: secondaryCredentialKey(
+								uniqueActive.secretDigest,
+							),
+							previousCredentialKeys: consumedChain.map((credential) =>
+								secondaryCredentialKey(credential.secretDigest),
+							),
+						});
+						return;
+					}
+
+					await cleanupInvalidRotationSecondary(rotation);
+					throw new Error("Managed rotation publication authority is invalid");
+				});
+			},
+			adapter,
+		);
 	}
 
 	async function deriveRotationSuccessors(
@@ -1970,15 +2206,25 @@ export const createInternalAdapter = (
 				) {
 					return null;
 				}
-				return recoverRecentSessionRotation(
+				const recovery = await recoverRecentSessionRotation(
 					credential,
 					await digestSessionRotationNonce(operationKey),
 					operationKey,
 					digest,
 				);
+				if (recovery && recovery !== recoveryCredentialRejected) {
+					await queueManagedRotationPublication(recovery);
+				}
+				return recovery;
 			});
 			if (!recovered || recovered === recoveryCredentialRejected) return null;
-			const { oldDigest: _, successorDigest: __, ...result } = recovered;
+			const {
+				oldDigest: _,
+				successorDigest: __,
+				parentCredential: ___,
+				successorCredential: ____,
+				...result
+			} = recovered;
 			return result;
 		},
 		rotateSessionCredential: async (token: string, idempotencyKey?: string) => {
@@ -2009,7 +2255,10 @@ export const createInternalAdapter = (
 			const rotationOperation = suppliedOperationKey ?? generateId(32);
 			const rotationNonceDigest =
 				await digestSessionRotationNonce(rotationOperation);
-			const rotated = await runWithTransaction(adapter, async () => {
+			const joinedAmbientTransaction = await isTransactionActive(adapter);
+			let rotated: SessionRotationResult | null;
+			try {
+				rotated = await runWithTransaction(adapter, async () => {
 				const currentAdapter = await getCurrentAdapter(adapter);
 				const digest = await digestSessionRefreshSecret(token);
 				const credentialId = credentialIdFromRefreshSecret(token);
@@ -2043,7 +2292,10 @@ export const createInternalAdapter = (
 							authority,
 						);
 						if (recovered === recoveryCredentialRejected) return null;
-						if (recovered) return recovered;
+						if (recovered) {
+							await queueManagedRotationPublication(recovered);
+							return recovered;
+						}
 						await revokeAndDeleteSessionById(
 							credential.sessionId,
 							new Date(),
@@ -2080,8 +2332,19 @@ export const createInternalAdapter = (
 					model: SESSION_CREDENTIAL_MODEL,
 					where: [
 						{ field: "id", value: activeCredential.id },
+						{ field: "sessionId", value: activeSessionId },
 						{ field: "status", value: "active" },
 						{ field: "secretDigest", value: digest },
+						{ field: "familyId", value: activeCredential.familyId },
+						{
+							field: "rotationCounter",
+							value: activeCredential.rotationCounter,
+						},
+						{
+							field: "parentCredentialId",
+							value: activeCredential.parentCredentialId ?? null,
+						},
+						{ field: "expiresAt", value: activeCredential.expiresAt },
 						{ field: "expiresAt", value: consumedAt, operator: "gt" },
 					],
 					increment: {},
@@ -2095,20 +2358,21 @@ export const createInternalAdapter = (
 					},
 				});
 				if (!consumed) {
-					const currentParent = await currentAdapter.findOne<SessionCredential>({
-						model: SESSION_CREDENTIAL_MODEL,
-						where: [{ field: "id", value: activeCredential.id }],
-					});
-					if (currentParent) {
+					const exactParent = await rereadExactCredential(activeCredential);
+					if (exactParent?.status === "active") return null;
+					if (exactParent?.status === "consumed") {
 						const recovered = await recoverRecentSessionRotation(
-							currentParent,
+							exactParent,
 							rotationNonceDigest,
 							rotationOperation,
 							digest,
 							authority,
 						);
 						if (recovered === recoveryCredentialRejected) return null;
-						if (recovered) return recovered;
+						if (recovered) {
+							await queueManagedRotationPublication(recovered);
+							return recovered;
+						}
 					}
 					await revokeAndDeleteSessionById(
 						activeSessionId,
@@ -2117,20 +2381,49 @@ export const createInternalAdapter = (
 					return null;
 				}
 
-				await createCredentialRecord({
+				const committedAuthority = await loadValidatedSessionAuthority(
+					activeSessionId,
+				);
+				const persistedParent = await rereadExactCredential(consumed);
+				if (
+					!persistedParent ||
+					persistedParent.status !== "consumed" ||
+					persistedParent.expiresAt <= consumedAt ||
+					!committedAuthority ||
+					committedAuthority.session.expiresAt.getTime() !==
+						persistedParent.expiresAt.getTime()
+				) {
+					throw new ManagedSessionRotationRejected();
+				}
+
+				const createdSuccessor = await createCredentialRecord({
 					...successorIdentity,
 					sessionId: activeSessionId,
-					familyId: activeCredential.familyId,
+					familyId: persistedParent.familyId,
 					secretDigest: successorDigest,
-					expiresAt: activeCredential.expiresAt,
-					parentCredentialId: activeCredential.id,
-					rotationCounter: activeCredential.rotationCounter + 1,
+					expiresAt: persistedParent.expiresAt,
+					parentCredentialId: persistedParent.id,
+					rotationCounter: persistedParent.rotationCounter + 1,
 				});
-				if (activeCredential.parentCredentialId) {
+				const persistedSuccessor = await rereadExactCredential(createdSuccessor);
+				if (
+					!persistedSuccessor ||
+					persistedSuccessor.status !== "active" ||
+					persistedSuccessor.sessionId !== persistedParent.sessionId ||
+					persistedSuccessor.familyId !== persistedParent.familyId ||
+					persistedSuccessor.parentCredentialId !== persistedParent.id ||
+					persistedSuccessor.rotationCounter !==
+						persistedParent.rotationCounter + 1 ||
+					persistedSuccessor.expiresAt.getTime() !==
+						persistedParent.expiresAt.getTime()
+				) {
+					throw new ManagedSessionRotationRejected();
+				}
+				if (persistedParent.parentCredentialId) {
 					await currentAdapter.update<SessionCredential>({
 						model: SESSION_CREDENTIAL_MODEL,
 						where: [
-							{ field: "id", value: activeCredential.parentCredentialId },
+							{ field: "id", value: persistedParent.parentCredentialId },
 						],
 						update: {
 							rotationNonceDigest: null,
@@ -2140,44 +2433,47 @@ export const createInternalAdapter = (
 						},
 					});
 				}
-				return {
-					session: { ...authority.session, token: successorSecret },
-					user: authority.user,
+				const result: SessionRotationResult = {
+					session: {
+						...committedAuthority.session,
+						token: successorSecret,
+					},
+					user: committedAuthority.user,
 					refreshToken: successorSecret,
-					familyId: activeCredential.familyId,
-					rotationCounter: activeCredential.rotationCounter + 1,
+					familyId: persistedParent.familyId,
+					rotationCounter: persistedSuccessor.rotationCounter,
 					oldDigest: digest,
 					successorDigest,
+					parentCredential: persistedParent,
+					successorCredential: persistedSuccessor,
 				};
-			});
-
-			if (rotated && secondaryStorage) {
-				const oldKey = secondaryCredentialKey(rotated.oldDigest);
-				const successorKey = secondaryCredentialKey(rotated.successorDigest);
-				const ttl = getTTLSeconds(rotated.session.expiresAt);
-				if (ttl > 0) {
-					await secondaryStorage.set(
-						successorKey,
-						JSON.stringify({
-							session: {
-								...rotated.session,
-								token: null,
-							},
-							user: rotated.user,
-						}),
-						ttl,
-					);
-					await secondaryStorage.set(
-						secondaryHandleKey(rotated.session.id),
-						JSON.stringify({ credentialKey: successorKey }),
-						ttl,
-					);
+				await queueManagedRotationPublication(result);
+				return result;
+				});
+			} catch (error) {
+				if (error instanceof ManagedSessionRotationRejected) {
+					if (joinedAmbientTransaction) {
+						const rollbackRequired = new Error(
+							"Managed session rotation authority changed after credential consumption; the ambient transaction must roll back",
+						);
+						await queueBeforeTransactionCommitHook(async () => {
+							throw rollbackRequired;
+						}, adapter);
+						throw rollbackRequired;
+					}
+					return null;
 				}
-				await secondaryStorage.delete(oldKey);
+				throw error;
 			}
 
 			if (!rotated) return null;
-			const { oldDigest: _, successorDigest: __, ...result } = rotated;
+			const {
+				oldDigest: _,
+				successorDigest: __,
+				parentCredential: ___,
+				successorCredential: ____,
+				...result
+			} = rotated;
 			return result;
 		},
 		findSessions: async (

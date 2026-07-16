@@ -9,6 +9,7 @@ import type {
 	SessionIssuanceContext,
 } from "@clearance/core";
 import {
+	AfterTransactionHookError,
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
@@ -29,7 +30,10 @@ import { generateCredentialOperationKey } from "../utils/operation-key";
 import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../security/session-assurance";
 import { schema as passkeySchema } from "../plugins/passkey/schema";
 import { schema as twoFactorSchema } from "../plugins/two-factor/schema";
-import { createSessionHandle } from "./session-credential";
+import {
+	createSessionHandle,
+	SESSION_ROTATION_RECOVERY_WINDOW_MS,
+} from "./session-credential";
 
 const identity = Object.freeze({
 	projectId: "project_1",
@@ -855,6 +859,841 @@ describe("managed stored session authority", () => {
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
 		expect(secondarySet).not.toHaveBeenCalled();
 		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("serializes managed expiry updates on both sides of the rotation reread", async () => {
+		let updateBeforeReread = false;
+		let firstSessionId = "";
+		const beforeRereadExpiry = new Date(Date.now() + 180_000);
+		const firstRuntime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (updateBeforeReread) {
+					updateBeforeReread = false;
+					await input.transaction!.update({
+						model: "session",
+						where: [{ field: "id", value: firstSessionId }],
+						update: { expiresAt: beforeRereadExpiry },
+					});
+					await input.transaction!.updateMany({
+						model: "sessionCredential",
+						where: [{ field: "sessionId", value: firstSessionId }],
+						update: { expiresAt: beforeRereadExpiry },
+					});
+				}
+				return policyResult(input);
+			},
+		});
+		const firstSession = await issuePasswordSession(firstRuntime);
+		firstSessionId = firstSession.id;
+		updateBeforeReread = true;
+		const firstRotation = await firstRuntime.context.internalAdapter.rotateSessionCredential(
+			firstSession.token,
+			generateCredentialOperationKey(),
+		);
+		expect(firstRotation).not.toBeNull();
+		const firstRows = await credentialRows(firstRuntime);
+		expect(firstRows).toHaveLength(2);
+		expect(
+			firstRows.every(
+				(row) =>
+					(row.expiresAt as Date).getTime() === beforeRereadExpiry.getTime(),
+			),
+		).toBe(true);
+		expect(
+			((await authorityRows(firstRuntime.context))[0]!.expiresAt as Date).getTime(),
+		).toBe(beforeRereadExpiry.getTime());
+
+		let secondRuntime!: ManagedRuntime;
+		let secondSessionId = "";
+		let updateAtCasBoundary = false;
+		let generatedId = 0;
+		const raceSecondarySet = vi.fn(async () => {});
+		const raceSecondaryDelete = vi.fn(async () => {});
+		const casBoundaryExpiry = new Date(Date.now() + 240_000);
+		secondRuntime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-expiry-race-test",
+					get: async () => null,
+					set: raceSecondarySet,
+					delete: raceSecondaryDelete,
+				},
+				advanced: {
+					database: {
+						generateId: ({ model }) => {
+							if (
+								updateAtCasBoundary &&
+								model === "sessionCredential"
+							) {
+								updateAtCasBoundary = false;
+								const stored = secondRuntime.database
+									.prepare(
+										'SELECT "expiresAt" FROM "session" WHERE "id" = ?',
+									)
+									.get(secondSessionId) as { expiresAt: number | string };
+								const encodedExpiry =
+									typeof stored.expiresAt === "number"
+										? casBoundaryExpiry.getTime()
+										: casBoundaryExpiry.toISOString();
+								secondRuntime.database
+									.prepare(
+										'UPDATE "session" SET "expiresAt" = ? WHERE "id" = ?',
+									)
+									.run(encodedExpiry, secondSessionId);
+								secondRuntime.database
+									.prepare(
+										'UPDATE "sessionCredential" SET "expiresAt" = ? WHERE "sessionId" = ?',
+									)
+									.run(encodedExpiry, secondSessionId);
+							}
+							generatedId += 1;
+							return `${model}-${generatedId}`;
+						},
+					},
+				},
+			},
+		});
+		const secondSession = await issuePasswordSession(secondRuntime);
+		secondSessionId = secondSession.id;
+		raceSecondarySet.mockClear();
+		raceSecondaryDelete.mockClear();
+		updateAtCasBoundary = true;
+		await expect(
+			secondRuntime.context.internalAdapter.rotateSessionCredential(
+				secondSession.token,
+				generateCredentialOperationKey(),
+			),
+		).resolves.toBeNull();
+		const secondRows = await credentialRows(secondRuntime);
+		expect(secondRows).toHaveLength(1);
+		expect(secondRows[0]).toMatchObject({ status: "active", rotationCounter: 0 });
+		expect((secondRows[0]!.expiresAt as Date).getTime()).toBe(
+			casBoundaryExpiry.getTime(),
+		);
+		expect(await secondRuntime.context.adapter.count({ model: "session" })).toBe(1);
+		expect(raceSecondarySet).not.toHaveBeenCalled();
+		expect(raceSecondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("rolls back a post-CAS authority race and returns null", async () => {
+		let racePostCas = false;
+		let rotationPolicyReads = 0;
+		let rotationSessionId = "";
+		let runtime!: ManagedRuntime;
+		const secondarySet = vi.fn(async () => {});
+		const secondaryDelete = vi.fn(async () => {});
+		runtime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (racePostCas) {
+					rotationPolicyReads += 1;
+					if (rotationPolicyReads === 2) {
+						await input.transaction!.updateMany({
+							model: "sessionCredential",
+							where: [{ field: "sessionId", value: rotationSessionId }],
+							update: { expiresAt: new Date(Date.now() + 180_000) },
+						});
+					}
+				}
+				return policyResult(input);
+			},
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-post-cas-race-test",
+					get: async () => null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		rotationSessionId = session.id;
+		const beforeCredentials = structuredClone(await credentialRows(runtime));
+		const beforeSession = structuredClone(await authorityRows(runtime.context));
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		racePostCas = true;
+
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				generateCredentialOperationKey(),
+			),
+		).resolves.toBeNull();
+		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+
+		rotationPolicyReads = 0;
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await expect(
+					runtime.context.internalAdapter.rotateSessionCredential(
+						session.token,
+						generateCredentialOperationKey(),
+					),
+				).rejects.toThrow("ambient transaction must roll back");
+			}),
+		).rejects.toThrow(
+			"ambient transaction must roll back",
+		);
+		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("publishes a committed successor after its recovery window closes", async () => {
+		vi.useFakeTimers({ now: new Date("2032-01-01T00:00:00.000Z") });
+		const store = new Map<string, string>();
+		let rotationPolicyReads = 0;
+		let gatePublication = false;
+		const publicationEntered = deferred();
+		const publicationRelease = deferred();
+		const runtime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (gatePublication) {
+					rotationPolicyReads += 1;
+					if (rotationPolicyReads === 3) {
+						publicationEntered.resolve();
+						await publicationRelease.promise;
+					}
+				}
+				return policyResult(input);
+			},
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-recovery-window-publication-test",
+					get: async (key) => store.get(key) ?? null,
+					set: async (key, value) => {
+						store.set(key, value);
+					},
+					delete: async (key) => {
+						store.delete(key);
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const oldCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		gatePublication = true;
+		const pending = runtime.context.internalAdapter.rotateSessionCredential(
+			session.token,
+			generateCredentialOperationKey(),
+		);
+		await publicationEntered.promise;
+		await vi.advanceTimersByTimeAsync(
+			SESSION_ROTATION_RECOVERY_WINDOW_MS + 1_000,
+		);
+		publicationRelease.resolve();
+		await expect(pending).resolves.not.toBeNull();
+
+		const successorCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		expect(successorCredentialKey).not.toBe(oldCredentialKey);
+		expect(store.has(successorCredentialKey)).toBe(true);
+		expect(store.has(oldCredentialKey)).toBe(false);
+	});
+
+	it("cleans only owned secondary residue when final rotation authority is invalid", async () => {
+		const store = new Map<string, string>();
+		let rotationPolicyReads = 0;
+		let invalidatePublication = false;
+		let invalidSessionId = "";
+		let malformedExpectedKey = "";
+		const runtime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (invalidatePublication) rotationPolicyReads += 1;
+				if (invalidatePublication && rotationPolicyReads === 3) {
+					const active = await input.transaction!.findOne<
+						Record<string, unknown>
+					>({
+						model: "sessionCredential",
+						where: [
+							{ field: "sessionId", value: invalidSessionId },
+							{ field: "status", value: "active" },
+						],
+					});
+					malformedExpectedKey =
+						`clearance:managed-rotation-invalid-cleanup-test:` +
+						`session-credential:${String(active!.secretDigest)}`;
+					store.set(malformedExpectedKey, "not-json");
+				}
+				return policyResult(input, {
+					revision:
+						invalidatePublication && rotationPolicyReads === 3 ? "8" : "7",
+				});
+			},
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-invalid-cleanup-test",
+					get: async (key) => store.get(key) ?? null,
+					set: async (key, value) => {
+						store.set(key, value);
+					},
+					delete: async (key) => {
+						store.delete(key);
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		invalidSessionId = session.id;
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const oldCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const unrelated = {
+			sessionId: "unrelated-session",
+			credentialKey: "unrelated-credential",
+			expiresAt: Date.now() - 1_000,
+		};
+		const crossSessionCredentialKey = "cross-session-credential";
+		store.set(
+			unrelated.credentialKey,
+			JSON.stringify({ session: { id: unrelated.sessionId } }),
+		);
+		store.set(
+			crossSessionCredentialKey,
+			JSON.stringify({ session: { id: "other-session" } }),
+		);
+		store.set(
+			handleKey,
+			JSON.stringify({ credentialKey: crossSessionCredentialKey }),
+		);
+		store.set(
+			indexKey,
+			JSON.stringify([
+				...(JSON.parse(store.get(indexKey)!) as unknown[]),
+				unrelated,
+			]),
+		);
+		invalidatePublication = true;
+
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				generateCredentialOperationKey(),
+			),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(await credentialRows(runtime)).toHaveLength(2);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(store.has(handleKey)).toBe(false);
+		expect(store.has(indexKey)).toBe(false);
+		expect(store.has(unrelated.credentialKey)).toBe(true);
+		expect(store.has(crossSessionCredentialKey)).toBe(true);
+		expect(store.get(malformedExpectedKey)).toBe("not-json");
+	});
+
+	it("canonically repairs stale duplicate topology for a gated newer successor", async () => {
+		const store = new Map<string, string>();
+		let rotationPolicyReads = 0;
+		let interleaveNewerSuccessor = false;
+		let sessionId = "";
+		const publicationEntered = deferred();
+		const newerCommitted = deferred();
+		let newerCredentialKey = "";
+		let capturedOldCredentialKey = "";
+		let capturedSuccessorCredentialKey = "";
+		const runtime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (interleaveNewerSuccessor) {
+					rotationPolicyReads += 1;
+					if (rotationPolicyReads === 3) {
+						publicationEntered.resolve();
+						await newerCommitted.promise;
+						const active = await input.transaction!.findOne<
+							Record<string, unknown>
+						>({
+							model: "sessionCredential",
+							where: [
+								{ field: "sessionId", value: sessionId },
+								{ field: "status", value: "active" },
+							],
+						});
+						const now = new Date();
+						await input.transaction!.update({
+							model: "sessionCredential",
+							where: [{ field: "id", value: String(active!.id) }],
+							update: {
+								status: "consumed",
+								consumedAt: now,
+								rotationNonceDigest: "newer-operation",
+								recoveryExpiresAt: new Date(
+									now.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
+								),
+								updatedAt: now,
+							},
+						});
+						const newerId = `newer-${String(active!.id)}`;
+						await input.transaction!.create({
+							model: "sessionCredential",
+							forceAllowId: true,
+							data: {
+								...active,
+								id: newerId,
+								selector: `selector-${newerId}`,
+								secretDigest: `digest-${newerId}`,
+								status: "active",
+								rotationCounter: Number(active!.rotationCounter) + 1,
+								parentCredentialId: active!.id,
+								consumedAt: null,
+								revokedAt: null,
+								reuseDetectedAt: null,
+								rotationNonceDigest: null,
+								recoverySecretCiphertext: null,
+								recoveryExpiresAt: null,
+								createdAt: now,
+								updatedAt: now,
+							},
+						});
+						const storedSession = await input.transaction!.findOne<
+							Record<string, unknown>
+						>({
+							model: "session",
+							where: [{ field: "id", value: sessionId }],
+						});
+						const storedUser = await input.transaction!.findOne<
+							Record<string, unknown>
+						>({
+							model: "user",
+							where: [{ field: "id", value: String(storedSession!.userId) }],
+						});
+						newerCredentialKey =
+							`clearance:managed-rotation-newer-successor-test:` +
+							`session-credential:digest-${newerId}`;
+						capturedSuccessorCredentialKey =
+							`clearance:managed-rotation-newer-successor-test:` +
+							`session-credential:${String(active!.secretDigest)}`;
+						store.set(
+							capturedSuccessorCredentialKey,
+							JSON.stringify({ session: { id: sessionId }, consumed: true }),
+						);
+						store.set(
+							newerCredentialKey,
+							JSON.stringify({
+								session: { ...storedSession, token: null, ipAddress: "stale" },
+								user: { ...storedUser, name: "Stale User" },
+							}),
+						);
+						const handleKey = [...store.keys()].find((key) =>
+							key.endsWith(`:session-handle:${sessionId}`),
+						)!;
+						const indexKey = [...store.keys()].find((key) =>
+							key.endsWith(`:active-sessions:${storedSession!.userId}`),
+						)!;
+						store.set(handleKey, JSON.stringify({ credentialKey: newerCredentialKey }));
+						store.set(
+							indexKey,
+							JSON.stringify([
+								{
+									sessionId,
+									credentialKey: newerCredentialKey,
+									expiresAt: (active!.expiresAt as Date).getTime(),
+								},
+								{
+									sessionId,
+									credentialKey: "duplicate-stale-credential",
+									expiresAt: (active!.expiresAt as Date).getTime(),
+								},
+							]),
+						);
+					}
+				}
+				return policyResult(input);
+			},
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-newer-successor-test",
+					get: async (key) => store.get(key) ?? null,
+					set: async (key, value) => {
+						store.set(key, value);
+					},
+					delete: async (key) => {
+						store.delete(key);
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		sessionId = session.id;
+		const issuedHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		capturedOldCredentialKey = (
+			JSON.parse(store.get(issuedHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		interleaveNewerSuccessor = true;
+		const pending = runtime.context.internalAdapter.rotateSessionCredential(
+			session.token,
+			generateCredentialOperationKey(),
+		);
+		await publicationEntered.promise;
+		newerCommitted.resolve();
+		await expect(pending).resolves.not.toBeNull();
+
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		expect(JSON.parse(store.get(handleKey)!)).toEqual({
+			credentialKey: newerCredentialKey,
+		});
+		const currentSession = (await authorityRows(runtime.context))[0]!;
+		const currentUser = await runtime.context.adapter.findOne<
+			Record<string, unknown>
+		>({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+		});
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			{
+				sessionId: session.id,
+				credentialKey: newerCredentialKey,
+				expiresAt: (currentSession.expiresAt as Date).getTime(),
+			},
+		]);
+		expect(JSON.parse(store.get(newerCredentialKey)!)).toEqual({
+			session: JSON.parse(
+				JSON.stringify({ ...currentSession, token: null }),
+			),
+			user: JSON.parse(JSON.stringify(currentUser)),
+		});
+		expect(store.has(capturedOldCredentialKey)).toBe(false);
+		expect(store.has(capturedSuccessorCredentialKey)).toBe(false);
+	});
+
+	it("cleans secondary authority and errors on broken newer lineage", async () => {
+		const store = new Map<string, string>();
+		let rotationPolicyReads = 0;
+		let breakPublicationLineage = false;
+		let sessionId = "";
+		let successorCredentialKey = "";
+		const runtime = await setupManagedRuntime({
+			reader: async (input) => {
+				if (breakPublicationLineage) {
+					rotationPolicyReads += 1;
+					if (rotationPolicyReads === 3) {
+						const active = await input.transaction!.findOne<
+							Record<string, unknown>
+						>({
+							model: "sessionCredential",
+							where: [
+								{ field: "sessionId", value: sessionId },
+								{ field: "status", value: "active" },
+							],
+						});
+						successorCredentialKey =
+							`clearance:managed-rotation-broken-lineage-test:` +
+							`session-credential:${String(active!.secretDigest)}`;
+						store.set(
+							successorCredentialKey,
+							JSON.stringify({ session: { id: sessionId }, stale: true }),
+						);
+						await input.transaction!.update({
+							model: "sessionCredential",
+							where: [{ field: "id", value: String(active!.id) }],
+							update: { parentCredentialId: null },
+						});
+					}
+				}
+				return policyResult(input);
+			},
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-broken-lineage-test",
+					get: async (key) => store.get(key) ?? null,
+					set: async (key, value) => {
+						store.set(key, value);
+					},
+					delete: async (key) => {
+						store.delete(key);
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		sessionId = session.id;
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const oldCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		breakPublicationLineage = true;
+
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				generateCredentialOperationKey(),
+			),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(store.has(successorCredentialKey)).toBe(false);
+		expect(store.has(handleKey)).toBe(false);
+		expect(store.has(indexKey)).toBe(false);
+		const rows = await credentialRows(runtime);
+		expect(rows).toHaveLength(2);
+		expect(rows.find((row) => row.status === "active")!.parentCredentialId).toBe(
+			rows.find((row) => row.status === "consumed")!.id,
+		);
+	});
+
+	it("publishes rotation only after outer commit and repairs both recovery paths", async () => {
+		const store = new Map<string, string>();
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-postcommit-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const oldCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const oldEnvelope = store.get(oldCredentialKey)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const initialStore = new Map(store);
+		const initialCredentials = structuredClone(await credentialRows(runtime));
+		const operationKey = generateCredentialOperationKey();
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const result = await runtime.context.internalAdapter.rotateSessionCredential(
+					session.token,
+					operationKey,
+				);
+				expect(result).not.toBeNull();
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("rotation outer rollback");
+			}),
+		).rejects.toThrow("rotation outer rollback");
+		expect(store).toEqual(initialStore);
+		expect(await credentialRows(runtime)).toEqual(initialCredentials);
+
+		let rotated: Awaited<
+			ReturnType<
+				typeof runtime.context.internalAdapter.rotateSessionCredential
+			>
+		> = null;
+		await runWithTransaction(runtime.context.adapter, async () => {
+			rotated = await runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			);
+			expect(rotated).not.toBeNull();
+			expect(secondarySet).not.toHaveBeenCalled();
+			expect(secondaryDelete).not.toHaveBeenCalled();
+		});
+		expect(rotated).not.toBeNull();
+		const rows = await credentialRows(runtime);
+		const parent = rows.find((row) => row.status === "consumed")!;
+		const successor = rows.find((row) => row.status === "active")!;
+		expect(successor).toMatchObject({
+			familyId: parent.familyId,
+			parentCredentialId: parent.id,
+			rotationCounter: Number(parent.rotationCounter) + 1,
+		});
+		expect((successor.expiresAt as Date).getTime()).toBe(
+			(parent.expiresAt as Date).getTime(),
+		);
+		const persistedSession = (await authorityRows(runtime.context))[0]!;
+		expect((successor.expiresAt as Date).getTime()).toBe(
+			(persistedSession.expiresAt as Date).getTime(),
+		);
+		const successorCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		expect(successorCredentialKey).not.toBe(oldCredentialKey);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			{
+				sessionId: session.id,
+				credentialKey: successorCredentialKey,
+				expiresAt: (successor.expiresAt as Date).getTime(),
+			},
+		]);
+		const readExactEnvelope = async () => {
+			const currentSession = (await authorityRows(runtime.context))[0]!;
+			const currentUser = await runtime.context.adapter.findOne<
+				Record<string, unknown>
+			>({
+				model: "user",
+				where: [{ field: "id", value: runtime.user.id }],
+			});
+			return {
+				session: JSON.parse(
+					JSON.stringify({ ...currentSession, token: null }),
+				),
+				user: JSON.parse(JSON.stringify(currentUser)),
+			};
+		};
+		expect(JSON.parse(store.get(successorCredentialKey)!)).toEqual(
+			await readExactEnvelope(),
+		);
+		expect(
+			secondaryDelete.mock.calls.filter(([key]) => key === oldCredentialKey),
+		).toHaveLength(1);
+
+		const preparePartialPublication = () => {
+			store.set(oldCredentialKey, oldEnvelope);
+			store.delete(successorCredentialKey);
+			secondarySet.mockClear();
+			secondaryDelete.mockClear();
+		};
+		preparePartialPublication();
+		const partialStore = new Map(store);
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await expect(
+					runtime.context.internalAdapter.recoverSessionCredential(
+						session.token,
+						operationKey,
+					),
+				).resolves.not.toBeNull();
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("recovery outer rollback");
+			}),
+		).rejects.toThrow("recovery outer rollback");
+		expect(store).toEqual(partialStore);
+
+		await expect(
+			runtime.context.internalAdapter.recoverSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toMatchObject({ refreshToken: rotated!.refreshToken });
+		expect(JSON.parse(store.get(successorCredentialKey)!)).toEqual(
+			await readExactEnvelope(),
+		);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(
+			secondaryDelete.mock.calls.filter(([key]) => key === oldCredentialKey),
+		).toHaveLength(1);
+
+		preparePartialPublication();
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toMatchObject({ refreshToken: rotated!.refreshToken });
+		expect(JSON.parse(store.get(successorCredentialKey)!)).toEqual(
+			await readExactEnvelope(),
+		);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(
+			secondaryDelete.mock.calls.filter(([key]) => key === oldCredentialKey),
+		).toHaveLength(1);
+	});
+
+	it("reports rotation publication failure after commit and repairs it by recovery", async () => {
+		const store = new Map<string, string>();
+		let failPublication = false;
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			if (failPublication) throw new Error("rotation cache unavailable");
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-rotation-publication-failure-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const operationKey = generateCredentialOperationKey();
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const oldCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		failPublication = true;
+
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		const committedRows = await credentialRows(runtime);
+		expect(committedRows).toHaveLength(2);
+		expect(committedRows.map((row) => row.status).sort()).toEqual([
+			"active",
+			"consumed",
+		]);
+		expect(store.has(oldCredentialKey)).toBe(true);
+		expect(secondaryDelete).not.toHaveBeenCalled();
+
+		failPublication = false;
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		const recovered = await runtime.context.internalAdapter.recoverSessionCredential(
+			session.token,
+			operationKey,
+		);
+		expect(recovered).not.toBeNull();
+		const successorCredentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		expect(successorCredentialKey).not.toBe(oldCredentialKey);
+		expect(store.has(successorCredentialKey)).toBe(true);
+		expect(store.has(oldCredentialKey)).toBe(false);
+		expect(
+			secondaryDelete.mock.calls.filter(([key]) => key === oldCredentialKey),
+		).toHaveLength(1);
 	});
 
 	it("fails stale lost-response recovery without revoking or publishing", async () => {
