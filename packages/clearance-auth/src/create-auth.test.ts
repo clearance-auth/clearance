@@ -84,6 +84,10 @@ describe("@clearance/auth runtime wrapper", () => {
 			secret: "unit-test-secret-value-not-default!!",
 			databaseUrl,
 			authenticationSecurity: {
+				passwordLockout: {
+					maxFailedAttempts: 6,
+					durationSeconds: 480,
+				},
 				twoFactor: {
 					issuer: "Clearance Test",
 					maxFailedAttempts: 7,
@@ -101,6 +105,13 @@ describe("@clearance/auth runtime wrapper", () => {
 				options: {
 					plugins: Array<{ id: string; options?: Record<string, unknown> }>;
 					account?: { encryptOAuthTokens?: boolean };
+					emailAndPassword?: {
+						accountLockout?: {
+							enabled?: boolean;
+							maxFailedAttempts?: number;
+							durationSeconds?: number;
+						};
+					};
 				};
 			}).options;
 			const twoFactor = options.plugins.find((plugin) => plugin.id === "two-factor");
@@ -108,6 +119,11 @@ describe("@clearance/auth runtime wrapper", () => {
 				(plugin) => plugin.id === "have-i-been-pwned",
 			);
 			const accessTokens = options.plugins.find((plugin) => plugin.id === "jwt");
+			expect(options.emailAndPassword?.accountLockout).toEqual({
+				enabled: true,
+				maxFailedAttempts: 6,
+				durationSeconds: 480,
+			});
 			expect(twoFactor?.options).toMatchObject({
 				issuer: "Clearance Test",
 			backupCodeOptions: { storeBackupCodes: "hashed" },
@@ -161,6 +177,26 @@ describe("@clearance/auth runtime wrapper", () => {
 				},
 			}),
 		).toThrow(/gracePeriodSeconds must be an integer between 300 and 86400/);
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "http://localhost:3300",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				authenticationSecurity: {
+					passwordLockout: { maxFailedAttempts: 2 },
+				},
+			}),
+		).toThrow(/passwordLockout.maxFailedAttempts must be an integer between 3 and 100/);
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "http://localhost:3300",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				authenticationSecurity: {
+					passwordLockout: { durationSeconds: 86_401 },
+				},
+			}),
+		).toThrow(/passwordLockout.durationSeconds must be an integer between 30 and 86400/);
 	});
 
 	it("enforces production-safe SAML and SCIM defaults", async () => {

@@ -7,6 +7,7 @@ import { setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto/random";
 import { parseUserInput } from "../../db";
 import { parseUserOutput } from "../../db/schema";
+import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import type { Account } from "../../types";
 import { getDate } from "../../utils/date";
 import { PHONE_NUMBER_ERROR_CODES } from "./error-codes";
@@ -163,10 +164,11 @@ export const signInPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 					PHONE_NUMBER_ERROR_CODES.UNEXPECTED_ERROR,
 				);
 			}
-			const validPassword = await ctx.context.password.verify({
-				hash: currentPassword,
+			const validPassword = await verifyPasswordForSignIn(
+				ctx,
+				credentialAccount,
 				password,
-			});
+			);
 			if (!validPassword) {
 				ctx.context.logger.warn("Invalid password");
 				throw APIError.from(

@@ -539,6 +539,28 @@ export const getAuthTables = (
 				},
 				...account?.fields,
 				...options.account?.additionalFields,
+				// Password lockout is credential-account authority. Extensions cannot
+				// expose or replace these internal concurrency fields.
+				failedPasswordAttempts: {
+					type: "number",
+					required: false,
+					input: false,
+					returned: false,
+					defaultValue: 0,
+				},
+				activePasswordAttemptReservations: {
+					type: "string",
+					required: false,
+					input: false,
+					returned: false,
+					defaultValue: "[]",
+				},
+				passwordLockedUntil: {
+					type: "date",
+					required: false,
+					input: false,
+					returned: false,
+				},
 			},
 			order: 4,
 		},

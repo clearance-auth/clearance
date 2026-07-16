@@ -10,6 +10,7 @@ import { setSessionCookie } from "../../cookies";
 import { parseUserOutput } from "../../db/schema";
 import { missingEmailLogMessage } from "../../oauth2/errors";
 import { handleOAuthUserInfo } from "../../oauth2/link-account";
+import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import { generateState } from "../../utils";
 import { safeCloneRequest } from "../../utils/request";
 import { formCsrfMiddleware } from "../middlewares/origin-check";
@@ -524,10 +525,11 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 					BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 				);
 			}
-			const validPassword = await ctx.context.password.verify({
-				hash: currentPassword,
+			const validPassword = await verifyPasswordForSignIn(
+				ctx,
+				credentialAccount,
 				password,
-			});
+			);
 			if (!validPassword) {
 				ctx.context.logger.warn("Invalid password");
 				throw APIError.from(

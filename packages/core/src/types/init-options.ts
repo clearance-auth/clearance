@@ -786,6 +786,15 @@ export type ClearanceOptions = {
 				 */
 				revokeSessionsOnPasswordReset?: boolean;
 				/**
+				 * Durable credential-account lockout for primary password sign-in.
+				 * @default { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 }
+				 */
+				accountLockout?: {
+					enabled?: boolean;
+					maxFailedAttempts?: number;
+					durationSeconds?: number;
+				};
+				/**
 				 * A callback function that is triggered when a user tries to sign up
 				 * with an email that already exists. Useful for notifying the existing user
 				 * that someone attempted to register with their email.

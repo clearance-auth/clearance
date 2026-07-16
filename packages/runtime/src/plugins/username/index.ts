@@ -15,6 +15,7 @@ import {
 import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema, parseUserOutput } from "../../db";
+import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import type { InferOptionSchema } from "../../types/plugins";
 import { PACKAGE_VERSION } from "../../version";
 import { USERNAME_ERROR_CODES as ERROR_CODES } from "./error-codes";
@@ -485,10 +486,11 @@ export const username = (options?: UsernameOptions | undefined) => {
 							ERROR_CODES.INVALID_USERNAME_OR_PASSWORD,
 						);
 					}
-					const validPassword = await ctx.context.password.verify({
-						hash: currentPassword,
-						password: ctx.body.password,
-					});
+					const validPassword = await verifyPasswordForSignIn(
+						ctx,
+						account,
+						ctx.body.password,
+					);
 					if (!validPassword) {
 						ctx.context.logger.warn("Invalid password");
 						throw APIError.from(

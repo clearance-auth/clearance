@@ -2219,23 +2219,52 @@ export const createInternalAdapter = (
 			return user;
 		},
 		updatePassword: async (userId: string, password: string) => {
-			await updateManyWithHooks(
+			const currentAdapter = await getCurrentAdapter(adapter);
+			const account = await currentAdapter.findOne<Account>({
+				model: "account",
+				where: [
+					{ field: "userId", value: userId },
+					{ field: "providerId", value: "credential" },
+				],
+			});
+			if (!account) return;
+			const where = [
+				{ field: "id", value: account.id },
+				{ field: "password", value: account.password ?? null },
+			] satisfies Where[];
+			const updated = await updateWithHooks<Account>(
 				{
 					password,
+					failedPasswordAttempts: 0,
+					activePasswordAttemptReservations: "[]",
+					passwordLockedUntil: null,
 				},
-				[
-					{
-						field: "userId",
-						value: userId,
-					},
-					{
-						field: "providerId",
-						value: "credential",
-					},
-				],
+				where,
 				"account",
-				undefined,
+				{
+					executeMainFn: false,
+					usesTransactionAdapter: true,
+					async fn(data, transactionAdapter) {
+						const result = await transactionAdapter.incrementOne<Account>({
+							model: "account",
+							where,
+							increment: {},
+							set: data,
+						});
+						if (!result) {
+							throw new Error("Password credential changed concurrently");
+						}
+						return result;
+					},
+				},
+				(data) => ({
+					...data,
+					failedPasswordAttempts: 0,
+					activePasswordAttemptReservations: "[]",
+					passwordLockedUntil: null,
+				}),
 			);
+			if (!updated) throw new Error("Password credential update was rejected");
 		},
 		findAccounts: async (userId: string) => {
 			const accounts = await (

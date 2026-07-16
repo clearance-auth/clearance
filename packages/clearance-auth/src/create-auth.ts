@@ -142,6 +142,11 @@ function boundedSecurityInteger(
 }
 
 type ResolvedAuthenticationSecurity = {
+	passwordLockout: {
+		enabled: boolean;
+		maxFailedAttempts: number;
+		durationSeconds: number;
+	};
 	twoFactor: {
 		enabled: boolean;
 		issuer: string;
@@ -190,6 +195,27 @@ function resolveAuthenticationSecurity(
 		},
 	);
 	return {
+		passwordLockout: {
+			enabled: input?.passwordLockout?.enabled ?? true,
+			maxFailedAttempts: boundedSecurityInteger(
+				input?.passwordLockout?.maxFailedAttempts,
+				10,
+				{
+					label: "authenticationSecurity.passwordLockout.maxFailedAttempts",
+					min: 3,
+					max: 100,
+				},
+			),
+			durationSeconds: boundedSecurityInteger(
+				input?.passwordLockout?.durationSeconds,
+				15 * 60,
+				{
+					label: "authenticationSecurity.passwordLockout.durationSeconds",
+					min: 30,
+					max: 24 * 60 * 60,
+				},
+			),
+		},
 		twoFactor: {
 			enabled: input?.twoFactor?.enabled !== false,
 			issuer: input?.twoFactor?.issuer?.trim() || "Clearance",
@@ -700,6 +726,7 @@ export function createClearanceAuth<
 		emailAndPassword: {
 			enabled: true,
 			minPasswordLength: 12,
+			accountLockout: authenticationSecurity.passwordLockout,
 		},
 		account: {
 			encryptOAuthTokens: true,
@@ -852,7 +879,10 @@ export function createClearanceAuth<
 		database: migrationDatabase,
 		secret: options.secret,
 		baseURL: options.baseURL,
-		emailAndPassword: { enabled: true },
+		emailAndPassword: {
+			enabled: true,
+			accountLockout: authenticationSecurity.passwordLockout,
+		},
 		user: { additionalFields: userAdditionalFields },
 		rateLimit,
 		plugins,
@@ -924,6 +954,9 @@ export function createClearanceAuth<
 				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "passkeyUserHandle" text;
 				ALTER TABLE session ADD COLUMN IF NOT EXISTS "twoFactorSessionGeneration" text;
 				ALTER TABLE session ADD COLUMN IF NOT EXISTS "passkeySessionGeneration" text;
+				ALTER TABLE account ADD COLUMN IF NOT EXISTS "failedPasswordAttempts" integer DEFAULT 0;
+				ALTER TABLE account ADD COLUMN IF NOT EXISTS "activePasswordAttemptReservations" text DEFAULT '[]';
+				ALTER TABLE account ADD COLUMN IF NOT EXISTS "passwordLockedUntil" timestamptz;
 
 				CREATE TABLE IF NOT EXISTS passkey (
 					id text PRIMARY KEY,
@@ -1131,6 +1164,9 @@ export function createClearanceAuth<
 					('user', 'passkeySessionGeneration', 'text', 'YES'),
 					('user', 'passkeyUserHandle', 'text', 'YES'),
 					('session', 'passkeySessionGeneration', 'text', 'YES'),
+					('account', 'failedPasswordAttempts', 'int4', 'YES'),
+					('account', 'activePasswordAttemptReservations', 'text', 'YES'),
+					('account', 'passwordLockedUntil', 'timestamptz', 'YES'),
 					('passkey', 'id', 'text', 'NO'),
 					('passkey', 'userId', 'text', 'NO'),
 					('passkey', 'name', 'text', 'YES'),
@@ -1170,6 +1206,25 @@ export function createClearanceAuth<
 			if (incompatiblePasskeyColumn.rows[0]) {
 				throw new Error(
 					`Cannot prepare the passkey bridge: incompatible column ${incompatiblePasskeyColumn.rows[0].tableName}.${incompatiblePasskeyColumn.rows[0].columnName}`,
+				);
+			}
+			const incompatiblePasswordLockoutDefault = await client.query<{
+				columnName: string;
+			}>(`
+				SELECT column_name AS "columnName"
+				FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name = 'account'
+				  AND (
+				    (column_name = 'failedPasswordAttempts' AND column_default IS DISTINCT FROM '0')
+				    OR (column_name = 'activePasswordAttemptReservations' AND column_default IS DISTINCT FROM '''[]''::text')
+				    OR (column_name = 'passwordLockedUntil' AND column_default IS NOT NULL)
+				  )
+				LIMIT 1
+			`);
+			if (incompatiblePasswordLockoutDefault.rows[0]) {
+				throw new Error(
+					`Cannot prepare password lockout: incompatible default for account.${incompatiblePasswordLockoutDefault.rows[0].columnName}`,
 				);
 			}
 			const incompatiblePasskeyIndex = await client.query<{ name: string }>(`

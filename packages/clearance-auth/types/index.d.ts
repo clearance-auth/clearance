@@ -4,6 +4,11 @@ export type SocialProviderConfig = {
     [key: string]: unknown;
 };
 export type ClearanceAuthenticationSecurityOptions = {
+    passwordLockout?: {
+        enabled?: boolean;
+        maxFailedAttempts?: number;
+        durationSeconds?: number;
+    };
     twoFactor?: {
         enabled?: boolean;
         issuer?: string;

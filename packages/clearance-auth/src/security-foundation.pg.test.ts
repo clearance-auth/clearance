@@ -1080,6 +1080,10 @@ describe.sequential.skipIf(!available)(
 					    OR (table_name = 'session' AND column_name IN (
 					      'twoFactorSessionGeneration', 'passkeySessionGeneration'
 					    ))
+					    OR (table_name = 'account' AND column_name IN (
+					      'failedPasswordAttempts', 'activePasswordAttemptReservations',
+					      'passwordLockedUntil'
+					    ))
 					    OR (table_name = 'twoFactor' AND column_name IN (
 					      'pendingSecret', 'pendingBackupCodes', 'verified',
 					      'failedVerificationCount', 'activeVerificationReservations',
@@ -1092,6 +1096,9 @@ describe.sequential.skipIf(!available)(
 				expect(
 					bridgeColumns.rows.map((row) => `${row.tableName}.${row.columnName}`),
 				).toEqual([
+					"account.activePasswordAttemptReservations",
+					"account.failedPasswordAttempts",
+					"account.passwordLockedUntil",
 					"jwks.alg",
 					"jwks.crv",
 					"session.passkeySessionGeneration",
@@ -1109,6 +1116,50 @@ describe.sequential.skipIf(!available)(
 					"user.twoFactorEnabled",
 					"user.twoFactorSessionGeneration",
 				]);
+				const passwordLockoutColumns = await scopedPool.query<{
+					columnName: string;
+					type: string;
+					nullable: "YES" | "NO";
+					defaultValue: string | null;
+				}>(`
+					SELECT column_name AS "columnName", udt_name AS type,
+					       is_nullable AS nullable, column_default AS "defaultValue"
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'account'
+					  AND column_name IN (
+					    'failedPasswordAttempts', 'activePasswordAttemptReservations',
+					    'passwordLockedUntil'
+					  )
+				`);
+				expect(
+					Object.fromEntries(
+						passwordLockoutColumns.rows.map((column) => [
+							column.columnName,
+							{
+								type: column.type,
+								nullable: column.nullable,
+								defaultValue: column.defaultValue,
+							},
+						]),
+					),
+				).toEqual({
+					activePasswordAttemptReservations: {
+						type: "text",
+						nullable: "YES",
+						defaultValue: "'[]'::text",
+					},
+					failedPasswordAttempts: {
+						type: "int4",
+						nullable: "YES",
+						defaultValue: "0",
+					},
+					passwordLockedUntil: {
+						type: "timestamptz",
+						nullable: "YES",
+						defaultValue: null,
+					},
+				});
 				const passkeyColumns = await scopedPool.query<{
 					tableName: string;
 					columnName: string;
@@ -1538,6 +1589,7 @@ describe.sequential.skipIf(!available)(
 				await scopedPool.query(`
 					CREATE TABLE "user" (id text PRIMARY KEY);
 					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE TABLE account (id text PRIMARY KEY);
 					CREATE TABLE passkey (
 						id text PRIMARY KEY,
 						"userId" text NOT NULL,
@@ -1613,6 +1665,7 @@ describe.sequential.skipIf(!available)(
 						"passkeyUserHandle" text
 					);
 					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE TABLE account (id text PRIMARY KEY);
 					CREATE UNIQUE INDEX "user_passkeyUserHandle_uidx"
 						ON "user" ("passkeyUserHandle") NULLS NOT DISTINCT;
 				`);
@@ -1749,6 +1802,57 @@ describe.sequential.skipIf(!available)(
 			} finally {
 				await upgradeBundle?.destroy();
 				await oldBundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("rejects a legacy password lock timestamp default", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_lockout_default_${suffix}`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bridgeBundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				await scopedPool.query(`
+					CREATE TABLE "user" (id text PRIMARY KEY);
+					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE TABLE account (
+						id text PRIMARY KEY,
+						"passwordLockedUntil" timestamptz
+							DEFAULT (now() + interval '1 hour')
+					);
+				`);
+				bridgeBundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "lockout-default-bridge-proof-secret!!",
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId: `lockout-default-${suffix}`,
+						instanceId: `bridge-${suffix}`,
+					},
+				});
+				await expect(
+					bridgeBundle.prepareCredentialAuthorityRuntime(),
+				).rejects.toThrow(
+					"incompatible default for account.passwordLockedUntil",
+				);
+			} finally {
+				await bridgeBundle?.destroy();
 				await scopedPool?.end();
 				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
 				await basePool.end();

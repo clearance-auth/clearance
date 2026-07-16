@@ -22,6 +22,7 @@ export const BASE_ERROR_CODES = defineErrorCodes({
 	INVALID_PASSWORD: "Invalid password",
 	INVALID_EMAIL: "Invalid email",
 	INVALID_EMAIL_OR_PASSWORD: "Invalid email or password",
+	PASSWORD_ACCOUNT_LOCKED: "Sign-in is temporarily unavailable",
 	INVALID_USER: "Invalid user",
 	SOCIAL_ACCOUNT_ALREADY_LINKED: "Social account already linked",
 	PROVIDER_NOT_FOUND: "Provider not found",

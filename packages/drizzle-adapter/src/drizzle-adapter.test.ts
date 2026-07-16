@@ -443,7 +443,7 @@ describe("drizzle-adapter", () => {
 		 * `update().set().where().returning()` mutates by that id. Captures the
 		 * `set` payload, the update's `where` args, and the select guard so a test
 		 * can assert the `field = field + delta` expression and that the update is
-		 * pinned to one selected id rather than the raw guard clause.
+		 * pinned to one selected id while rechecking the original guard.
 		 */
 		function createIncrementDb(returned: unknown[]) {
 			const calls: {
@@ -486,6 +486,14 @@ describe("drizzle-adapter", () => {
 			});
 		}
 
+		function nestedQueryChunks(value: unknown): unknown[] {
+			if (!is(value, SQL)) return [value];
+			return [
+				value,
+				...(value as SQL).queryChunks.flatMap((chunk) => nestedQueryChunks(chunk)),
+			];
+		}
+
 		it("compiles each increment to a `column + delta` expression", async () => {
 			const { db, calls } = createIncrementDb([{ id: "user-1", attempts: 4 }]);
 			const adapter = createAdapter(db);
@@ -508,8 +516,8 @@ describe("drizzle-adapter", () => {
 			expect(chunks).toContainEqual(userTable.attempts);
 			expect(chunks).toContainEqual({ value: [" + "] });
 			expect(chunks).toContain(3);
-			// The guard runs on the SELECT that picks one id (one predicate here);
-			// the UPDATE is pinned to that single id, not the raw guard clause.
+			// The guard runs on the SELECT that picks one id and is repeated on the
+			// UPDATE so a row changed while PostgreSQL waits on its lock cannot pass.
 			expect(calls.selectGuard).toHaveLength(1);
 			expect(calls.whereArgs).toHaveLength(1);
 		});
@@ -554,14 +562,14 @@ describe("drizzle-adapter", () => {
 			expect(db.select).toHaveBeenCalledTimes(1);
 			expect(calls.selectGuard).toHaveLength(1);
 
-			// The UPDATE is guarded by a single `id IN (<one-row subquery>)`
-			// predicate, not the original multi-row clause.
+			// The UPDATE combines `id IN (<one-row subquery>)` with the original
+			// predicate, retaining the one-row contract and CAS guard together.
 			expect(calls.whereArgs).toHaveLength(1);
 			const updateGuard = calls.whereArgs?.[0];
 			expect(is(updateGuard, SQL)).toBe(true);
-			// The pinned predicate embeds the single-id subquery, proving the update
-			// targets only the one selected row.
-			expect((updateGuard as SQL).queryChunks).toContain(targetIds);
+			const chunks = nestedQueryChunks(updateGuard);
+			expect(chunks).toContain(targetIds);
+			expect(chunks).toContain(calls.selectGuard?.[0]);
 		});
 
 		it("returns null when the guard matches no row", async () => {
