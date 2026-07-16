@@ -8,6 +8,7 @@ import {
 	getCurrentAdapter,
 	getCurrentAuthContext,
 	queueAfterTransactionHook,
+	queueBeforeTransactionCommitHook,
 	runWithTransaction,
 } from "@clearance/core/context";
 import type {
@@ -79,6 +80,7 @@ import {
 } from "../internal/session-issuance-context";
 import {
 	evaluateSessionIssuance,
+	SESSION_ASSURANCE_RESERVED_FIELDS,
 	stripReservedSessionAuthority,
 	type SessionAssuranceFields,
 	validateStoredSessionAssurance,
@@ -146,6 +148,7 @@ export const createInternalAdapter = (
 		| SessionRotationResult
 		| typeof recoveryCredentialRejected
 		| null;
+	class ManagedSessionUpdateRejected extends Error {}
 
 	const sessionMatchesSecurityGenerations = (
 		session: Record<string, unknown>,
@@ -159,6 +162,7 @@ export const createInternalAdapter = (
 	async function validateRawSessionAuthority(
 		session: Record<string, unknown>,
 		user: User & Record<string, unknown>,
+		allowExpiredSession = false,
 	): Promise<boolean> {
 		if (
 			(user as User & { banned?: boolean | null }).banned === true ||
@@ -206,7 +210,7 @@ export const createInternalAdapter = (
 		if (
 			!(session.expiresAt instanceof Date) ||
 			!Number.isFinite(session.expiresAt.getTime()) ||
-			session.expiresAt <= now
+			(!allowExpiredSession && session.expiresAt <= now)
 		) {
 			return false;
 		}
@@ -273,6 +277,7 @@ export const createInternalAdapter = (
 
 	async function loadValidatedSessionAuthority(
 		sessionId: string,
+		allowExpiredSession = false,
 	): Promise<ValidatedSessionAuthority | null> {
 		const record = await findSessionRecordById(sessionId);
 		if (!record?.user) return null;
@@ -286,6 +291,7 @@ export const createInternalAdapter = (
 			!(await validateRawSessionAuthority(
 				session as Record<string, unknown>,
 				activeUser as User & Record<string, unknown>,
+				allowExpiredSession,
 			))
 		) {
 			return null;
@@ -294,6 +300,303 @@ export const createInternalAdapter = (
 			session: session as Session & Record<string, unknown>,
 			user: activeUser as User & Record<string, unknown>,
 		};
+	}
+
+	type ManagedSessionUpdateAuthority = ValidatedSessionAuthority & {
+		credential: SessionCredential | null;
+	};
+
+	async function findUniqueFutureActiveCredential(
+		sessionId: string,
+		expected?: SessionCredential,
+		requireFuture = true,
+	): Promise<SessionCredential | null> {
+		const now = new Date();
+		const active = await (
+				await getCurrentAdapter(adapter)
+			).findMany<SessionCredential>({
+				model: SESSION_CREDENTIAL_MODEL,
+				where: [
+					{ field: "sessionId", value: sessionId },
+					{ field: "status", value: "active" },
+				],
+			});
+		if (
+			active.length !== 1 ||
+			(requireFuture && active[0]!.expiresAt <= now)
+		) {
+			return null;
+		}
+		if (expected && active[0]!.id !== expected.id) return null;
+		return expected
+			? requireFuture
+				? rereadActiveCredential(expected)
+				: rereadExactCredential(expected)
+			: (active[0] ?? null);
+	}
+
+	async function resolveManagedSessionUpdateAuthority(
+		presentedToken: string,
+		allowExpired = false,
+	): Promise<ManagedSessionUpdateAuthority | null> {
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const handleSessionId = sessionIdFromHandle(presentedToken);
+		let credential: SessionCredential | null = null;
+		let sessionId = handleSessionId;
+		if (!legacyCredentialAuthority) {
+			if (handleSessionId) {
+				credential = await findUniqueFutureActiveCredential(
+					handleSessionId,
+					undefined,
+					!allowExpired,
+				);
+			} else {
+				const digest = await digestSessionRefreshSecret(presentedToken);
+				const credentialId = credentialIdFromRefreshSecret(presentedToken);
+				credential = credentialId
+					? await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "selector", value: credentialId }],
+						})
+					: await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "secretDigest", value: digest }],
+						});
+				if (
+					!credential ||
+					!constantTimeEqual(credential.secretDigest, digest)
+				) {
+					return null;
+				}
+				sessionId = credential.sessionId ?? null;
+			}
+			if (!credential || !sessionId) return null;
+			credential = await findUniqueFutureActiveCredential(
+				sessionId,
+				credential,
+				!allowExpired,
+			);
+			if (!credential) return null;
+		}
+		if (!sessionId) {
+			const legacy = await currentAdapter.findOne<Session>({
+				model: "session",
+				where: [{ field: "token", value: presentedToken }],
+			});
+			sessionId = legacy?.id ?? null;
+		}
+		if (!sessionId) return null;
+		const authority = await loadValidatedSessionAuthority(
+			sessionId,
+			allowExpired,
+		);
+		if (!authority) return null;
+		if (credential) {
+			const currentCredential = await findUniqueFutureActiveCredential(
+				sessionId,
+				credential,
+				!allowExpired,
+			);
+			if (!currentCredential || currentCredential.sessionId !== sessionId) {
+				return null;
+			}
+			credential = currentCredential;
+		}
+		return { ...authority, credential };
+	}
+
+	const immutableSessionUpdateFields = (
+		stored: Record<string, unknown>,
+	): Record<string, unknown> => {
+		const immutable: Record<string, unknown> = {};
+		for (const field of [
+			"id",
+			"token",
+			"userId",
+			TWO_FACTOR_SESSION_GENERATION_FIELD,
+			PASSKEY_SESSION_GENERATION_FIELD,
+			...SESSION_ASSURANCE_RESERVED_FIELDS,
+		]) {
+			if (Object.hasOwn(stored, field)) immutable[field] = stored[field];
+		}
+		return immutable;
+	};
+
+	const stripSessionUpdateAuthority = (
+		input: Record<string, unknown>,
+	): Record<string, unknown> => {
+		const stripped = stripReservedSessionAuthority(input);
+		for (const field of [
+			"id",
+			"token",
+			"userId",
+			TWO_FACTOR_SESSION_GENERATION_FIELD,
+			PASSKEY_SESSION_GENERATION_FIELD,
+		]) {
+			delete stripped[field];
+		}
+		return stripped;
+	};
+
+	const sameImmutableSessionAuthority = (
+		left: Record<string, unknown>,
+		right: Record<string, unknown>,
+	): boolean => {
+		for (const field of [
+			"id",
+			"token",
+			"userId",
+			TWO_FACTOR_SESSION_GENERATION_FIELD,
+			PASSKEY_SESSION_GENERATION_FIELD,
+			...SESSION_ASSURANCE_RESERVED_FIELDS,
+		]) {
+			const leftValue = left[field];
+			const rightValue = right[field];
+			if (leftValue instanceof Date && rightValue instanceof Date) {
+				if (leftValue.getTime() !== rightValue.getTime()) return false;
+			} else if (leftValue !== rightValue) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	const managedOrganizationUpdateAllowed = (
+		update: Record<string, unknown>,
+		stored: Record<string, unknown>,
+	): boolean => {
+		if (!Object.hasOwn(update, "activeOrganizationId")) return true;
+		const requested = update.activeOrganizationId;
+		if (requested === null) return true;
+		if (typeof requested !== "string" || requested.length === 0) return false;
+		return (
+			requested === stored.activeOrganizationId ||
+			requested === stored.authenticationPolicyOrganizationId
+		);
+	};
+
+	async function publishSecondarySessionUpdate(input: {
+		session: Session & Record<string, unknown>;
+		user: User & Record<string, unknown>;
+		credentialKey: string;
+	}): Promise<void> {
+		if (!secondaryStorage) return;
+		const credentialKey = input.credentialKey;
+		const handleKey = secondaryHandleKey(input.session.id);
+		const oldCredentialKey = parseSecondaryHandle(
+			await secondaryStorage.get(handleKey),
+		);
+		const listKey = secondaryActiveSessionsKey(input.session.userId);
+		const now = Date.now();
+		const expiresAt = input.session.expiresAt.getTime();
+		const ttl = getTTLSeconds(expiresAt, now);
+		const listRaw = await secondaryStorage.get(listKey);
+		const list: SecondarySessionIndexEntry[] = listRaw
+			? safeJSONParse(listRaw) || []
+			: [];
+		const remaining = list.filter(
+			(entry) =>
+				entry.sessionId !== input.session.id && entry.expiresAt > now,
+		);
+		if (ttl > 0) {
+			const next = [
+				...remaining,
+				{
+					sessionId: input.session.id,
+					credentialKey,
+					expiresAt,
+				},
+			].sort((left, right) => left.expiresAt - right.expiresAt);
+			await secondaryStorage.set(
+				credentialKey,
+				JSON.stringify({
+					session: { ...input.session, token: null },
+					user: input.user,
+				}),
+				ttl,
+			);
+			await secondaryStorage.set(
+				handleKey,
+				JSON.stringify({ credentialKey }),
+				ttl,
+			);
+			const indexTTL = getTTLSeconds(next.at(-1)!.expiresAt, now);
+			if (indexTTL <= 0) {
+				await secondaryStorage.delete(listKey);
+				return;
+			}
+			await secondaryStorage.set(
+				listKey,
+				JSON.stringify(next),
+				indexTTL,
+			);
+			if (
+				oldCredentialKey &&
+				oldCredentialKey !== credentialKey &&
+				(await secondaryCredentialBelongsToSession(
+					oldCredentialKey,
+					input.session.id,
+				))
+			) {
+				await secondaryStorage.delete(oldCredentialKey);
+			}
+			return;
+		}
+		await secondaryStorage.delete(credentialKey);
+		if (
+			oldCredentialKey &&
+			oldCredentialKey !== credentialKey &&
+			(await secondaryCredentialBelongsToSession(
+				oldCredentialKey,
+				input.session.id,
+			))
+		) {
+			await secondaryStorage.delete(oldCredentialKey);
+		}
+		await secondaryStorage.delete(handleKey);
+		if (remaining.length > 0) {
+			const indexTTL = getTTLSeconds(remaining.at(-1)!.expiresAt, now);
+			if (indexTTL <= 0) {
+				await secondaryStorage.delete(listKey);
+				return;
+			}
+			await secondaryStorage.set(
+				listKey,
+				JSON.stringify(remaining),
+				indexTTL,
+			);
+		} else {
+			await secondaryStorage.delete(listKey);
+		}
+	}
+
+	async function secondaryCredentialBelongsToSession(
+		credentialKey: string,
+		sessionId: string,
+	): Promise<boolean> {
+		if (!secondaryStorage) return false;
+		const envelope = safeJSONParse<{ session?: { id?: unknown } }>(
+			await secondaryStorage.get(credentialKey),
+		);
+		return envelope?.session?.id === sessionId;
+	}
+
+	async function allSessionCredentialExpiriesMatch(
+		transactionAdapter: DBTransactionAdapter,
+		sessionId: string,
+		expiresAt: Date,
+	): Promise<boolean> {
+		const credentials = await transactionAdapter.findMany<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "sessionId", value: sessionId }],
+		});
+		return (
+			credentials.length > 0 &&
+			credentials.every(
+				(credential) =>
+					credential.expiresAt.getTime() === expiresAt.getTime(),
+			)
+		);
 	}
 
 	async function createCredentialRecord(input: {
@@ -1903,6 +2206,224 @@ export const createInternalAdapter = (
 			sessionToken: string,
 			session: Partial<Session> & Record<string, any>,
 		) => {
+			if (authenticationPolicy && storesSessionsInDatabase) {
+				try {
+					return await runWithTransaction(adapter, async () => {
+						const initial = await resolveManagedSessionUpdateAuthority(
+							sessionToken,
+						);
+						if (!initial) return null;
+						const directUpdate = stripSessionUpdateAuthority(session);
+						if (
+							!managedOrganizationUpdateAllowed(directUpdate, initial.session)
+						) {
+							return null;
+						}
+						const immutable = immutableSessionUpdateFields(initial.session);
+						let committedExpiresAt: Date | null = null;
+						let committedCredential: SessionCredential | null = null;
+						const updatedSession = await updateWithHooks<Session>(
+							directUpdate,
+							[{ field: "id", value: initial.session.id }],
+							"session",
+							{
+								executeMainFn: false,
+								usesTransactionAdapter: true,
+								async fn(hookedData, transactionAdapter) {
+									const current = await resolveManagedSessionUpdateAuthority(
+										sessionToken,
+									);
+									if (
+										!current ||
+										current.session.id !== initial.session.id ||
+										current.credential?.id !== initial.credential?.id ||
+										!sameImmutableSessionAuthority(
+											current.session,
+											initial.session,
+										)
+									) {
+										throw new ManagedSessionUpdateRejected();
+									}
+									if (
+										!managedOrganizationUpdateAllowed(
+											hookedData,
+											initial.session,
+										)
+									) {
+										throw new ManagedSessionUpdateRejected();
+									}
+									const finalData = {
+										...current.session,
+										...hookedData,
+										...immutable,
+									} as Session & Record<string, unknown>;
+									if (
+										!(finalData.expiresAt instanceof Date) ||
+										!Number.isFinite(finalData.expiresAt.getTime())
+									) {
+										throw new ManagedSessionUpdateRejected();
+									}
+									const mutationTime = new Date();
+									if (current.credential) {
+										const guarded =
+											await transactionAdapter.incrementOne<SessionCredential>({
+												model: SESSION_CREDENTIAL_MODEL,
+												where: [
+													{ field: "id", value: current.credential.id },
+													{
+														field: "sessionId",
+														value: initial.session.id,
+													},
+													{ field: "status", value: "active" },
+													{
+														field: "secretDigest",
+														value: current.credential.secretDigest,
+													},
+													{
+														field: "expiresAt",
+														value: current.credential.expiresAt,
+													},
+												],
+												increment: {},
+												set: { updatedAt: mutationTime },
+											});
+										if (!guarded) throw new ManagedSessionUpdateRejected();
+									}
+									const persisted = await transactionAdapter.update<Session>({
+										model: "session",
+										where: [{ field: "id", value: initial.session.id }],
+										update: finalData,
+									});
+									if (!persisted) {
+										throw new Error("Managed session update did not persist");
+									}
+									if (current.credential) {
+										const count = await transactionAdapter.updateMany({
+											model: SESSION_CREDENTIAL_MODEL,
+											where: [
+												{ field: "sessionId", value: initial.session.id },
+											],
+											update: {
+												expiresAt: finalData.expiresAt,
+												updatedAt: mutationTime,
+											},
+										});
+										if (Number(count) < 1) {
+											throw new Error(
+												"Managed credential expiry did not persist",
+											);
+										}
+										if (
+											!(await allSessionCredentialExpiriesMatch(
+												transactionAdapter,
+												initial.session.id,
+												finalData.expiresAt,
+											))
+										) {
+											throw new Error("Managed credential expiries diverged");
+										}
+										committedCredential = await rereadExactCredential(
+											current.credential,
+										);
+										if (
+											!committedCredential ||
+											committedCredential.status !== "active" ||
+											committedCredential.expiresAt.getTime() !==
+												finalData.expiresAt.getTime()
+										) {
+											throw new Error("Managed credential authority changed");
+										}
+									}
+									committedExpiresAt = finalData.expiresAt;
+									return parseInternalSessionOutput(ctx.options, persisted);
+								},
+							},
+							(hookedData) =>
+								({
+									...stripSessionUpdateAuthority(hookedData),
+									...immutable,
+								}) as Session,
+						);
+						if (!updatedSession || !committedExpiresAt) return null;
+						const finalExpiresAt = committedExpiresAt as Date;
+						await queueBeforeTransactionCommitHook(async () => {
+							const final = await resolveManagedSessionUpdateAuthority(
+								sessionToken,
+								true,
+							);
+							if (
+								!final ||
+								final.session.id !== initial.session.id ||
+								final.session.expiresAt.getTime() !==
+									finalExpiresAt.getTime() ||
+								!sameImmutableSessionAuthority(final.session, initial.session)
+							) {
+								throw new ManagedSessionUpdateRejected();
+							}
+							if (
+								legacyCredentialAuthority &&
+								(typeof final.session.token !== "string" ||
+									final.session.token.length === 0)
+							) {
+								throw new ManagedSessionUpdateRejected();
+							}
+							if (committedCredential) {
+								const finalCredential = final.credential;
+								const exactCredential = await rereadExactCredential(
+									committedCredential,
+								);
+								const currentAdapter = await getCurrentAdapter(adapter);
+								if (
+									!finalCredential ||
+									!exactCredential ||
+									finalCredential.id !== exactCredential.id ||
+									exactCredential.status !== "active" ||
+									exactCredential.expiresAt.getTime() !==
+										finalExpiresAt.getTime() ||
+									!(await allSessionCredentialExpiriesMatch(
+										currentAdapter,
+										initial.session.id,
+										finalExpiresAt,
+									))
+								) {
+									throw new ManagedSessionUpdateRejected();
+								}
+							}
+							if (secondaryStorage) {
+								const legacyToken = final.session.token;
+								if (
+									!committedCredential &&
+									(typeof legacyToken !== "string" || legacyToken.length === 0)
+								) {
+									throw new ManagedSessionUpdateRejected();
+								}
+								const credentialKey = committedCredential
+									? secondaryCredentialKey(committedCredential.secretDigest)
+									: secondaryCredentialKey(
+											await digestSessionRefreshSecret(legacyToken as string),
+										);
+								await queueAfterTransactionHook(
+									() =>
+										publishSecondarySessionUpdate({
+											...final,
+											credentialKey,
+										}),
+									adapter,
+								);
+							}
+						}, adapter);
+						return {
+							...updatedSession,
+							token: legacyCredentialAuthority
+								? updatedSession.token
+								: sessionToken,
+						};
+					});
+				} catch (error) {
+					if (error instanceof ManagedSessionUpdateRejected) return null;
+					throw error;
+				}
+			}
 			const {
 				token: _discardedToken,
 				id: _discardedId,

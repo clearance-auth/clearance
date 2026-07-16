@@ -23,8 +23,13 @@ import {
 	createInternalSessionIssuanceContext,
 	ManagedSessionIssuanceError,
 } from "../internal/session-issuance-context";
+import { attachInternalCredentialAuthority } from "../internal/credential-authority";
 import { getMigrations } from "./get-migration";
 import { generateCredentialOperationKey } from "../utils/operation-key";
+import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../security/session-assurance";
+import { schema as passkeySchema } from "../plugins/passkey/schema";
+import { schema as twoFactorSchema } from "../plugins/two-factor/schema";
+import { createSessionHandle } from "./session-credential";
 
 const identity = Object.freeze({
 	projectId: "project_1",
@@ -102,6 +107,7 @@ function deferred() {
 async function setupManagedRuntime(options?: {
 	reader?: ReaderImplementation;
 	options?: Omit<ClearanceOptions, "baseURL" | "secret" | "database">;
+	credentialAuthority?: "legacy-v1";
 }) {
 	const database = new DatabaseSync(":memory:");
 	databases.push(database);
@@ -114,11 +120,24 @@ async function setupManagedRuntime(options?: {
 		database,
 		...options?.options,
 	} satisfies ClearanceOptions;
+	if (options?.credentialAuthority) {
+		attachInternalCredentialAuthority(runtimeOptions, {
+			generation: options.credentialAuthority,
+		});
+	}
 	attachInternalAuthenticationPolicy(runtimeOptions, {
 		identity,
 		reader: { readForSubject } satisfies RuntimeAuthenticationPolicyReader,
 	});
 	await (await getMigrations(runtimeOptions)).runMigrations();
+	if (options?.credentialAuthority === "legacy-v1") {
+		database.exec(
+			'DROP TRIGGER IF EXISTS "clearance_session_credential_authority_v1_insert"',
+		);
+		database.exec(
+			'DROP TRIGGER IF EXISTS "clearance_session_credential_authority_v1_update"',
+		);
+	}
 	const context = await init(runtimeOptions);
 	const user = await context.internalAdapter.createUser({
 		email: `managed-${databases.length}@example.com`,
@@ -1015,5 +1034,950 @@ describe("managed stored session authority", () => {
 		await expect(
 			context.internalAdapter.findSessionById(session.id),
 		).resolves.toMatchObject({ session: { id: session.id } });
+	});
+
+	it("atomically updates expiry while preserving hook-protected authority", async () => {
+		const runtime = await setupManagedRuntime({
+			options: {
+				databaseHooks: {
+					session: {
+						update: {
+							before: async (data) => ({
+								data: {
+									...data,
+									...Object.fromEntries(
+										SESSION_ASSURANCE_RESERVED_FIELDS.map((field) => [
+											field,
+											`hook-${field}`,
+										]),
+									),
+									id: "hook-id",
+									token: "hook-token",
+									userId: "hook-user",
+									twoFactorSessionGeneration: "hook-two-factor",
+									passkeySessionGeneration: "hook-passkey",
+									authenticationPolicyRevision: "999",
+									authenticationPrimaryMethod: "anonymous",
+								},
+							}),
+						},
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const originalCredential = (await credentialRows(runtime))[0]!;
+		await runtime.context.adapter.create({
+			model: "sessionCredential",
+			forceAllowId: true,
+			data: {
+				...originalCredential,
+				id: `${originalCredential.id}-consumed`,
+				selector: `${originalCredential.selector}-consumed`,
+				secretDigest: `${originalCredential.secretDigest}-consumed`,
+				status: "consumed",
+				rotationCounter: 1,
+				parentCredentialId: originalCredential.id,
+				consumedAt: new Date(),
+			},
+		});
+		const before = (await authorityRows(runtime.context))[0]!;
+		const newExpiry = new Date(session.expiresAt.getTime() + 60_000);
+		const directForgery = Object.fromEntries(
+			SESSION_ASSURANCE_RESERVED_FIELDS.map((field) => [field, "forged"]),
+		);
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				...directForgery,
+				id: "direct-id",
+				token: "direct-token",
+				userId: "direct-user",
+				twoFactorSessionGeneration: "direct-two-factor",
+				passkeySessionGeneration: "direct-passkey",
+				expiresAt: newExpiry,
+			} as never),
+		).resolves.toMatchObject({ id: session.id, token: session.token });
+
+		const after = (await authorityRows(runtime.context))[0]!;
+		for (const field of [
+			"id",
+			"token",
+			"userId",
+			"twoFactorSessionGeneration",
+			"passkeySessionGeneration",
+			...SESSION_ASSURANCE_RESERVED_FIELDS,
+		]) {
+			expect(after[field]).toEqual(before[field]);
+		}
+		expect(after.expiresAt).toEqual(newExpiry);
+		const updatedCredentials = await credentialRows(runtime);
+		expect(updatedCredentials).toHaveLength(2);
+		expect(
+			updatedCredentials.every(
+				(credential) =>
+					(credential.expiresAt as Date).getTime() === newExpiry.getTime(),
+			),
+		).toBe(true);
+		const stableSession = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				expiresAt: new Date(Number.NaN),
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+	});
+
+	it("enforces managed organization deltas from direct and hook updates", async () => {
+		let hookOrganization: unknown;
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: {
+					additionalFields: {
+						activeOrganizationId: { type: "string", required: false },
+					},
+				},
+				databaseHooks: {
+					session: {
+						update: {
+							before: async (data) => ({
+								data:
+									hookOrganization === undefined
+										? data
+										: { ...data, activeOrganizationId: hookOrganization },
+							}),
+						},
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime, {
+			activeOrganizationId: "organization_1",
+			targetOrganizationId: "organization_1",
+		});
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				activeOrganizationId: "organization_1",
+			}),
+		).resolves.not.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				activeOrganizationId: null,
+			}),
+		).resolves.not.toBeNull();
+		const stable = structuredClone(await authorityRows(runtime.context));
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				activeOrganizationId: "organization_2",
+			}),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				activeOrganizationId: 42,
+			} as never),
+		).resolves.toBeNull();
+		hookOrganization = "organization_2";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.9",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stable);
+	});
+
+	it("propagates update reader failure and rejects expired credentials without mutation", async () => {
+		let readerFails = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) => {
+				if (readerFails) throw new Error("update policy unavailable");
+				return policyResult(input);
+			},
+			options: {
+				user: {
+					additionalFields: {
+						banned: { type: "boolean", defaultValue: false },
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		let stableSession = structuredClone(await authorityRows(runtime.context));
+		let stableCredentials = structuredClone(await credentialRows(runtime));
+		readerFails = true;
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.10",
+			}),
+		).rejects.toBeInstanceOf(RuntimeAuthenticationPolicyReaderError);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+
+		readerFails = false;
+		await runtime.context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+			update: { banned: true },
+		});
+		stableSession = structuredClone(await authorityRows(runtime.context));
+		stableCredentials = structuredClone(await credentialRows(runtime));
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.11",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		await runtime.context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+			update: { banned: false },
+		});
+
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: session.id }],
+			update: { expiresAt: new Date(Date.now() - 1_000) },
+		});
+		stableSession = structuredClone(await authorityRows(runtime.context));
+		stableCredentials = structuredClone(await credentialRows(runtime));
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.12",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+	});
+
+	it("rejects two-factor and passkey generation mismatch without mutation", async () => {
+		const runtime = await setupManagedRuntime({
+			options: {
+				plugins: [
+					{ id: "two-factor", schema: twoFactorSchema },
+					{ id: "passkey", schema: passkeySchema },
+				],
+			},
+		});
+		await runtime.context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+			update: {
+				twoFactorSessionGeneration: "generation-1",
+				passkeySessionGeneration: "generation-1",
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		await runtime.context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+			update: {
+				twoFactorSessionGeneration: "generation-2",
+				passkeySessionGeneration: "generation-2",
+			},
+		});
+		const stableSession = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.13",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+	});
+
+	it("rejects stale policy and post-hook authority changes without after hooks", async () => {
+		let liveRevision = "7";
+		const hookEntered = deferred();
+		const hookRelease = deferred();
+		const afterHook = vi.fn();
+		let blockHook = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) => policyResult(input, { revision: liveRevision }),
+			options: {
+				databaseHooks: {
+					session: {
+						update: {
+							before: async (data) => {
+								if (blockHook) {
+									hookEntered.resolve();
+									await hookRelease.promise;
+								}
+								return { data };
+							},
+							after: afterHook,
+						},
+					},
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const beforeSession = structuredClone(await authorityRows(runtime.context));
+		const beforeCredentials = structuredClone(await credentialRows(runtime));
+		blockHook = true;
+		const pending = runtime.context.internalAdapter.updateSession(session.token, {
+			ipAddress: "192.0.2.1",
+		});
+		await hookEntered.promise;
+		liveRevision = "8";
+		hookRelease.resolve();
+
+		await expect(pending).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
+		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+		expect(afterHook).not.toHaveBeenCalled();
+	});
+
+	it("rejects session-assurance and credential deadlines crossed inside an async before hook", async () => {
+		vi.useFakeTimers({ now: new Date("2031-01-01T00:00:00.000Z") });
+		let hookGate: ReturnType<typeof deferred> | null = null;
+		let hookEntered: ReturnType<typeof deferred> | null = null;
+		const afterHook = vi.fn();
+		const runtime = await setupManagedRuntime({
+			options: {
+				databaseHooks: {
+					session: {
+						update: {
+							before: async (data) => {
+								if (hookGate && hookEntered) {
+									hookEntered.resolve();
+									await hookGate.promise;
+								}
+								return { data };
+							},
+							after: afterHook,
+						},
+					},
+				},
+			},
+		});
+		const crossDeadline = async (token: string) => {
+			hookGate = deferred();
+			hookEntered = deferred();
+			const pending = runtime.context.internalAdapter.updateSession(token, {
+				ipAddress: "192.0.2.14",
+			});
+			await hookEntered.promise;
+			await vi.advanceTimersByTimeAsync(2_000);
+			hookGate.resolve();
+			await expect(pending).resolves.toBeNull();
+			hookGate = null;
+			hookEntered = null;
+		};
+
+		const sessionDeadline = await issuePasswordSession(runtime);
+		await runtime.context.adapter.update({
+			model: "session",
+			where: [{ field: "id", value: sessionDeadline.id }],
+			update: {
+				expiresAt: new Date(Date.now() + 1_000),
+				authenticationAssuranceExpiresAt: new Date(Date.now() + 1_000),
+			},
+		});
+		let stableSession = structuredClone(await authorityRows(runtime.context));
+		let stableCredentials = structuredClone(await credentialRows(runtime));
+		await crossDeadline(sessionDeadline.token);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+
+		const credentialDeadline = await issuePasswordSession(runtime);
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: credentialDeadline.id }],
+			update: { expiresAt: new Date(Date.now() + 1_000) },
+		});
+		stableSession = structuredClone(await authorityRows(runtime.context));
+		stableCredentials = structuredClone(await credentialRows(runtime));
+		await crossDeadline(credentialDeadline.token);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(afterHook).not.toHaveBeenCalled();
+	});
+
+	it("rejects duplicate active credentials for handle and refresh updates", async () => {
+		const runtime = await setupManagedRuntime();
+		const session = await issuePasswordSession(runtime);
+		const credential = (await credentialRows(runtime))[0]!;
+		await runtime.context.adapter.create({
+			model: "sessionCredential",
+			forceAllowId: true,
+			data: {
+				...credential,
+				id: `${credential.id}-duplicate`,
+				selector: `${credential.selector}-duplicate`,
+				secretDigest: `${credential.secretDigest}-duplicate`,
+			},
+		});
+		const beforeSession = structuredClone(await authorityRows(runtime.context));
+		const beforeCredentials = structuredClone(await credentialRows(runtime));
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.2",
+			}),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.updateSession(
+				String(beforeSession[0]!.token),
+				{ ipAddress: "192.0.2.3" },
+			),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
+		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+	});
+
+	it("publishes the final DB snapshot only after outer commit and never on rollback", async () => {
+		const store = new Map<string, string>();
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-update-publication-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const expectedHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const expectedCredentialKey = (
+			JSON.parse(store.get(expectedHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		const beforeStore = new Map(store);
+		const beforeSession = structuredClone(await authorityRows(runtime.context));
+		const beforeCredentials = structuredClone(await credentialRows(runtime));
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.updateSession(session.token, {
+					ipAddress: "192.0.2.4",
+				});
+				expect(secondarySet).not.toHaveBeenCalled();
+				throw new Error("outer rollback");
+			}),
+		).rejects.toThrow("outer rollback");
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+		expect(store).toEqual(beforeStore);
+		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
+		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+
+		await runtime.context.internalAdapter.updateSession(session.token, {
+			ipAddress: "192.0.2.5",
+		});
+		expect(secondarySet).toHaveBeenCalled();
+		const persistedSession = (await authorityRows(runtime.context))[0]!;
+		const persistedCredentials = await credentialRows(runtime);
+		const persistedExpiry = (persistedSession.expiresAt as Date).getTime();
+		expect(
+			persistedCredentials.every(
+				(credential) =>
+					(credential.expiresAt as Date).getTime() === persistedExpiry,
+			),
+		).toBe(true);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		);
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		);
+		expect(handleKey).toBeDefined();
+		expect(indexKey).toBeDefined();
+		expect(handleKey).toBe(expectedHandleKey);
+		const handle = JSON.parse(store.get(handleKey!)!) as {
+			credentialKey: string;
+		};
+		expect(handle).toEqual({ credentialKey: expectedCredentialKey });
+		const index = JSON.parse(store.get(indexKey!)!) as Array<{
+			sessionId: string;
+			credentialKey: string;
+			expiresAt: number;
+		}>;
+		expect(index).toEqual([
+			{
+				sessionId: session.id,
+				credentialKey: handle.credentialKey,
+				expiresAt: persistedExpiry,
+			},
+		]);
+		const envelope = JSON.parse(store.get(handle.credentialKey)!) as {
+			session: Record<string, unknown>;
+			user: Record<string, unknown>;
+		};
+		const persistedUser = await runtime.context.adapter.findOne<
+			Record<string, unknown>
+		>({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+		});
+		expect(envelope).toEqual({
+			session: JSON.parse(
+				JSON.stringify({ ...persistedSession, token: null }),
+			),
+			user: JSON.parse(JSON.stringify(persistedUser)),
+		});
+	});
+
+	it("removes only expired managed secondary material after commit and preserves it on outer rollback", async () => {
+		const store = new Map<string, string>();
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-update-expired-publication-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const originalHandle = JSON.parse(store.get(handleKey)!) as {
+			credentialKey: string;
+		};
+		const unrelated = {
+			sessionId: "unrelated-session",
+			credentialKey: "unrelated-credential-key",
+			expiresAt: Date.now() + 600_000,
+		};
+		const staleCredentialKey = "stale-mapped-credential-key";
+		store.set(
+			staleCredentialKey,
+			JSON.stringify({ session: { id: session.id }, stale: true }),
+		);
+		store.set(unrelated.credentialKey, JSON.stringify({ unrelated: true }));
+		store.set(handleKey, JSON.stringify({ credentialKey: staleCredentialKey }));
+		store.set(
+			indexKey,
+			JSON.stringify([
+				...(JSON.parse(store.get(indexKey)!) as unknown[]),
+				unrelated,
+			]),
+		);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		const stableStore = new Map(store);
+		const stableSession = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		const expiredAt = new Date(Date.now() - 1_000);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.updateSession(session.token, {
+					expiresAt: expiredAt,
+				});
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("expired outer rollback");
+			}),
+		).rejects.toThrow("expired outer rollback");
+		expect(store).toEqual(stableStore);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				expiresAt: expiredAt,
+			}),
+		).resolves.toMatchObject({ id: session.id });
+		expect(store.has(originalHandle.credentialKey)).toBe(false);
+		expect(store.has(staleCredentialKey)).toBe(false);
+		expect(store.has(handleKey)).toBe(false);
+		expect(store.get(unrelated.credentialKey)).toBe(
+			JSON.stringify({ unrelated: true }),
+		);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([unrelated]);
+		const persistedSession = (await authorityRows(runtime.context))[0]!;
+		expect((persistedSession.expiresAt as Date).getTime()).toBe(
+			expiredAt.getTime(),
+		);
+		expect(
+			(await credentialRows(runtime)).every(
+				(credential) =>
+					(credential.expiresAt as Date).getTime() === expiredAt.getTime(),
+			),
+		).toBe(true);
+	});
+
+	it("preserves secondary material owned by another session across future and expired updates", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-update-cross-session-key-test",
+					get: async (key) => store.get(key) ?? null,
+					set: async (key, value) => {
+						store.set(key, value);
+					},
+					delete: async (key) => {
+						store.delete(key);
+					},
+				},
+			},
+		});
+		const sessionA = await issuePasswordSession(runtime);
+		const sessionB = await issuePasswordSession(runtime);
+		const handleKey = (sessionId: string) =>
+			[...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${sessionId}`),
+			)!;
+		const aHandleKey = handleKey(sessionA.id);
+		const bHandleKey = handleKey(sessionB.id);
+		const aCredentialKey = (
+			JSON.parse(store.get(aHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const bHandleValue = store.get(bHandleKey)!;
+		const bCredentialKey = (
+			JSON.parse(bHandleValue) as { credentialKey: string }
+		).credentialKey;
+		const bEnvelope = store.get(bCredentialKey)!;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const bIndexEntry = (
+			JSON.parse(store.get(indexKey)!) as Array<{
+				sessionId: string;
+				credentialKey: string;
+				expiresAt: number;
+			}>
+		).find((entry) => entry.sessionId === sessionB.id)!;
+
+		store.set(aHandleKey, JSON.stringify({ credentialKey: bCredentialKey }));
+		await expect(
+			runtime.context.internalAdapter.updateSession(sessionA.token, {
+				ipAddress: "192.0.2.18",
+			}),
+		).resolves.toMatchObject({ id: sessionA.id });
+		expect(store.get(bCredentialKey)).toBe(bEnvelope);
+		expect(store.get(bHandleKey)).toBe(bHandleValue);
+		expect(JSON.parse(store.get(indexKey)!)).toContainEqual(bIndexEntry);
+		await expect(
+			runtime.context.internalAdapter.findSession(sessionB.token),
+		).resolves.toMatchObject({ session: { id: sessionB.id } });
+
+		const malformedKey = "malformed-stale-credential-key";
+		store.set(malformedKey, "not-json");
+		store.set(aHandleKey, JSON.stringify({ credentialKey: malformedKey }));
+		await runtime.context.internalAdapter.updateSession(sessionA.token, {
+			ipAddress: "192.0.2.19",
+		});
+		expect(store.get(malformedKey)).toBe("not-json");
+
+		store.set(aHandleKey, JSON.stringify({ credentialKey: bCredentialKey }));
+		const expiredAt = new Date(Date.now() - 1_000);
+		await expect(
+			runtime.context.internalAdapter.updateSession(sessionA.token, {
+				expiresAt: expiredAt,
+			}),
+		).resolves.toMatchObject({ id: sessionA.id });
+		expect(store.has(aCredentialKey)).toBe(false);
+		expect(store.has(aHandleKey)).toBe(false);
+		expect(store.get(bCredentialKey)).toBe(bEnvelope);
+		expect(store.get(bHandleKey)).toBe(bHandleValue);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([bIndexEntry]);
+		await expect(
+			runtime.context.internalAdapter.findSession(sessionB.token),
+		).resolves.toMatchObject({ session: { id: sessionB.id } });
+	});
+
+	it("captures and publishes managed legacy authority only after commit", async () => {
+		const store = new Map<string, string>();
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		let runtime: ManagedRuntime;
+		let hookMode: "none" | "mutate" | "throw" = "none";
+		runtime = await setupManagedRuntime({
+			credentialAuthority: "legacy-v1",
+			options: {
+				databaseHookFailureMode: "rollback",
+				databaseHooks: {
+					session: {
+						update: {
+							after: async (updated) => {
+								if (hookMode === "throw") {
+									throw new Error("legacy rollback hook failed");
+								}
+								if (hookMode === "mutate") {
+									await (
+										await getCurrentAdapter(runtime.context.adapter)
+									).update({
+										model: "session",
+										where: [{ field: "id", value: updated.id }],
+										update: {
+											expiresAt: new Date(Date.now() + 120_000),
+										},
+									});
+								}
+							},
+						},
+					},
+				},
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-legacy-update-publication-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		expect(await credentialRows(runtime)).toEqual([]);
+		const handleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${session.id}`),
+		)!;
+		const credentialKey = (
+			JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		const stableSession = structuredClone(await authorityRows(runtime.context));
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.updateSession(session.token, {
+					ipAddress: "192.0.2.20",
+				});
+				expect(secondarySet).not.toHaveBeenCalled();
+				throw new Error("legacy outer rollback");
+			}),
+		).rejects.toThrow("legacy outer rollback");
+		expect(store).toEqual(stableStore);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+
+		hookMode = "mutate";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.21",
+			}),
+		).resolves.toBeNull();
+		expect(store).toEqual(stableStore);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+
+		hookMode = "throw";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.22",
+			}),
+		).rejects.toThrow("legacy rollback hook failed");
+		expect(store).toEqual(stableStore);
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+
+		hookMode = "none";
+		const newExpiry = new Date(session.expiresAt.getTime() + 60_000);
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.23",
+				expiresAt: newExpiry,
+			}),
+		).resolves.toMatchObject({ token: session.token });
+		const persistedSession = (await authorityRows(runtime.context))[0]!;
+		const persistedUser = await runtime.context.adapter.findOne<
+			Record<string, unknown>
+		>({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+		});
+		expect(JSON.parse(store.get(handleKey)!)).toEqual({ credentialKey });
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			{
+				sessionId: session.id,
+				credentialKey,
+				expiresAt: newExpiry.getTime(),
+			},
+		]);
+		expect(JSON.parse(store.get(credentialKey)!)).toEqual({
+			session: JSON.parse(
+				JSON.stringify({ ...persistedSession, token: null }),
+			),
+			user: JSON.parse(JSON.stringify(persistedUser)),
+		});
+
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		const stableHandle = createSessionHandle(session.id);
+		const beforeHandleStore = new Map(store);
+		const beforeHandleSession = structuredClone(
+			await authorityRows(runtime.context),
+		);
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const result = await runtime.context.internalAdapter.updateSession(
+					stableHandle,
+					{ ipAddress: "192.0.2.24" },
+				);
+				expect(result?.token).toBe(session.token);
+				expect(secondarySet).not.toHaveBeenCalled();
+				expect(secondaryDelete).not.toHaveBeenCalled();
+				throw new Error("legacy handle outer rollback");
+			}),
+		).rejects.toThrow("legacy handle outer rollback");
+		expect(store).toEqual(beforeHandleStore);
+		expect(await authorityRows(runtime.context)).toEqual(beforeHandleSession);
+
+		await expect(
+			runtime.context.internalAdapter.updateSession(stableHandle, {
+				ipAddress: "192.0.2.25",
+			}),
+		).resolves.toMatchObject({ token: session.token });
+		const handlePersistedSession = (
+			await authorityRows(runtime.context)
+		)[0]!;
+		const handlePersistedUser = await runtime.context.adapter.findOne<
+			Record<string, unknown>
+		>({
+			model: "user",
+			where: [{ field: "id", value: runtime.user.id }],
+		});
+		expect(JSON.parse(store.get(handleKey)!)).toEqual({ credentialKey });
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([
+			{
+				sessionId: session.id,
+				credentialKey,
+				expiresAt: newExpiry.getTime(),
+			},
+		]);
+		expect(JSON.parse(store.get(credentialKey)!)).toEqual({
+			session: JSON.parse(
+				JSON.stringify({ ...handlePersistedSession, token: null }),
+			),
+			user: JSON.parse(JSON.stringify(handlePersistedUser)),
+		});
+	});
+
+	it("runs final capture after rollback-critical update hooks and rolls back hook failure", async () => {
+		const store = new Map<string, string>();
+		const secondarySet = vi.fn(async (key: string, value: string) => {
+			store.set(key, value);
+		});
+		const secondaryDelete = vi.fn(async (key: string) => {
+			store.delete(key);
+		});
+		let runtime: ManagedRuntime;
+		let hookMode: "none" | "mutate" | "lineage" | "throw" = "none";
+		runtime = await setupManagedRuntime({
+			options: {
+				databaseHookFailureMode: "rollback",
+				databaseHooks: {
+					session: {
+						update: {
+							after: async (updated) => {
+								if (hookMode === "throw") throw new Error("rollback hook failed");
+								if (hookMode === "mutate" || hookMode === "lineage") {
+									const currentAdapter = await getCurrentAdapter(
+										runtime.context.adapter,
+									);
+									const credential = await currentAdapter.findOne<
+										Record<string, unknown>
+									>({
+										model: "sessionCredential",
+										where: [{ field: "sessionId", value: updated.id }],
+									});
+									await currentAdapter.updateMany({
+										model: "sessionCredential",
+										where: [{ field: "sessionId", value: updated.id }],
+										update:
+											hookMode === "mutate"
+												? { expiresAt: new Date(Date.now() + 120_000) }
+												: {
+													familyId: "forged-family",
+													rotationCounter: 99,
+													parentCredentialId: credential?.id,
+												},
+									});
+								}
+							},
+						},
+					},
+				},
+				session: { storeSessionInDatabase: true },
+				secondaryStorage: {
+					namespace: "managed-update-rollback-hook-test",
+					get: async (key) => store.get(key) ?? null,
+					set: secondarySet,
+					delete: secondaryDelete,
+				},
+			},
+		});
+		const session = await issuePasswordSession(runtime);
+		const stableSession = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		hookMode = "mutate";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.15",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+
+		hookMode = "lineage";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.17",
+			}),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+
+		hookMode = "throw";
+		await expect(
+			runtime.context.internalAdapter.updateSession(session.token, {
+				ipAddress: "192.0.2.16",
+			}),
+		).rejects.toThrow("rollback hook failed");
+		expect(await authorityRows(runtime.context)).toEqual(stableSession);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
 	});
 });
