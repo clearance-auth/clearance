@@ -1,9 +1,10 @@
-import type { ClearanceOptions } from "../types";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationSessionField,
+} from "../types";
 import type { ClearanceDBSchema, DBFieldAttribute } from "./type";
 
-export const getAuthTables = (
-	options: ClearanceOptions,
-): ClearanceDBSchema => {
+export const getAuthTables = (options: ClearanceOptions): ClearanceDBSchema => {
 	const usesSerialIds = options.advanced?.database?.generateId === "serial";
 	const pluginSchema = (options.plugins ?? []).reduce(
 		(acc, plugin) => {
@@ -33,6 +34,74 @@ export const getAuthTables = (
 	);
 
 	const shouldAddRateLimitTable = options.rateLimit?.storage === "database";
+	const runtimeAuthenticationSessionFields = {
+		authenticationAssuranceVersion: {
+			type: "number",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPolicyProjectId: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPolicyEnvironmentId: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPrimaryMethod: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPrimaryAt: {
+			type: "date",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationFactorMethod: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationFactorAt: {
+			type: "date",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPolicyOrganizationId: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationPolicyRevision: {
+			type: "string",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationAssuranceExpiresAt: {
+			type: "date",
+			required: false,
+			input: false,
+			returned: false,
+		},
+		authenticationRecoveryRestricted: {
+			type: "boolean",
+			required: false,
+			input: false,
+			returned: false,
+		},
+	} satisfies Record<RuntimeAuthenticationSessionField, DBFieldAttribute>;
 	const rateLimitTable = {
 		rateLimit: {
 			modelName: options.rateLimit?.modelName || "rateLimit",
@@ -168,6 +237,10 @@ export const getAuthTables = (
 					fieldName: options.session?.fields?.token || "token",
 					unique: true,
 				},
+				// Runtime-owned authentication assurance is optional for migration
+				// compatibility. It is applied after extension fields so plugins and
+				// user options cannot expose, require, or default authority metadata.
+				...runtimeAuthenticationSessionFields,
 			},
 			order: 2,
 		},

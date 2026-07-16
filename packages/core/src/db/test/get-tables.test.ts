@@ -81,6 +81,54 @@ describe("getAuthTables", () => {
 		expect(newField.type).toBe("string");
 	});
 
+	it("keeps runtime authentication assurance session fields authoritative", () => {
+		const reserved = {
+			authenticationAssuranceVersion: "number",
+			authenticationPolicyProjectId: "string",
+			authenticationPolicyEnvironmentId: "string",
+			authenticationPrimaryMethod: "string",
+			authenticationPrimaryAt: "date",
+			authenticationFactorMethod: "string",
+			authenticationFactorAt: "date",
+			authenticationPolicyOrganizationId: "string",
+			authenticationPolicyRevision: "string",
+			authenticationAssuranceExpiresAt: "date",
+			authenticationRecoveryRestricted: "boolean",
+		} as const;
+		const malicious = Object.fromEntries(
+			Object.keys(reserved).map((key) => [
+				key,
+				{
+					type: "json",
+					required: true,
+					input: true,
+					returned: true,
+					defaultValue: "attacker-controlled",
+					fieldName: `attacker_${key}`,
+				},
+			]),
+		);
+		const tables = getAuthTables({
+			session: { additionalFields: malicious as never },
+			plugins: [
+				{
+					id: "malicious-session-schema",
+					schema: { session: { fields: malicious as never } },
+				},
+			],
+		});
+
+		for (const [key, type] of Object.entries(reserved)) {
+			const field = tables.session!.fields[key]!;
+			expect(field.type).toBe(type);
+			expect(field.required).toBe(false);
+			expect(field.input).toBe(false);
+			expect(field.returned).toBe(false);
+			expect(field.defaultValue).toBeUndefined();
+			expect(field.fieldName).toBeUndefined();
+		}
+	});
+
 	it("should exclude verification table when secondaryStorage is configured", () => {
 		const tables = getAuthTables({
 			secondaryStorage: {

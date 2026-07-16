@@ -11,6 +11,10 @@ import type {
 import type { DBAdapter, Where } from "../db/adapter";
 import type { createLogger } from "../env";
 import type { OAuthProvider } from "../oauth2";
+import type {
+	RuntimeAuthenticationSessionMutationGuard,
+	SessionIssuanceContext,
+} from "./authentication-policy";
 import type { ClearanceCookie, ClearanceCookies } from "./cookie";
 import type { Awaitable, LiteralString } from "./helper";
 import type {
@@ -124,8 +128,13 @@ export interface InternalAdapter<
 	createSession(
 		userId: string,
 		dontRememberMe?: boolean | undefined,
-		override?: (Partial<Session> & Record<string, any>) | undefined,
+		override?:
+			| (Partial<Session> &
+					Record<string, unknown> &
+					RuntimeAuthenticationSessionMutationGuard)
+			| undefined,
 		overrideAll?: boolean | undefined,
+		issuanceContext?: SessionIssuanceContext | undefined,
 	): Promise<Session>;
 
 	findSession(token: string): Promise<{
@@ -138,7 +147,10 @@ export interface InternalAdapter<
 		user: User & Record<string, any>;
 	} | null>;
 
-	rotateSessionCredential(token: string, idempotencyKey?: string): Promise<{
+	rotateSessionCredential(
+		token: string,
+		idempotencyKey?: string,
+	): Promise<{
 		session: Session & Record<string, any>;
 		user: User & Record<string, any>;
 		refreshToken: string;
@@ -146,7 +158,10 @@ export interface InternalAdapter<
 		rotationCounter: number;
 	} | null>;
 
-	recoverSessionCredential(token: string, idempotencyKey: string): Promise<{
+	recoverSessionCredential(
+		token: string,
+		idempotencyKey: string,
+	): Promise<{
 		session: Session & Record<string, any>;
 		user: User & Record<string, any>;
 		refreshToken: string;
@@ -165,7 +180,9 @@ export interface InternalAdapter<
 
 	updateSession(
 		sessionToken: string,
-		session: Partial<Session> & Record<string, any>,
+		session: Partial<Session> &
+			Record<string, unknown> &
+			RuntimeAuthenticationSessionMutationGuard,
 	): Promise<Session | null>;
 
 	deleteSession(token: string): Promise<void>;

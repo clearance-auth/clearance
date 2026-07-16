@@ -1,4 +1,5 @@
 export type { StandardSchemaV1 } from "@standard-schema/spec";
+export type * from "./authentication-policy";
 export type {
 	AuthContext,
 	ClearancePluginRegistry,
@@ -8,10 +9,7 @@ export type {
 	InternalAdapter,
 	PluginContext,
 } from "./context";
-export type {
-	ClearanceCookie,
-	ClearanceCookies,
-} from "./cookie";
+export type { ClearanceCookie, ClearanceCookies } from "./cookie";
 export type * from "./helper";
 export type {
 	BaseURLConfig,
