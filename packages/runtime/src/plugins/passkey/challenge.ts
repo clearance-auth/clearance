@@ -1,8 +1,9 @@
 import type { GenericEndpointContext } from "@clearance/core";
+import { getCurrentAdapter } from "@clearance/core/context";
 import { base64Url } from "@clearance/utils/base64";
 import { createHash } from "@clearance/utils/hash";
 
-export type PasskeyCeremony = "registration" | "authentication";
+export type PasskeyCeremony = "registration" | "authentication" | "deletion";
 
 /** 2 minutes: short-lived, well within the 5-minute upper bound. */
 export const CHALLENGE_TTL_SECONDS = 120;
@@ -19,6 +20,8 @@ export interface ChallengeRecord {
 	userId?: string;
 	/** Present only for registration: the stable handle embedded as `user.id`. */
 	userHandle?: string;
+	/** Present only for deletion: the credential row selected for removal. */
+	targetPasskeyId?: string;
 }
 
 /**
@@ -101,14 +104,15 @@ export async function createChallenge(
 ): Promise<void> {
 	const now = new Date();
 	const digestId = await digestChallengeId(ceremony, challenge);
+	const adapter = await getCurrentAdapter(ctx.context.adapter);
 	// Bound durable storage without a background worker. The indexed predicate
 	// makes cleanup proportional to expired rows, and every new ceremony
 	// eventually removes abandoned challenges that clients never return.
-	await ctx.context.adapter.deleteMany({
+	await adapter.deleteMany({
 		model: "passkeyChallenge",
 		where: [{ field: "expiresAt", operator: "lt", value: now }],
 	});
-	await ctx.context.adapter.create({
+	await adapter.create({
 		model: "passkeyChallenge",
 		data: {
 			digestId,
@@ -117,6 +121,7 @@ export async function createChallenge(
 			origin: record.origin,
 			userId: record.userId,
 			userHandle: record.userHandle,
+			targetPasskeyId: record.targetPasskeyId,
 			expiresAt: new Date(now.getTime() + CHALLENGE_TTL_SECONDS * 1000),
 			createdAt: now,
 			updatedAt: now,
@@ -143,12 +148,14 @@ export async function consumeChallengeByParsedChallenge(
 	challenge: string,
 ): Promise<ChallengeRecord | null> {
 	const digestId = await digestChallengeId(ceremony, challenge);
-	const consumed = await ctx.context.adapter.consumeOne<{
+	const adapter = await getCurrentAdapter(ctx.context.adapter);
+	const consumed = await adapter.consumeOne<{
 		ceremony: string;
 		rpID: string;
 		origin: string;
 		userId?: string | null;
 		userHandle?: string | null;
+		targetPasskeyId?: string | null;
 		expiresAt: Date;
 	}>({
 		model: "passkeyChallenge",
@@ -173,5 +180,6 @@ export async function consumeChallengeByParsedChallenge(
 		origin: consumed.origin,
 		userId: consumed.userId ?? undefined,
 		userHandle: consumed.userHandle ?? undefined,
+		targetPasskeyId: consumed.targetPasskeyId ?? undefined,
 	} satisfies ChallengeRecord;
 }

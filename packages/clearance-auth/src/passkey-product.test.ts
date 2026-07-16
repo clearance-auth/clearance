@@ -1,6 +1,10 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { createAuthClient, passkeyClient } from "./client.js";
 import { createClearanceAuth } from "./create-auth.js";
+import type {
+	ClearancePasskeyAuthenticationResponse,
+	ClearancePasskeyDeletionProof,
+} from "./public-types/index.js";
 
 const databaseUrl =
 	"postgres://clearance:clearance@127.0.0.1:5434/clearance";
@@ -72,11 +76,13 @@ describe("@clearance/auth passkey product integration", () => {
 		expect(plugin.id).toBe("passkey");
 		expect(typeof client.signIn.passkey).toBe("function");
 		expect(typeof client.passkey.addPasskey).toBe("function");
+		expect(typeof client.passkey.deletePasskey).toBe("function");
 		expect(typeof client.passkey.renamePasskey).toBe("function");
 		expect(typeof client.useListPasskeys.get).toBe("function");
 		expect(typeof client.useListPasskeys.subscribe).toBe("function");
 		expectTypeOf(client.signIn.passkey).toBeFunction();
 		expectTypeOf(client.passkey.addPasskey).toBeFunction();
+		expectTypeOf(client.passkey.deletePasskey).toBeFunction();
 		expectTypeOf(client.passkey.renamePasskey).toBeFunction();
 		expectTypeOf(client.useListPasskeys.get).toBeFunction();
 	});
@@ -128,6 +134,8 @@ describe("@clearance/auth passkey product integration", () => {
 		expect(plugin.pathMethods).toMatchObject({
 			"/passkey/generate-registration-options": "POST",
 			"/passkey/generate-authentication-options": "POST",
+			"/passkey/generate-deletion-options": "POST",
+			"/passkey/delete": "POST",
 			"/passkey/list": "GET",
 			"/passkey/update": "POST",
 		});
@@ -145,6 +153,8 @@ async function assertConditionalPasskeyProductTypes() {
 	void defaults.auth.api.verifyPasskeyRegistration;
 	void defaults.auth.api.generatePasskeyAuthenticationOptions;
 	void defaults.auth.api.verifyPasskeyAuthentication;
+	void defaults.auth.api.generatePasskeyDeletionOptions;
+	void defaults.auth.api.deletePasskey;
 	void defaults.auth.api.listPasskeys;
 	void defaults.auth.api.updatePasskey;
 	const registrationOptions =
@@ -182,6 +192,48 @@ async function assertConditionalPasskeyProductTypes() {
 	void authenticationTimeout;
 	void noAllowCredentials;
 
+	const deletionOptions = await defaults.auth.api.generatePasskeyDeletionOptions({
+		headers: new Headers(),
+		body: { id: "target-passkey" },
+	});
+	const deletionRpID: string = deletionOptions.rpId;
+	const deletionUserVerification: "required" =
+		deletionOptions.userVerification;
+	const deletionCredentialId: string = deletionOptions.allowCredentials[0].id;
+	const deletionCredentialType: "public-key" =
+		deletionOptions.allowCredentials[0].type;
+	void deletionRpID;
+	void deletionUserVerification;
+	void deletionCredentialId;
+	void deletionCredentialType;
+
+	const passkeyResponse: ClearancePasskeyAuthenticationResponse = {
+		id: "other-passkey",
+		rawId: "other-passkey",
+		type: "public-key",
+		clientExtensionResults: {},
+		response: {
+			clientDataJSON: "client-data",
+			authenticatorData: "authenticator-data",
+			signature: "signature",
+			userHandle: "user-handle",
+		},
+	};
+	const serverDeletionProofs: ClearancePasskeyDeletionProof[] = [
+		{ type: "password", password: "password" },
+		{ type: "totp", code: "123456" },
+		{ type: "recovery-code", code: "recovery-code" },
+		{ type: "passkey", response: passkeyResponse },
+	];
+	for (const proof of serverDeletionProofs) {
+		const deleted = await defaults.auth.api.deletePasskey({
+			headers: new Headers(),
+			body: { id: "target-passkey", proof },
+		});
+		const deletedStatus: true = deleted.status;
+		void deletedStatus;
+	}
+
 	const disabled = createClearanceAuth({
 		baseURL: "https://auth.example.test",
 		secret,
@@ -190,11 +242,35 @@ async function assertConditionalPasskeyProductTypes() {
 	});
 	// @ts-expect-error explicit disable removes passkey endpoints
 	void disabled.auth.api.generatePasskeyRegistrationOptions;
+	// @ts-expect-error explicit disable removes passkey deletion endpoints
+	void disabled.auth.api.deletePasskey;
 
 	const client = createAuthClient({ plugins: [passkeyClient()] });
 	void client.signIn.passkey;
 	void client.passkey.addPasskey;
+	void client.passkey.deletePasskey;
 	void client.passkey.renamePasskey;
+	await client.passkey.deletePasskey({
+		id: "target-passkey",
+		proof: { type: "password", password: "password" },
+	});
+	await client.passkey.deletePasskey({
+		id: "target-passkey",
+		proof: { type: "totp", code: "123456" },
+	});
+	await client.passkey.deletePasskey({
+		id: "target-passkey",
+		proof: { type: "recovery-code", code: "recovery-code" },
+	});
+	await client.passkey.deletePasskey({
+		id: "target-passkey",
+		proof: { type: "passkey" },
+	});
+	await client.passkey.deletePasskey({
+		id: "target-passkey",
+		// @ts-expect-error browser-facing passkey proof does not accept an assertion
+		proof: { type: "passkey", response: passkeyResponse },
+	});
 	const signIn = await client.signIn.passkey();
 	if (signIn.data) {
 		const email: string = signIn.data.user.email;
@@ -217,6 +293,8 @@ async function assertConditionalPasskeyProductTypes() {
 	const baseClient = createAuthClient({ plugins: [] });
 	// @ts-expect-error a client without passkeyClient has no typed passkey actions
 	void baseClient.passkey.addPasskey;
+	// @ts-expect-error a client without passkeyClient has no typed deletion action
+	void baseClient.passkey.deletePasskey;
 	// @ts-expect-error a client without passkeyClient has no typed passkey query
 	void baseClient.useListPasskeys.get();
 }

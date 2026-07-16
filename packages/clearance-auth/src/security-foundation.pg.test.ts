@@ -710,7 +710,7 @@ describe.sequential.skipIf(!available)(
 							name: "Identity Rollback",
 						},
 					}),
-				).rejects.toThrow("Failed to create user");
+				).rejects.toThrow("management identity sync failed");
 				expect(bridgeCalls).toBe(1);
 				const persisted = await scopedPool.query<{ count: number }>(
 					`SELECT count(*)::int AS count FROM "user" WHERE email = $1`,
@@ -1030,7 +1030,10 @@ describe.sequential.skipIf(!available)(
 				const preBridgeCatalog = await scopedPool.query<{ name: string }>(`
 					SELECT table_name AS name FROM information_schema.tables
 					WHERE table_schema = current_schema()
-					  AND table_name IN ('twoFactor', 'jwks', 'sessionCredential', 'securityMigration', 'credentialAuthorityFence')
+					  AND table_name IN (
+					    'twoFactor', 'jwks', 'passkey', 'passkeyChallenge',
+					    'sessionCredential', 'securityMigration', 'credentialAuthorityFence'
+					  )
 				`);
 				expect(preBridgeCatalog.rows).toEqual([]);
 
@@ -1070,8 +1073,13 @@ describe.sequential.skipIf(!available)(
 					FROM information_schema.columns
 					WHERE table_schema = current_schema()
 					  AND (
-					    (table_name = 'user' AND column_name IN ('twoFactorEnabled', 'twoFactorSessionGeneration'))
-					    OR (table_name = 'session' AND column_name = 'twoFactorSessionGeneration')
+					    (table_name = 'user' AND column_name IN (
+					      'twoFactorEnabled', 'twoFactorSessionGeneration',
+					      'passkeySessionGeneration', 'passkeyUserHandle'
+					    ))
+					    OR (table_name = 'session' AND column_name IN (
+					      'twoFactorSessionGeneration', 'passkeySessionGeneration'
+					    ))
 					    OR (table_name = 'twoFactor' AND column_name IN (
 					      'pendingSecret', 'pendingBackupCodes', 'verified',
 					      'failedVerificationCount', 'activeVerificationReservations',
@@ -1086,6 +1094,7 @@ describe.sequential.skipIf(!available)(
 				).toEqual([
 					"jwks.alg",
 					"jwks.crv",
+					"session.passkeySessionGeneration",
 					"session.twoFactorSessionGeneration",
 					"twoFactor.activeVerificationReservations",
 					"twoFactor.failedVerificationCount",
@@ -1095,8 +1104,161 @@ describe.sequential.skipIf(!available)(
 					"twoFactor.pendingSecret",
 					"twoFactor.trustDeviceGeneration",
 					"twoFactor.verified",
+					"user.passkeySessionGeneration",
+					"user.passkeyUserHandle",
 					"user.twoFactorEnabled",
 					"user.twoFactorSessionGeneration",
+				]);
+				const passkeyColumns = await scopedPool.query<{
+					tableName: string;
+					columnName: string;
+					type: string;
+					nullable: "YES" | "NO";
+				}>(`
+					SELECT table_name AS "tableName", column_name AS "columnName",
+					       udt_name AS type, is_nullable AS nullable
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name IN ('passkey', 'passkeyChallenge')
+				`);
+				expect(
+					Object.fromEntries(
+						passkeyColumns.rows.map((column) => [
+							`${column.tableName}.${column.columnName}`,
+							{ type: column.type, nullable: column.nullable },
+						]),
+					),
+				).toEqual({
+					"passkey.id": { type: "text", nullable: "NO" },
+					"passkey.userId": { type: "text", nullable: "NO" },
+					"passkey.name": { type: "text", nullable: "YES" },
+					"passkey.credentialID": { type: "text", nullable: "NO" },
+					"passkey.publicKey": { type: "text", nullable: "NO" },
+					"passkey.userHandle": { type: "text", nullable: "NO" },
+					"passkey.counter": { type: "int4", nullable: "NO" },
+					"passkey.deviceType": { type: "text", nullable: "NO" },
+					"passkey.backedUp": { type: "bool", nullable: "NO" },
+					"passkey.transports": { type: "text", nullable: "YES" },
+					"passkey.aaguid": { type: "text", nullable: "YES" },
+					"passkey.createdAt": { type: "timestamptz", nullable: "NO" },
+					"passkey.updatedAt": { type: "timestamptz", nullable: "NO" },
+					"passkeyChallenge.id": { type: "text", nullable: "NO" },
+					"passkeyChallenge.digestId": { type: "text", nullable: "NO" },
+					"passkeyChallenge.ceremony": { type: "text", nullable: "NO" },
+					"passkeyChallenge.rpID": { type: "text", nullable: "NO" },
+					"passkeyChallenge.origin": { type: "text", nullable: "NO" },
+					"passkeyChallenge.userId": { type: "text", nullable: "YES" },
+					"passkeyChallenge.userHandle": { type: "text", nullable: "YES" },
+					"passkeyChallenge.targetPasskeyId": {
+						type: "text",
+						nullable: "YES",
+					},
+					"passkeyChallenge.expiresAt": {
+						type: "timestamptz",
+						nullable: "NO",
+					},
+					"passkeyChallenge.createdAt": {
+						type: "timestamptz",
+						nullable: "NO",
+					},
+					"passkeyChallenge.updatedAt": {
+						type: "timestamptz",
+						nullable: "NO",
+					},
+				});
+				const passkeyIndexes = await scopedPool.query<{
+					name: string;
+					tableName: string;
+					unique: boolean;
+					columns: string[];
+				}>(`
+					SELECT index_record.relname AS name,
+					       table_record.relname AS "tableName",
+					       index_state.indisunique AS "unique",
+					       array_agg(attribute_record.attname::text ORDER BY index_key.ordinality) AS columns
+					FROM pg_index AS index_state
+					JOIN pg_class AS table_record ON table_record.oid = index_state.indrelid
+					JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+					JOIN pg_class AS index_record ON index_record.oid = index_state.indexrelid
+					CROSS JOIN LATERAL unnest(index_state.indkey)
+					  WITH ORDINALITY AS index_key(attnum, ordinality)
+					JOIN pg_attribute AS attribute_record
+					  ON attribute_record.attrelid = table_record.oid
+					 AND attribute_record.attnum = index_key.attnum
+					WHERE namespace_record.nspname = current_schema()
+					  AND index_record.relname IN (
+					    'user_passkeyUserHandle_uidx', 'passkey_credentialID_uidx',
+					    'passkey_userId_idx', 'passkeyChallenge_digestId_uidx',
+					    'passkeyChallenge_expiresAt_idx'
+					  )
+					GROUP BY index_record.relname, table_record.relname, index_state.indisunique
+					ORDER BY index_record.relname
+				`);
+				expect(passkeyIndexes.rows).toEqual([
+					{
+						name: "passkeyChallenge_digestId_uidx",
+						tableName: "passkeyChallenge",
+						unique: true,
+						columns: ["digestId"],
+					},
+					{
+						name: "passkeyChallenge_expiresAt_idx",
+						tableName: "passkeyChallenge",
+						unique: false,
+						columns: ["expiresAt"],
+					},
+					{
+						name: "passkey_credentialID_uidx",
+						tableName: "passkey",
+						unique: true,
+						columns: ["credentialID"],
+					},
+					{
+						name: "passkey_userId_idx",
+						tableName: "passkey",
+						unique: false,
+						columns: ["userId"],
+					},
+					{
+						name: "user_passkeyUserHandle_uidx",
+						tableName: "user",
+						unique: true,
+						columns: ["passkeyUserHandle"],
+					},
+				]);
+				const passkeyConstraints = await scopedPool.query<{
+					name: string;
+					type: string;
+					definition: string;
+				}>(`
+					SELECT constraint_record.conname AS name,
+					       constraint_record.contype AS type,
+					       pg_get_constraintdef(constraint_record.oid, true) AS definition
+					FROM pg_constraint AS constraint_record
+					JOIN pg_class AS table_record ON table_record.oid = constraint_record.conrelid
+					JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+					WHERE namespace_record.nspname = current_schema()
+					  AND constraint_record.conname IN (
+					    'passkey_pkey', 'passkeyChallenge_pkey', 'passkey_userId_fkey'
+					  )
+					ORDER BY constraint_record.conname
+				`);
+				expect(passkeyConstraints.rows).toEqual([
+					{
+						name: "passkeyChallenge_pkey",
+						type: "p",
+						definition: "PRIMARY KEY (id)",
+					},
+					{
+						name: "passkey_pkey",
+						type: "p",
+						definition: "PRIMARY KEY (id)",
+					},
+					{
+						name: "passkey_userId_fkey",
+						type: "f",
+						definition: 'FOREIGN KEY ("userId") REFERENCES "user"(id) ON DELETE CASCADE',
+					},
 				]);
 				const bridgeOnlyCatalog = await scopedPool.query<{ name: string }>(`
 					SELECT table_name AS name FROM information_schema.tables
@@ -1355,6 +1517,133 @@ describe.sequential.skipIf(!available)(
 				await staleBridgeBundle?.destroy();
 				await logoutBridgeBundle?.destroy();
 				await bridgeBundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("rejects a same-named partial passkey authority index", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_partial_passkey_${suffix}`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				await scopedPool.query(`
+					CREATE TABLE "user" (id text PRIMARY KEY);
+					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE TABLE passkey (
+						id text PRIMARY KEY,
+						"userId" text NOT NULL,
+						name text,
+						"credentialID" text NOT NULL,
+						"publicKey" text NOT NULL,
+						"userHandle" text NOT NULL,
+						counter integer NOT NULL,
+						"deviceType" text NOT NULL,
+						"backedUp" boolean NOT NULL,
+						transports text,
+						aaguid text,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL
+					);
+					CREATE UNIQUE INDEX "passkey_credentialID_uidx"
+						ON passkey ("credentialID")
+						WHERE "credentialID" <> '';
+				`);
+
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "partial-passkey-index-proof-secret!!",
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId: `partial-index-${suffix}`,
+						instanceId: `partial-index-pod-${suffix}`,
+					},
+				});
+
+				await expect(bundle.prepareCredentialAuthorityRuntime()).rejects.toThrow(
+					"incompatible index passkey_credentialID_uidx",
+				);
+				const rolledBackBridge = await scopedPool.query<{ count: number }>(`
+					SELECT count(*)::int AS count
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'user'
+					  AND column_name = 'passkeyUserHandle'
+				`);
+				expect(rolledBackBridge.rows[0]?.count).toBe(0);
+			} finally {
+				await bundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("rejects a same-named NULLS NOT DISTINCT passkey authority index", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_nulls_passkey_${suffix}`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				await scopedPool.query(`
+					CREATE TABLE "user" (
+						id text PRIMARY KEY,
+						"passkeyUserHandle" text
+					);
+					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE UNIQUE INDEX "user_passkeyUserHandle_uidx"
+						ON "user" ("passkeyUserHandle") NULLS NOT DISTINCT;
+				`);
+
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "nulls-not-distinct-index-proof!!",
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId: `nulls-index-${suffix}`,
+						instanceId: `nulls-index-pod-${suffix}`,
+					},
+				});
+
+				await expect(bundle.prepareCredentialAuthorityRuntime()).rejects.toThrow(
+					"incompatible index user_passkeyUserHandle_uidx",
+				);
+				const rolledBackBridge = await scopedPool.query<{ table: string | null }>(`
+					SELECT to_regclass(format('%I.%I', current_schema(), 'passkey'))::text AS table
+				`);
+				expect(rolledBackBridge.rows[0]?.table).toBeNull();
+			} finally {
+				await bundle?.destroy();
 				await scopedPool?.end();
 				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
 				await basePool.end();

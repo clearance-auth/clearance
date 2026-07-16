@@ -41,6 +41,67 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
         ],
         "type": "object",
       },
+      "CredentialAuthorityFence": {
+        "properties": {
+          "bridgeDeploymentId": {
+            "type": "string",
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string",
+          },
+          "drainId": {
+            "type": "string",
+          },
+          "drainStartedAt": {
+            "format": "date-time",
+            "type": "string",
+          },
+          "drainedAt": {
+            "format": "date-time",
+            "type": "string",
+          },
+          "expectedRuntimeCount": {
+            "type": "number",
+          },
+          "generation": {
+            "type": "string",
+          },
+          "id": {
+            "readOnly": true,
+            "type": "string",
+          },
+          "phase": {
+            "type": "string",
+          },
+          "protocolVersion": {
+            "default": 1,
+            "type": "number",
+          },
+          "publishedAt": {
+            "format": "date-time",
+            "type": "string",
+          },
+          "revision": {
+            "default": 0,
+            "type": "number",
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string",
+          },
+        },
+        "required": [
+          "id",
+          "protocolVersion",
+          "phase",
+          "generation",
+          "revision",
+          "createdAt",
+          "updatedAt",
+        ],
+        "type": "object",
+      },
       "Session": {
         "properties": {
           "createdAt": {

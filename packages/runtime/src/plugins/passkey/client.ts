@@ -18,6 +18,12 @@ import { PASSKEY_ERROR_CODES } from "./error-codes";
 import type { passkey } from ".";
 import type { PublicPasskey } from "./types";
 
+type PasskeyDeletionProof =
+	| { type: "password"; password: string }
+	| { type: "totp"; code: string }
+	| { type: "recovery-code"; code: string }
+	| { type: "passkey" };
+
 const getPasskeyActions = (
 	$fetch: BetterFetch,
 	{
@@ -151,12 +157,71 @@ const getPasskeyActions = (
 		return updated;
 	};
 
+	const deletePasskey = async (opts: {
+		id: string;
+		proof: PasskeyDeletionProof;
+		fetchOptions?: ClientFetchOption;
+	}) => {
+		let proof:
+			| Exclude<PasskeyDeletionProof, { type: "passkey" }>
+			| {
+					type: "passkey";
+					response: Awaited<ReturnType<typeof startAuthentication>>;
+			  };
+
+		if (opts.proof.type === "passkey") {
+			const options = await $fetch<PublicKeyCredentialRequestOptionsJSON>(
+				"/passkey/generate-deletion-options",
+				{
+					...opts.fetchOptions,
+					method: "POST",
+					body: { id: opts.id },
+					throw: false,
+				},
+			);
+			if (!options.data) {
+				return options;
+			}
+
+			let response: Awaited<ReturnType<typeof startAuthentication>>;
+			try {
+				response = await startAuthentication({ optionsJSON: options.data });
+			} catch {
+				return {
+					data: null,
+					error: {
+						code: "DELETION_PROOF_FAILED",
+						message: PASSKEY_ERROR_CODES.DELETION_PROOF_FAILED.message,
+						status: 401,
+						statusText: "UNAUTHORIZED",
+					},
+				};
+			}
+			proof = { type: "passkey", response };
+		} else {
+			proof = opts.proof;
+		}
+
+		const deleted = await $fetch<{ status: true }>("/passkey/delete", {
+			...opts.fetchOptions,
+			method: "POST",
+			body: { id: opts.id, proof },
+			throw: false,
+		});
+		if (deleted.data) {
+			$listPasskeys.set(Date.now());
+			$store.notify("$sessionSignal");
+		}
+		return deleted;
+	};
+
 	return {
 		signIn: {
 			passkey: signInPasskey,
 		},
 		passkey: {
 			addPasskey,
+			deletePasskey,
 			/** Ownership-scoped rename: the server enforces the caller owns `id`. */
 			renamePasskey,
 		},
@@ -189,6 +254,8 @@ export const passkeyClient = () => {
 		pathMethods: {
 			"/passkey/generate-registration-options": "POST",
 			"/passkey/generate-authentication-options": "POST",
+			"/passkey/generate-deletion-options": "POST",
+			"/passkey/delete": "POST",
 			"/passkey/list": "GET",
 			"/passkey/update": "POST",
 		},
@@ -197,11 +264,13 @@ export const passkeyClient = () => {
 				matcher: (path) =>
 					path === "/passkey/verify-registration" ||
 					path === "/passkey/update" ||
+					path === "/passkey/delete" ||
 					path === "/sign-out",
 				signal: "$listPasskeys",
 			},
 			{
-				matcher: (path) => path === "/passkey/verify-authentication",
+				matcher: (path) =>
+					path === "/passkey/verify-authentication" || path === "/passkey/delete",
 				signal: "$sessionSignal",
 			},
 		],

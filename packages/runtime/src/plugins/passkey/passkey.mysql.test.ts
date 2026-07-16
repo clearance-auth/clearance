@@ -12,6 +12,7 @@ import {
 	createChallenge,
 } from "./challenge";
 import { advancePasskeyCounter } from "./counter";
+import { assertPasskeyDeletionLifecycleOnAdapter } from "./passkey.deletion.adapter-test-utils";
 
 const engines = [
 	["MySQL", process.env.CLEARANCE_TEST_MYSQL_URL],
@@ -22,7 +23,7 @@ const quote = (value: string) => `\`${value.replaceAll("`", "``")}\``;
 
 describe.each(engines)("passkey authority on %s", (_engine, url) => {
 	it.skipIf(!url)(
-		"migrates unique authorities and serializes challenge/counter claims",
+		"migrates authorities and proves races plus deletion success/rollback",
 		async () => {
 			const databaseName = `passkey_${randomUUID().replaceAll("-", "")}`;
 			const adminPool = createPool(url!);
@@ -132,6 +133,11 @@ describe.each(engines)("passkey authority on %s", (_engine, url) => {
 					),
 				);
 				expect(counterClaims.filter(Boolean)).toHaveLength(1);
+
+				await assertPasskeyDeletionLifecycleOnAdapter(
+					auth,
+					"http://localhost:3312",
+				);
 			} finally {
 				await db.destroy();
 				await adminPool.promise().query(`DROP DATABASE IF EXISTS ${quote(databaseName)}`);

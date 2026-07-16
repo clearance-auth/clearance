@@ -159,6 +159,30 @@ export type ClearancePasskeyAuthenticationOptions = {
 	extensions?: Record<string, unknown>;
 };
 
+export type ClearancePasskeyDeletionCredential = {
+	id: string;
+	type: "public-key";
+	transports?: ClearancePublicPasskey["transports"];
+};
+
+export type ClearancePasskeyDeletionOptions = {
+	challenge: string;
+	rpId: string;
+	timeout: number;
+	allowCredentials: [
+		ClearancePasskeyDeletionCredential,
+		...ClearancePasskeyDeletionCredential[],
+	];
+	userVerification: "required";
+	extensions?: Record<string, unknown>;
+};
+
+export type ClearancePasskeyDeletionProof =
+	| { type: "password"; password: string }
+	| { type: "totp"; code: string }
+	| { type: "recovery-code"; code: string }
+	| { type: "passkey"; response: ClearancePasskeyAuthenticationResponse };
+
 export type ClearanceTwoFactorRuntimeUser = ClearanceRuntimeUser & {
 	twoFactorEnabled: boolean;
 };
@@ -426,6 +450,17 @@ type ClearancePasskeyProductApi = {
 			headers: HeadersInit;
 		},
 		ClearanceRuntimeSessionResponse
+	>;
+	generatePasskeyDeletionOptions: ClearanceProductEndpoint<
+		{ body: { id: string }; headers: HeadersInit },
+		ClearancePasskeyDeletionOptions
+	>;
+	deletePasskey: ClearanceProductEndpoint<
+		{
+			body: { id: string; proof: ClearancePasskeyDeletionProof };
+			headers: HeadersInit;
+		},
+		{ status: true }
 	>;
 	listPasskeys: ClearanceProductEndpoint<
 		{ headers: HeadersInit },

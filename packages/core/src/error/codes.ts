@@ -42,6 +42,11 @@ export const BASE_ERROR_CODES = defineErrorCodes({
 	SESSION_EXPIRED: "Session expired. Re-authenticate to perform this action.",
 	FAILED_TO_UNLINK_LAST_ACCOUNT: "You can't unlink your last account",
 	ACCOUNT_NOT_FOUND: "Account not found",
+	FACTOR_LIFECYCLE_CONFIGURATION_ERROR:
+		"Factor lifecycle requires rollback-capable database sessions",
+	LAST_FACTOR_PROTECTED:
+		"A password, verified two-factor method, or passkey must remain",
+	FACTOR_LIFECYCLE_CONFLICT: "Authentication factor state changed. Please try again",
 	USER_ALREADY_HAS_PASSWORD:
 		"User already has a password. Provide that to delete the account.",
 	CROSS_SITE_NAVIGATION_LOGIN_BLOCKED:

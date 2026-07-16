@@ -98,6 +98,12 @@ export type ClearancePasskeyClientSessionResponse = {
 	user: ClearancePasskeyClientUser;
 };
 
+export type ClearancePasskeyClientDeletionProof =
+	| { type: "password"; password: string }
+	| { type: "totp"; code: string }
+	| { type: "recovery-code"; code: string }
+	| { type: "passkey" };
+
 export type ClearancePasskeyListState = {
 	data: ClearanceClientPublicPasskey[] | null;
 	error: ClearanceClientError | null;
@@ -191,6 +197,11 @@ export interface ClearancePasskeyClientApi {
 			authenticatorAttachment?: "platform" | "cross-platform";
 			fetchOptions?: ClearanceClientFetchOptions;
 		}): Promise<ClearanceClientResponse<ClearanceClientPublicPasskey>>;
+		deletePasskey(input: {
+			id: string;
+			proof: ClearancePasskeyClientDeletionProof;
+			fetchOptions?: ClearanceClientFetchOptions;
+		}): Promise<ClearanceClientResponse<{ status: true }>>;
 		renamePasskey(input: {
 			id: string;
 			name: string;

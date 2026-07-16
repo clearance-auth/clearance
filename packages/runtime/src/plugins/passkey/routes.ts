@@ -1,7 +1,12 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
-import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
+import {
+	AfterTransactionHookError,
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import { base64Url } from "@clearance/utils/base64";
 import type {
 	AuthenticationResponseJSON,
@@ -19,6 +24,24 @@ import { sensitiveSessionMiddleware } from "../../api";
 import { getAuthoritativeSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { parseSessionOutput, parseUserOutput } from "../../db";
+import {
+	PASSKEY_SESSION_GENERATION_FIELD,
+	rotatePasskeySessionGeneration,
+} from "../../db/passkey-session-generation";
+import {
+	lockAndReadActiveUser,
+	lockAndReadUser,
+} from "../../db/user-authority";
+import type { Session, User } from "../../types";
+import { validatePassword } from "../../utils/password";
+import {
+	proveFactorStepUp,
+	type BackupCodeOptions,
+} from "../two-factor/backup-codes";
+import type {
+	TwoFactorOptions,
+	TwoFactorTable,
+} from "../two-factor/types";
 import {
 	CHALLENGE_TTL_SECONDS,
 	consumeChallengeByParsedChallenge,
@@ -103,6 +126,16 @@ const authenticationResponseSchema = z.object({
 	}),
 });
 
+const deletionProofSchema = z.discriminatedUnion("type", [
+	z.object({ type: z.literal("password"), password: z.string().min(1).max(1024) }),
+	z.object({ type: z.literal("totp"), code: z.string().min(1).max(128) }),
+	z.object({
+		type: z.literal("recovery-code"),
+		code: z.string().min(1).max(256),
+	}),
+	z.object({ type: z.literal("passkey"), response: authenticationResponseSchema }),
+]);
+
 function parseTransports(
 	stored: string | null | undefined,
 ): AuthenticatorTransportFuture[] | undefined {
@@ -142,13 +175,40 @@ function logFailure(ctx: GenericEndpointContext, label: string, error: unknown) 
  */
 function assertRollbackCapableAuthentication(ctx: GenericEndpointContext): void {
 	if (
-		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function"
+		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" ||
+		(ctx.context.options.secondaryStorage !== undefined &&
+			ctx.context.options.session?.storeSessionInDatabase !== true)
 	) {
 		throw APIError.from(
 			"INTERNAL_SERVER_ERROR",
 			PASSKEY_ERROR_CODES.CONFIGURATION_ERROR,
 		);
 	}
+}
+
+function assertPasskeyDeletionConfiguration(ctx: GenericEndpointContext): void {
+	if (
+		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" ||
+		(ctx.context.options.secondaryStorage !== undefined &&
+			ctx.context.options.session?.storeSessionInDatabase !== true)
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			PASSKEY_ERROR_CODES.CONFIGURATION_ERROR,
+		);
+	}
+}
+
+function deletionProofFailed(): never {
+	throw APIError.from("UNAUTHORIZED", PASSKEY_ERROR_CODES.DELETION_PROOF_FAILED);
+}
+
+function lastFactorProtected(): never {
+	throw APIError.from("BAD_REQUEST", PASSKEY_ERROR_CODES.LAST_FACTOR_PROTECTED);
+}
+
+function lifecycleConflict(): never {
+	throw APIError.from("CONFLICT", PASSKEY_ERROR_CODES.LIFECYCLE_CONFLICT);
 }
 
 export const generatePasskeyRegistrationOptions = (options: PasskeyOptions | undefined) =>
@@ -441,44 +501,68 @@ export const verifyPasskeyAuthentication = (options: PasskeyOptions | undefined)
 			}
 
 			const newCounter = verification.authenticationInfo.newCounter;
-			const { session, user } = await runWithTransaction(
-				ctx.context.adapter,
-				async () => {
-					const trxAdapter = await getCurrentAdapter(ctx.context.adapter);
-					const wonCas = await advancePasskeyCounter(
-						trxAdapter,
-						passkey.id,
-						passkey.counter,
-						newCounter,
-					);
-					if (!wonCas) {
-						throw APIError.from(
-							"UNAUTHORIZED",
-							PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+			type AuthenticationResult = { session: Session; user: User };
+			let authenticated: AuthenticationResult | undefined;
+			let committedAuthentication: AuthenticationResult | undefined;
+			try {
+				authenticated = await runWithTransaction(
+					ctx.context.adapter,
+					async () => {
+						const trxAdapter = await getCurrentAdapter(ctx.context.adapter);
+						const activeUser = await lockAndReadActiveUser(
+							trxAdapter,
+							passkey.userId,
 						);
-					}
+						if (!activeUser) {
+							throw APIError.from(
+								"UNAUTHORIZED",
+								PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+							);
+						}
+						const wonCas = await advancePasskeyCounter(
+							trxAdapter,
+							passkey.id,
+							passkey.counter,
+							newCounter,
+						);
+						if (!wonCas) {
+							throw APIError.from(
+								"UNAUTHORIZED",
+								PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+							);
+						}
 
-					const newSession = await ctx.context.internalAdapter.createSession(
-						passkey.userId,
-					);
-					if (!newSession) {
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+						const newSession = await ctx.context.internalAdapter.createSession(
+							passkey.userId,
 						);
-					}
-					const sessionUser = await ctx.context.internalAdapter.findUserById(
-						passkey.userId,
-					);
-					if (!sessionUser) {
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
-						);
-					}
-					return { session: newSession, user: sessionUser };
-				},
-			);
+						if (!newSession) {
+							throw APIError.from(
+								"INTERNAL_SERVER_ERROR",
+								PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+							);
+						}
+						committedAuthentication = {
+							session: newSession,
+							user: activeUser,
+						};
+						return committedAuthentication;
+					},
+				);
+			} catch (error) {
+				if (error instanceof AfterTransactionHookError && committedAuthentication) {
+					logFailure(ctx, "authentication post-commit publication failed", error);
+					authenticated = committedAuthentication;
+				} else {
+					throw error;
+				}
+			}
+			if (!authenticated) {
+				throw APIError.from(
+					"INTERNAL_SERVER_ERROR",
+					PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+				);
+			}
+			const { session, user } = authenticated;
 
 			await setSessionCookie(ctx, { session, user });
 
@@ -486,6 +570,383 @@ export const verifyPasskeyAuthentication = (options: PasskeyOptions | undefined)
 				session: parseSessionOutput(ctx.context.options, session),
 				user: parseUserOutput(ctx.context.options, user),
 			});
+		},
+	);
+
+export const generatePasskeyDeletionOptions = (
+	options: PasskeyOptions | undefined,
+) =>
+	createAuthEndpoint(
+		"/passkey/generate-deletion-options",
+		{
+			method: "POST",
+			use: [sensitiveSessionMiddleware],
+			body: z.object({ id: z.string().min(1).max(255) }),
+		},
+		async (ctx) => {
+			assertPasskeyDeletionConfiguration(ctx);
+			const userId = ctx.context.session.user.id;
+			const target = await ctx.context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [
+					{ field: "id", value: ctx.body.id },
+					{ field: "userId", value: userId },
+				],
+			});
+			if (!target) {
+				throw APIError.from("NOT_FOUND", PASSKEY_ERROR_CODES.PASSKEY_NOT_FOUND);
+			}
+
+			const alternatives = (
+				await ctx.context.adapter.findMany<Passkey>({
+					model: "passkey",
+					where: [{ field: "userId", value: userId }],
+					limit: 100,
+				})
+			).filter((candidate) => candidate.id !== target.id);
+			if (alternatives.length === 0) lastFactorProtected();
+
+			const rpID = resolveRpID(ctx, options);
+			const origin = assertTrustedOrigin(ctx, options, rpID);
+			const authenticationOptions = await generateAuthenticationOptions({
+				rpID,
+				userVerification: "required",
+				timeout: CHALLENGE_TTL_SECONDS * 1000,
+				allowCredentials: alternatives.map((passkey) => ({
+					id: passkey.credentialID,
+					transports: parseTransports(passkey.transports),
+				})),
+			});
+
+			await createChallenge(ctx, "deletion", authenticationOptions.challenge, {
+				rpID,
+				origin,
+				userId,
+				targetPasskeyId: target.id,
+			});
+			return ctx.json(authenticationOptions);
+		},
+	);
+
+export const deletePasskey = (options: PasskeyOptions | undefined) =>
+	createAuthEndpoint(
+		"/passkey/delete",
+		{
+			method: "POST",
+			use: [sensitiveSessionMiddleware],
+			body: z.object({
+				id: z.string().min(1).max(255),
+				proof: deletionProofSchema,
+			}),
+		},
+		async (ctx) => {
+			// Configuration must fail before a one-shot recovery proof or WebAuthn
+			// challenge is reserved or consumed.
+			assertPasskeyDeletionConfiguration(ctx);
+			const userId = ctx.context.session.user.id;
+			const originalSessionId = ctx.context.session.session.id;
+			const presentedSessionToken = ctx.context.session.session.token;
+			const originalExpiresAt = new Date(ctx.context.session.session.expiresAt);
+			const originalExpiresAtTime = originalExpiresAt.getTime();
+			if (
+				!Number.isFinite(originalExpiresAtTime) ||
+				originalExpiresAtTime <= Date.now()
+			) {
+				lifecycleConflict();
+			}
+
+			const deletionProof = ctx.body.proof;
+			let passkeyAuthority: {
+				rpID: string;
+				requestOrigin: string;
+				challenge: string;
+			} | null = null;
+			if (deletionProof.type === "passkey") {
+				try {
+					const rpID = resolveRpID(ctx, options);
+					const requestOrigin = assertTrustedOrigin(ctx, options, rpID);
+					const challenge = parseClientDataChallenge(
+						deletionProof.response.response.clientDataJSON,
+					);
+					if (!challenge) deletionProofFailed();
+					const challengeRecord = await consumeChallengeByParsedChallenge(
+						ctx,
+						"deletion",
+						challenge,
+					);
+					if (
+						!challengeRecord ||
+						challengeRecord.rpID !== rpID ||
+						challengeRecord.origin !== requestOrigin ||
+						challengeRecord.userId !== userId ||
+						challengeRecord.targetPasskeyId !== ctx.body.id
+					) {
+						deletionProofFailed();
+					}
+					passkeyAuthority = {
+						rpID,
+						requestOrigin,
+						challenge,
+					};
+				} catch {
+					deletionProofFailed();
+				}
+			}
+
+			// A passkey proof is one-shot for every submitted target, including a
+			// foreign or nonexistent identifier. Target lookup deliberately follows
+			// challenge consumption so an ownership miss cannot preserve the proof.
+			const target = await ctx.context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [
+					{ field: "id", value: ctx.body.id },
+					{ field: "userId", value: userId },
+				],
+			});
+			if (!target) {
+				throw APIError.from("NOT_FOUND", PASSKEY_ERROR_CODES.PASSKEY_NOT_FOUND);
+			}
+
+			type LifecycleResult =
+				| {
+						kind: "success";
+						replacementSession: Session;
+						replacementUser: User;
+				  }
+				| { kind: "proof-error" };
+			let lifecycle: LifecycleResult | undefined;
+			let committedLifecycle: Extract<LifecycleResult, { kind: "success" }> | undefined;
+			try {
+				lifecycle = await runWithTransaction(ctx.context.adapter, async () => {
+					const adapter = await getCurrentAdapter(ctx.context.adapter);
+					const authoritativeUser = (await lockAndReadUser(
+						adapter,
+						userId,
+					)) as (User & Record<string, unknown>) | null;
+					if (!authoritativeUser) lifecycleConflict();
+					const authoritative = await ctx.context.internalAdapter.findSession(
+						presentedSessionToken,
+					);
+					if (
+						!authoritative ||
+						authoritative.session.id !== originalSessionId ||
+						authoritative.session.userId !== userId ||
+						authoritative.user.id !== userId ||
+						new Date(authoritative.session.expiresAt).getTime() !==
+							originalExpiresAtTime
+					) {
+						lifecycleConflict();
+					}
+					const authoritativeSession = await adapter.findOne<
+						Session & Record<string, unknown>
+					>({
+						model: "session",
+						where: [
+							{ field: "id", value: originalSessionId },
+							{ field: "userId", value: userId },
+							{ field: "expiresAt", value: originalExpiresAt },
+						],
+					});
+					if (!authoritativeSession) lifecycleConflict();
+					const sessionGeneration =
+						authoritativeSession[PASSKEY_SESSION_GENERATION_FIELD];
+					const userGeneration =
+						authoritativeUser[PASSKEY_SESSION_GENERATION_FIELD];
+					if (
+						typeof sessionGeneration !== "string" ||
+						typeof userGeneration !== "string" ||
+						sessionGeneration !== userGeneration
+					) {
+						lifecycleConflict();
+					}
+
+					const currentTarget = await adapter.findOne<Passkey>({
+						model: "passkey",
+						where: [
+							{ field: "id", value: target.id },
+							{ field: "userId", value: userId },
+						],
+					});
+					if (!currentTarget) lifecycleConflict();
+
+					if (deletionProof.type === "password") {
+						const accounts = await ctx.context.internalAdapter.findAccounts(userId);
+						if (
+							!accounts.some(
+								(account) =>
+									account.providerId === "credential" && Boolean(account.password),
+							)
+						) {
+							lastFactorProtected();
+						}
+						if (
+							!(await validatePassword(ctx, {
+								password: deletionProof.password,
+								userId,
+							}))
+						) {
+							deletionProofFailed();
+						}
+					} else if (
+						deletionProof.type === "totp" ||
+						deletionProof.type === "recovery-code"
+					) {
+						const twoFactorPlugin = ctx.context.getPlugin("two-factor");
+						if (!twoFactorPlugin || authoritativeUser.twoFactorEnabled !== true) {
+							lastFactorProtected();
+						}
+						const pluginOptions = twoFactorPlugin.options as
+							| TwoFactorOptions
+							| undefined;
+						const table = pluginOptions?.twoFactorTable ?? "twoFactor";
+						const factor = await adapter.findOne<TwoFactorTable>({
+							model: table,
+							where: [
+								{ field: "userId", value: userId },
+								{ field: "verified", value: true },
+							],
+						});
+						if (!factor) lastFactorProtected();
+						const backupCodeOptions = {
+							storeBackupCodes: "encrypted",
+							...pluginOptions?.backupCodeOptions,
+						} satisfies BackupCodeOptions;
+						let prepared: Awaited<ReturnType<typeof proveFactorStepUp>>;
+						try {
+							prepared = await proveFactorStepUp(
+								ctx,
+								adapter,
+								table,
+								factor,
+								deletionProof.type === "totp"
+									? { currentCode: deletionProof.code }
+									: { recoveryCode: deletionProof.code },
+								{
+									backupCodeOptions,
+									totpOptions: pluginOptions?.totpOptions,
+								},
+							);
+						} catch {
+							return { kind: "proof-error" as const };
+						}
+						const consumed = await adapter.incrementOne<TwoFactorTable>({
+							model: table,
+							where: [
+								{ field: "id", value: factor.id },
+								{ field: "userId", value: userId },
+								...prepared.where,
+							],
+							increment: {},
+							set: prepared.set,
+						});
+						await prepared.restoreAttempt();
+						if (!consumed) return { kind: "proof-error" as const };
+					} else {
+						if (!passkeyAuthority) deletionProofFailed();
+						const { challenge } = passkeyAuthority;
+						const provingPasskey = await adapter.findOne<Passkey>({
+							model: "passkey",
+							where: [
+								{
+									field: "credentialID",
+									value: deletionProof.response.id,
+								},
+								{ field: "userId", value: userId },
+							],
+						});
+						if (provingPasskey?.id === currentTarget.id) lastFactorProtected();
+						if (!provingPasskey) deletionProofFailed();
+
+						let verification: Awaited<
+							ReturnType<typeof verifyAuthenticationResponse>
+						>;
+						try {
+							verification = await verifyAuthenticationResponse({
+								response: deletionProof
+									.response as unknown as AuthenticationResponseJSON,
+								expectedChallenge: challenge,
+								expectedOrigin: passkeyAuthority.requestOrigin,
+								expectedRPID: passkeyAuthority.rpID,
+								requireUserVerification: true,
+								credential: {
+									id: provingPasskey.credentialID,
+									publicKey: base64Url.decode(provingPasskey.publicKey),
+									counter: provingPasskey.counter,
+									transports: parseTransports(provingPasskey.transports),
+								},
+							});
+						} catch (error) {
+							logFailure(ctx, "deletion proof verification threw", error);
+							deletionProofFailed();
+						}
+						if (!verification.verified) deletionProofFailed();
+						if (
+							!(await advancePasskeyCounter(
+								adapter,
+								provingPasskey.id,
+								provingPasskey.counter,
+								verification.authenticationInfo.newCounter,
+							))
+						) {
+							deletionProofFailed();
+						}
+					}
+
+					const nextGeneration = generateId(32);
+					const replacementUser = await rotatePasskeySessionGeneration(
+						adapter,
+						userId,
+						userGeneration,
+						nextGeneration,
+					);
+					if (!replacementUser) lifecycleConflict();
+
+					const deletedTarget = await adapter.consumeOne<Passkey>({
+						model: "passkey",
+						where: [
+							{ field: "id", value: currentTarget.id },
+							{ field: "userId", value: userId },
+							{ field: "credentialID", value: currentTarget.credentialID },
+							{ field: "counter", value: currentTarget.counter },
+						],
+					});
+					if (!deletedTarget) lifecycleConflict();
+
+					await ctx.context.internalAdapter.deleteUserSessions(userId);
+					const replacementSession =
+						await ctx.context.internalAdapter.createSession(userId, false, {
+							expiresAt: originalExpiresAt,
+							__preserveSessionExpiresAt: true,
+						});
+					if (
+						new Date(replacementSession.expiresAt).getTime() !==
+						originalExpiresAtTime
+					) {
+						lifecycleConflict();
+					}
+					committedLifecycle = {
+						kind: "success",
+						replacementSession,
+						replacementUser: replacementUser as User,
+					};
+					return committedLifecycle;
+				});
+			} catch (error) {
+				if (error instanceof AfterTransactionHookError && committedLifecycle) {
+					logFailure(ctx, "deletion post-commit publication failed", error);
+					lifecycle = committedLifecycle;
+				} else {
+					throw error;
+				}
+			}
+
+			if (!lifecycle) lifecycleConflict();
+			if (lifecycle.kind === "proof-error") deletionProofFailed();
+			await setSessionCookie(ctx, {
+				session: lifecycle.replacementSession,
+				user: lifecycle.replacementUser,
+			});
+			return ctx.json({ status: true });
 		},
 	);
 

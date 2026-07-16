@@ -1,4 +1,5 @@
 import type {
+	AuthenticationResponseJSON,
 	AuthenticatorSelectionCriteria,
 	AuthenticatorTransportFuture,
 	CredentialDeviceType,
@@ -81,3 +82,9 @@ export interface PublicPasskey {
 	createdAt: Date;
 	updatedAt: Date;
 }
+
+export type PasskeyDeletionProof =
+	| { type: "password"; password: string }
+	| { type: "totp"; code: string }
+	| { type: "recovery-code"; code: string }
+	| { type: "passkey"; response: AuthenticationResponseJSON };

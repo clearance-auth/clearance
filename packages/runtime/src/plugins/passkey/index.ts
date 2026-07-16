@@ -4,8 +4,10 @@ import { PACKAGE_VERSION } from "../../version";
 import { PASSKEY_ERROR_CODES } from "./error-codes";
 import {
 	generatePasskeyAuthenticationOptions,
+	generatePasskeyDeletionOptions,
 	generatePasskeyRegistrationOptions,
 	listPasskeys,
+	deletePasskey,
 	updatePasskey,
 	verifyPasskeyAuthentication,
 	verifyPasskeyRegistration,
@@ -26,10 +28,6 @@ declare module "@clearance/core" {
 /**
  * WebAuthn ceremony core for discoverable (usernameless) registration and
  * authentication backed by `@simplewebauthn/server`.
- *
- * This slice intentionally does not include credential deletion/revocation,
- * last-factor recovery safety, or session-generation invalidation; those
- * ship in a separate destructive-lifecycle slice.
  */
 export const passkey = <O extends PasskeyOptions>(options?: O) => {
 	return {
@@ -42,6 +40,9 @@ export const passkey = <O extends PasskeyOptions>(options?: O) => {
 			generatePasskeyAuthenticationOptions:
 				generatePasskeyAuthenticationOptions(options),
 			verifyPasskeyAuthentication: verifyPasskeyAuthentication(options),
+			generatePasskeyDeletionOptions:
+				generatePasskeyDeletionOptions(options),
+			deletePasskey: deletePasskey(options),
 			listPasskeys,
 			updatePasskey,
 		},
@@ -58,4 +59,9 @@ export const passkey = <O extends PasskeyOptions>(options?: O) => {
 	} satisfies ClearancePlugin;
 };
 
-export type { Passkey, PasskeyOptions, PublicPasskey } from "./types";
+export type {
+	Passkey,
+	PasskeyDeletionProof,
+	PasskeyOptions,
+	PublicPasskey,
+} from "./types";

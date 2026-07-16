@@ -1,13 +1,19 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
+import { createOTP } from "@clearance/utils/otp";
 import { describe, expect, it, vi } from "vitest";
+import { symmetricDecrypt } from "../../crypto";
+import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { twoFactor } from "../two-factor";
+import type { TwoFactorTable } from "../two-factor/types";
 import { passkey } from ".";
 import {
 	consumeChallengeByParsedChallenge,
 	createChallenge,
 } from "./challenge";
 import { advancePasskeyCounter } from "./counter";
+import { assertPasskeyDeletionLifecycleOnAdapter } from "./passkey.deletion.adapter-test-utils";
 import type { Passkey } from "./types";
 import { createVirtualAuthenticator } from "./virtual-authenticator.test-utils";
 
@@ -17,9 +23,10 @@ const hasPostgres = Boolean(
 );
 const ORIGIN = "http://localhost:3311";
 const RP_ID = "localhost";
+const SECRET = "passkey-postgres-lifecycle-secret";
 
 describe.skipIf(!hasPostgres)("passkey PostgreSQL authority", () => {
-	it("migrates, completes both ceremonies, enforces uniqueness, and serializes challenge/counter races", async () => {
+	it("migrates, completes ceremonies, serializes authority races, and proves deletion success/rollback", async () => {
 		const instance = await getTestInstance(
 			{
 				baseURL: ORIGIN,
@@ -195,5 +202,118 @@ describe.skipIf(!hasPostgres)("passkey PostgreSQL authority", () => {
 			),
 		);
 		expect(counterClaims.filter(Boolean)).toHaveLength(1);
+
+		await assertPasskeyDeletionLifecycleOnAdapter(instance.auth, ORIGIN);
 	});
+
+	it(
+		"serializes concurrent sole-passkey deletion and two-factor disable without deadlock",
+		async () => {
+			const instance = await getTestInstance(
+				{
+					baseURL: ORIGIN,
+					secret: SECRET,
+					logger: { level: "error" },
+					plugins: [passkey(), twoFactor({ allowPasswordless: true })],
+				},
+				{ port: 3311, testWith: "postgres" },
+			);
+			const signedIn = await instance.signInWithTestUser();
+			const enrollment = await instance.auth.api.enableTwoFactor({
+				body: { password: instance.testUser.password },
+				headers: signedIn.headers,
+			});
+			const factor = await instance.db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			});
+			if (!factor) throw new Error("two-factor enrollment row missing");
+			const secret = await symmetricDecrypt({ key: SECRET, data: factor.secret });
+			const activated = await instance.auth.api.verifyTOTP({
+				body: { code: await createOTP(secret).totp() },
+				headers: signedIn.headers,
+				asResponse: true,
+			});
+			expect(activated.status).toBe(200);
+			// Activation consumed the current timestep. Reset only the test fixture's
+			// replay baseline so the deletion lane enters the shared lifecycle race
+			// with a valid TOTP instead of failing before serialization.
+			await instance.db.update({
+				model: "twoFactor",
+				where: [{ field: "id", value: factor.id }],
+				update: { lastUsedTotpCounter: -1 },
+			});
+			const headers = convertSetCookieToCookie(activated.headers);
+			headers.set("origin", ORIGIN);
+			const context = await instance.auth.$context;
+			const target = await context.adapter.create<Passkey>({
+				model: "passkey",
+				data: {
+					userId: signedIn.user.id,
+					name: "postgres-concurrent-survivor",
+					credentialID: `postgres-concurrent-${Math.random()}`,
+					publicKey: "unused-concurrent-public-key",
+					userHandle: `postgres-concurrent-handle-${Math.random()}`,
+					counter: 0,
+					deviceType: "singleDevice",
+					backedUp: false,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+			await instance.db.deleteMany({
+				model: "account",
+				where: [
+					{ field: "userId", value: signedIn.user.id },
+					{ field: "providerId", value: "credential" },
+				],
+			});
+			const currentCode = await createOTP(secret).totp();
+
+			const [deletion, disable] = await Promise.all([
+				instance.auth.api.deletePasskey({
+					body: {
+						id: target.id,
+						proof: { type: "totp", code: currentCode },
+					},
+					headers: new Headers(headers),
+					asResponse: true,
+				}),
+				instance.auth.api.disableTwoFactor({
+					body: { recoveryCode: enrollment.backupCodes[0]! },
+					headers: new Headers(headers),
+					asResponse: true,
+				}),
+			]);
+			const responses = [deletion, disable];
+			expect(
+				responses.filter((response) => response.status === 200),
+			).toHaveLength(1);
+			const loser = responses.find((response) => response.status !== 200);
+			if (!loser) throw new Error("concurrent lifecycle loser missing");
+			expect([400, 409]).toContain(loser.status);
+			const loserBody = (await loser.json()) as { code?: string };
+			expect(["LAST_FACTOR_PROTECTED", "LIFECYCLE_CONFLICT"]).toContain(
+				loserBody.code,
+			);
+
+			const remainingPasskeys = await instance.db.count({
+				model: "passkey",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			});
+			const remainingFactor = await instance.db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			});
+			expect(remainingPasskeys > 0 || remainingFactor !== null).toBe(true);
+			if (deletion.status === 200) {
+				expect(remainingPasskeys).toBe(0);
+				expect(remainingFactor).not.toBeNull();
+			} else {
+				expect(remainingPasskeys).toBe(1);
+				expect(remainingFactor).toBeNull();
+			}
+		},
+		20_000,
+	);
 });

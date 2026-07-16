@@ -920,7 +920,64 @@ export function createClearanceAuth<
 				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "banReason" text;
 				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "twoFactorEnabled" boolean DEFAULT false;
 				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "twoFactorSessionGeneration" text;
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "passkeySessionGeneration" text;
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "passkeyUserHandle" text;
 				ALTER TABLE session ADD COLUMN IF NOT EXISTS "twoFactorSessionGeneration" text;
+				ALTER TABLE session ADD COLUMN IF NOT EXISTS "passkeySessionGeneration" text;
+
+				CREATE TABLE IF NOT EXISTS passkey (
+					id text PRIMARY KEY,
+					"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+					name text,
+					"credentialID" text NOT NULL,
+					"publicKey" text NOT NULL,
+					"userHandle" text NOT NULL,
+					counter integer NOT NULL,
+					"deviceType" text NOT NULL,
+					"backedUp" boolean NOT NULL,
+					transports text,
+					aaguid text,
+					"createdAt" timestamptz NOT NULL,
+					"updatedAt" timestamptz NOT NULL
+				);
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS id text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "userId" text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS name text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "credentialID" text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "publicKey" text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "userHandle" text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS counter integer;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "deviceType" text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "backedUp" boolean;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS transports text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS aaguid text;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "createdAt" timestamptz;
+				ALTER TABLE passkey ADD COLUMN IF NOT EXISTS "updatedAt" timestamptz;
+
+				CREATE TABLE IF NOT EXISTS "passkeyChallenge" (
+					id text PRIMARY KEY,
+					"digestId" text NOT NULL,
+					ceremony text NOT NULL,
+					"rpID" text NOT NULL,
+					origin text NOT NULL,
+					"userId" text,
+					"userHandle" text,
+					"targetPasskeyId" text,
+					"expiresAt" timestamptz NOT NULL,
+					"createdAt" timestamptz NOT NULL,
+					"updatedAt" timestamptz NOT NULL
+				);
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS id text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "digestId" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS ceremony text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "rpID" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS origin text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "userId" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "userHandle" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "targetPasskeyId" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "expiresAt" timestamptz;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "createdAt" timestamptz;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "updatedAt" timestamptz;
 
 				CREATE TABLE IF NOT EXISTS "twoFactor" (
 					id text PRIMARY KEY,
@@ -967,9 +1024,244 @@ export function createClearanceAuth<
 					`Cannot prepare the credential bridge: duplicate two-factor records exist for user ${duplicateFactor.rows[0].userId}`,
 				);
 			}
+			const duplicatePasskeyHandle = await client.query<{ handle: string }>(`
+				SELECT "passkeyUserHandle" AS handle FROM "user"
+				WHERE "passkeyUserHandle" IS NOT NULL
+				GROUP BY "passkeyUserHandle" HAVING count(*) > 1 LIMIT 1
+			`);
+			if (duplicatePasskeyHandle.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: duplicate user handles exist for ${duplicatePasskeyHandle.rows[0].handle}`,
+				);
+			}
+			const duplicateCredential = await client.query<{ credentialId: string }>(`
+				SELECT "credentialID" AS "credentialId" FROM passkey
+				WHERE "credentialID" IS NOT NULL
+				GROUP BY "credentialID" HAVING count(*) > 1 LIMIT 1
+			`);
+			if (duplicateCredential.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: duplicate credential IDs exist for ${duplicateCredential.rows[0].credentialId}`,
+				);
+			}
+			const duplicateChallenge = await client.query<{ digestId: string }>(`
+				SELECT "digestId" FROM "passkeyChallenge"
+				WHERE "digestId" IS NOT NULL
+				GROUP BY "digestId" HAVING count(*) > 1 LIMIT 1
+			`);
+			if (duplicateChallenge.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: duplicate challenge digests exist for ${duplicateChallenge.rows[0].digestId}`,
+				);
+			}
+			const orphanedPasskey = await client.query<{ userId: string | null }>(`
+				SELECT passkey."userId" FROM passkey
+				LEFT JOIN "user" ON "user".id = passkey."userId"
+				WHERE passkey."userId" IS NULL OR "user".id IS NULL LIMIT 1
+			`);
+			if (orphanedPasskey.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: credential references unavailable user ${orphanedPasskey.rows[0].userId ?? "<null>"}`,
+				);
+			}
+			await client.query(`
+				ALTER TABLE passkey ALTER COLUMN id SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "userId" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "credentialID" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "publicKey" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "userHandle" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN counter SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "deviceType" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "backedUp" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "createdAt" SET NOT NULL;
+				ALTER TABLE passkey ALTER COLUMN "updatedAt" SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN id SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN "digestId" SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN ceremony SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN "rpID" SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN origin SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN "expiresAt" SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN "createdAt" SET NOT NULL;
+				ALTER TABLE "passkeyChallenge" ALTER COLUMN "updatedAt" SET NOT NULL;
+				CREATE UNIQUE INDEX IF NOT EXISTS "user_passkeyUserHandle_uidx"
+					ON "user" ("passkeyUserHandle");
+				CREATE UNIQUE INDEX IF NOT EXISTS "passkey_credentialID_uidx"
+					ON passkey ("credentialID");
+				CREATE INDEX IF NOT EXISTS "passkey_userId_idx" ON passkey ("userId");
+				CREATE UNIQUE INDEX IF NOT EXISTS "passkeyChallenge_digestId_uidx"
+					ON "passkeyChallenge" ("digestId");
+				CREATE INDEX IF NOT EXISTS "passkeyChallenge_expiresAt_idx"
+					ON "passkeyChallenge" ("expiresAt");
+				DO $bridge$
+				BEGIN
+					IF NOT EXISTS (
+						SELECT 1 FROM pg_constraint
+						WHERE conrelid = to_regclass(format('%I.%I', current_schema(), 'passkey'))
+						  AND contype = 'p'
+					) THEN
+						ALTER TABLE passkey ADD CONSTRAINT passkey_pkey PRIMARY KEY (id);
+					END IF;
+					IF NOT EXISTS (
+						SELECT 1 FROM pg_constraint
+						WHERE conrelid = to_regclass(format('%I.%I', current_schema(), 'passkeyChallenge'))
+						  AND contype = 'p'
+					) THEN
+						ALTER TABLE "passkeyChallenge"
+							ADD CONSTRAINT "passkeyChallenge_pkey" PRIMARY KEY (id);
+					END IF;
+					IF NOT EXISTS (
+						SELECT 1 FROM pg_constraint
+						WHERE conrelid = to_regclass(format('%I.%I', current_schema(), 'passkey'))
+						  AND conname = 'passkey_userId_fkey'
+					) THEN
+						ALTER TABLE passkey ADD CONSTRAINT "passkey_userId_fkey"
+							FOREIGN KEY ("userId") REFERENCES "user"(id) ON DELETE CASCADE;
+					END IF;
+				END
+				$bridge$;
+			`);
 			await client.query(
 				`CREATE UNIQUE INDEX IF NOT EXISTS "twoFactor_userId_unique" ON "twoFactor" ("userId")`,
 			);
+			const incompatiblePasskeyColumn = await client.query<{
+				tableName: string;
+				columnName: string;
+			}>(`
+				WITH expected("tableName", "columnName", type, nullable) AS (VALUES
+					('user', 'passkeySessionGeneration', 'text', 'YES'),
+					('user', 'passkeyUserHandle', 'text', 'YES'),
+					('session', 'passkeySessionGeneration', 'text', 'YES'),
+					('passkey', 'id', 'text', 'NO'),
+					('passkey', 'userId', 'text', 'NO'),
+					('passkey', 'name', 'text', 'YES'),
+					('passkey', 'credentialID', 'text', 'NO'),
+					('passkey', 'publicKey', 'text', 'NO'),
+					('passkey', 'userHandle', 'text', 'NO'),
+					('passkey', 'counter', 'int4', 'NO'),
+					('passkey', 'deviceType', 'text', 'NO'),
+					('passkey', 'backedUp', 'bool', 'NO'),
+					('passkey', 'transports', 'text', 'YES'),
+					('passkey', 'aaguid', 'text', 'YES'),
+					('passkey', 'createdAt', 'timestamptz', 'NO'),
+					('passkey', 'updatedAt', 'timestamptz', 'NO'),
+					('passkeyChallenge', 'id', 'text', 'NO'),
+					('passkeyChallenge', 'digestId', 'text', 'NO'),
+					('passkeyChallenge', 'ceremony', 'text', 'NO'),
+					('passkeyChallenge', 'rpID', 'text', 'NO'),
+					('passkeyChallenge', 'origin', 'text', 'NO'),
+					('passkeyChallenge', 'userId', 'text', 'YES'),
+					('passkeyChallenge', 'userHandle', 'text', 'YES'),
+					('passkeyChallenge', 'targetPasskeyId', 'text', 'YES'),
+					('passkeyChallenge', 'expiresAt', 'timestamptz', 'NO'),
+					('passkeyChallenge', 'createdAt', 'timestamptz', 'NO'),
+					('passkeyChallenge', 'updatedAt', 'timestamptz', 'NO')
+				)
+				SELECT expected."tableName", expected."columnName"
+				FROM expected
+				LEFT JOIN information_schema.columns AS actual
+				  ON actual.table_schema = current_schema()
+				 AND actual.table_name = expected."tableName"
+				 AND actual.column_name = expected."columnName"
+				WHERE actual.column_name IS NULL
+				   OR actual.udt_name <> expected.type
+				   OR actual.is_nullable <> expected.nullable
+				LIMIT 1
+			`);
+			if (incompatiblePasskeyColumn.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: incompatible column ${incompatiblePasskeyColumn.rows[0].tableName}.${incompatiblePasskeyColumn.rows[0].columnName}`,
+				);
+			}
+			const incompatiblePasskeyIndex = await client.query<{ name: string }>(`
+				WITH expected(name, "tableName", unique_index, column_name) AS (VALUES
+					('user_passkeyUserHandle_uidx', 'user', true, 'passkeyUserHandle'),
+					('passkey_credentialID_uidx', 'passkey', true, 'credentialID'),
+					('passkey_userId_idx', 'passkey', false, 'userId'),
+					('passkeyChallenge_digestId_uidx', 'passkeyChallenge', true, 'digestId'),
+					('passkeyChallenge_expiresAt_idx', 'passkeyChallenge', false, 'expiresAt')
+				), actual AS (
+					SELECT index_record.relname AS name,
+					       table_record.relname AS "tableName",
+					       index_state.indisunique AS unique_index,
+					       index_state.indisvalid AS valid_index,
+					       index_state.indisready AS ready_index,
+					       index_state.indislive AS live_index,
+					       COALESCE(
+					         (to_jsonb(index_state)->>'indnullsnotdistinct')::boolean,
+					         false
+					       ) AS nulls_not_distinct,
+					       index_state.indpred IS NULL AS unpredicated,
+					       index_state.indexprs IS NULL AS no_expressions,
+					       index_state.indnkeyatts AS key_attribute_count,
+					       index_state.indnatts AS total_attribute_count,
+					       array_agg(attribute_record.attname::text ORDER BY index_key.ordinality) AS columns
+					FROM pg_index AS index_state
+					JOIN pg_class AS table_record ON table_record.oid = index_state.indrelid
+					JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+					JOIN pg_class AS index_record ON index_record.oid = index_state.indexrelid
+					CROSS JOIN LATERAL unnest(index_state.indkey)
+					  WITH ORDINALITY AS index_key(attnum, ordinality)
+					JOIN pg_attribute AS attribute_record
+					  ON attribute_record.attrelid = table_record.oid
+					 AND attribute_record.attnum = index_key.attnum
+					WHERE namespace_record.nspname = current_schema()
+					GROUP BY index_record.relname, table_record.relname,
+					         index_state.indisunique, index_state.indisvalid,
+					         index_state.indisready, index_state.indislive,
+					         COALESCE(
+					           (to_jsonb(index_state)->>'indnullsnotdistinct')::boolean,
+					           false
+					         ),
+					         index_state.indpred, index_state.indexprs,
+					         index_state.indnkeyatts, index_state.indnatts
+				)
+				SELECT expected.name FROM expected
+				LEFT JOIN actual ON actual.name = expected.name
+				WHERE actual.name IS NULL
+				   OR actual."tableName" <> expected."tableName"
+				   OR actual.unique_index <> expected.unique_index
+				   OR actual.valid_index IS NOT TRUE
+				   OR actual.ready_index IS NOT TRUE
+				   OR actual.live_index IS NOT TRUE
+				   OR actual.nulls_not_distinct IS TRUE
+				   OR actual.unpredicated IS NOT TRUE
+				   OR actual.no_expressions IS NOT TRUE
+				   OR actual.key_attribute_count <> 1
+				   OR actual.total_attribute_count <> 1
+				   OR actual.columns <> ARRAY[expected.column_name]
+				LIMIT 1
+			`);
+			if (incompatiblePasskeyIndex.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: incompatible index ${incompatiblePasskeyIndex.rows[0].name}`,
+				);
+			}
+			const incompatiblePasskeyConstraint = await client.query<{ name: string }>(`
+				WITH expected(name, type, definition) AS (VALUES
+					('passkey_pkey', 'p', 'PRIMARY KEY (id)'),
+					('passkeyChallenge_pkey', 'p', 'PRIMARY KEY (id)'),
+					('passkey_userId_fkey', 'f', 'FOREIGN KEY ("userId") REFERENCES "user"(id) ON DELETE CASCADE')
+				), actual AS (
+					SELECT constraint_record.conname AS name,
+					       constraint_record.contype::text AS type,
+					       pg_get_constraintdef(constraint_record.oid, true) AS definition
+					FROM pg_constraint AS constraint_record
+					JOIN pg_class AS table_record ON table_record.oid = constraint_record.conrelid
+					JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+					WHERE namespace_record.nspname = current_schema()
+				)
+				SELECT expected.name FROM expected
+				LEFT JOIN actual ON actual.name = expected.name
+				WHERE actual.name IS NULL
+				   OR actual.type <> expected.type
+				   OR actual.definition <> expected.definition
+				LIMIT 1
+			`);
+			if (incompatiblePasskeyConstraint.rows[0]) {
+				throw new Error(
+					`Cannot prepare the passkey bridge: incompatible constraint ${incompatiblePasskeyConstraint.rows[0].name}`,
+				);
+			}
 			await client.query("COMMIT");
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);

@@ -119,6 +119,29 @@ describe("passkey challenge storage (database-backed, single-use)", () => {
 		expect(correctCeremony).not.toBeNull();
 	});
 
+	it("keeps deletion challenges ceremony-scoped and bound to user and target", async () => {
+		const ctx = await fakeCtx();
+		const challenge = "challenge-deletion-binding";
+		await createChallenge(ctx, "deletion", challenge, {
+			rpID: "app.example.com",
+			origin: "https://app.example.com",
+			userId: "user-1",
+			targetPasskeyId: "passkey-1",
+		});
+
+		await expect(
+			consumeChallengeByParsedChallenge(ctx, "authentication", challenge),
+		).resolves.toBeNull();
+		await expect(
+			consumeChallengeByParsedChallenge(ctx, "deletion", challenge),
+		).resolves.toMatchObject({
+			rpID: "app.example.com",
+			origin: "https://app.example.com",
+			userId: "user-1",
+			targetPasskeyId: "passkey-1",
+		});
+	});
+
 	it("rejects an unknown challenge", async () => {
 		const ctx = await fakeCtx();
 		expect(

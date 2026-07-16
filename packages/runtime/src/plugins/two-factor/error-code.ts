@@ -17,4 +17,9 @@ export const TWO_FACTOR_ERROR_CODES = defineErrorCodes({
 	ACCOUNT_TEMPORARILY_LOCKED:
 		"Too many failed verification attempts. Your account is temporarily locked. Please try again later.",
 	INVALID_TWO_FACTOR_COOKIE: "Invalid two factor cookie",
+	LIFECYCLE_CONFIGURATION_ERROR:
+		"Two-factor lifecycle requires rollback-capable database-backed sessions",
+	LAST_FACTOR_PROTECTED:
+		"A password or passkey must remain before two-factor authentication can be disabled",
+	LIFECYCLE_CONFLICT: "Recovery factor state changed. Please try again",
 });

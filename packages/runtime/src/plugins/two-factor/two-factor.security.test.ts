@@ -629,17 +629,20 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 		).toHaveLength(1);
 	});
 
-	it("revokes the generation marker in secondary-only verification storage", async () => {
+	it("fails closed before proof or trust mutation with secondary-authoritative sessions", async () => {
 		let otp = "";
 		const store = new Map<string, string>();
+		let secondaryWrites = 0;
 		const secondaryStorage = {
 			async get(key: string) {
 				return store.get(key) ?? null;
 			},
 			async set(key: string, value: string) {
+				secondaryWrites++;
 				store.set(key, value);
 			},
 			async delete(key: string) {
+				secondaryWrites++;
 				store.delete(key);
 			},
 			async getAndDelete(key: string) {
@@ -693,10 +696,15 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 		const markerKey = `verification:trust-device-generation-${user!.user.id}-${factor!.trustDeviceGeneration}`;
 		expect(store.has(markerKey)).toBe(true);
 		const trustedHeaders = convertSetCookieToCookie(trusted.headers);
+		const beforeDisable = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user!.user.id }],
+		});
 		const secret = await symmetricDecrypt({
 			key: DEFAULT_SECRET,
 			data: factor!.secret,
 		});
+		const writesBeforeDisable = secondaryWrites;
 		const disabled = await auth.api.disableTwoFactor({
 			body: {
 				password: testUser.password,
@@ -705,8 +713,28 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 			headers: trustedHeaders,
 			asResponse: true,
 		});
-		expect(disabled.status).toBe(200);
-		expect(store.has(markerKey)).toBe(false);
+		expect(disabled.status).toBe(500);
+		expect(await disabled.json()).toMatchObject({
+			code: "LIFECYCLE_CONFIGURATION_ERROR",
+		});
+		expect(disabled.headers.get("set-cookie")).toBeNull();
+		expect(secondaryWrites).toBe(writesBeforeDisable);
+		expect(store.has(markerKey)).toBe(true);
+		expect(
+			await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: user!.user.id }],
+			}),
+		).toMatchObject({
+			id: beforeDisable?.id,
+			backupCodes: beforeDisable?.backupCodes,
+			failedVerificationCount: beforeDisable?.failedVerificationCount,
+			activeVerificationReservations:
+				beforeDisable?.activeVerificationReservations,
+		});
+		await expect(
+			auth.api.getSession({ headers: trustedHeaders }),
+		).resolves.not.toBeNull();
 	});
 
 	it("refuses trusted-device bypass when secondary consume is process-local", async () => {

@@ -8,4 +8,7 @@ export const PASSKEY_ERROR_CODES = defineErrorCodes({
 	PASSKEY_NOT_FOUND: "Passkey not found",
 	INVALID_NAME: "Invalid passkey name",
 	CONFIGURATION_ERROR: "Passkey plugin is not configured correctly",
+	DELETION_PROOF_FAILED: "Passkey deletion proof failed",
+	LAST_FACTOR_PROTECTED: "The selected recovery factor must survive passkey deletion",
+	LIFECYCLE_CONFLICT: "Passkey lifecycle state changed. Please try again",
 });

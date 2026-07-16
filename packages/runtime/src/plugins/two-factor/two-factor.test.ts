@@ -2030,13 +2030,20 @@ describe("two factor passwordless", async () => {
 		expect(res.backupCodes.length).toBe(10);
 	});
 
-	it("allows disabling without password", async () => {
+	it("protects passwordless users from removing their last sign-in factor", async () => {
 		const res = await auth.api.disableTwoFactor({
 			body: { recoveryCode: recoveryCodes[0]! },
 			headers,
 			asResponse: true,
 		});
-		expect(res.status).toBe(200);
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ code: "LAST_FACTOR_PROTECTED" });
+		expect(
+			await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: userId }],
+			}),
+		).not.toBeNull();
 	});
 });
 

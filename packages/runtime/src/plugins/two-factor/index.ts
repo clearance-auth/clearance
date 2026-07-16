@@ -1,6 +1,11 @@
-import type { ClearancePlugin } from "@clearance/core";
+import type { ClearancePlugin, GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
-import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
+import {
+	AfterTransactionHookError,
+	getCurrentAdapter,
+	queueAfterTransactionHook,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { createHMAC } from "@clearance/utils/hmac";
 import { createOTP } from "@clearance/utils/otp";
@@ -17,7 +22,17 @@ import {
 	symmetricEncrypt,
 } from "../../crypto";
 import { generateRandomString } from "../../crypto/random";
+import {
+	PASSKEY_SESSION_GENERATION_FIELD,
+	rotatePasskeySessionGeneration,
+} from "../../db/passkey-session-generation";
+import {
+	rotateTwoFactorSessionGeneration,
+	TWO_FACTOR_SESSION_GENERATION_FIELD,
+} from "../../db/two-factor-session-generation";
 import { mergeSchema } from "../../db/schema";
+import { lockAndReadUser } from "../../db/user-authority";
+import type { Session, User } from "../../types";
 import { shouldRequirePassword, validatePassword } from "../../utils/password";
 import { PACKAGE_VERSION } from "../../version";
 import type { BackupCodeOptions } from "./backup-codes";
@@ -43,7 +58,6 @@ import type {
 import {
 	preserveSessionLifetime,
 	recordTrustGeneration,
-	revokeTrustGeneration,
 	trustGenerationMarkerIdentifier,
 } from "./utils";
 import {
@@ -53,6 +67,82 @@ import {
 
 export * from "./error-code";
 
+function assertTwoFactorLifecycleConfiguration(
+	ctx: GenericEndpointContext,
+): void {
+	if (
+		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" ||
+		(ctx.context.options.secondaryStorage !== undefined &&
+			ctx.context.options.session?.storeSessionInDatabase !== true)
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			TWO_FACTOR_ERROR_CODES.LIFECYCLE_CONFIGURATION_ERROR,
+		);
+	}
+}
+
+function twoFactorLastFactorProtected(): never {
+	throw APIError.from("BAD_REQUEST", TWO_FACTOR_ERROR_CODES.LAST_FACTOR_PROTECTED);
+}
+
+function twoFactorLifecycleConflict(): never {
+	throw APIError.from("CONFLICT", TWO_FACTOR_ERROR_CODES.LIFECYCLE_CONFLICT);
+}
+
+function logTwoFactorLifecycleFailure(
+	ctx: GenericEndpointContext,
+	label: string,
+	error: unknown,
+): void {
+	ctx.context.logger.debug(
+		`[two-factor] ${label}`,
+		error instanceof Error ? error.name : "unknown error",
+	);
+}
+
+type ResolveDefault<Value, Default> = Value extends undefined ? Default : Value;
+type OptionValue<
+	O extends TwoFactorOptions,
+	Key extends keyof TwoFactorOptions,
+> = Key extends keyof O ? O[Key] : undefined;
+type BackupCodeOptionValue<
+	Value,
+	Key extends keyof BackupCodeOptions,
+> = Value extends BackupCodeOptions
+	? Key extends keyof Value
+		? Value[Key]
+		: undefined
+	: undefined;
+
+type ResolvedBackupCodeOptions<Value> = ResolveDefault<Value, object> & {
+	storeBackupCodes: ResolveDefault<
+		BackupCodeOptionValue<Value, "storeBackupCodes">,
+		"encrypted"
+	>;
+};
+
+type ResolvedTwoFactorOptions<O extends TwoFactorOptions> = O & {
+	twoFactorTable: ResolveDefault<OptionValue<O, "twoFactorTable">, "twoFactor">;
+	backupCodeOptions: ResolvedBackupCodeOptions<
+		OptionValue<O, "backupCodeOptions">
+	>;
+};
+
+function resolveTwoFactorOptions<const O extends TwoFactorOptions = {}>(
+	options?: O,
+): ResolvedTwoFactorOptions<O>;
+function resolveTwoFactorOptions(options?: TwoFactorOptions) {
+	return {
+		...options,
+		twoFactorTable: options?.twoFactorTable ?? "twoFactor",
+		backupCodeOptions: {
+			storeBackupCodes: "encrypted" as const,
+			...options?.backupCodeOptions,
+		},
+	};
+}
+
 declare module "@clearance/core" {
 	interface ClearancePluginRegistry<AuthOptions, Options> {
 		"two-factor": {
@@ -60,9 +150,10 @@ declare module "@clearance/core" {
 		};
 	}
 }
-export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
-	const opts = {
-		twoFactorTable: "twoFactor",
+export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) => {
+	const resolvedOptions = resolveTwoFactorOptions(options);
+	const opts: { twoFactorTable: string } = {
+		twoFactorTable: resolvedOptions.twoFactorTable,
 	};
 	const trustDeviceMaxAge =
 		options?.trustDeviceMaxAge ?? TRUST_DEVICE_COOKIE_MAX_AGE;
@@ -532,142 +623,331 @@ export const twoFactor = <O extends TwoFactorOptions>(options?: O) => {
 							},
 						},
 					},
-				},
-				async (ctx) => {
-					const user = ctx.context.session.user as UserWithTwoFactor;
-					const { currentCode, password, recoveryCode } = ctx.body;
-					const requirePassword = await shouldRequirePassword(
-						ctx,
-						user.id,
-						allowPasswordless,
-					);
-					if (requirePassword) {
-						if (!password) {
-							throw APIError.from(
-								"BAD_REQUEST",
-								BASE_ERROR_CODES.INVALID_PASSWORD,
-							);
+					},
+					async (ctx) => {
+						const user = ctx.context.session.user as UserWithTwoFactor;
+						const { currentCode, password, recoveryCode } = ctx.body;
+						const passkeyLifecycle =
+							ctx.context.options.plugins?.some((plugin) => plugin.id === "passkey") ===
+							true;
+						const twoFactorGenerationLifecycle = !passkeyLifecycle;
+						assertTwoFactorLifecycleConfiguration(ctx);
+						const originalExpiresAt = new Date(ctx.context.session.session.expiresAt);
+						const originalExpiresAtMs = originalExpiresAt.getTime();
+						if (
+							!Number.isFinite(originalExpiresAtMs) ||
+							originalExpiresAtMs <= Date.now()
+						) {
+							twoFactorLifecycleConflict();
 						}
-						const isPasswordValid = await validatePassword(ctx, {
-							password,
-							userId: user.id,
-						});
-						if (!isPasswordValid) {
-							throw APIError.from(
-								"BAD_REQUEST",
-								BASE_ERROR_CODES.INVALID_PASSWORD,
-							);
-						}
-					}
-					const factor = await ctx.context.adapter.findOne<TwoFactorTable>({
-						model: opts.twoFactorTable,
-						where: [{ field: "userId", value: user.id }],
-					});
-					if (!factor || factor.verified === false) {
-						throw APIError.from(
-							"BAD_REQUEST",
-							TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
-						);
-					}
-					// Reserve the attempt outside the lifecycle transaction so an invalid
-					// proof remains accounted for after the request fails. The guarded
-					// mutation below still gives one winner for concurrent valid proofs.
-					const proof = await proveFactorStepUp(
-						ctx,
-						ctx.context.adapter,
-						opts.twoFactorTable,
-						factor,
-						{ currentCode, recoveryCode },
-						{
-							backupCodeOptions,
-							totpOptions: options?.totpOptions,
-						},
-					);
-					const rotated = await runWithTransaction(
-						ctx.context.adapter,
-						async () => {
-							const adapter = await getCurrentAdapter(ctx.context.adapter);
-							const generation = generateRandomString(32);
-							const authorized = await adapter.incrementOne<TwoFactorTable>({
-								model: opts.twoFactorTable,
-								where: [{ field: "id", value: factor.id }, ...proof.where],
-								increment: {},
-								set: {
-									...proof.set,
-									trustDeviceGeneration: generation,
-									failedVerificationCount: 0,
-									activeVerificationReservations: "[]",
-									lockedUntil: null,
-								},
-							});
-							if (!authorized) {
-								throw APIError.fromStatus("CONFLICT", {
-									message: "Two-factor state changed. Please try again.",
-								});
-							}
-							if (
-								factor.trustDeviceGeneration &&
-								(!ctx.context.options.secondaryStorage ||
-									ctx.context.options.verification?.storeInDatabase === true)
-							) {
-								await adapter.deleteMany({
-									model: "verification",
-									where: [
-										{
-											field: "value",
-											value: `${user.id}!${factor.trustDeviceGeneration}`,
+
+						type DisableResult =
+							| {
+									kind: "success";
+									replacementSession: Session;
+									updatedUser: User;
+							  }
+							| { kind: "proof-error"; error: unknown };
+						let rotated: DisableResult | undefined;
+						let committedLifecycle:
+							| Extract<DisableResult, { kind: "success" }>
+							| undefined;
+						try {
+							rotated = await runWithTransaction(
+								ctx.context.adapter,
+								async () => {
+									const adapter = await getCurrentAdapter(ctx.context.adapter);
+									const authoritativeUser = (await lockAndReadUser(
+										adapter,
+										user.id,
+									)) as (User & Record<string, unknown>) | null;
+									if (!authoritativeUser) twoFactorLifecycleConflict();
+
+									const presentedSession =
+										await ctx.context.internalAdapter.findSession(
+											ctx.context.session.session.token,
+										);
+									if (
+										!presentedSession ||
+										presentedSession.session.id !==
+											ctx.context.session.session.id ||
+										presentedSession.session.userId !== user.id ||
+										presentedSession.user.id !== user.id ||
+										new Date(presentedSession.session.expiresAt).getTime() !==
+											originalExpiresAtMs
+									) {
+										twoFactorLifecycleConflict();
+									}
+									const authoritativeSession = await adapter.findOne<
+										Session & Record<string, unknown>
+									>({
+										model: "session",
+										where: [
+											{
+												field: "id",
+												value: ctx.context.session.session.id,
+											},
+											{ field: "userId", value: user.id },
+											{ field: "expiresAt", value: originalExpiresAt },
+										],
+									});
+									if (!authoritativeSession) twoFactorLifecycleConflict();
+									if (authoritativeUser.twoFactorEnabled !== true) {
+										throw APIError.from(
+											"BAD_REQUEST",
+											TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
+										);
+									}
+
+									let observedPasskeyGeneration: string | null = null;
+									let observedTwoFactorGeneration: string | null = null;
+									if (passkeyLifecycle) {
+										const userGeneration =
+											authoritativeUser[PASSKEY_SESSION_GENERATION_FIELD];
+										const sessionGeneration =
+											authoritativeSession?.[PASSKEY_SESSION_GENERATION_FIELD];
+										if (
+											typeof userGeneration !== "string" ||
+											userGeneration.length === 0 ||
+											typeof sessionGeneration !== "string" ||
+											sessionGeneration.length === 0 ||
+											sessionGeneration !== userGeneration
+										) {
+											twoFactorLifecycleConflict();
+										}
+										observedPasskeyGeneration = userGeneration;
+									} else if (twoFactorGenerationLifecycle) {
+										const userGeneration =
+											authoritativeUser[TWO_FACTOR_SESSION_GENERATION_FIELD];
+										const sessionGeneration =
+											authoritativeSession[TWO_FACTOR_SESSION_GENERATION_FIELD];
+										if (
+											typeof userGeneration !== "string" ||
+											userGeneration.length === 0 ||
+											typeof sessionGeneration !== "string" ||
+											sessionGeneration.length === 0 ||
+											sessionGeneration !== userGeneration
+										) {
+											twoFactorLifecycleConflict();
+										}
+										observedTwoFactorGeneration = userGeneration;
+									}
+
+									const factor = await adapter.findOne<TwoFactorTable>({
+										model: opts.twoFactorTable,
+										where: [
+											{ field: "userId", value: user.id },
+											{ field: "verified", value: true },
+										],
+									});
+									if (!factor) {
+										throw APIError.from(
+											"BAD_REQUEST",
+											TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
+										);
+									}
+
+									const requirePassword = await shouldRequirePassword(
+										ctx,
+										user.id,
+										allowPasswordless,
+									);
+									if (requirePassword) {
+										if (
+											!password ||
+											!(await validatePassword(ctx, {
+												password,
+												userId: user.id,
+											}))
+										) {
+											throw APIError.from(
+												"BAD_REQUEST",
+												BASE_ERROR_CODES.INVALID_PASSWORD,
+											);
+										}
+									}
+
+									let proof: Awaited<ReturnType<typeof proveFactorStepUp>>;
+									try {
+										proof = await proveFactorStepUp(
+											ctx,
+											adapter,
+											opts.twoFactorTable,
+											factor,
+											{ currentCode, recoveryCode },
+											{
+												backupCodeOptions,
+												totpOptions: options?.totpOptions,
+											},
+										);
+									} catch (error) {
+										// Returning commits invalid-attempt accounting. Throwing here would
+										// roll it back with the lifecycle transaction.
+										return { kind: "proof-error" as const, error };
+									}
+
+									const accounts =
+										await ctx.context.internalAdapter.findAccounts(user.id);
+									const passkeyCount = passkeyLifecycle
+										? await adapter.count({
+												model: "passkey",
+												where: [{ field: "userId", value: user.id }],
+											})
+										: 0;
+									const hasPassword = accounts.some(
+										(account) =>
+											account.providerId === "credential" &&
+											typeof account.password === "string" &&
+											account.password.length > 0,
+									);
+									if (!hasPassword && passkeyCount === 0) {
+										twoFactorLastFactorProtected();
+									}
+
+									const generation = generateRandomString(32);
+									const authorized = await adapter.incrementOne<TwoFactorTable>({
+										model: opts.twoFactorTable,
+										where: [
+											{ field: "id", value: factor.id },
+											{ field: "userId", value: user.id },
+											{ field: "verified", value: true },
+											...proof.where,
+										],
+										increment: {},
+										set: {
+											...proof.set,
+											trustDeviceGeneration: generation,
+											failedVerificationCount: 0,
+											activeVerificationReservations: "[]",
+											lockedUntil: null,
 										},
-									],
-								});
-							}
-							await revokeTrustGeneration(
-								ctx,
-								user.id,
-								factor.trustDeviceGeneration,
-							);
-							await adapter.delete({
-								model: opts.twoFactorTable,
-								where: [
-									{ field: "id", value: factor.id },
-									{ field: "trustDeviceGeneration", value: generation },
-								],
-							});
-							const updatedUser = await ctx.context.internalAdapter.updateUser(
-								user.id,
-								{
-									twoFactorEnabled: false,
-									twoFactorSessionGeneration: generateRandomString(32),
+									});
+									if (!authorized) twoFactorLifecycleConflict();
+
+									if (passkeyLifecycle) {
+										if (!observedPasskeyGeneration) twoFactorLifecycleConflict();
+										const rotatedUser = await rotatePasskeySessionGeneration(
+											adapter,
+											user.id,
+											observedPasskeyGeneration,
+											generateRandomString(32),
+										);
+										if (!rotatedUser) twoFactorLifecycleConflict();
+									} else if (twoFactorGenerationLifecycle) {
+										if (!observedTwoFactorGeneration) twoFactorLifecycleConflict();
+										const rotatedUser = await rotateTwoFactorSessionGeneration(
+											adapter,
+											user.id,
+											observedTwoFactorGeneration,
+											generateRandomString(32),
+										);
+										if (!rotatedUser) twoFactorLifecycleConflict();
+									}
+
+									if (
+										factor.trustDeviceGeneration &&
+										(!ctx.context.options.secondaryStorage ||
+											ctx.context.options.verification?.storeInDatabase === true)
+									) {
+										await adapter.deleteMany({
+											model: "verification",
+											where: [
+												{
+													field: "value",
+													value: `${user.id}!${factor.trustDeviceGeneration}`,
+												},
+											],
+										});
+									}
+									if (
+										factor.trustDeviceGeneration &&
+										ctx.context.options.secondaryStorage
+									) {
+										const marker = trustGenerationMarkerIdentifier(
+											user.id,
+											factor.trustDeviceGeneration,
+										);
+										await queueAfterTransactionHook(() =>
+											ctx.context.internalAdapter.deleteVerificationByIdentifier(
+												marker,
+											),
+										);
+									}
+
+									const deletedFactor = await adapter.consumeOne<TwoFactorTable>({
+										model: opts.twoFactorTable,
+										where: [
+											{ field: "id", value: factor.id },
+											{ field: "userId", value: user.id },
+											{ field: "trustDeviceGeneration", value: generation },
+										],
+									});
+									if (!deletedFactor) twoFactorLifecycleConflict();
+
+									const updatedUser = await ctx.context.internalAdapter.updateUser(
+										user.id,
+										{
+											twoFactorEnabled: false,
+											twoFactorSessionGeneration: generateRandomString(32),
+										},
+									);
+									if (!updatedUser) twoFactorLifecycleConflict();
+									await ctx.context.internalAdapter.deleteUserSessions(user.id);
+									const replacementSession =
+										await ctx.context.internalAdapter.createSession(
+											user.id,
+											false,
+											preserveSessionLifetime({
+												...ctx.context.session.session,
+												expiresAt: originalExpiresAt,
+											}),
+										);
+									if (
+										new Date(replacementSession.expiresAt).getTime() !==
+										originalExpiresAtMs
+									) {
+										twoFactorLifecycleConflict();
+									}
+									committedLifecycle = {
+										kind: "success" as const,
+										replacementSession,
+										updatedUser,
+									};
+									return committedLifecycle;
 								},
 							);
-							await ctx.context.internalAdapter.deleteUserSessions(user.id);
-							const replacementSession =
-								await ctx.context.internalAdapter.createSession(
-									user.id,
-									false,
-									preserveSessionLifetime(ctx.context.session.session),
+						} catch (error) {
+							if (error instanceof AfterTransactionHookError && committedLifecycle) {
+								logTwoFactorLifecycleFailure(
+									ctx,
+									"disable post-commit publication failed",
+									error,
 								);
-							return { replacementSession, updatedUser };
-						},
-					).catch(async (error) => {
-						await proof.restoreAttempt();
-						throw error;
-					});
-					await setSessionCookie(ctx, {
-						session: rotated.replacementSession,
-						user: rotated.updatedUser,
-					});
-					const disableTrustCookie = ctx.context.createAuthCookie(
-						TRUST_DEVICE_COOKIE_NAME,
-						{
-							maxAge: trustDeviceMaxAge,
-						},
-					);
-					expireCookie(ctx, disableTrustCookie);
-					return ctx.json({ status: true });
-				},
-			),
+								rotated = committedLifecycle;
+							} else {
+								throw error;
+							}
+						}
+						if (!rotated) twoFactorLifecycleConflict();
+						if (rotated.kind === "proof-error") throw rotated.error;
+						await setSessionCookie(ctx, {
+							session: rotated.replacementSession,
+							user: rotated.updatedUser,
+						});
+						const disableTrustCookie = ctx.context.createAuthCookie(
+							TRUST_DEVICE_COOKIE_NAME,
+							{
+								maxAge: trustDeviceMaxAge,
+							},
+						);
+						expireCookie(ctx, disableTrustCookie);
+						return ctx.json({ status: true });
+					},
+				),
 		},
-		options: options as NoInfer<O>,
+		// Runtime consumers such as cross-factor recovery must see the same
+		// effective storage contract used by this plugin, including defaults.
+		options: resolvedOptions,
 		hooks: {
 			after: [
 				{

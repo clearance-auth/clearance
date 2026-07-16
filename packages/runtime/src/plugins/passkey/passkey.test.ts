@@ -1,7 +1,11 @@
 import { base64Url } from "@clearance/utils/base64";
 import { describe, expect, it } from "vitest";
+import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { admin } from "../admin";
 import { passkey } from ".";
+import type { Passkey, PublicPasskey } from "./types";
+import { createVirtualAuthenticator } from "./virtual-authenticator.test-utils";
 
 const ORIGIN = "http://localhost:3300";
 
@@ -84,6 +88,315 @@ describe("passkey: transaction requirement", () => {
 		await expect(
 			context.adapter.count({ model: "passkeyChallenge" }),
 		).resolves.toBe(before);
+	});
+
+	it("fails before challenge, counter, session, or secondary mutation for secondary-authoritative sessions", async () => {
+		const store = new Map<string, string>();
+		let secondaryWrites = 0;
+		const instance = await getTestInstance(
+			{
+				baseURL: ORIGIN,
+				plugins: [passkey()],
+				secondaryStorage: {
+					get(key: string) {
+						return store.get(key) ?? null;
+					},
+					set(key: string, value: string) {
+						secondaryWrites++;
+						store.set(key, value);
+					},
+					delete(key: string) {
+						secondaryWrites++;
+						store.delete(key);
+					},
+				},
+			},
+			{ port: 3300 },
+		);
+		const signedIn = await instance.signInWithTestUser();
+		signedIn.headers.set("origin", ORIGIN);
+		const context = await instance.auth.$context;
+		const credential = await context.adapter.create<Passkey>({
+			model: "passkey",
+			data: {
+				userId: signedIn.user.id,
+				credentialID: `secondary-auth-${Math.random()}`,
+				publicKey: "unused-secondary-auth-key",
+				userHandle: `secondary-handle-${Math.random()}`,
+				counter: 0,
+				deviceType: "singleDevice",
+				backedUp: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const challengesBefore = await context.adapter.count({
+			model: "passkeyChallenge",
+		});
+		const writesBefore = secondaryWrites;
+
+		await expect(
+			instance.auth.api.generatePasskeyAuthenticationOptions({
+				headers: signedIn.headers,
+			}),
+		).rejects.toMatchObject({
+			status: "INTERNAL_SERVER_ERROR",
+			body: { code: "CONFIGURATION_ERROR" },
+		});
+		await expect(
+			instance.auth.api.verifyPasskeyAuthentication({
+				headers: signedIn.headers,
+				body: {
+					response: {
+						id: credential.credentialID,
+						rawId: credential.credentialID,
+						type: "public-key",
+						clientExtensionResults: {},
+						response: {
+							clientDataJSON: clientDataFor("webauthn.get", "unused"),
+							authenticatorData: base64Url.encode("unused", {
+								padding: false,
+							}),
+							signature: base64Url.encode("unused", { padding: false }),
+						},
+					},
+				},
+			}),
+		).rejects.toMatchObject({
+			status: "INTERNAL_SERVER_ERROR",
+			body: { code: "CONFIGURATION_ERROR" },
+		});
+
+		expect(secondaryWrites).toBe(writesBefore);
+		await expect(
+			context.adapter.count({ model: "passkeyChallenge" }),
+		).resolves.toBe(challengesBefore);
+		await expect(
+			context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [{ field: "id", value: credential.id }],
+			}),
+		).resolves.toMatchObject({ counter: 0 });
+	});
+
+	it("returns the committed session when a dual-write publication hook fails", async () => {
+		const store = new Map<string, string>();
+		let failSecondary = false;
+		const instance = await getTestInstance(
+			{
+				baseURL: ORIGIN,
+				session: { storeSessionInDatabase: true },
+				plugins: [passkey()],
+				secondaryStorage: {
+					get(key: string) {
+						if (failSecondary) throw new Error("injected secondary read failure");
+						return store.get(key) ?? null;
+					},
+					set(key: string, value: string) {
+						if (failSecondary) throw new Error("injected secondary write failure");
+						store.set(key, value);
+					},
+					delete(key: string) {
+						if (failSecondary) throw new Error("injected secondary delete failure");
+						store.delete(key);
+					},
+				},
+			},
+			{ port: 3300 },
+		);
+		const signedIn = await instance.signInWithTestUser();
+		signedIn.headers.set("origin", ORIGIN);
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const registrationOptions =
+			await instance.auth.api.generatePasskeyRegistrationOptions({
+				headers: signedIn.headers,
+			});
+		const registered = await instance.auth.api.verifyPasskeyRegistration({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.registrationResponse(registrationOptions.challenge),
+			},
+		});
+		const context = await instance.auth.$context;
+		const challengesBefore = await context.adapter.count({
+			model: "passkeyChallenge",
+		});
+		const sessionsBefore = await context.adapter.count({
+			model: "session",
+			where: [{ field: "userId", value: signedIn.user.id }],
+		});
+		const authenticationOptions =
+			await instance.auth.api.generatePasskeyAuthenticationOptions({
+				headers: signedIn.headers,
+			});
+		failSecondary = true;
+		const response = await instance.auth.api.verifyPasskeyAuthentication({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.authenticationResponse(
+					authenticationOptions.challenge,
+					registrationOptions.user.id,
+					1,
+				),
+			},
+			asResponse: true,
+		});
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("set-cookie")).toContain("session_token");
+		failSecondary = false;
+		const replacementHeaders = convertSetCookieToCookie(response.headers);
+		replacementHeaders.set("origin", ORIGIN);
+		await expect(
+			instance.auth.api.getSession({ headers: replacementHeaders }),
+		).resolves.not.toBeNull();
+		await expect(
+			instance.auth.api.getSession({ headers: signedIn.headers }),
+		).resolves.not.toBeNull();
+		await expect(
+			context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [{ field: "id", value: registered.id }],
+			}),
+		).resolves.toMatchObject({ counter: 1 });
+		await expect(
+			context.adapter.count({ model: "passkeyChallenge" }),
+		).resolves.toBe(challengesBefore);
+		await expect(
+			context.adapter.count({
+				model: "session",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			}),
+		).resolves.toBe(sessionsBefore + 1);
+	});
+
+	it("consumes a banned user's assertion without advancing authority or publishing a session", async () => {
+		let sessionCreateHooks = 0;
+		const instance = await getTestInstance(
+			{
+				baseURL: ORIGIN,
+				plugins: [admin(), passkey()],
+				databaseHooks: {
+					session: {
+						create: {
+							before: async () => {
+								sessionCreateHooks++;
+							},
+						},
+					},
+				},
+			},
+			{ port: 3300 },
+		);
+		const signedIn = await instance.signInWithTestUser();
+		signedIn.headers.set("origin", ORIGIN);
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const registrationOptions =
+			await instance.auth.api.generatePasskeyRegistrationOptions({
+				headers: signedIn.headers,
+			});
+		const registered = await instance.auth.api.verifyPasskeyRegistration({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.registrationResponse(registrationOptions.challenge),
+			},
+		});
+		const context = await instance.auth.$context;
+		await context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: signedIn.user.id }],
+			update: { banned: true },
+		});
+		const challengesBefore = await context.adapter.count({
+			model: "passkeyChallenge",
+		});
+		const sessionsBefore = await context.adapter.count({
+			model: "session",
+			where: [{ field: "userId", value: signedIn.user.id }],
+		});
+		const credentialsBefore = await context.adapter.count({
+			model: "sessionCredential",
+		});
+		sessionCreateHooks = 0;
+		const bannedOptions =
+			await instance.auth.api.generatePasskeyAuthenticationOptions({
+				headers: signedIn.headers,
+			});
+
+		const rejected = await instance.auth.api.verifyPasskeyAuthentication({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.authenticationResponse(
+					bannedOptions.challenge,
+					registrationOptions.user.id,
+					1,
+				),
+			},
+			asResponse: true,
+		});
+
+		expect(rejected.status).toBe(401);
+		expect(await rejected.json()).toMatchObject({ code: "AUTHENTICATION_FAILED" });
+		expect(rejected.headers.get("set-cookie")).toBeNull();
+		expect(sessionCreateHooks).toBe(0);
+		await expect(
+			context.adapter.count({ model: "passkeyChallenge" }),
+		).resolves.toBe(challengesBefore);
+		await expect(
+			context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [{ field: "id", value: registered.id }],
+			}),
+		).resolves.toMatchObject({ counter: 0 });
+		await expect(
+			context.adapter.count({
+				model: "session",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			}),
+		).resolves.toBe(sessionsBefore);
+		await expect(
+			context.adapter.count({ model: "sessionCredential" }),
+		).resolves.toBe(credentialsBefore);
+
+		await context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: signedIn.user.id }],
+			update: { banned: false },
+		});
+		const activeOptions =
+			await instance.auth.api.generatePasskeyAuthenticationOptions({
+				headers: signedIn.headers,
+			});
+		const authenticated = await instance.auth.api.verifyPasskeyAuthentication({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.authenticationResponse(
+					activeOptions.challenge,
+					registrationOptions.user.id,
+					2,
+				),
+			},
+			asResponse: true,
+		});
+
+		expect(authenticated.status).toBe(200);
+		expect(authenticated.headers.get("set-cookie")).toContain("session_token");
+		expect(sessionCreateHooks).toBe(1);
+		await expect(
+			context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [{ field: "id", value: registered.id }],
+			}),
+		).resolves.toMatchObject({ counter: 2 });
+		await expect(
+			context.adapter.count({
+				model: "session",
+				where: [{ field: "userId", value: signedIn.user.id }],
+			}),
+		).resolves.toBe(sessionsBefore + 1);
+		await expect(
+			context.adapter.count({ model: "sessionCredential" }),
+		).resolves.toBe(credentialsBefore + 1);
 	});
 });
 
@@ -243,7 +556,7 @@ describe("passkey: list redaction and ownership-scoped rename", () => {
 			expect(entry).not.toHaveProperty("counter");
 			expect(entry).not.toHaveProperty("userId");
 		}
-		const entry = list.find((p) => p.name === "My Key");
+		const entry = list.find((p: PublicPasskey) => p.name === "My Key");
 		expect(entry?.backedUp).toBe(true);
 		expect(entry?.deviceType).toBe("multiDevice");
 	});

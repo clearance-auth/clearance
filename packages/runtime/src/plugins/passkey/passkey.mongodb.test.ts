@@ -9,11 +9,12 @@ import {
 	createChallenge,
 } from "./challenge";
 import { advancePasskeyCounter } from "./counter";
+import { assertPasskeyDeletionLifecycleOnAdapter } from "./passkey.deletion.adapter-test-utils";
 
 const hasMongo = Boolean(process.env.CLEARANCE_TEST_MONGODB_URL);
 
 describe.skipIf(!hasMongo)("passkey MongoDB authority", () => {
-	it("enforces unique authorities and serializes challenge/counter claims", async () => {
+	it("enforces authority races and proves deletion success/rollback", async () => {
 		const { auth } = await getTestInstance(
 			{
 				baseURL: "http://localhost:3313",
@@ -111,5 +112,10 @@ describe.skipIf(!hasMongo)("passkey MongoDB authority", () => {
 			),
 		);
 		expect(counterClaims.filter(Boolean)).toHaveLength(1);
+
+		await assertPasskeyDeletionLifecycleOnAdapter(
+			auth,
+			"http://localhost:3313",
+		);
 	});
 });
