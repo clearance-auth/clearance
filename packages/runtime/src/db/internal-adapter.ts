@@ -48,6 +48,11 @@ import {
 } from "./session-credential";
 import { getSecondarySessionKeys } from "./session-credential-migration";
 import {
+	hasPasskeySessionGeneration,
+	PASSKEY_SESSION_GENERATION_FIELD,
+	sessionMatchesPasskeyGeneration,
+} from "./passkey-session-generation";
+import {
 	hasTwoFactorSessionGeneration,
 	sessionMatchesTwoFactorGeneration,
 	TWO_FACTOR_SESSION_GENERATION_FIELD,
@@ -93,8 +98,10 @@ export const createInternalAdapter = (
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
 	const bindsTwoFactorSessionGeneration =
 		hasTwoFactorSessionGeneration(options);
+	const bindsPasskeySessionGeneration = hasPasskeySessionGeneration(options);
 	const serializesUserCredentialAuthority =
 		storesSessionsInDatabase ||
+		bindsPasskeySessionGeneration ||
 		options.plugins?.some((plugin) => plugin.id === "admin") === true ||
 		options.user?.additionalFields?.banned !== undefined;
 
@@ -113,6 +120,15 @@ export const createInternalAdapter = (
 		oldDigest: string;
 		successorDigest: string;
 	};
+
+	const sessionMatchesSecurityGenerations = (
+		session: Record<string, unknown>,
+		user: Record<string, unknown>,
+	) =>
+		(!bindsTwoFactorSessionGeneration ||
+			sessionMatchesTwoFactorGeneration(session, user)) &&
+		(!bindsPasskeySessionGeneration ||
+			sessionMatchesPasskeyGeneration(session, user));
 
 	const secondaryCredentialKey = (digest: string) =>
 		secondarySessionKeys?.credential(digest) ?? `session-credential:${digest}`;
@@ -446,6 +462,15 @@ export const createInternalAdapter = (
 		);
 		if (!activeUser) return null;
 		const { user: _, ...session } = record;
+		if (
+			bindsPasskeySessionGeneration &&
+			!sessionMatchesPasskeyGeneration(
+				session as unknown as Record<string, unknown>,
+				activeUser as unknown as Record<string, unknown>,
+			)
+		) {
+			return null;
+		}
 		return {
 			session: { ...session, token: recovered.refreshToken },
 			user: activeUser,
@@ -569,6 +594,15 @@ export const createInternalAdapter = (
 			options?: { onlyActiveSessions?: boolean | undefined } | undefined,
 		) => {
 			if (secondaryStorage && !storesSessionsInDatabase) {
+				const currentUser = bindsPasskeySessionGeneration
+					? await (
+							await getCurrentAdapter(adapter)
+						).findOne<User>({
+							model: "user",
+							where: [{ field: "id", value: userId }],
+						})
+					: null;
+				if (bindsPasskeySessionGeneration && !currentUser) return [];
 				const currentList = await secondaryStorage.get(
 					secondaryActiveSessionsKey(userId),
 				);
@@ -617,7 +651,16 @@ export const createInternalAdapter = (
 							session: Session;
 							user: User;
 						};
-						if (!parsed?.session) continue;
+						if (
+							!parsed?.session ||
+							(bindsPasskeySessionGeneration &&
+								!sessionMatchesPasskeyGeneration(
+									parsed.session as unknown as Record<string, unknown>,
+									currentUser as unknown as Record<string, unknown>,
+								))
+						) {
+							continue;
+						}
 
 						sessions.push(
 							parseInternalSessionOutput(ctx.options, {
@@ -669,7 +712,20 @@ export const createInternalAdapter = (
 						: []),
 				],
 			});
-			return sessions;
+			if (!bindsPasskeySessionGeneration) return sessions;
+			const currentUser = await (
+				await getCurrentAdapter(adapter)
+			).findOne<User>({
+				model: "user",
+				where: [{ field: "id", value: userId }],
+			});
+			if (!currentUser) return [];
+			return sessions.filter((session) =>
+				sessionMatchesPasskeyGeneration(
+					session as unknown as Record<string, unknown>,
+					currentUser as unknown as Record<string, unknown>,
+				),
+			);
 		},
 		listUsers: async (
 			limit?: number | undefined,
@@ -740,11 +796,20 @@ export const createInternalAdapter = (
 				return ctx?.headers || ctx?.request?.headers;
 			})();
 			const storeInDb = options.session?.storeSessionInDatabase;
+			if (
+				serializesUserCredentialAuthority &&
+				typeof adapter.options?.adapterConfig.transaction !== "function"
+			) {
+				throw new Error(
+					"Session creation with serialized user authority requires an adapter with rollback-capable transactions",
+				);
+			}
 			const {
 				// Authority and identity fields are always derived by the runtime.
 				id: _discardedId,
 				token: _discardedToken,
 				userId: _discardedUserId,
+				[PASSKEY_SESSION_GENERATION_FIELD]: _discardedPasskeySessionGeneration,
 				__preserveSessionExpiresAt,
 				...rest
 			} = override || {};
@@ -768,76 +833,6 @@ export const createInternalAdapter = (
 
 			// we're parsing default values for session additional fields
 			const defaultAdditionalFields = getSessionDefaultFields(options);
-			let twoFactorSessionGeneration: string | undefined;
-			if (bindsTwoFactorSessionGeneration && secondaryStorage && !storeInDb) {
-				const user = await (
-					await getCurrentAdapter(adapter)
-				).findOne<Record<string, unknown>>({
-					model: "user",
-					where: [{ field: "id", value: userId }],
-				});
-				const generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
-				if (typeof generation === "string") {
-					twoFactorSessionGeneration = generation;
-				}
-			} else if (bindsTwoFactorSessionGeneration) {
-				twoFactorSessionGeneration = await runWithTransaction(
-					adapter,
-					async () => {
-						const currentAdapter = await getCurrentAdapter(adapter);
-						let user = await currentAdapter.findOne<Record<string, unknown>>({
-							model: "user",
-							where: [{ field: "id", value: userId }],
-						});
-						let generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
-						if (typeof generation !== "string") {
-							const proposed = generateId(32);
-							const initialized = await currentAdapter.incrementOne<
-								Record<string, unknown>
-							>({
-								model: "user",
-								where: [
-									{ field: "id", value: userId },
-									{
-										field: TWO_FACTOR_SESSION_GENERATION_FIELD,
-										value: null,
-									},
-								],
-								increment: {},
-								set: {
-									[TWO_FACTOR_SESSION_GENERATION_FIELD]: proposed,
-								},
-							});
-							if (initialized) {
-								await currentAdapter.updateMany({
-									model: "session",
-									where: [
-										{ field: "userId", value: userId },
-										{
-											field: TWO_FACTOR_SESSION_GENERATION_FIELD,
-											value: null,
-										},
-									],
-									update: {
-										[TWO_FACTOR_SESSION_GENERATION_FIELD]: proposed,
-									},
-								});
-								user = initialized;
-							} else {
-								user = await currentAdapter.findOne<Record<string, unknown>>({
-									model: "user",
-									where: [{ field: "id", value: userId }],
-								});
-							}
-							generation = user?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
-						}
-						if (typeof generation !== "string") {
-							throw new Error("Could not bind the session security generation");
-						}
-						return generation;
-					},
-				);
-			}
 			const policyExpiresAt = dontRememberMe
 				? getDate(60 * 60 * 24, "sec")
 				: getDate(sessionExpiration, "sec");
@@ -849,7 +844,10 @@ export const createInternalAdapter = (
 				inheritedExpiresAt < policyExpiresAt
 					? inheritedExpiresAt
 					: policyExpiresAt;
-			const data = {
+			const buildSessionData = (
+				twoFactorSessionGeneration?: string,
+				passkeySessionGeneration?: string,
+			) => ({
 				...(requestedSessionId ? { id: requestedSessionId } : {}),
 				ipAddress: headers ? getIp(headers, options) || "" : "",
 				userAgent: headers?.get("user-agent") || "",
@@ -880,14 +878,25 @@ export const createInternalAdapter = (
 						}
 					: {}),
 				...(overrideAll ? rest : {}),
-			} satisfies Partial<Session>;
-			const enforceSessionAuthority = (
-				hookedData: Partial<Session> & Record<string, any>,
-			) => {
+				...(passkeySessionGeneration
+					? {
+							[PASSKEY_SESSION_GENERATION_FIELD]: passkeySessionGeneration,
+						}
+					: {}),
+			}) satisfies Partial<Session>;
+			const enforceSessionAuthority = <
+				T extends Partial<Session> & Record<string, any>,
+			>(
+				hookedData: T,
+				twoFactorSessionGeneration?: string,
+				passkeySessionGeneration?: string,
+			): T => {
 				const {
 					id: _hookedId,
 					token: _hookedToken,
 					userId: _hookedUserId,
+					[TWO_FACTOR_SESSION_GENERATION_FIELD]: _hookedTwoFactorSessionGeneration,
+					[PASSKEY_SESSION_GENERATION_FIELD]: _hookedPasskeySessionGeneration,
 					...safeHookedData
 				} = hookedData;
 				return {
@@ -899,13 +908,42 @@ export const createInternalAdapter = (
 						: createSessionHandle(
 								requestedSessionId ?? credentialIdentity.selector,
 							),
-				};
+					...(twoFactorSessionGeneration
+						? {
+								[TWO_FACTOR_SESSION_GENERATION_FIELD]:
+									twoFactorSessionGeneration,
+							}
+						: {}),
+					...(passkeySessionGeneration
+						? {
+								[PASSKEY_SESSION_GENERATION_FIELD]: passkeySessionGeneration,
+							}
+						: {}),
+				} as T;
 			};
 			const persistSecondarySession = async (
 				sessionData: Record<string, any>,
 			) => {
 				if (!secondaryStorage) return sessionData;
 				const persistedSessionId = String(sessionData.id);
+				const persistedExpiresAt = new Date(sessionData.expiresAt);
+				const user = await (
+					await getCurrentAdapter(adapter)
+				).findOne<User>({
+					model: "user",
+					where: [{ field: "id", value: userId }],
+				});
+				if (
+					(bindsPasskeySessionGeneration || bindsTwoFactorSessionGeneration) &&
+					(!user ||
+						!sessionMatchesSecurityGenerations(
+							sessionData,
+							user as unknown as Record<string, unknown>,
+						))
+				) {
+					if (storesSessionsInDatabase) return sessionData;
+					throw new Error("Session security generation changed during creation");
+				}
 				/**
 				 * store the session token for the user
 				 * so we can retrieve it later for listing sessions
@@ -931,11 +969,11 @@ export const createInternalAdapter = (
 					{
 						sessionId: persistedSessionId,
 						credentialKey,
-						expiresAt: data.expiresAt.getTime(),
+						expiresAt: persistedExpiresAt.getTime(),
 					},
 				].sort((a, b) => a.expiresAt - b.expiresAt);
 				const furthestSessionExp =
-					sorted.at(-1)?.expiresAt ?? data.expiresAt.getTime();
+					sorted.at(-1)?.expiresAt ?? persistedExpiresAt.getTime();
 				const furthestSessionTTL = getTTLSeconds(furthestSessionExp, now);
 				if (furthestSessionTTL > 0) {
 					await secondaryStorage.set(
@@ -945,18 +983,7 @@ export const createInternalAdapter = (
 					);
 				}
 
-				const user = await (
-					await getCurrentAdapter(adapter)
-				).findOne<User>({
-					model: "user",
-					where: [
-						{
-							field: "id",
-							value: userId,
-						},
-					],
-				});
-				const sessionTTL = getTTLSeconds(data.expiresAt, now);
+				const sessionTTL = getTTLSeconds(persistedExpiresAt, now);
 				if (sessionTTL > 0) {
 					await secondaryStorage.set(
 						credentialKey,
@@ -977,16 +1004,145 @@ export const createInternalAdapter = (
 			};
 
 			const create = async () => {
+				let lockedUser: (User & Record<string, unknown>) | null = null;
 				if (serializesUserCredentialAuthority) {
 					const currentAdapter = await getCurrentAdapter(adapter);
-					const lockedUser = await lockAndReadUser(
+					lockedUser = await lockAndReadUser(
 						currentAdapter,
 						userId,
-					);
+					) as (User & Record<string, unknown>) | null;
 					if (!lockedUser) {
 						throw new Error("Cannot create a session for an unavailable user");
 					}
 				}
+				const currentAdapter = await getCurrentAdapter(adapter);
+				const authorityUser =
+					bindsTwoFactorSessionGeneration || bindsPasskeySessionGeneration
+						? (lockedUser ??
+							(await currentAdapter.findOne<User & Record<string, unknown>>({
+								model: "user",
+								where: [{ field: "id", value: userId }],
+							})))
+						: null;
+				if (
+					(bindsTwoFactorSessionGeneration || bindsPasskeySessionGeneration) &&
+					!authorityUser
+				) {
+					throw new Error("Cannot create a session for an unavailable user");
+				}
+
+				let twoFactorSessionGeneration: string | undefined;
+				if (bindsTwoFactorSessionGeneration) {
+					const currentGeneration =
+						authorityUser?.[TWO_FACTOR_SESSION_GENERATION_FIELD];
+					if (currentGeneration == null) {
+						if (storesSessionsInDatabase) {
+							twoFactorSessionGeneration = generateId(32);
+							const initialized = await currentAdapter.update<
+								Record<string, unknown>
+							>({
+								model: "user",
+								where: [{ field: "id", value: userId }],
+								update: {
+									[TWO_FACTOR_SESSION_GENERATION_FIELD]:
+										twoFactorSessionGeneration,
+								},
+							});
+							if (!initialized) {
+								throw new Error("Could not bind the session security generation");
+							}
+							await currentAdapter.updateMany({
+								model: "session",
+								where: [
+									{ field: "userId", value: userId },
+									{
+										field: TWO_FACTOR_SESSION_GENERATION_FIELD,
+										value: null,
+									},
+								],
+								update: {
+									[TWO_FACTOR_SESSION_GENERATION_FIELD]:
+										twoFactorSessionGeneration,
+								},
+							});
+						}
+					} else if (typeof currentGeneration === "string") {
+						twoFactorSessionGeneration = currentGeneration;
+					} else {
+						throw new Error("Could not bind the session security generation");
+					}
+				}
+
+				let passkeySessionGeneration: string | undefined;
+				if (bindsPasskeySessionGeneration) {
+					const currentGeneration =
+						authorityUser?.[PASSKEY_SESSION_GENERATION_FIELD];
+					if (currentGeneration == null) {
+						if (storesSessionsInDatabase) {
+							passkeySessionGeneration = generateId(32);
+							const initialized = await currentAdapter.update<
+								Record<string, unknown>
+							>({
+								model: "user",
+								where: [{ field: "id", value: userId }],
+								update: {
+									[PASSKEY_SESSION_GENERATION_FIELD]:
+										passkeySessionGeneration,
+								},
+							});
+							if (!initialized) {
+								throw new Error("Could not bind the passkey session generation");
+							}
+							await currentAdapter.updateMany({
+								model: "session",
+								where: [
+									{ field: "userId", value: userId },
+									{
+										field: PASSKEY_SESSION_GENERATION_FIELD,
+										value: null,
+									},
+								],
+								update: {
+									[PASSKEY_SESSION_GENERATION_FIELD]:
+										passkeySessionGeneration,
+								},
+							});
+						}
+					} else if (typeof currentGeneration === "string") {
+						passkeySessionGeneration = currentGeneration;
+					} else {
+						throw new Error("Could not bind the passkey session generation");
+					}
+				}
+				const data = buildSessionData(
+					twoFactorSessionGeneration,
+					passkeySessionGeneration,
+				);
+				const persistDatabaseSession =
+					bindsTwoFactorSessionGeneration || bindsPasskeySessionGeneration
+					? async (sessionData: Record<string, any>) => {
+							const currentUser = await currentAdapter.findOne<User>({
+								model: "user",
+								where: [{ field: "id", value: userId }],
+							});
+							if (
+								!currentUser ||
+								!sessionMatchesSecurityGenerations(
+									sessionData,
+									currentUser as unknown as Record<string, unknown>,
+								)
+							) {
+								throw new Error(
+									"Session security generation changed during creation",
+								);
+							}
+							return currentAdapter.create<Record<string, any>>({
+								model: "session",
+								data: sessionData,
+								forceAllowId: true,
+							});
+						}
+					: null;
 				// Dual-write (DB session + secondary cache): create only the primary
 				// session row here. Secondary active-index / credential / handle
 				// publication is deferred via queueAfterTransactionHook after the
@@ -1000,8 +1156,18 @@ export const createInternalAdapter = (
 								fn: persistSecondarySession,
 								executeMainFn: storeInDb,
 							}
-						: undefined,
-					enforceSessionAuthority,
+						: persistDatabaseSession
+							? {
+									fn: persistDatabaseSession,
+									executeMainFn: false,
+								}
+							: undefined,
+					(hookedData) =>
+						enforceSessionAuthority(
+							hookedData,
+							twoFactorSessionGeneration,
+							passkeySessionGeneration,
+						),
 				);
 				if (!res) {
 					throw new Error("Session creation was rejected by a database hook");
@@ -1035,95 +1201,84 @@ export const createInternalAdapter = (
 				};
 			};
 
-			if (
-				serializesUserCredentialAuthority &&
-				typeof adapter.options?.adapterConfig.transaction !== "function"
-			) {
-				throw new Error(
-					"Admin-aware session creation requires an adapter with rollback-capable transactions",
-				);
-			}
 			return storesSessionsInDatabase || serializesUserCredentialAuthority
 				? runWithTransaction(adapter, create)
 				: create();
 		},
 		findSession: async (
 			token: string,
-			): Promise<{
-				session: Session & Record<string, any>;
-				user: User & Record<string, any>;
-			} | null> => {
-				if (legacyCredentialAuthority && storesSessionsInDatabase) {
-					const record = await (
-						await getCurrentAdapter(adapter)
-					).findOne<SessionWithUser>({
-						model: "session",
-						where: [{ field: "token", value: token }],
-						join: { user: true },
-					});
-					if (!record?.user) return null;
-					const { user, ...session } = record;
-					if (
-						(user as User & { banned?: boolean | null }).banned === true ||
-						(bindsTwoFactorSessionGeneration &&
-							!sessionMatchesTwoFactorGeneration(
-								session as Record<string, unknown>,
-								user as unknown as Record<string, unknown>,
-							))
-					) {
-						return null;
-					}
-					return {
-						session: parseInternalSessionOutput(ctx.options, session),
-						user: parseUserOutput(ctx.options, user),
-					};
+		): Promise<{
+			session: Session & Record<string, any>;
+			user: User & Record<string, any>;
+		} | null> => {
+			if (legacyCredentialAuthority && storesSessionsInDatabase) {
+				const record = await (
+					await getCurrentAdapter(adapter)
+				).findOne<SessionWithUser>({
+					model: "session",
+					where: [{ field: "token", value: token }],
+					join: { user: true },
+				});
+				if (!record?.user) return null;
+				const { user, ...session } = record;
+				if (
+					(user as User & { banned?: boolean | null }).banned === true ||
+					!sessionMatchesSecurityGenerations(
+						session as Record<string, unknown>,
+						user as unknown as Record<string, unknown>,
+					)
+				) {
+					return null;
 				}
-				if (secondaryStorage && !storesSessionsInDatabase) {
+				return {
+					session: parseInternalSessionOutput(ctx.options, session),
+					user: parseUserOutput(ctx.options, user),
+				};
+			}
+
+			if (secondaryStorage && !storesSessionsInDatabase) {
 				const digest = await digestSessionRefreshSecret(token);
 				const credentialKey = secondaryCredentialKey(digest);
 				const sessionStringified =
 					await secondaryStorage.get(credentialKey);
 				if (!sessionStringified) return null;
-				if (sessionStringified) {
-					const s = safeJSONParse<{
-						session: Session;
-						user: User;
-					}>(sessionStringified);
-					if (!s) return null;
-					const currentUser = await (
-						await getCurrentAdapter(adapter)
-					).findOne<User & { banned?: boolean | null }>({
-						model: "user",
-						where: [{ field: "id", value: s.user.id }],
-					});
-					if (
-						!currentUser ||
-						currentUser.banned === true ||
-						(bindsTwoFactorSessionGeneration &&
-							!sessionMatchesTwoFactorGeneration(
-								s.session as unknown as Record<string, unknown>,
-								currentUser,
-							))
-					) {
-						await secondaryStorage.delete(credentialKey);
-						return null;
-					}
-					const parsedSession = parseInternalSessionOutput(ctx.options, {
-						...s.session,
-						expiresAt: new Date(s.session.expiresAt),
-						createdAt: new Date(s.session.createdAt),
-						updatedAt: new Date(s.session.updatedAt),
-					});
-					const parsedUser = parseUserOutput(ctx.options, {
-						...currentUser,
-						createdAt: new Date(currentUser.createdAt),
-						updatedAt: new Date(currentUser.updatedAt),
-					});
-					return {
-						session: { ...parsedSession, token },
-						user: parsedUser,
-					};
+				const stored = safeJSONParse<{
+					session: Session;
+					user: User;
+				}>(sessionStringified);
+				if (!stored) return null;
+				const currentUser = await (
+					await getCurrentAdapter(adapter)
+				).findOne<User & { banned?: boolean | null }>({
+					model: "user",
+					where: [{ field: "id", value: stored.user.id }],
+				});
+				if (
+					!currentUser ||
+					currentUser.banned === true ||
+					!sessionMatchesSecurityGenerations(
+						stored.session as unknown as Record<string, unknown>,
+						currentUser,
+					)
+				) {
+					await secondaryStorage.delete(credentialKey);
+					return null;
 				}
+				const parsedSession = parseInternalSessionOutput(ctx.options, {
+					...stored.session,
+					expiresAt: new Date(stored.session.expiresAt),
+					createdAt: new Date(stored.session.createdAt),
+					updatedAt: new Date(stored.session.updatedAt),
+				});
+				const parsedUser = parseUserOutput(ctx.options, {
+					...currentUser,
+					createdAt: new Date(currentUser.createdAt),
+					updatedAt: new Date(currentUser.updatedAt),
+				});
+				return {
+					session: { ...parsedSession, token },
+					user: parsedUser,
+				};
 			}
 
 			const result = await findDatabaseSessionByCredential(token);
@@ -1131,19 +1286,16 @@ export const createInternalAdapter = (
 			const { user, session } = result;
 			if (
 				(user as User & { banned?: boolean | null }).banned === true ||
-				(bindsTwoFactorSessionGeneration &&
-					!sessionMatchesTwoFactorGeneration(
-						session as Record<string, unknown>,
-						user as unknown as Record<string, unknown>,
-					))
+				!sessionMatchesSecurityGenerations(
+					session as Record<string, unknown>,
+					user as unknown as Record<string, unknown>,
+				)
 			) {
 				return null;
 			}
-			const parsedSession = parseInternalSessionOutput(ctx.options, session);
-			const parsedUser = parseUserOutput(ctx.options, user);
 			return {
-				session: parsedSession,
-				user: parsedUser,
+				session: parseInternalSessionOutput(ctx.options, session),
+				user: parseUserOutput(ctx.options, user),
 			};
 		},
 		findSessionById: async (sessionId: string) => {
@@ -1156,6 +1308,25 @@ export const createInternalAdapter = (
 				const serialized = await secondaryStorage.get(credentialKey);
 				const parsed = safeJSONParse<{ session: Session; user: User }>(serialized);
 				if (!parsed) return null;
+				if (bindsPasskeySessionGeneration) {
+					const currentUser = await (
+						await getCurrentAdapter(adapter)
+					).findOne<User>({
+						model: "user",
+						where: [{ field: "id", value: parsed.user.id }],
+					});
+					if (
+						!currentUser ||
+						!sessionMatchesPasskeyGeneration(
+							parsed.session as unknown as Record<string, unknown>,
+							currentUser as unknown as Record<string, unknown>,
+						)
+					) {
+						await secondaryStorage.delete(credentialKey);
+						return null;
+					}
+					parsed.user = currentUser;
+				}
 				return {
 					session: parseInternalSessionOutput(ctx.options, {
 						...parsed.session,
@@ -1170,16 +1341,25 @@ export const createInternalAdapter = (
 					}),
 				};
 			}
-				const record = await findSessionRecordById(sessionId);
-				if (!record?.user) return null;
-				if (legacyCredentialAuthority) {
-					const { user, ...session } = record;
-					return {
-						session: parseInternalSessionOutput(ctx.options, session),
-						user: parseUserOutput(ctx.options, user),
-					};
-				}
-				const credentials = await (
+			const record = await findSessionRecordById(sessionId);
+			if (!record?.user) return null;
+			const { user, ...session } = record;
+			if (
+				bindsPasskeySessionGeneration &&
+				!sessionMatchesPasskeyGeneration(
+					session as unknown as Record<string, unknown>,
+					user as unknown as Record<string, unknown>,
+				)
+			) {
+				return null;
+			}
+			if (legacyCredentialAuthority) {
+				return {
+					session: parseInternalSessionOutput(ctx.options, session),
+					user: parseUserOutput(ctx.options, user),
+				};
+			}
+			const credentials = await (
 				await getCurrentAdapter(adapter)
 			).findMany<SessionCredential>({
 				model: SESSION_CREDENTIAL_MODEL,
@@ -1190,18 +1370,17 @@ export const createInternalAdapter = (
 				limit: 1,
 			});
 			if (!credentials[0] || credentials[0].expiresAt <= new Date()) return null;
-			const { user, ...session } = record;
 			return {
 				session: parseInternalSessionOutput(ctx.options, session),
 				user: parseUserOutput(ctx.options, user),
 			};
 		},
 		recoverSessionCredential: async (
-				token: string,
-				idempotencyKey: string,
-			) => {
-				if (legacyCredentialAuthority) return null;
-				if (!storesSessionsInDatabase) return null;
+			token: string,
+			idempotencyKey: string,
+		) => {
+			if (legacyCredentialAuthority) return null;
+			if (!storesSessionsInDatabase) return null;
 			const operationKey = parseCredentialOperationKey(idempotencyKey);
 			if (!operationKey) return null;
 			const recovered = await runWithTransaction(adapter, async () => {
@@ -1234,14 +1413,14 @@ export const createInternalAdapter = (
 			if (!recovered) return null;
 			const { oldDigest: _, successorDigest: __, ...result } = recovered;
 			return result;
-			},
-			rotateSessionCredential: async (token: string, idempotencyKey?: string) => {
-				if (legacyCredentialAuthority) {
-					throw new Error(
-						"Session credential rotation is unavailable during the legacy bridge generation",
-					);
-				}
-				if (!storesSessionsInDatabase) {
+		},
+		rotateSessionCredential: async (token: string, idempotencyKey?: string) => {
+			if (legacyCredentialAuthority) {
+				throw new Error(
+					"Session credential rotation is unavailable during the legacy bridge generation",
+				);
+			}
+			if (!storesSessionsInDatabase) {
 				throw new Error(
 					"Session credential rotation requires database-backed sessions with transactional compare-and-swap support",
 				);
@@ -1308,6 +1487,16 @@ export const createInternalAdapter = (
 					record.user.id,
 				);
 				if (!activeUser) return null;
+				const { user: _, ...session } = record;
+				if (
+					bindsPasskeySessionGeneration &&
+					!sessionMatchesPasskeyGeneration(
+						session as unknown as Record<string, unknown>,
+						activeUser as unknown as Record<string, unknown>,
+					)
+				) {
+					return null;
+				}
 
 				const [derivedSuccessor] = await deriveRotationSuccessors(
 					credential,
@@ -1382,7 +1571,6 @@ export const createInternalAdapter = (
 						},
 					});
 				}
-				const { user: _, ...session } = record;
 				return {
 					session: { ...session, token: successorSecret },
 					user: activeUser,

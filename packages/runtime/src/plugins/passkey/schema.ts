@@ -9,12 +9,28 @@ import type { ClearancePluginDBSchema } from "@clearance/core/db";
 export const schema = {
 	user: {
 		fields: {
+			passkeySessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			},
 			passkeyUserHandle: {
 				type: "string",
 				required: false,
 				input: false,
 				returned: false,
 				unique: true,
+			},
+		},
+	},
+	session: {
+		fields: {
+			passkeySessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
 			},
 		},
 	},

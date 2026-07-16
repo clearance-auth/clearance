@@ -19,6 +19,7 @@ import {
 	verifyJWT,
 } from "../crypto/jwt";
 import { parseSessionOutput, parseUserOutput } from "../db/schema";
+import { PASSKEY_SESSION_GENERATION_FIELD } from "../db/passkey-session-generation";
 import { TWO_FACTOR_SESSION_GENERATION_FIELD } from "../db/two-factor-session-generation";
 import type { Session, User } from "../types";
 import { getDate } from "../utils/date";
@@ -182,6 +183,21 @@ export async function setCookieCache(
 		(filteredUser as Record<string, unknown>)[
 			TWO_FACTOR_SESSION_GENERATION_FIELD
 		] = userGeneration;
+	}
+	const passkeySessionGeneration = (
+		session.session as unknown as Record<string, unknown>
+	)[PASSKEY_SESSION_GENERATION_FIELD];
+	if (typeof passkeySessionGeneration === "string") {
+		(filteredSession as Record<string, unknown>)[
+			PASSKEY_SESSION_GENERATION_FIELD
+		] = passkeySessionGeneration;
+	}
+	const passkeyUserGeneration = (
+		session.user as unknown as Record<string, unknown>
+	)[PASSKEY_SESSION_GENERATION_FIELD];
+	if (typeof passkeyUserGeneration === "string") {
+		(filteredUser as Record<string, unknown>)[PASSKEY_SESSION_GENERATION_FIELD] =
+			passkeyUserGeneration;
 	}
 
 	const versionConfig = ctx.context.options.session?.cookieCache?.version;
