@@ -3,6 +3,7 @@ import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@clearance/core/api";
+import { getCurrentAdapter } from "@clearance/core/context";
 import type { Account, User } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { generateId } from "@clearance/core/utils/id";
@@ -242,7 +243,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 											await validateUsername(
 												username,
 												displayUsername,
-												ctx.adapter,
+												await getCurrentAdapter(ctx.adapter),
 											);
 										}
 
@@ -292,7 +293,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 											await validateUsername(
 												username,
 												displayUsername,
-												ctx.adapter,
+												await getCurrentAdapter(ctx.adapter),
 												currentUserId,
 											);
 										}

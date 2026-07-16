@@ -2,10 +2,17 @@ import type { ClearanceOptions } from "@clearance/core";
 import {
 	getCurrentAdapter,
 	getCurrentAuthContext,
+	isTransactionActive,
 	queueAfterTransactionHook,
+	queueBeforeTransactionCommitHook,
+	runWithTransaction,
 } from "@clearance/core/context";
 import type { BaseModelNames } from "@clearance/core/db";
-import type { DBAdapter, Where } from "@clearance/core/db/adapter";
+import type {
+	DBAdapter,
+	DBTransactionAdapter,
+	Where,
+} from "@clearance/core/db/adapter";
 import type { InternalLogger } from "@clearance/core/env";
 import {
 	ATTR_CONTEXT,
@@ -20,6 +27,13 @@ export type DatabaseHooksEntry = {
 	failureMode?: "observe" | "rollback" | undefined;
 };
 
+type CustomMutation<Input> = {
+	fn: (input: Input, adapter: DBTransactionAdapter) => void | Promise<any>;
+	executeMainFn?: boolean | undefined;
+	/** The callback performs database work only through the supplied adapter. */
+	usesTransactionAdapter?: true | undefined;
+};
+
 export function getWithHooks(
 	adapter: DBAdapter<ClearanceOptions>,
 	ctx: {
@@ -29,6 +43,32 @@ export function getWithHooks(
 	},
 ) {
 	const hooksEntries = ctx.hooks;
+
+	function hasRollbackAfterHook(
+		model: BaseModelNames,
+		operation: "create" | "update" | "delete",
+	): boolean {
+		return hooksEntries.some(
+			({ hooks, failureMode }) =>
+				failureMode === "rollback" && Boolean(hooks[model]?.[operation]?.after),
+		);
+	}
+
+	function assertRollbackSafeCustomMutation(
+		model: BaseModelNames,
+		operation: "create" | "update" | "delete",
+		customMutation: CustomMutation<any> | undefined,
+	): void {
+		if (
+			customMutation &&
+			hasRollbackAfterHook(model, operation) &&
+			customMutation.usesTransactionAdapter !== true
+		) {
+			throw new Error(
+				`Rollback-critical ${model}.${operation} hooks require custom mutations to use the supplied transaction adapter`,
+			);
+		}
+	}
 
 	async function queuePublicAfterHook(
 		model: BaseModelNames,
@@ -48,7 +88,9 @@ export function getWithHooks(
 				run,
 			);
 		if (failureMode === "rollback") {
-			await execute();
+			await queueBeforeTransactionCommitHook(async () => {
+				await execute();
+			});
 			return;
 		}
 		await queueAfterTransactionHook(async () => {
@@ -68,14 +110,15 @@ export function getWithHooks(
 	async function createWithHooks<T extends Record<string, any>>(
 		data: T,
 		model: BaseModelNames,
-		customCreateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
+		customCreateFn?: CustomMutation<Record<string, any>> | undefined,
 		enforceData?: ((data: T) => T) | undefined,
-	) {
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "create", customCreateFn);
+		if (hasRollbackAfterHook(model, "create") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				createWithHooks(data, model, customCreateFn, enforceData),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 		for (const { source, hooks } of hooksEntries) {
@@ -115,7 +158,10 @@ export function getWithHooks(
 			});
 		}
 		if (customCreateFn?.fn) {
-			created = await customCreateFn.fn(created ?? actualData);
+			created = await customCreateFn.fn(
+				created ?? actualData,
+				await getCurrentAdapter(adapter),
+			);
 		}
 
 		for (const { source, hooks, failureMode } of hooksEntries) {
@@ -135,14 +181,15 @@ export function getWithHooks(
 		data: any,
 		where: Where[],
 		model: BaseModelNames,
-		customUpdateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
+		customUpdateFn?: CustomMutation<Record<string, any>> | undefined,
 		enforceData?: ((data: T) => T) | undefined,
-	) {
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
+		if (hasRollbackAfterHook(model, "update") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				updateWithHooks(data, where, model, customUpdateFn, enforceData),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 
@@ -175,7 +222,7 @@ export function getWithHooks(
 		actualData = enforceData ? enforceData(actualData) : actualData;
 
 		const customUpdated = customUpdateFn
-			? await customUpdateFn.fn(actualData)
+			? await customUpdateFn.fn(actualData, await getCurrentAdapter(adapter))
 			: null;
 
 		const updated =
@@ -203,13 +250,14 @@ export function getWithHooks(
 		data: any,
 		where: Where[],
 		model: BaseModelNames,
-		customUpdateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customUpdateFn?: CustomMutation<Record<string, any>> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
+		if (hasRollbackAfterHook(model, "update") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				updateManyWithHooks(data, where, model, customUpdateFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 
@@ -241,7 +289,7 @@ export function getWithHooks(
 		}
 
 		const customUpdated = customUpdateFn
-			? await customUpdateFn.fn(actualData)
+			? await customUpdateFn.fn(actualData, await getCurrentAdapter(adapter))
 			: null;
 
 		const updated =
@@ -269,13 +317,14 @@ export function getWithHooks(
 	async function deleteWithHooks<T extends Record<string, any>>(
 		where: Where[],
 		model: BaseModelNames,
-		customDeleteFn?:
-			| {
-					fn: (where: Where[]) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customDeleteFn?: CustomMutation<Where[]> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
+		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				deleteWithHooks(where, model, customDeleteFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let entityToDelete: T | null = null;
 
@@ -313,7 +362,7 @@ export function getWithHooks(
 		}
 
 		const customDeleted = customDeleteFn
-			? await customDeleteFn.fn(where)
+			? await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
 			: null;
 
 		const shouldRunAdapterDelete =
@@ -344,13 +393,14 @@ export function getWithHooks(
 	async function deleteManyWithHooks<T extends Record<string, any>>(
 		where: Where[],
 		model: BaseModelNames,
-		customDeleteFn?:
-			| {
-					fn: (where: Where[]) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customDeleteFn?: CustomMutation<Where[]> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
+		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				deleteManyWithHooks(where, model, customDeleteFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let entitiesToDelete: T[] = [];
 
@@ -386,7 +436,7 @@ export function getWithHooks(
 		}
 
 		const customDeleted = customDeleteFn
-			? await customDeleteFn.fn(where)
+			? await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
 			: null;
 
 		const deleted =
@@ -431,9 +481,14 @@ export function getWithHooks(
 	async function consumeOneWithHooks<T extends Record<string, any>>(
 		model: BaseModelNames,
 		hookWhere: Where[],
-		consumeFn: () => Promise<T | null>,
+		consumeFn: (adapter: DBTransactionAdapter) => Promise<T | null>,
 		preSnapshot?: T | null,
 	): Promise<T | null> {
+		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+			return runWithTransaction(adapter, () =>
+				consumeOneWithHooks(model, hookWhere, consumeFn, preSnapshot),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		const beforeHooks = hooksEntries.flatMap(({ source, hooks }) => {
 			const fn = hooks[model]?.delete?.before;
@@ -473,7 +528,7 @@ export function getWithHooks(
 			}
 		}
 
-		const consumed = await consumeFn();
+		const consumed = await consumeFn(await getCurrentAdapter(adapter));
 		if (!consumed) return null;
 
 		for (const { source, hooks, failureMode } of hooksEntries) {

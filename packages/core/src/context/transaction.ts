@@ -8,9 +8,40 @@ type StoredAdapter = DBTransactionAdapter<ClearanceOptions>;
 
 type HookContext = {
 	adapter: StoredAdapter;
+	pendingBeforeCommitHooks: Array<() => Promise<void>>;
 	pendingHooks: Array<() => Promise<void>>;
 	isTransactionActive: boolean;
 };
+
+/**
+ * The database transaction committed, but one or more best-effort publication
+ * hooks failed afterward. Callers that retain the committed result may recover
+ * without confusing this boundary with a rollback or commit failure.
+ */
+export class AfterTransactionHookError extends Error {
+	readonly errors: readonly unknown[];
+
+	constructor(errors: readonly unknown[]) {
+		super("One or more after-transaction hooks failed", {
+			cause: errors[0],
+		});
+		this.name = "AfterTransactionHookError";
+		this.errors = errors;
+	}
+}
+
+/** A non-transactional operation completed, then one or more hooks failed. */
+export class AfterOperationHookError extends Error {
+	readonly errors: readonly unknown[];
+
+	constructor(errors: readonly unknown[]) {
+		super("One or more after-operation hooks failed", {
+			cause: errors[0],
+		});
+		this.name = "AfterOperationHookError";
+		this.errors = errors;
+	}
+}
 
 const ensureAsyncStorage = async () => {
 	const clearanceGlobal = __getClearanceGlobal();
@@ -29,6 +60,14 @@ const ensureAsyncStorage = async () => {
  */
 export const getCurrentDBAdapterAsyncLocalStorage = async () => {
 	return ensureAsyncStorage();
+};
+
+export const isTransactionActive = async (): Promise<boolean> => {
+	try {
+		return (await ensureAsyncStorage()).getStore()?.isTransactionActive === true;
+	} catch {
+		return false;
+	}
 };
 
 export const getCurrentAdapter = async <
@@ -60,6 +99,10 @@ export const runWithAdapter = async <
 	return ensureAsyncStorage()
 		.then(async (als) => {
 			called = true;
+			const activeStore = als.getStore();
+			if (activeStore?.isTransactionActive) {
+				return fn();
+			}
 			const pendingHooks: Array<() => Promise<void>> = [];
 			let result: Awaited<R>;
 			let error: unknown;
@@ -68,6 +111,7 @@ export const runWithAdapter = async <
 				result = await als.run(
 					{
 						adapter: adapter as unknown as StoredAdapter,
+						pendingBeforeCommitHooks: [],
 						pendingHooks,
 						isTransactionActive: false,
 					},
@@ -81,8 +125,16 @@ export const runWithAdapter = async <
 			if (hasError) {
 				throw error;
 			}
+			const hookErrors: unknown[] = [];
 			for (const hook of pendingHooks) {
-				await hook();
+				try {
+					await hook();
+				} catch (error) {
+					hookErrors.push(error);
+				}
+			}
+			if (hookErrors.length > 0) {
+				throw new AfterOperationHookError(hookErrors);
 			}
 			return result!;
 		})
@@ -101,14 +153,13 @@ export const runWithTransaction = async <
 	adapter: DBAdapter<Options>,
 	fn: () => R,
 ): Promise<R> => {
-	let called = false;
 	return ensureAsyncStorage()
 		.then(async (als) => {
-			called = true;
 			const store = als.getStore();
 			if (store?.isTransactionActive) {
 				return fn();
 			}
+			const pendingBeforeCommitHooks: Array<() => Promise<void>> = [];
 			const pendingHooks: Array<() => Promise<void>> = [];
 			let result: Awaited<R>;
 			let error: unknown;
@@ -118,10 +169,17 @@ export const runWithTransaction = async <
 					return als.run(
 						{
 							adapter: trx as unknown as StoredAdapter,
+							pendingBeforeCommitHooks,
 							pendingHooks,
 							isTransactionActive: true,
 						},
-						fn,
+						async () => {
+							const transactionResult = await fn();
+							for (const hook of pendingBeforeCommitHooks) {
+								await hook();
+							}
+							return transactionResult;
+						},
 					);
 				});
 			} catch (e) {
@@ -131,17 +189,42 @@ export const runWithTransaction = async <
 			if (hasError) {
 				throw error;
 			}
+			const hookErrors: unknown[] = [];
 			for (const hook of pendingHooks) {
-				await hook();
+				try {
+					await hook();
+				} catch (error) {
+					hookErrors.push(error);
+				}
+			}
+			if (hookErrors.length > 0) {
+				throw new AfterTransactionHookError(hookErrors);
 			}
 			return result!;
-		})
-		.catch((err) => {
-			if (!called) {
-				return fn();
-			}
-			throw err;
 		});
+};
+
+/**
+ * Queue rollback-critical work after the transaction body succeeds and before
+ * the adapter commits. A hook failure rejects the transaction callback so the
+ * database rolls back. Outside a transaction the hook executes immediately.
+ */
+export const queueBeforeTransactionCommitHook = async (
+	hook: () => Promise<void>,
+): Promise<void> => {
+	let als: AsyncLocalStorage<HookContext>;
+	try {
+		als = await ensureAsyncStorage();
+	} catch {
+		return hook();
+	}
+
+	const store = als.getStore();
+	if (store?.isTransactionActive) {
+		store.pendingBeforeCommitHooks.push(hook);
+		return;
+	}
+	await hook();
 };
 
 /**

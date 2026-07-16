@@ -9,7 +9,11 @@ import {
 	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
-import type { DBAdapter, Where } from "@clearance/core/db/adapter";
+import type {
+	DBAdapter,
+	DBTransactionAdapter,
+	Where,
+} from "@clearance/core/db/adapter";
 import type { InternalLogger } from "@clearance/core/env";
 import { generateId } from "@clearance/core/utils/id";
 import { getIp } from "@clearance/core/utils/ip";
@@ -1120,8 +1124,11 @@ export const createInternalAdapter = (
 				);
 				const persistDatabaseSession =
 					bindsTwoFactorSessionGeneration || bindsPasskeySessionGeneration
-					? async (sessionData: Record<string, any>) => {
-							const currentUser = await currentAdapter.findOne<User>({
+					? async (
+							sessionData: Record<string, any>,
+							transactionAdapter: DBTransactionAdapter,
+						) => {
+							const currentUser = await transactionAdapter.findOne<User>({
 								model: "user",
 								where: [{ field: "id", value: userId }],
 							});
@@ -1136,7 +1143,7 @@ export const createInternalAdapter = (
 									"Session security generation changed during creation",
 								);
 							}
-							return currentAdapter.create<Record<string, any>>({
+							return transactionAdapter.create<Record<string, any>>({
 								model: "session",
 								data: sessionData,
 								forceAllowId: true,
@@ -1160,6 +1167,7 @@ export const createInternalAdapter = (
 							? {
 									fn: persistDatabaseSession,
 									executeMainFn: false,
+									usesTransactionAdapter: true,
 								}
 							: undefined,
 					(hookedData) =>
@@ -2535,13 +2543,13 @@ export const createInternalAdapter = (
 							return consumeOneWithHooks<Verification>(
 								"verification",
 								[{ field: "id", value: latest.id }],
-								async () => {
-									const row = await txAdapter.consumeOne<Verification>({
+								async (transactionAdapter) => {
+									const row = await transactionAdapter.consumeOne<Verification>({
 										model: "verification",
 										where: [{ field: "id", value: latest.id }],
 									});
 									if (!row) return null;
-									await txAdapter.deleteMany({
+									await transactionAdapter.deleteMany({
 										model: "verification",
 										where,
 									});

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAuthClient } from "../../client";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { USERNAME_ERROR_CODES, username } from "../username";
@@ -124,6 +124,43 @@ describe("admin + username plugin interaction", async () => {
 		};
 		expect(user.username).toBe("testuser3");
 		expect(user.displayUsername).toBe("TestUser3");
+	});
+
+	it("should validate username through the active transaction adapter", async () => {
+		const context = await auth.$context;
+		const originalFindOne = context.adapter.findOne.bind(context.adapter);
+		let baseUsernameReads = 0;
+		const findOneSpy = vi
+			.spyOn(context.adapter, "findOne")
+			.mockImplementation(async (query) => {
+				if (
+					query.model === "user" &&
+					query.where?.some((condition) => condition.field === "username")
+				) {
+					baseUsernameReads += 1;
+					throw new Error("username validation escaped the active transaction");
+				}
+				return originalFindOne(query);
+			});
+
+		try {
+			const result = await auth.api.createUser({
+				body: {
+					email: "transaction-user@example.com",
+					password: "some-secure-password",
+					name: "Transaction User",
+					role: "user",
+					data: { username: "TransactionUser" },
+				},
+			});
+
+			expect(
+				(result.user as typeof result.user & { username: string }).username,
+			).toBe("transactionuser");
+			expect(baseUsernameReads).toBe(0);
+		} finally {
+			findOneSpy.mockRestore();
+		}
 	});
 
 	it("should validate username format when creating user via admin endpoint", async () => {
