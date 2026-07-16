@@ -19,6 +19,7 @@ import {
 import { getSessionQuerySchema } from "../../cookies/session-store";
 import { symmetricDecodeJWT, verifyJWT } from "../../crypto";
 import { parseSessionOutput, parseUserOutput } from "../../db";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import type { Prettify, Session, User } from "../../types";
 import { getDate } from "../../utils/date";
 import { isAPIError } from "../../utils/is-api-error";
@@ -102,6 +103,16 @@ export const getSession = <Option extends ClearanceOptions>() =>
 				if (!sessionCookieToken) {
 					return null;
 				}
+				const managedAuthenticationPolicy = Boolean(
+					readInternalAuthenticationPolicy(ctx.context.options),
+				);
+				let authoritativeSession:
+					| {
+							session: Session & Record<string, any>;
+							user: User & Record<string, any>;
+					  }
+					| null
+					| undefined;
 				const rawOperationKey = ctx.headers?.get("idempotency-key");
 				const idempotencyKey = parseCredentialOperationKey(rawOperationKey);
 				if (rawOperationKey != null && !idempotencyKey) {
@@ -260,17 +271,29 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					ctx.context.options.session?.cookieCache?.enabled &&
 					!ctx.query?.disableCookieCache
 				) {
-					const session = sessionDataPayload.session;
+					const cachedSession = sessionDataPayload.session;
+					const hasSessionStore = hasServerSessionStore(ctx.context.options);
+					if (hasSessionStore) {
+						authoritativeSession =
+							await ctx.context.internalAdapter.findSession(sessionCookieToken);
+					}
+					const session =
+						managedAuthenticationPolicy && authoritativeSession
+							? {
+									...cachedSession,
+									session: authoritativeSession.session,
+									user: authoritativeSession.user,
+								}
+							: cachedSession;
 					const storedSessionIsCurrent =
-						!hasServerSessionStore(ctx.context.options) ||
-						Boolean(
-							await ctx.context.internalAdapter.findSession(sessionCookieToken),
-						);
+						!hasSessionStore || Boolean(authoritativeSession);
 					const hasAdminAuthority = ctx.context.options.plugins?.some(
 						(plugin) => plugin.id === "admin",
 					) === true;
 					const liveUser = hasAdminAuthority
-						? await ctx.context.internalAdapter.findUserById(session.user.id)
+						? managedAuthenticationPolicy
+							? (authoritativeSession?.user ?? null)
+							: await ctx.context.internalAdapter.findUserById(session.user.id)
 						: null;
 					const cachedSessionIsCurrent =
 						storedSessionIsCurrent &&
@@ -441,7 +464,9 @@ export const getSession = <Option extends ClearanceOptions>() =>
 				}
 
 				const session =
-					await ctx.context.internalAdapter.findSession(sessionCookieToken);
+					authoritativeSession !== undefined
+						? authoritativeSession
+						: await ctx.context.internalAdapter.findSession(sessionCookieToken);
 				ctx.context.session = session;
 				if (!session || session.session.expiresAt < new Date()) {
 					deleteSessionCookie(ctx);
@@ -449,7 +474,10 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					 * Clean up an expired credential on mutating validation. Calling delete
 					 * with an unknown credential is deliberately a fail-safe no-op.
 					 */
-					if (!deferSessionRefresh || isPostRequest) {
+					if (
+						!managedAuthenticationPolicy &&
+						(!deferSessionRefresh || isPostRequest)
+					) {
 						await ctx.context.internalAdapter.deleteSession(
 							session?.session.token ?? sessionCookieToken,
 						);

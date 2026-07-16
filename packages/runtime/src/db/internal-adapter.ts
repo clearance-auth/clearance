@@ -81,6 +81,7 @@ import {
 	evaluateSessionIssuance,
 	stripReservedSessionAuthority,
 	type SessionAssuranceFields,
+	validateStoredSessionAssurance,
 } from "../security/session-assurance";
 
 function getTTLSeconds(expiresAt: Date | number, now = Date.now()): number {
@@ -140,6 +141,11 @@ export const createInternalAdapter = (
 		oldDigest: string;
 		successorDigest: string;
 	};
+	const recoveryCredentialRejected = Symbol("recovery-credential-rejected");
+	type SessionRecoveryAttempt =
+		| SessionRotationResult
+		| typeof recoveryCredentialRejected
+		| null;
 
 	const sessionMatchesSecurityGenerations = (
 		session: Record<string, unknown>,
@@ -149,6 +155,74 @@ export const createInternalAdapter = (
 			sessionMatchesTwoFactorGeneration(session, user)) &&
 		(!bindsPasskeySessionGeneration ||
 			sessionMatchesPasskeyGeneration(session, user));
+
+	async function validateRawSessionAuthority(
+		session: Record<string, unknown>,
+		user: User & Record<string, unknown>,
+	): Promise<boolean> {
+		if (
+			(user as User & { banned?: boolean | null }).banned === true ||
+			!sessionMatchesSecurityGenerations(session, user)
+		) {
+			return false;
+		}
+		if (!authenticationPolicy) {
+			const now = new Date();
+			return (
+				session.expiresAt instanceof Date &&
+				Number.isFinite(session.expiresAt.getTime()) &&
+				session.expiresAt > now
+			);
+		}
+
+		const storedOrganizationId = session.authenticationPolicyOrganizationId;
+		if (
+			storedOrganizationId !== null &&
+			(typeof storedOrganizationId !== "string" ||
+				storedOrganizationId.length === 0 ||
+				storedOrganizationId.length > 1_024 ||
+				storedOrganizationId.trim() !== storedOrganizationId ||
+				storedOrganizationId.includes("\0"))
+		) {
+			return false;
+		}
+		const organizationId = storedOrganizationId as string | null;
+		const activeOrganizationId = session.activeOrganizationId;
+		if (
+			activeOrganizationId !== null &&
+			activeOrganizationId !== undefined &&
+			(typeof activeOrganizationId !== "string" ||
+				activeOrganizationId !== organizationId)
+		) {
+			return false;
+		}
+
+		const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(options, {
+			subjectId: user.id,
+			...(organizationId ? { organizationId } : {}),
+			transaction: await getCurrentAdapter(adapter),
+		});
+		const now = new Date();
+		if (
+			!(session.expiresAt instanceof Date) ||
+			!Number.isFinite(session.expiresAt.getTime()) ||
+			session.expiresAt <= now
+		) {
+			return false;
+		}
+		return (
+			validateStoredSessionAssurance({
+				stored: session,
+				policy: {
+					identity: resolvedPolicy.scope,
+					organizationId,
+					revision: resolvedPolicy.revision,
+					policy: resolvedPolicy.effective,
+				},
+				now,
+			}).kind === "accepted"
+		);
+	}
 
 	const secondaryCredentialKey = (digest: string) =>
 		secondarySessionKeys?.credential(digest) ?? `session-credential:${digest}`;
@@ -192,6 +266,36 @@ export const createInternalAdapter = (
 		});
 	}
 
+	type ValidatedSessionAuthority = {
+		session: Session & Record<string, unknown>;
+		user: User & Record<string, unknown>;
+	};
+
+	async function loadValidatedSessionAuthority(
+		sessionId: string,
+	): Promise<ValidatedSessionAuthority | null> {
+		const record = await findSessionRecordById(sessionId);
+		if (!record?.user) return null;
+		const activeUser = await lockAndReadActiveUser(
+			await getCurrentAdapter(adapter),
+			record.user.id,
+		);
+		if (!activeUser) return null;
+		const { user: _, ...session } = record;
+		if (
+			!(await validateRawSessionAuthority(
+				session as Record<string, unknown>,
+				activeUser as User & Record<string, unknown>,
+			))
+		) {
+			return null;
+		}
+		return {
+			session: session as Session & Record<string, unknown>,
+			user: activeUser as User & Record<string, unknown>,
+		};
+	}
+
 	async function createCredentialRecord(input: {
 		id?: string | undefined;
 		selector: string;
@@ -230,6 +334,38 @@ export const createInternalAdapter = (
 				updatedAt: now,
 			},
 		});
+	}
+
+	async function rereadExactCredential(
+		expected: SessionCredential,
+	): Promise<SessionCredential | null> {
+		const current = await (
+			await getCurrentAdapter(adapter)
+		).findOne<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "id", value: expected.id }],
+		});
+		if (
+			!current ||
+			current.sessionId !== expected.sessionId ||
+			current.familyId !== expected.familyId ||
+			current.rotationCounter !== expected.rotationCounter ||
+			current.parentCredentialId !== expected.parentCredentialId ||
+			!constantTimeEqual(current.secretDigest, expected.secretDigest)
+		) {
+			return null;
+		}
+		return current;
+	}
+
+	async function rereadActiveCredential(
+		expected: SessionCredential,
+	): Promise<SessionCredential | null> {
+		const current = await rereadExactCredential(expected);
+		const now = new Date();
+		return current?.status === "active" && current.expiresAt > now
+			? current
+			: null;
 	}
 
 	function createCredentialIdentity(): {
@@ -435,68 +571,91 @@ export const createInternalAdapter = (
 		rotationNonceDigest: string,
 		rotationOperation: string,
 		oldDigest: string,
-	): Promise<SessionRotationResult | null> {
-		if (
-			credential.status !== "consumed" ||
-			!credential.sessionId ||
-			!credential.rotationNonceDigest ||
-			!credential.recoveryExpiresAt ||
-			credential.recoveryExpiresAt <= new Date() ||
-			!constantTimeEqual(
-				credential.rotationNonceDigest,
-				rotationNonceDigest,
-			)
-		) {
-			return null;
-		}
+		validatedAuthority?: ValidatedSessionAuthority,
+	): Promise<SessionRecoveryAttempt> {
+		if (credential.status !== "consumed" || !credential.sessionId) return null;
+		const authority =
+			validatedAuthority ??
+			(await loadValidatedSessionAuthority(credential.sessionId));
+		if (!authority) return null;
 
-		const successor = await (
-			await getCurrentAdapter(adapter)
-		).findOne<SessionCredential>({
-			model: SESSION_CREDENTIAL_MODEL,
-			where: [{ field: "parentCredentialId", value: credential.id }],
-		});
+		const readRecoveryCredentials = async (): Promise<
+			| {
+					parent: SessionCredential;
+					successor: SessionCredential;
+			  }
+			| typeof recoveryCredentialRejected
+			| null
+		> => {
+			const parent = await rereadExactCredential(credential);
+			if (!parent || parent.status !== "consumed") {
+				return recoveryCredentialRejected;
+			}
+			if (!parent.rotationNonceDigest) return recoveryCredentialRejected;
+			if (!constantTimeEqual(parent.rotationNonceDigest, rotationNonceDigest)) {
+				return null;
+			}
+			const now = new Date();
+			if (
+				parent.expiresAt <= now ||
+				!parent.recoveryExpiresAt ||
+				parent.recoveryExpiresAt <= now
+			) {
+				return recoveryCredentialRejected;
+			}
+			const successor = await (
+				await getCurrentAdapter(adapter)
+			).findOne<SessionCredential>({
+				model: SESSION_CREDENTIAL_MODEL,
+				where: [{ field: "parentCredentialId", value: parent.id }],
+			});
+			if (
+				!successor ||
+				successor.status !== "active" ||
+				successor.sessionId !== parent.sessionId ||
+				successor.familyId !== parent.familyId ||
+				successor.rotationCounter !== parent.rotationCounter + 1 ||
+				!successor.secretDigest
+			) {
+				return recoveryCredentialRejected;
+			}
+			if (successor.expiresAt <= new Date()) {
+				return recoveryCredentialRejected;
+			}
+			return { parent, successor };
+		};
+
+		const initialCredentials = await readRecoveryCredentials();
 		if (
-			!successor ||
-			successor.status !== "active" ||
-			successor.sessionId !== credential.sessionId ||
-			successor.expiresAt <= new Date() ||
-			!successor.secretDigest
+			!initialCredentials ||
+			initialCredentials === recoveryCredentialRejected
 		) {
-			return null;
+			return initialCredentials;
 		}
 		const candidates = await deriveRotationSuccessors(
-			credential,
+			initialCredentials.parent,
 			rotationOperation,
 		);
-		const recovered = candidates.find((candidate) =>
-			constantTimeEqual(successor.secretDigest, candidate.digest),
-		);
-		if (!recovered) return null;
-		const record = await findSessionRecordById(credential.sessionId);
-		if (!record?.user || record.expiresAt <= new Date()) return null;
-		const currentAdapter = await getCurrentAdapter(adapter);
-		const activeUser = await lockAndReadActiveUser(
-			currentAdapter,
-			record.user.id,
-		);
-		if (!activeUser) return null;
-		const { user: _, ...session } = record;
+		const currentCredentials = await readRecoveryCredentials();
 		if (
-			bindsPasskeySessionGeneration &&
-			!sessionMatchesPasskeyGeneration(
-				session as unknown as Record<string, unknown>,
-				activeUser as unknown as Record<string, unknown>,
-			)
+			!currentCredentials ||
+			currentCredentials === recoveryCredentialRejected
 		) {
-			return null;
+			return currentCredentials;
 		}
+		const recovered = candidates.find((candidate) =>
+			constantTimeEqual(
+				currentCredentials.successor.secretDigest,
+				candidate.digest,
+			),
+		);
+		if (!recovered) return recoveryCredentialRejected;
 		return {
-			session: { ...session, token: recovered.refreshToken },
-			user: activeUser,
+			session: { ...authority.session, token: recovered.refreshToken },
+			user: authority.user,
 			refreshToken: recovered.refreshToken,
-			familyId: credential.familyId,
-			rotationCounter: successor.rotationCounter,
+			familyId: currentCredentials.parent.familyId,
+			rotationCounter: currentCredentials.successor.rotationCounter,
 			oldDigest,
 			successorDigest: recovered.digest,
 		};
@@ -1302,169 +1461,183 @@ export const createInternalAdapter = (
 			session: Session & Record<string, any>;
 			user: User & Record<string, any>;
 		} | null> => {
-			if (legacyCredentialAuthority && storesSessionsInDatabase) {
-				const record = await (
-					await getCurrentAdapter(adapter)
-				).findOne<SessionWithUser>({
-					model: "session",
-					where: [{ field: "token", value: token }],
-					join: { user: true },
-				});
-				if (!record?.user) return null;
-				const { user, ...session } = record;
-				if (
-					(user as User & { banned?: boolean | null }).banned === true ||
-					!sessionMatchesSecurityGenerations(
-						session as Record<string, unknown>,
-						user as unknown as Record<string, unknown>,
-					)
-				) {
-					return null;
+			const find = async () => {
+				if (legacyCredentialAuthority && storesSessionsInDatabase) {
+					const record = await (
+						await getCurrentAdapter(adapter)
+					).findOne<SessionWithUser>({
+						model: "session",
+						where: [{ field: "token", value: token }],
+						join: { user: true },
+					});
+					if (!record?.user) return null;
+					const { user, ...session } = record;
+					if (
+						!(await validateRawSessionAuthority(
+							session as Record<string, unknown>,
+							user as User & Record<string, unknown>,
+						))
+					) {
+						return null;
+					}
+					return {
+						session: parseInternalSessionOutput(ctx.options, session),
+						user: parseUserOutput(ctx.options, user),
+					};
 				}
-				return {
-					session: parseInternalSessionOutput(ctx.options, session),
-					user: parseUserOutput(ctx.options, user),
-				};
-			}
 
-			if (secondaryStorage && !storesSessionsInDatabase) {
-				const digest = await digestSessionRefreshSecret(token);
-				const credentialKey = secondaryCredentialKey(digest);
-				const sessionStringified =
-					await secondaryStorage.get(credentialKey);
-				if (!sessionStringified) return null;
-				const stored = safeJSONParse<{
-					session: Session;
-					user: User;
-				}>(sessionStringified);
-				if (!stored) return null;
-				const currentUser = await (
-					await getCurrentAdapter(adapter)
-				).findOne<User & { banned?: boolean | null }>({
-					model: "user",
-					where: [{ field: "id", value: stored.user.id }],
-				});
-				if (
-					!currentUser ||
-					currentUser.banned === true ||
-					!sessionMatchesSecurityGenerations(
-						stored.session as unknown as Record<string, unknown>,
-						currentUser,
-					)
-				) {
-					await secondaryStorage.delete(credentialKey);
-					return null;
-				}
-				const parsedSession = parseInternalSessionOutput(ctx.options, {
-					...stored.session,
-					expiresAt: new Date(stored.session.expiresAt),
-					createdAt: new Date(stored.session.createdAt),
-					updatedAt: new Date(stored.session.updatedAt),
-				});
-				const parsedUser = parseUserOutput(ctx.options, {
-					...currentUser,
-					createdAt: new Date(currentUser.createdAt),
-					updatedAt: new Date(currentUser.updatedAt),
-				});
-				return {
-					session: { ...parsedSession, token },
-					user: parsedUser,
-				};
-			}
-
-			const result = await findDatabaseSessionByCredential(token);
-			if (!result) return null;
-			const { user, session } = result;
-			if (
-				(user as User & { banned?: boolean | null }).banned === true ||
-				!sessionMatchesSecurityGenerations(
-					session as Record<string, unknown>,
-					user as unknown as Record<string, unknown>,
-				)
-			) {
-				return null;
-			}
-			return {
-				session: parseInternalSessionOutput(ctx.options, session),
-				user: parseUserOutput(ctx.options, user),
-			};
-		},
-		findSessionById: async (sessionId: string) => {
-			if (!storesSessionsInDatabase) {
-				if (!secondaryStorage) return null;
-				const credentialKey = parseSecondaryHandle(
-					await secondaryStorage.get(secondaryHandleKey(sessionId)),
-				);
-				if (!credentialKey) return null;
-				const serialized = await secondaryStorage.get(credentialKey);
-				const parsed = safeJSONParse<{ session: Session; user: User }>(serialized);
-				if (!parsed) return null;
-				if (bindsPasskeySessionGeneration) {
+				if (secondaryStorage && !storesSessionsInDatabase) {
+					const digest = await digestSessionRefreshSecret(token);
+					const credentialKey = secondaryCredentialKey(digest);
+					const sessionStringified = await secondaryStorage.get(credentialKey);
+					if (!sessionStringified) return null;
+					const stored = safeJSONParse<{
+						session: Session;
+						user: User;
+					}>(sessionStringified);
+					if (!stored) return null;
 					const currentUser = await (
 						await getCurrentAdapter(adapter)
-					).findOne<User>({
+					).findOne<User & Record<string, unknown>>({
 						model: "user",
-						where: [{ field: "id", value: parsed.user.id }],
+						where: [{ field: "id", value: stored.user.id }],
 					});
+					const rawSession = {
+						...stored.session,
+						expiresAt: new Date(stored.session.expiresAt),
+						createdAt: new Date(stored.session.createdAt),
+						updatedAt: new Date(stored.session.updatedAt),
+					};
 					if (
 						!currentUser ||
-						!sessionMatchesPasskeyGeneration(
-							parsed.session as unknown as Record<string, unknown>,
-							currentUser as unknown as Record<string, unknown>,
-						)
+						!(await validateRawSessionAuthority(rawSession, currentUser))
 					) {
 						await secondaryStorage.delete(credentialKey);
 						return null;
 					}
-					parsed.user = currentUser;
+					const parsedSession = parseInternalSessionOutput(
+						ctx.options,
+						rawSession,
+					);
+					const parsedUser = parseUserOutput(ctx.options, {
+						...currentUser,
+						createdAt: new Date(currentUser.createdAt),
+						updatedAt: new Date(currentUser.updatedAt),
+					});
+					return {
+						session: { ...parsedSession, token },
+						user: parsedUser,
+					};
 				}
-				return {
-					session: parseInternalSessionOutput(ctx.options, {
-						...parsed.session,
-						expiresAt: new Date(parsed.session.expiresAt),
-						createdAt: new Date(parsed.session.createdAt),
-						updatedAt: new Date(parsed.session.updatedAt),
-					}),
-					user: parseUserOutput(ctx.options, {
-						...parsed.user,
-						createdAt: new Date(parsed.user.createdAt),
-						updatedAt: new Date(parsed.user.updatedAt),
-					}),
-				};
-			}
-			const record = await findSessionRecordById(sessionId);
-			if (!record?.user) return null;
-			const { user, ...session } = record;
-			if (
-				bindsPasskeySessionGeneration &&
-				!sessionMatchesPasskeyGeneration(
-					session as unknown as Record<string, unknown>,
-					user as unknown as Record<string, unknown>,
-				)
-			) {
-				return null;
-			}
-			if (legacyCredentialAuthority) {
+
+				const result = await findDatabaseSessionByCredential(token);
+				if (!result) return null;
+				const { user, session } = result;
+				if (
+					!(await validateRawSessionAuthority(
+						session as Record<string, unknown>,
+						user as User & Record<string, unknown>,
+					))
+				) {
+					return null;
+				}
+				if (
+					authenticationPolicy &&
+					!(await rereadActiveCredential(result.credential))
+				) {
+					return null;
+				}
 				return {
 					session: parseInternalSessionOutput(ctx.options, session),
 					user: parseUserOutput(ctx.options, user),
 				};
-			}
-			const credentials = await (
-				await getCurrentAdapter(adapter)
-			).findMany<SessionCredential>({
-				model: SESSION_CREDENTIAL_MODEL,
-				where: [
-					{ field: "sessionId", value: sessionId },
-					{ field: "status", value: "active" },
-				],
-				limit: 1,
-			});
-			if (!credentials[0] || credentials[0].expiresAt <= new Date()) return null;
-			return {
-				session: parseInternalSessionOutput(ctx.options, session),
-				user: parseUserOutput(ctx.options, user),
 			};
+			return authenticationPolicy && storesSessionsInDatabase
+				? runWithTransaction(adapter, find)
+				: find();
+		},
+		findSessionById: async (sessionId: string) => {
+			const find = async () => {
+				if (!storesSessionsInDatabase) {
+					if (!secondaryStorage) return null;
+					const credentialKey = parseSecondaryHandle(
+						await secondaryStorage.get(secondaryHandleKey(sessionId)),
+					);
+					if (!credentialKey) return null;
+					const serialized = await secondaryStorage.get(credentialKey);
+					const parsed = safeJSONParse<{ session: Session; user: User }>(serialized);
+					if (!parsed) return null;
+					const currentUser = await (
+						await getCurrentAdapter(adapter)
+					).findOne<User & Record<string, unknown>>({
+						model: "user",
+						where: [{ field: "id", value: parsed.user.id }],
+					});
+					const rawSession = {
+						...parsed.session,
+						expiresAt: new Date(parsed.session.expiresAt),
+						createdAt: new Date(parsed.session.createdAt),
+						updatedAt: new Date(parsed.session.updatedAt),
+					};
+					if (
+						!currentUser ||
+						!(await validateRawSessionAuthority(rawSession, currentUser))
+					) {
+						await secondaryStorage.delete(credentialKey);
+						return null;
+					}
+					return {
+						session: parseInternalSessionOutput(ctx.options, rawSession),
+						user: parseUserOutput(ctx.options, {
+							...currentUser,
+							createdAt: new Date(currentUser.createdAt),
+							updatedAt: new Date(currentUser.updatedAt),
+						}),
+					};
+				}
+				const record = await findSessionRecordById(sessionId);
+				if (!record?.user) return null;
+				const { user, ...session } = record;
+				let matchedCredential: SessionCredential | undefined;
+				if (!legacyCredentialAuthority) {
+					const credentials = await (
+						await getCurrentAdapter(adapter)
+					).findMany<SessionCredential>({
+						model: SESSION_CREDENTIAL_MODEL,
+						where: [
+							{ field: "sessionId", value: sessionId },
+							{ field: "status", value: "active" },
+						],
+						limit: 1,
+					});
+					if (!credentials[0] || credentials[0].expiresAt <= new Date()) {
+						return null;
+					}
+					matchedCredential = credentials[0];
+				}
+				if (
+					!(await validateRawSessionAuthority(
+						session as Record<string, unknown>,
+						user as User & Record<string, unknown>,
+					))
+				) {
+					return null;
+				}
+				if (
+					authenticationPolicy &&
+					matchedCredential &&
+					!(await rereadActiveCredential(matchedCredential))
+				) {
+					return null;
+				}
+				return {
+					session: parseInternalSessionOutput(ctx.options, session),
+					user: parseUserOutput(ctx.options, user),
+				};
+			};
+			return authenticationPolicy && storesSessionsInDatabase
+				? runWithTransaction(adapter, find)
+				: find();
 		},
 		recoverSessionCredential: async (
 			token: string,
@@ -1501,7 +1674,7 @@ export const createInternalAdapter = (
 					digest,
 				);
 			});
-			if (!recovered) return null;
+			if (!recovered || recovered === recoveryCredentialRejected) return null;
 			const { oldDigest: _, successorDigest: __, ...result } = recovered;
 			return result;
 		},
@@ -1555,12 +1728,18 @@ export const createInternalAdapter = (
 				}
 				if (credential.status !== "active") {
 					if (credential.status === "consumed") {
+						const authority = await loadValidatedSessionAuthority(
+							credential.sessionId,
+						);
+						if (!authority) return null;
 						const recovered = await recoverRecentSessionRotation(
 							credential,
 							rotationNonceDigest,
 							rotationOperation,
 							digest,
+							authority,
 						);
+						if (recovered === recoveryCredentialRejected) return null;
 						if (recovered) return recovered;
 						await revokeAndDeleteSessionById(
 							credential.sessionId,
@@ -1571,29 +1750,19 @@ export const createInternalAdapter = (
 				}
 				if (credential.expiresAt <= new Date()) return null;
 
-				const record = await findSessionRecordById(credential.sessionId);
-				if (!record?.user || record.expiresAt <= new Date()) return null;
-				const activeUser = await lockAndReadActiveUser(
-					currentAdapter,
-					record.user.id,
+				const authority = await loadValidatedSessionAuthority(
+					credential.sessionId,
 				);
-				if (!activeUser) return null;
-				const { user: _, ...session } = record;
-				if (
-					bindsPasskeySessionGeneration &&
-					!sessionMatchesPasskeyGeneration(
-						session as unknown as Record<string, unknown>,
-						activeUser as unknown as Record<string, unknown>,
-					)
-				) {
-					return null;
-				}
+				if (!authority) return null;
 
 				const [derivedSuccessor] = await deriveRotationSuccessors(
 					credential,
 					rotationOperation,
 				);
 				if (!derivedSuccessor) return null;
+				const activeCredential = await rereadActiveCredential(credential);
+				if (!activeCredential?.sessionId) return null;
+				const activeSessionId = activeCredential.sessionId;
 				const successorIdentity = {
 					...createCredentialIdentity(),
 					selector: derivedSuccessor.selector,
@@ -1607,9 +1776,10 @@ export const createInternalAdapter = (
 				const consumed = await currentAdapter.incrementOne<SessionCredential>({
 					model: SESSION_CREDENTIAL_MODEL,
 					where: [
-						{ field: "id", value: credential.id },
+						{ field: "id", value: activeCredential.id },
 						{ field: "status", value: "active" },
 						{ field: "secretDigest", value: digest },
+						{ field: "expiresAt", value: consumedAt, operator: "gt" },
 					],
 					increment: {},
 					set: {
@@ -1624,7 +1794,7 @@ export const createInternalAdapter = (
 				if (!consumed) {
 					const currentParent = await currentAdapter.findOne<SessionCredential>({
 						model: SESSION_CREDENTIAL_MODEL,
-						where: [{ field: "id", value: credential.id }],
+						where: [{ field: "id", value: activeCredential.id }],
 					});
 					if (currentParent) {
 						const recovered = await recoverRecentSessionRotation(
@@ -1632,27 +1802,32 @@ export const createInternalAdapter = (
 							rotationNonceDigest,
 							rotationOperation,
 							digest,
+							authority,
 						);
+						if (recovered === recoveryCredentialRejected) return null;
 						if (recovered) return recovered;
 					}
-					await revokeAndDeleteSessionById(credential.sessionId, new Date());
+					await revokeAndDeleteSessionById(
+						activeSessionId,
+						new Date(),
+					);
 					return null;
 				}
 
 				await createCredentialRecord({
 					...successorIdentity,
-					sessionId: credential.sessionId,
-					familyId: credential.familyId,
+					sessionId: activeSessionId,
+					familyId: activeCredential.familyId,
 					secretDigest: successorDigest,
-					expiresAt: credential.expiresAt,
-					parentCredentialId: credential.id,
-					rotationCounter: credential.rotationCounter + 1,
+					expiresAt: activeCredential.expiresAt,
+					parentCredentialId: activeCredential.id,
+					rotationCounter: activeCredential.rotationCounter + 1,
 				});
-				if (credential.parentCredentialId) {
+				if (activeCredential.parentCredentialId) {
 					await currentAdapter.update<SessionCredential>({
 						model: SESSION_CREDENTIAL_MODEL,
 						where: [
-							{ field: "id", value: credential.parentCredentialId },
+							{ field: "id", value: activeCredential.parentCredentialId },
 						],
 						update: {
 							rotationNonceDigest: null,
@@ -1663,11 +1838,11 @@ export const createInternalAdapter = (
 					});
 				}
 				return {
-					session: { ...session, token: successorSecret },
-					user: activeUser,
+					session: { ...authority.session, token: successorSecret },
+					user: authority.user,
 					refreshToken: successorSecret,
-					familyId: credential.familyId,
-					rotationCounter: credential.rotationCounter + 1,
+					familyId: activeCredential.familyId,
+					rotationCounter: activeCredential.rotationCounter + 1,
 					oldDigest: digest,
 					successorDigest,
 				};

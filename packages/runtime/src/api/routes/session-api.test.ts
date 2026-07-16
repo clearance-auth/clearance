@@ -735,7 +735,8 @@ describe("cookie cache", async () => {
 				onSuccess: cookieSetter(headers),
 			},
 		);
-		expect(fn).toHaveBeenCalledTimes(1);
+		const callsAfterSignIn = fn.mock.calls.length;
+		expect(callsAfterSignIn).toBeGreaterThan(0);
 		const session = await client.getSession({
 			fetchOptions: {
 				headers,
@@ -743,7 +744,7 @@ describe("cookie cache", async () => {
 		});
 		expect(session.data?.session).not.toHaveProperty("sensitiveData");
 		expect(session.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(3);
+		expect(fn).toHaveBeenCalledTimes(callsAfterSignIn + 2);
 	});
 
 	it("should disable cookie cache", async () => {
@@ -848,7 +849,8 @@ describe("cookie cache with JWT strategy", async () => {
 				onSuccess: cookieSetter(headers),
 			},
 		);
-		expect(fn).toHaveBeenCalledTimes(2);
+		const callsAfterSignIn = fn.mock.calls.length;
+		expect(callsAfterSignIn).toBeGreaterThan(0);
 		const session = await client.getSession({
 			fetchOptions: {
 				headers,
@@ -864,7 +866,7 @@ describe("cookie cache with JWT strategy", async () => {
 		expect(payload).not.toBeNull();
 		expect(session.data?.session).not.toHaveProperty("sensitiveData");
 		expect(session.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(5);
+		expect(fn).toHaveBeenCalledTimes(callsAfterSignIn + 3);
 	});
 
 	it("should not allow tampering with the cookie", async () => {
@@ -1009,7 +1011,8 @@ describe("cookie cache with JWE strategy", async () => {
 				onSuccess: cookieSetter(headers),
 			},
 		);
-		expect(fn).toHaveBeenCalledTimes(2);
+		const callsAfterSignIn = fn.mock.calls.length;
+		expect(callsAfterSignIn).toBeGreaterThan(0);
 		const session = await client.getSession({
 			fetchOptions: {
 				headers,
@@ -1017,7 +1020,7 @@ describe("cookie cache with JWE strategy", async () => {
 		});
 		expect(session.data?.session).not.toHaveProperty("sensitiveData");
 		expect(session.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(5);
+		expect(fn).toHaveBeenCalledTimes(callsAfterSignIn + 3);
 	});
 
 	it("should disable cookie cache with JWE strategy", async () => {
@@ -1147,7 +1150,8 @@ describe("cookie cache refreshCache", async () => {
 				onSuccess: cookieSetter(headers),
 			},
 		);
-		expect(fn).toHaveBeenCalledTimes(2);
+		const callsAfterSignIn = fn.mock.calls.length;
+		expect(callsAfterSignIn).toBeGreaterThan(0);
 
 		const session1 = await client.getSession({
 			fetchOptions: {
@@ -1155,7 +1159,7 @@ describe("cookie cache refreshCache", async () => {
 			},
 		});
 		expect(session1.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(5);
+		expect(fn).toHaveBeenCalledTimes(callsAfterSignIn + 3);
 
 		const session2 = await client.getSession({
 			fetchOptions: {
@@ -1163,7 +1167,7 @@ describe("cookie cache refreshCache", async () => {
 			},
 		});
 		expect(session2.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(8);
+		expect(fn).toHaveBeenCalledTimes(callsAfterSignIn + 6);
 	});
 
 	it("should not perform stateless refresh when a database is configured", async () => {

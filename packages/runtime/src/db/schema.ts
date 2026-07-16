@@ -7,6 +7,7 @@ import type {
 import { getAuthTables } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { filterOutputFields } from "@clearance/core/utils/db";
+import { stripReservedSessionAuthority } from "../security/session-assurance";
 import type { Account, Session, User } from "../types";
 
 type Mode = "input" | "output";
@@ -117,7 +118,9 @@ export function parseSessionOutput<T extends Session>(
 	session: T,
 ) {
 	const schema = getFields(options, "session", "output");
-	const parsed = filterOutputFields(session, schema);
+	const parsed = stripReservedSessionAuthority(
+		filterOutputFields(session, schema),
+	);
 	return {
 		...parsed,
 		// Deprecated source-compatibility field. Public callers receive the stable,
@@ -278,7 +281,12 @@ export function parseSessionInput(
 	action?: "create" | "update",
 ) {
 	const schema = getFields(options, "session", "input");
-	return parseInputData(session, { fields: schema, action });
+	const safeInput = stripReservedSessionAuthority(
+		session as Record<string, unknown>,
+	);
+	return stripReservedSessionAuthority(
+		parseInputData(safeInput, { fields: schema, action }),
+	);
 }
 
 export function getSessionDefaultFields(options: ClearanceOptions) {
@@ -292,7 +300,7 @@ export function getSessionDefaultFields(options: ClearanceOptions) {
 					: fields[key]!.defaultValue;
 		}
 	}
-	return defaults;
+	return stripReservedSessionAuthority(defaults);
 }
 
 export function mergeSchema<S extends ClearancePluginDBSchema>(
