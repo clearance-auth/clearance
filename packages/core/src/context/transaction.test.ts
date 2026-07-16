@@ -5,6 +5,7 @@ import {
 	AfterOperationHookError,
 	AfterTransactionHookError,
 	getCurrentAdapter,
+	isTransactionActive,
 	queueAfterTransactionHook,
 	queueBeforeTransactionCommitHook,
 	runWithAdapter,
@@ -66,6 +67,205 @@ describe("runWithTransaction", () => {
 
 		expect(getTransactionCalls()).toBe(1);
 		expect(adapters).toEqual([transactionAdapter, transactionAdapter]);
+	});
+
+	it("keeps nested transactions isolated by owning adapter", async () => {
+		const first = createTransactionHarness();
+		const second = createTransactionHarness();
+		const adapters: DBTransactionAdapter[] = [];
+
+		await runWithTransaction(first.adapter, async () => {
+			adapters.push(await getCurrentAdapter(first.adapter));
+			expect(await getCurrentAdapter(second.adapter)).toBe(second.adapter);
+			expect(await isTransactionActive(first.adapter)).toBe(true);
+			expect(await isTransactionActive(second.adapter)).toBe(false);
+
+			await runWithTransaction(second.adapter, async () => {
+				adapters.push(await getCurrentAdapter(second.adapter));
+				adapters.push(await getCurrentAdapter(first.adapter));
+				expect(await isTransactionActive(first.adapter)).toBe(true);
+				expect(await isTransactionActive(second.adapter)).toBe(true);
+			});
+		});
+
+		expect(first.getTransactionCalls()).toBe(1);
+		expect(second.getTransactionCalls()).toBe(1);
+		expect(adapters).toEqual([
+			first.transactionAdapter,
+			second.transactionAdapter,
+			first.transactionAdapter,
+		]);
+	});
+
+	it("restores the matching owner when nesting back across transactions", async () => {
+		const first = createTransactionHarness();
+		const second = createTransactionHarness();
+		const events: string[] = [];
+
+		await runWithTransaction(first.adapter, async () => {
+			await queueAfterTransactionHook(async () => {
+				events.push("first-outer");
+			});
+			await runWithTransaction(second.adapter, async () => {
+				await queueAfterTransactionHook(async () => {
+					events.push("second-outer");
+				});
+				await runWithTransaction(first.adapter, async () => {
+					expect(await getCurrentAdapter(first.adapter)).toBe(
+						first.transactionAdapter,
+					);
+					await queueAfterTransactionHook(async () => {
+						events.push("first-inner");
+					});
+					await runWithTransaction(second.adapter, async () => {
+						expect(await getCurrentAdapter(second.adapter)).toBe(
+							second.transactionAdapter,
+						);
+						await queueAfterTransactionHook(async () => {
+							events.push("second-inner");
+						});
+					});
+				});
+				expect(events).toEqual([]);
+			});
+			expect(events).toEqual(["second-outer", "second-inner"]);
+		});
+
+		expect(first.getTransactionCalls()).toBe(1);
+		expect(second.getTransactionCalls()).toBe(1);
+		expect(events).toEqual([
+			"second-outer",
+			"second-inner",
+			"first-outer",
+			"first-inner",
+		]);
+	});
+
+	it("keeps overlapping sibling transactions branch-local", async () => {
+		const events: string[] = [];
+		const transactionAdapters: DBTransactionAdapter[] = [];
+		let transactionCalls = 0;
+		const adapter = {
+			transaction: async <R>(
+				callback: (trx: DBTransactionAdapter) => Promise<R>,
+			) => {
+				transactionCalls += 1;
+				const id = transactionCalls;
+				const transactionAdapter = { id } as unknown as DBTransactionAdapter;
+				transactionAdapters.push(transactionAdapter);
+				events.push(`begin-${id}`);
+				const result = await callback(transactionAdapter);
+				events.push(`commit-${id}`);
+				return result;
+			},
+		} as DBAdapter;
+		let enterFirst!: () => void;
+		let enterSecond!: () => void;
+		let releaseFirst!: () => void;
+		let releaseSecond!: () => void;
+		const firstEntered = new Promise<void>((resolve) => {
+			enterFirst = resolve;
+		});
+		const secondEntered = new Promise<void>((resolve) => {
+			enterSecond = resolve;
+		});
+		const firstRelease = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const secondRelease = new Promise<void>((resolve) => {
+			releaseSecond = resolve;
+		});
+
+		await runWithAdapter(adapter, async () => {
+			const first = runWithTransaction(adapter, async () => {
+				enterFirst();
+				await queueAfterTransactionHook(async () => {
+					events.push("after-1");
+				}, adapter);
+				await firstRelease;
+			});
+			await firstEntered;
+
+			const second = runWithTransaction(adapter, async () => {
+				enterSecond();
+				await queueAfterTransactionHook(async () => {
+					events.push("after-2");
+				}, adapter);
+				await secondRelease;
+			});
+			await secondEntered;
+
+			expect(transactionCalls).toBe(2);
+			expect(await getCurrentAdapter(adapter)).toBe(adapter);
+			releaseSecond();
+			await second;
+			releaseFirst();
+			await first;
+		});
+
+		expect(transactionAdapters).toHaveLength(2);
+		expect(transactionAdapters[0]).not.toBe(transactionAdapters[1]);
+		expect(events).toEqual([
+			"begin-1",
+			"begin-2",
+			"commit-2",
+			"after-2",
+			"commit-1",
+			"after-1",
+		]);
+	});
+
+	it("routes direct cross-owner adapters and hooks to the suspended owner", async () => {
+		const first = createTransactionHarness();
+		const second = createTransactionHarness();
+		const events: string[] = [];
+
+		await runWithTransaction(first.adapter, async () => {
+			await runWithTransaction(second.adapter, async () => {
+				await runWithTransaction(first.adapter, async () => {
+					expect(await getCurrentAdapter(second.adapter)).toBe(
+						second.transactionAdapter,
+					);
+					await queueBeforeTransactionCommitHook(async () => {
+						events.push("second-before");
+					}, second.adapter);
+					await queueAfterTransactionHook(async () => {
+						events.push("second-after");
+					}, second.adapter);
+				});
+				expect(events).toEqual([]);
+			});
+			expect(events).toEqual(["second-before", "second-after"]);
+		});
+
+		expect(first.getTransactionCalls()).toBe(1);
+		expect(second.getTransactionCalls()).toBe(1);
+	});
+
+	it("isolates a different plain adapter context and its hooks", async () => {
+		const first = createTransactionHarness();
+		const second = createTransactionHarness();
+		const events: string[] = [];
+
+		await runWithTransaction(first.adapter, async () => {
+			await queueAfterTransactionHook(async () => {
+				events.push("first");
+			});
+			await runWithAdapter(second.adapter, async () => {
+				expect(await getCurrentAdapter(second.adapter)).toBe(second.adapter);
+				expect(await getCurrentAdapter(first.adapter)).toBe(
+					first.transactionAdapter,
+				);
+				await queueAfterTransactionHook(async () => {
+					events.push("second");
+				});
+			});
+			expect(events).toEqual(["second"]);
+		});
+
+		expect(first.getTransactionCalls()).toBe(1);
+		expect(second.getTransactionCalls()).toBe(0);
+		expect(events).toEqual(["second", "first"]);
 	});
 
 	it("still opens a transaction from a plain adapter context", async () => {

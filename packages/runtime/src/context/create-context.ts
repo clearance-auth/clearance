@@ -41,6 +41,38 @@ import {
 	attachInternalCredentialAuthority,
 	readInternalCredentialAuthority,
 } from "../internal/credential-authority";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+	type InternalRuntimeAuthenticationPolicyBinding,
+} from "../internal/authentication-policy";
+
+function sameAuthenticationPolicyBinding(
+	left: InternalRuntimeAuthenticationPolicyBinding,
+	right: InternalRuntimeAuthenticationPolicyBinding,
+): boolean {
+	return left === right;
+}
+
+function assertCompatibleAuthenticationPolicyTarget(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	const existing = readInternalAuthenticationPolicy(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Authentication policy authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && !sameAuthenticationPolicyBinding(existing, binding)) {
+		throw new ClearanceError(
+			"Authentication policy authority does not match the runtime options binding",
+		);
+	}
+}
 
 /**
  * Estimates the entropy of a string in bits.
@@ -101,6 +133,37 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 	getDatabaseType: (database: Options["database"]) => string,
 ): Promise<AuthContext<Options>> {
 	const credentialAuthority = readInternalCredentialAuthority(options);
+	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const initialPolicyTargets = [
+		adapter,
+		...(adapter.options ? [adapter.options] : []),
+	];
+	for (const target of new Set(initialPolicyTargets)) {
+		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+	}
+	if (authenticationPolicy) {
+		if (!options.database) {
+			throw new ClearanceError(
+				"Managed authentication policy requires a primary database",
+			);
+		}
+		if (
+			options.secondaryStorage &&
+			options.session?.storeSessionInDatabase !== true
+		) {
+			throw new ClearanceError(
+				"Managed authentication policy requires sessions to be stored in the primary database",
+			);
+		}
+		if (
+			!adapter.options ||
+			typeof adapter.options.adapterConfig?.transaction !== "function"
+		) {
+			throw new ClearanceError(
+				"Managed authentication policy requires rollback-capable database transactions",
+			);
+		}
+	}
 	// secondaryStorage is a durable server-side session store, so treat it like
 	// a database for session cache defaults.
 	const isStateful = hasServerSessionStore(options);
@@ -210,6 +273,19 @@ Most of the features of Clearance will not work correctly.`,
 			adapter.options as unknown as ClearanceOptions,
 			credentialAuthority,
 		);
+	}
+	const authenticationPolicyTargets = new Set<object>([
+		options,
+		adapter,
+		...(adapter.options ? [adapter.options] : []),
+	]);
+	for (const target of authenticationPolicyTargets) {
+		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+	}
+	if (authenticationPolicy) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalAuthenticationPolicy(target, authenticationPolicy);
+		}
 	}
 
 	checkEndpointConflicts(options, logger);

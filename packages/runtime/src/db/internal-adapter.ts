@@ -2,6 +2,7 @@ import type {
 	AuthContext,
 	ClearanceOptions,
 	InternalAdapter,
+	SessionIssuanceContext,
 } from "@clearance/core";
 import {
 	getCurrentAdapter,
@@ -68,6 +69,19 @@ import {
 import type { DatabaseHooksEntry } from "./with-hooks";
 import { getWithHooks } from "./with-hooks";
 import { readInternalCredentialAuthority } from "../internal/credential-authority";
+import {
+	readInternalAuthenticationPolicy,
+	resolveRuntimeAuthenticationPolicy,
+} from "../internal/authentication-policy";
+import {
+	ManagedSessionIssuanceError,
+	requireInternalSessionIssuanceContext,
+} from "../internal/session-issuance-context";
+import {
+	evaluateSessionIssuance,
+	stripReservedSessionAuthority,
+	type SessionAssuranceFields,
+} from "../security/session-assurance";
 
 function getTTLSeconds(expiresAt: Date | number, now = Date.now()): number {
 	const expiresMs =
@@ -89,6 +103,7 @@ export const createInternalAdapter = (
 	const options = ctx.options;
 	const secondaryStorage = options.secondaryStorage;
 	const credentialAuthority = readInternalCredentialAuthority(options);
+	const authenticationPolicy = readInternalAuthenticationPolicy(options);
 	const legacyCredentialAuthority =
 		credentialAuthority?.generation === "legacy-v1";
 	const storesSessionsInDatabase =
@@ -105,6 +120,7 @@ export const createInternalAdapter = (
 	const bindsPasskeySessionGeneration = hasPasskeySessionGeneration(options);
 	const serializesUserCredentialAuthority =
 		storesSessionsInDatabase ||
+		Boolean(authenticationPolicy) ||
 		bindsPasskeySessionGeneration ||
 		options.plugins?.some((plugin) => plugin.id === "admin") === true ||
 		options.user?.additionalFields?.banned !== undefined;
@@ -794,7 +810,29 @@ export const createInternalAdapter = (
 			dontRememberMe?: boolean | undefined,
 			override?: (Partial<Session> & Record<string, any>) | undefined,
 			overrideAll?: boolean | undefined,
+			issuanceContext?: SessionIssuanceContext | undefined,
 		) => {
+			const managedIssuanceContext = authenticationPolicy
+				? requireInternalSessionIssuanceContext(issuanceContext)
+				: undefined;
+			if (
+				(managedIssuanceContext?.purpose === "interactive" ||
+					managedIssuanceContext?.purpose === "impersonation") &&
+				managedIssuanceContext.subjectId !== userId
+			) {
+				throw new ManagedSessionIssuanceError("subject_mismatch");
+			}
+			if (
+				managedIssuanceContext?.purpose === "replacement" ||
+				managedIssuanceContext?.purpose === "device"
+			) {
+				throw new ManagedSessionIssuanceError("unsupported_purpose");
+			}
+			const supportedManagedIssuanceContext =
+				managedIssuanceContext?.purpose === "interactive" ||
+				managedIssuanceContext?.purpose === "impersonation"
+					? managedIssuanceContext
+					: undefined;
 			const headers: Headers | undefined = await (async () => {
 				const ctx = await getCurrentAuthContext().catch(() => null);
 				return ctx?.headers || ctx?.request?.headers;
@@ -808,6 +846,9 @@ export const createInternalAdapter = (
 					"Session creation with serialized user authority requires an adapter with rollback-capable transactions",
 				);
 			}
+			const safeOverride = stripReservedSessionAuthority(
+				(override ?? {}) as Record<string, unknown>,
+			);
 			const {
 				// Authority and identity fields are always derived by the runtime.
 				id: _discardedId,
@@ -816,7 +857,7 @@ export const createInternalAdapter = (
 				[PASSKEY_SESSION_GENERATION_FIELD]: _discardedPasskeySessionGeneration,
 				__preserveSessionExpiresAt,
 				...rest
-			} = override || {};
+			} = safeOverride;
 
 			// A stable id is the public administrative handle. The independently
 			// generated refresh secret exists only at the issuance boundary.
@@ -836,11 +877,15 @@ export const createInternalAdapter = (
 			const familyId = generateId();
 
 			// we're parsing default values for session additional fields
-			const defaultAdditionalFields = getSessionDefaultFields(options);
+			const defaultAdditionalFields = stripReservedSessionAuthority(
+				getSessionDefaultFields(options),
+			);
 			const policyExpiresAt = dontRememberMe
 				? getDate(60 * 60 * 24, "sec")
 				: getDate(sessionExpiration, "sec");
-			const inheritedExpiresAt = new Date(rest.expiresAt ?? Number.NaN);
+			const inheritedExpiresAt = new Date(
+				(rest.expiresAt as string | number | Date | undefined) ?? Number.NaN,
+			);
 			const expiresAt =
 				__preserveSessionExpiresAt === true &&
 				Number.isFinite(inheritedExpiresAt.getTime()) &&
@@ -894,6 +939,7 @@ export const createInternalAdapter = (
 				hookedData: T,
 				twoFactorSessionGeneration?: string,
 				passkeySessionGeneration?: string,
+				assuranceFields?: SessionAssuranceFields,
 			): T => {
 				const {
 					id: _hookedId,
@@ -901,8 +947,11 @@ export const createInternalAdapter = (
 					userId: _hookedUserId,
 					[TWO_FACTOR_SESSION_GENERATION_FIELD]: _hookedTwoFactorSessionGeneration,
 					[PASSKEY_SESSION_GENERATION_FIELD]: _hookedPasskeySessionGeneration,
-					...safeHookedData
+					...unsafeHookedData
 				} = hookedData;
+				const safeHookedData = stripReservedSessionAuthority(
+					unsafeHookedData,
+				);
 				return {
 					...safeHookedData,
 					...(requestedSessionId ? { id: requestedSessionId } : {}),
@@ -923,6 +972,7 @@ export const createInternalAdapter = (
 								[PASSKEY_SESSION_GENERATION_FIELD]: passkeySessionGeneration,
 							}
 						: {}),
+					...(assuranceFields ?? {}),
 				} as T;
 			};
 			const persistSecondarySession = async (
@@ -1020,6 +1070,38 @@ export const createInternalAdapter = (
 					}
 				}
 				const currentAdapter = await getCurrentAdapter(adapter);
+				let assuranceFields: SessionAssuranceFields | undefined;
+				if (authenticationPolicy && supportedManagedIssuanceContext) {
+					const targetOrganizationId =
+						supportedManagedIssuanceContext.targetOrganizationId ?? undefined;
+					const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(
+						options,
+						{
+							subjectId: userId,
+							...(targetOrganizationId
+								? { organizationId: targetOrganizationId }
+								: {}),
+							transaction: currentAdapter,
+						},
+					);
+					const evaluation = evaluateSessionIssuance({
+						purpose: supportedManagedIssuanceContext.purpose,
+						policy: {
+							identity: resolvedPolicy.scope,
+							organizationId: targetOrganizationId ?? null,
+							revision: resolvedPolicy.revision,
+							policy: resolvedPolicy.effective,
+						},
+						now: new Date(),
+						evidence: supportedManagedIssuanceContext.evidence,
+					});
+					if (evaluation.kind !== "satisfied") {
+						throw new ManagedSessionIssuanceError("policy_unsatisfied", {
+							requirement: evaluation.requirement,
+						});
+					}
+					assuranceFields = evaluation.fields;
+				}
 				const authorityUser =
 					bindsTwoFactorSessionGeneration || bindsPasskeySessionGeneration
 						? (lockedUser ??
@@ -1175,6 +1257,7 @@ export const createInternalAdapter = (
 							hookedData,
 							twoFactorSessionGeneration,
 							passkeySessionGeneration,
+							assuranceFields,
 						),
 				);
 				if (!res) {
@@ -1201,7 +1284,7 @@ export const createInternalAdapter = (
 				if (secondaryStorage && storesSessionsInDatabase) {
 					await queueAfterTransactionHook(async () => {
 						await persistSecondarySession(res as Record<string, any>);
-					});
+					}, adapter);
 				}
 				return {
 					...(res as Session),
@@ -1916,7 +1999,7 @@ export const createInternalAdapter = (
 				};
 
 				if (!options.session?.storeSessionInDatabase) {
-					await queueAfterTransactionHook(cleanupSecondarySession);
+					await queueAfterTransactionHook(cleanupSecondarySession, adapter);
 					return;
 				}
 			}
@@ -1927,7 +2010,7 @@ export const createInternalAdapter = (
 				);
 			}
 			if (cleanupSecondarySession) {
-				await queueAfterTransactionHook(cleanupSecondarySession);
+				await queueAfterTransactionHook(cleanupSecondarySession, adapter);
 			}
 		},
 		deleteSessionById: async (sessionId: string) => {
@@ -2003,7 +2086,7 @@ export const createInternalAdapter = (
 					}
 					await secondaryStorage?.delete(secondaryActiveSessionsKey(userId));
 				}
-			});
+			}, adapter);
 		},
 		revokeUserOAuthTokenFamilies: async (userId: string) => {
 			const hasOAuthTokenAuthority = ctx.options.plugins?.some(

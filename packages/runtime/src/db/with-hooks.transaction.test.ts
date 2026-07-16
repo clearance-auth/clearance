@@ -190,6 +190,33 @@ describe("database after-hook transaction order", () => {
 		expect(events).toEqual(["begin", "after", "rollback"]);
 	});
 
+	it("keeps direct with-hooks work on a suspended transaction owner", async () => {
+		const firstEvents: string[] = [];
+		const secondEvents: string[] = [];
+		const first = harness(firstEvents);
+		const second = harness(secondEvents, false, "rollback");
+
+		await runWithTransaction(first.adapter, async () => {
+			await runWithTransaction(second.adapter, async () => {
+				await runWithTransaction(first.adapter, async () => {
+					await second.withHooks.createWithHooks(
+						{ userId: "second-owner-user" },
+						"session",
+					);
+				});
+				expect(secondEvents).toEqual(["begin"]);
+			});
+			expect(secondEvents).toEqual([
+				"begin",
+				"after",
+				"commit",
+				"second-after",
+			]);
+		});
+
+		expect(firstEvents).toEqual(["begin", "commit"]);
+	});
+
 	it("rejects non-transactional custom mutations before any work", async () => {
 		const events: string[] = [];
 		const { withHooks } = harness(events, true, "rollback");

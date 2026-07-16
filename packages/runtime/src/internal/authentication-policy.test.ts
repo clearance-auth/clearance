@@ -9,6 +9,7 @@ import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { describe, expect, it, vi } from "vitest";
 import {
 	applyRuntimeAuthenticationPolicyOverride,
+	attachCapturedInternalAuthenticationPolicy,
 	attachInternalAuthenticationPolicy,
 	InvalidRuntimeAuthenticationPolicyError,
 	normalizeRuntimeAuthenticationPolicy,
@@ -252,6 +253,42 @@ describe("runtime authentication policy reader binding", () => {
 				identity: { projectId: "forged", environmentId: "forged" },
 				reader: reader(result()),
 			}),
+		).toThrow(InvalidRuntimeAuthenticationPolicyError);
+	});
+
+	it("propagates only the exact captured binding and permits idempotent reuse", () => {
+		const source = {};
+		const target = {};
+		attachInternalAuthenticationPolicy(source, {
+			identity,
+			reader: reader(result()),
+		});
+		const binding = readInternalAuthenticationPolicy(source)!;
+
+		expect(
+			attachCapturedInternalAuthenticationPolicy(target, binding),
+		).toBe(target);
+		expect(readInternalAuthenticationPolicy(target)).toBe(binding);
+		expect(
+			attachCapturedInternalAuthenticationPolicy(target, binding),
+		).toBe(target);
+		expect(() =>
+			attachCapturedInternalAuthenticationPolicy({}, {
+				identity,
+				reader: reader(result()),
+			}),
+		).toThrow(InvalidRuntimeAuthenticationPolicyError);
+
+		const other = {};
+		attachInternalAuthenticationPolicy(other, {
+			identity,
+			reader: reader(result()),
+		});
+		expect(() =>
+			attachCapturedInternalAuthenticationPolicy(
+				target,
+				readInternalAuthenticationPolicy(other)!,
+			),
 		).toThrow(InvalidRuntimeAuthenticationPolicyError);
 	});
 

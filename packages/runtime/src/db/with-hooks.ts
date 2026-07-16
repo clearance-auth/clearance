@@ -90,7 +90,7 @@ export function getWithHooks(
 		if (failureMode === "rollback") {
 			await queueBeforeTransactionCommitHook(async () => {
 				await execute();
-			});
+			}, adapter);
 			return;
 		}
 		await queueAfterTransactionHook(async () => {
@@ -104,7 +104,7 @@ export function getWithHooks(
 					errorName: error instanceof Error ? error.name : "UnknownError",
 				});
 			}
-		});
+		}, adapter);
 	}
 
 	async function createWithHooks<T extends Record<string, any>>(
@@ -114,7 +114,10 @@ export function getWithHooks(
 		enforceData?: ((data: T) => T) | undefined,
 	): Promise<any> {
 		assertRollbackSafeCustomMutation(model, "create", customCreateFn);
-		if (hasRollbackAfterHook(model, "create") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "create") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				createWithHooks(data, model, customCreateFn, enforceData),
 			);
@@ -185,7 +188,10 @@ export function getWithHooks(
 		enforceData?: ((data: T) => T) | undefined,
 	): Promise<any> {
 		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
-		if (hasRollbackAfterHook(model, "update") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "update") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				updateWithHooks(data, where, model, customUpdateFn, enforceData),
 			);
@@ -253,7 +259,10 @@ export function getWithHooks(
 		customUpdateFn?: CustomMutation<Record<string, any>> | undefined,
 	): Promise<any> {
 		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
-		if (hasRollbackAfterHook(model, "update") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "update") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				updateManyWithHooks(data, where, model, customUpdateFn),
 			);
@@ -320,7 +329,10 @@ export function getWithHooks(
 		customDeleteFn?: CustomMutation<Where[]> | undefined,
 	): Promise<any> {
 		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
-		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				deleteWithHooks(where, model, customDeleteFn),
 			);
@@ -396,7 +408,10 @@ export function getWithHooks(
 		customDeleteFn?: CustomMutation<Where[]> | undefined,
 	): Promise<any> {
 		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
-		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				deleteManyWithHooks(where, model, customDeleteFn),
 			);
@@ -484,7 +499,10 @@ export function getWithHooks(
 		consumeFn: (adapter: DBTransactionAdapter) => Promise<T | null>,
 		preSnapshot?: T | null,
 	): Promise<T | null> {
-		if (hasRollbackAfterHook(model, "delete") && !(await isTransactionActive())) {
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
 			return runWithTransaction(adapter, () =>
 				consumeOneWithHooks(model, hookWhere, consumeFn, preSnapshot),
 			);

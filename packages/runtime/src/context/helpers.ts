@@ -11,6 +11,11 @@ import type { EndpointContext, InputContext } from "@clearance/call";
 import { defu } from "defu";
 import { createCookieGetter, getCookies } from "../cookies";
 import { createInternalAdapter } from "../db";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+	type InternalRuntimeAuthenticationPolicyBinding,
+} from "../internal/authentication-policy";
 import { isPromise } from "../utils/is-promise";
 import {
 	getBaseURL,
@@ -20,8 +25,38 @@ import {
 	resolveBaseURL,
 } from "../utils/url";
 
+function assertCompatibleAuthenticationPolicyBinding(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	const existing = readInternalAuthenticationPolicy(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced authentication policy authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options authentication policy authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveAuthenticationPolicyBinding(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	assertCompatibleAuthenticationPolicyBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalAuthenticationPolicy(target, binding);
+}
+
 export async function runPluginInit(context: AuthContext) {
 	let options = context.options;
+	const authenticationPolicy = readInternalAuthenticationPolicy(options);
 	const plugins = options.plugins || [];
 	const pluginTrustedOrigins: NonNullable<
 		ClearanceOptions["trustedOrigins"]
@@ -42,6 +77,10 @@ export async function runPluginInit(context: AuthContext) {
 			}
 			if (typeof result === "object") {
 				if (result.options) {
+					assertCompatibleAuthenticationPolicyBinding(
+						result.options,
+						authenticationPolicy,
+					);
 					const { databaseHooks, trustedOrigins, ...restOpts } = result.options;
 					if (databaseHooks) {
 						dbHooks.push({
@@ -52,7 +91,12 @@ export async function runPluginInit(context: AuthContext) {
 					if (trustedOrigins) {
 						pluginTrustedOrigins.push(trustedOrigins);
 					}
-					options = defu(options, restOpts);
+					const normalizedOptions = defu(options, restOpts);
+					preserveAuthenticationPolicyBinding(
+						normalizedOptions,
+						authenticationPolicy,
+					);
+					options = normalizedOptions;
 				}
 				if (result.context) {
 					// Use Object.assign to keep the reference to the original context
@@ -92,6 +136,7 @@ export async function runPluginInit(context: AuthContext) {
 			failureMode: options.databaseHookFailureMode,
 		});
 	}
+	preserveAuthenticationPolicyBinding(options, authenticationPolicy);
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {
 		options,

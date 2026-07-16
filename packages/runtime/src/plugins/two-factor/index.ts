@@ -867,10 +867,12 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 											user.id,
 											factor.trustDeviceGeneration,
 										);
-										await queueAfterTransactionHook(() =>
-											ctx.context.internalAdapter.deleteVerificationByIdentifier(
-												marker,
-											),
+										await queueAfterTransactionHook(
+											() =>
+												ctx.context.internalAdapter.deleteVerificationByIdentifier(
+													marker,
+												),
+											adapter,
 										);
 									}
 

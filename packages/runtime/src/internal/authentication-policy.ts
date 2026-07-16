@@ -44,6 +44,7 @@ const bindings = new WeakMap<
 	object,
 	InternalRuntimeAuthenticationPolicyBinding
 >();
+const capturedBindings = new WeakSet<object>();
 
 function invalid(): never {
 	throw new InvalidRuntimeAuthenticationPolicyError();
@@ -534,7 +535,25 @@ export function attachInternalAuthenticationPolicy<Target extends object>(
 	const reader = Object.freeze({
 		readForSubject: readForSubject.bind(binding.reader),
 	});
-	bindings.set(target, Object.freeze({ identity: normalizedIdentity, reader }));
+	const captured = Object.freeze({ identity: normalizedIdentity, reader });
+	capturedBindings.add(captured);
+	bindings.set(target, captured);
+	return target;
+}
+
+export function attachCapturedInternalAuthenticationPolicy<
+	Target extends object,
+>(
+	target: Target,
+	binding: InternalRuntimeAuthenticationPolicyBinding,
+): Target {
+	if (!capturedBindings.has(binding)) invalid();
+	const existing = bindings.get(target);
+	if (existing) {
+		if (existing !== binding) invalid();
+		return target;
+	}
+	bindings.set(target, binding);
 	return target;
 }
 
