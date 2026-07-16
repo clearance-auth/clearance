@@ -2502,6 +2502,77 @@ describe("forced strict session validation", async () => {
 	});
 });
 
+describe("authoritative-null signed-cookie invalidation", () => {
+	async function setupManagedCookieFixture(namespace: string) {
+		const store = new Map<string, string>();
+		const instance = await getTestInstance({
+			session: {
+				storeSessionInDatabase: true,
+				cookieCache: {
+					enabled: true,
+					strategy: "jwt",
+					refreshCache: false,
+				},
+			},
+			secondaryStorage: {
+				namespace,
+				get: async (key) => store.get(key) ?? null,
+				set: async (key, value) => {
+					store.set(key, value);
+				},
+				delete: async (key) => {
+					store.delete(key);
+				},
+			},
+		});
+		const headers = new Headers();
+		await instance.client.signIn.email(
+			{ email: instance.testUser.email, password: instance.testUser.password },
+			{ onSuccess: instance.cookieSetter(headers) },
+		);
+		const initial = await instance.client.getSession({
+			fetchOptions: {
+				headers,
+				onSuccess: instance.cookieSetter(headers),
+			},
+		});
+		expect(initial.data).not.toBeNull();
+		expect(headers.get("cookie")).toContain("clearance.session_data");
+		return { ...instance, headers, initial, store };
+	}
+
+	const expectExpiredSessionCookies = (
+		cookies: ReturnType<typeof parseSetCookieHeader>,
+	) => {
+		expect(cookies.get("clearance.session_data")?.["max-age"]).toBe(0);
+		expect(cookies.get("clearance.session_token")?.["max-age"]).toBe(0);
+	};
+
+	it("expires signed cache and token cookies when strict authority returns null", async () => {
+		const fixture = await setupManagedCookieFixture(
+			"session-api-managed-policy-revision",
+		);
+		const ctx = await fixture.auth.$context;
+		// Managed policy/topology rejection is exercised against the real adapter
+		// in internal-adapter.authentication-policy.test.ts. This route-seam
+		// regression proves its authoritative null expires both signed cookies.
+		vi.spyOn(ctx.internalAdapter, "findSession").mockResolvedValue(null);
+		let cookies = new Map() as ReturnType<typeof parseSetCookieHeader>;
+		const response = await fixture.client.getSession({
+			fetchOptions: {
+				headers: fixture.headers,
+				onSuccess(context) {
+					cookies = parseSetCookieHeader(
+						context.response.headers.get("set-cookie") || "",
+					);
+				},
+			},
+		});
+		expect(response.data).toBeNull();
+		expectExpiredSessionCookies(cookies);
+	});
+});
+
 describe("get-session cache headers", async () => {
 	/**
 	 * @see https://github.com/clearance-auth/clearance

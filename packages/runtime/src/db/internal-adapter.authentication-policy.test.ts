@@ -13,6 +13,7 @@ import {
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
+import { safeJSONParse } from "@clearance/core/utils/json";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { init } from "../context/init";
 import {
@@ -28,6 +29,7 @@ import { attachInternalCredentialAuthority } from "../internal/credential-author
 import { getMigrations } from "./get-migration";
 import { generateCredentialOperationKey } from "../utils/operation-key";
 import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../security/session-assurance";
+import type { Session, User } from "../types";
 import { schema as passkeySchema } from "../plugins/passkey/schema";
 import { schema as twoFactorSchema } from "../plugins/two-factor/schema";
 import {
@@ -4244,7 +4246,7 @@ describe("managed single-session authoritative revocation", () => {
 		expect(store).toEqual(new Map());
 	});
 
-	it("cleans secondary authority after replay-triggered family revocation", async () => {
+	it("cleans secondary authority without mutating DB on a non-active managed token read", async () => {
 		const { runtime, store } = await setupManagedDeletionRuntime({
 			namespace: "managed-delete-replay-cleanup-test",
 		});
@@ -4259,17 +4261,14 @@ describe("managed single-session authoritative revocation", () => {
 			where: [{ field: "id", value: String(root.id) }],
 			update: { recoveryExpiresAt: new Date(Date.now() - 1_000) },
 		});
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
 
 		await expect(
 			runtime.context.internalAdapter.findSession(session.token),
 		).resolves.toBeNull();
-		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
-		expect(
-			(await credentialRows(runtime)).every(
-				(credential) =>
-					credential.status === "revoked" && credential.sessionId === null,
-			),
-		).toBe(true);
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
 		expect(store).toEqual(new Map());
 	});
 
@@ -4964,5 +4963,633 @@ describe("database-backed bulk deletion without authentication policy", () => {
 		expect([...runtime.store.keys()]).toEqual([
 			"clearance:compatibility-bulk-secondary-only:session-storage-epoch",
 		]);
+	});
+});
+
+describe("managed complete-topology session reads", () => {
+	it("rejects a real stale-policy token read, cleans owner cache, and leaves DB unchanged", async () => {
+		let revision = "7";
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-read-stale-policy-token",
+			reader: (input) => policyResult(input, { revision }),
+		});
+		const session = await issuePasswordSession(runtime);
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		revision = "8";
+
+		await expect(
+			runtime.context.internalAdapter.findSession(session.token),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(new Map());
+	});
+
+	it.each(["token", "id"] as const)(
+		"rejects and owner-cleans duplicate active authority by %s without DB mutation",
+		async (access) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-read-duplicate-${access}`,
+			});
+			const session = await issuePasswordSession(runtime);
+			const credential = (await credentialRows(runtime))[0]!;
+			await runtime.context.adapter.create({
+				model: "sessionCredential",
+				forceAllowId: true,
+				data: {
+					...credential,
+					id: `${credential.id}-duplicate`,
+					selector: `${credential.selector}-duplicate`,
+					secretDigest: await digestSessionRefreshSecret(
+						`duplicate-${access}`,
+					),
+				},
+			});
+			const stableSessions = structuredClone(await authorityRows(runtime.context));
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+
+			const result =
+				access === "token"
+					? runtime.context.internalAdapter.findSession(session.token)
+					: runtime.context.internalAdapter.findSessionById(session.id);
+			await expect(result).resolves.toBeNull();
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+			expect(store).toEqual(new Map());
+		},
+	);
+
+	it.each([
+		"disconnected",
+		"expiry_mismatch",
+		"malformed_digest",
+		"malformed_selector",
+	] as const)(
+		"rejects %s topology and cleans every owned candidate",
+		async (mode) => {
+			const namespace = `managed-read-${mode}`;
+			const { runtime, store } = await setupManagedDeletionRuntime({ namespace });
+			const session = await issuePasswordSession(runtime);
+			const credential = (await credentialRows(runtime))[0]!;
+			if (mode === "disconnected") {
+				await runtime.context.adapter.create({
+					model: "sessionCredential",
+					forceAllowId: true,
+					data: {
+						...credential,
+						id: `${credential.id}-disconnected`,
+						selector: `${credential.selector}-disconnected`,
+						secretDigest: await digestSessionRefreshSecret("disconnected"),
+						status: "consumed",
+						familyId: `${credential.familyId}-disconnected`,
+						consumedAt: new Date(),
+					},
+				});
+			} else if (mode === "expiry_mismatch") {
+				await runtime.context.adapter.update({
+					model: "sessionCredential",
+					where: [{ field: "id", value: String(credential.id) }],
+					update: { expiresAt: new Date(session.expiresAt.getTime() - 1_000) },
+				});
+			} else if (mode === "malformed_digest") {
+				const handleKey = [...store.keys()].find((key) =>
+					key.endsWith(`:session-handle:${session.id}`),
+				)!;
+				const oldKey = (
+					JSON.parse(store.get(handleKey)!) as { credentialKey: string }
+				).credentialKey;
+				const malformedKey = `clearance:${namespace}:session-credential:malformed`;
+				store.set(malformedKey, store.get(oldKey)!);
+				store.delete(oldKey);
+				store.delete(handleKey);
+				const indexKey = `clearance:${namespace}:active-sessions:${runtime.user.id}`;
+				store.set(
+					indexKey,
+					JSON.stringify([
+						{
+							sessionId: session.id,
+							credentialKey: malformedKey,
+							expiresAt: session.expiresAt.getTime(),
+						},
+					]),
+				);
+				await runtime.context.adapter.update({
+					model: "sessionCredential",
+					where: [{ field: "id", value: String(credential.id) }],
+					update: { secretDigest: "malformed" },
+				});
+			} else {
+				await runtime.context.adapter.update({
+					model: "sessionCredential",
+					where: [{ field: "id", value: String(credential.id) }],
+					update: { selector: "malformed selector" },
+				});
+			}
+			const stableSessions = structuredClone(await authorityRows(runtime.context));
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+
+			await expect(
+				runtime.context.internalAdapter.findSessionById(session.id),
+			).resolves.toBeNull();
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+			expect(store).toEqual(new Map());
+		},
+	);
+
+	it("defers invalid-read cleanup through an outer rollback", async () => {
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-read-outer-rollback",
+			});
+		const session = await issuePasswordSession(runtime);
+		const credential = (await credentialRows(runtime))[0]!;
+		await runtime.context.adapter.create({
+			model: "sessionCredential",
+			forceAllowId: true,
+			data: {
+				...credential,
+				id: `${credential.id}-duplicate`,
+				selector: `${credential.selector}-duplicate`,
+				secretDigest: await digestSessionRefreshSecret("rollback-duplicate"),
+			},
+		});
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await expect(
+					runtime.context.internalAdapter.findSessionById(session.id),
+				).resolves.toBeNull();
+				throw new Error("invalid read rollback");
+			}),
+		).rejects.toThrow("invalid read rollback");
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it.each(["token", "id"] as const)(
+		"owner-cleans an orphaned managed %s read",
+		async (access) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-read-orphan-${access}`,
+			});
+			const session = await issuePasswordSession(runtime);
+			await runtime.context.adapter.delete({
+				model: "session",
+				where: [{ field: "id", value: session.id }],
+			});
+			expect(store.size).toBeGreaterThan(0);
+			const result =
+				access === "token"
+					? runtime.context.internalAdapter.findSession(session.token)
+					: runtime.context.internalAdapter.findSessionById(session.id);
+			await expect(result).resolves.toBeNull();
+			const remainingSessionKeys = [...store.keys()].filter(
+				(key) => !key.includes(":active-sessions:"),
+			);
+			expect(remainingSessionKeys).toEqual(
+				access === "token"
+					? [`clearance:managed-read-orphan-token:session-handle:${session.id}`]
+					: [],
+			);
+		},
+	);
+
+	it("never derives handle or index cleanup authority from a poisoned orphan envelope", async () => {
+		const namespace = "managed-read-poisoned-orphan";
+		const { runtime, store } = await setupManagedDeletionRuntime({ namespace });
+		const orphan = await issuePasswordSession(runtime);
+		const live = await issuePasswordSession(runtime);
+		const orphanHandleKey = `clearance:${namespace}:session-handle:${orphan.id}`;
+		const liveHandleKey = `clearance:${namespace}:session-handle:${live.id}`;
+		const orphanCredentialKey = (
+			JSON.parse(store.get(orphanHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const liveCredentialKey = (
+			JSON.parse(store.get(liveHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const indexKey = `clearance:${namespace}:active-sessions:${runtime.user.id}`;
+		await runtime.context.adapter.delete({
+			model: "session",
+			where: [{ field: "id", value: orphan.id }],
+		});
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: null }],
+			update: { status: "revoked", revokedAt: new Date() },
+		});
+		store.set(
+			orphanCredentialKey,
+			JSON.stringify({
+				session: { id: live.id, userId: runtime.user.id },
+				user: { id: runtime.user.id },
+			}),
+		);
+		const stableLiveEnvelope = store.get(liveCredentialKey)!;
+		const stableLiveHandle = store.get(liveHandleKey)!;
+		const stableIndex = store.get(indexKey)!;
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+
+		await expect(
+			runtime.context.internalAdapter.findSession(orphan.token),
+		).resolves.toBeNull();
+		expect(store.has(orphanCredentialKey)).toBe(false);
+		expect(store.get(liveCredentialKey)).toBe(stableLiveEnvelope);
+		expect(store.get(liveHandleKey)).toBe(stableLiveHandle);
+		expect(store.get(indexKey)).toBe(stableIndex);
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		await expect(
+			runtime.context.internalAdapter.findSession(live.token),
+		).resolves.not.toBeNull();
+	});
+
+	it.each(["selector", "digest"] as const)(
+		"fails closed when a corrupted adapter returns duplicate %s candidates",
+		async (mode) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-read-duplicate-${mode}-lookup`,
+			});
+			const session = await issuePasswordSession(runtime);
+			const stableStore = new Map(store);
+			const stableSessions = structuredClone(await authorityRows(runtime.context));
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+			const originalTransaction = runtime.context.adapter.transaction.bind(
+				runtime.context.adapter,
+			);
+			vi.spyOn(runtime.context.adapter, "transaction").mockImplementation(
+				async (callback) =>
+					originalTransaction(async (transactionAdapter) => {
+						const originalFindMany =
+							transactionAdapter.findMany.bind(transactionAdapter);
+						transactionAdapter.findMany = (async (input) => {
+							const rows = await originalFindMany(input);
+							const lookupField = input.where?.[0]?.field;
+							if (
+								input.model === "sessionCredential" &&
+								lookupField ===
+									(mode === "selector" ? "selector" : "secretDigest") &&
+								rows.length === 1
+							) {
+								const row = rows[0] as Record<string, unknown>;
+								return [
+									...rows,
+									{
+										...row,
+										id: `${String(row.id)}-corrupt`,
+										...(mode === "selector"
+											? {
+												secretDigest:
+													await digestSessionRefreshSecret("other-digest"),
+											  }
+											: { selector: "A".repeat(32) }),
+									},
+								] as never;
+							}
+							return rows;
+						}) as typeof transactionAdapter.findMany;
+						return callback(transactionAdapter);
+					}),
+			);
+
+			await expect(
+				runtime.context.internalAdapter.findSession(session.token),
+			).resolves.toBeNull();
+			expect(store).toEqual(stableStore);
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		},
+	);
+
+	it("preserves legacy and unmanaged successful reads", async () => {
+		const legacy = await setupManagedDeletionRuntime({
+			namespace: "managed-read-legacy",
+			credentialAuthority: "legacy-v1",
+		});
+		const legacySession = await issuePasswordSession(legacy.runtime);
+		await expect(
+			legacy.runtime.context.internalAdapter.findSession(legacySession.token),
+		).resolves.not.toBeNull();
+		await expect(
+			legacy.runtime.context.internalAdapter.findSessionById(legacySession.id),
+		).resolves.not.toBeNull();
+
+		const unmanaged = await setupDatabaseBackedCompatibilityRuntime({
+			namespace: "managed-read-unmanaged",
+			options: { session: { storeSessionInDatabase: false } },
+		});
+		const unmanagedSession =
+			await unmanaged.context.internalAdapter.createSession(unmanaged.user.id);
+		await expect(
+			unmanaged.context.internalAdapter.findSession(unmanagedSession.token),
+		).resolves.not.toBeNull();
+	});
+});
+
+describe("managed user session reconciliation", () => {
+	it("publishes the committed DB user after updateUser and updateUserByEmail", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-user-refresh-commit",
+		});
+		const session = await issuePasswordSession(runtime);
+		await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+			name: "First committed name",
+		});
+		await runtime.context.internalAdapter.updateUserByEmail(runtime.user.email, {
+			name: "Final committed name",
+		});
+		const envelope = [...store.values()]
+			.map((value) => safeJSONParse<{ session?: Session; user?: User }>(value))
+			.find((value) => value?.session?.id === session.id)!;
+		expect(envelope.user?.name).toBe("Final committed name");
+		expect(
+			await runtime.context.adapter.findOne({
+				model: "user",
+				where: [{ field: "id", value: runtime.user.id }],
+			}),
+		).toEqual(expect.objectContaining({ name: "Final committed name" }));
+	});
+
+	it("defers managed user reconciliation through outer rollback", async () => {
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-user-refresh-rollback",
+			});
+		await issuePasswordSession(runtime);
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+					name: "Rolled back name",
+				});
+				throw new Error("user refresh rollback");
+			}),
+		).rejects.toThrow("user refresh rollback");
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("cleans stale-policy and banned-user authority after committed updates", async () => {
+		let revision = "7";
+		const stale = await setupManagedDeletionRuntime({
+			namespace: "managed-user-refresh-stale-policy",
+			reader: (input) => policyResult(input, { revision }),
+		});
+		await issuePasswordSession(stale.runtime);
+		revision = "8";
+		await stale.runtime.context.internalAdapter.updateUser(stale.runtime.user.id, {
+			name: "Policy changed",
+		});
+		expect(stale.store).toEqual(new Map());
+
+		const banned = await setupManagedDeletionRuntime({
+			namespace: "managed-user-refresh-banned",
+			options: {
+				user: {
+					additionalFields: {
+						banned: { type: "boolean", defaultValue: false },
+					},
+				},
+			},
+		});
+		await issuePasswordSession(banned.runtime);
+		await banned.runtime.context.internalAdapter.updateUser(banned.runtime.user.id, {
+			banned: true,
+		});
+		expect(banned.store).toEqual(new Map());
+	});
+
+	it("cleans cached authority when an earlier observe hook deletes the updated user", async () => {
+		let runtimeRef: ManagedRuntime | null = null;
+		const setup = await setupManagedDeletionRuntime({
+			namespace: "managed-user-refresh-deleted",
+			options: {
+				databaseHooks: {
+					user: {
+						update: {
+							after: async (user) => {
+								await runtimeRef!.context.adapter.delete({
+									model: "user",
+									where: [{ field: "id", value: user.id }],
+								});
+							},
+						},
+					},
+				},
+			},
+		});
+		runtimeRef = setup.runtime;
+		await issuePasswordSession(setup.runtime);
+		await setup.runtime.context.internalAdapter.updateUser(setup.runtime.user.id, {
+			name: "Deleted by observe hook",
+		});
+		expect(
+			await setup.runtime.context.adapter.findOne({
+				model: "user",
+				where: [{ field: "id", value: setup.runtime.user.id }],
+			}),
+		).toBeNull();
+		expect(setup.store).toEqual(new Map());
+	});
+
+	it("propagates reader failure with zero secondary mutation after the DB commit", async () => {
+		let readerFails = false;
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-user-refresh-reader-failure",
+				reader: (input) => {
+					if (readerFails) throw new Error("refresh policy unavailable");
+					return policyResult(input);
+				},
+			});
+		await issuePasswordSession(runtime);
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		readerFails = true;
+		await expect(
+			runtime.context.internalAdapter.updateUser(runtime.user.id, {
+				name: "Committed despite reader outage",
+			}),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+		expect(
+			await runtime.context.adapter.findOne({
+				model: "user",
+				where: [{ field: "id", value: runtime.user.id }],
+			}),
+		).toEqual(expect.objectContaining({ name: "Committed despite reader outage" }));
+	});
+
+	it.each(["duplicate", "disconnected", "branch", "expiry_mismatch"] as const)(
+		"does not publish %s credential topology during user reconciliation",
+		async (mode) => {
+			const { runtime, store } = await setupManagedDeletionRuntime({
+				namespace: `managed-user-refresh-${mode}`,
+			});
+			const session = await issuePasswordSession(runtime);
+			let credential = (await credentialRows(runtime))[0]!;
+			if (mode === "branch") {
+				await runtime.context.internalAdapter.rotateSessionCredential(
+					session.token,
+					generateCredentialOperationKey(),
+				);
+				const credentials = await credentialRows(runtime);
+				const active = credentials.find((row) => row.status === "active")!;
+				await runtime.context.adapter.create({
+					model: "sessionCredential",
+					forceAllowId: true,
+					data: {
+						...active,
+						id: `${active.id}-branch`,
+						selector: `${active.selector}-branch`,
+						secretDigest: await digestSessionRefreshSecret("branch"),
+						status: "consumed",
+						parentCredentialId: null,
+						rotationCounter: 0,
+						familyId: `${active.familyId}-branch`,
+						consumedAt: new Date(),
+					},
+				});
+			} else if (mode === "expiry_mismatch") {
+				await runtime.context.adapter.update({
+					model: "sessionCredential",
+					where: [{ field: "id", value: String(credential.id) }],
+					update: { expiresAt: new Date(session.expiresAt.getTime() - 1_000) },
+				});
+			} else {
+				await runtime.context.adapter.create({
+					model: "sessionCredential",
+					forceAllowId: true,
+					data: {
+						...credential,
+						id: `${credential.id}-${mode}`,
+						selector: `${credential.selector}-${mode}`,
+						secretDigest: await digestSessionRefreshSecret(mode),
+						...(mode === "disconnected"
+							? {
+								status: "consumed",
+								familyId: `${credential.familyId}-other`,
+								consumedAt: new Date(),
+							  }
+							: {}),
+					},
+				});
+			}
+			await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+				name: `Topology ${mode}`,
+			});
+			expect(store).toEqual(new Map());
+		},
+	);
+
+	it("prunes cross-owner poisoning without deleting the other session authority", async () => {
+		const namespace = "managed-user-refresh-cross-owner";
+		const { runtime, store } = await setupManagedDeletionRuntime({ namespace });
+		const target = await issuePasswordSession(runtime);
+		const otherUser = await runtime.context.internalAdapter.createUser({
+			email: "managed-other-owner@example.com",
+			name: "Other owner",
+		});
+		const other = await runtime.context.internalAdapter.createSession(
+			otherUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: otherUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const targetIndexKey = `clearance:${namespace}:active-sessions:${runtime.user.id}`;
+		const otherIndexKey = `clearance:${namespace}:active-sessions:${otherUser.id}`;
+		const otherEntry = (
+			JSON.parse(store.get(otherIndexKey)!) as Array<{ sessionId: string }>
+		).find((entry) => entry.sessionId === other.id)!;
+		store.set(
+			targetIndexKey,
+			JSON.stringify([
+				...(JSON.parse(store.get(targetIndexKey)!) as unknown[]),
+				otherEntry,
+			]),
+		);
+		const otherStore = [...store.entries()].filter(
+			([key, value]) =>
+				key !== targetIndexKey &&
+				(key.includes(other.id) || value.includes(other.id)),
+		);
+
+		await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+			name: "Cross owner pruned",
+		});
+
+		expect(JSON.parse(store.get(targetIndexKey)!)).toEqual([
+			expect.objectContaining({ sessionId: target.id }),
+		]);
+		for (const [key, value] of otherStore) expect(store.get(key)).toBe(value);
+	});
+
+	it("serializes concurrent user refresh publishers so the newer DB user wins", async () => {
+		const olderPublicationEntered = deferred();
+		const olderPublicationGate = deferred();
+		let blockOlderPublication = false;
+		let storeRef: Map<string, string> | null = null;
+		const setup = await setupManagedDeletionRuntime({
+			namespace: "managed-user-refresh-concurrent",
+			set: async (key, value) => {
+				if (blockOlderPublication && value.includes("Older concurrent name")) {
+					blockOlderPublication = false;
+					olderPublicationEntered.resolve();
+					await olderPublicationGate.promise;
+				}
+				storeRef!.set(key, value);
+			},
+		});
+		storeRef = setup.store;
+		const session = await issuePasswordSession(setup.runtime);
+		blockOlderPublication = true;
+		const older = setup.runtime.context.internalAdapter.updateUser(
+			setup.runtime.user.id,
+			{ name: "Older concurrent name" },
+		);
+		await olderPublicationEntered.promise;
+		const newer = setup.runtime.context.internalAdapter.updateUser(
+			setup.runtime.user.id,
+			{ name: "Newer concurrent name" },
+		);
+		olderPublicationGate.resolve();
+		await older;
+		await newer;
+		const envelope = [...setup.store.values()]
+			.map((value) => safeJSONParse<{ session?: Session; user?: User }>(value))
+			.find((value) => value?.session?.id === session.id)!;
+		expect(envelope.user?.name).toBe("Newer concurrent name");
+	});
+
+	it("preserves unmanaged refresh compatibility", async () => {
+		const runtime = await setupDatabaseBackedCompatibilityRuntime({
+			namespace: "managed-user-refresh-unmanaged",
+			options: { session: { storeSessionInDatabase: false } },
+		});
+		const session = await runtime.context.internalAdapter.createSession(runtime.user.id);
+		await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+			name: "Unmanaged updated",
+		});
+		const envelope = [...runtime.store.values()]
+			.map((value) => safeJSONParse<{ session?: Session; user?: User }>(value))
+			.find((value) => value?.session?.id === session.id)!;
+		expect(envelope.user?.name).toBe("Unmanaged updated");
 	});
 });

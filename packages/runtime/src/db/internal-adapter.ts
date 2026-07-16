@@ -709,6 +709,7 @@ export const createInternalAdapter = (
 		session: Session & Record<string, unknown>;
 		credentialAnchors: readonly SessionCredential[];
 		allowExpiredSession?: boolean;
+		requireValidDigests?: boolean;
 		credentials?: readonly SessionCredential[];
 	}): Promise<{
 		active: SessionCredential;
@@ -750,14 +751,23 @@ export const createInternalAdapter = (
 		}
 		if (
 			all.length === 0 ||
+			(input.requireValidDigests &&
+				(new Set(all.map((credential) => credential.selector)).size !==
+					all.length ||
+					new Set(all.map((credential) => credential.secretDigest)).size !==
+						all.length)) ||
 			all.some(
 				(credential) =>
 					credential.sessionId !== input.session.id ||
 					credential.digestVersion !== SESSION_CREDENTIAL_DIGEST_VERSION ||
 					typeof credential.selector !== "string" ||
 					credential.selector.length === 0 ||
+					(input.requireValidDigests &&
+						!(/^[A-Za-z0-9_-]{32,128}$/).test(credential.selector)) ||
 					typeof credential.secretDigest !== "string" ||
 					credential.secretDigest.length === 0 ||
+					(input.requireValidDigests &&
+						!isValidSessionCredentialDigest(credential.secretDigest)) ||
 					(credential.status !== "active" &&
 						credential.status !== "consumed") ||
 					credential.expiresAt.getTime() !== expiresAt,
@@ -1033,6 +1043,243 @@ export const createInternalAdapter = (
 		);
 	}
 
+	type ManagedUserSessionReconciliation = {
+		sessionId: string;
+		handleKey: string;
+		candidateCredentialKeys: string[];
+		owned: boolean;
+		validAuthority?:
+			| {
+					session: Session & Record<string, unknown>;
+					user: User & Record<string, unknown>;
+					credentialKey: string;
+			  }
+			| undefined;
+	};
+
+	async function reconcileManagedUserSessions(userId: string): Promise<void> {
+		if (!secondaryStorage) return;
+		await runWithTransaction(adapter, async () => {
+			const currentAdapter = await getCurrentAdapter(adapter);
+			const lockedUser = await lockAndReadUser(currentAdapter, userId);
+			const activeUser =
+				lockedUser &&
+				(lockedUser as User & { banned?: boolean | null }).banned !== true
+					? (lockedUser as User & Record<string, unknown>)
+					: null;
+			const indexKey = secondaryActiveSessionsKey(userId);
+			const parsedIndex = safeJSONParse<SecondarySessionIndexEntry[]>(
+				await secondaryStorage.get(indexKey),
+			);
+			const index = Array.isArray(parsedIndex) ? parsedIndex : [];
+			const candidateSessionIds = [
+				...new Set(
+					index
+						.map((entry) => entry?.sessionId)
+						.filter(
+							(sessionId): sessionId is string =>
+								typeof sessionId === "string" && sessionId.length > 0,
+						),
+				),
+			];
+			const envelopeByKey = new Map<
+				string,
+				{ session?: { id?: unknown; userId?: unknown } } | null
+			>();
+			const readEnvelope = async (credentialKey: string) => {
+				if (!envelopeByKey.has(credentialKey)) {
+					envelopeByKey.set(
+						credentialKey,
+						safeJSONParse<{ session?: { id?: unknown; userId?: unknown } }>(
+							await secondaryStorage.get(credentialKey),
+						),
+					);
+				}
+				return envelopeByKey.get(credentialKey) ?? null;
+			};
+			const decisions: ManagedUserSessionReconciliation[] = [];
+
+			// Evaluation phase: secondary reads are allowed, writes are deferred until
+			// every candidate and live policy read has succeeded.
+			for (const sessionId of candidateSessionIds) {
+				const handleKey = secondaryHandleKey(sessionId);
+				const mappedCredentialKey = parseSecondaryHandle(
+					await secondaryStorage.get(handleKey),
+				);
+				const indexedCredentialKeys = index
+					.filter(
+						(entry) =>
+							entry?.sessionId === sessionId &&
+							typeof entry.credentialKey === "string" &&
+							entry.credentialKey.length > 0,
+					)
+					.map((entry) => entry.credentialKey);
+				const session = await currentAdapter.findOne<
+					Session & Record<string, unknown>
+				>({
+					model: "session",
+					where: [{ field: "id", value: sessionId }],
+				});
+				const credentials = session
+					? await currentAdapter.findMany<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "sessionId", value: sessionId }],
+						})
+					: [];
+				const expectedCredentialKeys = credentials
+					.filter((credential) =>
+						typeof credential.secretDigest === "string" &&
+						credential.secretDigest.length > 0,
+					)
+					.map((credential) =>
+						secondaryCredentialKey(credential.secretDigest),
+					);
+				if (
+					legacyCredentialAuthority &&
+					session &&
+					typeof session.token === "string" &&
+					session.token.length > 0
+				) {
+					expectedCredentialKeys.push(
+						secondaryCredentialKey(
+							await digestSessionRefreshSecret(session.token),
+						),
+					);
+				}
+				const candidateCredentialKeys = [
+					...new Set([
+						...expectedCredentialKeys,
+						...(mappedCredentialKey ? [mappedCredentialKey] : []),
+						...indexedCredentialKeys,
+					]),
+				];
+				for (const credentialKey of candidateCredentialKeys) {
+					await readEnvelope(credentialKey);
+				}
+				const cachedOwnership = candidateCredentialKeys.some((credentialKey) => {
+					const envelope = envelopeByKey.get(credentialKey);
+					return (
+						envelope?.session?.id === sessionId &&
+						envelope.session.userId === userId
+					);
+				});
+				const owned = session?.userId === userId || (!session && cachedOwnership);
+				let validAuthority:
+					| ManagedUserSessionReconciliation["validAuthority"]
+					| undefined;
+				if (session?.userId === userId && activeUser) {
+					const policyValid = await validateRawSessionAuthority(session, activeUser);
+					let credentialKey: string | null = null;
+					if (
+						policyValid &&
+						legacyCredentialAuthority &&
+						credentials.length === 0 &&
+						typeof session.token === "string" &&
+						session.token.length > 0
+					) {
+						credentialKey = secondaryCredentialKey(
+							await digestSessionRefreshSecret(session.token),
+						);
+					} else if (policyValid && !legacyCredentialAuthority) {
+						const lineage = await findCanonicalManagedCredentialLineage({
+							session,
+							credentialAnchors: credentials,
+							requireValidDigests: true,
+							credentials,
+						});
+						credentialKey = lineage
+							? secondaryCredentialKey(lineage.active.secretDigest)
+							: null;
+					}
+					if (credentialKey) {
+						validAuthority = {
+							session,
+							user: activeUser,
+							credentialKey,
+						};
+					}
+				}
+				decisions.push({
+					sessionId,
+					handleKey,
+					candidateCredentialKeys,
+					owned,
+					validAuthority,
+				});
+			}
+
+			// Apply phase: every policy/topology decision above is complete.
+			const now = Date.now();
+			const nextIndex: SecondarySessionIndexEntry[] = [];
+			for (const decision of decisions) {
+				if (decision.validAuthority) {
+					const { session, user, credentialKey } = decision.validAuthority;
+					const ttl = getTTLSeconds(session.expiresAt, now);
+					if (ttl > 0) {
+						await secondaryStorage.set(
+							credentialKey,
+							JSON.stringify({ session: { ...session, token: null }, user }),
+							ttl,
+						);
+						await secondaryStorage.set(
+							decision.handleKey,
+							JSON.stringify({ credentialKey }),
+							ttl,
+						);
+						nextIndex.push({
+							sessionId: decision.sessionId,
+							credentialKey,
+							expiresAt: session.expiresAt.getTime(),
+						});
+					}
+					for (const candidateKey of decision.candidateCredentialKeys) {
+						if (
+							candidateKey !== credentialKey &&
+							envelopeByKey.get(candidateKey)?.session?.id === decision.sessionId
+						) {
+							await secondaryStorage.delete(candidateKey);
+						}
+					}
+					continue;
+				}
+				if (decision.owned) {
+					for (const candidateKey of decision.candidateCredentialKeys) {
+						if (
+							envelopeByKey.get(candidateKey)?.session?.id === decision.sessionId
+						) {
+							await secondaryStorage.delete(candidateKey);
+						}
+					}
+					await secondaryStorage.delete(decision.handleKey);
+				}
+			}
+			nextIndex.sort(
+				(left, right) =>
+					left.expiresAt - right.expiresAt ||
+					left.sessionId.localeCompare(right.sessionId) ||
+					left.credentialKey.localeCompare(right.credentialKey),
+			);
+			if (nextIndex.length === 0) {
+				await secondaryStorage.delete(indexKey);
+				return;
+			}
+			const ttl = getTTLSeconds(nextIndex.at(-1)!.expiresAt, now);
+			if (ttl > 0) {
+				await secondaryStorage.set(indexKey, JSON.stringify(nextIndex), ttl);
+			} else {
+				await secondaryStorage.delete(indexKey);
+			}
+		});
+	}
+
+	async function queueManagedUserSessionReconciliation(userId: string) {
+		if (!secondaryStorage) return;
+		await queueAfterTransactionHook(
+			() => reconcileManagedUserSessions(userId),
+			adapter,
+		);
+	}
+
 	async function withVerificationConsumeLock<T>(
 		key: string,
 		fn: () => Promise<T>,
@@ -1299,6 +1546,136 @@ export const createInternalAdapter = (
 			},
 			adapter,
 		);
+	}
+
+	async function queueManagedInvalidSessionReadCleanup(input: {
+		sessionId: string;
+		userId?: string | undefined;
+		expectedCredentialKeys: readonly string[];
+	}): Promise<void> {
+		if (!secondaryStorage) return;
+		await queueAfterTransactionHook(
+			async () => {
+				await runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					if (input.userId) {
+						await lockAndReadUser(currentAdapter, input.userId);
+					}
+					await cleanupInvalidManagedSessionSecondary(input);
+				});
+			},
+			adapter,
+		);
+	}
+
+	async function queueManagedOrphanCredentialCleanup(
+		credentialKey: string,
+		observedValue: string,
+	): Promise<void> {
+		if (!secondaryStorage) return;
+		await queueAfterTransactionHook(
+			async () => {
+				const current = await secondaryStorage.get(credentialKey);
+				if (current === observedValue) {
+					await secondaryStorage.delete(credentialKey);
+				}
+			},
+			adapter,
+		);
+	}
+
+	async function findExactManagedCredentialCandidate(
+		presentedSecret: string,
+	): Promise<SessionCredential | null> {
+		const secretDigest = await digestSessionRefreshSecret(presentedSecret);
+		const selector = credentialIdFromRefreshSecret(presentedSecret);
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const digestCandidates = await currentAdapter.findMany<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "secretDigest", value: secretDigest }],
+		});
+		const exactDigestCandidates = digestCandidates.filter((candidate) =>
+			constantTimeEqual(candidate.secretDigest, secretDigest),
+		);
+		if (exactDigestCandidates.length !== 1) return null;
+		if (!selector) return exactDigestCandidates[0]!;
+		const selectorCandidates = await currentAdapter.findMany<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "selector", value: selector }],
+		});
+		if (
+			selectorCandidates.length !== 1 ||
+			selectorCandidates[0]!.id !== exactDigestCandidates[0]!.id ||
+			!constantTimeEqual(selectorCandidates[0]!.secretDigest, secretDigest)
+		) {
+			return null;
+		}
+		return exactDigestCandidates[0]!;
+	}
+
+	async function loadManagedModernDatabaseSession(input: {
+		sessionId: string;
+		presentedCredential?: SessionCredential | undefined;
+		presentedToken?: string | undefined;
+	}): Promise<ValidatedSessionAuthority | null> {
+		const record = await findSessionRecordById(input.sessionId);
+		if (!record) {
+			await queueManagedInvalidSessionReadCleanup({
+				sessionId: input.sessionId,
+				expectedCredentialKeys: input.presentedCredential
+					? [secondaryCredentialKey(input.presentedCredential.secretDigest)]
+					: [],
+			});
+			return null;
+		}
+		const { user, ...session } = record;
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const credentials = await currentAdapter.findMany<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "sessionId", value: input.sessionId }],
+		});
+		const expectedCredentialKeys = credentials
+			.filter((credential) =>
+				typeof credential.secretDigest === "string" &&
+				credential.secretDigest.length > 0,
+			)
+			.map((credential) => secondaryCredentialKey(credential.secretDigest));
+		const policyValid = user
+			? await validateRawSessionAuthority(
+					session as Record<string, unknown>,
+					user as User & Record<string, unknown>,
+				)
+			: false;
+		const lineage = user
+			? await findCanonicalManagedCredentialLineage({
+					session: session as Session & Record<string, unknown>,
+					credentialAnchors: credentials,
+					requireValidDigests: true,
+					credentials,
+				})
+			: null;
+		const presentedCredentialValid = input.presentedCredential
+			? lineage?.active.id === input.presentedCredential.id &&
+				constantTimeEqual(
+					lineage.active.secretDigest,
+					input.presentedCredential.secretDigest,
+				)
+			: true;
+		if (!user || !policyValid || !lineage || !presentedCredentialValid) {
+			await queueManagedInvalidSessionReadCleanup({
+				sessionId: input.sessionId,
+				userId: session.userId,
+				expectedCredentialKeys,
+			});
+			return null;
+		}
+		return {
+			session: {
+				...(session as Session & Record<string, unknown>),
+				...(input.presentedToken ? { token: input.presentedToken } : {}),
+			},
+			user: user as User & Record<string, unknown>,
+		};
 	}
 
 	async function revokeDatabaseSession(
@@ -2597,6 +2974,42 @@ export const createInternalAdapter = (
 						user: parsedUser,
 					};
 				}
+				if (
+					authenticationPolicy &&
+					storesSessionsInDatabase &&
+					!legacyCredentialAuthority
+				) {
+					const credential = await findExactManagedCredentialCandidate(token);
+					if (!credential) return null;
+					if (!credential.sessionId) {
+						const credentialKey = secondaryCredentialKey(
+							credential.secretDigest,
+						);
+						const observedValue = secondaryStorage
+							? await secondaryStorage.get(credentialKey)
+							: null;
+						if (typeof observedValue === "string") {
+							await queueManagedOrphanCredentialCleanup(
+								credentialKey,
+								observedValue,
+							);
+						}
+						return null;
+					}
+					const authority = await loadManagedModernDatabaseSession({
+						sessionId: credential.sessionId,
+						presentedCredential: credential,
+						presentedToken: token,
+					});
+					if (!authority) return null;
+					return {
+						session: parseInternalSessionOutput(
+							ctx.options,
+							authority.session,
+						),
+						user: parseUserOutput(ctx.options, authority.user),
+					};
+				}
 
 				const result = await findDatabaseSessionByCredential(token);
 				if (!result) return null;
@@ -2661,6 +3074,21 @@ export const createInternalAdapter = (
 							createdAt: new Date(currentUser.createdAt),
 							updatedAt: new Date(currentUser.updatedAt),
 						}),
+					};
+				}
+				if (
+					authenticationPolicy &&
+					storesSessionsInDatabase &&
+					!legacyCredentialAuthority
+				) {
+					const authority = await loadManagedModernDatabaseSession({ sessionId });
+					if (!authority) return null;
+					return {
+						session: parseInternalSessionOutput(
+							ctx.options,
+							authority.session,
+						),
+						user: parseUserOutput(ctx.options, authority.user),
 					};
 				}
 				const record = await findSessionRecordById(sessionId);
@@ -3821,6 +4249,28 @@ export const createInternalAdapter = (
 			userId: string,
 			data: Partial<User> & Record<string, any>,
 		) => {
+			if (authenticationPolicy && storesSessionsInDatabase) {
+				return runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					const authoritativeUser = await currentAdapter.findOne<User>({
+						model: "user",
+						where: [{ field: "id", value: userId }],
+					});
+					const user = await updateWithHooks<User>(
+						{
+							...data,
+							...(data.email ? { email: data.email.toLowerCase() } : {}),
+						},
+						[{ field: "id", value: userId }],
+						"user",
+						undefined,
+					);
+					if (authoritativeUser && user) {
+						await queueManagedUserSessionReconciliation(authoritativeUser.id);
+					}
+					return user;
+				});
+			}
 			const user = await updateWithHooks<User>(
 				{
 					...data,
@@ -3842,6 +4292,28 @@ export const createInternalAdapter = (
 			email: string,
 			data: Partial<User & Record<string, any>>,
 		) => {
+			if (authenticationPolicy && storesSessionsInDatabase) {
+				return runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					const authoritativeUser = await currentAdapter.findOne<User>({
+						model: "user",
+						where: [{ field: "email", value: email.toLowerCase() }],
+					});
+					const user = await updateWithHooks<User>(
+						{
+							...data,
+							...(data.email ? { email: data.email.toLowerCase() } : {}),
+						},
+						[{ field: "email", value: email.toLowerCase() }],
+						"user",
+						undefined,
+					);
+					if (authoritativeUser && user) {
+						await queueManagedUserSessionReconciliation(authoritativeUser.id);
+					}
+					return user;
+				});
+			}
 			const user = await updateWithHooks<User>(
 				{
 					...data,
