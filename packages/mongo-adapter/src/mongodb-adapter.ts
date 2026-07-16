@@ -31,6 +31,22 @@ const CREDENTIAL_AUTHORITY_MODELS = new Set([
 	"oauthAccessToken",
 ]);
 
+const PASSKEY_AUTHORITY_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+	user: new Set(["passkeyUserHandle"]),
+	passkey: new Set(["credentialID"]),
+	passkeyChallenge: new Set(["digestId"]),
+};
+
+function isCredentialAuthorityUniqueField(
+	options: ClearanceOptions,
+	model: string,
+	field: string,
+): boolean {
+	if (CREDENTIAL_AUTHORITY_MODELS.has(model)) return true;
+	if (!options.plugins?.some((plugin) => plugin.id === "passkey")) return false;
+	return PASSKEY_AUTHORITY_FIELDS[model]?.has(field) === true;
+}
+
 function mongoPartialIndexType(
 	options: ClearanceOptions,
 	field: {
@@ -71,10 +87,14 @@ async function ensureCredentialAuthorityIndexes(
 	const getFieldName = initGetFieldName({ schema, usePlural });
 
 	for (const [model, table] of Object.entries(schema)) {
-		if (!CREDENTIAL_AUTHORITY_MODELS.has(model)) continue;
 		const collection = db.collection(getModelName(model));
 		for (const [field, attributes] of Object.entries(table.fields)) {
-			if (attributes.unique !== true) continue;
+			if (
+				attributes.unique !== true ||
+				!isCredentialAuthorityUniqueField(options, model, field)
+			) {
+				continue;
+			}
 			const fieldName = getFieldName({ model, field });
 			const name = `clearance_${model}_${field}_unique_v1`;
 			const partialFilterExpression =

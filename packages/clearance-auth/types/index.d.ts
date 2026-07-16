@@ -25,6 +25,23 @@ export type ClearanceAuthenticationSecurityOptions = {
         gracePeriodSeconds?: number;
     };
 };
+/** Product-supported options forwarded directly to the runtime passkey plugin. */
+export type ClearancePasskeyOptions = {
+    /** Exact WebAuthn relying-party domain. Defaults from the static `baseURL`. */
+    rpID?: string;
+    /** Human-readable relying-party name shown by authenticators. */
+    rpName?: string;
+    /** Additional exact ceremony origins, validated by the runtime. */
+    origin?: string[];
+    authenticatorSelection?: {
+        authenticatorAttachment?: "platform" | "cross-platform";
+    };
+    /** Per-plugin rate limit for all `/passkey/*` endpoints. */
+    rateLimit?: {
+        window?: number;
+        max?: number;
+    };
+};
 export type ClearanceRuntimeUser = {
     id: string;
     email: string;
@@ -56,6 +73,81 @@ export type ClearanceRuntimeSession = {
 export type ClearanceRuntimeSessionResponse = {
     session: ClearanceRuntimeSession;
     user: ClearanceRuntimeUser;
+};
+export type ClearancePublicPasskey = {
+    id: string;
+    name?: string | null;
+    deviceType: "singleDevice" | "multiDevice";
+    backedUp: boolean;
+    transports?: Array<"ble" | "cable" | "hybrid" | "internal" | "nfc" | "smart-card" | "usb">;
+    createdAt: Date;
+    updatedAt: Date;
+};
+export type ClearancePasskeyRegistrationResponse = {
+    id: string;
+    rawId: string;
+    type: "public-key";
+    authenticatorAttachment?: "platform" | "cross-platform";
+    clientExtensionResults: Record<string, unknown>;
+    response: {
+        clientDataJSON: string;
+        attestationObject: string;
+        authenticatorData?: string;
+        transports?: ClearancePublicPasskey["transports"];
+        publicKeyAlgorithm?: number;
+        publicKey?: string;
+    };
+};
+export type ClearancePasskeyAuthenticationResponse = {
+    id: string;
+    rawId: string;
+    type: "public-key";
+    authenticatorAttachment?: "platform" | "cross-platform";
+    clientExtensionResults: Record<string, unknown>;
+    response: {
+        clientDataJSON: string;
+        authenticatorData: string;
+        signature: string;
+        userHandle?: string;
+    };
+};
+export type ClearancePasskeyRegistrationOptions = {
+    challenge: string;
+    rp: {
+        id: string;
+        name: string;
+    };
+    user: {
+        id: string;
+        name: string;
+        displayName: string;
+    };
+    pubKeyCredParams: Array<{
+        alg: number;
+        type: "public-key";
+    }>;
+    timeout: number;
+    excludeCredentials?: Array<{
+        id: string;
+        type: "public-key";
+        transports?: ClearancePublicPasskey["transports"];
+    }>;
+    authenticatorSelection: {
+        authenticatorAttachment?: "platform" | "cross-platform";
+        residentKey: "required";
+        requireResidentKey: true;
+        userVerification: "required";
+    };
+    attestation: "none";
+    extensions?: Record<string, unknown>;
+};
+export type ClearancePasskeyAuthenticationOptions = {
+    challenge: string;
+    rpId: string;
+    timeout: number;
+    allowCredentials?: never;
+    userVerification: "required";
+    extensions?: Record<string, unknown>;
 };
 export type ClearanceTwoFactorRuntimeUser = ClearanceRuntimeUser & {
     twoFactorEnabled: boolean;
@@ -136,7 +228,7 @@ interface ClearanceProductEndpoint<Input, Output> {
     }>;
     (input: Input): Promise<Output>;
 }
-export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationSecurityOptions | undefined = ClearanceAuthenticationSecurityOptions> = {
+export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationSecurityOptions | undefined = ClearanceAuthenticationSecurityOptions, Passkeys extends false | ClearancePasskeyOptions | undefined = false | ClearancePasskeyOptions | undefined> = {
     baseURL: string;
     secret: string;
     databaseUrl: string;
@@ -150,6 +242,8 @@ export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationS
     /** Product-guarded runtime extensions such as OIDC Provider and MCP. */
     plugins?: ClearancePlugin[];
     authenticationSecurity?: Security;
+    /** Enabled by default. Set to `false` to omit the passkey server surface. */
+    passkeys?: Passkeys;
     credentialAuthority?: {
         /** Runtime generation admitted by the durable database fence. */
         generation: "legacy-v1" | "digest-v1";
@@ -308,6 +402,40 @@ type ClearanceJwtProductApi = {
         payload: ClearanceJwtPayload | null;
     }>;
 };
+type ClearancePasskeyProductApi = {
+    generatePasskeyRegistrationOptions: ClearanceProductEndpoint<{
+        body?: {
+            authenticatorAttachment?: "platform" | "cross-platform";
+        };
+        headers: HeadersInit;
+    }, ClearancePasskeyRegistrationOptions>;
+    verifyPasskeyRegistration: ClearanceProductEndpoint<{
+        body: {
+            response: ClearancePasskeyRegistrationResponse;
+            name?: string;
+        };
+        headers: HeadersInit;
+    }, ClearancePublicPasskey>;
+    generatePasskeyAuthenticationOptions: ClearanceProductEndpoint<{
+        headers: HeadersInit;
+    }, ClearancePasskeyAuthenticationOptions>;
+    verifyPasskeyAuthentication: ClearanceProductEndpoint<{
+        body: {
+            response: ClearancePasskeyAuthenticationResponse;
+        };
+        headers: HeadersInit;
+    }, ClearanceRuntimeSessionResponse>;
+    listPasskeys: ClearanceProductEndpoint<{
+        headers: HeadersInit;
+    }, ClearancePublicPasskey[]>;
+    updatePasskey: ClearanceProductEndpoint<{
+        body: {
+            id: string;
+            name: string;
+        };
+        headers: HeadersInit;
+    }, ClearancePublicPasskey>;
+};
 type ClearanceAuthenticationSecurityApi<Security extends ClearanceAuthenticationSecurityOptions | undefined> = (Security extends undefined ? ClearanceTwoFactorProductApi : "twoFactor" extends keyof Security ? Security extends {
     twoFactor: {
         enabled: false;
@@ -325,8 +453,9 @@ type ClearanceAuthenticationSecurityApi<Security extends ClearanceAuthentication
         enabled: true;
     };
 } ? ClearanceJwtProductApi : Partial<ClearanceJwtProductApi> : ClearanceJwtProductApi);
-export type ClearanceProductAuthRuntime<Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined> = Omit<ClearanceAuthRuntime, "api"> & {
-    readonly api: ClearanceBaseProductApi & ClearanceAuthenticationSecurityApi<Security>;
+type ClearancePasskeyApi<Passkeys extends false | ClearancePasskeyOptions | undefined> = [Passkeys] extends [false] ? Record<never, never> : false extends Passkeys ? Partial<ClearancePasskeyProductApi> : ClearancePasskeyProductApi;
+export type ClearanceProductAuthRuntime<Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined, Passkeys extends false | ClearancePasskeyOptions | undefined = undefined> = Omit<ClearanceAuthRuntime, "api"> & {
+    readonly api: ClearanceBaseProductApi & ClearanceAuthenticationSecurityApi<Security> & ClearancePasskeyApi<Passkeys>;
 };
 export interface ClearanceQueryResult<Row extends Record<string, unknown> = Record<string, unknown>> {
     rows: Row[];
@@ -336,8 +465,8 @@ export interface ClearanceDatabasePool {
     query<Row extends Record<string, unknown> = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<ClearanceQueryResult<Row>>;
     end(): Promise<void>;
 }
-export type ClearanceAuthBundle<Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined> = {
-    auth: ClearanceProductAuthRuntime<Security>;
+export type ClearanceAuthBundle<Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined, Passkeys extends false | ClearancePasskeyOptions | undefined = undefined> = {
+    auth: ClearanceProductAuthRuntime<Security, Passkeys>;
     pool: ClearanceDatabasePool;
     db: unknown;
     plugins: {
@@ -347,6 +476,7 @@ export type ClearanceAuthBundle<Security extends ClearanceAuthenticationSecurity
         twoFactor: boolean;
         breachedPassword: boolean;
         asymmetricAccessTokens: boolean;
+        passkeys: boolean;
     };
     rateLimitEnabled: boolean;
     credentialAuthority: {
@@ -420,7 +550,7 @@ export declare const DEFAULT_TELEMETRY_ENDPOINT: string | undefined;
 export declare function encryptRuntimeCredential(plaintext: string, secret: string): Promise<string>;
 export declare function decryptRuntimeCredential(ciphertext: string, secret: string): Promise<string>;
 export declare function socialProvidersFromEnvironment(env?: Record<string, string | undefined>): Record<string, SocialProviderConfig>;
-export declare function createClearanceAuth<const Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined>(options: CreateClearanceAuthOptions<Security>): ClearanceAuthBundle<Security>;
+export declare function createClearanceAuth<const Security extends ClearanceAuthenticationSecurityOptions | undefined = undefined, const Passkeys extends false | ClearancePasskeyOptions | undefined = undefined>(options: CreateClearanceAuthOptions<Security, Passkeys>): ClearanceAuthBundle<Security, Passkeys>;
 export declare function withClearanceDefaults<T extends Record<string, unknown>>(options: T): T & {
     telemetry: {
         enabled: false;

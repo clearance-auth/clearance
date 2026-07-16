@@ -53,6 +53,65 @@ export type ClearanceJsonWebKeySet = {
 	keys: ClearanceJsonWebKey[];
 };
 
+export type ClearanceClientPublicPasskey = {
+	id: string;
+	name?: string | null;
+	deviceType: "singleDevice" | "multiDevice";
+	backedUp: boolean;
+	transports?: Array<
+		| "ble"
+		| "cable"
+		| "hybrid"
+		| "internal"
+		| "nfc"
+		| "smart-card"
+		| "usb"
+	>;
+	createdAt: Date;
+	updatedAt: Date;
+};
+
+export type ClearancePasskeyClientUser = {
+	id: string;
+	email: string;
+	name: string;
+	emailVerified: boolean;
+	image?: string | null;
+	createdAt: Date;
+	updatedAt: Date;
+};
+
+export type ClearancePasskeyClientSession = {
+	id: string;
+	/** @deprecated Stable, non-secret compatibility alias for `id`. */
+	token: string;
+	userId: string;
+	expiresAt: Date;
+	createdAt: Date;
+	updatedAt: Date;
+	ipAddress?: string | null;
+	userAgent?: string | null;
+};
+
+export type ClearancePasskeyClientSessionResponse = {
+	session: ClearancePasskeyClientSession;
+	user: ClearancePasskeyClientUser;
+};
+
+export type ClearancePasskeyListState = {
+	data: ClearanceClientPublicPasskey[] | null;
+	error: ClearanceClientError | null;
+	isPending: boolean;
+	isRefetching: boolean;
+	refetch(): Promise<void>;
+};
+
+/** Minimal structural query-atom contract; no nanostores dependency required. */
+export interface ClearancePasskeyListQuery {
+	get(): ClearancePasskeyListState;
+	subscribe(listener: (value: ClearancePasskeyListState) => void): () => void;
+}
+
 export interface ClearanceTwoFactorClientApi {
 	readonly twoFactor: {
 		enable(input: {
@@ -120,9 +179,31 @@ export interface ClearanceJwtClientApi {
 	): Promise<ClearanceClientResponse<ClearanceJsonWebKeySet>>;
 }
 
+export interface ClearancePasskeyClientApi {
+	readonly signIn: {
+		passkey(input?: {
+			fetchOptions?: ClearanceClientFetchOptions;
+		}): Promise<ClearanceClientResponse<ClearancePasskeyClientSessionResponse>>;
+	};
+	readonly passkey: {
+		addPasskey(input?: {
+			name?: string;
+			authenticatorAttachment?: "platform" | "cross-platform";
+			fetchOptions?: ClearanceClientFetchOptions;
+		}): Promise<ClearanceClientResponse<ClearanceClientPublicPasskey>>;
+		renamePasskey(input: {
+			id: string;
+			name: string;
+			fetchOptions?: ClearanceClientFetchOptions;
+		}): Promise<ClearanceClientResponse<ClearanceClientPublicPasskey>>;
+	};
+	readonly useListPasskeys: ClearancePasskeyListQuery;
+}
+
 export type ClearanceAuthClient = Readonly<Record<string, unknown>> &
 	ClearanceTwoFactorClientApi &
-	ClearanceJwtClientApi;
+	ClearanceJwtClientApi &
+	ClearancePasskeyClientApi;
 
 export type ClearanceBaseAuthClient = Readonly<Record<string, unknown>>;
 
@@ -143,6 +224,11 @@ export interface ClearanceJwtClientPlugin extends ClearanceClientPlugin {
 	readonly $clearanceProductApi?: "jwt";
 }
 
+export interface ClearancePasskeyClientPlugin extends ClearanceClientPlugin {
+	readonly id: "passkey";
+	readonly $clearanceProductApi?: "passkey";
+}
+
 export type ClearanceAuthClientOptions = {
 	baseURL?: string;
 	basePath?: string;
@@ -157,23 +243,25 @@ type ClearancePluginUnion<Options> = Options extends {
 	? Plugin
 	: never;
 
-type ClearanceAuthClientFor<Options> =
-	Extract<
+type ClearanceAuthClientFor<Options> = ClearanceBaseAuthClient &
+	(Extract<
 		ClearancePluginUnion<Options>,
 		ClearanceTwoFactorClientPlugin
 	> extends never
-		? Extract<
-				ClearancePluginUnion<Options>,
-				ClearanceJwtClientPlugin
-			> extends never
-			? ClearanceBaseAuthClient
-			: ClearanceBaseAuthClient & ClearanceJwtClientApi
-		: Extract<
-					ClearancePluginUnion<Options>,
-					ClearanceJwtClientPlugin
-			  > extends never
-			? ClearanceBaseAuthClient & ClearanceTwoFactorClientApi
-			: ClearanceAuthClient;
+		? Record<never, never>
+		: ClearanceTwoFactorClientApi) &
+	(Extract<
+		ClearancePluginUnion<Options>,
+		ClearanceJwtClientPlugin
+	> extends never
+		? Record<never, never>
+		: ClearanceJwtClientApi) &
+	(Extract<
+		ClearancePluginUnion<Options>,
+		ClearancePasskeyClientPlugin
+	> extends never
+		? Record<never, never>
+		: ClearancePasskeyClientApi);
 
 export declare function createAuthClient<
 	const Plugins extends ClearanceClientPlugin[],
@@ -198,3 +286,5 @@ export declare function twoFactorClient(options?: {
 export declare function jwtClient(options?: {
 	jwks?: { jwksPath?: string };
 }): ClearanceJwtClientPlugin;
+
+export declare function passkeyClient(): ClearancePasskeyClientPlugin;

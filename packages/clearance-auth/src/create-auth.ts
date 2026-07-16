@@ -19,8 +19,10 @@ import {
 	jwt,
 	isOneWayBackupCodeEnvelope,
 	organization,
+	passkey,
 	twoFactor,
 	type Jwk,
+	type PasskeyOptions,
 } from "../../runtime/src/plugins/index.js";
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
@@ -39,6 +41,7 @@ import {
 import type {
 	ClearanceAuthBundle,
 	ClearanceAuthenticationSecurityOptions,
+	ClearancePasskeyOptions,
 	ClearanceProductAuthRuntime,
 	ClearanceRuntimeMigrationPlan,
 	ClearanceRuntimeMigrationResult,
@@ -60,6 +63,7 @@ export type {
 	ClearanceRuntimeUser,
 	CreateClearanceAuthOptions,
 	ClearanceAuthenticationSecurityOptions,
+	ClearancePasskeyOptions,
 	SocialProviderConfig,
 } from "./public-types/index.js";
 
@@ -467,9 +471,10 @@ function validateDurableDeliveryUrl(
 export function createClearanceAuth<
 	const Security extends ClearanceAuthenticationSecurityOptions | undefined =
 		undefined,
+	const Passkeys extends false | ClearancePasskeyOptions | undefined = undefined,
 >(
-	options: CreateClearanceAuthOptions<Security>,
-): ClearanceAuthBundle<Security> {
+	options: CreateClearanceAuthOptions<Security, Passkeys>,
+): ClearanceAuthBundle<Security, Passkeys> {
 	const nodeEnv = process.env.NODE_ENV ?? "development";
 	const strict =
 		options.strictSecrets === true ||
@@ -491,6 +496,8 @@ export function createClearanceAuth<
 		validateDurableDeliveryUrl(options.baseURL, "baseURL", strict);
 	}
 	const authenticationSecurity = resolveAuthenticationSecurity(options, strict);
+	const passkeyOptions: PasskeyOptions | undefined =
+		options.passkeys === false ? undefined : options.passkeys;
 
 	const pool = new pg.Pool({ connectionString: options.databaseUrl });
 	const credentialAuthorityGeneration =
@@ -573,6 +580,7 @@ export function createClearanceAuth<
 
 	const plugins = [
 		organization(),
+		...(options.passkeys === false ? [] : [passkey(passkeyOptions)]),
 		...(authenticationSecurity.twoFactor.enabled
 			? [
 					twoFactor({
@@ -1186,7 +1194,7 @@ export function createClearanceAuth<
 	});
 
 	return {
-		auth: auth as unknown as ClearanceProductAuthRuntime<Security>,
+		auth: auth as unknown as ClearanceProductAuthRuntime<Security, Passkeys>,
 		pool,
 		db,
 		credentialAuthority: credentialAuthorityFacade,
@@ -1198,6 +1206,7 @@ export function createClearanceAuth<
 			breachedPassword: authenticationSecurity.breachedPassword.enabled,
 			asymmetricAccessTokens:
 				authenticationSecurity.asymmetricAccessTokens.enabled,
+			passkeys: options.passkeys !== false,
 		},
 		rateLimitEnabled,
 		prepareCredentialAuthorityRuntime: assertProductRuntimeServing,

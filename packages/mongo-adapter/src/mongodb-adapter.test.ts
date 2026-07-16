@@ -2,6 +2,146 @@ import { ObjectId, UUID } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { mongodbAdapter } from "./mongodb-adapter";
 
+type TestIndex = {
+	name: string;
+	key: Record<string, 1>;
+	unique?: boolean | undefined;
+	partialFilterExpression?:
+		| Record<string, { $type: string }>
+		| undefined;
+};
+
+class UniqueIndexCollection {
+	readonly indexes: TestIndex[] = [
+		{ name: "_id_", key: { _id: 1 }, unique: true },
+	];
+	readonly documents: Record<string, unknown>[] = [];
+
+	listIndexes() {
+		return {
+			toArray: async () => this.indexes.map((index) => ({ ...index })),
+		};
+	}
+
+	async createIndex(
+		key: Record<string, 1>,
+		options: Omit<TestIndex, "key">,
+	) {
+		this.indexes.push({ key, ...options });
+		return options.name;
+	}
+
+	async dropIndex(name: string) {
+		const index = this.indexes.findIndex((candidate) => candidate.name === name);
+		if (index >= 0) this.indexes.splice(index, 1);
+	}
+
+	async insertOne(document: Record<string, unknown>) {
+		for (const index of this.indexes) {
+			if (!index.unique || !this.isIncluded(document, index)) continue;
+			const field = Object.keys(index.key)[0]!;
+			if (
+				this.documents.some(
+					(existing) =>
+						this.isIncluded(existing, index) &&
+						existing[field] === document[field],
+				)
+			) {
+				throw Object.assign(new Error("E11000 duplicate key error"), {
+					code: 11000,
+				});
+			}
+		}
+		this.documents.push(document);
+		return { insertedId: document._id };
+	}
+
+	private isIncluded(document: Record<string, unknown>, index: TestIndex) {
+		if (!index.partialFilterExpression) return true;
+		const [field, condition] = Object.entries(
+			index.partialFilterExpression,
+		)[0]!;
+		if (condition.$type === "string") return typeof document[field] === "string";
+		if (condition.$type === "number") return typeof document[field] === "number";
+		if (condition.$type === "bool") return typeof document[field] === "boolean";
+		if (condition.$type === "date") return document[field] instanceof Date;
+		if (condition.$type === "objectId") {
+			return document[field] instanceof ObjectId;
+		}
+		if (condition.$type === "binData") return document[field] instanceof UUID;
+		return false;
+	}
+}
+
+class UniqueIndexDb {
+	private readonly collections = new Map<string, UniqueIndexCollection>();
+
+	collection(name: string) {
+		let collection = this.collections.get(name);
+		if (!collection) {
+			collection = new UniqueIndexCollection();
+			this.collections.set(name, collection);
+		}
+		return collection;
+	}
+}
+
+async function createPasskeyIndexedAdapter() {
+	const db = new UniqueIndexDb();
+	const options = {
+		user: { modelName: "member" },
+		plugins: [
+			{
+				id: "passkey",
+				schema: {
+					user: {
+						fields: {
+							passkeyUserHandle: {
+								type: "string",
+								required: false,
+								unique: true,
+								fieldName: "webauthn_handle",
+							},
+						},
+					},
+					passkey: {
+						modelName: "authenticator",
+						fields: {
+							credentialID: {
+								type: "string",
+								required: true,
+								unique: true,
+								fieldName: "credential_key",
+							},
+						},
+					},
+					passkeyChallenge: {
+						modelName: "ceremonyChallenge",
+						fields: {
+							digestId: {
+								type: "string",
+								required: true,
+								unique: true,
+								fieldName: "challenge_digest",
+							},
+						},
+					},
+				},
+			},
+		],
+	} as any;
+	const adapter = mongodbAdapter(db as any, {
+		transaction: false,
+		usePlural: true,
+	})(options);
+	await (
+		adapter as typeof adapter & {
+			ensureCredentialAuthorityIndexes(): Promise<void>;
+		}
+	).ensureCredentialAuthorityIndexes();
+	return { adapter, db };
+}
+
 describe("mongodb-adapter", () => {
 	it("should create mongodb adapter", () => {
 		const db = {
@@ -170,6 +310,102 @@ describe("mongodb-adapter", () => {
 		expect(aggregate.mock.calls[0]?.[0]).toContainEqual({
 			$sort: { _id: 1 },
 		});
+	});
+});
+
+describe("passkey authority indexes", () => {
+	it("installs exact remapped indexes without making other user fields unique", async () => {
+		const { db } = await createPasskeyIndexedAdapter();
+
+		expect(db.collection("authenticators").indexes).toContainEqual({
+			name: "clearance_passkey_credentialID_unique_v1",
+			key: { credential_key: 1 },
+			unique: true,
+		});
+		expect(db.collection("ceremonyChallenges").indexes).toContainEqual({
+			name: "clearance_passkeyChallenge_digestId_unique_v1",
+			key: { challenge_digest: 1 },
+			unique: true,
+		});
+		expect(db.collection("members").indexes).toContainEqual({
+			name: "clearance_user_passkeyUserHandle_unique_v1",
+			key: { webauthn_handle: 1 },
+			unique: true,
+			partialFilterExpression: {
+				webauthn_handle: { $type: "string" },
+			},
+		});
+		expect(
+			db
+				.collection("members")
+				.indexes.filter((index) => index.name !== "_id_")
+				.map((index) => index.key),
+		).toEqual([{ webauthn_handle: 1 }]);
+		expect(db.collection("sessionCredentials").indexes).toContainEqual(
+			expect.objectContaining({
+				name: "clearance_sessionCredential_selector_unique_v1",
+				unique: true,
+			}),
+		);
+	});
+
+	it("rejects duplicate passkey credential IDs", async () => {
+		const { adapter } = await createPasskeyIndexedAdapter();
+		await adapter.create({
+			model: "passkey",
+			data: { credentialID: "credential-1" },
+		});
+
+		await expect(
+			adapter.create({
+				model: "passkey",
+				data: { credentialID: "credential-1" },
+			}),
+		).rejects.toMatchObject({ code: 11000 });
+	});
+
+	it("rejects duplicate passkey challenge digests", async () => {
+		const { adapter } = await createPasskeyIndexedAdapter();
+		await adapter.create({
+			model: "passkeyChallenge",
+			data: { digestId: "digest-1" },
+		});
+
+		await expect(
+			adapter.create({
+				model: "passkeyChallenge",
+				data: { digestId: "digest-1" },
+			}),
+		).rejects.toMatchObject({ code: 11000 });
+	});
+
+	it("allows absent and null user handles but rejects duplicate real handles", async () => {
+		const { adapter } = await createPasskeyIndexedAdapter();
+		const user = {
+			name: "Passkey user",
+			email: "shared@example.test",
+			emailVerified: true,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		};
+
+		await adapter.create({ model: "user", data: user });
+		await adapter.create({ model: "user", data: { ...user } });
+		await adapter.create({
+			model: "user",
+			data: { ...user, passkeyUserHandle: null },
+		});
+		await adapter.create({
+			model: "user",
+			data: { ...user, passkeyUserHandle: "handle-1" },
+		});
+
+		await expect(
+			adapter.create({
+				model: "user",
+				data: { ...user, passkeyUserHandle: "handle-1" },
+			}),
+		).rejects.toMatchObject({ code: 11000 });
 	});
 });
 

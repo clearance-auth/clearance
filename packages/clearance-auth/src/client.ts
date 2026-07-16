@@ -4,6 +4,7 @@ export * from "../../runtime/src/client/index.js";
 export {
 	jwtClient,
 	organizationClient,
+	passkeyClient,
 	twoFactorClient,
 } from "../../runtime/src/client/plugins/index.js";
 
