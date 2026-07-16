@@ -200,6 +200,7 @@ async function credentialRows(runtime: ManagedRuntime) {
 
 async function setupManagedDeletionRuntime(input: {
 	namespace: string;
+	reader?: ReaderImplementation;
 	credentialAuthority?: "legacy-v1";
 	options?: Omit<ClearanceOptions, "baseURL" | "secret" | "database">;
 	set?: (key: string, value: string) => Promise<void>;
@@ -219,6 +220,7 @@ async function setupManagedDeletionRuntime(input: {
 			}),
 	);
 	const runtime = await setupManagedRuntime({
+		...(input.reader ? { reader: input.reader } : {}),
 		...(input.credentialAuthority
 			? { credentialAuthority: input.credentialAuthority }
 			: {}),
@@ -237,6 +239,55 @@ async function setupManagedDeletionRuntime(input: {
 		},
 	});
 	return { runtime, store, secondarySet, secondaryDelete };
+}
+
+async function setupDatabaseBackedCompatibilityRuntime(input: {
+	namespace: string;
+	options?: Omit<ClearanceOptions, "baseURL" | "secret" | "database">;
+}) {
+	const database = new DatabaseSync(":memory:");
+	databases.push(database);
+	const store = new Map<string, string>();
+	const secondarySet = vi.fn(async (key: string, value: string) => {
+		store.set(key, value);
+	});
+	const secondaryDelete = vi.fn(async (key: string) => {
+		store.delete(key);
+	});
+	const runtimeOptions = {
+		baseURL: "http://localhost:3000",
+		secret: "database-backed-compatibility-secret",
+		database,
+		...input.options,
+		session: {
+			...input.options?.session,
+		},
+		secondaryStorage: {
+			namespace: input.namespace,
+			get: async (key: string) => store.get(key) ?? null,
+			set: secondarySet,
+			delete: secondaryDelete,
+			runExclusive<T>(_name: string, operation: () => T): T {
+				return operation();
+			},
+			assertNoLegacySessionWriters() {},
+		},
+	} satisfies ClearanceOptions;
+	await (await getMigrations(runtimeOptions)).runMigrations();
+	const context = await init(runtimeOptions);
+	const user = await context.internalAdapter.createUser({
+		email: `compatibility-${databases.length}@example.com`,
+		name: "Compatibility User",
+	});
+	return {
+		context,
+		database,
+		runtimeOptions,
+		user,
+		store,
+		secondarySet,
+		secondaryDelete,
+	};
 }
 
 afterEach(() => {
@@ -4237,5 +4288,681 @@ describe("managed single-session authoritative revocation", () => {
 		await runtime.context.internalAdapter.deleteSessionById(orphanId);
 		expect(store.has(envelopeKey)).toBe(false);
 		expect(store.has(handleKey)).toBe(false);
+	});
+});
+
+describe("managed bulk session authoritative revocation", () => {
+	it("atomically deletes mixed modern histories and canonically cleans every captured authority", async () => {
+		const namespace = "managed-bulk-mixed-test";
+		const { runtime, store } = await setupManagedDeletionRuntime({ namespace });
+		const rotatedSession = await issuePasswordSession(runtime);
+		await runtime.context.internalAdapter.rotateSessionCredential(
+			rotatedSession.token,
+			generateCredentialOperationKey(),
+		);
+		const plainSession = await issuePasswordSession(runtime);
+		const credentials = await credentialRows(runtime);
+		const expectedCredentialKeys = credentials.map(
+			(credential) =>
+				`clearance:${namespace}:session-credential:${String(credential.secretDigest)}`,
+		);
+		for (const credential of credentials) {
+			store.set(
+				`clearance:${namespace}:session-credential:${String(credential.secretDigest)}`,
+				JSON.stringify({ session: { id: credential.sessionId } }),
+			);
+		}
+		const rotatedHandleKey = `clearance:${namespace}:session-handle:${rotatedSession.id}`;
+		const plainHandleKey = `clearance:${namespace}:session-handle:${plainSession.id}`;
+		store.delete(plainHandleKey);
+		const malformedEnvelopeKey = `clearance:${namespace}:session-credential:malformed`;
+		const crossEnvelopeKey = `clearance:${namespace}:session-credential:cross`;
+		store.set(malformedEnvelopeKey, "not-json");
+		store.set(
+			crossEnvelopeKey,
+			JSON.stringify({ session: { id: "other-session" } }),
+		);
+		store.set(
+			rotatedHandleKey,
+			JSON.stringify({ credentialKey: crossEnvelopeKey }),
+		);
+		const indexKey = `clearance:${namespace}:active-sessions:${runtime.user.id}`;
+		const unrelated = {
+			sessionId: "future-session",
+			credentialKey: "future-credential",
+			expiresAt: Date.now() + 120_000,
+		};
+		store.set(
+			indexKey,
+			JSON.stringify([
+				...expectedCredentialKeys.map((credentialKey, index) => ({
+					sessionId: index < 2 ? rotatedSession.id : plainSession.id,
+					credentialKey,
+					expiresAt: Date.now() + 60_000,
+				})),
+				{
+					sessionId: rotatedSession.id,
+					credentialKey: expectedCredentialKeys[0],
+					expiresAt: Date.now() - 1,
+				},
+				{
+					sessionId: rotatedSession.id,
+					credentialKey: malformedEnvelopeKey,
+					expiresAt: Date.now() + 60_000,
+				},
+				{ broken: true },
+				unrelated,
+			]),
+		);
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		const revoked = await credentialRows(runtime);
+		expect(revoked).toHaveLength(credentials.length);
+		expect(
+			revoked.every(
+				(credential) =>
+					credential.status === "revoked" &&
+					credential.sessionId === null &&
+					credential.rotationNonceDigest === null &&
+					credential.recoverySecretCiphertext === null &&
+					credential.recoveryExpiresAt === null,
+			),
+		).toBe(true);
+		for (const credentialKey of expectedCredentialKeys) {
+			expect(store.has(credentialKey)).toBe(false);
+		}
+		expect(store.has(rotatedHandleKey)).toBe(false);
+		expect(store.has(plainHandleKey)).toBe(false);
+		expect(store.get(malformedEnvelopeKey)).toBe("not-json");
+		expect(store.has(crossEnvelopeKey)).toBe(true);
+		expect(JSON.parse(store.get(indexKey)!)).toEqual([unrelated]);
+		await expect(
+			runtime.context.internalAdapter.findSession(plainSession.token),
+		).resolves.toBeNull();
+	});
+
+	it("preserves every modern row while revoking mixed and zero-credential sessions without delete hooks", async () => {
+		const before = vi.fn(async () => {});
+		const after = vi.fn(async () => {});
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-preserve-test",
+			options: {
+				session: { preserveSessionInDatabase: true },
+				databaseHooks: { session: { delete: { before, after } } },
+			},
+		});
+		const credentialSession = await issuePasswordSession(runtime);
+		const zeroCredentialSession = await issuePasswordSession(runtime);
+		const credentialHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${credentialSession.id}`),
+		)!;
+		const zeroCredentialHandleKey = [...store.keys()].find((key) =>
+			key.endsWith(`:session-handle:${zeroCredentialSession.id}`),
+		)!;
+		const zeroCredentialKey = (
+			JSON.parse(store.get(zeroCredentialHandleKey)!) as { credentialKey: string }
+		).credentialKey;
+		const indexKey = [...store.keys()].find((key) =>
+			key.endsWith(`:active-sessions:${runtime.user.id}`),
+		)!;
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: credentialSession.id }],
+			update: {
+				rotationNonceDigest: "pending",
+				recoverySecretCiphertext: "ciphertext",
+				recoveryExpiresAt: new Date(Date.now() + 60_000),
+			},
+		});
+		await runtime.context.adapter.deleteMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: zeroCredentialSession.id }],
+		});
+		store.delete(zeroCredentialHandleKey);
+		store.set(
+			credentialHandleKey,
+			JSON.stringify({ credentialKey: zeroCredentialKey }),
+		);
+		store.set(
+			indexKey,
+			JSON.stringify(
+				(
+					JSON.parse(store.get(indexKey)!) as Array<{ sessionId: string }>
+				).filter((entry) => entry.sessionId !== zeroCredentialSession.id),
+			),
+		);
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(2);
+		expect(await credentialRows(runtime)).toEqual([
+			expect.objectContaining({
+				sessionId: credentialSession.id,
+				status: "revoked",
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+			}),
+		]);
+		expect(store).toEqual(new Map());
+		expect(before).not.toHaveBeenCalled();
+		expect(after).not.toHaveBeenCalled();
+	});
+
+	it.each(["zero", "partial"] as const)(
+		"rolls back preserve mode when the adapter reports a %s credential update",
+		async (mode) => {
+			const { runtime, store, secondarySet, secondaryDelete } =
+				await setupManagedDeletionRuntime({
+					namespace: `managed-bulk-preserve-${mode}-update-test`,
+					options: { session: { preserveSessionInDatabase: true } },
+				});
+			const session = await issuePasswordSession(runtime);
+			await runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				generateCredentialOperationKey(),
+			);
+			const stableSessions = structuredClone(
+				await authorityRows(runtime.context),
+			);
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+			const stableStore = new Map(store);
+			secondarySet.mockClear();
+			secondaryDelete.mockClear();
+			const originalTransaction = runtime.context.adapter.transaction.bind(
+				runtime.context.adapter,
+			);
+			let armed = true;
+			vi.spyOn(runtime.context.adapter, "transaction").mockImplementation(
+				async (callback) =>
+					originalTransaction(async (transactionAdapter) => {
+						if (!armed) return callback(transactionAdapter);
+						armed = false;
+						const originalUpdateMany =
+							transactionAdapter.updateMany.bind(transactionAdapter);
+						transactionAdapter.updateMany = (async (input) => {
+							if (input.model !== "sessionCredential") {
+								return originalUpdateMany(input);
+							}
+							if (mode === "zero") return 0;
+							return originalUpdateMany({
+								...input,
+								where: [
+									{
+										field: "id",
+										value: String(stableCredentials[0]!.id),
+									},
+								],
+							});
+						}) as typeof transactionAdapter.updateMany;
+						return callback(transactionAdapter);
+					}),
+			);
+
+			await expect(
+				runtime.context.internalAdapter.deleteUserSessions(runtime.user.id),
+			).rejects.toThrow("Bulk session credential revocation count mismatch");
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+			expect(store).toEqual(stableStore);
+			expect(secondarySet).not.toHaveBeenCalled();
+			expect(secondaryDelete).not.toHaveBeenCalled();
+		},
+	);
+
+	it("deletes legacy rows despite preserveSessionInDatabase", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-legacy-preserve-test",
+			credentialAuthority: "legacy-v1",
+			options: { session: { preserveSessionInDatabase: true } },
+		});
+		await issuePasswordSession(runtime);
+		await issuePasswordSession(runtime);
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(store).toEqual(new Map());
+	});
+
+	it.each(["veto", "before_throw", "rollback_after"] as const)(
+		"rolls back the entire bulk group for %s hooks",
+		async (mode) => {
+			const before = vi.fn(async () => {
+				if (mode === "veto") return false;
+				if (mode === "before_throw") throw new Error("bulk before failed");
+			});
+			const after = vi.fn(async () => {
+				if (mode === "rollback_after") throw new Error("bulk after failed");
+			});
+			const { runtime, store, secondarySet, secondaryDelete } =
+				await setupManagedDeletionRuntime({
+					namespace: `managed-bulk-${mode}-test`,
+					options: {
+						databaseHookFailureMode:
+							mode === "rollback_after" ? "rollback" : undefined,
+						databaseHooks: { session: { delete: { before, after } } },
+					},
+				});
+			await issuePasswordSession(runtime);
+			await issuePasswordSession(runtime);
+			const stableSessions = structuredClone(await authorityRows(runtime.context));
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+			const stableStore = new Map(store);
+			secondarySet.mockClear();
+			secondaryDelete.mockClear();
+
+			const deletion = runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+			if (mode === "veto") await expect(deletion).resolves.toBeUndefined();
+			else {
+				await expect(deletion).rejects.toThrow(
+					mode === "before_throw" ? "bulk before failed" : "bulk after failed",
+				);
+			}
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+			expect(store).toEqual(stableStore);
+			expect(secondarySet).not.toHaveBeenCalled();
+			expect(secondaryDelete).not.toHaveBeenCalled();
+			expect(before).toHaveBeenCalledTimes(
+				mode === "rollback_after" ? 2 : 1,
+			);
+			expect(after).toHaveBeenCalledTimes(mode === "rollback_after" ? 1 : 0);
+		},
+	);
+
+	it("runs observe after hooks before the single cleanup pass", async () => {
+		const order: string[] = [];
+		const after = vi.fn(async (session: { id: string }) => {
+			order.push(`after:${session.id}`);
+			throw new Error("observed bulk after");
+		});
+		const { runtime, secondaryDelete } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-observe-test",
+			options: { databaseHooks: { session: { delete: { after } } } },
+			delete: async (key) => {
+				order.push(`cleanup:${key}`);
+			},
+		});
+		await issuePasswordSession(runtime);
+		await issuePasswordSession(runtime);
+		order.length = 0;
+		secondaryDelete.mockClear();
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		expect(after).toHaveBeenCalledTimes(2);
+		expect(order.slice(0, 2).every((entry) => entry.startsWith("after:"))).toBe(true);
+		expect(order.slice(2).some((entry) => entry.startsWith("cleanup:"))).toBe(true);
+	});
+
+	it("fails closed when a before hook changes the locked target set", async () => {
+		let runtimeRef: ManagedRuntime | null = null;
+		let driftSessionId = "";
+		let changed = false;
+		const after = vi.fn(async () => {});
+		const before = vi.fn(async () => {
+			if (changed) return;
+			changed = true;
+			await (
+				await getCurrentAdapter(runtimeRef!.context.adapter)
+			).delete({
+				model: "session",
+				where: [{ field: "id", value: driftSessionId }],
+			});
+		});
+		const setup = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-target-drift-test",
+			options: { databaseHooks: { session: { delete: { before, after } } } },
+		});
+		runtimeRef = setup.runtime;
+		await issuePasswordSession(setup.runtime);
+		const driftSession = await issuePasswordSession(setup.runtime);
+		driftSessionId = driftSession.id;
+		const stableSessions = structuredClone(
+			await authorityRows(setup.runtime.context),
+		);
+		const stableCredentials = structuredClone(await credentialRows(setup.runtime));
+		const stableStore = new Map(setup.store);
+		setup.secondarySet.mockClear();
+		setup.secondaryDelete.mockClear();
+
+		await expect(
+			setup.runtime.context.internalAdapter.deleteUserSessions(
+				setup.runtime.user.id,
+			),
+		).rejects.toThrow("Locked bulk session revocation target set changed");
+		expect(await authorityRows(setup.runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(setup.runtime)).toEqual(stableCredentials);
+		expect(setup.store).toEqual(stableStore);
+		expect(after).not.toHaveBeenCalled();
+		expect(setup.secondarySet).not.toHaveBeenCalled();
+		expect(setup.secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("defers the complete cleanup through outer rollback", async () => {
+		const { runtime, store, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-bulk-outer-rollback-test",
+			});
+		await issuePasswordSession(runtime);
+		await issuePasswordSession(runtime);
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+		const stableStore = new Map(store);
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+				throw new Error("bulk outer rollback");
+			}),
+		).rejects.toThrow("bulk outer rollback");
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		expect(store).toEqual(stableStore);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("surfaces postcommit cleanup failure while retaining the committed group delete", async () => {
+		const { runtime } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-cleanup-failure-test",
+			delete: async () => {
+				throw new Error("bulk cleanup failed");
+			},
+		});
+		await issuePasswordSession(runtime);
+		await issuePasswordSession(runtime);
+		await expect(
+			runtime.context.internalAdapter.deleteUserSessions(runtime.user.id),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(
+			(await credentialRows(runtime)).every(
+				(credential) => credential.status === "revoked" && credential.sessionId === null,
+			),
+		).toBe(true);
+	});
+
+	it("is idempotent for an empty user", async () => {
+		const { runtime, secondarySet, secondaryDelete } =
+			await setupManagedDeletionRuntime({
+				namespace: "managed-bulk-empty-test",
+			});
+		secondarySet.mockClear();
+		secondaryDelete.mockClear();
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+		expect(secondarySet).not.toHaveBeenCalled();
+		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("serializes a concurrent new session after revocation owns the user lock", async () => {
+		const cleanupEntered = deferred();
+		const cleanupGate = deferred();
+		let blockCleanup = false;
+		let storeRef: Map<string, string> | null = null;
+		const setup = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-revoke-before-create-test",
+			delete: async (key) => {
+				if (blockCleanup) {
+					blockCleanup = false;
+					cleanupEntered.resolve();
+					await cleanupGate.promise;
+				}
+				storeRef!.delete(key);
+			},
+		});
+		const { runtime, store } = setup;
+		storeRef = store;
+		const revoked = await issuePasswordSession(runtime);
+		blockCleanup = true;
+		const deletion = runtime.context.internalAdapter.deleteUserSessions(
+			runtime.user.id,
+		);
+		await cleanupEntered.promise;
+		const creation = issuePasswordSession(runtime);
+		cleanupGate.resolve();
+		await deletion;
+		const created = await creation;
+		const rows = await authorityRows(runtime.context);
+		expect(rows.map((row) => row.id)).toEqual([created.id]);
+		expect(
+			[...store.values()].some((value) => value.includes(revoked.id)),
+		).toBe(false);
+		expect(
+			[...store.values()].some((value) => value.includes(created.id)),
+		).toBe(true);
+	});
+
+	it("captures a concurrent creation that owns the user lock before revocation", async () => {
+		const creationEntered = deferred();
+		const creationGate = deferred();
+		let blockCreation = false;
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-create-lock-first-test",
+			reader: async (input) => {
+				if (blockCreation) {
+					blockCreation = false;
+					creationEntered.resolve();
+					await creationGate.promise;
+				}
+				return policyResult(input);
+			},
+		});
+		const original = await issuePasswordSession(runtime);
+		blockCreation = true;
+		const creation = issuePasswordSession(runtime);
+		await creationEntered.promise;
+		const deletion = runtime.context.internalAdapter.deleteUserSessions(
+			runtime.user.id,
+		);
+		creationGate.resolve();
+		const creationResult = await creation.then(
+			(value) => ({ kind: "created" as const, value }),
+			(error: unknown) => ({ kind: "failed" as const, error }),
+		);
+		await deletion;
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+		expect(
+			[...store.values()].some((value) => value.includes(original.id)),
+		).toBe(false);
+		if (creationResult.kind === "created") {
+			expect(
+				[...store.values()].some((value) =>
+					value.includes(creationResult.value.id),
+				),
+			).toBe(false);
+		} else {
+			expect(creationResult.error).toBeInstanceOf(AfterTransactionHookError);
+		}
+		const survivor = await issuePasswordSession(runtime);
+		expect((await authorityRows(runtime.context)).map((row) => row.id)).toEqual([
+			survivor.id,
+		]);
+		expect(
+			[...store.values()].some((value) => value.includes(survivor.id)),
+		).toBe(true);
+	});
+
+	it("prevents pending captured publication from resurrecting authority and keeps the post-revocation successor", async () => {
+		const { runtime, store } = await setupManagedDeletionRuntime({
+			namespace: "managed-bulk-create-before-revoke-test",
+		});
+		let captured: Awaited<ReturnType<typeof issuePasswordSession>> | null = null;
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				captured = await issuePasswordSession(runtime);
+				await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+			}),
+		).rejects.toBeInstanceOf(ManagedSessionIssuanceError);
+		const survivor = await issuePasswordSession(runtime);
+		const rows = await authorityRows(runtime.context);
+		expect(rows.map((row) => row.id)).toEqual([survivor.id]);
+		expect(
+			[...store.values()].some((value) => value.includes(captured!.id)),
+		).toBe(false);
+		expect(
+			[...store.values()].some((value) => value.includes(survivor.id)),
+		).toBe(true);
+	});
+});
+
+describe("database-backed bulk deletion without authentication policy", () => {
+	it.each([false, true])(
+		"keeps compatibility with preserveSessionInDatabase=%s and rewrites the active index once",
+		async (preserveSessionInDatabase) => {
+			const namespace = `compatibility-bulk-preserve-${preserveSessionInDatabase}`;
+			const runtime = await setupDatabaseBackedCompatibilityRuntime({
+				namespace,
+				options: {
+					session: {
+						storeSessionInDatabase: true,
+						preserveSessionInDatabase,
+					},
+				},
+			});
+			await runtime.context.internalAdapter.createSession(runtime.user.id);
+			await runtime.context.internalAdapter.createSession(runtime.user.id);
+			const indexKey = `clearance:${namespace}:active-sessions:${runtime.user.id}`;
+			const unrelated = {
+				sessionId: "compatibility-future-session",
+				credentialKey: "compatibility-future-credential",
+				expiresAt: Date.now() + 120_000,
+			};
+			runtime.store.set(
+				indexKey,
+				JSON.stringify([
+					...(JSON.parse(runtime.store.get(indexKey)!) as unknown[]),
+					unrelated,
+				]),
+			);
+			runtime.secondarySet.mockClear();
+			runtime.secondaryDelete.mockClear();
+
+			await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+			expect(
+				await runtime.context.adapter.count({ model: "session" }),
+			).toBe(preserveSessionInDatabase ? 2 : 0);
+			const credentials = await runtime.context.adapter.findMany<
+				Record<string, unknown>
+			>({ model: "sessionCredential" });
+			expect(credentials).toHaveLength(2);
+			expect(
+				credentials.every(
+					(credential) =>
+						credential.status === "revoked" &&
+						(preserveSessionInDatabase
+							? typeof credential.sessionId === "string"
+							: credential.sessionId === null),
+				),
+			).toBe(true);
+			expect(JSON.parse(runtime.store.get(indexKey)!)).toEqual([unrelated]);
+			const indexWrites = runtime.secondarySet.mock.calls.filter(
+				([key]) => key === indexKey,
+			);
+			expect(indexWrites).toHaveLength(1);
+		},
+	);
+
+	it("runs every compatibility delete hook before mutation and every observe hook before cleanup", async () => {
+		const order: string[] = [];
+		const runtime = await setupDatabaseBackedCompatibilityRuntime({
+			namespace: "compatibility-bulk-hook-order",
+			options: {
+				session: { storeSessionInDatabase: true },
+				databaseHooks: {
+					session: {
+						delete: {
+							before: async (session) => {
+								order.push(`before:${session.id}`);
+							},
+							after: async (session) => {
+								order.push(`after:${session.id}`);
+							},
+						},
+					},
+				},
+			},
+		});
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		const originalDelete = runtime.secondaryDelete.getMockImplementation()!;
+		runtime.secondaryDelete.mockImplementation(async (key) => {
+			order.push(`cleanup:${key}`);
+			await originalDelete(key);
+		});
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		const firstAfter = order.findIndex((entry) => entry.startsWith("after:"));
+		const firstCleanup = order.findIndex((entry) => entry.startsWith("cleanup:"));
+		expect(order.slice(0, firstAfter)).toHaveLength(2);
+		expect(order.slice(0, firstAfter).every((entry) => entry.startsWith("before:"))).toBe(
+			true,
+		);
+		expect(order.slice(firstAfter, firstCleanup)).toHaveLength(2);
+		expect(
+			order
+				.slice(firstAfter, firstCleanup)
+				.every((entry) => entry.startsWith("after:")),
+		).toBe(true);
+		expect(firstCleanup).toBeGreaterThan(firstAfter);
+	});
+
+	it("honors a compatibility delete-hook veto without DB or secondary mutation", async () => {
+		const after = vi.fn(async () => {});
+		const before = vi.fn(async () => false);
+		const runtime = await setupDatabaseBackedCompatibilityRuntime({
+			namespace: "compatibility-bulk-hook-veto",
+			options: {
+				session: { storeSessionInDatabase: true },
+				databaseHooks: { session: { delete: { before, after } } },
+			},
+		});
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		const stableSessions = structuredClone(
+			await runtime.context.adapter.findMany({ model: "session" }),
+		);
+		const stableCredentials = structuredClone(
+			await runtime.context.adapter.findMany({ model: "sessionCredential" }),
+		);
+		const stableStore = new Map(runtime.store);
+		runtime.secondarySet.mockClear();
+		runtime.secondaryDelete.mockClear();
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		expect(await runtime.context.adapter.findMany({ model: "session" })).toEqual(
+			stableSessions,
+		);
+		expect(
+			await runtime.context.adapter.findMany({ model: "sessionCredential" }),
+		).toEqual(stableCredentials);
+		expect(runtime.store).toEqual(stableStore);
+		expect(before).toHaveBeenCalledTimes(1);
+		expect(after).not.toHaveBeenCalled();
+		expect(runtime.secondarySet).not.toHaveBeenCalled();
+		expect(runtime.secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("preserves secondary-authoritative compatibility deletion", async () => {
+		const runtime = await setupDatabaseBackedCompatibilityRuntime({
+			namespace: "compatibility-bulk-secondary-only",
+			options: { session: { storeSessionInDatabase: false } },
+		});
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		await runtime.context.internalAdapter.createSession(runtime.user.id);
+		expect(runtime.store.size).toBeGreaterThan(0);
+
+		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
+
+		expect([...runtime.store.keys()]).toEqual([
+			"clearance:compatibility-bulk-secondary-only:session-storage-epoch",
+		]);
 	});
 });

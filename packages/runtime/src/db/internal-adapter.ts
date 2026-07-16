@@ -590,11 +590,24 @@ export const createInternalAdapter = (
 		userId?: string | undefined;
 		expectedCredentialKeys: readonly string[];
 	}): Promise<void> {
+		await cleanupInvalidManagedSessionsSecondary({
+			userId: input.userId,
+			targets: [input],
+		});
+	}
+
+	async function cleanupInvalidManagedSessionsSecondary(input: {
+		userId?: string | undefined;
+		targets: readonly {
+			sessionId: string;
+			expectedCredentialKeys: readonly string[];
+		}[];
+	}): Promise<void> {
 		if (!secondaryStorage) return;
-		const handleKey = secondaryHandleKey(input.sessionId);
-		const mappedCredentialKey = parseSecondaryHandle(
-			await secondaryStorage.get(handleKey),
+		const targetsById = new Map(
+			input.targets.map((target) => [target.sessionId, target]),
 		);
+		if (targetsById.size === 0) return;
 		const now = Date.now();
 		const listKey = input.userId
 			? secondaryActiveSessionsKey(input.userId)
@@ -605,34 +618,49 @@ export const createInternalAdapter = (
 				)
 			: null;
 		const list = Array.isArray(parsedList) ? parsedList : null;
-		const indexedCredentialKeys = list
-			? list
-					.filter(
-						(entry) =>
-							typeof entry?.sessionId === "string" &&
-							entry.sessionId === input.sessionId &&
-							typeof entry.credentialKey === "string" &&
-							entry.credentialKey.length > 0,
-					)
-					.map((entry) => entry.credentialKey)
-			: [];
-		for (const credentialKey of new Set([
-			...input.expectedCredentialKeys,
-			mappedCredentialKey,
-			...indexedCredentialKeys,
-		])) {
+		const credentialKeys = new Set<string>();
+		const addCredentialKey = (credentialKey: unknown) => {
+			if (typeof credentialKey !== "string" || credentialKey.length === 0) {
+				return;
+			}
+			credentialKeys.add(credentialKey);
+		};
+		for (const target of targetsById.values()) {
+			for (const credentialKey of target.expectedCredentialKeys) {
+				addCredentialKey(credentialKey);
+			}
+			const handleKey = secondaryHandleKey(target.sessionId);
+			addCredentialKey(parseSecondaryHandle(await secondaryStorage.get(handleKey)));
+		}
+		if (list) {
+			for (const entry of list) {
+				if (
+					typeof entry?.sessionId === "string" &&
+					targetsById.has(entry.sessionId)
+				) {
+					addCredentialKey(entry.credentialKey);
+				}
+			}
+		}
+		for (const credentialKey of credentialKeys) {
+			const envelope = safeJSONParse<{ session?: { id?: unknown } }>(
+				await secondaryStorage.get(credentialKey),
+			);
 			if (
-				credentialKey &&
-				(await secondaryCredentialBelongsToSession(
-					credentialKey,
-					input.sessionId,
-				))
+				typeof envelope?.session?.id === "string" &&
+				targetsById.has(envelope.session.id)
 			) {
 				await secondaryStorage.delete(credentialKey);
 			}
 		}
-		await secondaryStorage.delete(handleKey);
-		if (!listKey || !list) return;
+		for (const sessionId of targetsById.keys()) {
+			await secondaryStorage.delete(secondaryHandleKey(sessionId));
+		}
+		if (!listKey) return;
+		if (!list) {
+			await secondaryStorage.delete(listKey);
+			return;
+		}
 		const remaining = list
 			.filter(
 				(entry) =>
@@ -640,7 +668,7 @@ export const createInternalAdapter = (
 					typeof entry.credentialKey === "string" &&
 					typeof entry.expiresAt === "number" &&
 					Number.isFinite(entry.expiresAt) &&
-					entry.sessionId !== input.sessionId &&
+					!targetsById.has(entry.sessionId) &&
 					entry.expiresAt > now,
 			)
 			.sort(
@@ -1027,28 +1055,6 @@ export const createInternalAdapter = (
 		}
 	}
 
-	async function revokeCredentialFamiliesBySessionId(
-		sessionId: string,
-		reuseDetectedAt?: Date | undefined,
-	): Promise<void> {
-		if (!storesSessionsInDatabase) return;
-		const currentAdapter = await getCurrentAdapter(adapter);
-		const revokedAt = reuseDetectedAt ?? new Date();
-		await currentAdapter.updateMany({
-			model: SESSION_CREDENTIAL_MODEL,
-			where: [{ field: "sessionId", value: sessionId }],
-			update: {
-				status: "revoked",
-				revokedAt,
-				...(reuseDetectedAt ? { reuseDetectedAt } : {}),
-				rotationNonceDigest: null,
-				recoverySecretCiphertext: null,
-				recoveryExpiresAt: null,
-				updatedAt: revokedAt,
-			},
-		});
-	}
-
 	type DatabaseSessionRevocationTarget =
 		| {
 				kind: "id";
@@ -1171,6 +1177,123 @@ export const createInternalAdapter = (
 						sessionId: outcome.sessionId,
 						userId: outcome.userId,
 						expectedCredentialKeys: outcome.expectedCredentialKeys,
+					});
+				});
+			},
+			adapter,
+		);
+	}
+
+	type BulkDatabaseSessionRevocationTarget = {
+		session: Session;
+		credentials: SessionCredential[];
+		expectedCredentialKeys: string[];
+	};
+
+	async function readBulkDatabaseSessionRevocationTargets(
+		transactionAdapter: DBTransactionAdapter,
+		sessions: readonly Session[],
+	): Promise<BulkDatabaseSessionRevocationTarget[]> {
+		const targets: BulkDatabaseSessionRevocationTarget[] = [];
+		for (const session of sessions) {
+			const captured = await readSessionRevocationCredentialKeys(
+				transactionAdapter,
+				session,
+			);
+			targets.push({
+				session,
+				credentials: captured.credentials,
+				expectedCredentialKeys: captured.keys,
+			});
+		}
+		return targets;
+	}
+
+	const sameCredentialDate = (
+		left: Date | null | undefined,
+		right: Date | null | undefined,
+	): boolean =>
+		left == null || right == null
+			? left == null && right == null
+			: left.getTime() === right.getTime();
+
+	async function revokeAndVerifyBulkDatabaseSessionCredentials(
+		transactionAdapter: DBTransactionAdapter,
+		targets: readonly BulkDatabaseSessionRevocationTarget[],
+		revokedAt: Date,
+	): Promise<void> {
+		for (const target of targets) {
+			const updated = await transactionAdapter.updateMany({
+				model: SESSION_CREDENTIAL_MODEL,
+				where: [{ field: "sessionId", value: target.session.id }],
+				update: {
+					status: "revoked",
+					revokedAt,
+					rotationNonceDigest: null,
+					recoverySecretCiphertext: null,
+					recoveryExpiresAt: null,
+					updatedAt: revokedAt,
+				},
+			});
+			if (Number(updated) !== target.credentials.length) {
+				throw new Error("Bulk session credential revocation count mismatch");
+			}
+			const currentCredentials =
+				await transactionAdapter.findMany<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "sessionId", value: target.session.id }],
+				});
+			if (currentCredentials.length !== target.credentials.length) {
+				throw new Error("Bulk session credential authority set changed");
+			}
+			const expectedById = new Map(
+				target.credentials.map((credential) => [credential.id, credential]),
+			);
+			for (const current of currentCredentials) {
+				const expected = expectedById.get(current.id);
+				if (
+					!expected ||
+					current.selector !== expected.selector ||
+					current.sessionId !== target.session.id ||
+					expected.sessionId !== target.session.id ||
+					current.familyId !== expected.familyId ||
+					!constantTimeEqual(current.secretDigest, expected.secretDigest) ||
+					current.digestVersion !== expected.digestVersion ||
+					current.rotationCounter !== expected.rotationCounter ||
+					current.parentCredentialId !== expected.parentCredentialId ||
+					!sameCredentialDate(current.expiresAt, expected.expiresAt) ||
+					!sameCredentialDate(current.consumedAt, expected.consumedAt) ||
+					!sameCredentialDate(current.reuseDetectedAt, expected.reuseDetectedAt) ||
+					!sameCredentialDate(current.createdAt, expected.createdAt) ||
+					current.status !== "revoked" ||
+					!sameCredentialDate(current.revokedAt, revokedAt) ||
+					current.rotationNonceDigest !== null ||
+					current.recoverySecretCiphertext !== null ||
+					current.recoveryExpiresAt !== null ||
+					!sameCredentialDate(current.updatedAt, revokedAt)
+				) {
+					throw new Error("Bulk session credential revocation verification failed");
+				}
+			}
+		}
+	}
+
+	async function queueBulkDatabaseSessionRevocationCleanup(input: {
+		userId: string;
+		targets: readonly BulkDatabaseSessionRevocationTarget[];
+	}): Promise<void> {
+		if (!secondaryStorage || input.targets.length === 0) return;
+		await queueAfterTransactionHook(
+			async () => {
+				await runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					await lockAndReadUser(currentAdapter, input.userId);
+					await cleanupInvalidManagedSessionsSecondary({
+						userId: input.userId,
+						targets: input.targets.map((target) => ({
+							sessionId: target.session.id,
+							expectedCredentialKeys: target.expectedCredentialKeys,
+						})),
 					});
 				});
 			},
@@ -3422,46 +3545,105 @@ export const createInternalAdapter = (
 			);
 		},
 		deleteUserSessions: async (userId: string) => {
-			const sessions = storesSessionsInDatabase
-				? await runWithTransaction(adapter, async () => {
-						const currentAdapter = await getCurrentAdapter(adapter);
-						const rows = await currentAdapter.findMany<Session>({
-							model: "session",
-							where: [{ field: "userId", value: userId }],
-						});
-							for (const session of rows) {
-								if (!legacyCredentialAuthority) {
-									await revokeCredentialFamiliesBySessionId(session.id);
-								}
-						}
-						if (!ctx.options.session?.preserveSessionInDatabase) {
-							await deleteManyWithHooks(
-								[{ field: "userId", value: userId }],
-								"session",
-								undefined,
-							);
-						}
-						return rows;
-					})
-				: await internalAdapter.listSessions(userId);
-			await queueAfterTransactionHook(async () => {
-				if (secondaryStorage && storesSessionsInDatabase) {
-					for (const session of sessions) {
-						const handleKey = secondaryHandleKey(session.id);
-						const credentialKey = parseSecondaryHandle(
-							await secondaryStorage.get(handleKey),
+			if (storesSessionsInDatabase) {
+				await runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					await lockAndReadUser(currentAdapter, userId);
+					const lockedSessions = await currentAdapter.findMany<Session>({
+						model: "session",
+						where: [{ field: "userId", value: userId }],
+					});
+					if (lockedSessions.length === 0) return;
+
+					const lockedSessionIds = [...lockedSessions]
+						.map((session) => session.id)
+						.sort();
+					const preserveModernSessions =
+						!legacyCredentialAuthority &&
+						ctx.options.session?.preserveSessionInDatabase === true;
+					if (preserveModernSessions) {
+						const targets = await readBulkDatabaseSessionRevocationTargets(
+							currentAdapter,
+							lockedSessions,
 						);
-						if (credentialKey) await secondaryStorage.delete(credentialKey);
-						await secondaryStorage.delete(handleKey);
+						const revokedAt = new Date();
+						await revokeAndVerifyBulkDatabaseSessionCredentials(
+							currentAdapter,
+							targets,
+							revokedAt,
+						);
+						await queueBulkDatabaseSessionRevocationCleanup({ userId, targets });
+						return;
 					}
-					await secondaryStorage.delete(secondaryActiveSessionsKey(userId));
+
+					let targets: BulkDatabaseSessionRevocationTarget[] = [];
+					let mutationCompleted = false;
+					const deleted = await deleteManyWithHooks<Session>(
+						[{ field: "userId", value: userId }],
+						"session",
+						{
+							executeMainFn: false,
+							usesTransactionAdapter: true,
+							async fn(_where, transactionAdapter) {
+								const reconfirmed = await transactionAdapter.findMany<Session>({
+									model: "session",
+									where: [{ field: "userId", value: userId }],
+								});
+								const reconfirmedIds = reconfirmed
+									.map((session) => session.id)
+									.sort();
+								if (
+									reconfirmedIds.length !== lockedSessionIds.length ||
+									reconfirmedIds.some(
+										(sessionId, index) => sessionId !== lockedSessionIds[index],
+									)
+								) {
+									throw new Error(
+										"Locked bulk session revocation target set changed",
+									);
+								}
+								targets = await readBulkDatabaseSessionRevocationTargets(
+									transactionAdapter,
+									reconfirmed,
+								);
+								const revokedAt = new Date();
+								await revokeAndVerifyBulkDatabaseSessionCredentials(
+									transactionAdapter,
+									targets,
+									revokedAt,
+								);
+								for (const sessionId of lockedSessionIds) {
+									await transactionAdapter.delete({
+										model: "session",
+										where: [{ field: "id", value: sessionId }],
+									});
+								}
+								const remaining = await transactionAdapter.findMany<Session>({
+									model: "session",
+									where: [{ field: "userId", value: userId }],
+								});
+								mutationCompleted = remaining.length === 0;
+								if (!mutationCompleted) {
+									throw new Error(
+										"Locked bulk session revocation delete was incomplete",
+									);
+								}
+								return reconfirmed;
+							},
+						},
+					);
+					if (!deleted || !mutationCompleted) return;
+					await queueBulkDatabaseSessionRevocationCleanup({ userId, targets });
+				});
+				return;
+			}
+
+			const sessions = await internalAdapter.listSessions(userId);
+			await queueAfterTransactionHook(async () => {
+				for (const session of sessions) {
+					await internalAdapter.deleteSession(createSessionHandle(session.id));
 				}
-				if (!storesSessionsInDatabase) {
-					for (const session of sessions) {
-						await internalAdapter.deleteSession(createSessionHandle(session.id));
-					}
-					await secondaryStorage?.delete(secondaryActiveSessionsKey(userId));
-				}
+				await secondaryStorage?.delete(secondaryActiveSessionsKey(userId));
 			}, adapter);
 		},
 		revokeUserOAuthTokenFamilies: async (userId: string) => {
