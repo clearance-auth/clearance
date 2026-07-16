@@ -29,6 +29,7 @@ export async function runPluginInit(context: AuthContext) {
 	const dbHooks: {
 		source: string;
 		hooks: Exclude<ClearanceOptions["databaseHooks"], undefined>;
+		failureMode?: "observe" | "rollback" | undefined;
 	}[] = [];
 	for (const plugin of plugins) {
 		if (plugin.init) {
@@ -85,7 +86,11 @@ export async function runPluginInit(context: AuthContext) {
 
 	// Add the global database hooks last
 	if (options.databaseHooks) {
-		dbHooks.push({ source: "user", hooks: options.databaseHooks });
+		dbHooks.push({
+			source: "user",
+			hooks: options.databaseHooks,
+			failureMode: options.databaseHookFailureMode,
+		});
 	}
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {
@@ -93,6 +98,7 @@ export async function runPluginInit(context: AuthContext) {
 		logger: context.logger,
 		hooks: dbHooks,
 		generateId: context.generateId,
+		secretConfig: context.secretConfig,
 	});
 	context.options = options;
 }

@@ -7,7 +7,8 @@ export interface OIDCOptions {
 	/**
 	 * The amount of time in seconds that the access token is valid for.
 	 *
-	 * @default 3600 (1 hour) - Recommended by the OIDC spec
+	 * @default 300 (5 minutes)
+	 * @maximum 300 (5 minutes)
 	 */
 	accessTokenExpiresIn?: number | undefined;
 	/**
@@ -382,14 +383,29 @@ export interface CodeVerificationValue {
 }
 
 export interface OAuthAccessToken {
+	id: string;
+	createdAt: Date;
+	updatedAt: Date;
 	/**
-	 * The access token
+	 * Legacy plaintext access token, read only for online migration.
 	 */
-	accessToken: string;
+	accessToken?: string | null;
 	/**
-	 * The refresh token
+	 * Legacy plaintext refresh token, read only for online migration.
 	 */
-	refreshToken: string;
+	refreshToken?: string | null;
+	accessTokenDigest?: string | null;
+	refreshTokenDigest?: string | null;
+	digestVersion?: number | null;
+	familyId?: string | null;
+	refreshStatus?: "none" | "active" | "consumed" | "revoked" | null;
+	rotationCounter?: number | null;
+	parentTokenId?: string | null;
+	consumedAt?: Date | null;
+	revokedAt?: Date | null;
+	reuseDetectedAt?: Date | null;
+	rotationNonceDigest?: string | null;
+	recoveryExpiresAt?: Date | null;
 	/**
 	 * The time that the access token expires
 	 */
@@ -397,7 +413,7 @@ export interface OAuthAccessToken {
 	/**
 	 * The time that the refresh token expires
 	 */
-	refreshTokenExpiresAt: Date;
+	refreshTokenExpiresAt?: Date | null;
 	/**
 	 * The client ID
 	 */

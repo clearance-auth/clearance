@@ -1,13 +1,286 @@
 import { listen } from "listhen";
+import { createLocalJWKSet, decodeProtectedHeader, jwtVerify } from "jose";
 import { afterAll, describe, expect, it } from "vitest";
 import { createAuthClient } from "../../client";
+import { OAUTH_TOKEN_MIGRATION_ID } from "../../db/session-credential-migration";
 import { toNodeHandler } from "../../integrations/node";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { genericOAuth } from "../generic-oauth";
 import { genericOAuthClient } from "../generic-oauth/client";
+import { admin } from "../admin";
 import { jwt } from "../jwt";
+import { createOAuthTokenPair } from "../oidc-provider";
 import type { Client } from "../oidc-provider/types";
 import { mcp, withMcpAuth } from ".";
+
+describe("mcp OAuth credential migration gate", () => {
+	it("fails closed before bearer lookup when the digest migration marker is absent", async () => {
+		const { auth, db } = await getTestInstance({
+			plugins: [mcp({ loginPage: "/login" })],
+			logger: { level: "error" },
+		});
+		await db.delete({
+			model: "securityMigration",
+			where: [{ field: "key", value: OAUTH_TOKEN_MIGRATION_ID }],
+		});
+
+		await expect(
+			auth.handler(
+				new Request("http://localhost:3000/api/auth/mcp/get-session", {
+					headers: { authorization: "Bearer legacy-plaintext-access-token" },
+				}),
+			),
+		).rejects.toMatchObject({
+			status: "SERVICE_UNAVAILABLE",
+			statusCode: 503,
+			body: { code: "SECURITY_MIGRATION_REQUIRED" },
+			headers: { "Retry-After": "5" },
+		});
+	});
+});
+
+describe("mcp token response hardening", () => {
+	it("rejects banned users across access, userinfo, session, and refresh paths", async () => {
+		const { auth, customFetchImpl, db, signInWithTestUser } =
+			await getTestInstance({
+				plugins: [admin(), mcp({ loginPage: "/login" })],
+				logger: { level: "error" },
+			});
+		const { user } = await signInWithTestUser();
+		const clientId = "mcp-banned-user-client";
+		const clientSecret = "mcp-banned-user-secret";
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId,
+				clientSecret,
+				type: "web",
+				name: "MCP banned-user proof",
+				redirectUrls: "http://localhost/callback",
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const token = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId,
+			userId: user.id,
+			scopes: "openid profile email offline_access",
+			issueRefreshToken: true,
+		});
+		await db.update({
+			model: "user",
+			where: [{ field: "id", value: user.id }],
+			update: { banned: true, banReason: "disabled", updatedAt: new Date() },
+		});
+
+		for (const path of ["mcp/get-session", "mcp/userinfo"]) {
+			const response = await customFetchImpl(
+				`http://localhost:3000/api/auth/${path}`,
+				{ headers: { authorization: `Bearer ${token.accessToken}` } },
+			);
+			expect(response.status, path).toBe(401);
+		}
+		const refresh = await customFetchImpl(
+			"http://localhost:3000/api/auth/mcp/token",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					grant_type: "refresh_token",
+					client_id: clientId,
+					client_secret: clientSecret,
+					refresh_token: token.refreshToken!,
+				}).toString(),
+			},
+		);
+		expect(refresh.status).toBe(401);
+		expect(await refresh.json()).toMatchObject({ error: "invalid_grant" });
+		const revoked = await db.findOne<Record<string, unknown>>({
+			model: "oauthAccessToken",
+			where: [{ field: "id", value: token.row.id }],
+		});
+		expect(revoked).toMatchObject({
+			refreshStatus: "revoked",
+			revokedAt: expect.any(Date),
+		});
+	});
+
+	it("rejects existing bearer authority after its MCP client is disabled", async () => {
+		const { customFetchImpl, db, signInWithTestUser } = await getTestInstance({
+			plugins: [mcp({ loginPage: "/login" })],
+			logger: { level: "error" },
+		});
+		const { user } = await signInWithTestUser();
+		const clientId = "mcp-disabled-client-authority";
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId,
+				clientSecret: "mcp-disabled-client-secret",
+				type: "web",
+				name: "MCP disabled-client proof",
+				redirectUrls: "http://localhost/callback",
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const token = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId,
+			userId: user.id,
+			scopes: "openid profile email",
+			issueRefreshToken: true,
+		});
+		await db.update<{ disabled: boolean }>({
+			model: "oauthApplication",
+			where: [{ field: "clientId", value: clientId }],
+			update: { disabled: true },
+		});
+
+		for (const path of ["mcp/userinfo", "mcp/get-session"]) {
+			const response = await customFetchImpl(
+				`http://localhost:3000/api/auth/${path}`,
+				{ headers: { authorization: `Bearer ${token.accessToken}` } },
+			);
+			expect(response.status, path).toBe(401);
+			if (path === "mcp/get-session") {
+				expect(response.headers.get("www-authenticate")).toBe(
+					'Bearer error="invalid_token"',
+				);
+			}
+		}
+	});
+
+	it("marks an authorization-code token response as non-cacheable", async () => {
+		const authTime = Date.now() - 30_000;
+		const { auth, customFetchImpl, db, signInWithTestUser } =
+			await getTestInstance({
+				plugins: [
+					mcp({
+						loginPage: "/login",
+							oidcConfig: {
+								loginPage: "/login",
+								requirePKCE: false,
+								getAdditionalUserInfoClaim: async () => ({
+									sub: "attacker-subject",
+									aud: "attacker-audience",
+									iss: "https://attacker.invalid",
+									auth_time: 0,
+									email: "attacker@example.com",
+									custom: "preserved-extension",
+								}),
+							},
+					}),
+				],
+				logger: { level: "error" },
+			});
+		const { user } = await signInWithTestUser();
+		const clientId = "mcp-no-store-client";
+		const clientSecret = "mcp-no-store-client-secret";
+		const redirectURI = "http://localhost/callback";
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId,
+				clientSecret,
+				type: "web",
+				name: "MCP No-Store Client",
+				redirectUrls: redirectURI,
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const code = "mcp-no-store-authorization-code";
+		const context = await auth.$context;
+		await context.internalAdapter.createVerificationValue({
+			identifier: code,
+			value: JSON.stringify({
+				clientId,
+				redirectURI,
+					scope: ["openid", "profile", "email"],
+					userId: user.id,
+					authTime,
+				requireConsent: false,
+				state: null,
+			}),
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+
+		const response = await customFetchImpl(
+			"http://localhost:3000/api/auth/mcp/token",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					grant_type: "authorization_code",
+					client_id: clientId,
+					client_secret: clientSecret,
+					code,
+					redirect_uri: redirectURI,
+				}).toString(),
+			},
+		);
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("pragma")).toBe("no-cache");
+		const body = await response.json();
+		expect(body).toMatchObject({
+			token_type: "Bearer",
+			access_token: expect.any(String),
+			id_token: expect.any(String),
+		});
+
+		const jwksResponse = await customFetchImpl(
+			"http://localhost:3000/api/auth/mcp/jwks",
+		);
+		expect(jwksResponse.status).toBe(200);
+		const jwks = await jwksResponse.json();
+		const header = decodeProtectedHeader(body.id_token);
+		expect(header).toMatchObject({ alg: "RS256", kid: expect.any(String) });
+		const verified = await jwtVerify(body.id_token, createLocalJWKSet(jwks), {
+			issuer: "http://localhost:3000",
+			audience: clientId,
+		});
+		expect(verified.payload).toMatchObject({
+			sub: user.id,
+			aud: clientId,
+			iss: "http://localhost:3000",
+			auth_time: Math.floor(authTime / 1000),
+			email: user.email,
+			custom: "preserved-extension",
+		});
+		expect(Number.isInteger(verified.payload.iat)).toBe(true);
+
+		const userInfoResponse = await customFetchImpl(
+			"http://localhost:3000/api/auth/mcp/userinfo",
+			{ headers: { authorization: `Bearer ${body.access_token}` } },
+		);
+		expect(userInfoResponse.status).toBe(200);
+		expect(userInfoResponse.headers.get("cache-control")).toBe("no-store");
+		expect(await userInfoResponse.json()).toMatchObject({
+			sub: user.id,
+			email: user.email,
+			custom: "preserved-extension",
+		});
+	});
+});
 
 // Pre-verifies any user the RP creates via OAuth signup so the existing-user
 // path on the RP side does not trip the local-emailVerified gate.
@@ -338,90 +611,76 @@ describe("mcp", async () => {
 		expect(callbackURL).toContain("/dashboard");
 	});
 
-	// FIXME(mcp-race-coverage): write a `/mcp/token` race-redemption
-	// regression test once the consent + PKCE harness here can hand us a code
-	// without going through genericOAuth. The `/mcp/token` handler calls the
-	// same `internalAdapter.consumeVerificationValue` primitive that
-	// `@clearance/oauth-provider` and `clearance`'s `oidc-provider` plugin
-	// use, both of which already carry the race regression test, so a
-	// regression in the primitive surfaces in those tests today.
-	it.skip("rejects concurrent redemption of the same authorization code", async ({
+	it("rejects concurrent redemption of the same authorization code", async ({
 		expect,
 	}) => {
-		const { customFetchImpl: customFetchImplRP, cookieSetter } =
+		const { auth, customFetchImpl, db, signInWithTestUser } =
 			await getTestInstance({
-				account: {
-					accountLinking: {
-						trustedProviders: ["test-confidential"],
-					},
-				},
 				plugins: [
-					genericOAuth({
-						config: [
-							{
-								providerId: "test-confidential",
-								clientId: confidentialClient.clientId,
-								clientSecret: confidentialClient.clientSecret || "",
-								authorizationUrl: `${baseURL}/api/auth/mcp/authorize`,
-								tokenUrl: `${baseURL}/api/auth/mcp/token`,
-								scopes: ["openid", "profile", "email"],
-								// Confidential client authenticates via client_secret;
-								// no PKCE so we can replay the issued code at the
-								// token endpoint without a stored verifier.
-								pkce: false,
-							},
-						],
+					mcp({
+						loginPage: "/login",
+						oidcConfig: { loginPage: "/login", requirePKCE: false },
 					}),
 				],
+				logger: { level: "error" },
 			});
-		const oAuthHeaders = new Headers();
-		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
-			baseURL: "http://localhost:5004",
-			fetchOptions: { customFetchImpl: customFetchImplRP },
-		});
-
-		const data = await client.signIn.oauth2(
-			{ providerId: "test-confidential", callbackURL: "/dashboard" },
-			{ throw: true, onSuccess: cookieSetter(oAuthHeaders) },
-		);
-
-		let redirectURI = "";
-		await serverClient.$fetch(data.url, {
-			method: "GET",
-			onError(context: any) {
-				redirectURI = context.response.headers.get("Location") || "";
+		const { user } = await signInWithTestUser();
+		const clientId = "mcp-race-client";
+		const clientSecret = "mcp-race-client-secret";
+		const redirectURI = "http://localhost/race-callback";
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId,
+				clientSecret,
+				type: "web",
+				name: "MCP Race Client",
+				redirectUrls: redirectURI,
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
 			},
 		});
-		const code = new URL(redirectURI).searchParams.get("code");
-		expect(code).toBeTruthy();
-
-		// `redirect_uri` matches what the auth-code flow recorded for the
-		// client; PKCE is verified server-side from the stored verifier.
-		const redirectUri = confidentialClient.redirectUrls[0]!;
+		const code = "mcp-concurrent-authorization-code";
+		const context = await auth.$context;
+		await context.internalAdapter.createVerificationValue({
+			identifier: code,
+			value: JSON.stringify({
+				clientId,
+				redirectURI,
+				scope: ["openid", "profile", "email"],
+				userId: user.id,
+				authTime: Date.now(),
+				requireConsent: false,
+				state: null,
+			}),
+			expiresAt: new Date(Date.now() + 60_000),
+		});
 		const exchange = () =>
-			serverClient.$fetch<{ access_token?: string; error?: string }>(
-				"/mcp/token",
-				{
-					method: "POST",
-					body: {
-						grant_type: "authorization_code",
-						client_id: confidentialClient.clientId,
-						client_secret: confidentialClient.clientSecret,
-						code,
-						redirect_uri: redirectUri,
-					},
-				},
-			);
+			customFetchImpl("http://localhost:3000/api/auth/mcp/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					grant_type: "authorization_code",
+					client_id: clientId,
+					client_secret: clientSecret,
+					code,
+					redirect_uri: redirectURI,
+				}).toString(),
+			});
 
-		const [first, second] = await Promise.all([exchange(), exchange()]);
-		const successes = [first, second].filter(
-			(r) => (r.data as any)?.access_token != null,
+		const responses = await Promise.all([exchange(), exchange()]);
+		expect(responses.map((response) => response.status).sort()).toEqual([
+			200, 401,
+		]);
+		const bodies = await Promise.all(responses.map((response) => response.json()));
+		expect(bodies.filter((body) => body.access_token)).toHaveLength(1);
+		expect(bodies.filter((body) => body.error === "invalid_grant")).toHaveLength(
+			1,
 		);
-		const failures = [first, second].filter((r) => r.error != null);
-		expect(successes).toHaveLength(1);
-		expect(failures).toHaveLength(1);
-		expect((failures[0]!.error as any).error).toBe("invalid_grant");
 	});
 
 	it("should expose OAuth discovery metadata", async ({ expect }) => {
@@ -981,19 +1240,15 @@ describe("mcp refresh_token grant client authentication", () => {
 				updatedAt: new Date(),
 			},
 		});
-		await db.create({
-			model: "oauthAccessToken",
-			data: {
-				accessToken: "stale-access-token-not-used",
-				refreshToken: REFRESH_TOKEN,
-				accessTokenExpiresAt: new Date(Date.now() - 60 * 1000),
-				refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
-				clientId: CLIENT_ID,
-				userId,
-				scopes: "openid profile email offline_access",
-				createdAt: new Date(),
-				updatedAt: new Date(),
-			},
+		await createOAuthTokenPair(db, "oauthAccessToken", {
+			clientId: CLIENT_ID,
+			userId,
+			scopes: "openid profile email offline_access",
+			accessTokenExpiresAt: new Date(Date.now() - 60 * 1000),
+			refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+			issueRefreshToken: true,
+			accessToken: "stale-access-token-not-used",
+			refreshToken: REFRESH_TOKEN,
 		});
 	}
 
@@ -1065,10 +1320,11 @@ describe("mcp refresh_token grant client authentication", () => {
 			"http://localhost:3000/api/auth/mcp/token",
 			{
 				method: "POST",
-				headers: {
-					"Content-Type": "application/x-www-form-urlencoded",
-					authorization: basic,
-				},
+					headers: {
+						"Content-Type": "application/x-www-form-urlencoded",
+						authorization: basic,
+						"Idempotency-Key": generateCredentialOperationKey(),
+					},
 				body: new URLSearchParams({
 					grant_type: "refresh_token",
 					refresh_token: REFRESH_TOKEN,
@@ -1078,8 +1334,38 @@ describe("mcp refresh_token grant client authentication", () => {
 		const body = await response.json().catch(() => null);
 
 		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("pragma")).toBe("no-cache");
 		expect(body?.access_token).toBeDefined();
 		expect(body?.refresh_token).toBeDefined();
+	});
+
+	it("rejects a predictable repeated refresh operation key", async () => {
+		const { customFetchImpl, signInWithTestUser, db } = await getTestInstance({
+			plugins: [mcp({ loginPage: "/login" })],
+		});
+		const { user } = await signInWithTestUser();
+		await seedConfidentialClientAndToken(db, user.id);
+
+		const response = await customFetchImpl(
+			"http://localhost:3000/api/auth/mcp/token",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/x-www-form-urlencoded",
+					"Idempotency-Key": "a".repeat(22),
+				},
+				body: new URLSearchParams({
+					grant_type: "refresh_token",
+					refresh_token: REFRESH_TOKEN,
+					client_id: CLIENT_ID,
+					client_secret: CLIENT_SECRET,
+				}).toString(),
+			},
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ error: "invalid_request" });
 	});
 
 	it("should accept refresh_token grant when Authorization: Basic and matching client_id is in body", async () => {
@@ -1218,7 +1504,13 @@ describe("mcp session freshness (security)", () => {
 	async function seedToken(
 		db: Awaited<ReturnType<typeof getTestInstance>>["db"],
 		userId: string,
-		overrides: Record<string, unknown>,
+		overrides: {
+			accessToken?: string;
+			refreshToken?: string;
+			accessTokenExpiresAt?: Date;
+			refreshTokenExpiresAt?: Date;
+			scopes?: string;
+		},
 	) {
 		await db.create({
 			model: "oauthApplication",
@@ -1236,20 +1528,18 @@ describe("mcp session freshness (security)", () => {
 				updatedAt: new Date(),
 			},
 		});
-		await db.create({
-			model: "oauthAccessToken",
-			data: {
-				accessToken: "freshness-access-token",
-				refreshToken: "freshness-refresh-token",
-				accessTokenExpiresAt: new Date(Date.now() + 3600 * 1000),
-				refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
-				clientId: "freshness-test-client",
-				userId,
-				scopes: "openid profile email offline_access",
-				createdAt: new Date(),
-				updatedAt: new Date(),
-				...overrides,
-			},
+		await createOAuthTokenPair(db, "oauthAccessToken", {
+			clientId: "freshness-test-client",
+			userId,
+			scopes: overrides.scopes ?? "openid profile email offline_access",
+			accessTokenExpiresAt:
+				overrides.accessTokenExpiresAt ?? new Date(Date.now() + 3600 * 1000),
+			refreshTokenExpiresAt:
+				overrides.refreshTokenExpiresAt ??
+				new Date(Date.now() + 7 * 24 * 3600 * 1000),
+			issueRefreshToken: true,
+			accessToken: overrides.accessToken ?? "freshness-access-token",
+			refreshToken: overrides.refreshToken ?? "freshness-refresh-token",
 		});
 	}
 
@@ -1276,6 +1566,42 @@ describe("mcp session freshness (security)", () => {
 
 		expect(response.status).toBe(401);
 		expect(handlerCalled).toBe(false);
+
+		const direct = await auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/get-session", {
+				headers: { Authorization: "Bearer expired-access-token" },
+			}),
+		);
+		expect(direct.status).toBe(401);
+		expect(direct.headers.get("www-authenticate")).toBe(
+			'Bearer error="invalid_token"',
+		);
+		expect(direct.headers.get("cache-control")).toBe("no-store");
+		expect(direct.headers.get("pragma")).toBe("no-cache");
+	});
+
+	it("returns a response challenge for missing and invalid bearer tokens", async () => {
+		const { auth } = await getTestInstance({
+			baseURL: "http://localhost:3000",
+			plugins: [mcp({ loginPage: "/login" })],
+		});
+
+		for (const authorization of [undefined, "Bearer invalid-access-token"]) {
+			const headers = new Headers();
+			if (authorization) headers.set("Authorization", authorization);
+			const response = await auth.handler(
+				new Request("http://localhost:3000/api/auth/mcp/get-session", {
+					headers,
+				}),
+			);
+			expect(response.status).toBe(401);
+			expect(response.headers.get("www-authenticate")).toBe(
+				'Bearer error="invalid_token"',
+			);
+			expect(response.headers.get("cache-control")).toBe("no-store");
+			expect(response.headers.get("pragma")).toBe("no-cache");
+		expect(await response.json()).toMatchObject({ code: "invalid_token" });
+		}
 	});
 
 	it("accepts an unexpired access token", async () => {
@@ -1296,6 +1622,51 @@ describe("mcp session freshness (security)", () => {
 		);
 
 		expect(response.status).toBe(200);
+	});
+
+	it("returns only the public MCP session projection and prevents caching", async () => {
+		const { auth, signInWithTestUser, db } = await getTestInstance({
+			baseURL: "http://localhost:3000",
+			plugins: [mcp({ loginPage: "/login" })],
+		});
+		const { user } = await signInWithTestUser();
+		await seedToken(db, user.id, { accessToken: "projected-access-token" });
+
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/get-session", {
+				headers: { Authorization: "Bearer projected-access-token" },
+			}),
+		);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("pragma")).toBe("no-cache");
+		const session = await response.json();
+		expect(Object.keys(session).sort()).toEqual(
+			["accessTokenExpiresAt", "clientId", "id", "scopes", "userId"].sort(),
+		);
+		expect(session).toMatchObject({
+			clientId: "freshness-test-client",
+			userId: user.id,
+			scopes: "openid profile email offline_access",
+		});
+		for (const privateField of [
+			"accessToken",
+			"refreshToken",
+			"accessTokenDigest",
+			"refreshTokenDigest",
+			"digestVersion",
+			"familyId",
+			"refreshStatus",
+			"rotationCounter",
+			"parentTokenId",
+			"consumedAt",
+			"revokedAt",
+			"reuseDetectedAt",
+			"rotationNonceDigest",
+			"recoveryExpiresAt",
+		]) {
+			expect(session).not.toHaveProperty(privateField);
+		}
 	});
 
 	it("rejects a refresh_token grant whose original scopes lack offline_access", async () => {

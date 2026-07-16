@@ -133,6 +133,27 @@ export interface InternalAdapter<
 		user: User & Record<string, any>;
 	} | null>;
 
+	findSessionById(sessionId: string): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+	} | null>;
+
+	rotateSessionCredential(token: string, idempotencyKey?: string): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+		refreshToken: string;
+		familyId: string;
+		rotationCounter: number;
+	} | null>;
+
+	recoverSessionCredential(token: string, idempotencyKey: string): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+		refreshToken: string;
+		familyId: string;
+		rotationCounter: number;
+	} | null>;
+
 	findSessions(
 		sessionTokens: string[],
 		options?:
@@ -149,6 +170,8 @@ export interface InternalAdapter<
 
 	deleteSession(token: string): Promise<void>;
 
+	deleteSessionById(sessionId: string): Promise<void>;
+
 	deleteAccounts(userId: string): Promise<void>;
 
 	/**
@@ -162,6 +185,9 @@ export interface InternalAdapter<
 	 * Delete every session belonging to a user.
 	 */
 	deleteUserSessions(userId: string): Promise<void>;
+
+	/** Revoke every OIDC/MCP token family belonging to a user, when configured. */
+	revokeUserOAuthTokenFamilies(userId: string): Promise<void>;
 
 	/**
 	 * Delete sessions by their session tokens.

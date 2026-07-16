@@ -40,6 +40,8 @@ services:
       NODE_ENV: production
       CLEARANCE_STRICT_SECRETS: "1"
       CLEARANCE_API_PORT: "3200"
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:?set legacy-v1 for bridge or digest-v1 after migration}
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:?set immutable candidate deployment id}
       CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
       CLEARANCE_CREDENTIAL_KEY: ${CLEARANCE_CREDENTIAL_KEY:?set CLEARANCE_CREDENTIAL_KEY}
@@ -161,6 +163,8 @@ services:
       NODE_ENV: production
       CLEARANCE_STRICT_SECRETS: "1"
       SAMPLE_APP_PORT: "3000"
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:?set legacy-v1 for bridge or digest-v1 after migration}
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:?set immutable candidate deployment id}
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
       CLEARANCE_BASE_URL: ${CLEARANCE_BASE_URL:?set CLEARANCE_BASE_URL}
       # Optional social providers. The application fails startup on incomplete pairs.
@@ -173,6 +177,39 @@ services:
     ports: !override
       - "127.0.0.1:${CLEARANCE_SAMPLE_PORT:?set CLEARANCE_SAMPLE_PORT}:3000"
     restart: always
+
+  # One-shot credential-authority migrator. On a blank database run it before
+  # either serving container. On upgrade run only after arm/drain and after
+  # scaling every credential-capable serving container to zero.
+  credential-migrator:
+    profiles: ["migration"]
+    build: !reset null
+    image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
+    command:
+      - node
+      - packages/clearance-cli/dist/index.js
+      - --json
+      - --no-input
+      - --yes
+      - schema
+      - migrate
+      - --local
+      - --drain-id
+      - ${CLEARANCE_CREDENTIAL_DRAIN_ID:?set the armed drain id}
+    environment:
+      NODE_ENV: production
+      CLEARANCE_STRICT_SECRETS: "1"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_BASE_URL: ${CLEARANCE_BASE_URL:?set CLEARANCE_BASE_URL}
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: digest-v1
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:?set immutable candidate deployment id}
+      CLEARANCE_INSTANCE_ID: credential-migrator
+      CLEARANCE_CREDENTIAL_DRAIN_ID: ${CLEARANCE_CREDENTIAL_DRAIN_ID:?set the armed drain id}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   # One-shot scheduled job. Invoke from cron/systemd:
   # docker compose ... --profile backup run --rm backup

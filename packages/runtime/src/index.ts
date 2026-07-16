@@ -1,7 +1,10 @@
 //#region Re-exports necessaries from core module
 export type { StandardSchemaV1 } from "@clearance/core";
 export * from "@clearance/core";
-export { getCurrentAdapter } from "@clearance/core/context";
+export {
+	getCurrentAdapter,
+	queueAfterTransactionHook,
+} from "@clearance/core/context";
 export * from "@clearance/core/db";
 export * from "@clearance/core/env";
 export * from "@clearance/core/error";

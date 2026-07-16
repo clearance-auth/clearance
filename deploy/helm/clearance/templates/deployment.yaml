@@ -1,5 +1,19 @@
 {{- $apiRepository := required "image.repository is required" .Values.image.repository }}
 {{- $apiDigest := required "image.digest is required; deploy an immutable release digest" .Values.image.digest }}
+{{- $phase := required "credentialAuthority.phase is required" .Values.credentialAuthority.phase }}
+{{- if not (has $phase (list "bootstrap" "bridge" "drain" "migrate" "serve")) }}
+{{- fail "credentialAuthority.phase must be bootstrap, bridge, drain, migrate, or serve" }}
+{{- end }}
+{{- $deploymentId := required "credentialAuthority.deploymentId is required" .Values.credentialAuthority.deploymentId }}
+{{- if and (eq $phase "bridge") (ne (int .Values.credentialAuthority.expectedRuntimeCount) (int .Values.replicaCount)) }}
+{{- fail "credentialAuthority.expectedRuntimeCount must equal replicaCount in bridge phase" }}
+{{- end }}
+{{- if and (eq $phase "migrate") (empty .Values.credentialAuthority.drainId) }}
+{{- fail "credentialAuthority.drainId is required in migrate phase" }}
+{{- end }}
+{{- if and (or (eq $phase "bootstrap") (eq $phase "migrate")) (empty .Values.credentialAuthority.migrationAttemptId) }}
+{{- fail "credentialAuthority.migrationAttemptId is required in bootstrap and migrate phases" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,8 +24,12 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: api
 spec:
-  replicas: {{ .Values.replicaCount }}
-  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # Bridge permits a normal candidate rollout. Drain and migrate retain the
+  # Deployment at zero replicas. Serve starts only digest-generation runtimes.
+  strategy:
+    type: {{ if eq $phase "bridge" }}RollingUpdate{{ else }}Recreate{{ end }}
+  replicas: {{ if or (eq $phase "bootstrap") (eq $phase "drain") (eq $phase "migrate") }}0{{ else }}{{ .Values.replicaCount }}{{ end }}
+  revisionHistoryLimit: {{ if eq $phase "bridge" }}{{ .Values.revisionHistoryLimit }}{{ else }}0{{ end }}
   selector:
     matchLabels:
       app: clearance-api
@@ -19,7 +37,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken (toJson .Values.delivery) | sha256sum }}
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken (toJson .Values.delivery) $phase $deploymentId | sha256sum }}
       labels:
         app: clearance-api
         app.kubernetes.io/name: clearance
@@ -66,6 +84,14 @@ spec:
             - { name: backups, mountPath: /backups }
 {{- end }}
           env:
+            - name: CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION
+              value: {{ if eq $phase "serve" }}digest-v1{{ else }}legacy-v1{{ end }}
+            - name: CLEARANCE_DEPLOYMENT_ID
+              value: {{ $deploymentId | quote }}
+            - name: CLEARANCE_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

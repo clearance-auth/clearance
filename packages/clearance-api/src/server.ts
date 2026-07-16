@@ -10,6 +10,8 @@ import {
 	deliveryStoreOptionsFromEnvironment,
 	createManagementApplication,
 	createAuthBridgeRuntimeGateway,
+	closeAuthBundle,
+	getAuthBundle,
 	createScimConnectionReal,
 	createSsoConnectionReal,
 	isClearanceError,
@@ -440,6 +442,32 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 app.use("/v1/*", requireManagementPrincipal);
 
 app.use("/v1/*", async (c, next) => {
+	if (!runtimeDatabaseConfigured() || c.req.path.startsWith("/v1/schema/")) {
+		return next();
+	}
+	try {
+		await getAuthBundle().credentialAuthority.assertRuntimeServing();
+		return next();
+	} catch (error) {
+		return c.json(
+			{
+				error: {
+					code: "CREDENTIAL_AUTHORITY_FENCED",
+					message: "Credential authority generation cannot serve requests.",
+					stage: "api.credential-authority",
+					retryable: true,
+					remediation:
+						error instanceof Error
+							? error.message
+							: "Inspect schema credential-authority status.",
+				},
+			},
+			503,
+		);
+	}
+});
+
+app.use("/v1/*", async (c, next) => {
 	if (!["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) return next();
 	if (!(c.req.header("content-type") ?? "").toLowerCase().includes("application/json")) return next();
 	const request = await c.req.raw.clone().json().catch(() => undefined);
@@ -854,6 +882,9 @@ app.get("/readyz", async (c) => {
 	try {
 		const store = await storeForRequest();
 		await store.ready();
+		if (runtimeDatabaseConfigured()) {
+			await getAuthBundle().credentialAuthority.assertRuntimeServing();
+		}
 		return c.json({
 			ok: true,
 			service: "clearance-api",
@@ -1113,6 +1144,7 @@ function installGracefulShutdown(
 				try {
 					if (error) throw error;
 					await store.ready();
+					await closeAuthBundle();
 					const destroy = (store as ManagementStore & { destroy?: () => Promise<void> }).destroy;
 					if (destroy) await destroy.call(store);
 					console.log(JSON.stringify({ event: "shutdown_completed", service: "clearance-api" }));
@@ -1143,6 +1175,9 @@ async function start() {
 	// Eager store init so postgres schema exists before traffic
 	const store = await getStore();
 	await store.ready();
+	if (runtimeDatabaseConfigured()) {
+		await getAuthBundle().credentialAuthority.assertRuntimeServing();
+	}
 
 	const { createServer } = await import("node:http");
 	const server = createServer(nodeRequestHandler);

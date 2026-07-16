@@ -37,11 +37,13 @@ trap cleanup EXIT INT TERM
 # Self-heal a stale pair if the operating system later reuses this PID.
 cleanup
 
-docker run -d --rm --name "$SHARED_NAME" \
-  -e POSTGRES_USER=clearance -e POSTGRES_PASSWORD=clearance -e POSTGRES_DB=clearance \
-  -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
-docker run -d --rm --name "$ORG_NAME" \
-  -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=clearance \
+docker run -d --name "$SHARED_NAME" \
+	--tmpfs /var/lib/postgresql/data:rw,size=256m \
+	-e POSTGRES_USER=clearance -e POSTGRES_PASSWORD=clearance -e POSTGRES_DB=clearance \
+	-p 127.0.0.1::5432 postgres:16-alpine >/dev/null
+docker run -d --name "$ORG_NAME" \
+	--tmpfs /var/lib/postgresql/data:rw,size=256m \
+	-e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=clearance \
   -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
 
 port_of() {
@@ -106,5 +108,26 @@ run_zero_skip_suite packages/management management
 run_zero_skip_suite packages/delivery delivery
 run_zero_skip_suite packages/delivery-worker delivery-worker
 run_zero_skip_suite packages/clearance-auth clearance-auth
+
+RUNTIME_AUTH_REPORT="$(mktemp -t clearance-runtime-auth-report.XXXXXX).json"
+(cd packages/runtime && pnpm exec vitest run \
+	  src/plugins/mcp/mcp.test.ts \
+	  src/plugins/mcp/mcp.postgres.test.ts \
+  src/plugins/oidc-provider/oidc.postgres.test.ts \
+  src/db/session-credential.postgres.test.ts \
+  src/db/credential-upgrade.postgres.test.ts \
+  --reporter=default --reporter=json --outputFile="$RUNTIME_AUTH_REPORT")
+node - "$RUNTIME_AUTH_REPORT" runtime-auth-security <<'EOF'
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const label = process.argv[3];
+const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
+if (!r.success || skipped !== 0) {
+  console.error(`${label} suite failed or skipped tests (${r.numFailedTests} failed, ${skipped} skipped)`);
+  process.exit(1);
+}
+console.log(`${label} suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
+EOF
+rm -f "$RUNTIME_AUTH_REPORT"
 
 echo "TEST_WITH_POSTGRES_OK"

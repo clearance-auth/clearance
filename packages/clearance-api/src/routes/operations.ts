@@ -8,10 +8,13 @@ import {
 	UPGRADE_OPERATIONS,
 	applyUpgrade,
 	applyStoreV2,
+	armCredentialAuthority,
 	cutoverStoreV2Events,
 	cutoverStoreV2Principals,
 	createBackup,
 	createPostgresBackup,
+	drainCredentialAuthority,
+	getCredentialAuthorityStatus,
 	getRuntimeSchemaStatus,
 	getStoreV2Status,
 	migrateRuntimeSchema,
@@ -260,6 +263,110 @@ export function registerOperationRoutes({
 			return handleError(c, e);
 		}
 	});
+
+	routes.get(
+		SCHEMA_OPERATIONS.credentialAuthorityStatus.http.path,
+		async (c) => {
+			try {
+				return c.json(await getCredentialAuthorityStatus());
+			} catch (error) {
+				return handleError(c, error);
+			}
+		},
+	);
+
+	routes.post(
+		SCHEMA_OPERATIONS.credentialAuthorityArm.http.path,
+		async (c) => {
+			try {
+				const body = (await c.req.json().catch(() => ({}))) as Record<
+					string,
+					unknown
+				>;
+				if (body.confirm !== true) {
+					throw new ClearanceError({
+						code: "CREDENTIAL_AUTHORITY_ARM_CONFIRMATION_REQUIRED",
+						message: "Credential authority arm requires explicit confirmation",
+						stage: "schema.credential-authority.arm",
+						status: 400,
+						remediation: "Verify the candidate rollout, then send confirm as true.",
+					});
+				}
+				if (
+					typeof body.deploymentId !== "string" ||
+					body.deploymentId.trim().length === 0 ||
+					body.deploymentId.length > 200 ||
+					typeof body.expectedRuntimeCount !== "number" ||
+					!Number.isSafeInteger(body.expectedRuntimeCount) ||
+					body.expectedRuntimeCount < 1 ||
+					body.expectedRuntimeCount > 10_000
+				) {
+					throw new ClearanceError({
+						code: "CREDENTIAL_AUTHORITY_ARM_INPUT_INVALID",
+						message: "Credential authority arm input is invalid",
+						stage: "schema.credential-authority.arm",
+						status: 400,
+						remediation:
+							"Send a non-empty deploymentId up to 200 characters and expectedRuntimeCount as an integer from 1 through 10000.",
+					});
+				}
+				return c.json(
+					await armCredentialAuthority({
+						deploymentId: body.deploymentId.trim(),
+						expectedRuntimeCount: body.expectedRuntimeCount,
+					}),
+				);
+			} catch (error) {
+				return handleError(c, error);
+			}
+		},
+	);
+
+	routes.post(
+		SCHEMA_OPERATIONS.credentialAuthorityDrain.http.path,
+		async (c) => {
+			try {
+				const body = (await c.req.json().catch(() => ({}))) as Record<
+					string,
+					unknown
+				>;
+				if (body.confirm !== true) {
+					throw new ClearanceError({
+						code: "CREDENTIAL_AUTHORITY_DRAIN_CONFIRMATION_REQUIRED",
+						message: "Credential authority drain requires explicit confirmation",
+						stage: "schema.credential-authority.drain",
+						status: 400,
+						remediation: "Verify the armed rollout, then send confirm as true.",
+					});
+				}
+				if (
+					typeof body.deploymentId !== "string" ||
+					body.deploymentId.trim().length === 0 ||
+					body.deploymentId.length > 200 ||
+					typeof body.drainId !== "string" ||
+					body.drainId.trim().length === 0 ||
+					body.drainId.length > 200
+				) {
+					throw new ClearanceError({
+						code: "CREDENTIAL_AUTHORITY_DRAIN_INPUT_INVALID",
+						message: "Credential authority drain input is invalid",
+						stage: "schema.credential-authority.drain",
+						status: 400,
+						remediation:
+							"Send non-empty deploymentId and drainId values up to 200 characters.",
+					});
+				}
+				return c.json(
+					await drainCredentialAuthority({
+						deploymentId: body.deploymentId.trim(),
+						drainId: body.drainId.trim(),
+					}),
+				);
+			} catch (error) {
+				return handleError(c, error);
+			}
+		},
+	);
 
 	routes.get(STORE_V2_OPERATIONS.status.http.path, async (c) => {
 		try {

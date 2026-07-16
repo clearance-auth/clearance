@@ -1,11 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { clearance, APIError, type ClearanceOptions } from "@clearance/runtime";
+import {
+	clearance,
+	APIError,
+	type ClearanceOptions,
+} from "../../runtime/src/index.js";
 import {
 	createDeliveryKeyring,
 	enqueueDeliveryInExistingTransaction,
 	migrateDeliverySchema,
 } from "@clearance/delivery";
-import { symmetricDecrypt, symmetricEncrypt } from "@clearance/runtime/crypto";
+import {
+	symmetricDecrypt,
+	symmetricEncrypt,
+} from "../../runtime/src/crypto/index.js";
 import {
 	encodeBackupCodes,
 	haveIBeenPwned,
@@ -14,8 +21,9 @@ import {
 	organization,
 	twoFactor,
 	type Jwk,
-} from "@clearance/runtime/plugins";
-import { getMigrations } from "@clearance/runtime/db/migration";
+} from "../../runtime/src/plugins/index.js";
+import { getMigrations } from "../../runtime/src/db/get-migration.js";
+import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
 import { sso } from "@clearance/sso";
 import { scim } from "@clearance/scim";
 import { Kysely, PostgresDialect } from "kysely";
@@ -24,6 +32,10 @@ import {
 	MINIMUM_SECRET_LENGTH,
 	isForbiddenDefaultSecret,
 } from "./secret-policy.js";
+import {
+	PostgresCredentialAuthorityFence,
+	bootstrapCredentialAuthorityFence,
+} from "./credential-authority-fence.js";
 import type {
 	ClearanceAuthBundle,
 	ClearanceAuthenticationSecurityOptions,
@@ -50,6 +62,27 @@ export type {
 	ClearanceAuthenticationSecurityOptions,
 	SocialProviderConfig,
 } from "./public-types/index.js";
+
+function createLeaseBoundMigrationDatabase(client: pg.PoolClient): Kysely<unknown> {
+	// Kysely releases a client after every reserved connection. The migration
+	// session must retain the exact pg backend that owns the advisory lease, so
+	// expose a single-client pool whose release/end operations are deliberately
+	// local no-ops. The fence remains the sole owner of the real client lifetime.
+	const leasedClient = {
+		query: client.query.bind(client),
+		release: () => undefined,
+	};
+	const leasedPool = {
+		connect: async () => leasedClient,
+		end: async () => undefined,
+		options: {},
+	};
+	return new Kysely({
+		dialect: new PostgresDialect({
+			pool: leasedPool as unknown as pg.Pool,
+		}),
+	});
+}
 
 export function socialProvidersFromEnvironment(
 	env: Record<string, string | undefined> = process.env,
@@ -460,6 +493,29 @@ export function createClearanceAuth<
 	const authenticationSecurity = resolveAuthenticationSecurity(options, strict);
 
 	const pool = new pg.Pool({ connectionString: options.databaseUrl });
+	const credentialAuthorityGeneration =
+		options.credentialAuthority?.generation ?? "digest-v1";
+	const credentialAuthority = new PostgresCredentialAuthorityFence(pool, {
+		generation: credentialAuthorityGeneration,
+		deploymentId:
+			options.credentialAuthority?.deploymentId ?? (strict ? "" : "development"),
+		instanceId:
+			options.credentialAuthority?.instanceId ??
+			(strict ? "" : `development-${randomUUID()}`),
+	});
+	let legacyBridgeCompatibilityPromise: Promise<void> | null = null;
+	const assertProductRuntimeServing = async () => {
+		await credentialAuthority.assertRuntimeServing();
+		if (credentialAuthorityGeneration === "legacy-v1") {
+			legacyBridgeCompatibilityPromise ??=
+				ensureLegacyBridgeCompatibility().catch((error) => {
+					legacyBridgeCompatibilityPromise = null;
+					throw error;
+				});
+			await legacyBridgeCompatibilityPromise;
+			await credentialAuthority.assertRuntimeServing();
+		}
+	};
 	const jwksAdapter = postgresJwksAdapter(pool);
 	const db = new Kysely({
 		dialect: new PostgresDialect({ pool }),
@@ -512,7 +568,7 @@ export function createClearanceAuth<
 	const database = {
 		db,
 		type: "postgres" as const,
-		...(durableDelivery ? { transaction: true as const } : {}),
+		transaction: true as const,
 	};
 
 	const plugins = [
@@ -542,6 +598,7 @@ export function createClearanceAuth<
 		...(authenticationSecurity.asymmetricAccessTokens.enabled
 			? [
 					jwt({
+						disableSettingJwtHeader: true,
 						adapter: jwksAdapter,
 						jwks: {
 							keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
@@ -595,6 +652,7 @@ export function createClearanceAuth<
 					}),
 				]
 			: []),
+		...((options.plugins ?? []) as NonNullable<ClearanceOptions["plugins"]>),
 	];
 
 	const rateLimitEnabled = options.rateLimitEnabled ?? true;
@@ -622,7 +680,9 @@ export function createClearanceAuth<
 		},
 	};
 
-	const auth = clearance({
+	const underlyingAuth = clearance(
+		attachInternalCredentialAuthority(
+			{
 		appName: "Clearance",
 		baseURL: options.baseURL,
 		secret: options.secret,
@@ -649,6 +709,7 @@ export function createClearanceAuth<
 		},
 		// Durable management identity bridge + disable/delete sign-in guard.
 		// Failures in onUserCreated must not be swallowed by the caller.
+		databaseHookFailureMode: onUserCreated ? "rollback" : "observe",
 		databaseHooks: {
 			user: onUserCreated
 				? {
@@ -688,30 +749,226 @@ export function createClearanceAuth<
 			},
 		},
 		plugins,
+			},
+			{
+				generation: credentialAuthorityGeneration,
+			},
+		),
+	);
+	const guardedApiFunctions = new Map<PropertyKey, unknown>();
+	const guardedApi = new Proxy(underlyingAuth.api, {
+		get(target, property, receiver) {
+			const value = Reflect.get(target, property, receiver);
+			if (typeof value !== "function") return value;
+			if (guardedApiFunctions.has(property)) {
+				return guardedApiFunctions.get(property);
+			}
+			const guarded = async (...args: unknown[]) => {
+				await assertProductRuntimeServing();
+				return Reflect.apply(value, target, args);
+			};
+			guardedApiFunctions.set(property, guarded);
+			return guarded;
+		},
+	});
+	const guardedHandler = async (...args: unknown[]) => {
+		try {
+			await assertProductRuntimeServing();
+		} catch (error) {
+			return new Response(
+				JSON.stringify({
+					code: "CREDENTIAL_AUTHORITY_FENCED",
+					message:
+						error instanceof Error
+							? error.message
+							: "Credential authority is unavailable",
+				}),
+				{
+					status: 503,
+					headers: { "content-type": "application/json; charset=utf-8" },
+				},
+			);
+		}
+		return Reflect.apply(underlyingAuth.handler, underlyingAuth, args);
+	};
+	const guardRuntimeMethods = <Target extends object>(target: Target): Target => {
+		const guardedMethods = new Map<PropertyKey, unknown>();
+		return new Proxy(target, {
+			get(current, property, receiver) {
+				const value = Reflect.get(current, property, receiver);
+				if (typeof value !== "function") return value;
+				if (guardedMethods.has(property)) return guardedMethods.get(property);
+				const guarded = async (...args: unknown[]) => {
+					await assertProductRuntimeServing();
+					return Reflect.apply(value, current, args);
+				};
+				guardedMethods.set(property, guarded);
+				return guarded;
+			},
+		});
+	};
+	const guardedContext = underlyingAuth.$context.then((context) => {
+		const guardedAdapter = guardRuntimeMethods(context.adapter);
+		const guardedInternalAdapter = guardRuntimeMethods(context.internalAdapter);
+		return new Proxy(context, {
+			get(current, property, receiver) {
+				if (property === "adapter") return guardedAdapter;
+				if (property === "internalAdapter") return guardedInternalAdapter;
+				if (property === "runMigrations") {
+					const runMigrations = Reflect.get(current, property, receiver);
+					if (typeof runMigrations !== "function") return runMigrations;
+					return async (...args: unknown[]) => {
+						await assertProductRuntimeServing();
+						return Reflect.apply(runMigrations, current, args);
+					};
+				}
+				return Reflect.get(current, property, receiver);
+			},
+		});
+	});
+	const auth = new Proxy(underlyingAuth, {
+		get(target, property, receiver) {
+			if (property === "api") return guardedApi;
+			if (property === "handler") return guardedHandler;
+			if (property === "$context") return guardedContext;
+			return Reflect.get(target, property, receiver);
+		},
 	});
 
-	const migrationConfig = {
-		database,
+	const migrationConfigFor = (
+		migrationDatabase = database,
+		migrationDrainId?: string,
+	) =>
+		attachInternalCredentialAuthority(
+			{
+		database: migrationDatabase,
 		secret: options.secret,
 		baseURL: options.baseURL,
 		emailAndPassword: { enabled: true },
 		user: { additionalFields: userAdditionalFields },
 		rateLimit,
 		plugins,
-	} as Parameters<typeof getMigrations>[0];
+			},
+			{
+				generation: credentialAuthorityGeneration,
+				...(migrationDrainId ? { migrationDrainId } : {}),
+			},
+		) as Parameters<typeof getMigrations>[0];
 
-	async function planMigrations(): Promise<ClearanceRuntimeMigrationPlan> {
-		const { toBeCreated, toBeAdded, runMigrations, compileMigrations } =
-			await getMigrations(migrationConfig);
+	async function planMigrationsFor(
+		migrationDatabase = database,
+		migrationDrainId?: string,
+	): Promise<ClearanceRuntimeMigrationPlan> {
+		const {
+			toBeCreated,
+			toBeAdded,
+			pendingSecurityMigrations,
+			runMigrations,
+			compileMigrations,
+		} =
+			await getMigrations(
+				migrationConfigFor(migrationDatabase, migrationDrainId),
+			);
 		return {
 			pendingTables: toBeCreated.length,
 			pendingFields: [...toBeCreated, ...toBeAdded].reduce(
 				(total, migration) => total + Object.keys(migration.fields).length,
 				0,
 			),
+			pendingSecurityMigrations,
 			compileSql: compileMigrations,
 			apply: runMigrations,
 		};
+	}
+
+	async function inspectPreFenceCredentialSchema(): Promise<{
+		fence: boolean;
+		session: boolean;
+		oauth: boolean;
+	}> {
+		const result = await pool.query<{
+			fence: boolean;
+			session: boolean;
+			oauth: boolean;
+		}>(`SELECT
+			to_regclass(format('%I.%I', current_schema(), 'credentialAuthorityFence')) IS NOT NULL AS fence,
+			to_regclass(format('%I.%I', current_schema(), 'session')) IS NOT NULL AS session,
+			to_regclass(format('%I.%I', current_schema(), 'oauthAccessToken')) IS NOT NULL AS oauth`);
+		return result.rows[0] ?? { fence: false, session: false, oauth: false };
+	}
+
+	async function ensureLegacyBridgeCompatibility(): Promise<void> {
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query(
+				`SELECT pg_advisory_xact_lock(
+					hashtext(current_database()),
+					hashtext(current_schema() || ':clearance:legacy-bridge-prep:v1')
+				)`,
+			);
+			await client.query(`
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS banned boolean DEFAULT false;
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "banReason" text;
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "twoFactorEnabled" boolean DEFAULT false;
+				ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "twoFactorSessionGeneration" text;
+				ALTER TABLE session ADD COLUMN IF NOT EXISTS "twoFactorSessionGeneration" text;
+
+				CREATE TABLE IF NOT EXISTS "twoFactor" (
+					id text PRIMARY KEY,
+					secret text NOT NULL,
+					"backupCodes" text NOT NULL,
+					"pendingSecret" text,
+					"pendingBackupCodes" text,
+					"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+					verified boolean DEFAULT true,
+					"failedVerificationCount" integer DEFAULT 0,
+					"activeVerificationReservations" text DEFAULT '[]',
+					"lockedUntil" timestamptz,
+					"lastUsedTotpCounter" integer DEFAULT -1,
+					"trustDeviceGeneration" text
+				);
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "pendingSecret" text;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "pendingBackupCodes" text;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS verified boolean DEFAULT true;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "failedVerificationCount" integer DEFAULT 0;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "activeVerificationReservations" text DEFAULT '[]';
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "lockedUntil" timestamptz;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "lastUsedTotpCounter" integer DEFAULT -1;
+				ALTER TABLE "twoFactor" ADD COLUMN IF NOT EXISTS "trustDeviceGeneration" text;
+				CREATE INDEX IF NOT EXISTS "twoFactor_secret_idx" ON "twoFactor" (secret);
+
+				CREATE TABLE IF NOT EXISTS jwks (
+					id text PRIMARY KEY,
+					"publicKey" text NOT NULL,
+					"privateKey" text NOT NULL,
+					"createdAt" timestamptz NOT NULL,
+					"expiresAt" timestamptz,
+					alg text,
+					crv text
+				);
+				ALTER TABLE jwks ADD COLUMN IF NOT EXISTS alg text;
+				ALTER TABLE jwks ADD COLUMN IF NOT EXISTS crv text
+			`);
+			const duplicateFactor = await client.query<{ userId: string }>(`
+				SELECT "userId" FROM "twoFactor"
+				GROUP BY "userId" HAVING count(*) > 1 LIMIT 1
+			`);
+			if (duplicateFactor.rows[0]) {
+				throw new Error(
+					`Cannot prepare the credential bridge: duplicate two-factor records exist for user ${duplicateFactor.rows[0].userId}`,
+				);
+			}
+			await client.query(
+				`CREATE UNIQUE INDEX IF NOT EXISTS "twoFactor_userId_unique" ON "twoFactor" ("userId")`,
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async function ensureLifecycleCompatibility(): Promise<void> {
@@ -919,11 +1176,20 @@ export function createClearanceAuth<
 			client.release();
 		}
 	}
+	const credentialAuthorityFacade = Object.freeze({
+		status: () => credentialAuthority.status(),
+		arm: (input: { deploymentId: string; expectedRuntimeCount: number }) =>
+			credentialAuthority.arm(input),
+		beginDrain: (input: { deploymentId: string; drainId: string }) =>
+			credentialAuthority.beginDrain(input),
+		assertRuntimeServing: () => assertProductRuntimeServing(),
+	});
 
 	return {
 		auth: auth as unknown as ClearanceProductAuthRuntime<Security>,
 		pool,
 		db,
+		credentialAuthority: credentialAuthorityFacade,
 		plugins: {
 			organization: true,
 			sso: options.enableSso !== false,
@@ -934,19 +1200,89 @@ export function createClearanceAuth<
 				authenticationSecurity.asymmetricAccessTokens.enabled,
 		},
 		rateLimitEnabled,
-		planMigrations,
-		async migrate() {
-			const plan = await planMigrations();
-			await plan.apply();
-			await ensureAuthenticationSecurityCompatibility();
-			await ensureLifecycleCompatibility();
-			if (options.durableDelivery) {
-				await migrateDeliverySchema(pool, {
-					schema: options.durableDelivery.schema,
-					prefix: options.durableDelivery.prefix,
-					legacyFingerprintKeyId:
-						options.durableDelivery.legacyFingerprintKeyId,
+		prepareCredentialAuthorityRuntime: assertProductRuntimeServing,
+		planMigrations: () => planMigrationsFor(),
+		async migrate(input) {
+			const preFenceSchema = await inspectPreFenceCredentialSchema();
+			await bootstrapCredentialAuthorityFence(pool);
+			const plan = await planMigrationsFor();
+			const apply = async () => {
+				await plan.apply();
+				await ensureAuthenticationSecurityCompatibility();
+				await ensureLifecycleCompatibility();
+				if (options.durableDelivery) {
+					await migrateDeliverySchema(pool, {
+						schema: options.durableDelivery.schema,
+						prefix: options.durableDelivery.prefix,
+						legacyFingerprintKeyId:
+							options.durableDelivery.legacyFingerprintKeyId,
+					});
+				}
+			};
+			const state = await credentialAuthority.status();
+			if (
+				state.phase === "digest-live" &&
+				plan.pendingSecurityMigrations.length > 0
+			) {
+				throw new Error(
+					`Credential authority markers conflict with the durable digest-live generation: ${plan.pendingSecurityMigrations.join(", ")}`,
+				);
+			}
+			if (state.phase !== "digest-live") {
+				const freshDatabase =
+					!preFenceSchema.fence &&
+					!preFenceSchema.session &&
+					!preFenceSchema.oauth;
+				// Development/test databases may already contain a fully migrated
+				// digest schema from a pre-fence candidate. Production must still arm
+				// and drain that deployment before publishing the durable generation.
+				const localFenceAdoption = !strict && !preFenceSchema.fence;
+				const allowUnarmedLegacyOpen = freshDatabase || localFenceAdoption;
+				const drainId =
+					input?.drainId ??
+					options.credentialAuthority?.migrationDrainId ??
+					(allowUnarmedLegacyOpen
+						? state.drainId ?? `bootstrap-${randomUUID()}`
+						: undefined);
+				if (!drainId) {
+					throw new Error(
+						"Existing credential authority requires an armed drain and credentialAuthority.migrationDrainId",
+					);
+				}
+				await credentialAuthority.withExclusiveMigrationLease({
+					drainId,
+					allowUnarmedLegacyOpen,
+					timeoutMs:
+						options.credentialAuthority?.migrationLeaseTimeoutMs,
+					run: async (leaseClient) => {
+						const leaseDatabase = {
+							db: createLeaseBoundMigrationDatabase(leaseClient),
+							type: "postgres" as const,
+							transaction: true as const,
+						};
+						try {
+							const leasePlan = await planMigrationsFor(
+								leaseDatabase,
+								drainId,
+							);
+							await leasePlan.apply();
+							await ensureAuthenticationSecurityCompatibility();
+							await ensureLifecycleCompatibility();
+							if (options.durableDelivery) {
+								await migrateDeliverySchema(pool, {
+									schema: options.durableDelivery.schema,
+									prefix: options.durableDelivery.prefix,
+									legacyFingerprintKeyId:
+										options.durableDelivery.legacyFingerprintKeyId,
+								});
+							}
+						} finally {
+							await leaseDatabase.db.destroy();
+						}
+					},
 				});
+			} else {
+				await apply();
 			}
 			return {
 				appliedTables: plan.pendingTables,
@@ -954,6 +1290,7 @@ export function createClearanceAuth<
 			};
 		},
 		async destroy() {
+			await credentialAuthority.close();
 			await pool.end();
 		},
 	};

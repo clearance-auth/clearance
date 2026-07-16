@@ -1,7 +1,11 @@
 /** @clearance/auth — Clearance product entry for the authentication runtime. */
-export { clearance } from "@clearance/runtime";
-export { organization } from "@clearance/runtime/plugins";
-export { getMigrations } from "@clearance/runtime/db/migration";
+export { clearance } from "../../runtime/src/index.js";
+export {
+	mcp,
+	oidcProvider,
+	organization,
+} from "../../runtime/src/plugins/index.js";
+export { getMigrations } from "../../runtime/src/db/get-migration.js";
 export { sso } from "@clearance/sso";
 export { scim } from "@clearance/scim";
 
@@ -24,7 +28,10 @@ export {
 	isForbiddenDefaultSecret,
 } from "./secret-policy.js";
 
-export { toNodeHandler, fromNodeHeaders } from "@clearance/runtime/node";
+export {
+	toNodeHandler,
+	fromNodeHeaders,
+} from "../../runtime/src/integrations/node.js";
 
 /** Clearance product defaults layered on auth options. */
 export function withClearanceDefaults<T extends Record<string, unknown>>(

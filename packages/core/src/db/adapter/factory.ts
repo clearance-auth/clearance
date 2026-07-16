@@ -1679,6 +1679,7 @@ export const createAdapterFactory =
 				...(adapterInstance.options ?? {}),
 			},
 			id: config.adapterId,
+			storagePersistence: config.storagePersistence ?? "durable",
 
 			// Secretly export values ONLY if this adapter has enabled adapter-test-debug-logs.
 			// This would then be used during our adapter-tests to help print debug logs if a test fails.

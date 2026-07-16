@@ -141,6 +141,7 @@ export const memoryAdapter = (
 		createAdapterFactory({
 			config: {
 				adapterId: "memory",
+				storagePersistence: "ephemeral",
 				adapterName: "Memory Adapter",
 				usePlural: false,
 				debugLogs: config?.debugLogs || false,

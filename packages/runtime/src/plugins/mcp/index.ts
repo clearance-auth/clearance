@@ -3,29 +3,31 @@ import type {
 	ClearancePlugin,
 	GenericEndpointContext,
 } from "@clearance/core";
-import {
-	createAuthEndpoint,
-	createAuthMiddleware,
-} from "@clearance/core/api";
+import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { isProduction, logger } from "@clearance/core/env";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { isSafeUrlScheme } from "@clearance/core/utils/url";
-import { getWebcryptoSubtle } from "@clearance/utils";
 import { base64 } from "@clearance/utils/base64";
 import { createHash } from "@clearance/utils/hash";
-import { SignJWT } from "jose";
 import * as z from "zod";
 import { APIError, getSessionFromCtx } from "../../api";
 import { resolveDynamicTrustedProxyHeaders } from "../../context/helpers";
 import { expireCookie, parseSetCookieHeader } from "../../cookies";
 import { constantTimeEqual, generateRandomString } from "../../crypto";
 import { HIDE_METADATA } from "../../utils";
+import { isAPIError } from "../../utils/is-api-error";
+import {
+	CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+	parseCredentialOperationKey,
+} from "../../utils/operation-key";
 import {
 	getBaseURL,
 	isDynamicBaseURLConfig,
 	resolveBaseURL,
 } from "../../utils/url";
 import { PACKAGE_VERSION } from "../../version";
+import { type Jwk, jwt, signJWT } from "../jwt";
 import type {
 	Client,
 	CodeVerificationValue,
@@ -33,8 +35,23 @@ import type {
 	OIDCMetadata,
 	OIDCOptions,
 } from "../oidc-provider";
-import { oidcProvider } from "../oidc-provider";
+import {
+	createOAuthTokenPair,
+	filterAdditionalUserClaims,
+	findOAuthTokenBySecret,
+	getClient,
+	oidcProvider,
+	rotateOAuthRefreshToken,
+} from "../oidc-provider";
 import { schema } from "../oidc-provider/schema";
+import {
+	setNoStoreTokenResponseHeaders,
+} from "../oidc-provider/token-response";
+import { lockAndReadActiveUser } from "../../db/user-authority";
+import {
+	attachInternalCredentialAuthority,
+	readInternalCredentialAuthority,
+} from "../../internal/credential-authority";
 import { parsePrompt } from "../oidc-provider/utils/prompt";
 import { authorizeMCPOAuth } from "./authorize";
 
@@ -51,6 +68,11 @@ interface MCPOptions {
 	resource?: string | undefined;
 	oidcConfig?: OIDCOptions | undefined;
 }
+
+export type MCPSession = Pick<
+	OAuthAccessToken,
+	"id" | "clientId" | "userId" | "scopes" | "accessTokenExpiresAt"
+>;
 
 export const getMCPProviderMetadata = (
 	ctx: GenericEndpointContext,
@@ -183,7 +205,7 @@ export const mcp = (options: MCPOptions) => {
 	const opts = {
 		codeExpiresIn: 600,
 		defaultScope: "openid",
-		accessTokenExpiresIn: 3600,
+		accessTokenExpiresIn: 300,
 		refreshTokenExpiresIn: 604800,
 		allowPlainCodeChallengeMethod: false,
 		...options.oidcConfig,
@@ -201,10 +223,38 @@ export const mcp = (options: MCPOptions) => {
 		oauthAccessToken: "oauthAccessToken",
 		oauthConsent: "oauthConsent",
 	};
+	const signerOptions = {
+		disableSettingJwtHeader: true,
+		jwks: {
+			jwksPath: "/mcp/jwks",
+			keyPairConfig: { alg: "RS256" as const, modulusLength: 2048 },
+		},
+		adapter: {
+			getJwks: async (ctx: GenericEndpointContext) => {
+				const keys = await ctx.context.adapter.findMany<Jwk>({ model: "jwks" });
+				return keys.filter((key) => key.alg === "RS256");
+			},
+			createJwk: async (
+				data: Omit<Jwk, "id">,
+				ctx: GenericEndpointContext,
+			) =>
+				ctx.context.adapter.create<Omit<Jwk, "id">, Jwk>({
+					model: "jwks",
+					data,
+				}),
+		},
+	};
+	const signer = jwt(signerOptions);
 	const provider = oidcProvider({ ...opts, __skipDeprecationWarning: true });
 	return {
 		id: "mcp",
 		version: PACKAGE_VERSION,
+		init(ctx) {
+			provider.init?.(ctx);
+		},
+		async onRequest(request, ctx) {
+			return await provider.onRequest?.(request, ctx);
+		},
 		hooks: {
 			after: [
 				{
@@ -264,6 +314,77 @@ export const mcp = (options: MCPOptions) => {
 			],
 		},
 		endpoints: {
+			getMcpJwks: signer.endpoints.getJwks,
+			mcpUserInfo: createAuthEndpoint(
+				"/mcp/userinfo",
+				{ method: "GET", metadata: HIDE_METADATA },
+				async (ctx) => {
+					const authorization = ctx.request?.headers.get("authorization");
+					if (!authorization?.startsWith("Bearer ")) {
+						throw new APIError("UNAUTHORIZED", {
+							error: "invalid_request",
+							error_description: "authorization bearer token not found",
+						});
+					}
+					const accessToken = await findOAuthTokenBySecret(
+						ctx.context.adapter,
+						modelName.oauthAccessToken,
+						"access",
+						authorization.slice("Bearer ".length),
+					);
+					if (
+						!accessToken ||
+						accessToken.refreshStatus === "revoked" ||
+						accessToken.accessTokenExpiresAt <= new Date()
+					) {
+						throw new APIError("UNAUTHORIZED", {
+							error: "invalid_token",
+							error_description: "invalid access token",
+						});
+					}
+					const client = await getClient(
+						accessToken.clientId,
+						opts.trustedClients,
+					);
+					const user = await ctx.context.internalAdapter.findUserById(
+						accessToken.userId,
+					);
+					if (
+						!client ||
+						client.disabled === true ||
+						!user ||
+						(user as Record<string, unknown>).banned === true
+					) {
+						throw new APIError("UNAUTHORIZED", {
+							error: "invalid_token",
+							error_description: "token authority no longer exists",
+						});
+					}
+					const scopes = accessToken.scopes.split(" ");
+					const canonicalClaims = {
+						sub: user.id,
+						name: scopes.includes("profile") ? user.name : undefined,
+						picture: scopes.includes("profile") ? user.image : undefined,
+						given_name: scopes.includes("profile")
+							? user.name.split(" ")[0]
+							: undefined,
+						family_name: scopes.includes("profile")
+							? user.name.split(" ")[1]
+							: undefined,
+						email: scopes.includes("email") ? user.email : undefined,
+						email_verified: scopes.includes("email")
+							? user.emailVerified
+							: undefined,
+					};
+					const extensionClaims = opts.getAdditionalUserInfoClaim
+						? filterAdditionalUserClaims(
+								await opts.getAdditionalUserInfoClaim(user, scopes, client),
+							)
+						: {};
+					setNoStoreTokenResponseHeaders(ctx);
+					return ctx.json({ ...canonicalClaims, ...extensionClaims });
+				},
+			),
 			oAuthConsent: provider.endpoints.oAuthConsent,
 			getMcpOAuthConfig: createAuthEndpoint(
 				"/.well-known/oauth-authorization-server",
@@ -422,42 +543,10 @@ export const mcp = (options: MCPOptions) => {
 								error: "invalid_request",
 							});
 						}
-						const token = await ctx.context.adapter.findOne<OAuthAccessToken>({
-							model: "oauthAccessToken",
-							where: [
-								{
-									field: "refreshToken",
-									value: refresh_token.toString(),
-								},
-							],
-						});
-						if (!token) {
-							throw new APIError("UNAUTHORIZED", {
-								error_description: "invalid refresh token",
-								error: "invalid_grant",
-							});
-						}
-						if (token.clientId !== client_id?.toString()) {
+						if (!client_id) {
 							throw new APIError("UNAUTHORIZED", {
 								error_description: "invalid client_id",
 								error: "invalid_client",
-							});
-						}
-						if (token.refreshTokenExpiresAt < new Date()) {
-							throw new APIError("UNAUTHORIZED", {
-								error_description: "refresh token expired",
-								error: "invalid_grant",
-							});
-						}
-						// A refresh token is only legitimate when the original grant
-						// included offline_access. Rejecting redemption otherwise makes a
-						// refresh token that was stored without offline_access (and may be
-						// exposed to its access-token holder) unusable for escalation.
-						if (!token.scopes?.split(" ").includes("offline_access")) {
-							throw new APIError("UNAUTHORIZED", {
-								error_description:
-									"refresh token was not issued for the offline_access scope",
-								error: "invalid_grant",
 							});
 						}
 						const refreshClient = await ctx.context.adapter
@@ -506,34 +595,79 @@ export const mcp = (options: MCPOptions) => {
 								});
 							}
 						}
-						const accessToken = generateRandomString(32, "a-z", "A-Z");
-						const newRefreshToken = generateRandomString(32, "a-z", "A-Z");
+						const token = await findOAuthTokenBySecret(
+							ctx.context.adapter,
+							modelName.oauthAccessToken,
+							"refresh",
+							refresh_token.toString(),
+						);
+						if (!token) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "invalid refresh token",
+								error: "invalid_grant",
+							});
+						}
+						if (token.clientId !== client_id.toString()) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "invalid client_id",
+								error: "invalid_client",
+							});
+						}
+						if (
+							!token.refreshTokenExpiresAt ||
+							token.refreshTokenExpiresAt < new Date()
+						) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "refresh token expired",
+								error: "invalid_grant",
+							});
+						}
+						if (!token.scopes?.split(" ").includes("offline_access")) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description:
+									"refresh token was not issued for the offline_access scope",
+								error: "invalid_grant",
+							});
+						}
 						const accessTokenExpiresAt = new Date(
 							Date.now() + opts.accessTokenExpiresIn * 1000,
 						);
-						const refreshTokenExpiresAt = new Date(
-							Date.now() + opts.refreshTokenExpiresIn * 1000,
-						);
-						await ctx.context.adapter.create({
-							model: modelName.oauthAccessToken,
-							data: {
-								accessToken,
-								refreshToken: newRefreshToken,
-								accessTokenExpiresAt,
-								refreshTokenExpiresAt,
+						const rawOperationKey =
+							ctx.request?.headers.get("idempotency-key") ?? undefined;
+						const idempotencyKey =
+							rawOperationKey === undefined
+								? undefined
+								: (parseCredentialOperationKey(rawOperationKey) ?? undefined);
+						if (rawOperationKey !== undefined && !idempotencyKey) {
+							throw new APIError("BAD_REQUEST", {
+								error: "invalid_request",
+								error_description: CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+							});
+						}
+						const rotation = await rotateOAuthRefreshToken(
+							ctx.context.adapter,
+							modelName.oauthAccessToken,
+							{
+								presentedRefreshToken: refresh_token.toString(),
 								clientId: client_id.toString(),
-								userId: token.userId,
-								scopes: token.scopes,
-								createdAt: new Date(),
-								updatedAt: new Date(),
+								accessTokenExpiresAt,
+								secretConfig: ctx.context.secretConfig,
+								idempotencyKey,
 							},
-						});
+						);
+						if (rotation.kind !== "rotated") {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "invalid refresh token",
+								error: "invalid_grant",
+							});
+						}
+						setNoStoreTokenResponseHeaders(ctx);
 						return ctx.json({
-							access_token: accessToken,
-							token_type: "bearer",
+							access_token: rotation.successor.accessToken,
+							token_type: "Bearer",
 							expires_in: opts.accessTokenExpiresIn,
-							refresh_token: newRefreshToken,
-							scope: token.scopes,
+							refresh_token: rotation.successor.refreshToken,
+							scope: rotation.token.scopes,
 						});
 					}
 
@@ -551,16 +685,8 @@ export const mcp = (options: MCPOptions) => {
 						});
 					}
 
-					// Atomic single-use redemption per RFC 6749 §4.1.2. The first
-					// caller receives the row; concurrent racers receive `null`
-					// and fall through to the `invalid_grant` error path.
-					//
-					// TODO(legacy-hardening-coordinate): follow-up hardening touches
-					// this same surface. Whoever lands second must rebase to keep
-					// the atomic consume + `invalid_grant` semantics in place; do
-					// not regress to a `findVerificationValue` + delete pair.
 					const verificationValue =
-						await ctx.context.internalAdapter.consumeVerificationValue(
+						await ctx.context.internalAdapter.findVerificationValue(
 							code.toString(),
 						);
 					if (!verificationValue) {
@@ -693,48 +819,26 @@ export const mcp = (options: MCPOptions) => {
 					}
 
 					const requestedScopes = value.scope;
-					const accessToken = generateRandomString(32, "a-z", "A-Z");
-					const refreshToken = generateRandomString(32, "A-Z", "a-z");
+					const accessToken = generateRandomString(48, "a-z", "A-Z", "0-9");
+					const issueRefreshToken = requestedScopes.includes("offline_access");
+					const refreshToken = issueRefreshToken
+						? generateRandomString(48, "A-Z", "a-z", "0-9")
+						: undefined;
 					const accessTokenExpiresAt = new Date(
 						Date.now() + opts.accessTokenExpiresIn * 1000,
 					);
 					const refreshTokenExpiresAt = new Date(
 						Date.now() + opts.refreshTokenExpiresIn * 1000,
 					);
-					await ctx.context.adapter.create({
-						model: modelName.oauthAccessToken,
-						data: {
-							accessToken,
-							refreshToken,
-							accessTokenExpiresAt,
-							refreshTokenExpiresAt,
-							clientId: client_id.toString(),
-							userId: value.userId,
-							scopes: requestedScopes.join(" "),
-							createdAt: new Date(),
-							updatedAt: new Date(),
-						},
-					});
 					const user = await ctx.context.internalAdapter.findUserById(
 						value.userId,
 					);
-					if (!user) {
+					if (!user || (user as Record<string, unknown>).banned === true) {
 						throw new APIError("UNAUTHORIZED", {
-							error_description: "user not found",
+							error_description: "user is unavailable",
 							error: "invalid_grant",
 						});
 					}
-					const secretKey = {
-						alg: "HS256",
-						key: await getWebcryptoSubtle().generateKey(
-							{
-								name: "HMAC",
-								hash: "SHA-256",
-							},
-							true,
-							["sign", "verify"],
-						),
-					};
 					const profile = {
 						given_name: user.name.split(" ")[0]!,
 						family_name: user.name.split(" ")[1]!,
@@ -758,45 +862,95 @@ export const mcp = (options: MCPOptions) => {
 								client,
 							)
 						: {};
-
-					const idToken = await new SignJWT({
-						sub: user.id,
-						aud: client_id.toString(),
-						iat: Date.now(),
-						auth_time: ctx.context.session
-							? new Date(ctx.context.session.session.createdAt).getTime()
-							: undefined,
-						nonce: value.nonce,
-						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
-						...userClaims,
-						...additionalUserClaims,
-					})
-						.setProtectedHeader({ alg: secretKey.alg })
-						.setIssuedAt()
-						.setExpirationTime(
-							Math.floor(Date.now() / 1000) + opts.accessTokenExpiresIn,
-						)
-						.sign(secretKey.key);
-					return ctx.json(
-						{
-							access_token: accessToken,
-							token_type: "Bearer",
-							expires_in: opts.accessTokenExpiresIn,
-							refresh_token: requestedScopes.includes("offline_access")
-								? refreshToken
-								: undefined,
-							scope: requestedScopes.join(" "),
-							id_token: requestedScopes.includes("openid")
-								? idToken
-								: undefined,
-						},
-						{
-							headers: {
-								"Cache-Control": "no-store",
-								Pragma: "no-cache",
+					const extensionClaims = filterAdditionalUserClaims(
+						additionalUserClaims,
+					);
+					const issuedAt = Math.floor(Date.now() / 1000);
+					const issuer = getMCPProviderMetadata(ctx, opts).issuer;
+					const idToken = await signJWT(ctx, {
+						options: {
+							...signerOptions,
+							jwt: {
+								issuer,
+								audience: client_id.toString(),
+								expirationTime: Math.floor(
+									accessTokenExpiresAt.getTime() / 1000,
+								),
 							},
 						},
+						maxExpiresAt: accessTokenExpiresAt,
+						payload: {
+							...userClaims,
+							...extensionClaims,
+						sub: user.id,
+						aud: client_id.toString(),
+							iss: issuer,
+							iat: issuedAt,
+							auth_time: Math.floor(value.authTime / 1000),
+						nonce: value.nonce,
+						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
+						},
+					});
+					const issued = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							const consumed =
+								await ctx.context.internalAdapter.consumeVerificationValue(
+									code.toString(),
+								);
+							if (
+								!consumed ||
+								!constantTimeEqual(consumed.value, verificationValue.value)
+							) {
+								return false;
+								}
+								const adapter = await getCurrentAdapter(ctx.context.adapter);
+								const authority = readInternalCredentialAuthority(
+									ctx.context.options,
+								);
+								if (authority) {
+									attachInternalCredentialAuthority(adapter, authority);
+								}
+								const activeUser = await lockAndReadActiveUser(
+								adapter,
+								value.userId,
+							);
+							if (!activeUser) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "user is unavailable",
+									error: "invalid_grant",
+								});
+							}
+							await createOAuthTokenPair(adapter, modelName.oauthAccessToken, {
+								clientId: client_id.toString(),
+								userId: value.userId,
+								scopes: requestedScopes.join(" "),
+								accessTokenExpiresAt,
+								refreshTokenExpiresAt: issueRefreshToken
+									? refreshTokenExpiresAt
+									: null,
+								issueRefreshToken,
+								accessToken,
+								refreshToken,
+							});
+							return true;
+						},
 					);
+					if (!issued) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "invalid code",
+							error: "invalid_grant",
+						});
+					}
+					setNoStoreTokenResponseHeaders(ctx);
+					return ctx.json({
+						access_token: accessToken,
+						token_type: "Bearer",
+						expires_in: opts.accessTokenExpiresIn,
+						refresh_token: refreshToken,
+						scope: requestedScopes.join(" "),
+						id_token: requestedScopes.includes("openid") ? idToken : undefined,
+					});
 				},
 			),
 			registerMcpClient: createAuthEndpoint(
@@ -1019,39 +1173,66 @@ export const mcp = (options: MCPOptions) => {
 					requireHeaders: true,
 				},
 				async (c) => {
+					setNoStoreTokenResponseHeaders(c);
+					const invalidToken = () => {
+						throw new APIError(
+							"UNAUTHORIZED",
+							{ message: "invalid_token", code: "invalid_token" },
+							{ "WWW-Authenticate": 'Bearer error="invalid_token"' },
+						);
+					};
 					const accessToken = c.headers
 						?.get("Authorization")
 						?.replace("Bearer ", "");
 					if (!accessToken) {
-						c.headers?.set("WWW-Authenticate", "Bearer");
-						return c.json(null);
+						return invalidToken();
 					}
-					const accessTokenData =
-						await c.context.adapter.findOne<OAuthAccessToken>({
-							model: modelName.oauthAccessToken,
-							where: [
-								{
-									field: "accessToken",
-									value: accessToken,
-								},
-							],
-						});
+					const accessTokenData = await findOAuthTokenBySecret(
+						c.context.adapter,
+						modelName.oauthAccessToken,
+						"access",
+						accessToken,
+					);
 					if (!accessTokenData) {
-						return c.json(null);
+						return invalidToken();
 					}
 					// An access token authorizes a protected resource only while it is
 					// unexpired. Without this gate an expired bearer token keeps
 					// authorizing handlers until its row is deleted (RFC 6750 §3.1
 					// treats an expired token as `invalid_token`).
 					if (accessTokenData.accessTokenExpiresAt < new Date()) {
-						c.headers?.set("WWW-Authenticate", "Bearer");
-						return c.json(null);
+						return invalidToken();
 					}
-					return c.json(accessTokenData);
+					if (accessTokenData.refreshStatus === "revoked") {
+						return invalidToken();
+					}
+					const tokenClient = await getClient(
+						accessTokenData.clientId,
+						opts.trustedClients,
+					);
+					if (!tokenClient || tokenClient.disabled === true) {
+						return invalidToken();
+					}
+					const tokenUser = await c.context.internalAdapter.findUserById(
+						accessTokenData.userId,
+					);
+					if (
+						!tokenUser ||
+						(tokenUser as Record<string, unknown>).banned === true
+					) {
+						return invalidToken();
+					}
+					return c.json({
+						id: accessTokenData.id,
+						clientId: accessTokenData.clientId,
+						userId: accessTokenData.userId,
+						scopes: accessTokenData.scopes,
+						accessTokenExpiresAt: accessTokenData.accessTokenExpiresAt,
+					} satisfies MCPSession);
 				},
 			),
 		},
-		schema,
+		schema: { ...schema, ...signer.schema },
 		options,
 	} satisfies ClearancePlugin;
 };
@@ -1059,7 +1240,7 @@ export const mcp = (options: MCPOptions) => {
 export const withMcpAuth = <
 	Auth extends {
 		api: {
-			getMcpSession: (...args: any) => Promise<OAuthAccessToken | null>;
+			getMcpSession: (...args: any) => Promise<MCPSession | null>;
 		};
 		options: ClearanceOptions;
 	},
@@ -1067,7 +1248,7 @@ export const withMcpAuth = <
 	auth: Auth,
 	handler: (
 		req: Request,
-		session: OAuthAccessToken,
+		session: MCPSession,
 	) => Response | Promise<Response>,
 ) => {
 	return async (req: Request) => {
@@ -1090,11 +1271,17 @@ export const withMcpAuth = <
 		if (!baseURL && !isProduction) {
 			logger.warn("Unable to get the baseURL, please check your config!");
 		}
-		const session = await auth.api.getMcpSession({
-			request: req,
-			headers: req.headers,
-			asResponse: false,
-		});
+		let session: MCPSession | null;
+		try {
+			session = await auth.api.getMcpSession({
+				request: req,
+				headers: req.headers,
+				asResponse: false,
+			});
+		} catch (error) {
+			if (!isAPIError(error) || error.statusCode !== 401) throw error;
+			session = null;
+		}
 		// Omit the `resource_metadata` URL when we can't build a valid one,
 		// so clients don't follow `Bearer resource_metadata="undefined/..."`.
 		const wwwAuthenticateValue = baseURL

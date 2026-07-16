@@ -12,6 +12,39 @@ import type {
 	User,
 } from "../types";
 import { getMigrations } from "./get-migration";
+import { getSecondarySessionEpoch } from "./session-credential-migration";
+
+type SecondarySessionIndexEntry = {
+	sessionId: string;
+	credentialKey: string;
+	expiresAt: number;
+};
+
+const secondaryIndexKey = (namespace: string, userId: string) =>
+	`clearance:${namespace}:active-sessions:${userId}`;
+
+function getSecondaryIndex(
+	store: Map<string, string>,
+	userId: string,
+): SecondarySessionIndexEntry[] {
+	return safeJSONParse<SecondarySessionIndexEntry[]>(
+		Array.from(store.entries()).find(([key]) =>
+			key.endsWith(`:active-sessions:${userId}`),
+		)?.[1],
+	) ?? [];
+}
+
+function getSecondaryCredentialKey(
+	store: Map<string, string>,
+	userId: string,
+	sessionId: string,
+): string {
+	const key = getSecondaryIndex(store, userId).find(
+		(entry) => entry.sessionId === sessionId,
+	)?.credentialKey;
+	if (!key) throw new Error(`Missing secondary credential for ${sessionId}`);
+	return key;
+}
 
 describe("internal adapter test", async () => {
 	const map = new Map();
@@ -27,6 +60,7 @@ describe("internal adapter test", async () => {
 	const pluginHookUserCreateAfter = vi.fn();
 	const opts = {
 		database: new DatabaseSync(":memory:"),
+		secret: "internal-adapter-suite-secret-for-migration-binding",
 		user: {
 			fields: {
 				email: "email_address",
@@ -37,6 +71,11 @@ describe("internal adapter test", async () => {
 			storeInDatabase: true,
 		},
 		secondaryStorage: {
+			namespace: "internal-adapter-suite",
+			runExclusive<T>(_name: string, operation: () => T): T {
+				return operation();
+			},
+			assertNoLegacySessionWriters() {},
 			set(key, value, ttl) {
 				map.set(key, value);
 				expirationMap.set(key, ttl);
@@ -130,7 +169,7 @@ describe("internal adapter test", async () => {
 		],
 	} satisfies ClearanceOptions;
 	beforeAll(async () => {
-		(await getMigrations(opts)).runMigrations();
+		await (await getMigrations(opts)).runMigrations();
 	});
 	afterEach(async () => {
 		vi.clearAllMocks();
@@ -293,7 +332,7 @@ describe("internal adapter test", async () => {
 				},
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(hashedOpts)).runMigrations();
+			await (await getMigrations(hashedOpts)).runMigrations();
 			const hashedCtx = await init(hashedOpts);
 			const hashedAdapter = hashedCtx.internalAdapter;
 
@@ -336,7 +375,7 @@ describe("internal adapter test", async () => {
 				},
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(overrideOpts)).runMigrations();
+			await (await getMigrations(overrideOpts)).runMigrations();
 			const overrideCtx = await init(overrideOpts);
 			const overrideAdapter = overrideCtx.internalAdapter;
 
@@ -368,7 +407,7 @@ describe("internal adapter test", async () => {
 				verification: { storeIdentifier: "plain" as const },
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(plainOpts)).runMigrations();
+			await (await getMigrations(plainOpts)).runMigrations();
 			const plainCtx = await init(plainOpts);
 			await plainCtx.internalAdapter.createVerificationValue({
 				identifier: "old-token:abc123",
@@ -462,6 +501,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number | undefined) {
 					if (ttl !== undefined) {
 						capturedTTLs.push(ttl);
@@ -481,7 +523,7 @@ describe("internal adapter test", async () => {
 		} satisfies ClearanceOptions;
 
 		// Run migrations for the new database
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		// Test the actual refreshUserSessions functionality from internal adapter
 		const testCtx = await init(testOpts);
@@ -515,17 +557,22 @@ describe("internal adapter test", async () => {
 		};
 
 		// Set up active sessions and session data for refresh test
+		const credentialKey = "session-credential:test-token-digest";
 		const activeSessions = [
-			{ token: session.token, expiresAt: expiresAt.getTime() },
+			{
+				sessionId: "test-session",
+				credentialKey,
+				expiresAt: expiresAt.getTime(),
+			},
 		];
 
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify(activeSessions),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			session.token,
+			credentialKey,
 			JSON.stringify({ session, user: testUser }),
 		);
 
@@ -533,6 +580,11 @@ describe("internal adapter test", async () => {
 		await ctx.context.internalAdapter.updateUser(testUser.id, {
 			name: "Updated Name",
 		});
+		expect(
+			safeJSONParse<{ session: Session }>(
+				mockStorage.get(credentialKey)?.value,
+			)?.session.token,
+		).toBeNull();
 
 		// The TTL should be properly rounded down
 		const lastTTL = capturedTTLs[capturedTTLs.length - 1];
@@ -547,18 +599,20 @@ describe("internal adapter test", async () => {
 			expiresAt: new Date(Date.now() + 500), // 0.5 seconds from now
 		};
 
+		const almostExpiredKey = "session-credential:almost-expired-digest";
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify([
 				{
-					token: almostExpiredSession.token,
+					sessionId: "almost-expired-session",
+					credentialKey: almostExpiredKey,
 					expiresAt: almostExpiredSession.expiresAt.getTime(),
 				},
 			]),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			almostExpiredSession.token,
+			almostExpiredKey,
 			JSON.stringify({ session: almostExpiredSession, user: testUser }),
 		);
 
@@ -577,18 +631,20 @@ describe("internal adapter test", async () => {
 			expiresAt: new Date(Date.now() + 7199999), // ~2 hours from now (7199.999 seconds)
 		};
 
+		const longCredentialKey = "session-credential:long-token-digest";
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify([
 				{
-					token: longSession.token,
+					sessionId: "long-session",
+					credentialKey: longCredentialKey,
 					expiresAt: longSession.expiresAt.getTime(),
 				},
 			]),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			longSession.token,
+			longCredentialKey,
 			JSON.stringify({ session: longSession, user: testUser }),
 		);
 
@@ -617,18 +673,20 @@ describe("internal adapter test", async () => {
 		expect(typeof session.id).toBe("string");
 		expect(session.id.length).toBeGreaterThan(0);
 
-		const storedSessions: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${user.id}`),
+		const storedSessions: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", user.id)),
 		);
-		const token = session.token;
+		const credentialKey = storedSessions[0]!.credentialKey;
 		// Check stored sessions
 		expect(storedSessions.length).toBe(1);
-		expect(storedSessions.at(0)?.token).toBe(session.token);
+		expect(storedSessions.at(0)?.sessionId).toBe(session.id);
 		// Check expiration time set is the last expiration set
 		const lastExpiration = storedSessions.reduce((prev, curr) =>
 			prev.expiresAt >= curr.expiresAt ? prev : curr,
 		);
-		const actualExp = expirationMap.get(`active-sessions-${user.id}`);
+		const actualExp = expirationMap.get(
+			secondaryIndexKey("internal-adapter-suite", user.id),
+		);
 		const expectedExp = Math.floor(
 			(lastExpiration.expiresAt - Date.now()) / 1000,
 		);
@@ -639,13 +697,14 @@ describe("internal adapter test", async () => {
 		const storedSession = safeJSONParse<{
 			session: Session;
 			user: User;
-		}>(map.get(token));
+		}>(map.get(credentialKey));
 		expect(storedSession?.user).toMatchObject(user);
 		expect(storedSession?.session).toMatchObject({
 			...session,
+			token: null,
 			activeOrganizationId: "1",
 		});
-		const actualTokenExp = expirationMap.get(token);
+		const actualTokenExp = expirationMap.get(credentialKey);
 		const expectedTokenExp = Math.floor(
 			(expiresAt.getTime() - Date.now()) / 1000,
 		);
@@ -659,10 +718,11 @@ describe("internal adapter test", async () => {
 		const now = Date.now();
 		const userId = "test-user";
 		// 10 consecutive days (5 in past, 1 now, 4 in future)
+		const issuedSessions: Session[] = [];
 		for (let i = -5; i < 5; i++) {
 			const expiresIn = i * 60 * 60 * 24 * 1000;
 			const expiresAt = new Date(now + expiresIn);
-			await internalAdapter.createSession(
+			const issued = await internalAdapter.createSession(
 				userId,
 				undefined,
 				{
@@ -670,38 +730,48 @@ describe("internal adapter test", async () => {
 				},
 				true,
 			);
+			issuedSessions.push(issued);
 			if (i > 0) {
-				const actualExp = expirationMap.get(`active-sessions-${userId}`);
+				const actualExp = expirationMap.get(
+					secondaryIndexKey("internal-adapter-suite", userId),
+				);
 				const expectedExp = Math.floor(
 					(expiresAt.getTime() - Date.now()) / 1000,
 				);
 				expect(actualExp - expectedExp).toBeLessThanOrEqual(1); // max 1s clock drift between check and set
 				expect(actualExp - expectedExp).toBeGreaterThanOrEqual(0); // max 1s clock drift between check and set
 			} else {
-				expect(expirationMap.get(`active-sessions-${userId}`)).toBeUndefined();
+				expect(
+					expirationMap.get(
+						secondaryIndexKey("internal-adapter-suite", userId),
+					),
+				).toBeUndefined();
 			}
 		}
-		const storedSessions: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${userId}`),
+		const storedSessions: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", userId)),
 		);
 		expect(storedSessions.length).toBe(4);
-		const token = storedSessions.at(-1)?.token;
-		const tokenStored = map.get(token);
+		const target = issuedSessions.at(-1)!;
+		const credentialKey = storedSessions.at(-1)?.credentialKey;
+		const tokenStored = map.get(credentialKey);
 		expect(tokenStored).toBeDefined();
 
 		// Delete session should clean expiresAt and token
-		await internalAdapter.deleteSession(token!);
-		const afterDeleted: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${userId}`),
+		await internalAdapter.deleteSession(target.token);
+		const afterDeleted: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", userId)),
 		);
 		expect(afterDeleted.length).toBe(3);
-		const removedToken = map.get(token);
+		const removedToken = map.get(credentialKey);
 		expect(removedToken).toBeUndefined();
 		// Check expiration time set is the last expiration set
 		const lastExpiration = afterDeleted.reduce((prev, curr) =>
 			prev.expiresAt >= curr.expiresAt ? prev : curr,
 		);
-		const actualExp = expirationMap.get(`active-sessions-${userId}`);
+		const actualExp = expirationMap.get(
+			secondaryIndexKey("internal-adapter-suite", userId),
+		);
 		const expectedExp = Math.floor(
 			(lastExpiration.expiresAt - Date.now()) / 1000,
 		);
@@ -769,6 +839,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -781,7 +854,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -801,13 +874,13 @@ describe("internal adapter test", async () => {
 		expect(sessions.length).toBe(3);
 
 		// Delete session2 from storage (simulating missing/expired session)
-		testMap.delete(session2.token);
+		testMap.delete(getSecondaryCredentialKey(testMap, user.id, session2.id));
 
 		// listSessions should still return session1 and session3
 		sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -817,6 +890,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -829,7 +905,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -845,13 +921,16 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Set session2 to valid JSON but malformed structure (session is null, will throw on property access)
-		testMap.set(session2.token, JSON.stringify({ session: null, user: null }));
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			JSON.stringify({ session: null, user: null }),
+		);
 
 		// listSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -861,6 +940,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -873,7 +955,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -889,13 +971,16 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt session2 data
-		testMap.set(session2.token, "invalid-json{{{");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"invalid-json{{{",
+		);
 
 		// listSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -904,6 +989,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -916,7 +1004,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -931,8 +1019,14 @@ describe("internal adapter test", async () => {
 		const session2 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt both sessions
-		testMap.set(session1.token, "invalid-json");
-		testMap.set(session2.token, "also-invalid");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session1.id),
+			"invalid-json",
+		);
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"also-invalid",
+		);
 
 		// listSessions should return empty array
 		const sessions = await testInternalAdapter.listSessions(user.id);
@@ -945,6 +1039,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -957,7 +1054,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -973,7 +1070,10 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt session2 data
-		testMap.set(session2.token, "invalid-json{{{");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"invalid-json{{{",
+		);
 
 		// findSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.findSessions([
@@ -982,8 +1082,8 @@ describe("internal adapter test", async () => {
 			session3.token,
 		]);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.session.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.session.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -994,6 +1094,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 					if (ttl !== undefined) {
@@ -1011,7 +1114,7 @@ describe("internal adapter test", async () => {
 		} satisfies ClearanceOptions;
 
 		// Run migrations for the new database
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -1026,7 +1129,12 @@ describe("internal adapter test", async () => {
 		const session = await testInternalAdapter.createSession(user.id);
 
 		// Verify session is in secondary storage
-		const storedSessionStr = testMap.get(session.token);
+		const credentialKey = getSecondaryCredentialKey(
+			testMap,
+			user.id,
+			session.id,
+		);
+		const storedSessionStr = testMap.get(credentialKey);
 		expect(storedSessionStr).toBeDefined();
 
 		const storedSession = safeJSONParse<{
@@ -1037,9 +1145,11 @@ describe("internal adapter test", async () => {
 		expect(storedSession?.session.ipAddress).toBe("");
 
 		// Get initial active-sessions list
-		const initialListStr = testMap.get(`active-sessions-${user.id}`);
+		const initialListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		expect(initialListStr).toBeDefined();
-		const initialList = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const initialList = safeJSONParse<SecondarySessionIndexEntry[]>(
 			initialListStr!,
 		);
 		expect(initialList).toBeDefined();
@@ -1052,10 +1162,13 @@ describe("internal adapter test", async () => {
 		await testInternalAdapter.updateSession(session.token, {
 			ipAddress: updatedIpAddress,
 			expiresAt: newExpiresAt,
+			token: session.token,
+			id: "caller-controlled-session-id",
+			userId: "caller-controlled-user-id",
 		});
 
 		// Get the session from secondary storage again
-		const updatedStoredSessionStr = testMap.get(session.token);
+		const updatedStoredSessionStr = testMap.get(credentialKey);
 		expect(updatedStoredSessionStr).toBeDefined();
 
 		const updatedStoredSession = safeJSONParse<{
@@ -1065,25 +1178,33 @@ describe("internal adapter test", async () => {
 
 		// The session in secondary storage MUST have the updated data
 		expect(updatedStoredSession?.session.ipAddress).toBe(updatedIpAddress);
+		expect(updatedStoredSession?.session.token).toBeNull();
+		expect(updatedStoredSession?.session.id).toBe(session.id);
+		expect(updatedStoredSession?.session.userId).toBe(user.id);
 
 		// User should still be intact
 		expect(updatedStoredSession?.user.id).toBe(user.id);
 
 		// Get updated active-sessions list
-		const updatedListStr = testMap.get(`active-sessions-${user.id}`);
+		const updatedListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		expect(updatedListStr).toBeDefined();
-		const updatedList = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const updatedList = safeJSONParse<SecondarySessionIndexEntry[]>(
 			updatedListStr!,
 		);
 		expect(updatedList).toBeDefined();
 
 		// The expiresAt in active-sessions list should be updated
 		expect(updatedList!.length).toBe(1);
-		expect(updatedList![0]!.token).toBe(session.token);
+		expect(updatedList![0]!.sessionId).toBe(session.id);
+		expect(updatedList![0]!.credentialKey).toBe(credentialKey);
 		expect(updatedList![0]!.expiresAt).toBe(newExpiresAt.getTime());
 
 		// TTL should also be updated
-		const updatedTTL = testExpirationMap.get(`active-sessions-${user.id}`);
+		const updatedTTL = testExpirationMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		const expectedTTL = Math.floor(
 			(newExpiresAt.getTime() - Date.now()) / 1000,
 		);
@@ -1099,6 +1220,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 					if (ttl !== undefined) {
@@ -1115,7 +1239,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 		const testAuthContext = await init(testOpts);
 		const testInternalAdapter = testAuthContext.internalAdapter;
 
@@ -1128,23 +1252,25 @@ describe("internal adapter test", async () => {
 		// Create a session
 		const session = await testInternalAdapter.createSession(user.id);
 
-		// Manually corrupt the active-sessions list by adding duplicate tokens
-		const listStr = testMap.get(`active-sessions-${user.id}`);
-		const list = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		// Manually corrupt the active-sessions list by duplicating its safe index.
+		const listStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
+		const list = safeJSONParse<SecondarySessionIndexEntry[]>(
 			listStr!,
 		);
 
-		// Add duplicates of the same token
-		const corruptedList = [
-			...list!,
-			{ token: session.token, expiresAt: session.expiresAt.getTime() },
-			{ token: session.token, expiresAt: session.expiresAt.getTime() },
-		];
-		testMap.set(`active-sessions-${user.id}`, JSON.stringify(corruptedList));
+		const corruptedList = [...list!, list![0]!, list![0]!];
+		testMap.set(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+			JSON.stringify(corruptedList),
+		);
 
 		// Verify corruption
-		const corruptedListStr = testMap.get(`active-sessions-${user.id}`);
-		const parsed = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const corruptedListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
+		const parsed = safeJSONParse<SecondarySessionIndexEntry[]>(
 			corruptedListStr!,
 		);
 		expect(parsed!.length).toBe(3); // 1 original + 2 duplicates
@@ -1158,10 +1284,42 @@ describe("internal adapter test", async () => {
 		function createMockStorage() {
 			const dataMap = new Map<string, string>();
 			const ttlMap = new Map<string, number>();
+			const legacyDeletesPerLease: number[] = [];
+			let exclusiveCalls = 0;
+			let afterExclusive:
+				| ((call: number) => void | Promise<void>)
+				| undefined;
 			return {
 				dataMap,
 				ttlMap,
+				legacyDeletesPerLease,
+				get exclusiveCalls() {
+					return exclusiveCalls;
+				},
+				setAfterExclusive(
+					hook: ((call: number) => void | Promise<void>) | undefined,
+				) {
+					afterExclusive = hook;
+				},
 				storage: {
+					namespace: "internal-adapter-tests",
+					async runExclusive<T>(
+						_name: string,
+						operation: () => T | Promise<T>,
+					): Promise<T> {
+						exclusiveCalls += 1;
+						const legacyBefore = [...dataMap.keys()].filter((key) =>
+							key.startsWith("active-sessions-"),
+						).length;
+						const result = await operation();
+						const legacyAfter = [...dataMap.keys()].filter((key) =>
+							key.startsWith("active-sessions-"),
+						).length;
+						legacyDeletesPerLease.push(legacyBefore - legacyAfter);
+						await afterExclusive?.(exclusiveCalls);
+						return result;
+					},
+					assertNoLegacySessionWriters() {},
 					set(key: string, value: string, ttl?: number) {
 						dataMap.set(key, value);
 						if (ttl) ttlMap.set(key, ttl);
@@ -1177,6 +1335,210 @@ describe("internal adapter test", async () => {
 			};
 		}
 
+		it("migrates indexed legacy raw sessions into the digest namespace", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Legacy secondary user",
+				email: "legacy-secondary@example.com",
+			});
+			const rawToken = "legacy-secondary-session-bearer-with-entropy";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const now = new Date();
+			const session = {
+				id: "legacy-secondary-session",
+				userId: user.id,
+				token: rawToken,
+				expiresAt,
+				createdAt: now,
+				updatedAt: now,
+			};
+			dataMap.set(rawToken, JSON.stringify({ session, user }));
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([{ token: rawToken, expiresAt: expiresAt.getTime() }]),
+			);
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			expect(dataMap.has(rawToken)).toBe(false);
+			const index = getSecondaryIndex(dataMap, user.id);
+			expect(index).toHaveLength(1);
+			expect(index[0]).toMatchObject({ sessionId: session.id });
+			expect(index[0]!.credentialKey).toMatch(
+				/^clearance:internal-adapter-tests:session-credential:v1:/,
+			);
+			expect(dataMap.get(index[0]!.credentialKey)).not.toContain(rawToken);
+			const epoch = await getSecondarySessionEpoch(secondaryOnlyOpts);
+			expect(dataMap.get(epoch.key)).toBe(JSON.stringify(epoch.value));
+			expect(await ctx.internalAdapter.findSession(rawToken)).toMatchObject({
+				session: { id: session.id, token: rawToken },
+				user: { id: user.id },
+			});
+		});
+
+		it("merges coexisting legacy and namespaced session indexes", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Coexisting secondary user",
+				email: "coexisting-secondary@example.com",
+			});
+			const current = await ctx.internalAdapter.createSession(user.id);
+			const rawToken = "coexisting-legacy-session-bearer-with-entropy";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const now = new Date();
+			const legacy = {
+				id: "coexisting-legacy-session",
+				userId: user.id,
+				token: rawToken,
+				expiresAt,
+				createdAt: now,
+				updatedAt: now,
+			};
+			dataMap.set(rawToken, JSON.stringify({ session: legacy, user }));
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([{ token: rawToken, expiresAt: expiresAt.getTime() }]),
+			);
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			const index = getSecondaryIndex(dataMap, user.id);
+			expect(index.map((entry) => entry.sessionId).sort()).toEqual(
+				[current.id, legacy.id].sort(),
+			);
+			expect(new Set(index.map((entry) => entry.sessionId))).toHaveLength(2);
+			expect(dataMap.has(rawToken)).toBe(false);
+			expect(dataMap.has(`active-sessions-${user.id}`)).toBe(false);
+		});
+
+		it("resumes durable one-user lease units after interruption", async () => {
+			const mock = createMockStorage();
+			const { dataMap, storage } = mock;
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			for (let index = 0; index < 3; index += 1) {
+				const user = await ctx.internalAdapter.createUser({
+					name: `Restartable secondary user ${index}`,
+					email: `restartable-secondary-${index}@example.com`,
+				});
+				const token = `restartable-secondary-bearer-${index}-with-entropy`;
+				const expiresAt = new Date(Date.now() + 60_000);
+				const now = new Date();
+				const session = {
+					id: `restartable-secondary-session-${index}`,
+					userId: user.id,
+					token,
+					expiresAt,
+					createdAt: now,
+					updatedAt: now,
+				};
+				dataMap.set(token, JSON.stringify({ session, user }));
+				dataMap.set(
+					`active-sessions-${user.id}`,
+					JSON.stringify([{ token, expiresAt: expiresAt.getTime() }]),
+				);
+			}
+			const callsBeforeRestart = mock.exclusiveCalls;
+			mock.setAfterExclusive((call) => {
+				if (call === callsBeforeRestart + 1) {
+					throw new Error("simulated migration interruption");
+				}
+			});
+
+			await expect(
+				(await getMigrations(secondaryOnlyOpts)).runMigrations(),
+			).rejects.toThrow("simulated migration interruption");
+			const progressKey =
+				"clearance:internal-adapter-tests:session-credential-migration-progress";
+			expect(dataMap.has(progressKey)).toBe(true);
+			expect(
+				[...dataMap.keys()].filter((key) =>
+					key.startsWith("active-sessions-"),
+				),
+			).toHaveLength(2);
+
+			mock.setAfterExclusive(undefined);
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			expect(dataMap.has(progressKey)).toBe(false);
+			expect(
+				[...dataMap.keys()].filter((key) =>
+					key.startsWith("active-sessions-"),
+				),
+			).toHaveLength(0);
+			expect(
+				mock.legacyDeletesPerLease.every((deleted) => deleted <= 1),
+			).toBe(true);
+			expect(mock.legacyDeletesPerLease.filter((deleted) => deleted === 1)).toHaveLength(
+				3,
+			);
+		});
+
+		it("refuses oversized legacy user indexes before migration", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Oversized secondary user",
+				email: "oversized-secondary@example.com",
+			});
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([
+					{
+						token: "x".repeat(70 * 1024),
+						expiresAt: Date.now() + 60_000,
+					},
+				]),
+			);
+
+			await expect(
+				(await getMigrations(secondaryOnlyOpts)).runMigrations(),
+			).rejects.toThrow(/exceeds the 65536-byte migration bound/);
+		});
+
+		it("refuses to publish a secondary epoch without durable legacy-writer drain proof", async () => {
+			const { storage } = createMockStorage();
+			const {
+				assertNoLegacySessionWriters: _unsupported,
+				...unsafeStorage
+			} = storage;
+			const unsafeOptions = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: unsafeStorage,
+			} satisfies ClearanceOptions;
+
+			await expect(
+				(await getMigrations(unsafeOptions)).runMigrations(),
+			).rejects.toThrow(
+				"requires runExclusive and assertNoLegacySessionWriters provider guarantees",
+			);
+		});
+
 		it("should store verification in secondary storage by default", async () => {
 			const { dataMap, ttlMap, storage } = createMockStorage();
 
@@ -1185,7 +1547,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			const verification = await ctx.internalAdapter.createVerificationValue({
@@ -1206,7 +1568,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1230,7 +1592,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1256,7 +1618,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1283,7 +1645,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(dualStorageOpts)).runMigrations();
+			await (await getMigrations(dualStorageOpts)).runMigrations();
 			const ctx = await init(dualStorageOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1312,7 +1674,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(dualStorageOpts)).runMigrations();
+			await (await getMigrations(dualStorageOpts)).runMigrations();
 			const ctx = await init(dualStorageOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1337,7 +1699,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			const expiresIn = 300000; // 5 minutes in ms
@@ -1369,6 +1731,11 @@ describe("internal adapter test", async () => {
 				dataMap,
 				ttlMap,
 				storage: {
+					namespace: "internal-adapter-preparsed-storage",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
 					set(key: string, value: string, ttl?: number) {
 						// Store as pre-parsed object (simulating Redis auto-parse)
 						dataMap.set(key, JSON.parse(value));
@@ -1393,7 +1760,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(opts)).runMigrations();
+			await (await getMigrations(opts)).runMigrations();
 			const ctx = await init(opts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1506,7 +1873,7 @@ describe("internal adapter test", async () => {
 				database: new DatabaseSync(":memory:"),
 				...overrides,
 			} satisfies ClearanceOptions;
-			(await getMigrations(opts)).runMigrations();
+			await (await getMigrations(opts)).runMigrations();
 			const ctx = await init(opts);
 			return ctx.internalAdapter;
 		}
@@ -1670,6 +2037,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1706,6 +2076,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1747,6 +2120,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1778,6 +2154,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1813,6 +2192,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1853,6 +2235,9 @@ describe("internal adapter test", async () => {
 				},
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1887,7 +2272,7 @@ describe("internal adapter test", async () => {
 				database: new DatabaseSync(":memory:"),
 				...overrides,
 			} satisfies ClearanceOptions;
-			(await getMigrations(opts)).runMigrations();
+			await (await getMigrations(opts)).runMigrations();
 			const ctx = await init(opts);
 			return ctx.internalAdapter;
 		}

@@ -1,1 +1,4 @@
-export { toNodeHandler, fromNodeHeaders } from "@clearance/runtime/node";
+export {
+	toNodeHandler,
+	fromNodeHeaders,
+} from "../../runtime/src/integrations/node.js";

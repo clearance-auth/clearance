@@ -1,4 +1,9 @@
-import { createLocalJWKSet, decodeProtectedHeader, jwtVerify } from "jose";
+import {
+	createLocalJWKSet,
+	decodeProtectedHeader,
+	jwtVerify,
+	SignJWT,
+} from "jose";
 import type { Listener } from "listhen";
 import { listen } from "listhen";
 import {
@@ -14,10 +19,16 @@ import type { AuthClient } from "../../client";
 import { createAuthClient } from "../../client";
 import { toNodeHandler } from "../../integrations/node";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { genericOAuth } from "../generic-oauth";
 import { genericOAuthClient } from "../generic-oauth/client";
+import { admin } from "../admin";
 import { jwt } from "../jwt";
-import { oidcProvider } from ".";
+import {
+	createOAuthTokenPair,
+	oidcProvider,
+	rotateOAuthRefreshToken,
+} from ".";
 import type { OidcClientPlugin } from "./client";
 import { oidcClient } from "./client";
 import type { Client } from "./types";
@@ -33,6 +44,58 @@ const autoVerifyUserHook = {
 		},
 	},
 } as const;
+
+const RESERVED_ADDITIONAL_CLAIM_NAMES = [
+	"iss",
+	"sub",
+	"aud",
+	"exp",
+	"nbf",
+	"iat",
+	"jti",
+	"auth_time",
+	"nonce",
+	"acr",
+	"amr",
+	"azp",
+	"at_hash",
+	"c_hash",
+	"s_hash",
+	"sid",
+	"cnf",
+	"act",
+	"may_act",
+	"middle_name",
+	"nickname",
+	"preferred_username",
+	"website",
+	"gender",
+	"birthdate",
+	"zoneinfo",
+	"locale",
+	"phone_number",
+	"phone_number_verified",
+	"address",
+	"updated_at",
+	"_claim_names",
+	"_claim_sources",
+	"client_id",
+	"scope",
+	"authorization_details",
+	"token_type",
+	"token_use",
+	"username",
+	"groups",
+	"roles",
+	"entitlements",
+	"events",
+	"toe",
+	"txn",
+	"htm",
+	"htu",
+	"ath",
+	"jkt",
+] as const;
 
 // Type for the server client with OIDC plugin
 type ServerClient = AuthClient<{
@@ -88,7 +151,7 @@ describe("oidc init", () => {
 		const options = provider.options;
 		expect(options).toMatchInlineSnapshot(`
 			{
-			  "accessTokenExpiresIn": 3600,
+			  "accessTokenExpiresIn": 300,
 			  "allowPlainCodeChallengeMethod": false,
 			  "codeExpiresIn": 600,
 			  "defaultScope": "openid",
@@ -103,6 +166,37 @@ describe("oidc init", () => {
 			  "storeClientSecret": "plain",
 			}
 		`);
+	});
+
+	it("rejects access-token lifetimes above five minutes", () => {
+		expect(() =>
+			oidcProvider({ loginPage: "/login", accessTokenExpiresIn: 301 }),
+		).toThrow("between 1 and 300 seconds");
+	});
+
+	it("fails closed without rollback-capable transactions", () => {
+		const provider = oidcProvider({ loginPage: "/login" });
+		expect(() =>
+			provider.init?.({
+				adapter: { options: { adapterConfig: { transaction: false } } },
+				options: {},
+			} as any),
+		).toThrow("rollback-capable transactions");
+	});
+
+	it("refuses direct refresh rotation without rollback-capable transactions", async () => {
+		await expect(
+			rotateOAuthRefreshToken(
+				{ options: { adapterConfig: { transaction: false } } } as any,
+				"oauthAccessToken",
+				{
+					presentedRefreshToken: "unsupported-adapter-refresh-token",
+					clientId: "unsupported-adapter-client",
+					accessTokenExpiresAt: new Date(Date.now() + 300_000),
+					secretConfig: "unsupported-adapter-secret",
+				},
+			),
+		).rejects.toThrow("rollback-capable transactions");
 	});
 });
 
@@ -1086,6 +1180,7 @@ describe("oidc storage", async () => {
 			auth: authorizationServer,
 			signInWithTestUser,
 			customFetchImpl,
+			db,
 		} = await getTestInstance({
 			baseURL: "http://localhost:3000",
 			plugins: [
@@ -1244,14 +1339,20 @@ describe("oidc storage", async () => {
 });
 
 describe("oidc token response format", async () => {
-	async function setupOAuthFlowAndGetCode(scopes: string[]) {
+	async function setupOAuthFlowAndGetCode(
+		scopes: string[],
+		databaseHooks?: any,
+	) {
 		const {
 			auth: authorizationServer,
 			signInWithTestUser,
 			customFetchImpl,
+			db,
 		} = await getTestInstance({
 			baseURL: "http://localhost:3000",
+			databaseHooks,
 			plugins: [
+				admin(),
 				oidcProvider({
 					loginPage: "/login",
 					consentPage: "/oauth2/authorize",
@@ -1350,13 +1451,14 @@ describe("oidc token response format", async () => {
 			customFetchImpl,
 			application,
 			code,
+			db,
 		};
 	}
 
 	it("should return Bearer token_type in authorization_code token response", async ({
 		expect,
 	}) => {
-		const { server, customFetchImpl, application, code } =
+		const { server, customFetchImpl, application, code, db } =
 			await setupOAuthFlowAndGetCode(["openid", "profile", "email"]);
 
 		const tokenResponse = await customFetchImpl(
@@ -1378,19 +1480,190 @@ describe("oidc token response format", async () => {
 
 		const tokenData = await tokenResponse.json();
 
+		expect(tokenResponse.headers.get("cache-control")).toBe("no-store");
+		expect(tokenResponse.headers.get("pragma")).toBe("no-cache");
 		expect(tokenData.token_type).toBe("Bearer");
 		expect(tokenData.access_token).toBeDefined();
-		expect(tokenData.expires_in).toBeDefined();
+		expect(tokenData.expires_in).toBe(300);
 		expect(tokenData.id_token).toBeDefined();
 		expect(tokenData.scope).toBeDefined();
+		expect(tokenData.refresh_token).toBeUndefined();
+
+		const rows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.accessToken).toMatch(/^clr_oauth_ref_access_/);
+		expect(rows[0]?.refreshToken).toMatch(/^clr_oauth_ref_refresh_/);
+		expect(rows[0]?.accessTokenDigest).toMatch(/^v1:/);
+		expect(rows[0]?.refreshTokenDigest).toBeNull();
+		expect(rows[0]?.refreshStatus).toBe("none");
+		expect(
+			rows[0]?.accessTokenExpiresAt.getTime() - Date.now(),
+		).toBeLessThanOrEqual(300_000);
 
 		await server.close();
+	});
+
+	it("rejects a banned user on OIDC userinfo and refresh while revoking the family", async () => {
+		const { server, customFetchImpl, application, code, db } =
+			await setupOAuthFlowAndGetCode([
+				"openid",
+				"profile",
+				"email",
+				"offline_access",
+			]);
+		try {
+			const issuedResponse = await customFetchImpl(
+				"http://localhost:3000/api/auth/oauth2/token",
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						grant_type: "authorization_code",
+						code,
+						redirect_uri:
+							"http://localhost:3000/api/auth/oauth2/callback/test",
+						client_id: application.clientId,
+						client_secret: application.clientSecret,
+					}),
+				},
+			);
+			expect(issuedResponse.status).toBe(200);
+			const issued = await issuedResponse.json();
+			const [row] = await db.findMany<Record<string, any>>({
+				model: "oauthAccessToken",
+			});
+			await db.update({
+				model: "user",
+				where: [{ field: "id", value: row!.userId }],
+				update: {
+					banned: true,
+					banReason: "disabled",
+					updatedAt: new Date(),
+				},
+			});
+
+			const userInfo = await customFetchImpl(
+				"http://localhost:3000/api/auth/oauth2/userinfo",
+				{
+					headers: { authorization: `Bearer ${issued.access_token}` },
+				},
+			);
+			expect(userInfo.status).toBe(401);
+			const refresh = await customFetchImpl(
+				"http://localhost:3000/api/auth/oauth2/token",
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						grant_type: "refresh_token",
+						refresh_token: issued.refresh_token,
+						client_id: application.clientId,
+						client_secret: application.clientSecret,
+					}),
+				},
+			);
+			expect(refresh.status).toBe(401);
+			expect(await refresh.json()).toMatchObject({ error: "invalid_grant" });
+			const revoked = await db.findOne<Record<string, any>>({
+				model: "oauthAccessToken",
+				where: [{ field: "id", value: row!.id }],
+			});
+			expect(revoked).toMatchObject({
+				refreshStatus: "revoked",
+				revokedAt: expect.any(Date),
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it("rejects an existing access token after its OIDC client is disabled", async () => {
+		const { server, customFetchImpl, application, code, db } =
+			await setupOAuthFlowAndGetCode(["openid", "profile", "email"]);
+		try {
+			const issuedResponse = await customFetchImpl(
+				"http://localhost:3000/api/auth/oauth2/token",
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						grant_type: "authorization_code",
+						code,
+						redirect_uri:
+							"http://localhost:3000/api/auth/oauth2/callback/test",
+						client_id: application.clientId,
+						client_secret: application.clientSecret,
+					}),
+				},
+			);
+			expect(issuedResponse.status).toBe(200);
+			const issued = await issuedResponse.json();
+			await db.update<{ disabled: boolean }>({
+				model: "oauthApplication",
+				where: [{ field: "clientId", value: application.clientId }],
+				update: { disabled: true },
+			});
+
+			const userInfo = await customFetchImpl(
+				"http://localhost:3000/api/auth/oauth2/userinfo",
+				{
+					headers: { authorization: `Bearer ${issued.access_token}` },
+				},
+			);
+			expect(userInfo.status).toBe(401);
+			expect(await userInfo.json()).toMatchObject({ error: "invalid_token" });
+		} finally {
+			await server.close();
+		}
+	});
+
+	it("returns a committed token response when a public delete.after hook fails", async () => {
+		const { server, customFetchImpl, application, code, db } =
+			await setupOAuthFlowAndGetCode(["openid", "profile"], {
+				verification: {
+					delete: {
+						after: async () => {
+							throw new Error("observer delivery failed");
+						},
+					},
+				},
+			});
+		const exchange = () =>
+			customFetchImpl("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "authorization_code",
+					code,
+					redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+					client_id: application.clientId,
+					client_secret: application.clientSecret,
+				}),
+			});
+
+		try {
+			const first = await exchange();
+			expect(first.status).toBe(200);
+			expect(await first.json()).toMatchObject({
+				token_type: "Bearer",
+				access_token: expect.any(String),
+			});
+			expect(await db.findMany({ model: "oauthAccessToken" })).toHaveLength(1);
+
+			const replay = await exchange();
+			expect(replay.status).toBe(401);
+			expect(await replay.json()).toMatchObject({ error: "invalid_grant" });
+		} finally {
+			await server.close();
+		}
 	});
 
 	it("should return Bearer token_type in refresh_token grant response", async ({
 		expect,
 	}) => {
-		const { server, customFetchImpl, application, code } =
+		const { server, customFetchImpl, application, code, db } =
 			await setupOAuthFlowAndGetCode([
 				"openid",
 				"profile",
@@ -1416,8 +1689,19 @@ describe("oidc token response format", async () => {
 		);
 
 		const initialTokenData = await initialTokenResponse.json();
+		expect(initialTokenResponse.headers.get("cache-control")).toBe("no-store");
+		expect(initialTokenResponse.headers.get("pragma")).toBe("no-cache");
 		expect(initialTokenData.refresh_token).toBeDefined();
 		expect(initialTokenData.token_type).toBe("Bearer");
+		const [parentBeforeRotation] = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(parentBeforeRotation?.accessToken).toMatch(/^clr_oauth_ref_access_/);
+		expect(parentBeforeRotation?.refreshToken).toMatch(
+			/^clr_oauth_ref_refresh_/,
+		);
+		expect(parentBeforeRotation?.accessTokenDigest).toMatch(/^v1:/);
+		expect(parentBeforeRotation?.refreshTokenDigest).toMatch(/^v1:/);
 
 		const refreshTokenResponse = await customFetchImpl(
 			"http://localhost:3000/api/auth/oauth2/token",
@@ -1437,11 +1721,270 @@ describe("oidc token response format", async () => {
 
 		const refreshTokenData = await refreshTokenResponse.json();
 
+		expect(refreshTokenResponse.headers.get("cache-control")).toBe("no-store");
+		expect(refreshTokenResponse.headers.get("pragma")).toBe("no-cache");
 		expect(refreshTokenData.token_type).toBe("Bearer");
 		expect(refreshTokenData.access_token).toBeDefined();
 		expect(refreshTokenData.expires_in).toBeDefined();
 		expect(refreshTokenData.refresh_token).toBeDefined();
 		expect(refreshTokenData.scope).toBeDefined();
+		expect(refreshTokenData.refresh_token).not.toBe(
+			initialTokenData.refresh_token,
+		);
+
+		const rowsAfterRotation = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+			sortBy: { field: "rotationCounter", direction: "asc" },
+		});
+		expect(rowsAfterRotation).toHaveLength(2);
+		const [parent, successor] = rowsAfterRotation;
+		expect(parent?.refreshStatus).toBe("consumed");
+		expect(successor?.refreshStatus).toBe("active");
+		expect(successor?.familyId).toBe(parent?.familyId);
+		expect(successor?.parentTokenId).toBe(parent?.id);
+		expect(successor?.rotationCounter).toBe(1);
+		expect(successor?.refreshTokenExpiresAt).toEqual(
+			parent?.refreshTokenExpiresAt,
+		);
+		expect(successor?.accessToken).toMatch(/^clr_oauth_ref_access_/);
+		expect(successor?.refreshToken).toMatch(/^clr_oauth_ref_refresh_/);
+
+		const replayResponse = await customFetchImpl(
+			"http://localhost:3000/api/auth/oauth2/token",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: initialTokenData.refresh_token,
+					client_id: application.clientId,
+					client_secret: application.clientSecret,
+				}),
+			},
+		);
+		expect(replayResponse.status).toBe(401);
+		expect((await replayResponse.json()).error).toBe("invalid_grant");
+
+		const successorAfterReplay = await customFetchImpl(
+			"http://localhost:3000/api/auth/oauth2/token",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: refreshTokenData.refresh_token,
+					client_id: application.clientId,
+					client_secret: application.clientSecret,
+				}),
+			},
+		);
+		expect(successorAfterReplay.status).toBe(401);
+
+		const userInfoAfterReplay = await customFetchImpl(
+			"http://localhost:3000/api/auth/oauth2/userinfo",
+			{
+				headers: {
+					authorization: `Bearer ${refreshTokenData.access_token}`,
+				},
+			},
+		);
+		expect(userInfoAfterReplay.status).toBe(401);
+		const revokedRows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(revokedRows.every((row) => row.refreshStatus === "revoked")).toBe(
+			true,
+		);
+
+		await server.close();
+	});
+
+	it("recovers the exact OAuth refresh successor without persisting a reversible retry secret", async () => {
+		const { server, customFetchImpl, application, code, db } =
+			await setupOAuthFlowAndGetCode([
+				"openid",
+				"profile",
+				"email",
+				"offline_access",
+			]);
+		const tokenUrl = "http://localhost:3000/api/auth/oauth2/token";
+		const initialResponse = await customFetchImpl(tokenUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				grant_type: "authorization_code",
+				code,
+				redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+				client_id: application.clientId,
+				client_secret: application.clientSecret,
+			}),
+		});
+		const initial = await initialResponse.json();
+		const idempotencyKey = generateCredentialOperationKey();
+		const rotate = (operationKey: string) =>
+			customFetchImpl(tokenUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Idempotency-Key": operationKey,
+				},
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: initial.refresh_token,
+					client_id: application.clientId,
+					client_secret: application.clientSecret,
+				}),
+			});
+
+		try {
+			const predictable = await rotate("a".repeat(22));
+			expect(predictable.status).toBe(400);
+			expect(await predictable.json()).toMatchObject({
+				error: "invalid_request",
+			});
+
+			const responses = await Promise.all(
+				Array.from({ length: 16 }, () => rotate(idempotencyKey)),
+			);
+			for (const response of responses) {
+				expect(response.status).toBe(200);
+				expect(response.headers.get("cache-control")).toBe("no-store");
+				expect(response.headers.get("pragma")).toBe("no-cache");
+			}
+			const successors = await Promise.all(
+				responses.map((response) => response.json()),
+			);
+			const first = successors[0]!;
+			expect(new Set(successors.map((value) => value.access_token))).toEqual(
+				new Set([first.access_token]),
+			);
+			expect(new Set(successors.map((value) => value.refresh_token))).toEqual(
+				new Set([first.refresh_token]),
+			);
+
+			const rowsBeforeReuse = await db.findMany<Record<string, any>>({
+				model: "oauthAccessToken",
+				sortBy: { field: "rotationCounter", direction: "asc" },
+			});
+			expect(rowsBeforeReuse).toHaveLength(2);
+			const [parent, successor] = rowsBeforeReuse;
+			expect(parent?.refreshStatus).toBe("consumed");
+			expect(parent?.rotationNonceDigest).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			expect(parent?.recoveryExpiresAt).toBeInstanceOf(Date);
+			expect(successor?.refreshStatus).toBe("active");
+			const persisted = JSON.stringify(rowsBeforeReuse);
+			expect(persisted).not.toContain(idempotencyKey);
+			expect(persisted).not.toContain(first.access_token);
+			expect(persisted).not.toContain(first.refresh_token);
+			expect(parent).not.toHaveProperty("recoverySecretCiphertext");
+
+			const reuseResponse = await rotate(generateCredentialOperationKey());
+			expect(reuseResponse.status).toBe(401);
+			expect(await reuseResponse.json()).toMatchObject({
+				error: "invalid_grant",
+			});
+			const revokedRows = await db.findMany<Record<string, any>>({
+				model: "oauthAccessToken",
+			});
+			expect(revokedRows).toHaveLength(2);
+			expect(
+				revokedRows.every((row) => row.refreshStatus === "revoked"),
+			).toBe(true);
+			expect(
+				revokedRows.every(
+					(row) =>
+						row.rotationNonceDigest === null &&
+						row.recoveryExpiresAt === null,
+				),
+			).toBe(true);
+		} finally {
+			await server.close();
+		}
+	});
+
+	it("rejects legacy OAuth bearer writes after storage is sealed", async () => {
+		const { server, application, db } =
+			await setupOAuthFlowAndGetCode(["openid"]);
+		const [user] = await db.findMany<{ id: string }>({
+			model: "user",
+			limit: 1,
+		});
+		const now = new Date();
+		const legacyRefresh = "legacy-refresh-without-offline-access";
+		await expect(
+			db.create({
+				model: "oauthAccessToken",
+				forceAllowId: true,
+				data: {
+				id: "legacy-online-only-token",
+				accessToken: null,
+				refreshToken: legacyRefresh,
+				accessTokenDigest: null,
+				refreshTokenDigest: null,
+				digestVersion: null,
+				familyId: null,
+				refreshStatus: null,
+				rotationCounter: null,
+				parentTokenId: null,
+				consumedAt: null,
+				revokedAt: null,
+				reuseDetectedAt: null,
+				accessTokenExpiresAt: new Date(now.getTime() + 300_000),
+				refreshTokenExpiresAt: new Date(now.getTime() + 3_600_000),
+				clientId: application.clientId,
+				userId: user!.id,
+				scopes: "openid",
+				createdAt: now,
+				updatedAt: now,
+				},
+			}),
+		).rejects.toThrow(
+			"Clearance credential authority rejects replayable bearer storage",
+		);
+		await server.close();
+	});
+
+	it("revokes the family when the same refresh token races", async () => {
+		const { server, customFetchImpl, application, code, db } =
+			await setupOAuthFlowAndGetCode([
+				"openid",
+				"profile",
+				"email",
+				"offline_access",
+			]);
+		const tokenUrl = "http://localhost:3000/api/auth/oauth2/token";
+		const initialResponse = await customFetchImpl(tokenUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				grant_type: "authorization_code",
+				code,
+				redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+				client_id: application.clientId,
+				client_secret: application.clientSecret,
+			}),
+		});
+		const initial = await initialResponse.json();
+		const rotate = () =>
+			customFetchImpl(tokenUrl, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: initial.refresh_token,
+					client_id: application.clientId,
+					client_secret: application.clientSecret,
+				}),
+			});
+		const responses = await Promise.all([rotate(), rotate()]);
+		expect(responses.map((response) => response.status).sort()).toEqual([
+			200, 401,
+		]);
+		const rows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(rows).toHaveLength(2);
+		expect(rows.every((row) => row.refreshStatus === "revoked")).toBe(true);
 
 		await server.close();
 	});
@@ -1506,30 +2049,87 @@ describe("oidc-jwt", async () => {
 	test.for([
 		{ useJwt: true, description: "with jwt plugin", expected: "EdDSA" },
 		{ useJwt: false, description: "without jwt plugin", expected: "HS256" },
-	])("testing oidc-provider $description to return token signed with $expected", async ({
-		useJwt,
-		expected,
-	}) => {
+	])(
+		"testing oidc-provider $description to return token signed with $expected",
+		async ({ useJwt, expected }) => {
 		const {
 			auth: authorizationServer,
 			signInWithTestUser,
 			customFetchImpl,
 			testUser,
+			db,
 		} = await getTestInstance({
 			baseURL: "http://localhost:3000",
 			plugins: [
-				oidcProvider({
-					loginPage: "/login",
-					consentPage: "/oauth2/authorize",
-					requirePKCE: true,
-					getAdditionalUserInfoClaim(user) {
-						return {
-							custom: "custom value",
-							userId: user.id,
-						};
-					},
-					useJWTPlugin: useJwt,
-				}),
+					oidcProvider({
+						loginPage: "/login",
+						consentPage: "/oauth2/authorize",
+						requirePKCE: true,
+						metadata: { issuer: "https://issuer.clearance.test" },
+						getAdditionalUserInfoClaim(user) {
+							return {
+								custom: "custom value",
+								userId: user.id,
+								iss: "https://attacker.example.test",
+								sub: "attacker-controlled-sub",
+								aud: "attacker-controlled-audience",
+								sid: "attacker-controlled-family",
+								exp: 1,
+								nbf: 4_102_444_800,
+								iat: 1,
+								jti: "attacker-controlled-token-id",
+								auth_time: 4_102_444_800,
+								nonce: "attacker-controlled-nonce",
+								acr: "attacker-controlled-acr",
+								amr: ["attacker-controlled-amr"],
+								azp: "attacker-controlled-authorized-party",
+								at_hash: "attacker-controlled-access-token-hash",
+								c_hash: "attacker-controlled-code-hash",
+								s_hash: "attacker-controlled-state-hash",
+								cnf: { jkt: "attacker-controlled-confirmation" },
+								act: { sub: "attacker-controlled-actor" },
+								may_act: { sub: "attacker-controlled-future-actor" },
+								name: "Attacker Controlled Name",
+								given_name: "Attacker",
+								family_name: "Controlled",
+								profile: "https://attacker.example.test/profile",
+								picture: "https://attacker.example.test/picture",
+								email: "attacker@example.test",
+								email_verified: "attacker-controlled-email-verification",
+								updated_at: "attacker-controlled-update",
+								middle_name: "attacker-controlled-middle-name",
+								nickname: "attacker-controlled-nickname",
+								preferred_username: "attacker-controlled-username",
+								website: "https://attacker.example.test",
+								gender: "attacker-controlled-gender",
+								birthdate: "1970-01-01",
+								zoneinfo: "attacker-controlled-zone",
+								locale: "attacker-controlled-locale",
+								phone_number: "+15555550100",
+								phone_number_verified: true,
+								address: { formatted: "attacker-controlled-address" },
+								_claim_names: { email: "attacker-source" },
+								_claim_sources: { "attacker-source": {} },
+								client_id: "attacker-controlled-client",
+								scope: "attacker-controlled-scope",
+								authorization_details: [{ type: "attacker-controlled" }],
+								token_type: "attacker-controlled-token-type",
+								token_use: "attacker-controlled-token-use",
+								username: "attacker-controlled-username",
+								groups: ["attacker-controlled-group"],
+								roles: ["attacker-controlled-role"],
+								entitlements: ["attacker-controlled-entitlement"],
+								events: { "attacker-controlled-event": {} },
+								toe: 1,
+								txn: "attacker-controlled-transaction",
+								htm: "DELETE",
+								htu: "https://attacker.example.test/resource",
+								ath: "attacker-controlled-access-token-hash",
+								jkt: "attacker-controlled-key-thumbprint",
+							};
+						},
+						useJWTPlugin: useJwt,
+					}),
 				...(useJwt ? [jwt()] : []),
 			],
 		});
@@ -1699,28 +2299,165 @@ describe("oidc-jwt", async () => {
 			},
 		);
 		const decoded = decodeProtectedHeader(accessToken.data?.idToken!);
+		const discoveryResponse = await customFetchImpl(
+			"http://localhost:3000/api/auth/.well-known/openid-configuration",
+		);
+		expect(discoveryResponse.status).toBe(200);
+		const discovery = (await discoveryResponse.json()) as { issuer: string };
+		expect(discovery.issuer).toBe("https://issuer.clearance.test");
+		const standardVerification = {
+			issuer: discovery.issuer,
+			audience: application.clientId,
+		};
+		let verifiedPayload: Awaited<ReturnType<typeof jwtVerify>>["payload"];
 		if (useJwt) {
 			const jwks = await authorizationServer.api.getJwks();
 			const jwkSet = createLocalJWKSet(jwks);
 			const checkSignature = await jwtVerify(
 				accessToken.data?.idToken!,
 				jwkSet,
+				standardVerification,
 			);
 			expect(checkSignature).toBeDefined();
 			expect(Number.isInteger(checkSignature.payload.iat)).toBeTruthy();
 			expect(Number.isInteger(checkSignature.payload.exp)).toBeTruthy();
+			verifiedPayload = checkSignature.payload;
 		} else {
 			const clientSecret = application.clientSecret;
 			const checkSignature = await jwtVerify(
 				accessToken.data?.idToken!,
 				new TextEncoder().encode(clientSecret),
+				standardVerification,
 			);
 			expect(checkSignature).toBeDefined();
+			verifiedPayload = checkSignature.payload;
+		}
+		expect(verifiedPayload.sub).toBe(verifiedPayload.userId);
+		expect(verifiedPayload.iss).toBe(discovery.issuer);
+		expect(verifiedPayload.sub).not.toBe("attacker-controlled-sub");
+		expect(verifiedPayload.aud).toBe(application.clientId);
+		expect(verifiedPayload.sid).toEqual(expect.any(String));
+		expect(verifiedPayload.sid).not.toBe("attacker-controlled-family");
+		expect(verifiedPayload.iat).not.toBe(1);
+		expect(verifiedPayload.auth_time).toEqual(expect.any(Number));
+		expect(Number.isInteger(verifiedPayload.auth_time)).toBe(true);
+		expect(verifiedPayload.auth_time).toBeLessThanOrEqual(
+			Math.floor(Date.now() / 1000),
+		);
+		expect(verifiedPayload.auth_time).toBeGreaterThan(
+			Math.floor(Date.now() / 1000) - 3600,
+		);
+		expect(verifiedPayload.acr).toBe("urn:mace:incommon:iap:silver");
+		expect(verifiedPayload.email).not.toBe("attacker@example.test");
+		expect(verifiedPayload.email_verified).toEqual(expect.any(Boolean));
+		expect(verifiedPayload.name).not.toBe("Attacker Controlled Name");
+		expect(verifiedPayload.given_name).not.toBe("Attacker");
+		expect(verifiedPayload.family_name).not.toBe("Controlled");
+		expect(verifiedPayload.profile).not.toBe(
+			"https://attacker.example.test/profile",
+		);
+		expect(verifiedPayload.picture).toBeUndefined();
+		expect(Number.isInteger(verifiedPayload.updated_at)).toBe(true);
+		for (const claim of [
+			"jti",
+			"amr",
+			"azp",
+			"at_hash",
+			"c_hash",
+			"s_hash",
+			"cnf",
+			"act",
+			"may_act",
+		]) {
+			expect(verifiedPayload[claim]).toBeUndefined();
+		}
+		expect(verifiedPayload.custom).toBe("custom value");
+
+		const userInfoResponse = await customFetchImpl(
+			"http://localhost:3000/api/auth/oauth2/userinfo",
+			{
+				headers: {
+					authorization: `Bearer ${accessToken.data?.accessToken}`,
+				},
+			},
+		);
+		expect(userInfoResponse.status).toBe(200);
+		const userInfo = await userInfoResponse.json();
+		expect(userInfo).toMatchObject({
+			custom: "custom value",
+		});
+		expect(userInfo.sub).toBe(userInfo.userId);
+		expect(userInfo.sub).not.toBe("attacker-controlled-sub");
+		expect(userInfo.email).not.toBe("attacker@example.test");
+		expect(userInfo.email_verified).toEqual(expect.any(Boolean));
+		expect(userInfo.name).not.toBe("Attacker Controlled Name");
+		expect(userInfo.given_name).not.toBe("Attacker");
+		expect(userInfo.family_name).not.toBe("Controlled");
+		expect(userInfo.picture).not.toBe(
+			"https://attacker.example.test/picture",
+		);
+		for (const claim of RESERVED_ADDITIONAL_CLAIM_NAMES) {
+			if (claim === "sub") continue;
+			expect(userInfo[claim]).toBeUndefined();
+		}
+
+		if (useJwt) {
+			const targetUserId = verifiedPayload.sub as string;
+			const targetFamilyId = verifiedPayload.sid as string;
+			const targetBefore = await db.findOne<Record<string, any>>({
+				model: "oauthAccessToken",
+				where: [
+					{ field: "userId", value: targetUserId },
+					{ field: "clientId", value: application.clientId },
+					{ field: "familyId", value: targetFamilyId },
+				],
+			});
+			expect(targetBefore).not.toBeNull();
+			const siblingFamily = await createOAuthTokenPair(
+				db,
+				"oauthAccessToken",
+				{
+					accessTokenExpiresAt: new Date(Date.now() + 300_000),
+					refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+					clientId: application.clientId,
+					userId: targetUserId,
+					scopes: "openid offline_access",
+					familyId: "endsession-jwks-sibling-family",
+					issueRefreshToken: true,
+				},
+			);
+
+			const endSessionURL = new URL(
+				"http://localhost:3000/api/auth/oauth2/endsession",
+			);
+			endSessionURL.searchParams.set(
+				"id_token_hint",
+				accessToken.data?.idToken!,
+			);
+			const endSessionResponse = await authorizationServer.handler(
+				new Request(endSessionURL, {
+					method: "GET",
+					headers: { "Sec-Fetch-Site": "same-origin" },
+				}),
+			);
+			expect(endSessionResponse.status).toBe(200);
+
+			const targetAfter = await db.findOne<Record<string, any>>({
+				model: "oauthAccessToken",
+				where: [{ field: "id", value: targetBefore!.id }],
+			});
+			const siblingAfter = await db.findOne<Record<string, any>>({
+				model: "oauthAccessToken",
+				where: [{ field: "id", value: siblingFamily.row.id }],
+			});
+			expect(targetAfter?.refreshStatus).toBe("revoked");
+			expect(siblingAfter?.refreshStatus).toBe("active");
 		}
 
 		// expect(checkSignature.payload).toBeDefined();
 		expect(decoded.alg).toBe(expected);
-	});
+		},
+	);
 });
 
 /**
@@ -1751,19 +2488,15 @@ describe("oidc-provider refresh_token grant client authentication", () => {
 				updatedAt: new Date(),
 			},
 		});
-		await db.create({
-			model: "oauthAccessToken",
-			data: {
-				accessToken: "stale-access-token-not-used",
-				refreshToken: REFRESH_TOKEN,
-				accessTokenExpiresAt: new Date(Date.now() - 60 * 1000),
-				refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
-				clientId: CLIENT_ID,
-				userId,
-				scopes: "openid profile email offline_access",
-				createdAt: new Date(),
-				updatedAt: new Date(),
-			},
+		await createOAuthTokenPair(db, "oauthAccessToken", {
+			clientId: CLIENT_ID,
+			userId,
+			scopes: "openid profile email offline_access",
+			accessTokenExpiresAt: new Date(Date.now() - 60 * 1000),
+			refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+			issueRefreshToken: true,
+			accessToken: "stale-access-token-not-used",
+			refreshToken: REFRESH_TOKEN,
 		});
 	}
 
@@ -2217,24 +2950,18 @@ describe("oidc end session cross-site protection (security)", async () => {
 				updatedAt: new Date(),
 			},
 		});
-		await db.create({
-			model: "oauthAccessToken",
-			data: {
-				accessToken: "endsession-csrf-access",
-				refreshToken: "endsession-csrf-refresh",
-				accessTokenExpiresAt: new Date(Date.now() + 3600 * 1000),
-				refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
-				clientId: "endsession-csrf-client",
-				userId: user.id,
-				scopes: "openid",
-				createdAt: new Date(),
-				updatedAt: new Date(),
-			},
+		return createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 3600 * 1000),
+			refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+			clientId: "endsession-csrf-client",
+			userId: user.id,
+			scopes: "openid",
+			issueRefreshToken: true,
 		});
 	}
 
 	it("rejects a cross-site GET logout carrying only a session cookie", async () => {
-		await seedAccessToken();
+		const { row } = await seedAccessToken();
 
 		const response = await auth.handler(
 			new Request("http://localhost:3000/api/auth/oauth2/endsession", {
@@ -2251,7 +2978,7 @@ describe("oidc end session cross-site protection (security)", async () => {
 		expect(session?.user.id).toBe(user.id);
 		const tokenRow = await db.findOne({
 			model: "oauthAccessToken",
-			where: [{ field: "accessToken", value: "endsession-csrf-access" }],
+			where: [{ field: "id", value: row.id }],
 		});
 		expect(tokenRow).not.toBeNull();
 	});
@@ -2264,5 +2991,314 @@ describe("oidc end session cross-site protection (security)", async () => {
 			}),
 		);
 		expect(response.status).toBe(200);
+	});
+
+	it("revokes only the family identified by the validated RP logout hint", async () => {
+		const clientA = {
+			clientId: "endsession-family-client-a",
+			clientSecret: "endsession-family-secret-a",
+		};
+		const clientB = {
+			clientId: "endsession-family-client-b",
+			clientSecret: "endsession-family-secret-b",
+		};
+		for (const client of [clientA, clientB]) {
+			await db.create({
+				model: "oauthApplication",
+				data: {
+					...client,
+					type: "web",
+					name: client.clientId,
+					redirectUrls: "http://localhost/callback",
+					disabled: false,
+					metadata: null,
+					icon: null,
+					userId: null,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+		}
+
+		const target = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: clientA.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-family-a-target",
+			issueRefreshToken: true,
+		});
+		const sameClientOtherFamily = await createOAuthTokenPair(
+			db,
+			"oauthAccessToken",
+			{
+				accessTokenExpiresAt: new Date(Date.now() + 300_000),
+				refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+				clientId: clientA.clientId,
+				userId: user.id,
+				scopes: "openid offline_access",
+				familyId: "endsession-family-a-other",
+				issueRefreshToken: true,
+			},
+		);
+		const otherClient = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: clientB.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-family-b",
+			issueRefreshToken: true,
+		});
+		const idTokenHint = await new SignJWT({
+			sid: target.row.familyId,
+		})
+			.setProtectedHeader({ alg: "HS256" })
+			.setSubject(user.id)
+			.setIssuer("http://localhost:3000")
+			.setAudience(clientA.clientId)
+			.setIssuedAt()
+			.setExpirationTime("5m")
+			.sign(new TextEncoder().encode(clientA.clientSecret));
+
+		const url = new URL(
+			"http://localhost:3000/api/auth/oauth2/endsession",
+		);
+		url.searchParams.set("id_token_hint", idTokenHint);
+		url.searchParams.set("client_id", clientA.clientId);
+		const response = await auth.handler(
+			new Request(url, {
+				method: "GET",
+				headers: { "Sec-Fetch-Site": "same-origin" },
+			}),
+		);
+		expect(response.status).toBe(200);
+
+		const rows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+			where: [
+				{
+					field: "id",
+					operator: "in",
+					value: [
+						target.row.id,
+						sameClientOtherFamily.row.id,
+						otherClient.row.id,
+					],
+				},
+			],
+		});
+		const byId = new Map(rows.map((row) => [row.id, row]));
+		expect(byId.get(target.row.id)?.refreshStatus).toBe("revoked");
+		expect(byId.get(sameClientOtherFamily.row.id)?.refreshStatus).toBe(
+			"active",
+		);
+		expect(byId.get(otherClient.row.id)?.refreshStatus).toBe("active");
+	});
+
+	it("revokes every family for a validated pre-sid id_token_hint on the (userId, clientId) pair", async () => {
+		const clientA = {
+			clientId: "endsession-presid-client-a",
+			clientSecret: "endsession-presid-secret-a",
+		};
+		const clientB = {
+			clientId: "endsession-presid-client-b",
+			clientSecret: "endsession-presid-secret-b",
+		};
+		for (const client of [clientA, clientB]) {
+			await db.create({
+				model: "oauthApplication",
+				data: {
+					...client,
+					type: "web",
+					name: client.clientId,
+					redirectUrls: "http://localhost/callback",
+					disabled: false,
+					metadata: null,
+					icon: null,
+					userId: null,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+		}
+
+		const familyOne = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: clientA.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-presid-a-one",
+			issueRefreshToken: true,
+		});
+		const familyTwo = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: clientA.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-presid-a-two",
+			issueRefreshToken: true,
+		});
+		const otherClient = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: clientB.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-presid-b",
+			issueRefreshToken: true,
+		});
+
+		// Valid HS256 pre-sid hint: fully verifiable sub + aud, intentionally no sid.
+		const idTokenHint = await new SignJWT({})
+			.setProtectedHeader({ alg: "HS256" })
+			.setSubject(user.id)
+			.setIssuer("http://localhost:3000")
+			.setAudience(clientA.clientId)
+			.setIssuedAt()
+			.setExpirationTime("5m")
+			.sign(new TextEncoder().encode(clientA.clientSecret));
+
+		const url = new URL(
+			"http://localhost:3000/api/auth/oauth2/endsession",
+		);
+		url.searchParams.set("id_token_hint", idTokenHint);
+		url.searchParams.set("client_id", clientA.clientId);
+		const response = await auth.handler(
+			new Request(url, {
+				method: "GET",
+				headers: { "Sec-Fetch-Site": "same-origin" },
+			}),
+		);
+		expect(response.status).toBe(200);
+
+		const rows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+			where: [
+				{
+					field: "id",
+					operator: "in",
+					value: [familyOne.row.id, familyTwo.row.id, otherClient.row.id],
+				},
+			],
+		});
+		const byId = new Map(rows.map((row) => [row.id, row]));
+		expect(byId.get(familyOne.row.id)).toMatchObject({
+			refreshStatus: "revoked",
+			revokedAt: expect.any(Date),
+			rotationNonceDigest: null,
+			recoveryExpiresAt: null,
+		});
+		expect(byId.get(familyTwo.row.id)).toMatchObject({
+			refreshStatus: "revoked",
+			revokedAt: expect.any(Date),
+			rotationNonceDigest: null,
+			recoveryExpiresAt: null,
+		});
+		expect(byId.get(otherClient.row.id)?.refreshStatus).toBe("active");
+		// Digest rows remain present after revocation.
+		expect(byId.get(familyOne.row.id)?.refreshTokenDigest).toBeTruthy();
+		expect(byId.get(familyTwo.row.id)?.refreshTokenDigest).toBeTruthy();
+
+		for (const refreshToken of [
+			familyOne.refreshToken!,
+			familyTwo.refreshToken!,
+		]) {
+			const refreshResponse = await auth.handler(
+				new Request("http://localhost:3000/api/auth/oauth2/token", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						grant_type: "refresh_token",
+						refresh_token: refreshToken,
+						client_id: clientA.clientId,
+						client_secret: clientA.clientSecret,
+					}),
+				}),
+			);
+			expect(refreshResponse.status).toBe(401);
+			expect(await refreshResponse.json()).toMatchObject({
+				error: "invalid_grant",
+			});
+		}
+	});
+
+	it("does not revoke OAuth families for an invalid id_token_hint", async () => {
+		const client = {
+			clientId: "endsession-invalid-hint-client",
+			clientSecret: "endsession-invalid-hint-secret",
+		};
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				...client,
+				type: "web",
+				name: client.clientId,
+				redirectUrls: "http://localhost/callback",
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const family = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: client.clientId,
+			userId: user.id,
+			scopes: "openid offline_access",
+			familyId: "endsession-invalid-hint-family",
+			issueRefreshToken: true,
+		});
+
+		// Signature fails verification against the registered client secret.
+		const invalidHint = await new SignJWT({})
+			.setProtectedHeader({ alg: "HS256" })
+			.setSubject(user.id)
+			.setIssuer("http://localhost:3000")
+			.setAudience(client.clientId)
+			.setIssuedAt()
+			.setExpirationTime("5m")
+			.sign(new TextEncoder().encode("wrong-client-secret"));
+
+		const url = new URL(
+			"http://localhost:3000/api/auth/oauth2/endsession",
+		);
+		url.searchParams.set("id_token_hint", invalidHint);
+		url.searchParams.set("client_id", client.clientId);
+		const response = await auth.handler(
+			new Request(url, {
+				method: "GET",
+				headers: { "Sec-Fetch-Site": "same-origin" },
+			}),
+		);
+		expect(response.status).toBe(200);
+
+		const row = await db.findOne<Record<string, any>>({
+			model: "oauthAccessToken",
+			where: [{ field: "id", value: family.row.id }],
+		});
+		expect(row?.refreshStatus).toBe("active");
+		expect(row?.revokedAt).toBeNull();
+
+		const refreshResponse = await auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: family.refreshToken!,
+					client_id: client.clientId,
+					client_secret: client.clientSecret,
+				}),
+			}),
+		);
+		expect(refreshResponse.status).toBe(200);
+		expect((await refreshResponse.json()).access_token).toBeDefined();
 	});
 });

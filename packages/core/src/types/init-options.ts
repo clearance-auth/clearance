@@ -406,8 +406,8 @@ export type ClearanceAdvancedOptions = {
 				 * ` function. If mysql or mssql, we use the `uuid()`
 				 * function.
 				 */
-				generateId?: GenerateIdFn | false | "serial" | "uuid";
-		  }
+					generateId?: GenerateIdFn | false | "serial" | "uuid";
+			  }
 		| undefined;
 	/**
 	 * Trusted proxy headers
@@ -1592,6 +1592,14 @@ export type ClearanceOptions = {
 				};
 		  }
 		| undefined;
+	/**
+	 * Controls failures from caller-provided database `after` hooks.
+	 * `observe` logs failures after commit. `rollback` runs the hook before a
+	 * transaction commits and propagates failures to the caller.
+	 *
+	 * @default "observe"
+	 */
+	databaseHookFailureMode?: "observe" | "rollback" | undefined;
 	/**
 	 * API error handling
 	 */

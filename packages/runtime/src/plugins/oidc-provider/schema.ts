@@ -113,17 +113,77 @@ export const schema = {
 		fields: {
 			accessToken: {
 				type: "string",
-				unique: true,
+				required: false,
+				returned: false,
 			},
 			refreshToken: {
 				type: "string",
+				required: false,
+				returned: false,
+			},
+			accessTokenDigest: {
+				type: "string",
+				required: false,
 				unique: true,
+				returned: false,
+			},
+			digestVersion: {
+				type: "number",
+				required: false,
+				defaultValue: 1,
+			},
+			refreshTokenDigest: {
+				type: "string",
+				required: false,
+				unique: true,
+				returned: false,
+			},
+			familyId: {
+				type: "string",
+				required: false,
+				index: true,
+			},
+			refreshStatus: {
+				type: "string",
+				required: false,
+				defaultValue: "active",
+			},
+			rotationCounter: {
+				type: "number",
+				required: false,
+				defaultValue: 0,
+			},
+			parentTokenId: {
+				type: "string",
+				required: false,
+			},
+			consumedAt: {
+				type: "date",
+				required: false,
+			},
+			revokedAt: {
+				type: "date",
+				required: false,
+			},
+			reuseDetectedAt: {
+				type: "date",
+				required: false,
+			},
+			rotationNonceDigest: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
+			recoveryExpiresAt: {
+				type: "date",
+				required: false,
 			},
 			accessTokenExpiresAt: {
 				type: "date",
 			},
 			refreshTokenExpiresAt: {
 				type: "date",
+				required: false,
 			},
 			clientId: {
 				type: "string",

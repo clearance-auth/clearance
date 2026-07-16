@@ -367,11 +367,14 @@ describe("updateUser", async () => {
 	});
 
 	it("should not write to secondary storage multiple times for the same session token during updateUser", async () => {
+		const namespace = "update-user-storage-test";
+		const migrationEpochKey = `clearance:${namespace}:session-storage-epoch`;
 		const store = new Map<string, string>();
 		const writeLog: { key: string; timestamp: number }[] = [];
 
 		const { auth, signInWithTestUser: signIn } = await getTestInstance({
 			secondaryStorage: {
+				namespace,
 				set(key, value) {
 					writeLog.push({ key, timestamp: Date.now() });
 					store.set(key, value);
@@ -385,18 +388,23 @@ describe("updateUser", async () => {
 			},
 		});
 
-		// Clear any previous state
+		// Clear any previous state, but keep the migration epoch published at setup
+		const migrationEpoch = store.get(migrationEpochKey);
 		store.clear();
+		if (migrationEpoch !== undefined) {
+			store.set(migrationEpochKey, migrationEpoch);
+		}
 		writeLog.length = 0;
 
 		const { headers } = await signIn();
 
-		// Get the session token that was just created
-		const sessionTokens = Array.from(store.keys()).filter(
-			(k) => !k.startsWith("active-sessions-"),
+		// Resolve the digest-keyed credential record (the other keys are the
+		// active-session index and stable session handle).
+		const sessionCredentials = Array.from(store.keys()).filter((key) =>
+			key.includes(":session-credential:"),
 		);
-		expect(sessionTokens.length).toBe(1);
-		const sessionToken = sessionTokens[0];
+		expect(sessionCredentials.length).toBe(1);
+		const sessionCredential = sessionCredentials[0];
 
 		// Clear the write log before updateUser call
 		writeLog.length = 0;
@@ -410,12 +418,12 @@ describe("updateUser", async () => {
 		});
 
 		// Count how many times the same session token was written
-		const sessionTokenWrites = writeLog.filter(
-			(log) => log.key === sessionToken,
+		const sessionCredentialWrites = writeLog.filter(
+			(log) => log.key === sessionCredential,
 		);
 
 		// Should only write once per session token, not multiple times
-		expect(sessionTokenWrites.length).toBe(1);
+		expect(sessionCredentialWrites.length).toBe(1);
 	});
 
 	it("should not allow updating user with additional fields that are input: false", async () => {
@@ -539,6 +547,8 @@ describe("delete user", async () => {
 	});
 
 	it("should delete every session from deleted user", async () => {
+		const namespace = "delete-user-session-storage-test";
+		const migrationEpochKey = `clearance:${namespace}:session-storage-epoch`;
 		const store = new Map<string, string>();
 		const { client, signInWithTestUser } = await getTestInstance({
 			user: {
@@ -547,6 +557,7 @@ describe("delete user", async () => {
 				},
 			},
 			secondaryStorage: {
+				namespace,
 				set(key, value) {
 					store.set(key, value);
 				},
@@ -570,7 +581,7 @@ describe("delete user", async () => {
 		// Check if there are multiple sessions
 		const userId = session.data!.session.userId;
 		const sessions = JSON.parse(
-			store.get(`active-sessions-${userId}`)!,
+			store.get(`clearance:${namespace}:active-sessions:${userId}`)!,
 		) as Array<Session>;
 		expect(sessions.length).toBe(2);
 
@@ -582,8 +593,13 @@ describe("delete user", async () => {
 		});
 
 		// All sessions should be gone now
-		expect(store.get(`active-sessions-${userId}`)).toBeUndefined();
-		expect(store.size).toBe(0);
+		expect(
+			store.get(`clearance:${namespace}:active-sessions:${userId}`),
+		).toBeUndefined();
+		expect([...store.keys()]).toEqual([migrationEpochKey]);
+		expect(JSON.parse(store.get(migrationEpochKey)!)).toMatch(
+			/^digest-v1:[A-Za-z0-9_-]+$/,
+		);
 	});
 
 	it("should delete with verification flow and password", async () => {
@@ -740,7 +756,7 @@ describe("delete user", async () => {
 
 	it("rejects /delete-user/callback when the backing session was revoked", async () => {
 		let token = "";
-		const { client, auth, db, sessionSetter } = await getTestInstance(
+		const { client, auth, sessionSetter } = await getTestInstance(
 			{
 				baseURL: "http://localhost:3000",
 				session: { cookieCache: { enabled: true, maxAge: 60 } },
@@ -767,10 +783,10 @@ describe("delete user", async () => {
 			fetchOptions: { onSuccess: sessionSetter(headers) },
 		});
 
-		// Materialize the cookie cache and capture the backing session token.
+		// Materialize the cookie cache and capture the stable backing session ID.
 		const sessionRes = await client.getSession({ fetchOptions: { headers } });
-		const sessionToken = sessionRes.data?.session.token;
-		if (!sessionToken) throw new Error("expected an active session");
+		const sessionId = sessionRes.data?.session.id;
+		if (!sessionId) throw new Error("expected an active session");
 
 		// Request deletion while the session is still valid to obtain a token.
 		await client.deleteUser({ password, fetchOptions: { headers } });
@@ -778,10 +794,7 @@ describe("delete user", async () => {
 
 		// Revoke the backing session server-side; the signed session_data cookie
 		// is still present in `headers`.
-		await db.delete({
-			model: "session",
-			where: [{ field: "token", value: sessionToken }],
-		});
+		await (await auth.$context).internalAdapter.deleteSessionById(sessionId);
 
 		// The GET callback (the email-link path) must not complete deletion from
 		// the stale cookie-cache session now that the backing row is gone.

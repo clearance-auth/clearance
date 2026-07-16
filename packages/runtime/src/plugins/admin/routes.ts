@@ -3,8 +3,9 @@ import {
 	createAuthMiddleware,
 } from "@clearance/core/api";
 import type { Session } from "@clearance/core/db";
-import type { Where } from "@clearance/core/db/adapter";
+import type { DBAdapter, Where } from "@clearance/core/db/adapter";
 import { whereOperators } from "@clearance/core/db/adapter";
+import { runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getAuthoritativeSessionFromCtx, getSessionFromCtx } from "../../api";
@@ -47,6 +48,15 @@ const adminMiddleware = createAuthMiddleware(async (ctx) => {
 
 function parseRoles(roles: string | string[]): string {
 	return Array.isArray(roles) ? roles.join(",") : roles;
+}
+
+function requireAtomicCredentialMutation(adapter: Pick<DBAdapter, "options">) {
+	if (typeof adapter.options?.adapterConfig.transaction !== "function") {
+		throw new APIError("SERVICE_UNAVAILABLE", {
+			message:
+				"Administrative credential revocation requires rollback-capable database transactions",
+		});
+	}
 }
 
 const setRoleBodySchema = z.object({
@@ -663,14 +673,28 @@ export const adminUpdateUser = (opts: AdminOptions) =>
 				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
 			}
 
-			const updatedUser = await ctx.context.internalAdapter.updateUser(
-				ctx.body.userId,
-				ctx.body.data,
-			);
+			const update = async () => {
+				const updatedUser = await ctx.context.internalAdapter.updateUser(
+					ctx.body.userId,
+					ctx.body.data,
+				);
 
-			// Match the ban-user endpoint: banning a user must revoke their sessions.
+				// Match the ban-user endpoint: banning a user revokes every bearer
+				// authority in the same database transaction as the user mutation.
+				if (updateData.banned === true) {
+					await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+					await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+						ctx.body.userId,
+					);
+				}
+				return updatedUser;
+			};
+			let updatedUser: Awaited<ReturnType<typeof update>>;
 			if (updateData.banned === true) {
-				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				requireAtomicCredentialMutation(ctx.context.adapter);
+				updatedUser = await runWithTransaction(ctx.context.adapter, update);
+			} else {
+				updatedUser = await update();
 			}
 
 			return ctx.json(
@@ -1136,22 +1160,28 @@ export const banUser = (opts: AdminOptions) =>
 					ADMIN_ERROR_CODES.YOU_CANNOT_BAN_YOURSELF,
 				);
 			}
-			const user = await ctx.context.internalAdapter.updateUser(
-				ctx.body.userId,
-				{
-					banned: true,
-					banReason:
-						ctx.body.banReason || opts?.defaultBanReason || "No reason",
-					banExpires: ctx.body.banExpiresIn
-						? getDate(ctx.body.banExpiresIn, "sec")
-						: opts?.defaultBanExpiresIn
-							? getDate(opts.defaultBanExpiresIn, "sec")
-							: undefined,
-					updatedAt: new Date(),
-				},
-			);
-			//revoke all sessions
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			const user = await runWithTransaction(ctx.context.adapter, async () => {
+				const updated = await ctx.context.internalAdapter.updateUser(
+					ctx.body.userId,
+					{
+						banned: true,
+						banReason:
+							ctx.body.banReason || opts?.defaultBanReason || "No reason",
+						banExpires: ctx.body.banExpiresIn
+							? getDate(ctx.body.banExpiresIn, "sec")
+							: opts?.defaultBanExpiresIn
+								? getDate(opts.defaultBanExpiresIn, "sec")
+								: undefined,
+						updatedAt: new Date(),
+					},
+				);
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+				return updated;
+			});
 			return ctx.json({
 				user: parseUserOutput(ctx.context.options, user) as UserWithRole,
 			});
@@ -1308,7 +1338,7 @@ export const impersonateUser = (opts: AdminOptions) =>
 				true,
 			);
 			return ctx.json({
-				session: session,
+				session: parseSessionOutput(ctx.context.options, session),
 				user: parseUserOutput(ctx.context.options, targetUser) as UserWithRole,
 			});
 		},
@@ -1380,7 +1410,7 @@ export const stopImpersonating = () =>
 					message: "Failed to find admin session",
 				});
 			}
-			await ctx.context.internalAdapter.deleteSession(session.session.token);
+			await ctx.context.internalAdapter.deleteSessionById(session.session.id);
 			await setSessionCookie(ctx, adminSession, !!dontRememberMeCookie);
 			expireCookie(ctx, adminSessionCookie);
 			return ctx.json({
@@ -1390,11 +1420,20 @@ export const stopImpersonating = () =>
 		},
 	);
 
-const revokeUserSessionBodySchema = z.object({
-	sessionToken: z.string().meta({
-		description: "The session token",
-	}),
-});
+const revokeUserSessionBodySchema = z
+	.object({
+		sessionId: z.string().optional().meta({
+			description: "The stable session identifier",
+		}),
+		sessionToken: z.string().optional().meta({
+			description:
+				"Deprecated session-token compatibility alias. Public session responses provide a non-secret stable handle.",
+			deprecated: true,
+		}),
+	})
+	.refine((body) => Boolean(body.sessionId) !== Boolean(body.sessionToken), {
+		message: "Provide exactly one of sessionId or sessionToken",
+	});
 /**
  * ### Endpoint
  *
@@ -1422,6 +1461,31 @@ export const revokeUserSession = (opts: AdminOptions) =>
 					operationId: "revokeUserSession",
 					summary: "Revoke a user session",
 					description: "Revoke a user session",
+					requestBody: {
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										sessionId: {
+											type: "string",
+											description: "The stable session identifier",
+										},
+										sessionToken: {
+											type: "string",
+											description:
+												"Deprecated non-secret session handle or legacy bearer token",
+											deprecated: true,
+										},
+									},
+									oneOf: [
+										{ required: ["sessionId"] },
+										{ required: ["sessionToken"] },
+									],
+								},
+							},
+						},
+					},
 					responses: {
 						200: {
 							description: "Session revoked",
@@ -1459,7 +1523,18 @@ export const revokeUserSession = (opts: AdminOptions) =>
 				);
 			}
 
-			await ctx.context.internalAdapter.deleteSession(ctx.body.sessionToken);
+			const legacySession = ctx.body.sessionToken
+				? (await ctx.context.internalAdapter.findSessionById(
+						ctx.body.sessionToken,
+					)) ??
+					(await ctx.context.internalAdapter.findSession(
+						ctx.body.sessionToken,
+					))
+				: null;
+			const sessionId = ctx.body.sessionId ?? legacySession?.session.id;
+			if (sessionId) {
+				await ctx.context.internalAdapter.deleteSessionById(sessionId);
+			}
 			return ctx.json({
 				success: true,
 			});
@@ -1535,7 +1610,13 @@ export const revokeUserSessions = (opts: AdminOptions) =>
 				);
 			}
 
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+			});
 			return ctx.json({
 				success: true,
 			});
@@ -1628,8 +1709,14 @@ export const removeUser = (opts: AdminOptions) =>
 				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
 			}
 
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
-			await ctx.context.internalAdapter.deleteUser(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+				await ctx.context.internalAdapter.deleteUser(ctx.body.userId);
+			});
 			return ctx.json({
 				success: true,
 			});

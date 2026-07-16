@@ -37,6 +37,10 @@ import {
 	validateSecretsArray,
 } from "./secret-utils";
 import { hasServerSessionStore } from "./store-capabilities";
+import {
+	attachInternalCredentialAuthority,
+	readInternalCredentialAuthority,
+} from "../internal/credential-authority";
 
 /**
  * Estimates the entropy of a string in bits.
@@ -96,6 +100,7 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 	options: Options,
 	getDatabaseType: (database: Options["database"]) => string,
 ): Promise<AuthContext<Options>> {
+	const credentialAuthority = readInternalCredentialAuthority(options);
 	// secondaryStorage is a durable server-side session store, so treat it like
 	// a database for session cache defaults.
 	const isStateful = hasServerSessionStore(options);
@@ -196,6 +201,16 @@ Most of the features of Clearance will not work correctly.`,
 		basePath: options.basePath || "/api/auth",
 		plugins: plugins.concat(internalPlugins),
 	};
+	if (credentialAuthority) {
+		attachInternalCredentialAuthority(options, credentialAuthority);
+		attachInternalCredentialAuthority(adapter, credentialAuthority);
+	}
+	if (credentialAuthority && adapter.options) {
+		attachInternalCredentialAuthority(
+			adapter.options as unknown as ClearanceOptions,
+			credentialAuthority,
+		);
+	}
 
 	checkEndpointConflicts(options, logger);
 
@@ -382,9 +397,16 @@ Most of the features of Clearance will not work correctly.`,
 			options,
 			logger,
 			hooks: options.databaseHooks
-				? [{ source: "user", hooks: options.databaseHooks }]
+				? [
+						{
+							source: "user",
+							hooks: options.databaseHooks,
+							failureMode: options.databaseHookFailureMode,
+						},
+					]
 				: [],
 			generateId: generateIdFunc,
+			secretConfig,
 		}),
 		createAuthCookie: createCookieGetter(options),
 		async runMigrations() {

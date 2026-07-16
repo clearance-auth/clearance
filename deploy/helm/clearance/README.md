@@ -16,6 +16,7 @@ helm lint deploy/helm/clearance \
   --set-string image.digest=sha256:<immutable-release-digest> \
   --set secrets.existingSecret=clearance-secrets \
   --set console.secrets.existingSecret=clearance-secrets \
+  --set credentialAuthority.deploymentId=release-2026-07-16 \
   --set env.CLEARANCE_BASE_URL=https://auth.example.com \
   --set env.CLEARANCE_CORS_ORIGINS=https://console.example.com
 
@@ -57,6 +58,85 @@ Secret objects are external and Helm cannot hash their contents. Change
 `restartToken` (and `console.restartToken`) after secret rotation to force a
 controlled rollout. The checksum annotation also rolls pods when relevant
 non-secret chart configuration changes.
+
+Credential-authority upgrades use an explicit `bridge -> drain -> migrate ->
+serve` protocol. The database stores the durable phase and generation. Every
+serving API replica holds a shared PostgreSQL session advisory lease and checks
+the durable row on readiness and requests. The migrator requires the exclusive
+form of the same lease, so paused or still-running bridge processes block data
+mutation. PostgreSQL installs `NOT VALID` writer constraints before backfill;
+those constraints reject new plaintext authority immediately. The final
+validated constraints and durable `digest-live` generation reject later legacy
+rollbacks.
+
+For a fresh database, the chart defaults to `bootstrap`: it renders zero API
+replicas and one unexposed migration Job. Install with `--wait --wait-for-jobs`,
+verify that Job completed, then promote the same immutable image to `serve`:
+
+```bash
+helm install clearance deploy/helm/clearance --wait --wait-for-jobs \
+  --set-string image.repository="$IMAGE_REPOSITORY" \
+  --set-string image.digest="$DIGEST" \
+  --set-string secrets.existingSecret="$SECRET_NAME" \
+  --set-string credentialAuthority.deploymentId="$DEPLOYMENT_ID" \
+  --set-string credentialAuthority.migrationAttemptId="install-1" \
+  --set-string env.CLEARANCE_BASE_URL="$BASE_URL"
+kubectl wait --for=condition=complete \
+  -l app.kubernetes.io/component=credential-migrator --timeout=600s
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=serve
+kubectl rollout status deployment/clearance-api
+```
+
+Never use `bootstrap` for an existing database; use the bridge protocol below.
+
+Use one immutable image digest and deployment identity through the cutover:
+
+```bash
+# Roll the 0.3 candidate while it still understands legacy authority.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set-string image.digest="$DIGEST" \
+  --set credentialAuthority.phase=bridge \
+  --set-string credentialAuthority.deploymentId="$DEPLOYMENT_ID" \
+  --set credentialAuthority.expectedRuntimeCount=2
+kubectl rollout status deployment/clearance-api
+
+# Verify every pod imageID, then bind the exact shared-lease count to this rollout.
+clearance schema credential-authority arm \
+  --deployment-id "$DEPLOYMENT_ID" --expected-runtimes 2 --yes
+clearance schema credential-authority drain \
+  --deployment-id "$DEPLOYMENT_ID" --drain-id "$DRAIN_ID" --yes
+
+# Retire all credential-capable API processes and their shared leases.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=drain
+kubectl wait --for=delete pod \
+  -l app=clearance-api,app.kubernetes.io/instance=clearance --timeout=180s
+
+# Render one unexposed, no-retry migration Job with the exact candidate image.
+MIGRATION_ATTEMPT_ID="attempt-$(date -u +%Y%m%dT%H%M%SZ)"
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=migrate \
+  --set-string credentialAuthority.drainId="$DRAIN_ID" \
+  --set-string credentialAuthority.migrationAttemptId="$MIGRATION_ATTEMPT_ID"
+kubectl wait --for=condition=complete \
+  job/clearance-credential-migration-$(printf '%s:%s' "$DRAIN_ID" "$MIGRATION_ATTEMPT_ID" | sha256sum | cut -c1-12) \
+  --timeout=600s
+
+# Start digest-only runtimes after durable publication.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=serve
+kubectl rollout status deployment/clearance-api
+clearance schema credential-authority status --json
+```
+
+`drain` and `migrate` render the API Deployment at zero replicas, omit its
+PodDisruptionBudget, and set revision history to zero. The migration Job has no
+Service and uses the same `repository@digest`, database Secret, deployment ID,
+and drain ID. A failed or interrupted migration leaves the durable phase at
+`migrating`; rerun with the same drain ID and a new, unique migration attempt
+ID. The attempt ID creates a new immutable Job while the durable drain identity
+prevents an unrelated migration from resuming the cutover.
 
 ## Transactional delivery worker
 

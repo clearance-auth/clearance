@@ -6,6 +6,8 @@ import {
 	EVENTS_EXPORT_MAX_LIMIT,
 	EVENTS_TAIL_MAX_LIMIT,
 	USERS_EXPORT_MAX_LIMIT,
+	closeAuthBundle,
+	migrateRuntimeSchemaLocally,
 } from "@clearance/management";
 import { CliExitError, fail, printResult, type GlobalOpts } from "./output.js";
 import {
@@ -75,6 +77,53 @@ async function remoteCommandAction(this: Command): Promise<void> {
 		printResult(g, result);
 	} catch (cause) {
 		fail(cause, g);
+	}
+}
+
+async function schemaMigrateAction(this: Command): Promise<void> {
+	const opts = this.opts() as Record<string, unknown>;
+	if (opts.local !== true) {
+		await remoteCommandAction.call(this);
+		return;
+	}
+	const g = globals(this);
+	try {
+		if (g.profile || g.apiUrl) {
+			throw new ClearanceError({
+				code: "SCHEMA_LOCAL_MIGRATION_REMOTE_FLAGS_INVALID",
+				message: "Local schema migration cannot use an API profile or URL.",
+				stage: "schema.migrate.local",
+				remediation: "Remove --profile and --api-url from the one-shot migration command.",
+			});
+		}
+		if (!g.dryRun && !g.yes) {
+			throw new ClearanceError({
+				code: "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED",
+				message: "Local schema migration requires explicit confirmation.",
+				stage: "schema.migrate.local",
+				remediation: "Review --dry-run, then pass --local --yes.",
+			});
+		}
+		if (
+			!g.dryRun &&
+			(typeof opts.drainId !== "string" || opts.drainId.trim().length === 0)
+		) {
+			throw new ClearanceError({
+				code: "SCHEMA_MIGRATE_DRAIN_ID_REQUIRED",
+				message: "Local schema migration requires the exact armed drain ID.",
+				stage: "schema.migrate.local",
+				remediation: "Pass --local --drain-id <id> --yes from the one-shot migrator.",
+			});
+		}
+		const result = await migrateRuntimeSchemaLocally({
+			dryRun: Boolean(g.dryRun),
+			drainId: typeof opts.drainId === "string" ? opts.drainId : undefined,
+		});
+		printResult(g, result);
+	} catch (cause) {
+		fail(cause, g);
+	} finally {
+		await closeAuthBundle().catch(() => undefined);
 	}
 }
 
@@ -549,6 +598,25 @@ async function main() {
 	schema
 		.command("migrate")
 		.description("Apply pending Clearance migrations and lifecycle compatibility ensures")
+		.option("--local", "Run directly against DATABASE_URL after API replicas drain", false)
+		.option("--drain-id <id>", "Exact armed credential-authority drain id")
+		.action(schemaMigrateAction);
+	const credentialAuthority = schema
+		.command("credential-authority")
+		.description("Durable credential-generation cutover fence");
+	credentialAuthority
+		.command("status")
+		.description("Show durable phase, generation, and active runtime leases")
+		.action(remoteCommandAction);
+	credentialAuthority
+		.command("arm")
+		.requiredOption("--deployment-id <id>", "Immutable candidate deployment id")
+		.requiredOption("--expected-runtimes <count>", "Exact bridge runtime lease count")
+		.action(remoteCommandAction);
+	credentialAuthority
+		.command("drain")
+		.requiredOption("--deployment-id <id>", "Armed candidate deployment id")
+		.requiredOption("--drain-id <id>", "Unique cutover drain id")
 		.action(remoteCommandAction);
 	const storeV2 = schema
 		.command("store-v2")

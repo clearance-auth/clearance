@@ -572,7 +572,7 @@ describe("setActiveTeam org scoping", async () => {
 	let scopedTeamId: string;
 	let outOfScopeOrganizationId: string;
 	let outOfScopeTeamId: string;
-	let sessionToken: string;
+	let sessionId: string;
 	let userId: string;
 
 	beforeAll(async () => {
@@ -580,7 +580,7 @@ describe("setActiveTeam org scoping", async () => {
 			fetchOptions: { headers },
 		});
 		userId = session.data?.user.id as string;
-		sessionToken = session.data?.session.token as string;
+		sessionId = session.data?.session.id as string;
 
 		const firstOrganization = await client.organization.create({
 			name: "Scoped Org One",
@@ -701,8 +701,8 @@ describe("setActiveTeam org scoping", async () => {
 			model: "session",
 			where: [
 				{
-					field: "token",
-					value: sessionToken,
+					field: "id",
+					value: sessionId,
 				},
 			],
 			update: {
@@ -741,8 +741,8 @@ describe("setActiveTeam org scoping", async () => {
 			model: "session",
 			where: [
 				{
-					field: "token",
-					value: sessionToken,
+					field: "id",
+					value: sessionId,
 				},
 			],
 			update: {

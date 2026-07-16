@@ -953,10 +953,17 @@ export const kyselyAdapter = (
 					// `limit(1)`.
 					const targetIds =
 						config?.type === "mssql" ? selectIds.top(1) : selectIds.limit(1);
-					const updateQuery = db
-						.updateTable(model)
-						.set(assignments)
-						.where(`${model}.${idField}`, "in", targetIds);
+					// Keep the single-row selector and repeat the complete guard on the
+					// outer UPDATE. PostgreSQL may evaluate the subquery before waiting
+					// for a concurrent updater; after the wait, the outer guard must be
+					// rechecked against the committed row so only one claimant can win a
+					// state transition such as `active` -> `consumed`.
+					const updateQuery = applyWhere(
+						db
+							.updateTable(model)
+							.set(assignments)
+							.where(`${model}.${idField}`, "in", targetIds),
+					);
 					if (config?.type === "mssql") {
 						return (
 							(await updateQuery.outputAll("inserted").executeTakeFirst()) ??

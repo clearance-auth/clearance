@@ -1,6 +1,8 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mcp } from "../../runtime/src/plugins/mcp/index.js";
+import { oidcProvider } from "../../runtime/src/plugins/oidc-provider/index.js";
 import {
 	createClearanceAuth,
 	decryptRuntimeCredential,
@@ -75,6 +77,83 @@ function signedSessionHeaders(token: string, secret: string): Headers {
 	return new Headers({
 		cookie: `clearance.session_token=${signedToken}`,
 	});
+}
+
+function signedLegacyIdToken(
+	payload: { sub: string; iss: string; aud: string },
+	secret: string,
+): string {
+	const now = Math.floor(Date.now() / 1_000);
+	const header = Buffer.from(
+		JSON.stringify({ alg: "HS256", typ: "JWT" }),
+	).toString("base64url");
+	const body = Buffer.from(
+		JSON.stringify({ ...payload, iat: now, exp: now + 300 }),
+	).toString("base64url");
+	const signingInput = `${header}.${body}`;
+	return `${signingInput}.${createHmac("sha256", secret)
+		.update(signingInput)
+		.digest("base64url")}`;
+}
+
+function sessionCredentialDigest(token: string): string {
+	return `v1:${createHash("sha256")
+		.update(`clearance:session-refresh:v1:${token}`)
+		.digest("base64url")}`;
+}
+
+function credentialOperationKey(label: string): string {
+	return `clr_op_v1_${createHash("sha256").update(label).digest("base64url")}`;
+}
+
+async function insertDigestSession(
+	pool: pg.Pool,
+	input: {
+		userId: string;
+		twoFactorSessionGeneration?: string | undefined;
+	},
+): Promise<string> {
+	const sessionId = randomUUID();
+	const credentialId = randomUUID();
+	const token = `clr_rt_${credentialId}~${randomUUID().replaceAll("-", "")}`;
+	const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		await client.query(
+			`INSERT INTO session
+			 (id, token, "userId", "expiresAt", "createdAt", "updatedAt",
+			  "twoFactorSessionGeneration")
+			 VALUES ($1, 'clr_sid_' || $1, $2, $3, now(), now(), $4)`,
+			[
+				sessionId,
+				input.userId,
+				expiresAt,
+				input.twoFactorSessionGeneration ?? null,
+			],
+		);
+		await client.query(
+			`INSERT INTO "sessionCredential" (
+			 id, selector, "sessionId", "familyId", "secretDigest",
+			 "digestVersion", status, "rotationCounter", "expiresAt",
+			 "createdAt", "updatedAt"
+			) VALUES ($1,$1,$2,$3,$4,1,'active',0,$5,now(),now())`,
+			[
+				credentialId,
+				sessionId,
+				randomUUID(),
+				sessionCredentialDigest(token),
+				expiresAt,
+			],
+		);
+		await client.query("COMMIT");
+		return token;
+	} catch (error) {
+		await client.query("ROLLBACK").catch(() => {});
+		throw error;
+	} finally {
+		client.release();
+	}
 }
 
 describe.sequential.skipIf(!available)(
@@ -158,6 +237,12 @@ describe.sequential.skipIf(!available)(
 				},
 			});
 			headers = signedSessionHeaders(signup.token, secret);
+			headers.set(
+				"idempotency-key",
+				credentialOperationKey(
+					"security-foundation-jwt-refresh-operation-0001",
+				),
+			);
 		});
 
 		afterAll(async () => {
@@ -280,16 +365,31 @@ describe.sequential.skipIf(!available)(
 				)
 			).rows[0]!.twoFactorSessionGeneration;
 			const sessionsAfterActivation = await scopedPool.query<{
-				token: string;
-			}>(`SELECT token FROM session WHERE "userId"=$1`, [user.id]);
-			expect(sessionsAfterActivation.rows.map((row) => row.token)).toEqual([
-				activated.token,
-			]);
-			expect(
-				sessionsAfterActivation.rows.some(
-					(row) => row.token === additionalSession.token,
-				),
-			).toBe(false);
+				id: string;
+				token: string | null;
+			}>(`SELECT id, token FROM session WHERE "userId"=$1`, [user.id]);
+			expect(sessionsAfterActivation.rows).toHaveLength(1);
+			expect(sessionsAfterActivation.rows[0]?.token).toBe(
+				`clr_sid_${sessionsAfterActivation.rows[0]?.id}`,
+			);
+			const activeCredential = (
+				await scopedPool.query<{
+					secretDigest: string;
+					status: string;
+				}>(
+					`SELECT "secretDigest", status FROM "sessionCredential"
+					 WHERE "sessionId"=$1`,
+					[sessionsAfterActivation.rows[0]!.id],
+				)
+			).rows[0]!;
+			expect(activeCredential).toEqual({
+				secretDigest: sessionCredentialDigest(activated.token),
+				status: "active",
+			});
+			expect(activeCredential.secretDigest).not.toContain(activated.token);
+			expect(activeCredential.secretDigest).not.toContain(
+				additionalSession.token,
+			);
 
 			const passwordOnly = await postAuth(
 				"/two-factor/generate-backup-codes",
@@ -298,13 +398,9 @@ describe.sequential.skipIf(!available)(
 			);
 			expect(passwordOnly.status).toBe(400);
 
-			const staleSessionToken = `stale-${randomUUID()}`;
-			await scopedPool.query(
-				`INSERT INTO session
-				 (id, token, "userId", "expiresAt", "createdAt", "updatedAt")
-				 VALUES ($1, $2, $3, now()+interval '1 day', now(), now())`,
-				[randomUUID(), staleSessionToken, user.id],
-			);
+			const staleSessionToken = await insertDigestSession(scopedPool, {
+				userId: user.id,
+			});
 			const trustIdentifier = `trust-device-${randomUUID()}`;
 			const activeTrustGeneration = (
 				await scopedPool.query<{ trustDeviceGeneration: string }>(
@@ -343,23 +439,27 @@ describe.sequential.skipIf(!available)(
 			};
 			expect(generated.backupCodes).toHaveLength(10);
 			const sessionsAfterRegeneration = await scopedPool.query<{
-				token: string;
-			}>(`SELECT token FROM session WHERE "userId"=$1`, [user.id]);
+				id: string;
+				token: string | null;
+			}>(`SELECT id, token FROM session WHERE "userId"=$1`, [user.id]);
 			expect(sessionsAfterRegeneration.rows).toHaveLength(1);
-			expect(
-				sessionsAfterRegeneration.rows.some(
-					(row) =>
-						row.token === activated.token || row.token === staleSessionToken,
-				),
-			).toBe(false);
-			const lateStaleToken = `late-stale-${randomUUID()}`;
-			await scopedPool.query(
-				`INSERT INTO session
-				 (id, token, "userId", "expiresAt", "createdAt", "updatedAt",
-				  "twoFactorSessionGeneration")
-				 VALUES ($1, $2, $3, now()+interval '1 day', now(), now(), $4)`,
-				[randomUUID(), lateStaleToken, user.id, preRotationSessionGeneration],
+			expect(sessionsAfterRegeneration.rows[0]?.token).toBe(
+				`clr_sid_${sessionsAfterRegeneration.rows[0]?.id}`,
 			);
+			expect(
+				await scopedPool.query(
+					`SELECT id FROM "sessionCredential"
+					 WHERE "secretDigest" IN ($1,$2) AND status='active'`,
+					[
+						sessionCredentialDigest(activated.token),
+						sessionCredentialDigest(staleSessionToken),
+					],
+				),
+			).toMatchObject({ rowCount: 0 });
+			const lateStaleToken = await insertDigestSession(scopedPool, {
+				userId: user.id,
+				twoFactorSessionGeneration: preRotationSessionGeneration,
+			});
 			expect(
 				await bundle.auth.api.getSession({
 					headers: signedSessionHeaders(lateStaleToken, secret),
@@ -570,6 +670,697 @@ describe.sequential.skipIf(!available)(
 describe.sequential.skipIf(!available)(
 	"authentication security schema upgrade",
 	() => {
+		it("rolls back signup when the durable identity bridge fails once", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_identity_bridge_${suffix}`;
+			const email = `identity-rollback-${suffix}@example.test`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			let bridgeCalls = 0;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "identity-bridge-rollback-proof-secret!!",
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					onUserCreated: async () => {
+						bridgeCalls += 1;
+						throw new Error("management identity sync failed");
+					},
+				});
+				await bundle.migrate();
+
+				await expect(
+					bundle.auth.api.signUpEmail({
+						body: {
+							email,
+							password: "correct-horse-battery-staple",
+							name: "Identity Rollback",
+						},
+					}),
+				).rejects.toThrow("Failed to create user");
+				expect(bridgeCalls).toBe(1);
+				const persisted = await scopedPool.query<{ count: number }>(
+					`SELECT count(*)::int AS count FROM "user" WHERE email = $1`,
+					[email],
+				);
+				expect(persisted.rows[0]?.count).toBe(0);
+			} finally {
+				await bundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("installs and validates the durable PostgreSQL credential writer fence", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_drain_fence_${suffix}`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				const now = new Date();
+				await scopedPool.query(`
+					CREATE TABLE "user" (
+						id text PRIMARY KEY,
+						name text NOT NULL,
+						email text NOT NULL UNIQUE,
+						"emailVerified" boolean NOT NULL,
+						image text,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL
+					);
+					CREATE TABLE session (
+						id text PRIMARY KEY,
+						"expiresAt" timestamptz NOT NULL,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL,
+						"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+						token text NOT NULL UNIQUE
+					)
+				`);
+				await scopedPool.query(
+					`INSERT INTO "user" (
+						id, name, email, "emailVerified", "createdAt", "updatedAt"
+					) VALUES ('drain-user', 'Drain User', 'drain@example.test', true, $1, $1)`,
+					[now],
+				);
+				await scopedPool.query(
+					`INSERT INTO session (
+						id, "expiresAt", "createdAt", "updatedAt", "userId", token
+					) VALUES ('drain-session', $1, $2, $2, 'drain-user', 'legacy-drain-bearer')`,
+					[new Date(now.getTime() + 3_600_000), now],
+				);
+
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "bundle-migrate-drain-fence-proof-secret!!",
+					databaseUrl,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+				});
+				const directPlan = await bundle.planMigrations();
+				expect(directPlan.pendingSecurityMigrations).toContain(
+					"session-credential-digests-v1",
+				);
+				await expect(directPlan.apply()).rejects.toThrow(
+					"reserved for createClearanceAuth(...).migrate()",
+				);
+				expect(
+					await scopedPool.query(
+						`SELECT to_regclass(format('%I.%I', current_schema(), 'sessionCredential')) AS table`,
+					),
+				).toMatchObject({ rows: [{ table: null }] });
+				await bundle.migrate();
+
+				const fence = await basePool.query<{
+					kind: string;
+					validated: boolean;
+				}>(
+					`SELECT constraint_record.contype AS kind,
+					        constraint_record.convalidated AS validated
+					 FROM pg_constraint constraint_record
+					 JOIN pg_class table_record
+					   ON table_record.oid = constraint_record.conrelid
+					 JOIN pg_namespace namespace_record
+					   ON namespace_record.oid = table_record.relnamespace
+					 WHERE namespace_record.nspname = $1
+					   AND table_record.relname = 'session'
+					   AND constraint_record.conname = 'clearance_session_credential_authority_v1'`,
+					[schema],
+				);
+				expect(fence.rows).toEqual([{ kind: "c", validated: true }]);
+				const migrated = await scopedPool.query<{
+					token: string;
+					credentialCount: number;
+				}>(
+					`SELECT session.token,
+					        count(credential.id)::int AS "credentialCount"
+					 FROM session
+					 JOIN "sessionCredential" credential
+					   ON credential."sessionId" = session.id
+					 WHERE session.id = 'drain-session'
+					 GROUP BY session.token`,
+				);
+				expect(migrated.rows[0]).toEqual({
+					token: "clr_sid_drain-session",
+					credentialCount: 1,
+				});
+				await expect(
+					scopedPool.query(
+						`INSERT INTO session (
+							id, "expiresAt", "createdAt", "updatedAt", "userId", token
+						 ) VALUES (
+							'legacy-writer-after-fence', $1, $2, $2,
+							'drain-user', 'legacy-writer-bearer'
+						 )`,
+						[new Date(now.getTime() + 3_600_000), now],
+					),
+				).rejects.toMatchObject({
+					constraint: "clearance_session_credential_authority_v1",
+				});
+
+				const beforeMarkerDrift = await bundle.credentialAuthority.status();
+				await scopedPool.query(
+					`DELETE FROM "securityMigration"
+					 WHERE key = 'session-credential-digests-v1'`,
+				);
+				await expect(bundle.migrate()).rejects.toThrow(
+					"markers conflict with the durable digest-live generation",
+				);
+				const afterMarkerDrift = await bundle.credentialAuthority.status();
+				expect(afterMarkerDrift).toMatchObject({
+					phase: "digest-live",
+					generation: "digest-v1",
+					revision: beforeMarkerDrift.revision,
+				});
+			} finally {
+				await bundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("keeps legacy sessions live through bridge, drain, migration, and digest restart", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_bridge_cutover_${suffix}`;
+			const baseURL = "http://localhost:3300/api/auth";
+			const secret = "credential-bridge-cutover-proof-secret!!";
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bridgeBundle: ClearanceAuthBundle | undefined;
+			let logoutBridgeBundle: ClearanceAuthBundle | undefined;
+			let staleBridgeBundle: ClearanceAuthBundle | undefined;
+			let migratorBundle: ClearanceAuthBundle | undefined;
+			let digestBundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				const common = {
+					baseURL,
+					secret,
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					plugins: [mcp({ loginPage: "/login" })],
+				} as const;
+
+				const seedUserId = `legacy-user-${suffix}`;
+				const logoutUserId = `legacy-logout-user-${suffix}`;
+				const legacySeedToken = `legacy-session-${randomUUID()}`;
+				const legacyAccessToken = `legacy-access-${randomUUID()}`;
+				const legacyRefreshToken = `legacy-refresh-${randomUUID()}`;
+				const legacyLogoutAccessToken = `legacy-logout-access-${randomUUID()}`;
+				const legacyLogoutRefreshToken = `legacy-logout-refresh-${randomUUID()}`;
+				await scopedPool.query(`
+					CREATE TABLE "user" (
+						id text PRIMARY KEY,
+						name text NOT NULL,
+						email text NOT NULL UNIQUE,
+						"emailVerified" boolean NOT NULL,
+						image text,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL,
+						banned boolean DEFAULT false,
+						"banReason" text
+					);
+					CREATE TABLE account (
+						id text PRIMARY KEY,
+						"accountId" text NOT NULL,
+						"providerId" text NOT NULL,
+						"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+						"accessToken" text,
+						"refreshToken" text,
+						"idToken" text,
+						"accessTokenExpiresAt" timestamptz,
+						"refreshTokenExpiresAt" timestamptz,
+						scope text,
+						password text,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL
+					);
+					CREATE TABLE session (
+						id text PRIMARY KEY,
+						"expiresAt" timestamptz NOT NULL,
+						token text NOT NULL UNIQUE,
+						"createdAt" timestamptz NOT NULL,
+						"updatedAt" timestamptz NOT NULL,
+						"ipAddress" text,
+						"userAgent" text,
+						"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE
+					);
+					CREATE TABLE verification (
+						id text PRIMARY KEY,
+						identifier text NOT NULL,
+						value text NOT NULL,
+						"expiresAt" timestamptz NOT NULL,
+							"createdAt" timestamptz,
+							"updatedAt" timestamptz
+						);
+						CREATE TABLE "oauthApplication" (
+							id text PRIMARY KEY,
+							name text NOT NULL,
+							icon text,
+							metadata text,
+							"clientId" text NOT NULL UNIQUE,
+							"clientSecret" text,
+							"redirectUrls" text NOT NULL,
+							type text NOT NULL,
+							disabled boolean DEFAULT false,
+							"userId" text REFERENCES "user"(id) ON DELETE CASCADE,
+							"createdAt" timestamptz NOT NULL,
+							"updatedAt" timestamptz NOT NULL
+						);
+						CREATE TABLE "oauthAccessToken" (
+							id text PRIMARY KEY,
+							"accessToken" text,
+							"refreshToken" text,
+							"accessTokenExpiresAt" timestamptz NOT NULL,
+							"refreshTokenExpiresAt" timestamptz,
+							"clientId" text NOT NULL,
+							"userId" text REFERENCES "user"(id) ON DELETE CASCADE,
+							scopes text NOT NULL,
+							"createdAt" timestamptz NOT NULL,
+							"updatedAt" timestamptz NOT NULL
+						)
+				`);
+				await scopedPool.query(
+					`INSERT INTO "user" (
+						id, name, email, "emailVerified", "createdAt", "updatedAt"
+					) VALUES ($1, 'Bridge Seed', $2, true, now(), now())`,
+					[seedUserId, `bridge-seed-${suffix}@example.test`],
+				);
+				await scopedPool.query(
+					`INSERT INTO "user" (
+						id, name, email, "emailVerified", "createdAt", "updatedAt"
+					) VALUES ($1, 'Legacy Logout', $2, true, now(), now())`,
+					[logoutUserId, `legacy-logout-${suffix}@example.test`],
+				);
+				await scopedPool.query(
+					`INSERT INTO session (
+						id, "expiresAt", token, "createdAt", "updatedAt", "userId"
+					 ) VALUES ($1, now() + interval '1 hour', $2, now(), now(), $3)`,
+					[`legacy-session-row-${suffix}`, legacySeedToken, seedUserId],
+				);
+				await scopedPool.query(
+					`INSERT INTO "oauthApplication" (
+							id, name, "clientId", "clientSecret", "redirectUrls", type,
+							disabled, "createdAt", "updatedAt"
+						 ) VALUES ($1, 'Legacy MCP client', 'legacy-mcp-client',
+							'legacy-mcp-secret', 'https://client.example.test/callback',
+							'web', false, now(), now())`,
+					[randomUUID()],
+				);
+				await scopedPool.query(
+					`INSERT INTO "oauthAccessToken" (
+							id, "accessToken", "refreshToken", "accessTokenExpiresAt",
+							"refreshTokenExpiresAt", "clientId", "userId", scopes,
+							"createdAt", "updatedAt"
+						 ) VALUES ($1, $2, $3, now() + interval '5 minutes',
+							now() + interval '1 hour', 'legacy-mcp-client', $4,
+							'openid offline_access', now(), now())`,
+					[randomUUID(), legacyAccessToken, legacyRefreshToken, seedUserId],
+				);
+				await scopedPool.query(
+					`INSERT INTO "oauthAccessToken" (
+							id, "accessToken", "refreshToken", "accessTokenExpiresAt",
+							"refreshTokenExpiresAt", "clientId", "userId", scopes,
+							"createdAt", "updatedAt"
+						 ) VALUES ($1, $2, $3, now() + interval '5 minutes',
+							now() + interval '1 hour', 'legacy-mcp-client', $4,
+							'openid offline_access', now(), now())`,
+					[
+						randomUUID(),
+						legacyLogoutAccessToken,
+						legacyLogoutRefreshToken,
+						logoutUserId,
+					],
+				);
+				const preBridgeCatalog = await scopedPool.query<{ name: string }>(`
+					SELECT table_name AS name FROM information_schema.tables
+					WHERE table_schema = current_schema()
+					  AND table_name IN ('twoFactor', 'jwks', 'sessionCredential', 'securityMigration', 'credentialAuthorityFence')
+				`);
+				expect(preBridgeCatalog.rows).toEqual([]);
+
+				const deploymentId = `bridge-${suffix}`;
+				const drainId = `drain-${suffix}`;
+				bridgeBundle = createClearanceAuth({
+					...common,
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId,
+						instanceId: `bridge-pod-${suffix}`,
+					},
+				});
+				expect(Object.isFrozen(bridgeBundle.credentialAuthority)).toBe(true);
+				expect(
+					"withExclusiveMigrationLease" in bridgeBundle.credentialAuthority,
+				).toBe(false);
+				expect("releaseRuntimeLease" in bridgeBundle.credentialAuthority).toBe(
+					false,
+				);
+				await bridgeBundle.prepareCredentialAuthorityRuntime();
+				const bridgeContext = await bridgeBundle.auth.$context;
+				for (const surface of [
+					(bridgeBundle.auth as unknown as { options: object }).options,
+					bridgeContext.options,
+					bridgeContext.adapter.options,
+				]) {
+					expect(
+						Object.getOwnPropertySymbols(surface).map(String),
+					).not.toContain("Symbol(credential-authority-internal)");
+				}
+				const bridgeColumns = await scopedPool.query<{
+					tableName: string;
+					columnName: string;
+				}>(`
+					SELECT table_name AS "tableName", column_name AS "columnName"
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND (
+					    (table_name = 'user' AND column_name IN ('twoFactorEnabled', 'twoFactorSessionGeneration'))
+					    OR (table_name = 'session' AND column_name = 'twoFactorSessionGeneration')
+					    OR (table_name = 'twoFactor' AND column_name IN (
+					      'pendingSecret', 'pendingBackupCodes', 'verified',
+					      'failedVerificationCount', 'activeVerificationReservations',
+					      'lockedUntil', 'lastUsedTotpCounter', 'trustDeviceGeneration'
+					    ))
+					    OR (table_name = 'jwks' AND column_name IN ('alg', 'crv'))
+					  )
+					ORDER BY table_name, column_name
+				`);
+				expect(
+					bridgeColumns.rows.map((row) => `${row.tableName}.${row.columnName}`),
+				).toEqual([
+					"jwks.alg",
+					"jwks.crv",
+					"session.twoFactorSessionGeneration",
+					"twoFactor.activeVerificationReservations",
+					"twoFactor.failedVerificationCount",
+					"twoFactor.lastUsedTotpCounter",
+					"twoFactor.lockedUntil",
+					"twoFactor.pendingBackupCodes",
+					"twoFactor.pendingSecret",
+					"twoFactor.trustDeviceGeneration",
+					"twoFactor.verified",
+					"user.twoFactorEnabled",
+					"user.twoFactorSessionGeneration",
+				]);
+				const bridgeOnlyCatalog = await scopedPool.query<{ name: string }>(`
+					SELECT table_name AS name FROM information_schema.tables
+					WHERE table_schema = current_schema()
+					  AND table_name IN ('sessionCredential', 'securityMigration')
+				`);
+				expect(bridgeOnlyCatalog.rows).toEqual([]);
+				const seededHeaders = signedSessionHeaders(legacySeedToken, secret);
+				await expect(
+					bridgeBundle.auth.api.getSession({ headers: seededHeaders }),
+				).resolves.toMatchObject({ user: { id: seedUserId } });
+				const legacyMcpResponse = await bridgeBundle.auth.handler(
+					new Request(`${baseURL}/mcp/get-session`, {
+						headers: { authorization: `Bearer ${legacyAccessToken}` },
+					}),
+				);
+				expect(legacyMcpResponse.status).toBe(200);
+				expect(await legacyMcpResponse.text()).toContain(seedUserId);
+				const legacyRefreshResponse = await bridgeBundle.auth.handler(
+					new Request(`${baseURL}/mcp/token`, {
+						method: "POST",
+						headers: {
+							"content-type": "application/x-www-form-urlencoded",
+						},
+						body: new URLSearchParams({
+							grant_type: "refresh_token",
+							client_id: "legacy-mcp-client",
+							client_secret: "legacy-mcp-secret",
+							refresh_token: legacyRefreshToken,
+						}).toString(),
+					}),
+				);
+				expect(legacyRefreshResponse.status).toBe(200);
+				expect(await legacyRefreshResponse.json()).toMatchObject({
+					access_token: expect.any(String),
+					refresh_token: expect.any(String),
+					token_type: "Bearer",
+				});
+				logoutBridgeBundle = createClearanceAuth({
+					...common,
+					plugins: [
+						oidcProvider({
+							loginPage: "/login",
+							__skipDeprecationWarning: true,
+						}),
+					],
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId,
+						instanceId: `logout-bridge-pod-${suffix}`,
+					},
+				});
+				await logoutBridgeBundle.prepareCredentialAuthorityRuntime();
+				const legacyMetadataResponse = await logoutBridgeBundle.auth.handler(
+					new Request(`${baseURL}/.well-known/openid-configuration`),
+				);
+				expect(legacyMetadataResponse.status).toBe(200);
+				const legacyMetadata = (await legacyMetadataResponse.json()) as {
+					issuer: string;
+				};
+				const legacyIdTokenWithoutSid = signedLegacyIdToken(
+					{
+						sub: logoutUserId,
+						iss: legacyMetadata.issuer,
+						aud: "legacy-mcp-client",
+					},
+					"legacy-mcp-secret",
+				);
+				const legacyLogoutUrl = new URL(`${baseURL}/oauth2/endsession`);
+				legacyLogoutUrl.searchParams.set(
+					"id_token_hint",
+					legacyIdTokenWithoutSid,
+				);
+				legacyLogoutUrl.searchParams.set("client_id", "legacy-mcp-client");
+				const legacyLogoutResponse = await logoutBridgeBundle.auth.handler(
+					new Request(legacyLogoutUrl, {
+						headers: { "Sec-Fetch-Site": "same-origin" },
+					}),
+				);
+				expect(legacyLogoutResponse.status).toBe(200);
+				expect(
+					(
+						await scopedPool.query<{ count: string }>(
+							`SELECT count(*)::text AS count FROM "oauthAccessToken"
+								 WHERE "userId" = $1 AND "clientId" = 'legacy-mcp-client'`,
+							[logoutUserId],
+						)
+					).rows[0]?.count,
+				).toBe("0");
+				await logoutBridgeBundle.destroy();
+				logoutBridgeBundle = undefined;
+				const bridgeIssued = await bridgeBundle.auth.api.signUpEmail({
+					body: {
+						email: `bridge-issued-${suffix}@example.test`,
+						password: "correct-horse-battery-staple",
+						name: "Bridge Issued",
+					},
+				});
+				await expect(
+					bridgeBundle.auth.api.getSession({
+						headers: signedSessionHeaders(bridgeIssued.token, secret),
+					}),
+				).resolves.toMatchObject({ user: { id: bridgeIssued.user.id } });
+				await expect(
+					scopedPool.query(`SELECT 1 FROM "sessionCredential"`),
+				).rejects.toMatchObject({ code: "42P01" });
+
+				await bridgeBundle.credentialAuthority.arm({
+					deploymentId,
+					expectedRuntimeCount: 1,
+				});
+				await bridgeBundle.credentialAuthority.beginDrain({
+					deploymentId,
+					drainId,
+				});
+				const beforeStaleStart = await scopedPool.query<{
+					catalog: string;
+					fence: string;
+				}>(`
+					SELECT
+						md5(COALESCE(string_agg(
+							table_name || ':' || column_name || ':' || data_type || ':' || is_nullable,
+							',' ORDER BY table_name, ordinal_position
+						), '')) AS catalog,
+						(SELECT row_to_json(fence)::text FROM "credentialAuthorityFence" fence
+						 WHERE id = 'credential-authority') AS fence
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+				`);
+				staleBridgeBundle = createClearanceAuth({
+					...common,
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId,
+						instanceId: `stale-bridge-pod-${suffix}`,
+					},
+				});
+				await expect(
+					staleBridgeBundle.prepareCredentialAuthorityRuntime(),
+				).rejects.toThrow(/draining|fenced/);
+				const afterStaleStart = await scopedPool.query<{
+					catalog: string;
+					fence: string;
+				}>(`
+					SELECT
+						md5(COALESCE(string_agg(
+							table_name || ':' || column_name || ':' || data_type || ':' || is_nullable,
+							',' ORDER BY table_name, ordinal_position
+						), '')) AS catalog,
+						(SELECT row_to_json(fence)::text FROM "credentialAuthorityFence" fence
+						 WHERE id = 'credential-authority') AS fence
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+				`);
+				expect(afterStaleStart.rows).toEqual(beforeStaleStart.rows);
+				await staleBridgeBundle.destroy();
+				staleBridgeBundle = undefined;
+				const retainedBridgeContext = await bridgeBundle.auth.$context;
+				await bridgeBundle.destroy();
+				await expect(
+					retainedBridgeContext.internalAdapter.createSession(seedUserId),
+				).rejects.toThrow(/closing|draining|fenced|cannot serve/);
+				bridgeBundle = undefined;
+
+				migratorBundle = createClearanceAuth({
+					...common,
+					credentialAuthority: {
+						generation: "digest-v1",
+						deploymentId,
+						instanceId: `migrator-${suffix}`,
+						migrationDrainId: drainId,
+					},
+				});
+				await migratorBundle.migrate({ drainId });
+				expect(await migratorBundle.credentialAuthority.status()).toMatchObject(
+					{
+						phase: "digest-live",
+						generation: "digest-v1",
+					},
+				);
+				const migratedCredentials = await scopedPool.query<{
+					secretDigest: string;
+					status: string;
+				}>(
+					`SELECT "secretDigest", status FROM "sessionCredential"
+					 WHERE "sessionId" IN (
+						SELECT id FROM session WHERE "userId" IN ($1, $2)
+					 )`,
+					[seedUserId, bridgeIssued.user.id],
+				);
+				expect(migratedCredentials.rows).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							secretDigest: sessionCredentialDigest(legacySeedToken),
+							status: "active",
+						}),
+						expect.objectContaining({
+							secretDigest: sessionCredentialDigest(bridgeIssued.token),
+							status: "active",
+						}),
+					]),
+				);
+				const migratedOAuth = await scopedPool.query<{
+					accessToken: string;
+					refreshToken: string;
+					accessTokenDigest: string;
+					refreshTokenDigest: string;
+				}>(
+					`SELECT "accessToken", "refreshToken", "accessTokenDigest", "refreshTokenDigest"
+						 FROM "oauthAccessToken" WHERE "userId" = $1`,
+					[seedUserId],
+				);
+				expect(migratedOAuth.rows.length).toBeGreaterThanOrEqual(2);
+				for (const row of migratedOAuth.rows) {
+					expect(row).toMatchObject({
+						accessTokenDigest: expect.stringMatching(/^v1:/),
+						refreshTokenDigest: expect.stringMatching(/^v1:/),
+						accessToken: expect.stringMatching(/^clr_oauth_ref_access_/),
+						refreshToken: expect.stringMatching(/^clr_oauth_ref_refresh_/),
+					});
+				}
+				await migratorBundle.destroy();
+				migratorBundle = undefined;
+
+				digestBundle = createClearanceAuth({
+					...common,
+					credentialAuthority: {
+						generation: "digest-v1",
+						deploymentId,
+						instanceId: `digest-pod-${suffix}`,
+					},
+				});
+				await digestBundle.credentialAuthority.assertRuntimeServing();
+				const digestContext = await digestBundle.auth.$context;
+				await expect(
+					digestContext.internalAdapter.findSession(legacySeedToken),
+				).resolves.toMatchObject({ user: { id: seedUserId } });
+				await expect(
+					digestBundle.auth.api.getSession({ headers: seededHeaders }),
+				).resolves.toMatchObject({ user: { id: seedUserId } });
+				await expect(
+					digestBundle.auth.api.getSession({
+						headers: signedSessionHeaders(bridgeIssued.token, secret),
+					}),
+				).resolves.toMatchObject({ user: { id: bridgeIssued.user.id } });
+				const digestMcpResponse = await digestBundle.auth.handler(
+					new Request(`${baseURL}/mcp/get-session`, {
+						headers: { authorization: `Bearer ${legacyAccessToken}` },
+					}),
+				);
+				expect(digestMcpResponse.status).toBe(200);
+				expect(await digestMcpResponse.text()).toContain(seedUserId);
+			} finally {
+				await digestBundle?.destroy();
+				await migratorBundle?.destroy();
+				await staleBridgeBundle?.destroy();
+				await logoutBridgeBundle?.destroy();
+				await bridgeBundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
 		it("adds signing metadata to the legacy table shape and rotates its key", async () => {
 			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
 			const schema = `auth_security_upgrade_${suffix}`;
@@ -609,6 +1400,10 @@ describe.sequential.skipIf(!available)(
 					},
 				});
 				const headers = signedSessionHeaders(signup.token, secret);
+				headers.set(
+					"idempotency-key",
+					credentialOperationKey("security-upgrade-jwt-refresh-operation-0001"),
+				);
 				const legacyToken = await oldBundle.auth.api.getToken({ headers });
 				const legacyHeader = decodeJwtPart<{ kid: string }>(
 					legacyToken.token,

@@ -6,6 +6,7 @@ import {
 } from "@clearance/core/context";
 import type { BaseModelNames } from "@clearance/core/db";
 import type { DBAdapter, Where } from "@clearance/core/db/adapter";
+import type { InternalLogger } from "@clearance/core/env";
 import {
 	ATTR_CONTEXT,
 	ATTR_DB_COLLECTION_NAME,
@@ -16,6 +17,7 @@ import {
 export type DatabaseHooksEntry = {
 	source: string;
 	hooks: Exclude<ClearanceOptions["databaseHooks"], undefined>;
+	failureMode?: "observe" | "rollback" | undefined;
 };
 
 export function getWithHooks(
@@ -23,9 +25,46 @@ export function getWithHooks(
 	ctx: {
 		options: ClearanceOptions;
 		hooks: DatabaseHooksEntry[];
+		logger?: Pick<InternalLogger, "error"> | undefined;
 	},
 ) {
 	const hooksEntries = ctx.hooks;
+
+	async function queuePublicAfterHook(
+		model: BaseModelNames,
+		operation: "create" | "update" | "updateMany" | "delete" | "deleteMany",
+		source: string,
+		failureMode: "observe" | "rollback" | undefined,
+		run: () => Promise<unknown>,
+	): Promise<void> {
+		const execute = () =>
+			withSpan(
+				`db ${operation}.after ${model}`,
+				{
+					[ATTR_HOOK_TYPE]: `${operation}.after`,
+					[ATTR_DB_COLLECTION_NAME]: model,
+					[ATTR_CONTEXT]: source,
+				},
+				run,
+			);
+		if (failureMode === "rollback") {
+			await execute();
+			return;
+		}
+		await queueAfterTransactionHook(async () => {
+			try {
+				await execute();
+			} catch (error) {
+				ctx.logger?.error("Database after hook failed after commit", {
+					model,
+					operation,
+					source,
+					errorName: error instanceof Error ? error.name : "UnknownError",
+				});
+			}
+		});
+	}
+
 	async function createWithHooks<T extends Record<string, any>>(
 		data: T,
 		model: BaseModelNames,
@@ -35,6 +74,7 @@ export function getWithHooks(
 					executeMainFn?: boolean;
 			  }
 			| undefined,
+		enforceData?: ((data: T) => T) | undefined,
 	) {
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
@@ -64,6 +104,7 @@ export function getWithHooks(
 				}
 			}
 		}
+		actualData = enforceData ? enforceData(actualData) : actualData;
 
 		let created: any = null;
 		if (!customCreateFn || customCreateFn.executeMainFn) {
@@ -77,22 +118,13 @@ export function getWithHooks(
 			created = await customCreateFn.fn(created ?? actualData);
 		}
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.create?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db create.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "create.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(created as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "create", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(created as any, context),
+				);
 			}
 		}
 
@@ -109,6 +141,7 @@ export function getWithHooks(
 					executeMainFn?: boolean;
 			  }
 			| undefined,
+		enforceData?: ((data: T) => T) | undefined,
 	) {
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
@@ -139,6 +172,7 @@ export function getWithHooks(
 				}
 			}
 		}
+		actualData = enforceData ? enforceData(actualData) : actualData;
 
 		const customUpdated = customUpdateFn
 			? await customUpdateFn.fn(actualData)
@@ -153,22 +187,13 @@ export function getWithHooks(
 					})
 				: customUpdated;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.update?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db update.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "update.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(updated as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "update", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(updated as any, context),
+				);
 			}
 		}
 		return updated;
@@ -228,22 +253,13 @@ export function getWithHooks(
 					})
 				: customUpdated;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.update?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db updateMany.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "updateMany.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(updated as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "updateMany", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(updated as any, context),
+				);
 			}
 		}
 
@@ -311,22 +327,13 @@ export function getWithHooks(
 				: customDeleted;
 
 		if (entityToDelete) {
-			for (const { source, hooks } of hooksEntries) {
+			for (const { source, hooks, failureMode } of hooksEntries) {
 				const toRun = hooks[model]?.delete?.after;
 				if (toRun) {
-					await queueAfterTransactionHook(async () => {
-						await withSpan(
-							`db delete.after ${model}`,
-							{
-								[ATTR_HOOK_TYPE]: "delete.after",
-								[ATTR_DB_COLLECTION_NAME]: model,
-								[ATTR_CONTEXT]: source,
-							},
-							() =>
-								// @ts-expect-error context type mismatch
-								toRun(entityToDelete as any, context),
-						);
-					});
+					await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+						// @ts-expect-error context type mismatch
+						toRun(entityToDelete as any, context),
+					);
 				}
 			}
 		}
@@ -391,23 +398,13 @@ export function getWithHooks(
 				: customDeleted;
 
 		for (const entity of entitiesToDelete) {
-			for (const { source, hooks } of hooksEntries) {
+			for (const { source, hooks, failureMode } of hooksEntries) {
 				const toRun = hooks[model]?.delete?.after;
 				if (toRun) {
-					// Queue after hooks to run post-transaction
-					await queueAfterTransactionHook(async () => {
-						await withSpan(
-							`db delete.after ${model}`,
-							{
-								[ATTR_HOOK_TYPE]: "delete.after",
-								[ATTR_DB_COLLECTION_NAME]: model,
-								[ATTR_CONTEXT]: source,
-							},
-							() =>
-								// @ts-expect-error context type mismatch
-								toRun(entity as any, context),
-						);
-					});
+					await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+						// @ts-expect-error context type mismatch
+						toRun(entity as any, context),
+					);
 				}
 			}
 		}
@@ -479,22 +476,13 @@ export function getWithHooks(
 		const consumed = await consumeFn();
 		if (!consumed) return null;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.delete?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db delete.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "delete.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(consumed as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(consumed as any, context),
+				);
 			}
 		}
 

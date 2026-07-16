@@ -29,7 +29,12 @@ const readonlyQueryValues = ["active", 10] as const;
 
 async function assertPublicCompatibility(): Promise<void> {
 	await bundle.auth.api.signInEmail({});
-	await bundle.auth.api.getSession({});
+	const session = await bundle.auth.api.getSession({});
+	if (session) {
+		void session.session.id;
+		const deprecatedNonSecretHandle: string = session.session.token;
+		void deprecatedNonSecretHandle;
+	}
 	await bundle.auth.api.resetPassword({});
 
 	const { rows, rowCount } = await bundle.pool.query(

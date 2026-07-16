@@ -12,6 +12,19 @@ image:
 replicaCount: 2
 revisionHistoryLimit: 5
 terminationGracePeriodSeconds: 30
+# Credential-authority upgrades are an explicit four-phase protocol. Existing
+# installations first roll this candidate in bridge, then arm/drain through the
+# CLI, render drain, run migrate, and finally render serve.
+credentialAuthority:
+  # Fresh installs start with an unexposed bootstrap Job and zero API replicas.
+  # Promote to serve only after that Job publishes digest-live.
+  phase: bootstrap
+  deploymentId: ""
+  drainId: ""
+  # Unique per Job attempt. Keep drainId stable when resuming; change this value.
+  migrationAttemptId: install-1
+  expectedRuntimeCount: 2
+  migrationLeaseTimeoutMs: 180000
 # Change after rotating an external Secret to trigger a controlled rollout.
 restartToken: ""
 service:

@@ -46,12 +46,38 @@ describe("cookies", async () => {
 			},
 			{
 				onResponse(context) {
+					expect(context.response.headers.get("cache-control")).toBe(
+						"no-store",
+					);
+					expect(context.response.headers.get("pragma")).toBe("no-cache");
 					const setCookie = context.response.headers.get("set-cookie");
 					expect(setCookie).toBeDefined();
 					expect(setCookie).toContain("Path=/");
 					expect(setCookie).toContain("HttpOnly");
 					expect(setCookie).toContain("SameSite=Lax");
 					expect(setCookie).toContain("clearance");
+				},
+			},
+		);
+	});
+
+	it("prevents caching sign-up responses that issue a session credential", async () => {
+		const { client } = await getTestInstance();
+		await client.signUp.email(
+			{
+				email: "no-store-sign-up@test.com",
+				password: "password",
+				name: "No Store",
+			},
+			{
+				onResponse(context) {
+					expect(context.response.headers.get("set-cookie")).toContain(
+						"clearance.session_token",
+					);
+					expect(context.response.headers.get("cache-control")).toBe(
+						"no-store",
+					);
+					expect(context.response.headers.get("pragma")).toBe("no-cache");
 				},
 			},
 		);
@@ -666,7 +692,8 @@ describe("getSessionCookie", async () => {
 		});
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 	});
 
 	it("should respect dontRememberMe when storing session in cookie cache", async () => {
@@ -1079,8 +1106,9 @@ describe("Cookie Cache Field Filtering", () => {
 
 		expect(cache).not.toBeNull();
 		// Verify session field filtering still works correctly
-		// Session should have token
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		// The deprecated token field is a stable handle, never the refresh secret.
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 		// Session field with returned: false should be excluded
 		expect(cache?.session?.internalSessionData).toBeUndefined();
 	});
@@ -1165,7 +1193,8 @@ describe("Cookie Cache Field Filtering", () => {
 		});
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 	});
 
 	it("should work with compact strategy", async () => {
@@ -1201,7 +1230,8 @@ describe("Cookie Cache Field Filtering", () => {
 		});
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 	});
 
 	it("should return null for invalid JWT token", async () => {
@@ -1253,7 +1283,8 @@ describe("Cookie Cache Field Filtering", () => {
 		});
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual(testUser.email);
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 	});
 });
 
@@ -1334,7 +1365,8 @@ describe("Cookie Chunking", () => {
 
 		expect(cache).not.toBeNull();
 		expect(cache?.user?.email).toEqual("chunk-test@example.com");
-		expect(cache?.session?.token).toEqual(expect.any(String));
+		expect(cache?.session?.id).toEqual(expect.any(String));
+		expect(cache?.session?.token).toBe(cache?.session?.id);
 	});
 
 	it("should reconstruct chunked cookies correctly", async () => {

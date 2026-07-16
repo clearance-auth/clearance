@@ -6,13 +6,6 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
     "schemas": {
       "Account": {
         "properties": {
-          "accessToken": {
-            "type": "string",
-          },
-          "accessTokenExpiresAt": {
-            "format": "date-time",
-            "type": "string",
-          },
           "accountId": {
             "type": "string",
           },
@@ -24,20 +17,7 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
             "readOnly": true,
             "type": "string",
           },
-          "idToken": {
-            "type": "string",
-          },
-          "password": {
-            "type": "string",
-          },
           "providerId": {
-            "type": "string",
-          },
-          "refreshToken": {
-            "type": "string",
-          },
-          "refreshTokenExpiresAt": {
-            "format": "date-time",
             "type": "string",
           },
           "scope": {
@@ -79,6 +59,9 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
             "type": "string",
           },
           "token": {
+            "deprecated": true,
+            "description": "Deprecated non-secret compatibility handle. This value equals the stable session id and is not a refresh credential.",
+            "readOnly": true,
             "type": "string",
           },
           "updatedAt": {
@@ -95,10 +78,10 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
         "required": [
           "id",
           "expiresAt",
-          "token",
           "createdAt",
           "updatedAt",
           "userId",
+          "token",
         ],
         "type": "object",
       },
@@ -3328,15 +3311,29 @@ exports[`open-api > should generate OpenAPI schema > openAPISchema 1`] = `
           "content": {
             "application/json": {
               "schema": {
+                "oneOf": [
+                  {
+                    "required": [
+                      "id",
+                    ],
+                  },
+                  {
+                    "required": [
+                      "token",
+                    ],
+                  },
+                ],
                 "properties": {
+                  "id": {
+                    "description": "The stable session ID to revoke",
+                    "type": "string",
+                  },
                   "token": {
-                    "description": "The token to revoke",
+                    "deprecated": true,
+                    "description": "Deprecated session refresh token compatibility alias",
                     "type": "string",
                   },
                 },
-                "required": [
-                  "token",
-                ],
                 "type": "object",
               },
             },

@@ -135,7 +135,7 @@ describe("One-time token", async () => {
 			.catch((e) => e);
 
 		expect(isAPIError(shouldFail)).toBeTruthy();
-		expect(shouldFail.body.message).toBe("Session expired");
+		expect(shouldFail.body.message).toBe("Session not found");
 
 		vi.useRealTimers();
 	});

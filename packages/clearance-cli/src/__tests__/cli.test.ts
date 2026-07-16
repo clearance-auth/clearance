@@ -145,6 +145,27 @@ describe("clearance CLI binary", () => {
 		const applyWithoutYes = run(["schema", "migrate"], data);
 		expect(applyWithoutYes.status).toBe(1);
 		expect(JSON.parse(applyWithoutYes.stdout).error.code).toBe("SCHEMA_MIGRATE_CONFIRMATION_REQUIRED");
+
+		const localWithoutDrain = run(["schema", "migrate", "--local", "--yes"], data);
+		expect(localWithoutDrain.status).toBe(1);
+		expect(JSON.parse(localWithoutDrain.stdout).error.code).toBe(
+			"SCHEMA_MIGRATE_DRAIN_ID_REQUIRED",
+		);
+
+		const localWithRemoteProfile = run([
+			"schema",
+			"migrate",
+			"--local",
+			"--drain-id",
+			"drain-v03",
+			"--profile",
+			"production",
+			"--yes",
+		], data);
+		expect(localWithRemoteProfile.status).toBe(1);
+		expect(JSON.parse(localWithRemoteProfile.stdout).error.code).toBe(
+			"SCHEMA_LOCAL_MIGRATION_REMOTE_FLAGS_INVALID",
+		);
 	});
 
 	it("creates distinct durable projects and keeps environment scope explicit", () => {

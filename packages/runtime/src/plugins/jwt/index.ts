@@ -1,16 +1,21 @@
 import type { ClearancePlugin } from "@clearance/core";
-import {
-	createAuthEndpoint,
-	createAuthMiddleware,
-} from "@clearance/core/api";
+import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
 import { ClearanceError } from "@clearance/core/error";
 import type { JSONWebKeySet, JWTPayload } from "jose";
 import * as z from "zod";
 import { APIError, sessionMiddleware } from "../../api";
+import { deleteSessionCookie, setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
 import { PACKAGE_VERSION } from "../../version";
+import {
+	CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+	parseCredentialOperationKey,
+} from "../../utils/operation-key";
 import { getJwksAdapter } from "./adapter";
-import { DEFAULT_JWKS_GRACE_PERIOD_SECONDS } from "./constant";
+import {
+	DEFAULT_JWKS_GRACE_PERIOD_SECONDS,
+	JWT_ROTATION_UNAVAILABLE_CODE,
+} from "./constant";
 import { schema } from "./schema";
 import { getJwtToken, signJWT } from "./sign";
 import type { JwtOptions } from "./types";
@@ -39,6 +44,21 @@ const verifyJWTBodySchema = z.object({
 	token: z.string(),
 	issuer: z.string().optional(),
 });
+
+const NO_STORE_TOKEN_RESPONSE_HEADERS = {
+	"Cache-Control": "no-store",
+	Pragma: "no-cache",
+} as const;
+
+function setNoStoreTokenResponseHeaders(ctx: {
+	setHeader(name: string, value: string): void;
+}): void {
+	ctx.setHeader(
+		"Cache-Control",
+		NO_STORE_TOKEN_RESPONSE_HEADERS["Cache-Control"],
+	);
+	ctx.setHeader("Pragma", NO_STORE_TOKEN_RESPONSE_HEADERS.Pragma);
+}
 
 export const jwt = <O extends JwtOptions>(options?: O) => {
 	// Remote url must be set when using signing function
@@ -215,13 +235,27 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 			getToken: createAuthEndpoint(
 				"/token",
 				{
-					method: "GET",
+					method: "POST",
 					requireHeaders: true,
-					use: [sessionMiddleware],
 					metadata: {
 						openapi: {
 							operationId: "getJSONWebToken",
 							description: "Get a JWT token",
+							parameters: [
+								{
+									name: "Idempotency-Key",
+									in: "header",
+									description:
+										"Versioned 256-bit opaque operation token using clr_op_v1_ followed by 43 canonical base64url characters; reuse it only for the same refresh operation",
+									required: true,
+									schema: {
+										type: "string",
+										minLength: 53,
+										maxLength: 53,
+										pattern: "^clr_op_v1_[A-Za-z0-9_-]{43}$",
+									},
+								},
+							],
 							responses: {
 								200: {
 									description: "Success",
@@ -243,10 +277,82 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 					},
 				},
 				async (ctx) => {
-					const jwt = await getJwtToken(ctx, options);
-					return ctx.json({
-						token: jwt,
+					const refreshSecret = await ctx.getSignedCookie(
+						ctx.context.authCookies.sessionToken.name,
+						ctx.context.secret,
+					);
+					if (!refreshSecret) throw new APIError("UNAUTHORIZED");
+					if (
+						ctx.context.options.secondaryStorage &&
+						ctx.context.options.session?.storeSessionInDatabase !== true
+					) {
+						setNoStoreTokenResponseHeaders(ctx);
+						throw new APIError(
+							"SERVICE_UNAVAILABLE",
+							{
+								code: JWT_ROTATION_UNAVAILABLE_CODE,
+								message:
+									"Atomic JWT refresh rotation is unavailable for secondary-storage-only sessions; use deprecated GET /token compatibility issuance",
+							},
+							{ "Clearance-JWT-Token-Mode": "legacy-get" },
+						);
+					}
+					const idempotencyKey = parseCredentialOperationKey(
+						ctx.headers?.get("idempotency-key"),
+					);
+					if (!idempotencyKey) {
+						throw new APIError("BAD_REQUEST", {
+							message: CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+						});
+					}
+					const rotated =
+						await ctx.context.internalAdapter.rotateSessionCredential(
+							refreshSecret,
+							idempotencyKey,
+						);
+					if (!rotated) {
+						deleteSessionCookie(ctx);
+						throw new APIError("UNAUTHORIZED");
+					}
+					ctx.context.session = {
+						session: rotated.session,
+						user: rotated.user,
+					};
+					await setSessionCookie(ctx, {
+						session: rotated.session,
+						user: rotated.user,
 					});
+					const jwt = await getJwtToken(ctx, options, {
+						sid: rotated.session.id,
+						session_family: rotated.familyId,
+						session_generation: rotated.rotationCounter,
+					});
+					setNoStoreTokenResponseHeaders(ctx);
+					return ctx.json({ token: jwt });
+				},
+			),
+			legacyGetToken: createAuthEndpoint(
+				"/token",
+				{
+					method: "GET",
+					requireHeaders: true,
+					use: [sessionMiddleware],
+					metadata: {
+						openapi: {
+							operationId: "getJSONWebTokenLegacy",
+							description:
+								"Deprecated compatibility endpoint; use POST /token with Idempotency-Key",
+							responses: {
+								200: { description: "Success" },
+							},
+						},
+					},
+				},
+				async (ctx) => {
+					ctx.setHeader("Deprecation", "true");
+					ctx.setHeader("Link", '</token>; rel="successor-version"');
+					setNoStoreTokenResponseHeaders(ctx);
+					return ctx.json({ token: await getJwtToken(ctx, options) });
 				},
 			),
 			signJWT: createAuthEndpoint.serverOnly(

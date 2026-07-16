@@ -191,6 +191,9 @@ export CLEARANCE_PG_VOLUME="clearance_pg_prod"
 export CLEARANCE_BACKUP_VOLUME="clearance_backups_prod"
 export CLEARANCE_IMAGE_REPOSITORY="ghcr.io/example/clearance"
 export CLEARANCE_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION="digest-v1"
+export CLEARANCE_DEPLOYMENT_ID="production-proof-v03"
+export CLEARANCE_CREDENTIAL_DRAIN_ID="production-proof-drain-v03"
 export CLEARANCE_BACKUP_IMAGE_REPOSITORY="ghcr.io/example/clearance-backup"
 export CLEARANCE_BACKUP_IMAGE_DIGEST="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 export NODE_ENV=production
@@ -368,7 +371,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   export CLEARANCE_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   export CLEARANCE_BACKUP_IMAGE_REPOSITORY="ghcr.io/example/clearance-backup"
   export CLEARANCE_BACKUP_IMAGE_DIGEST="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  if docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml --profile backup config >"$SCRATCH/compose-ok.yml" 2>/dev/null; then
+  if docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml --profile backup --profile migration config >"$SCRATCH/compose-ok.yml" 2>/dev/null; then
     ok "production compose config succeeds with strong env"
     # postgres ports should be empty / absent host publish
     if node -e '
@@ -395,6 +398,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         "delivery-worker":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         console:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         "sample-b2b":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
+        "credential-migrator":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         backup:"ghcr.io/example/clearance-backup@sha256:"+"b".repeat(64),
       };
       for (const [name,image] of Object.entries(expected)) {
@@ -465,6 +469,22 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     else
       bad "production delivery worker wiring is incomplete"
     fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  credential-migrator:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const job=m[1];
+      for(const value of ["schema","migrate","--local","--drain-id","production-proof-drain-v03"]) {
+        if(!job.includes(value)) process.exit(1);
+      }
+      if(!/^    restart:\s+(?:"no"|'no'|no)\s*$/m.test(job)) process.exit(1);
+      if(/published:|ports:/.test(job)) process.exit(1);
+	  if(!/depends_on:[\s\S]*postgres:[\s\S]*condition:\s*service_healthy/.test(job)) process.exit(1);
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "production Compose renders an unexposed one-shot credential migrator"
+    else
+      bad "production Compose credential migrator contract is incomplete"
+    fi
   else
     bad "production compose config failed with strong env"
   fi
@@ -475,6 +495,23 @@ else
 fi
 
 # ---------- Helm network and trusted-proxy contracts ----------
+fresh_compose_bootstrap=$(
+	sed -n '/For a fresh Compose database/,/The API and sample ports/p' \
+		docs/production-operations.md
+)
+if grep -Fq 'CLEARANCE_CREDENTIAL_DRAIN_ID="bootstrap-$CLEARANCE_DEPLOYMENT_ID"' \
+	<<<"$fresh_compose_bootstrap" \
+	&& grep -Fq -- '--profile migration run --rm credential-migrator' \
+		<<<"$fresh_compose_bootstrap" \
+	&& ! grep -Fq -- '--profile migration run --no-deps' \
+		<<<"$fresh_compose_bootstrap" \
+	&& grep -Fq '$COMPOSE up -d api sample-b2b' \
+		<<<"$fresh_compose_bootstrap"; then
+  ok "production Compose documents CLI-first fresh bootstrap before serving"
+else
+  bad "production Compose fresh bootstrap sequence is incomplete"
+fi
+
 section "behavioral: Helm network and trusted-proxy contracts"
 if command -v helm >/dev/null 2>&1; then
   HELM_ARGS=(
@@ -482,6 +519,7 @@ if command -v helm >/dev/null 2>&1; then
     --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --set secrets.existingSecret=clearance-secrets
     --set console.secrets.existingSecret=clearance-secrets
+    --set credentialAuthority.deploymentId=production-proof-v03
     --set env.CLEARANCE_BASE_URL=https://auth.example.test
     --set env.CLEARANCE_CORS_ORIGINS=https://console.example.test
   )
@@ -495,6 +533,13 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "Helm lint/default render failed"
   fi
+	if grep -q 'app.kubernetes.io/component: credential-migrator' "$SCRATCH/helm-default.yml" \
+	  && grep -q 'bootstrap-beta-production-proof-v03' "$SCRATCH/helm-default.yml" \
+	  && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-default.yml"; then
+	  ok "Helm fresh-install default bootstraps through an unexposed Job before serving"
+	else
+	  bad "Helm fresh-install bootstrap path is incomplete"
+	fi
   if grep -q 'name: beta-api-ingress' "$SCRATCH/helm-default.yml" \
     && grep -q 'name: beta-console-ingress' "$SCRATCH/helm-default.yml" \
     && grep -q 'name: beta-console-api-egress' "$SCRATCH/helm-default.yml" \
@@ -504,6 +549,45 @@ if command -v helm >/dev/null 2>&1; then
     ok "Helm defaults to untrusted forwarded headers and renders split policies"
   else
     bad "Helm default proxy/network policy contract is missing"
+  fi
+	if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+	    --set credentialAuthority.phase=serve >"$SCRATCH/helm-serve.yml" \
+	  && grep -A8 'name: CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION' "$SCRATCH/helm-serve.yml" | grep -q 'value: digest-v1' \
+	  && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /type: Recreate/ && $0 ~ /replicas: 2/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-serve.yml"; then
+    ok "Helm serve phase admits only the durable digest generation"
+  else
+    bad "Helm serve phase credential generation is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=drain >"$SCRATCH/helm-drain.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/ && $0 ~ /revisionHistoryLimit: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-drain.yml" \
+    && awk 'BEGIN{RS="---"} /kind: PodDisruptionBudget/ && /name: beta-api/{found=1} END{exit found ? 1 : 0}' "$SCRATCH/helm-drain.yml"; then
+    ok "Helm drain phase renders zero API replicas and omits the API disruption budget"
+  else
+    bad "Helm drain phase can leave credential-capable API pods serving"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=migrate \
+      --set credentialAuthority.drainId=production-proof-drain-v03 \
+      --set credentialAuthority.migrationAttemptId=attempt-1 >"$SCRATCH/helm-migrate.yml" \
+    && grep -q 'kind: Job' "$SCRATCH/helm-migrate.yml" \
+    && grep -q 'app.kubernetes.io/component: credential-migrator' "$SCRATCH/helm-migrate.yml" \
+    && grep -q -- '--local' "$SCRATCH/helm-migrate.yml" \
+    && grep -q 'production-proof-drain-v03' "$SCRATCH/helm-migrate.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-migrate.yml"; then
+    ok "Helm migrate phase keeps API at zero and renders the exact one-shot migration job"
+  else
+    bad "Helm migrate phase contract is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=migrate \
+      --set credentialAuthority.drainId=production-proof-drain-v03 \
+      --set credentialAuthority.migrationAttemptId=attempt-2 >"$SCRATCH/helm-migrate-retry.yml" \
+    && test "$(awk '/^  name: beta-credential-migration-/{print $2; exit}' "$SCRATCH/helm-migrate.yml")" != "$(awk '/^  name: beta-credential-migration-/{print $2; exit}' "$SCRATCH/helm-migrate-retry.yml")" \
+    && grep -q 'production-proof-drain-v03' "$SCRATCH/helm-migrate-retry.yml"; then
+    ok "Helm migration retries retain the drain and create a new immutable Job attempt"
+  else
+    bad "Helm migration retry identity is not resumable"
   fi
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
     --set-string env.CLEARANCE_TRUSTED_PROXY=1 >"$SCRATCH/helm-trusted.yml" \

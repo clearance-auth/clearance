@@ -83,6 +83,7 @@ export const createKyselyAdapter = async (config: ClearanceOptions) => {
 	}
 
 	let dialect: Dialect | undefined = undefined;
+	let supportsTransactions = false;
 
 	const databaseType = getKyselyDatabaseType(db);
 
@@ -94,17 +95,20 @@ export const createKyselyAdapter = async (config: ClearanceOptions) => {
 		dialect = new SqliteDialect({
 			database: db,
 		});
+		supportsTransactions = true;
 	}
 
 	if ("getConnection" in db) {
 		// @ts-expect-error - mysql2/promise
 		dialect = new MysqlDialect(db);
+		supportsTransactions = true;
 	}
 
 	if ("connect" in db) {
 		dialect = new PostgresDialect({
 			pool: db,
 		});
+		supportsTransactions = true;
 	}
 
 	if ("fileControl" in db) {
@@ -112,6 +116,7 @@ export const createKyselyAdapter = async (config: ClearanceOptions) => {
 		dialect = new BunSqliteDialect({
 			database: db,
 		});
+		supportsTransactions = true;
 	}
 
 	if ("createSession" in db) {
@@ -141,6 +146,7 @@ export const createKyselyAdapter = async (config: ClearanceOptions) => {
 			dialect = new NodeSqliteDialect({
 				database: db,
 			});
+			supportsTransactions = true;
 		}
 	}
 
@@ -155,6 +161,6 @@ export const createKyselyAdapter = async (config: ClearanceOptions) => {
 	return {
 		kysely: dialect ? new Kysely<any>({ dialect }) : null,
 		databaseType,
-		transaction: undefined,
+		transaction: supportsTransactions ? true : undefined,
 	};
 };

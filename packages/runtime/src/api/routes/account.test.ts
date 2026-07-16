@@ -2038,16 +2038,16 @@ describe("account", async () => {
 			fetchOptions: { headers },
 		});
 		expect(currentSession.data).not.toBeNull();
-		const sessionToken = currentSession.data?.session?.token;
+		const sessionId = currentSession.data?.session?.id;
 
 		// Make session due for refresh
 		const pastExpiresAt = new Date(
 			Date.now() + sessionExpiresIn * 1000 - sessionUpdateAge * 1000 - 1000,
 		);
-		if (sessionToken) {
+		if (sessionId) {
 			await ctx.adapter.update({
 				model: "session",
-				where: [{ field: "token", value: sessionToken }],
+				where: [{ field: "id", value: sessionId }],
 				update: { expiresAt: pastExpiresAt },
 			});
 		}
@@ -2140,10 +2140,10 @@ describe("account", async () => {
 			fetchOptions: { headers },
 		});
 		expect(firstSession.data).not.toBeNull();
-		const sessionToken = firstSession.data?.session?.token;
+		const sessionId = firstSession.data?.session?.id;
 
-		if (sessionToken) {
-			await ctx.internalAdapter.deleteSession(sessionToken);
+		if (sessionId) {
+			await ctx.internalAdapter.deleteSessionById(sessionId);
 		}
 
 		vi.useFakeTimers();
@@ -2187,12 +2187,12 @@ describe("token routes cookie cache revocation", async () => {
 		const initial = await client.getSession({
 			fetchOptions: { headers, onSuccess: cookieSetter(headers) },
 		});
-		const sessionToken = initial.data!.session.token;
+		const sessionId = initial.data!.session.id;
 		expect(headers.get("cookie")).toContain("session_data");
 
 		// Revoke server-side; the cookie cache is the only thing still vouching.
 		const ctx = await auth.$context;
-		await ctx.internalAdapter.deleteSession(sessionToken);
+		await ctx.internalAdapter.deleteSessionById(sessionId);
 
 		// resolveUserId validates against the database before any account lookup,
 		// so the revoked session is rejected outright rather than minting a token.

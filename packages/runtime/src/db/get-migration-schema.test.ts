@@ -1,10 +1,162 @@
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { ClearanceOptions } from "@clearance/core";
 import { CamelCasePlugin, Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { clearance } from "../auth/full";
-import { getMigrations } from "./get-migration";
+import {
+	assertCredentialAuthorityMigrationEngineSupported,
+	getMigrations,
+} from "./get-migration";
+
+describe("credential migration planning", () => {
+	it("fails SQL Server credential upgrades closed before mutation until live proof exists", () => {
+		expect(() =>
+			assertCredentialAuthorityMigrationEngineSupported("mssql"),
+		).toThrow(/disabled until the writer seals pass canonical live-engine proof/);
+		expect(() =>
+			assertCredentialAuthorityMigrationEngineSupported("postgres"),
+		).not.toThrow();
+	});
+
+	it("refuses a structural SQL artifact until executable security migration completes", async () => {
+		const database = new DatabaseSync(":memory:");
+		const config = {
+			database,
+			secret: "migration-planning-test-secret-with-enough-entropy",
+			emailAndPassword: { enabled: true },
+		} satisfies ClearanceOptions;
+		const initial = await getMigrations(config);
+		expect(initial.pendingSecurityMigrations).toContain(
+			"session-credential-digests-v1",
+		);
+		await expect(initial.compileMigrations()).rejects.toThrow(
+			"run schema migrate",
+		);
+		await initial.runMigrations();
+		const current = await getMigrations(config);
+		expect(current.pendingSecurityMigrations).toEqual([]);
+		await expect(current.compileMigrations()).resolves.toBe(";");
+	});
+
+	it("refuses D1 credential migration before the first mutation", async () => {
+		const database = new DatabaseSync(":memory:");
+		let mutations = 0;
+		const d1 = {
+			batch: async () => [],
+			exec: async () => {
+				mutations++;
+				return { count: 0, duration: 0 };
+			},
+			prepare(sql: string) {
+				let parameters: SQLInputValue[] = [];
+				const prepared = {
+					bind(...values: SQLInputValue[]) {
+						parameters = values;
+						return prepared;
+					},
+					async all() {
+						if (!/^\s*(?:select|pragma)/i.test(sql)) {
+							mutations++;
+						}
+						const statement = database.prepare(sql);
+						const results = statement.all(...parameters) as Record<
+							string,
+							unknown
+						>[];
+						return {
+							results,
+							meta: { changes: 0, last_row_id: null },
+						};
+					},
+				};
+				return prepared;
+			},
+		};
+		const config = {
+			database: d1 as unknown as ClearanceOptions["database"],
+			secret: "d1-preflight-test-secret-with-enough-entropy",
+			emailAndPassword: { enabled: true },
+		} satisfies ClearanceOptions;
+		const initial = await getMigrations(config);
+
+		await expect(initial.runMigrations()).rejects.toThrow(
+			"refused before applying schema changes",
+		);
+		expect(mutations).toBe(0);
+	});
+
+	it("refuses to replace a weak SQLite writer seal without a native product fence", async () => {
+		const database = new DatabaseSync(":memory:");
+		const config = {
+			database,
+			secret: "sqlite-writer-seal-test-secret-with-enough-entropy",
+			emailAndPassword: { enabled: true },
+		} satisfies ClearanceOptions;
+		await (await getMigrations(config)).runMigrations();
+
+		database.exec(`
+			DROP TRIGGER "clearance_session_credential_authority_v1_insert";
+			CREATE TRIGGER "clearance_session_credential_authority_v1_insert"
+			BEFORE INSERT ON "session" FOR EACH ROW WHEN 0
+			BEGIN SELECT RAISE(ABORT, 'weak stale seal'); END;
+			DELETE FROM "securityMigration"
+			WHERE "key" = 'session-credential-digests-v1';
+		`);
+
+		const migration = await getMigrations(config);
+		expect(migration.pendingSecurityMigrations).toContain(
+			"session-credential-digests-v1",
+		);
+		await expect(migration.runMigrations()).rejects.toThrow(
+			"database-native product drain fence",
+		);
+
+		const trigger = database
+			.prepare(
+				`SELECT sql FROM sqlite_master
+				 WHERE type = 'trigger'
+				   AND name = 'clearance_session_credential_authority_v1_insert'`,
+			)
+			.get() as { sql: string };
+		expect(trigger.sql).toContain("WHEN 0");
+		const afterRejection = await getMigrations(config);
+		expect(afterRejection.pendingSecurityMigrations).toContain(
+			"session-credential-digests-v1",
+		);
+	});
+
+	it("requires the durable legacy-runtime drain fence before any existing authority mutation", async () => {
+		const database = new DatabaseSync(":memory:");
+		const initialConfig = {
+			database,
+			secret: "sqlite-drain-fence-test-secret-with-enough-entropy",
+			emailAndPassword: { enabled: true },
+		} satisfies ClearanceOptions;
+		await (await getMigrations(initialConfig)).runMigrations();
+		database.exec(`
+			DROP TRIGGER "clearance_session_credential_authority_v1_insert";
+			CREATE TRIGGER "clearance_session_credential_authority_v1_insert"
+			BEFORE INSERT ON "session" FOR EACH ROW WHEN 0
+			BEGIN SELECT RAISE(ABORT, 'unchanged weak seal'); END;
+			DELETE FROM "securityMigration"
+			WHERE "key" = 'session-credential-digests-v1';
+		`);
+
+		const migration = await getMigrations(initialConfig);
+		await expect(migration.runMigrations()).rejects.toThrow(
+			"database-native product drain fence",
+		);
+		const trigger = database
+			.prepare(
+				`SELECT sql FROM sqlite_master
+				 WHERE type = 'trigger'
+				   AND name = 'clearance_session_credential_authority_v1_insert'`,
+			)
+			.get() as { sql: string };
+		expect(trigger.sql).toContain("WHEN 0");
+	});
+});
 
 const CONNECTION_STRING = "postgres://user:password@localhost:5433/clearance";
 // Check if PostgreSQL is available

@@ -95,4 +95,17 @@ describe("runWithTransaction", () => {
 
 		expect(hookRuns).toBe(0);
 	});
+
+	it("propagates an immediate hook failure without executing the hook twice", async () => {
+		let hookRuns = 0;
+
+		await expect(
+			queueAfterTransactionHook(async () => {
+				hookRuns += 1;
+				throw new Error("immediate hook failed");
+			}),
+		).rejects.toThrow("immediate hook failed");
+
+		expect(hookRuns).toBe(1);
+	});
 });

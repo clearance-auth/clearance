@@ -19,6 +19,8 @@ import { signJWT } from "../../crypto";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { createAccessControl } from "../access";
+import { mcp } from "../mcp";
+import { createOAuthTokenPair } from "../oidc-provider";
 import { admin } from "./admin";
 import { ADMIN_ERROR_CODES, adminClient } from "./client";
 import type { UserWithRole } from "./types";
@@ -68,6 +70,221 @@ afterEach(() => {
 });
 
 afterAll(() => server.close());
+
+describe("Admin OAuth family revocation", () => {
+	it("revokes every OAuth family when an administrator bans a user", async () => {
+		const { auth, db, signInWithTestUser } = await getTestInstance(
+			{
+				plugins: [admin(), mcp({ loginPage: "/login" })],
+				databaseHooks: {
+					user: {
+						create: {
+							before: async (user) => ({
+								data: {
+									...user,
+									emailVerified: true,
+									...(user.name === "Admin" ? { role: "admin" } : {}),
+								},
+							}),
+						},
+					},
+				},
+			},
+			{ testUser: { name: "Admin" } },
+		);
+		const { headers } = await signInWithTestUser();
+		const context = await auth.$context;
+		const target = await context.internalAdapter.createUser({
+			name: "OAuth ban target",
+			email: "oauth-ban-target@example.test",
+			emailVerified: true,
+			image: null,
+		});
+		for (const clientId of ["admin-ban-client-a", "admin-ban-client-b"]) {
+			await db.create({
+				model: "oauthApplication",
+				data: {
+					clientId,
+					clientSecret: `${clientId}-secret`,
+					type: "web",
+					name: clientId,
+					redirectUrls: "http://localhost/callback",
+					disabled: false,
+					metadata: null,
+					icon: null,
+					userId: null,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+		}
+		const first = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: "admin-ban-client-a",
+			userId: target.id,
+			scopes: "openid offline_access",
+			issueRefreshToken: true,
+		});
+		const second = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: "admin-ban-client-b",
+			userId: target.id,
+			scopes: "openid offline_access",
+			issueRefreshToken: true,
+		});
+
+		await auth.api.banUser({
+			headers,
+			body: { userId: target.id, banReason: "security response" },
+		});
+		const rows = await db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+			where: [
+				{ field: "id", operator: "in", value: [first.row.id, second.row.id] },
+			],
+		});
+		expect(rows).toHaveLength(2);
+		expect(
+			rows.every(
+				(row) =>
+					row.refreshStatus === "revoked" &&
+					row.revokedAt instanceof Date &&
+					row.rotationNonceDigest === null &&
+					row.recoveryExpiresAt === null,
+			),
+		).toBe(true);
+	});
+
+	it("rolls both admin disable paths back after OAuth revocation executes and fails", async () => {
+		const { auth, db, signInWithTestUser } = await getTestInstance(
+			{
+				plugins: [admin(), mcp({ loginPage: "/login" })],
+				databaseHooks: {
+					user: {
+						create: {
+							before: async (user) => ({
+								data: {
+									...user,
+									emailVerified: true,
+									...(user.name === "Admin" ? { role: "admin" } : {}),
+								},
+							}),
+						},
+					},
+				},
+			},
+			{ testUser: { name: "Admin" } },
+		);
+		const { headers } = await signInWithTestUser();
+		const context = await auth.$context;
+		const target = await context.internalAdapter.createUser({
+			name: "Atomic ban target",
+			email: "atomic-ban-target@example.test",
+			emailVerified: true,
+			image: null,
+		});
+		const session = await context.internalAdapter.createSession(target.id);
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId: "atomic-ban-client",
+				clientSecret: "atomic-ban-client-secret",
+				type: "web",
+				name: "Atomic ban client",
+				redirectUrls: "http://localhost/callback",
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const token = await createOAuthTokenPair(db, "oauthAccessToken", {
+			accessTokenExpiresAt: new Date(Date.now() + 300_000),
+			refreshTokenExpiresAt: new Date(Date.now() + 3_600_000),
+			clientId: "atomic-ban-client",
+			userId: target.id,
+			scopes: "openid offline_access",
+			issueRefreshToken: true,
+		});
+
+		const originalTransaction = context.adapter.transaction.bind(context.adapter);
+		const transactionSpy = vi
+			.spyOn(context.adapter, "transaction")
+			.mockImplementation(async (callback) =>
+				originalTransaction(async (trx) => {
+					const originalUpdateMany = trx.updateMany.bind(trx);
+					trx.updateMany = async (input) => {
+						if (input.model === "oauthAccessToken") {
+							await originalUpdateMany(input);
+							throw new Error("simulated OAuth revocation failure");
+						}
+						return originalUpdateMany(input);
+					};
+					return callback(trx);
+				}),
+			);
+		try {
+			for (const mutate of [
+				() =>
+					auth.api.banUser({
+						headers,
+						body: { userId: target.id, banReason: "must roll back" },
+					}),
+				() =>
+					auth.api.adminUpdateUser({
+						headers,
+						body: {
+							userId: target.id,
+							data: { banned: true, banReason: "must roll back" },
+						},
+					}),
+			]) {
+				await expect(mutate()).rejects.toThrow(
+					"simulated OAuth revocation failure",
+				);
+				await expect(
+					context.internalAdapter.findUserById(target.id),
+				).resolves.toMatchObject({ banned: false });
+				await expect(
+					context.internalAdapter.findSession(session.token),
+				).resolves.toMatchObject({ user: { id: target.id } });
+				await expect(
+					db.findOne<Record<string, unknown>>({
+						model: "oauthAccessToken",
+						where: [{ field: "id", value: token.row.id }],
+					}),
+				).resolves.toMatchObject({ refreshStatus: "active" });
+			}
+		} finally {
+			transactionSpy.mockRestore();
+		}
+	});
+
+	it("rejects a still-present session when its user is banned", async () => {
+		const { auth, db } = await getTestInstance({ plugins: [admin()] });
+		const context = await auth.$context;
+		const target = await context.internalAdapter.createUser({
+			name: "Banned session target",
+			email: "banned-session-target@example.test",
+			emailVerified: true,
+			image: null,
+		});
+		const session = await context.internalAdapter.createSession(target.id);
+		await db.update({
+			model: "user",
+			where: [{ field: "id", value: target.id }],
+			update: { banned: true, updatedAt: new Date() },
+		});
+
+		await expect(
+			context.internalAdapter.findSession(session.token),
+		).resolves.toBeNull();
+	});
+});
 
 describe("Admin plugin", async () => {
 	const {
@@ -1184,10 +1401,15 @@ describe("Admin plugin", async () => {
 		expect(afterStopImpersonationRes.data?.users.length).toBeGreaterThan(1);
 	});
 
-	it("should allow admin to revoke user session", async () => {
+	it("should allow admin to revoke user sessions by ID and legacy handle", async () => {
 		const {
 			res: { user },
+			headers: targetHeaders,
 		} = await signInWithUser(data.email, data.password);
+		const current = await client.getSession({
+			fetchOptions: { headers: targetHeaders },
+		});
+		const currentSessionId = current.data!.session.id;
 		const sessions = await client.admin.listUserSessions(
 			{
 				userId: user.id,
@@ -1197,8 +1419,30 @@ describe("Admin plugin", async () => {
 			},
 		);
 		expect(sessions.data?.sessions.length).toBe(3);
+		expect(sessions.data?.sessions[0]?.token).toBe(
+			sessions.data?.sessions[0]?.id,
+		);
+
+		const both = await client.admin.revokeUserSession(
+			{
+				sessionId: sessions.data!.sessions[0]!.id,
+				sessionToken: sessions.data!.sessions[0]!.token,
+			},
+			{ headers: adminHeaders },
+		);
+		expect(both.error?.status).toBe(400);
+		const neither = await client.$fetch("/admin/revoke-user-session", {
+			method: "POST",
+			body: {},
+			headers: adminHeaders,
+		});
+		expect(neither.error?.status).toBe(400);
+
+		const canonicalTarget = sessions.data!.sessions.find(
+			(session) => session.id !== currentSessionId,
+		)!;
 		const res = await client.admin.revokeUserSession(
-			{ sessionToken: sessions.data?.sessions[0]!.token || "" },
+			{ sessionId: canonicalTarget.id },
 			{ headers: adminHeaders },
 		);
 		expect(res.data?.success).toBe(true);
@@ -1207,6 +1451,37 @@ describe("Admin plugin", async () => {
 			{ headers: adminHeaders },
 		);
 		expect(sessions2.data?.sessions.length).toBe(2);
+
+		const stableHandleTarget = sessions2.data!.sessions.find(
+			(session) => session.id !== currentSessionId,
+		)!;
+		const legacy = await client.admin.revokeUserSession(
+			{ sessionToken: stableHandleTarget.token },
+			{ headers: adminHeaders },
+		);
+		expect(legacy.data?.success).toBe(true);
+		const sessions3 = await client.admin.listUserSessions(
+			{ userId: user.id },
+			{ headers: adminHeaders },
+		);
+		expect(sessions3.data?.sessions.length).toBe(1);
+		expect(sessions3.data!.sessions[0]!.id).toBe(currentSessionId);
+
+		const rawBearer = targetHeaders
+			.get("cookie")!
+			.split("clearance.session_token=")[1]!
+			.split(".")[0]!;
+		expect(rawBearer).not.toBe(currentSessionId);
+		const rawLegacy = await client.admin.revokeUserSession(
+			{ sessionToken: rawBearer },
+			{ headers: adminHeaders },
+		);
+		expect(rawLegacy.data?.success).toBe(true);
+		const finalSessions = await client.admin.listUserSessions(
+			{ userId: user.id },
+			{ headers: adminHeaders },
+		);
+		expect(finalSessions.data?.sessions.length).toBe(0);
 	});
 
 	it("should not allow non-admin to revoke user sessions", async () => {
@@ -2325,6 +2600,7 @@ describe("edge cases: userId validation", async () => {
 				headers: adminHeaders,
 			},
 		);
+		expect(res.error).toBeNull();
 		expect(res.data?.success).toBe(true);
 	});
 

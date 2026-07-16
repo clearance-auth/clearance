@@ -66,6 +66,7 @@ export async function signJWT(
 	config: {
 		options?: JwtOptions | undefined;
 		payload: JWTPayloadWithOptional;
+		maxExpiresAt?: Date | undefined;
 	},
 ) {
 	const { options } = config;
@@ -82,6 +83,14 @@ export async function signJWT(
 		iat ?? nowSeconds,
 	);
 	exp = exp ?? defaultExp;
+	if (config.maxExpiresAt) {
+		exp = Math.min(exp, Math.floor(config.maxExpiresAt.getTime() / 1000));
+	}
+	if (config.maxExpiresAt && exp <= nowSeconds) {
+		throw new ClearanceError(
+			"Cannot issue an access token for an expired session",
+		);
+	}
 
 	// Nbf
 	const nbf = payload.nbf!;
@@ -152,6 +161,13 @@ export async function signJWT(
 export async function getJwtToken(
 	ctx: GenericEndpointContext,
 	options?: JwtOptions | undefined,
+	sessionClaims?:
+		| {
+				sid: string;
+				session_family: string;
+				session_generation: number;
+		  }
+		| undefined,
 ) {
 	const payload = !options?.jwt?.definePayload
 		? ctx.context.session!.user
@@ -159,9 +175,11 @@ export async function getJwtToken(
 
 	return await signJWT(ctx, {
 		options,
+		maxExpiresAt: ctx.context.session!.session.expiresAt,
 		payload: {
 			iat: Math.floor(Date.now() / 1000),
 			...payload,
+			...sessionClaims,
 			sub:
 				(await options?.jwt?.getSubject?.(ctx.context.session!)) ??
 				ctx.context.session!.user.id,

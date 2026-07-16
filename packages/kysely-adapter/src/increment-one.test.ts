@@ -190,6 +190,12 @@ describe("kysely incrementOne native", () => {
 		expect(untouched).toHaveLength(2);
 		// The returned row is the one that was actually mutated.
 		expect(mutated[0]?.id).toBe(result?.id);
+
+		// The predicate appears in both the single-row selector and the outer
+		// UPDATE. The outer copy is the compare-and-swap guard PostgreSQL
+		// rechecks after waiting for a concurrent update to commit.
+		const updateSql = executedSql.find((sql) => sql.startsWith("update"));
+		expect(updateSql?.match(/"remaining"\s*>/gi)).toHaveLength(2);
 	});
 
 	it("returns null when the guard matches no row and leaves data untouched", async () => {

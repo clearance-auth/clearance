@@ -22,6 +22,66 @@ and watches Kubernetes Jobs or the host scheduler.
   HTTP work and pending store writes, closes the Postgres pool, and has a
   25-second hard deadline under the chart's 30-second grace period.
 
+## Credential-authority cutover
+
+For a fresh Compose database, bootstrap with the unexposed CLI migrator before
+starting either credential-capable service. Use a stable bootstrap drain ID so
+the same command resumes safely after interruption:
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml"
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+export CLEARANCE_CREDENTIAL_DRAIN_ID="bootstrap-$CLEARANCE_DEPLOYMENT_ID"
+
+$COMPOSE --profile migration run --rm credential-migrator
+$COMPOSE up -d api sample-b2b
+clearance --json schema credential-authority status
+```
+
+The API and sample ports remain closed until migration publishes `digest-live`.
+The same command refuses an existing unarmed database, so an upgrade cannot be
+silently treated as a fresh install.
+
+The 0.3 credential upgrade uses one immutable application image and one
+deployment identity through four phases: `bridge`, `drain`, `migrate`, and
+`serve`. Bridge runtimes hold shared PostgreSQL session advisory leases. The
+durable fence records the armed deployment, exact runtime count, drain ID,
+phase, and generation. Credential mutation requires the exclusive lease after
+every bridge process has released its shared lease. A paused process therefore
+blocks the migration, and a restarted legacy process cannot serve after drain.
+
+For production Compose, export the immutable image reference plus
+`CLEARANCE_DEPLOYMENT_ID`, start the candidate with
+`CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=legacy-v1`, and verify the image ID
+of both credential-capable services before arming:
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml"
+
+$COMPOSE up -d --force-recreate api sample-b2b
+clearance schema credential-authority arm \
+  --deployment-id "$CLEARANCE_DEPLOYMENT_ID" --expected-runtimes 2 --yes
+clearance schema credential-authority drain \
+  --deployment-id "$CLEARANCE_DEPLOYMENT_ID" \
+  --drain-id "$CLEARANCE_CREDENTIAL_DRAIN_ID" --yes
+
+$COMPOSE up -d --no-deps --scale api=0 --scale sample-b2b=0 api sample-b2b
+$COMPOSE --profile migration run --no-deps --rm credential-migrator
+
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+$COMPOSE up -d --force-recreate api sample-b2b
+clearance --json schema credential-authority status
+```
+
+The migrator has no published port, uses the exact API image digest, and accepts
+only the armed drain ID. Do not start it until every Clearance runtime sharing
+the database has joined the armed cohort and then stopped. A failed migration
+leaves the durable phase at `migrating`; resume with the same image, deployment,
+and drain ID. Writer constraints reject later plaintext session and OAuth
+authority even if an old binary reconnects. The Helm chart documents and
+renders the equivalent phase sequence as a zero-replica Deployment plus a
+one-shot Job.
+
 ## Delivery worker operations
 
 Production Compose and Helm run `packages/delivery-worker/dist/cli.mjs` from

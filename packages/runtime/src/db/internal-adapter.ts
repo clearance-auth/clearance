@@ -6,6 +6,7 @@ import type {
 import {
 	getCurrentAdapter,
 	getCurrentAuthContext,
+	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
 import type { DBAdapter, Where } from "@clearance/core/db/adapter";
@@ -15,10 +16,17 @@ import { getIp } from "@clearance/core/utils/ip";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { base64Url } from "@clearance/utils/base64";
 import { createHash } from "@clearance/utils/hash";
+import { createHMAC } from "@clearance/utils/hmac";
 import type { Account, Session, User, Verification } from "../types";
+import { constantTimeEqual } from "../crypto";
 import { getDate } from "../utils/date";
 import {
+	CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+	parseCredentialOperationKey,
+} from "../utils/operation-key";
+import {
 	getSessionDefaultFields,
+	parseInternalSessionOutput,
 	parseSessionOutput,
 	parseUserOutput,
 } from "./schema";
@@ -27,12 +35,30 @@ import {
 	processIdentifier,
 } from "./verification-token-storage";
 import {
+	createSessionHandle,
+	createSessionRefreshSecret,
+	credentialIdFromRefreshSecret,
+	digestSessionRotationNonce,
+	digestSessionRefreshSecret,
+	SESSION_CREDENTIAL_DIGEST_VERSION,
+	SESSION_CREDENTIAL_MODEL,
+	SESSION_ROTATION_RECOVERY_WINDOW_MS,
+	sessionIdFromHandle,
+	type SessionCredential,
+} from "./session-credential";
+import { getSecondarySessionKeys } from "./session-credential-migration";
+import {
 	hasTwoFactorSessionGeneration,
 	sessionMatchesTwoFactorGeneration,
 	TWO_FACTOR_SESSION_GENERATION_FIELD,
 } from "./two-factor-session-generation";
+import {
+	lockAndReadActiveUser,
+	lockAndReadUser,
+} from "./user-authority";
 import type { DatabaseHooksEntry } from "./with-hooks";
 import { getWithHooks } from "./with-hooks";
+import { readInternalCredentialAuthority } from "../internal/credential-authority";
 
 function getTTLSeconds(expiresAt: Date | number, now = Date.now()): number {
 	const expiresMs =
@@ -47,11 +73,19 @@ export const createInternalAdapter = (
 		logger: InternalLogger;
 		hooks: DatabaseHooksEntry[];
 		generateId: AuthContext["generateId"];
+		secretConfig: AuthContext["secretConfig"];
 	},
 ): InternalAdapter => {
 	const logger = ctx.logger;
 	const options = ctx.options;
 	const secondaryStorage = options.secondaryStorage;
+	const credentialAuthority = readInternalCredentialAuthority(options);
+	const legacyCredentialAuthority =
+		credentialAuthority?.generation === "legacy-v1";
+	const storesSessionsInDatabase =
+		!secondaryStorage || options.session?.storeSessionInDatabase === true;
+	const secondarySessionKeys =
+		secondaryStorage ? getSecondarySessionKeys(options) : null;
 	const verificationConsumeLocks = new Map<string, Promise<void>>();
 	// Warn at most once when a single-use value is consumed through the
 	// non-atomic secondary-storage fallback (see consumeVerificationValue).
@@ -59,6 +93,120 @@ export const createInternalAdapter = (
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
 	const bindsTwoFactorSessionGeneration =
 		hasTwoFactorSessionGeneration(options);
+	const serializesUserCredentialAuthority =
+		storesSessionsInDatabase ||
+		options.plugins?.some((plugin) => plugin.id === "admin") === true ||
+		options.user?.additionalFields?.banned !== undefined;
+
+	type SessionWithUser = Session & { user: User | null };
+	type SecondarySessionIndexEntry = {
+		sessionId: string;
+		credentialKey: string;
+		expiresAt: number;
+	};
+	type SessionRotationResult = {
+		session: Session;
+		user: User;
+		refreshToken: string;
+		familyId: string;
+		rotationCounter: number;
+		oldDigest: string;
+		successorDigest: string;
+	};
+
+	const secondaryCredentialKey = (digest: string) =>
+		secondarySessionKeys?.credential(digest) ?? `session-credential:${digest}`;
+	const secondaryHandleKey = (sessionId: string) =>
+		secondarySessionKeys?.handle(sessionId) ?? `session-handle:${sessionId}`;
+	const secondaryActiveSessionsKey = (userId: string) =>
+		secondarySessionKeys?.activeSessions(userId) ?? `active-sessions-${userId}`;
+	const parseSecondaryHandle = (value: unknown): string | null =>
+		safeJSONParse<{ credentialKey?: string }>(value)?.credentialKey ?? null;
+
+	async function revokeCredentialFamily(
+		familyId: string,
+		revokedAt = new Date(),
+	): Promise<void> {
+		if (!storesSessionsInDatabase) return;
+		const currentAdapter = await getCurrentAdapter(adapter);
+		await currentAdapter.updateMany({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [
+				{ field: "familyId", value: familyId },
+				{ field: "status", value: "revoked", operator: "ne" },
+			],
+			update: {
+				status: "revoked",
+				revokedAt,
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+				updatedAt: revokedAt,
+			},
+		});
+	}
+
+	async function findSessionRecordById(
+		sessionId: string,
+	): Promise<SessionWithUser | null> {
+		return (await getCurrentAdapter(adapter)).findOne<SessionWithUser>({
+			model: "session",
+			where: [{ field: "id", value: sessionId }],
+			join: { user: true },
+		});
+	}
+
+	async function createCredentialRecord(input: {
+		id?: string | undefined;
+		selector: string;
+		sessionId: string;
+		familyId: string;
+		secretDigest: string;
+		expiresAt: Date;
+		parentCredentialId?: string | undefined;
+		rotationCounter?: number | undefined;
+	}): Promise<SessionCredential> {
+		const now = new Date();
+		return (await getCurrentAdapter(adapter)).create<
+			Record<string, unknown>,
+			SessionCredential
+		>({
+			model: SESSION_CREDENTIAL_MODEL,
+			forceAllowId: input.id !== undefined,
+			data: {
+				...(input.id ? { id: input.id } : {}),
+				selector: input.selector,
+				sessionId: input.sessionId,
+				familyId: input.familyId,
+				secretDigest: input.secretDigest,
+				digestVersion: SESSION_CREDENTIAL_DIGEST_VERSION,
+				status: "active",
+				rotationCounter: input.rotationCounter ?? 0,
+				parentCredentialId: input.parentCredentialId ?? null,
+				expiresAt: input.expiresAt,
+				consumedAt: null,
+				revokedAt: null,
+				reuseDetectedAt: null,
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+	}
+
+	function createCredentialIdentity(): {
+		id?: string | undefined;
+		selector: string;
+	} {
+		const generatedId = ctx.generateId({ model: SESSION_CREDENTIAL_MODEL });
+		return {
+			...(generatedId === false ? {} : { id: generatedId }),
+			selector: generateId(),
+		};
+	}
+
 	const {
 		createWithHooks,
 		updateWithHooks,
@@ -71,17 +219,18 @@ export const createInternalAdapter = (
 	async function refreshUserSessions(user: User) {
 		if (!secondaryStorage) return;
 
-		const listRaw = await secondaryStorage.get(`active-sessions-${user.id}`);
+		const listRaw = await secondaryStorage.get(
+			secondaryActiveSessionsKey(user.id),
+		);
 		if (!listRaw) return;
 
 		const now = Date.now();
-		const list =
-			safeJSONParse<{ token: string; expiresAt: number }[]>(listRaw) || [];
+		const list = safeJSONParse<SecondarySessionIndexEntry[]>(listRaw) || [];
 		const validSessions = list.filter((s) => s.expiresAt > now);
 
 		await Promise.all(
-			validSessions.map(async ({ token }) => {
-				const cached = await secondaryStorage.get(token);
+			validSessions.map(async ({ credentialKey }) => {
+				const cached = await secondaryStorage.get(credentialKey);
 				if (!cached) return;
 				const parsed = safeJSONParse<{ session: Session; user: User }>(cached);
 				if (!parsed) return;
@@ -89,9 +238,9 @@ export const createInternalAdapter = (
 				const sessionTTL = getTTLSeconds(parsed.session.expiresAt, now);
 
 				await secondaryStorage.set(
-					token,
+					credentialKey,
 					JSON.stringify({
-						session: parsed.session,
+						session: { ...parsed.session, token: null },
 						user,
 					}),
 					Math.floor(sessionTTL),
@@ -122,7 +271,227 @@ export const createInternalAdapter = (
 		}
 	}
 
-	return {
+	async function revokeCredentialFamiliesBySessionId(
+		sessionId: string,
+		reuseDetectedAt?: Date | undefined,
+	): Promise<void> {
+		if (!storesSessionsInDatabase) return;
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const revokedAt = reuseDetectedAt ?? new Date();
+		await currentAdapter.updateMany({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "sessionId", value: sessionId }],
+			update: {
+				status: "revoked",
+				revokedAt,
+				...(reuseDetectedAt ? { reuseDetectedAt } : {}),
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+				updatedAt: revokedAt,
+			},
+		});
+	}
+
+	async function revokeAndDeleteSessionById(
+		sessionId: string,
+		reuseDetectedAt?: Date | undefined,
+	): Promise<void> {
+		if (storesSessionsInDatabase) {
+			await revokeCredentialFamiliesBySessionId(sessionId, reuseDetectedAt);
+			if (!ctx.options.session?.preserveSessionInDatabase) {
+				await deleteWithHooks(
+					[{ field: "id", value: sessionId }],
+					"session",
+					undefined,
+				);
+			}
+		}
+	}
+
+	async function findDatabaseSessionByCredential(
+		presentedSecret: string,
+	): Promise<{ session: Session; user: User; credential: SessionCredential } | null> {
+		const secretDigest = await digestSessionRefreshSecret(presentedSecret);
+		const credentialId = credentialIdFromRefreshSecret(presentedSecret);
+		const currentAdapter = await getCurrentAdapter(adapter);
+		let credential = credentialId
+			? await currentAdapter.findOne<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "selector", value: credentialId }],
+				})
+			: await currentAdapter.findOne<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "secretDigest", value: secretDigest }],
+				});
+
+		if (
+			!credential ||
+			!constantTimeEqual(credential.secretDigest, secretDigest)
+		) {
+			return null;
+		}
+
+		if (credential.status === "consumed") {
+			// During the lost-response recovery window the consumed parent must
+			// fail closed for ordinary authentication without revoking the
+			// family. Recovery itself is only available through
+			// rotateSessionCredential with the exact same operation key.
+			// After the window expires, presenting the parent is replay.
+			const recoveryStillValid =
+				credential.recoveryExpiresAt != null &&
+				credential.recoveryExpiresAt > new Date();
+			if (!recoveryStillValid) {
+				const reuseDetectedAt = new Date();
+				await runWithTransaction(adapter, () =>
+					revokeAndDeleteSessionById(
+						credential!.sessionId ?? "",
+						reuseDetectedAt,
+					),
+				);
+			}
+			return null;
+		}
+		if (
+			credential.status !== "active" ||
+			credential.expiresAt <= new Date() ||
+			!credential.sessionId
+		) {
+			return null;
+		}
+
+		const record = await findSessionRecordById(credential.sessionId);
+		if (!record?.user) return null;
+		const { user, ...storedSession } = record;
+		return {
+			session: { ...storedSession, token: presentedSecret },
+			user,
+			credential,
+		};
+	}
+
+	async function findDatabaseSessionIdByCredential(
+		presentedSecret: string,
+	): Promise<string | null> {
+		const secretDigest = await digestSessionRefreshSecret(presentedSecret);
+		const credentialId = credentialIdFromRefreshSecret(presentedSecret);
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const credential = credentialId
+			? await currentAdapter.findOne<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "selector", value: credentialId }],
+				})
+			: await currentAdapter.findOne<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "secretDigest", value: secretDigest }],
+				});
+		if (
+			!credential?.sessionId ||
+			!constantTimeEqual(credential.secretDigest, secretDigest)
+		) {
+			return null;
+		}
+		return credential.sessionId;
+	}
+
+	async function recoverRecentSessionRotation(
+		credential: SessionCredential,
+		rotationNonceDigest: string,
+		rotationOperation: string,
+		oldDigest: string,
+	): Promise<SessionRotationResult | null> {
+		if (
+			credential.status !== "consumed" ||
+			!credential.sessionId ||
+			!credential.rotationNonceDigest ||
+			!credential.recoveryExpiresAt ||
+			credential.recoveryExpiresAt <= new Date() ||
+			!constantTimeEqual(
+				credential.rotationNonceDigest,
+				rotationNonceDigest,
+			)
+		) {
+			return null;
+		}
+
+		const successor = await (
+			await getCurrentAdapter(adapter)
+		).findOne<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "parentCredentialId", value: credential.id }],
+		});
+		if (
+			!successor ||
+			successor.status !== "active" ||
+			successor.sessionId !== credential.sessionId ||
+			successor.expiresAt <= new Date() ||
+			!successor.secretDigest
+		) {
+			return null;
+		}
+		const candidates = await deriveRotationSuccessors(
+			credential,
+			rotationOperation,
+		);
+		const recovered = candidates.find((candidate) =>
+			constantTimeEqual(successor.secretDigest, candidate.digest),
+		);
+		if (!recovered) return null;
+		const record = await findSessionRecordById(credential.sessionId);
+		if (!record?.user || record.expiresAt <= new Date()) return null;
+		const currentAdapter = await getCurrentAdapter(adapter);
+		const activeUser = await lockAndReadActiveUser(
+			currentAdapter,
+			record.user.id,
+		);
+		if (!activeUser) return null;
+		const { user: _, ...session } = record;
+		return {
+			session: { ...session, token: recovered.refreshToken },
+			user: activeUser,
+			refreshToken: recovered.refreshToken,
+			familyId: credential.familyId,
+			rotationCounter: successor.rotationCounter,
+			oldDigest,
+			successorDigest: recovered.digest,
+		};
+	}
+
+	async function deriveRotationSuccessors(
+		credential: SessionCredential,
+		rotationOperation: string,
+	): Promise<Array<{ selector: string; refreshToken: string; digest: string }>> {
+		const keys =
+			typeof ctx.secretConfig === "string"
+				? [ctx.secretConfig]
+				: [
+						ctx.secretConfig.keys.get(ctx.secretConfig.currentVersion),
+						...ctx.secretConfig.keys.values(),
+					].filter((key, index, all): key is string =>
+						Boolean(key) && all.indexOf(key) === index,
+					);
+		const hmac = createHMAC("SHA-256", "base64urlnopad");
+		return Promise.all(
+			keys.map(async (key) => {
+				const authority = [
+					"clearance:session-rotation-successor:v1",
+					credential.id,
+					credential.secretDigest,
+					rotationOperation,
+				].join(":");
+				const selector = await hmac.sign(key, `${authority}:selector`);
+				const material = await hmac.sign(key, `${authority}:secret`);
+				const refreshToken = createSessionRefreshSecret(selector, material);
+				return {
+					selector,
+					refreshToken,
+					digest: await digestSessionRefreshSecret(refreshToken),
+				};
+			}),
+		);
+	}
+
+	const internalAdapter: InternalAdapter = {
 		createOAuthUser: async (
 			user: Omit<User, "id" | "createdAt" | "updatedAt">,
 			account: Omit<Account, "userId" | "id" | "createdAt" | "updatedAt"> &
@@ -162,16 +531,18 @@ export const createInternalAdapter = (
 				Partial<User> &
 				Record<string, any>,
 		) => {
-			const createdUser = await createWithHooks(
-				{
-					// todo: we should remove auto setting createdAt and updatedAt in the next major release, since the db generators already handle that
-					createdAt: new Date(),
-					updatedAt: new Date(),
-					...user,
-					email: user.email?.toLowerCase(),
-				},
-				"user",
-				undefined,
+			const createdUser = await runWithTransaction(adapter, () =>
+				createWithHooks(
+					{
+						// todo: we should remove auto setting createdAt and updatedAt in the next major release, since the db generators already handle that
+						createdAt: new Date(),
+						updatedAt: new Date(),
+						...user,
+						email: user.email?.toLowerCase(),
+					},
+					"user",
+					undefined,
+				),
 			);
 
 			return createdUser as T & User;
@@ -197,24 +568,46 @@ export const createInternalAdapter = (
 			userId: string,
 			options?: { onlyActiveSessions?: boolean | undefined } | undefined,
 		) => {
-			if (secondaryStorage) {
+			if (secondaryStorage && !storesSessionsInDatabase) {
 				const currentList = await secondaryStorage.get(
-					`active-sessions-${userId}`,
+					secondaryActiveSessionsKey(userId),
 				);
 				if (!currentList) return [];
 
-				const list: { token: string; expiresAt: number }[] =
-					safeJSONParse(currentList) || [];
+				const list:
+					| (SecondarySessionIndexEntry | {
+							token: string;
+							expiresAt: number;
+					  })[] = safeJSONParse(currentList) || [];
 				const now = Date.now();
 
-				const seenTokens = new Set<string>();
+				const seenSessionIds = new Set<string>();
 				const sessions: Session[] = [];
+				const migratedIndex: SecondarySessionIndexEntry[] = [];
 
-				for (const { token, expiresAt } of list) {
-					if (expiresAt <= now || seenTokens.has(token)) continue;
-					seenTokens.add(token);
+				for (const entry of list) {
+					if (entry.expiresAt <= now) continue;
+					let credentialKey =
+						"credentialKey" in entry ? entry.credentialKey : undefined;
+					let sessionId = "sessionId" in entry ? entry.sessionId : undefined;
+					if (!credentialKey && "token" in entry) {
+						const legacy = await internalAdapter.findSession(entry.token);
+						if (!legacy) continue;
+						sessionId = legacy.session.id;
+						credentialKey = secondaryCredentialKey(
+							await digestSessionRefreshSecret(entry.token),
+						);
+					}
+					if (
+						!credentialKey ||
+						!sessionId ||
+						seenSessionIds.has(sessionId)
+					) {
+						continue;
+					}
+					seenSessionIds.add(sessionId);
 
-					const data = await secondaryStorage.get(token);
+					const data = await secondaryStorage.get(credentialKey);
 					if (!data) continue;
 
 					try {
@@ -227,14 +620,31 @@ export const createInternalAdapter = (
 						if (!parsed?.session) continue;
 
 						sessions.push(
-							parseSessionOutput(ctx.options, {
+							parseInternalSessionOutput(ctx.options, {
 								...parsed.session,
 								expiresAt: new Date(parsed.session.expiresAt),
 							}),
 						);
+						migratedIndex.push({
+							sessionId,
+							credentialKey,
+							expiresAt: entry.expiresAt,
+						});
 					} catch {
 						continue;
 					}
+				}
+				if (migratedIndex.length > 0) {
+					const furthestExpiry = Math.max(
+						...migratedIndex.map((entry) => entry.expiresAt),
+					);
+					await secondaryStorage.set(
+						secondaryActiveSessionsKey(userId),
+						JSON.stringify(migratedIndex),
+						getTTLSeconds(furthestExpiry, now),
+					);
+				} else {
+					await secondaryStorage.delete(secondaryActiveSessionsKey(userId));
 				}
 				return sessions;
 			}
@@ -296,18 +706,7 @@ export const createInternalAdapter = (
 			return total;
 		},
 		deleteUser: async (userId: string) => {
-			if (!secondaryStorage || options.session?.storeSessionInDatabase) {
-				await deleteManyWithHooks(
-					[
-						{
-							field: "userId",
-							value: userId,
-						},
-					],
-					"session",
-					undefined,
-				);
-			}
+			await internalAdapter.deleteUserSessions(userId);
 			await deleteManyWithHooks(
 				[
 					{
@@ -342,19 +741,30 @@ export const createInternalAdapter = (
 			})();
 			const storeInDb = options.session?.storeSessionInDatabase;
 			const {
-				// always ignore override id - new sessions must have new ids
-				id: _,
+				// Authority and identity fields are always derived by the runtime.
+				id: _discardedId,
+				token: _discardedToken,
+				userId: _discardedUserId,
 				__preserveSessionExpiresAt,
 				...rest
 			} = override || {};
 
-			// When secondary storage is the only store, the database adapter
-			// won't run, so we need to generate an id ourselves.
-			let sessionId: string | undefined;
-			if (secondaryStorage && !storeInDb) {
-				const generatedId = ctx.generateId({ model: "session" });
-				sessionId = generatedId !== false ? generatedId : generateId();
-			}
+			// A stable id is the public administrative handle. The independently
+			// generated refresh secret exists only at the issuance boundary.
+			const generatedSessionId = ctx.generateId({ model: "session" });
+			const requestedSessionId =
+				generatedSessionId !== false
+					? generatedSessionId
+					: storesSessionsInDatabase
+						? undefined
+						: generateId();
+			const credentialIdentity = createCredentialIdentity();
+			const refreshSecret = legacyCredentialAuthority
+				? generateId(32)
+				: createSessionRefreshSecret(credentialIdentity.selector);
+			const refreshDigest = await digestSessionRefreshSecret(refreshSecret);
+			const credentialKey = secondaryCredentialKey(refreshDigest);
+			const familyId = generateId();
 
 			// we're parsing default values for session additional fields
 			const defaultAdditionalFields = getSessionDefaultFields(options);
@@ -440,7 +850,7 @@ export const createInternalAdapter = (
 					? inheritedExpiresAt
 					: policyExpiresAt;
 			const data = {
-				...(sessionId ? { id: sessionId } : {}),
+				...(requestedSessionId ? { id: requestedSessionId } : {}),
 				ipAddress: headers ? getIp(headers, options) || "" : "",
 				userAgent: headers?.get("user-agent") || "",
 				...rest,
@@ -451,7 +861,15 @@ export const createInternalAdapter = (
 				 */
 				expiresAt,
 				userId,
-				token: generateId(32),
+				// Keep a unique non-secret handle in the retired legacy column. This
+				// remains compatible with upgraded schemas that still enforce the old
+				// NOT NULL + UNIQUE contract while all authentication uses the digest
+				// credential ledger.
+				token: legacyCredentialAuthority
+					? refreshSecret
+					: createSessionHandle(
+							requestedSessionId ?? credentialIdentity.selector,
+						),
 				// todo: we should remove auto setting createdAt and updatedAt in the next major release, since the db generators already handle that
 				createdAt: new Date(),
 				updatedAt: new Date(),
@@ -463,174 +881,547 @@ export const createInternalAdapter = (
 					: {}),
 				...(overrideAll ? rest : {}),
 			} satisfies Partial<Session>;
-			const res = await createWithHooks(
-				data,
-				"session",
-				secondaryStorage
-					? {
-							fn: async (sessionData) => {
-								/**
-								 * store the session token for the user
-								 * so we can retrieve it later for listing sessions
-								 */
-								const currentList = await secondaryStorage.get(
-									`active-sessions-${userId}`,
-								);
+			const enforceSessionAuthority = (
+				hookedData: Partial<Session> & Record<string, any>,
+			) => {
+				const {
+					id: _hookedId,
+					token: _hookedToken,
+					userId: _hookedUserId,
+					...safeHookedData
+				} = hookedData;
+				return {
+					...safeHookedData,
+					...(requestedSessionId ? { id: requestedSessionId } : {}),
+					userId,
+					token: legacyCredentialAuthority
+						? refreshSecret
+						: createSessionHandle(
+								requestedSessionId ?? credentialIdentity.selector,
+							),
+				};
+			};
+			const persistSecondarySession = async (
+				sessionData: Record<string, any>,
+			) => {
+				if (!secondaryStorage) return sessionData;
+				const persistedSessionId = String(sessionData.id);
+				/**
+				 * store the session token for the user
+				 * so we can retrieve it later for listing sessions
+				 */
+				const currentList = await secondaryStorage.get(
+					secondaryActiveSessionsKey(userId),
+				);
 
-								let list: { token: string; expiresAt: number }[] = [];
-								const now = Date.now();
+				let list: SecondarySessionIndexEntry[] = [];
+				const now = Date.now();
 
-								if (currentList) {
-									list = safeJSONParse(currentList) || [];
-									list = list.filter(
-										(session) =>
-											session.expiresAt > now && session.token !== data.token,
-									);
-								}
+				if (currentList) {
+					list = safeJSONParse(currentList) || [];
+					list = list.filter(
+						(session) =>
+							session.expiresAt > now &&
+							session.sessionId !== persistedSessionId,
+					);
+				}
 
-								const sorted = [
-									...list,
-									{ token: data.token, expiresAt: data.expiresAt.getTime() },
-								].sort((a, b) => a.expiresAt - b.expiresAt);
-								const furthestSessionExp =
-									sorted.at(-1)?.expiresAt ?? data.expiresAt.getTime();
-								const furthestSessionTTL = getTTLSeconds(
-									furthestSessionExp,
-									now,
-								);
-								if (furthestSessionTTL > 0) {
-									await secondaryStorage.set(
-										`active-sessions-${userId}`,
-										JSON.stringify(sorted),
-										furthestSessionTTL,
-									);
-								}
+				const sorted = [
+					...list,
+					{
+						sessionId: persistedSessionId,
+						credentialKey,
+						expiresAt: data.expiresAt.getTime(),
+					},
+				].sort((a, b) => a.expiresAt - b.expiresAt);
+				const furthestSessionExp =
+					sorted.at(-1)?.expiresAt ?? data.expiresAt.getTime();
+				const furthestSessionTTL = getTTLSeconds(furthestSessionExp, now);
+				if (furthestSessionTTL > 0) {
+					await secondaryStorage.set(
+						secondaryActiveSessionsKey(userId),
+						JSON.stringify(sorted),
+						furthestSessionTTL,
+					);
+				}
 
-								const user = await (
-									await getCurrentAdapter(adapter)
-								).findOne<User>({
-									model: "user",
-									where: [
-										{
-											field: "id",
-											value: userId,
-										},
-									],
-								});
-								const sessionTTL = getTTLSeconds(data.expiresAt, now);
-								if (sessionTTL > 0) {
-									await secondaryStorage.set(
-										data.token,
-										JSON.stringify({
-											session: sessionData,
-											user,
-										}),
-										sessionTTL,
-									);
-								}
+				const user = await (
+					await getCurrentAdapter(adapter)
+				).findOne<User>({
+					model: "user",
+					where: [
+						{
+							field: "id",
+							value: userId,
+						},
+					],
+				});
+				const sessionTTL = getTTLSeconds(data.expiresAt, now);
+				if (sessionTTL > 0) {
+					await secondaryStorage.set(
+						credentialKey,
+						JSON.stringify({
+							session: { ...sessionData, token: null },
+							user,
+						}),
+						sessionTTL,
+					);
+					await secondaryStorage.set(
+						secondaryHandleKey(persistedSessionId),
+						JSON.stringify({ credentialKey }),
+						sessionTTL,
+					);
+				}
 
-								return sessionData;
-							},
-							executeMainFn: storeInDb,
-						}
-					: undefined,
-			);
-			return res as Session;
+				return sessionData;
+			};
+
+			const create = async () => {
+				if (serializesUserCredentialAuthority) {
+					const currentAdapter = await getCurrentAdapter(adapter);
+					const lockedUser = await lockAndReadUser(
+						currentAdapter,
+						userId,
+					);
+					if (!lockedUser) {
+						throw new Error("Cannot create a session for an unavailable user");
+					}
+				}
+				// Dual-write (DB session + secondary cache): create only the primary
+				// session row here. Secondary active-index / credential / handle
+				// publication is deferred via queueAfterTransactionHook after the
+				// credential row succeeds, so a later rollback leaves no ghosts.
+				// Secondary-authoritative mode still publishes immediately.
+				const res = await createWithHooks(
+					data,
+					"session",
+					secondaryStorage && !storesSessionsInDatabase
+						? {
+								fn: persistSecondarySession,
+								executeMainFn: storeInDb,
+							}
+						: undefined,
+					enforceSessionAuthority,
+				);
+				if (!res) {
+					throw new Error("Session creation was rejected by a database hook");
+				}
+				if (storesSessionsInDatabase && !legacyCredentialAuthority) {
+					const persistedSessionId = (res as Session).id;
+					const stableHandle = createSessionHandle(persistedSessionId);
+					if ((res as Session).token !== stableHandle) {
+						await (await getCurrentAdapter(adapter)).update<Session>({
+							model: "session",
+							where: [{ field: "id", value: persistedSessionId }],
+							update: { token: stableHandle },
+						});
+					}
+					await createCredentialRecord({
+						...credentialIdentity,
+						sessionId: persistedSessionId,
+						familyId,
+						secretDigest: refreshDigest,
+						expiresAt,
+					});
+				}
+				if (secondaryStorage && storesSessionsInDatabase) {
+					await queueAfterTransactionHook(async () => {
+						await persistSecondarySession(res as Record<string, any>);
+					});
+				}
+				return {
+					...(res as Session),
+					token: refreshSecret,
+				};
+			};
+
+			if (
+				serializesUserCredentialAuthority &&
+				typeof adapter.options?.adapterConfig.transaction !== "function"
+			) {
+				throw new Error(
+					"Admin-aware session creation requires an adapter with rollback-capable transactions",
+				);
+			}
+			return storesSessionsInDatabase || serializesUserCredentialAuthority
+				? runWithTransaction(adapter, create)
+				: create();
 		},
 		findSession: async (
 			token: string,
-		): Promise<{
-			session: Session & Record<string, any>;
-			user: User & Record<string, any>;
-		} | null> => {
-			if (secondaryStorage) {
-				const sessionStringified = await secondaryStorage.get(token);
-				// When preserveSessionInDatabase is enabled, revoked sessions
-				// remain in the database for audit purposes. Skip the database
-				// fallback to prevent those revoked sessions from being restored.
-				if (
-					!sessionStringified &&
-					(!options.session?.storeSessionInDatabase ||
-						ctx.options.session?.preserveSessionInDatabase)
-				) {
-					return null;
+			): Promise<{
+				session: Session & Record<string, any>;
+				user: User & Record<string, any>;
+			} | null> => {
+				if (legacyCredentialAuthority && storesSessionsInDatabase) {
+					const record = await (
+						await getCurrentAdapter(adapter)
+					).findOne<SessionWithUser>({
+						model: "session",
+						where: [{ field: "token", value: token }],
+						join: { user: true },
+					});
+					if (!record?.user) return null;
+					const { user, ...session } = record;
+					if (
+						(user as User & { banned?: boolean | null }).banned === true ||
+						(bindsTwoFactorSessionGeneration &&
+							!sessionMatchesTwoFactorGeneration(
+								session as Record<string, unknown>,
+								user as unknown as Record<string, unknown>,
+							))
+					) {
+						return null;
+					}
+					return {
+						session: parseInternalSessionOutput(ctx.options, session),
+						user: parseUserOutput(ctx.options, user),
+					};
 				}
+				if (secondaryStorage && !storesSessionsInDatabase) {
+				const digest = await digestSessionRefreshSecret(token);
+				const credentialKey = secondaryCredentialKey(digest);
+				const sessionStringified =
+					await secondaryStorage.get(credentialKey);
+				if (!sessionStringified) return null;
 				if (sessionStringified) {
 					const s = safeJSONParse<{
 						session: Session;
 						user: User;
 					}>(sessionStringified);
 					if (!s) return null;
-					if (bindsTwoFactorSessionGeneration) {
-						const currentUser = await (
-							await getCurrentAdapter(adapter)
-						).findOne<Record<string, unknown>>({
-							model: "user",
-							where: [{ field: "id", value: s.user.id }],
-						});
-						if (
-							!currentUser ||
+					const currentUser = await (
+						await getCurrentAdapter(adapter)
+					).findOne<User & { banned?: boolean | null }>({
+						model: "user",
+						where: [{ field: "id", value: s.user.id }],
+					});
+					if (
+						!currentUser ||
+						currentUser.banned === true ||
+						(bindsTwoFactorSessionGeneration &&
 							!sessionMatchesTwoFactorGeneration(
 								s.session as unknown as Record<string, unknown>,
 								currentUser,
-							)
-						) {
-							await secondaryStorage.delete(token);
-							return null;
-						}
+							))
+					) {
+						await secondaryStorage.delete(credentialKey);
+						return null;
 					}
-					const parsedSession = parseSessionOutput(ctx.options, {
+					const parsedSession = parseInternalSessionOutput(ctx.options, {
 						...s.session,
 						expiresAt: new Date(s.session.expiresAt),
 						createdAt: new Date(s.session.createdAt),
 						updatedAt: new Date(s.session.updatedAt),
 					});
 					const parsedUser = parseUserOutput(ctx.options, {
-						...s.user,
-						createdAt: new Date(s.user.createdAt),
-						updatedAt: new Date(s.user.updatedAt),
+						...currentUser,
+						createdAt: new Date(currentUser.createdAt),
+						updatedAt: new Date(currentUser.updatedAt),
 					});
 					return {
-						session: parsedSession,
+						session: { ...parsedSession, token },
 						user: parsedUser,
 					};
 				}
 			}
 
-			const currentAdapter = await getCurrentAdapter(adapter);
-			const result = await currentAdapter.findOne<
-				Session & { user: User | null }
-			>({
-				model: "session",
-				where: [
-					{
-						value: token,
-						field: "token",
-					},
-				],
-				join: {
-					user: true,
-				},
-			});
+			const result = await findDatabaseSessionByCredential(token);
 			if (!result) return null;
-
-			const { user, ...session } = result;
-			if (!user) return null;
+			const { user, session } = result;
 			if (
-				bindsTwoFactorSessionGeneration &&
-				!sessionMatchesTwoFactorGeneration(
-					session as Record<string, unknown>,
-					user as unknown as Record<string, unknown>,
-				)
+				(user as User & { banned?: boolean | null }).banned === true ||
+				(bindsTwoFactorSessionGeneration &&
+					!sessionMatchesTwoFactorGeneration(
+						session as Record<string, unknown>,
+						user as unknown as Record<string, unknown>,
+					))
 			) {
 				return null;
 			}
-			const parsedSession = parseSessionOutput(ctx.options, session);
+			const parsedSession = parseInternalSessionOutput(ctx.options, session);
 			const parsedUser = parseUserOutput(ctx.options, user);
 			return {
 				session: parsedSession,
 				user: parsedUser,
 			};
+		},
+		findSessionById: async (sessionId: string) => {
+			if (!storesSessionsInDatabase) {
+				if (!secondaryStorage) return null;
+				const credentialKey = parseSecondaryHandle(
+					await secondaryStorage.get(secondaryHandleKey(sessionId)),
+				);
+				if (!credentialKey) return null;
+				const serialized = await secondaryStorage.get(credentialKey);
+				const parsed = safeJSONParse<{ session: Session; user: User }>(serialized);
+				if (!parsed) return null;
+				return {
+					session: parseInternalSessionOutput(ctx.options, {
+						...parsed.session,
+						expiresAt: new Date(parsed.session.expiresAt),
+						createdAt: new Date(parsed.session.createdAt),
+						updatedAt: new Date(parsed.session.updatedAt),
+					}),
+					user: parseUserOutput(ctx.options, {
+						...parsed.user,
+						createdAt: new Date(parsed.user.createdAt),
+						updatedAt: new Date(parsed.user.updatedAt),
+					}),
+				};
+			}
+				const record = await findSessionRecordById(sessionId);
+				if (!record?.user) return null;
+				if (legacyCredentialAuthority) {
+					const { user, ...session } = record;
+					return {
+						session: parseInternalSessionOutput(ctx.options, session),
+						user: parseUserOutput(ctx.options, user),
+					};
+				}
+				const credentials = await (
+				await getCurrentAdapter(adapter)
+			).findMany<SessionCredential>({
+				model: SESSION_CREDENTIAL_MODEL,
+				where: [
+					{ field: "sessionId", value: sessionId },
+					{ field: "status", value: "active" },
+				],
+				limit: 1,
+			});
+			if (!credentials[0] || credentials[0].expiresAt <= new Date()) return null;
+			const { user, ...session } = record;
+			return {
+				session: parseInternalSessionOutput(ctx.options, session),
+				user: parseUserOutput(ctx.options, user),
+			};
+		},
+		recoverSessionCredential: async (
+				token: string,
+				idempotencyKey: string,
+			) => {
+				if (legacyCredentialAuthority) return null;
+				if (!storesSessionsInDatabase) return null;
+			const operationKey = parseCredentialOperationKey(idempotencyKey);
+			if (!operationKey) return null;
+			const recovered = await runWithTransaction(adapter, async () => {
+				const currentAdapter = await getCurrentAdapter(adapter);
+				const digest = await digestSessionRefreshSecret(token);
+				const credentialId = credentialIdFromRefreshSecret(token);
+				const credential = credentialId
+					? await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "selector", value: credentialId }],
+						})
+					: await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "secretDigest", value: digest }],
+						});
+				if (
+					!credential ||
+					credential.status !== "consumed" ||
+					!constantTimeEqual(credential.secretDigest, digest)
+				) {
+					return null;
+				}
+				return recoverRecentSessionRotation(
+					credential,
+					await digestSessionRotationNonce(operationKey),
+					operationKey,
+					digest,
+				);
+			});
+			if (!recovered) return null;
+			const { oldDigest: _, successorDigest: __, ...result } = recovered;
+			return result;
+			},
+			rotateSessionCredential: async (token: string, idempotencyKey?: string) => {
+				if (legacyCredentialAuthority) {
+					throw new Error(
+						"Session credential rotation is unavailable during the legacy bridge generation",
+					);
+				}
+				if (!storesSessionsInDatabase) {
+				throw new Error(
+					"Session credential rotation requires database-backed sessions with transactional compare-and-swap support",
+				);
+			}
+			if (
+				typeof adapter.options?.adapterConfig.transaction !== "function"
+			) {
+				throw new Error(
+					"Session credential rotation requires an adapter with rollback-capable transactions",
+				);
+			}
+			const suppliedOperationKey =
+				idempotencyKey === undefined
+					? undefined
+					: parseCredentialOperationKey(idempotencyKey);
+			if (idempotencyKey !== undefined && !suppliedOperationKey) {
+				throw new Error(CREDENTIAL_OPERATION_KEY_REQUIREMENT);
+			}
+			const rotationOperation = suppliedOperationKey ?? generateId(32);
+			const rotationNonceDigest =
+				await digestSessionRotationNonce(rotationOperation);
+			const rotated = await runWithTransaction(adapter, async () => {
+				const currentAdapter = await getCurrentAdapter(adapter);
+				const digest = await digestSessionRefreshSecret(token);
+				const credentialId = credentialIdFromRefreshSecret(token);
+				const credential = credentialId
+					? await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "selector", value: credentialId }],
+						})
+					: await currentAdapter.findOne<SessionCredential>({
+							model: SESSION_CREDENTIAL_MODEL,
+							where: [{ field: "secretDigest", value: digest }],
+						});
+				if (
+					!credential ||
+					!constantTimeEqual(credential.secretDigest, digest) ||
+					!credential.sessionId
+				) {
+					return null;
+				}
+				if (credential.status !== "active") {
+					if (credential.status === "consumed") {
+						const recovered = await recoverRecentSessionRotation(
+							credential,
+							rotationNonceDigest,
+							rotationOperation,
+							digest,
+						);
+						if (recovered) return recovered;
+						await revokeAndDeleteSessionById(
+							credential.sessionId,
+							new Date(),
+						);
+					}
+					return null;
+				}
+				if (credential.expiresAt <= new Date()) return null;
+
+				const record = await findSessionRecordById(credential.sessionId);
+				if (!record?.user || record.expiresAt <= new Date()) return null;
+				const activeUser = await lockAndReadActiveUser(
+					currentAdapter,
+					record.user.id,
+				);
+				if (!activeUser) return null;
+
+				const [derivedSuccessor] = await deriveRotationSuccessors(
+					credential,
+					rotationOperation,
+				);
+				if (!derivedSuccessor) return null;
+				const successorIdentity = {
+					...createCredentialIdentity(),
+					selector: derivedSuccessor.selector,
+				};
+				const successorSecret = derivedSuccessor.refreshToken;
+				const successorDigest = derivedSuccessor.digest;
+				const consumedAt = new Date();
+				const recoveryExpiresAt = new Date(
+					consumedAt.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
+				);
+				const consumed = await currentAdapter.incrementOne<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [
+						{ field: "id", value: credential.id },
+						{ field: "status", value: "active" },
+						{ field: "secretDigest", value: digest },
+					],
+					increment: {},
+					set: {
+						status: "consumed",
+						consumedAt,
+						rotationNonceDigest,
+						recoverySecretCiphertext: null,
+						recoveryExpiresAt,
+						updatedAt: consumedAt,
+					},
+				});
+				if (!consumed) {
+					const currentParent = await currentAdapter.findOne<SessionCredential>({
+						model: SESSION_CREDENTIAL_MODEL,
+						where: [{ field: "id", value: credential.id }],
+					});
+					if (currentParent) {
+						const recovered = await recoverRecentSessionRotation(
+							currentParent,
+							rotationNonceDigest,
+							rotationOperation,
+							digest,
+						);
+						if (recovered) return recovered;
+					}
+					await revokeAndDeleteSessionById(credential.sessionId, new Date());
+					return null;
+				}
+
+				await createCredentialRecord({
+					...successorIdentity,
+					sessionId: credential.sessionId,
+					familyId: credential.familyId,
+					secretDigest: successorDigest,
+					expiresAt: credential.expiresAt,
+					parentCredentialId: credential.id,
+					rotationCounter: credential.rotationCounter + 1,
+				});
+				if (credential.parentCredentialId) {
+					await currentAdapter.update<SessionCredential>({
+						model: SESSION_CREDENTIAL_MODEL,
+						where: [
+							{ field: "id", value: credential.parentCredentialId },
+						],
+						update: {
+							rotationNonceDigest: null,
+							recoverySecretCiphertext: null,
+							recoveryExpiresAt: null,
+							updatedAt: consumedAt,
+						},
+					});
+				}
+				const { user: _, ...session } = record;
+				return {
+					session: { ...session, token: successorSecret },
+					user: activeUser,
+					refreshToken: successorSecret,
+					familyId: credential.familyId,
+					rotationCounter: credential.rotationCounter + 1,
+					oldDigest: digest,
+					successorDigest,
+				};
+			});
+
+			if (rotated && secondaryStorage) {
+				const oldKey = secondaryCredentialKey(rotated.oldDigest);
+				const successorKey = secondaryCredentialKey(rotated.successorDigest);
+				const ttl = getTTLSeconds(rotated.session.expiresAt);
+				if (ttl > 0) {
+					await secondaryStorage.set(
+						successorKey,
+						JSON.stringify({
+							session: {
+								...rotated.session,
+								token: null,
+							},
+							user: rotated.user,
+						}),
+						ttl,
+					);
+					await secondaryStorage.set(
+						secondaryHandleKey(rotated.session.id),
+						JSON.stringify({ credentialKey: successorKey }),
+						ttl,
+					);
+				}
+				await secondaryStorage.delete(oldKey);
+			}
+
+			if (!rotated) return null;
+			const { oldDigest: _, successorDigest: __, ...result } = rotated;
+			return result;
 		},
 		findSessions: async (
 			sessionTokens: string[],
@@ -640,100 +1431,75 @@ export const createInternalAdapter = (
 				  }
 				| undefined,
 		) => {
-			if (secondaryStorage) {
-				const sessions: {
-					session: Session;
-					user: User;
-				}[] = [];
-				for (const sessionToken of sessionTokens) {
-					const sessionStringified = await secondaryStorage.get(sessionToken);
-					if (sessionStringified) {
-						try {
-							const s = (
-								typeof sessionStringified === "string"
-									? JSON.parse(sessionStringified)
-									: sessionStringified
-							) as {
-								session: Session;
-								user: User;
-							};
-							if (!s) return [];
-							const expiresAt = new Date(s.session.expiresAt);
-							if (options?.onlyActiveSessions && expiresAt <= new Date()) {
-								continue;
-							}
-							const session = {
-								session: {
-									...s.session,
-									expiresAt: new Date(s.session.expiresAt),
-								},
-								user: {
-									...s.user,
-									createdAt: new Date(s.user.createdAt),
-									updatedAt: new Date(s.user.updatedAt),
-								},
-							} as {
-								session: Session;
-								user: User;
-							};
-							sessions.push(session);
-						} catch {
-							// Skip invalid/corrupt session data
-							continue;
-						}
-					}
+			const sessions: { session: Session; user: User }[] = [];
+			for (const sessionToken of sessionTokens) {
+				const resolved = await internalAdapter.findSession(sessionToken);
+				if (!resolved) continue;
+				if (
+					options?.onlyActiveSessions &&
+					resolved.session.expiresAt <= new Date()
+				) {
+					continue;
 				}
-				return sessions;
+				sessions.push(resolved);
 			}
-
-			const sessions = await (
-				await getCurrentAdapter(adapter)
-			).findMany<Session & { user: User | null }>({
-				model: "session",
-				where: [
-					{
-						field: "token",
-						value: sessionTokens,
-						operator: "in",
-					},
-					...(options?.onlyActiveSessions
-						? [
-								{
-									field: "expiresAt",
-									value: new Date(),
-									operator: "gt",
-								} satisfies Where,
-							]
-						: []),
-				],
-				join: {
-					user: true,
-				},
-			});
-
-			if (!sessions.length) return [];
-			if (sessions.some((session) => !session.user)) return [];
-
-			return sessions.map((_session) => {
-				const { user, ...session } = _session;
-				return {
-					session,
-					user: user!,
-				};
-			});
+			return sessions;
 		},
 		updateSession: async (
 			sessionToken: string,
 			session: Partial<Session> & Record<string, any>,
 		) => {
+			const {
+				token: _discardedToken,
+				id: _discardedId,
+				userId: _discardedUserId,
+				...safeSessionUpdate
+				} = session;
+				const handleSessionId = sessionIdFromHandle(sessionToken);
+				const resolved = storesSessionsInDatabase
+					? legacyCredentialAuthority
+						? await (
+								await getCurrentAdapter(adapter)
+							).findOne<Session>({
+								model: "session",
+								where: [{ field: "token", value: sessionToken }],
+							})
+						: handleSessionId
+							? await findSessionRecordById(handleSessionId)
+							: await findDatabaseSessionByCredential(sessionToken)
+					: null;
+			const sessionId =
+				handleSessionId ??
+				(resolved
+					? "session" in resolved
+						? resolved.session.id
+						: resolved.id
+					: undefined);
+			if (storesSessionsInDatabase && !sessionId) return null;
+			const secondaryKey = secondaryStorage
+				? handleSessionId
+					? parseSecondaryHandle(
+							await secondaryStorage.get(
+								secondaryHandleKey(handleSessionId),
+							),
+						)
+					: secondaryCredentialKey(
+							await digestSessionRefreshSecret(sessionToken),
+						)
+				: null;
 			const updatedSession = await updateWithHooks<Session>(
-				session,
-				[{ field: "token", value: sessionToken }],
+				safeSessionUpdate,
+				[
+					storesSessionsInDatabase
+						? { field: "id", value: sessionId! }
+						: { field: "token", value: createSessionHandle(sessionId ?? "") },
+				],
 				"session",
 				secondaryStorage
 					? {
 							async fn(data) {
-								const currentSession = await secondaryStorage.get(sessionToken);
+								if (!secondaryKey) return null;
+								const currentSession = await secondaryStorage.get(secondaryKey);
 								if (!currentSession) {
 									return null;
 								}
@@ -756,7 +1522,7 @@ export const createInternalAdapter = (
 									),
 								};
 
-								const updatedSession = parseSessionOutput(
+								const updatedSession = parseInternalSessionOutput(
 									ctx.options,
 									mergedSession,
 								);
@@ -767,25 +1533,34 @@ export const createInternalAdapter = (
 
 								if (sessionTTL > 0) {
 									await secondaryStorage.set(
-										sessionToken,
-										JSON.stringify({
-											session: updatedSession,
+										secondaryKey,
+									JSON.stringify({
+										session: { ...updatedSession, token: null },
 											user: parsedSession.user,
 										}),
 										sessionTTL,
 									);
 
-									const listKey = `active-sessions-${updatedSession.userId}`;
+									const listKey = secondaryActiveSessionsKey(
+										updatedSession.userId,
+									);
 									const listRaw = await secondaryStorage.get(listKey);
-									const list: { token: string; expiresAt: number }[] = listRaw
+									const list: SecondarySessionIndexEntry[] = listRaw
 										? safeJSONParse(listRaw) || []
 										: [];
 
 									const filtered = list
 										.filter(
-											(s) => s.token !== sessionToken && s.expiresAt > now,
+											(s) =>
+												s.sessionId !== updatedSession.id && s.expiresAt > now,
 										)
-										.concat([{ token: sessionToken, expiresAt: expiresMs }]);
+										.concat([
+											{
+												sessionId: updatedSession.id,
+												credentialKey: secondaryKey,
+												expiresAt: expiresMs,
+											},
+										]);
 
 									const sorted = filtered.sort(
 										(a, b) => a.expiresAt - b.expiresAt,
@@ -808,13 +1583,85 @@ export const createInternalAdapter = (
 							executeMainFn: options.session?.storeSessionInDatabase,
 						}
 					: undefined,
+				(hookedData) => {
+					const {
+						id: _hookedId,
+						token: _hookedToken,
+						userId: _hookedUserId,
+						...safeHookedData
+					} = hookedData;
+					return safeHookedData as Session;
+				},
 			);
-			return updatedSession;
-		},
-		deleteSession: async (token: string) => {
+				if (
+					storesSessionsInDatabase &&
+					!legacyCredentialAuthority &&
+					updatedSession &&
+					sessionId
+				) {
+				await (
+					await getCurrentAdapter(adapter)
+				).updateMany({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "sessionId", value: sessionId }],
+					update: {
+						expiresAt: updatedSession.expiresAt,
+						updatedAt: new Date(),
+					},
+				});
+			}
+			return updatedSession
+				? {
+						...updatedSession,
+						token: handleSessionId ? updatedSession.token : sessionToken,
+					}
+				: null;
+			},
+			deleteSession: async (token: string) => {
+				if (typeof token !== "string" || token.length === 0) return;
+				if (legacyCredentialAuthority && storesSessionsInDatabase) {
+					await deleteWithHooks(
+						[{ field: "token", value: token }],
+						"session",
+						undefined,
+					);
+					return;
+				}
+				const handleSessionId = sessionIdFromHandle(token);
+			const databaseSession = storesSessionsInDatabase
+				? handleSessionId
+					? await findSessionRecordById(handleSessionId)
+					: await findDatabaseSessionByCredential(token)
+				: null;
+			let sessionId =
+				handleSessionId ??
+				(databaseSession
+					? "session" in databaseSession
+						? databaseSession.session.id
+						: databaseSession.id
+					: undefined);
+			if (storesSessionsInDatabase && !sessionId && !handleSessionId) {
+				sessionId =
+					(await findDatabaseSessionIdByCredential(token)) ?? undefined;
+			}
+			let credentialKey: string | null = null;
+			let secondaryUserId = databaseSession
+				? "session" in databaseSession
+					? databaseSession.session.userId
+					: databaseSession.userId
+				: undefined;
+			let cleanupSecondarySession: (() => Promise<void>) | null = null;
 			if (secondaryStorage) {
-				// remove the session from the active sessions list
-				const data = await secondaryStorage.get(token);
+				credentialKey = handleSessionId
+					? parseSecondaryHandle(
+							await secondaryStorage.get(
+								secondaryHandleKey(handleSessionId),
+							),
+						)
+					: secondaryCredentialKey(await digestSessionRefreshSecret(token));
+				const data = credentialKey
+					? await secondaryStorage.get(credentialKey)
+					: null;
 				if (data) {
 					const { session } =
 						safeJSONParse<{
@@ -825,18 +1672,23 @@ export const createInternalAdapter = (
 						logger.error("Session not found in secondary storage");
 						return;
 					}
-					const userId = session.userId;
+					sessionId ??= session.id;
+					secondaryUserId = session.userId;
+				}
 
-					const currentList = await secondaryStorage.get(
-						`active-sessions-${userId}`,
-					);
+				cleanupSecondarySession = async () => {
+					if (secondaryUserId) {
+						const currentList = await secondaryStorage.get(
+							secondaryActiveSessionsKey(secondaryUserId),
+						);
 					if (currentList) {
-						const list: { token: string; expiresAt: number }[] =
+						const list: SecondarySessionIndexEntry[] =
 							safeJSONParse(currentList) || [];
 						const now = Date.now();
 
 						const filtered = list.filter(
-							(session) => session.expiresAt > now && session.token !== token,
+							(session) =>
+								session.expiresAt > now && session.sessionId !== sessionId,
 						);
 						const sorted = filtered.sort((a, b) => a.expiresAt - b.expiresAt);
 						const furthestSessionExp = sorted.at(-1)?.expiresAt;
@@ -847,33 +1699,43 @@ export const createInternalAdapter = (
 							furthestSessionExp > Date.now()
 						) {
 							await secondaryStorage.set(
-								`active-sessions-${userId}`,
+								secondaryActiveSessionsKey(secondaryUserId),
 								JSON.stringify(filtered),
 								getTTLSeconds(furthestSessionExp, now),
 							);
 						} else {
-							await secondaryStorage.delete(`active-sessions-${userId}`);
+							await secondaryStorage.delete(
+								secondaryActiveSessionsKey(secondaryUserId),
+							);
 						}
 					} else {
 						logger.error("Active sessions list not found in secondary storage");
 					}
-				}
+					}
 
-				await secondaryStorage.delete(token);
+					if (credentialKey) await secondaryStorage.delete(credentialKey);
+					if (sessionId) {
+						await secondaryStorage.delete(secondaryHandleKey(sessionId));
+					}
+				};
 
-				if (
-					!options.session?.storeSessionInDatabase ||
-					ctx.options.session?.preserveSessionInDatabase
-				) {
+				if (!options.session?.storeSessionInDatabase) {
+					await queueAfterTransactionHook(cleanupSecondarySession);
 					return;
 				}
 			}
 
-			await deleteWithHooks(
-				[{ field: "token", value: token }],
-				"session",
-				undefined,
-			);
+			if (sessionId) {
+				await runWithTransaction(adapter, () =>
+					revokeAndDeleteSessionById(sessionId!),
+				);
+			}
+			if (cleanupSecondarySession) {
+				await queueAfterTransactionHook(cleanupSecondarySession);
+			}
+		},
+		deleteSessionById: async (sessionId: string) => {
+			await internalAdapter.deleteSession(createSessionHandle(sessionId));
 		},
 		deleteAccounts: async (userId: string) => {
 			await deleteManyWithHooks(
@@ -905,64 +1767,75 @@ export const createInternalAdapter = (
 			);
 		},
 		deleteUserSessions: async (userId: string) => {
-			if (secondaryStorage) {
-				const activeSession = await secondaryStorage.get(
-					`active-sessions-${userId}`,
-				);
-				const sessions = activeSession
-					? safeJSONParse<{ token: string }[]>(activeSession)
-					: [];
-				if (!sessions) return;
-				for (const session of sessions) {
-					await secondaryStorage.delete(session.token);
+			const sessions = storesSessionsInDatabase
+				? await runWithTransaction(adapter, async () => {
+						const currentAdapter = await getCurrentAdapter(adapter);
+						const rows = await currentAdapter.findMany<Session>({
+							model: "session",
+							where: [{ field: "userId", value: userId }],
+						});
+							for (const session of rows) {
+								if (!legacyCredentialAuthority) {
+									await revokeCredentialFamiliesBySessionId(session.id);
+								}
+						}
+						if (!ctx.options.session?.preserveSessionInDatabase) {
+							await deleteManyWithHooks(
+								[{ field: "userId", value: userId }],
+								"session",
+								undefined,
+							);
+						}
+						return rows;
+					})
+				: await internalAdapter.listSessions(userId);
+			await queueAfterTransactionHook(async () => {
+				if (secondaryStorage && storesSessionsInDatabase) {
+					for (const session of sessions) {
+						const handleKey = secondaryHandleKey(session.id);
+						const credentialKey = parseSecondaryHandle(
+							await secondaryStorage.get(handleKey),
+						);
+						if (credentialKey) await secondaryStorage.delete(credentialKey);
+						await secondaryStorage.delete(handleKey);
+					}
+					await secondaryStorage.delete(secondaryActiveSessionsKey(userId));
 				}
-				await secondaryStorage.delete(`active-sessions-${userId}`);
-
-				if (
-					!options.session?.storeSessionInDatabase ||
-					ctx.options.session?.preserveSessionInDatabase
-				) {
-					return;
+				if (!storesSessionsInDatabase) {
+					for (const session of sessions) {
+						await internalAdapter.deleteSession(createSessionHandle(session.id));
+					}
+					await secondaryStorage?.delete(secondaryActiveSessionsKey(userId));
 				}
-			}
-			await deleteManyWithHooks(
-				[
-					{
-						field: "userId",
-						value: userId,
-					},
-				],
-				"session",
-				undefined,
+			});
+		},
+		revokeUserOAuthTokenFamilies: async (userId: string) => {
+			const hasOAuthTokenAuthority = ctx.options.plugins?.some(
+				(plugin) => plugin.id === "oidc-provider" || plugin.id === "mcp",
 			);
+			if (!hasOAuthTokenAuthority) return;
+			await runWithTransaction(adapter, async () => {
+				const currentAdapter = await getCurrentAdapter(adapter);
+				const revokedAt = new Date();
+				await currentAdapter.updateMany({
+					model: "oauthAccessToken",
+					where: [{ field: "userId", value: userId }],
+					update: {
+						refreshStatus: "revoked",
+						revokedAt,
+						rotationNonceDigest: null,
+						recoveryExpiresAt: null,
+						updatedAt: revokedAt,
+					},
+				});
+			});
 		},
 		deleteSessions: async (sessionTokens: string[]) => {
-			if (secondaryStorage) {
+			await runWithTransaction(adapter, async () => {
 				for (const sessionToken of sessionTokens) {
-					const session = await secondaryStorage.get(sessionToken);
-					if (session) {
-						await secondaryStorage.delete(sessionToken);
-					}
+					await internalAdapter.deleteSession(sessionToken);
 				}
-
-				if (
-					!options.session?.storeSessionInDatabase ||
-					ctx.options.session?.preserveSessionInDatabase
-				) {
-					return;
-				}
-			}
-			await deleteManyWithHooks(
-				[
-					{
-						field: "token",
-						value: sessionTokens,
-						operator: "in",
-					},
-				],
-				"session",
-				undefined,
-			);
+			});
 		},
 		findOAuthUser: async (
 			email: string,
@@ -1676,4 +2549,5 @@ export const createInternalAdapter = (
 		},
 		refreshUserSessions,
 	};
+	return internalAdapter;
 };

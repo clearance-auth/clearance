@@ -152,6 +152,25 @@ describe("mongodb-adapter", () => {
 
 		expect(result).toBeNull();
 	});
+
+	it("sorts logical ids by MongoDB _id for restartable cursors", async () => {
+		const aggregate = vi.fn((_pipeline: unknown[]) => ({
+			toArray: vi.fn(async () => []),
+		}));
+		const db = {
+			collection: vi.fn(() => ({ aggregate })),
+		} as any;
+		const adapter = mongodbAdapter(db, { transaction: false })({});
+
+		await adapter.findMany({
+			model: "session",
+			sortBy: { field: "id", direction: "asc" },
+		});
+
+		expect(aggregate.mock.calls[0]?.[0]).toContainEqual({
+			$sort: { _id: 1 },
+		});
+	});
 });
 
 describe("uuid support", () => {

@@ -171,6 +171,9 @@ export async function dispatchRemoteCommand(
 		case SCHEMA_OPERATIONS.status.cliPath:
 		case SCHEMA_OPERATIONS.generate.cliPath:
 		case SCHEMA_OPERATIONS.migrate.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityStatus.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityArm.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityDrain.cliPath:
 		case CONFIG_OPERATIONS.get.cliPath:
 		case CONFIG_OPERATIONS.set.cliPath:
 		case CONFIG_OPERATIONS.validate.cliPath:

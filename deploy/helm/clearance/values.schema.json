@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["image", "replicaCount", "terminationGracePeriodSeconds", "service", "secrets", "env", "console", "ingress", "networkPolicy", "podDisruptionBudget", "metrics", "delivery", "backup"],
+  "required": ["image", "replicaCount", "terminationGracePeriodSeconds", "credentialAuthority", "service", "secrets", "env", "console", "ingress", "networkPolicy", "podDisruptionBudget", "metrics", "delivery", "backup"],
   "properties": {
     "image": {
       "type": "object",
@@ -16,6 +16,18 @@
     "replicaCount": { "type": "integer", "minimum": 1 },
     "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
     "terminationGracePeriodSeconds": { "type": "integer", "minimum": 10 },
+    "credentialAuthority": {
+      "type": "object",
+      "required": ["phase", "deploymentId", "drainId", "migrationAttemptId", "expectedRuntimeCount", "migrationLeaseTimeoutMs"],
+      "properties": {
+        "phase": { "type": "string", "enum": ["bootstrap", "bridge", "drain", "migrate", "serve"] },
+        "deploymentId": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "drainId": { "type": "string", "maxLength": 200 },
+        "migrationAttemptId": { "type": "string", "maxLength": 200 },
+        "expectedRuntimeCount": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "migrationLeaseTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 600000 }
+      }
+    },
     "restartToken": { "type": "string" },
     "service": {
       "type": "object",

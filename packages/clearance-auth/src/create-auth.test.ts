@@ -226,7 +226,7 @@ describe("@clearance/auth runtime wrapper", () => {
 		}
 	});
 
-	it("enables adapter transactions only for durable delivery", async () => {
+	it("enables adapter transactions for every PostgreSQL runtime", async () => {
 		const legacy = createClearanceAuth({
 			baseURL: "http://localhost:3300",
 			secret: "unit-test-secret-value-not-default!!",
@@ -255,7 +255,7 @@ describe("@clearance/auth runtime wrapper", () => {
 					options: { database: Record<string, unknown> };
 				}
 			).options.database;
-			expect(legacyDatabase).not.toHaveProperty("transaction");
+			expect(legacyDatabase).toHaveProperty("transaction", true);
 			expect(durableDatabase).toHaveProperty("transaction", true);
 		} finally {
 			await Promise.all([legacy.destroy(), durable.destroy()]);

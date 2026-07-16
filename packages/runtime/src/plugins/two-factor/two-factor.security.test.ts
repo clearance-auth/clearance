@@ -4,6 +4,11 @@ import { createOTP } from "@clearance/utils/otp";
 import { describe, expect, it } from "vitest";
 import { parseSetCookieHeader } from "../../cookies";
 import { makeSignature, symmetricDecrypt } from "../../crypto";
+import {
+	createSessionHandle,
+	digestSessionRefreshSecret,
+	SESSION_CREDENTIAL_DIGEST_VERSION,
+} from "../../db/session-credential";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
 import type { Session, User, Verification } from "../../types";
@@ -837,16 +842,44 @@ describe("two-factor security: sessions are bound to the factor generation", () 
 			update: { twoFactorSessionGeneration: "rotated-session-generation" },
 		});
 		const staleToken = "late-stale-session-token";
+		const staleSessionId = "late-stale-session-id";
 		const { id: _sourceId, ...sourceData } = source!;
 		await db.create({
 			model: "session",
+			forceAllowId: true,
 			data: {
 				...sourceData,
-				token: staleToken,
+				id: staleSessionId,
+				token: createSessionHandle(staleSessionId),
 				createdAt: new Date(),
 				updatedAt: new Date(),
 				expiresAt: new Date(Date.now() + 60 * 60 * 1000),
 				twoFactorSessionGeneration: staleGeneration,
+			},
+		});
+		const credentialNow = new Date();
+		await db.create({
+			model: "sessionCredential",
+			forceAllowId: true,
+			data: {
+				id: "late-stale-session-credential",
+				selector: "late-stale-session-selector",
+				sessionId: staleSessionId,
+				familyId: "late-stale-session-family",
+				secretDigest: await digestSessionRefreshSecret(staleToken),
+				digestVersion: SESSION_CREDENTIAL_DIGEST_VERSION,
+				status: "active",
+				rotationCounter: 0,
+				parentCredentialId: null,
+				expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+				consumedAt: null,
+				revokedAt: null,
+				reuseDetectedAt: null,
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+				createdAt: credentialNow,
+				updatedAt: credentialNow,
 			},
 		});
 		const signature = await makeSignature(staleToken, DEFAULT_SECRET);

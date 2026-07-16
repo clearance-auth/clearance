@@ -15,6 +15,26 @@ import { kAPIErrorHeaderSymbol, toResponse } from "@clearance/call";
 import { createDefu } from "defu";
 import { isAPIError } from "../utils/is-api-error";
 import { isRequestLike } from "../utils/url";
+import { assertSessionCredentialMigrationComplete } from "../db/session-credential-migration";
+import { readInternalCredentialAuthority } from "../internal/credential-authority";
+const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
+
+async function assertDispatchCredentialAuthority(context: AuthContext) {
+	const authority = readInternalCredentialAuthority(context.options);
+	if (authority?.generation === "legacy-v1") return;
+	let pending = credentialMigrationChecks.get(context);
+	if (!pending) {
+		pending = assertSessionCredentialMigrationComplete(
+			context.adapter,
+			context.options,
+		).catch((error) => {
+			credentialMigrationChecks.delete(context);
+			throw error;
+		});
+		credentialMigrationChecks.set(context, pending);
+	}
+	await pending;
+}
 
 /**
  * Input accepted by {@link dispatchAuthEndpoint}. `context` must already be a
@@ -354,6 +374,7 @@ export async function dispatchAuthEndpoint(
 		},
 		async () =>
 			runWithEndpointContext(internalContext, async () => {
+				await assertDispatchCredentialAuthority(internalContext.context);
 				const { beforeHooks, afterHooks } = getHooks(internalContext.context);
 				const before = await runBeforeHooks(
 					internalContext,

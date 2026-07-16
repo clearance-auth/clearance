@@ -361,6 +361,7 @@ describe("base context creation", () => {
 					log,
 				} as any,
 				secondaryStorage: {
+					namespace: "context-cookie-refresh-test",
 					get: vi.fn(),
 					set: vi.fn(),
 					delete: vi.fn(),
@@ -436,6 +437,7 @@ describe("base context creation", () => {
 		it("should use secondary-storage when secondaryStorage is provided", async () => {
 			const res = await initBase({
 				secondaryStorage: {
+					namespace: "context-rate-limit-test",
 					get: vi.fn(),
 					set: vi.fn(),
 					delete: vi.fn(),
@@ -860,6 +862,7 @@ describe("base context creation", () => {
 		it("should default storeStateStrategy to 'database' when only secondaryStorage is configured", async () => {
 			const res = await initBase({
 				secondaryStorage: {
+					namespace: "context-oauth-state-test",
 					get: vi.fn(),
 					set: vi.fn(),
 					delete: vi.fn(),
@@ -879,6 +882,7 @@ describe("base context creation", () => {
 		it("should keep storeAccountCookie enabled when only secondaryStorage is configured", async () => {
 			const res = await initBase({
 				secondaryStorage: {
+					namespace: "context-account-cookie-test",
 					get: vi.fn(),
 					set: vi.fn(),
 					delete: vi.fn(),
@@ -1839,6 +1843,7 @@ describe("base context creation", () => {
 
 		it("should handle secondaryStorage configuration", async () => {
 			const mockStorage = {
+				namespace: "context-edge-case-test",
 				get: vi.fn(),
 				set: vi.fn(),
 				delete: vi.fn(),

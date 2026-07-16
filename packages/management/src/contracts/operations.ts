@@ -44,6 +44,9 @@ import type {
 	verifyUpgrade,
 } from "../services/upgrade.js";
 import type {
+	armCredentialAuthority,
+	drainCredentialAuthority,
+	getCredentialAuthorityStatus,
 	getRuntimeSchemaStatus,
 	migrateRuntimeSchema,
 	planRuntimeSchema,
@@ -498,6 +501,22 @@ export interface ManagementOperationTypes {
 	"schema.migrate": {
 		input: { dryRun?: boolean; confirm?: boolean };
 		output: Awaited<ReturnType<typeof migrateRuntimeSchema>>;
+	};
+	"schema.credential-authority.status": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof getCredentialAuthorityStatus>>;
+	};
+	"schema.credential-authority.arm": {
+		input: {
+			deploymentId: string;
+			expectedRuntimeCount: number;
+			confirm?: boolean;
+		};
+		output: Awaited<ReturnType<typeof armCredentialAuthority>>;
+	};
+	"schema.credential-authority.drain": {
+		input: { deploymentId: string; drainId: string; confirm?: boolean };
+		output: Awaited<ReturnType<typeof drainCredentialAuthority>>;
 	};
 	"schema.store-v2.status": {
 		input: Record<string, never>;
@@ -1318,6 +1337,30 @@ export const SCHEMA_OPERATIONS = Object.freeze({
 		http: { method: "POST", path: "/v1/schema/migrate" },
 		mutation: true,
 		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	credentialAuthorityStatus: defineOperation({
+		id: "schema.credential-authority.status",
+		cliPath: "schema credential-authority status",
+		http: { method: "GET", path: "/v1/schema/credential-authority" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	credentialAuthorityArm: defineOperation({
+		id: "schema.credential-authority.arm",
+		cliPath: "schema credential-authority arm",
+		http: { method: "POST", path: "/v1/schema/credential-authority/arm" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	credentialAuthorityDrain: defineOperation({
+		id: "schema.credential-authority.drain",
+		cliPath: "schema credential-authority drain",
+		http: { method: "POST", path: "/v1/schema/credential-authority/drain" },
+		mutation: true,
+		supportsDryRun: false,
 		confirmation: "server-required",
 	}),
 });

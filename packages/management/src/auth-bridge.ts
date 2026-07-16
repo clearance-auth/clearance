@@ -114,6 +114,41 @@ function managementSyncOptions(
 
 let bundle: ClearanceAuthBundle | null = null;
 
+function credentialAuthorityRuntimeOptions(): NonNullable<
+	Parameters<typeof createClearanceAuth>[0]["credentialAuthority"]
+> {
+	const production =
+		process.env.NODE_ENV === "production" ||
+		process.env.CLEARANCE_STRICT_SECRETS === "1";
+	const generation =
+		process.env.CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION ??
+		(production ? "" : "digest-v1");
+	if (generation !== "legacy-v1" && generation !== "digest-v1") {
+		throw new Error(
+			"CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION must be legacy-v1 or digest-v1",
+		);
+	}
+	const deploymentId =
+		process.env.CLEARANCE_DEPLOYMENT_ID ?? (production ? "" : "development");
+	const instanceId =
+		process.env.CLEARANCE_INSTANCE_ID ?? process.env.HOSTNAME ??
+		(production ? "" : `development-${process.pid}`);
+	if (!deploymentId.trim()) {
+		throw new Error("CLEARANCE_DEPLOYMENT_ID is required in production");
+	}
+	if (!instanceId.trim()) {
+		throw new Error("CLEARANCE_INSTANCE_ID is required in production");
+	}
+	return {
+		generation,
+		deploymentId,
+		instanceId,
+		...(process.env.CLEARANCE_CREDENTIAL_DRAIN_ID
+			? { migrationDrainId: process.env.CLEARANCE_CREDENTIAL_DRAIN_ID }
+			: {}),
+	};
+}
+
 export function getAuthBundle(): ClearanceAuthBundle {
 	if (bundle) return bundle;
 	const databaseUrl = process.env.DATABASE_URL;
@@ -142,6 +177,7 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		databaseUrl,
 		enableSso: true,
 		enableScim: true,
+		credentialAuthority: credentialAuthorityRuntimeOptions(),
 	});
 	return bundle;
 }
@@ -156,11 +192,15 @@ export async function closeAuthBundle(): Promise<void> {
 	if (!bundle) return;
 	const current = bundle;
 	bundle = null;
-	await current.pool.end();
+	await current.destroy();
 }
 
 export async function ensureAuthMigrated(): Promise<void> {
 	const b = getAuthBundle();
+	if (credentialAuthorityRuntimeOptions().generation === "legacy-v1") {
+		await b.prepareCredentialAuthorityRuntime();
+		return;
+	}
 	await b.migrate();
 }
 
@@ -1261,6 +1301,19 @@ export async function revokeSessionInAuth(
 			!runtimeRow && (!mgmt || mgmt.status === "revoked");
 
 		if (runtimeRow) {
+			if (credentialAuthorityRuntimeOptions().generation === "digest-v1") {
+				await query(
+					`update "sessionCredential"
+					 set status = 'revoked',
+					     "revokedAt" = $2,
+					     "updatedAt" = $2,
+					     "rotationNonceDigest" = null,
+					     "recoverySecretCiphertext" = null,
+					     "recoveryExpiresAt" = null
+					 where "sessionId" = $1`,
+					[sessionId, now],
+				);
+			}
 			await query(`delete from session where id = $1`, [sessionId]);
 		}
 
@@ -1370,7 +1423,11 @@ function requireCoordinatedStore(
 
 async function ensureRuntimeLifecycleSchema(): Promise<void> {
 	const b = getAuthBundle();
-	await b.migrate();
+	if (credentialAuthorityRuntimeOptions().generation === "legacy-v1") {
+		await b.prepareCredentialAuthorityRuntime();
+	} else {
+		await b.migrate();
+	}
 	// migrate() already adds banned columns; re-assert for safety when migrate skipped work
 	await b.pool.query(
 		`ALTER TABLE "user" ADD COLUMN IF NOT EXISTS banned boolean DEFAULT false`,
@@ -1450,8 +1507,61 @@ async function requireRuntimeUser(
 async function revokeRuntimeSessions(
 	query: CoordinatedQuery,
 	userId: string,
+	revokedAt: string,
 ): Promise<number> {
+	if (credentialAuthorityRuntimeOptions().generation === "legacy-v1") {
+		const legacy = await query(`delete from session where "userId" = $1`, [
+			userId,
+		]);
+		return legacy.rowCount ?? 0;
+	}
+	await query(
+		`update "sessionCredential" as credential
+		 set status = 'revoked',
+		     "revokedAt" = $2,
+		     "updatedAt" = $2,
+		     "rotationNonceDigest" = null,
+		     "recoverySecretCiphertext" = null,
+		     "recoveryExpiresAt" = null
+		 from session
+		 where credential."sessionId" = session.id
+		   and session."userId" = $1`,
+		[userId, revokedAt],
+	);
 	const r = await query(`delete from session where "userId" = $1`, [userId]);
+	return r.rowCount ?? 0;
+}
+
+async function revokeRuntimeOAuthTokenFamilies(
+	query: CoordinatedQuery,
+	userId: string,
+	revokedAt: string,
+): Promise<number> {
+	const table = await query(
+		`select 1
+		 from information_schema.tables
+		 where table_schema = current_schema()
+		   and table_name = 'oauthAccessToken'
+		 limit 1`,
+	);
+	if (table.rows.length === 0) return 0;
+	if (credentialAuthorityRuntimeOptions().generation === "legacy-v1") {
+		const legacy = await query(
+			`delete from "oauthAccessToken" where "userId" = $1`,
+			[userId],
+		);
+		return legacy.rowCount ?? 0;
+	}
+	const r = await query(
+		`update "oauthAccessToken"
+		 set "refreshStatus" = 'revoked',
+		     "revokedAt" = $2,
+		     "rotationNonceDigest" = null,
+		     "recoveryExpiresAt" = null,
+		     "updatedAt" = $2
+		 where "userId" = $1`,
+		[userId, revokedAt],
+	);
 	return r.rowCount ?? 0;
 }
 
@@ -1580,13 +1690,12 @@ export async function updateUserInAuth(
 		let nextBanReason: string | null =
 			nextBanned ? "disabled" : null;
 		let revokedRuntimeSessions = 0;
+		let revokedOAuthTokenFamilies = 0;
 		let revokedMgmtSessions = 0;
 
 		if (status === "disabled") {
 			nextBanned = true;
 			nextBanReason = "disabled";
-			revokedRuntimeSessions = await revokeRuntimeSessions(query, id);
-			revokedMgmtSessions = revokeManagementSessions(data, user.id, now);
 		} else if (status === "active") {
 			// Soft-deleted management principals never reach here (NOT_FOUND).
 			// Tombstoned runtime identities (delete) cannot be safely restored —
@@ -1628,6 +1737,15 @@ export async function updateUserInAuth(
 				status: 404,
 			});
 		}
+		if (status === "disabled") {
+			revokedRuntimeSessions = await revokeRuntimeSessions(query, id, now);
+			revokedOAuthTokenFamilies = await revokeRuntimeOAuthTokenFamilies(
+				query,
+				id,
+				now,
+			);
+			revokedMgmtSessions = revokeManagementSessions(data, user.id, now);
+		}
 
 		if (email) user.email = nextEmail;
 		if (name !== undefined) user.name = nextName;
@@ -1665,6 +1783,7 @@ export async function updateUserInAuth(
 					...(hasStatus ? ["status"] : []),
 				],
 				revokedRuntimeSessions,
+				revokedOAuthTokenFamilies,
 				revokedManagementSessions: revokedMgmtSessions,
 				runtimeBanned: nextBanned,
 			},
@@ -1700,9 +1819,6 @@ export async function disableUserInAuth(
 			: now;
 
 		const alreadyDisabled = user.status === "disabled";
-		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id);
-		const revokedMgmtSessions = revokeManagementSessions(data, user.id, now);
-
 		await query(
 			`update "user"
        set banned = true,
@@ -1711,6 +1827,13 @@ export async function disableUserInAuth(
        where id = $2`,
 			[new Date(principalUpdatedAt), id],
 		);
+		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id, now);
+		const revokedOAuthTokenFamilies = await revokeRuntimeOAuthTokenFamilies(
+			query,
+			id,
+			now,
+		);
+		const revokedMgmtSessions = revokeManagementSessions(data, user.id, now);
 
 		if (!alreadyDisabled) {
 			user.status = "disabled";
@@ -1735,7 +1858,12 @@ export async function disableUserInAuth(
 
 		const principal: Principal = { ...user };
 		// Idempotent re-disable with no remaining sessions is a no-op (no audit).
-		if (!alreadyDisabled || revokedRuntimeSessions > 0 || revokedMgmtSessions > 0) {
+		if (
+			!alreadyDisabled ||
+			revokedRuntimeSessions > 0 ||
+			revokedOAuthTokenFamilies > 0 ||
+			revokedMgmtSessions > 0
+		) {
 			appendAuditEvent(data, {
 				actor: input?.actor ?? "operator",
 				action: "users.disable",
@@ -1749,6 +1877,7 @@ export async function disableUserInAuth(
 				metadata: {
 					revokedSessions: revokedMgmtSessions,
 					revokedRuntimeSessions,
+					revokedOAuthTokenFamilies,
 					idempotent: alreadyDisabled,
 				},
 			});
@@ -1784,8 +1913,6 @@ export async function deleteUserInAuth(
 			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
 			: now;
 
-		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id);
-		const strippedAccounts = await stripRuntimeCredentials(query, id);
 		// Free original email for re-create; keep row for FK stability (member/sso).
 		const tombstoneEmail = `deleted+${id.replace(/[^a-zA-Z0-9_-]/g, "_")}@users.clearance.invalid`;
 		await query(
@@ -1797,6 +1924,13 @@ export async function deleteUserInAuth(
        where id = $3`,
 			[tombstoneEmail, new Date(principalUpdatedAt), id],
 		);
+		const revokedRuntimeSessions = await revokeRuntimeSessions(query, id, now);
+		const revokedOAuthTokenFamilies = await revokeRuntimeOAuthTokenFamilies(
+			query,
+			id,
+			now,
+		);
+		const strippedAccounts = await stripRuntimeCredentials(query, id);
 
 		user.status = "deleted";
 		user.updatedAt = principalUpdatedAt;
@@ -1842,6 +1976,7 @@ export async function deleteUserInAuth(
 			metadata: {
 				revokedSessions: revokedMgmtSessions,
 				revokedRuntimeSessions,
+				revokedOAuthTokenFamilies,
 				strippedCredentialAccounts: strippedAccounts,
 			},
 		});

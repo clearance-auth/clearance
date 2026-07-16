@@ -1,0 +1,10 @@
+{
+  "name": "clearance-v021-public-credential-compat-fixture",
+  "private": true,
+  "type": "module",
+  "description": "Exact public @clearance/auth@0.2.1 artifact fixture for credential-authority migration proof",
+  "dependencies": {
+    "@clearance/auth": "https://registry.npmjs.org/@clearance/auth/-/auth-0.2.1.tgz",
+    "pg": "8.14.1"
+  }
+}

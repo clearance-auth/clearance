@@ -79,6 +79,11 @@ export interface DBAdapterFactoryConfig<
 	 */
 	adapterId: string;
 	/**
+	 * Whether records survive process teardown. Security migrations treat an
+	 * unspecified capability as durable and require the deployment drain fence.
+	 */
+	storagePersistence?: "durable" | "ephemeral" | undefined;
+	/**
 	 * If the database supports numeric ids, set this to `true`.
 	 *
 	 * @default true
@@ -405,6 +410,8 @@ export type DBRawTransactionQuery = <
 
 export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 	id: string;
+	/** Explicit storage capability; absent adapters are conservatively durable. */
+	storagePersistence?: "durable" | "ephemeral" | undefined;
 	create: <T extends Record<string, any>, R = T>(data: {
 		model: string;
 		data: Omit<T, "id">;

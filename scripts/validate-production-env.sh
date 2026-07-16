@@ -45,6 +45,8 @@ Required (strong secrets, no defaults):
   CLEARANCE_BACKUP_VOLUME
   CLEARANCE_IMAGE_REPOSITORY
   CLEARANCE_IMAGE_DIGEST          # immutable sha256:...; signature is a release gate
+  CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION # legacy-v1 bridge or digest-v1 serve
+  CLEARANCE_DEPLOYMENT_ID         # immutable candidate rollout identity
   CLEARANCE_BACKUP_IMAGE_REPOSITORY
   CLEARANCE_BACKUP_IMAGE_DIGEST   # immutable sha256:...; signature is a release gate
 
@@ -147,6 +149,29 @@ check_present CLEARANCE_PG_VOLUME "${CLEARANCE_PG_VOLUME-}"
 check_present CLEARANCE_BACKUP_VOLUME "${CLEARANCE_BACKUP_VOLUME-}"
 check_present CLEARANCE_IMAGE_REPOSITORY "${CLEARANCE_IMAGE_REPOSITORY-}"
 check_present CLEARANCE_BACKUP_IMAGE_REPOSITORY "${CLEARANCE_BACKUP_IMAGE_REPOSITORY-}"
+
+case "${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION-}" in
+  legacy-v1|digest-v1)
+    note "CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION is supported"
+    ;;
+  *)
+    fail "CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION must be legacy-v1 or digest-v1"
+    ;;
+esac
+if [[ "${CLEARANCE_DEPLOYMENT_ID-}" =~ [^[:space:]] ]] \
+  && (( ${#CLEARANCE_DEPLOYMENT_ID} <= 200 )); then
+  note "CLEARANCE_DEPLOYMENT_ID is a bounded non-blank identity"
+else
+  fail "CLEARANCE_DEPLOYMENT_ID must contain a non-space character and be at most 200 characters"
+fi
+if [[ -n "${CLEARANCE_CREDENTIAL_DRAIN_ID-}" ]]; then
+  if [[ "${CLEARANCE_CREDENTIAL_DRAIN_ID}" =~ [^[:space:]] ]] \
+    && (( ${#CLEARANCE_CREDENTIAL_DRAIN_ID} <= 200 )); then
+    note "CLEARANCE_CREDENTIAL_DRAIN_ID is a bounded non-blank identity"
+  else
+    fail "CLEARANCE_CREDENTIAL_DRAIN_ID must contain a non-space character and be at most 200 characters"
+  fi
+fi
 
 # Delivery keys are three purpose-separated 32-byte authorities. Validate the
 # complete ring without printing ids, JSON, or decoded material.

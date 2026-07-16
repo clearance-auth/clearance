@@ -92,11 +92,10 @@ describe("organization creation in database hooks", async () => {
 		});
 	});
 
-	it("should handle errors gracefully when organization creation fails in hook", async ({
+	it("keeps a committed user when a post-commit organization hook fails", async ({
 		skip,
 	}) => {
 		let firstUserCreated = false;
-		let errorOnSecondUser: any = null;
 
 		const { auth, client, db } = await getTestInstance({
 			plugins: [organization()],
@@ -141,18 +140,15 @@ describe("organization creation in database hooks", async () => {
 		expect(result1.data?.user?.email).toBe("user1-hook@example.com");
 		expect(firstUserCreated).toBe(true);
 
-		// Second user should fail due to duplicate org slug
-		try {
-			await client.signUp.email({
-				email: "user2-hook@example.com",
-				password: "password123",
-				name: "User 2",
-			});
-		} catch (error) {
-			errorOnSecondUser = error;
-		}
-
-		expect(errorOnSecondUser).toBeDefined();
+		// The user mutation commits before public after hooks run. A duplicate
+		// organization is logged without misreporting the committed signup as a
+		// rollback-safe failure that a client could retry.
+		const result2 = await client.signUp.email({
+			email: "user2-hook@example.com",
+			password: "password123",
+			name: "User 2",
+		});
+		expect(result2.data?.user?.email).toBe("user2-hook@example.com");
 
 		// Verify only one organization with our test slug was created
 		const orgs = await db.findMany({
@@ -166,7 +162,7 @@ describe("organization creation in database hooks", async () => {
 		});
 		expect(orgs).toHaveLength(1);
 
-		// Verify only the first user exists (transaction should have rolled back for second user)
+		// The second user remains committed even though its post-commit side effect failed.
 		const users = await db.findMany({
 			model: "user",
 			where: [
@@ -176,7 +172,7 @@ describe("organization creation in database hooks", async () => {
 				},
 			],
 		});
-		expect(users).toHaveLength(0);
+		expect(users).toHaveLength(1);
 	});
 
 	it("should work with multiple async operations in the hook", async () => {

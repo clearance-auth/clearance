@@ -175,17 +175,17 @@ describe("database instrumentation", () => {
 		const instance = await createTestInstance();
 		await instance.client.signUp.email(testUser);
 
-		let sessionToken: string | undefined;
+		let sessionId: string | undefined;
 		await instance.runWithUser(testUser.email, testUser.password, async () => {
 			const res = await instance.client.getSession();
-			sessionToken = res?.data?.session?.token;
+			sessionId = res?.data?.session?.id;
 		});
 
 		await instance.runWithUser(
 			testUser.email,
 			testUser.password,
 			async () =>
-				void (await instance.client.revokeSession({ token: sessionToken! })),
+				void (await instance.client.revokeSession({ id: sessionId! })),
 		);
 
 		const span = await waitForSpan((s) => s.name === "db delete session");

@@ -118,10 +118,10 @@ export interface JwtOptions {
 		| undefined;
 
 	/**
-	 * Disables setting JWTs through middleware.
+	 * Disables the legacy `set-auth-jwt` response header on `/get-session`.
 	 *
-	 * Recommended to set `true` when using an oAuth provider plugin
-	 * like OIDC or MCP where session payloads should not be signed.
+	 * New integrations should set this to true and use POST `/token`; the
+	 * historical default remains during the compatibility window.
 	 *
 	 * @default false
 	 */

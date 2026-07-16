@@ -151,19 +151,21 @@ export const runWithTransaction = async <
 export const queueAfterTransactionHook = async (
 	hook: () => Promise<void>,
 ): Promise<void> => {
-	return ensureAsyncStorage()
-		.then((als) => {
-			const store = als.getStore();
-			if (store) {
-				// We're in a transaction context, queue the hook
-				store.pendingHooks.push(hook);
-			} else {
-				// Not in a transaction, execute immediately
-				return hook();
-			}
-		})
-		.catch(() => {
-			// No async storage available, execute immediately
-			return hook();
-		});
+	let als: AsyncLocalStorage<HookContext>;
+	try {
+		als = await ensureAsyncStorage();
+	} catch {
+		// No async storage available, execute immediately.
+		return hook();
+	}
+
+	const store = als.getStore();
+	if (store) {
+		// We're in a transaction context, queue the hook.
+		store.pendingHooks.push(hook);
+		return;
+	}
+
+	// Not in a transaction, execute immediately. Hook failures propagate once.
+	await hook();
 };

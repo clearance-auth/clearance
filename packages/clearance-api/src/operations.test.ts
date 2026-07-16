@@ -51,6 +51,9 @@ describe("authenticated operational API contracts", () => {
 			["POST", "/v1/backups", {}],
 			["GET", "/v1/upgrades/check", undefined],
 			["GET", "/v1/schema/status", undefined],
+			["GET", "/v1/schema/credential-authority", undefined],
+			["POST", "/v1/schema/credential-authority/arm", { confirm: true }],
+			["POST", "/v1/schema/credential-authority/drain", { confirm: true }],
 			["GET", "/v1/schema/store-v2", undefined],
 			["POST", "/v1/migrations/plan", { source: "legacy", fixture: {} }],
 		] as const) {
@@ -62,6 +65,77 @@ describe("authenticated operational API contracts", () => {
 				}),
 			});
 			expect(response.status, `${method} ${path}`).toBe(401);
+		}
+	});
+
+	it("requires explicit confirmation before credential-authority arm or drain", async () => {
+		for (const [path, body, code] of [
+			[
+				"/v1/schema/credential-authority/arm",
+				{ deploymentId: "candidate-v03", expectedRuntimeCount: 2 },
+				"CREDENTIAL_AUTHORITY_ARM_CONFIRMATION_REQUIRED",
+			],
+			[
+				"/v1/schema/credential-authority/drain",
+				{ deploymentId: "candidate-v03", drainId: "drain-v03" },
+				"CREDENTIAL_AUTHORITY_DRAIN_CONFIRMATION_REQUIRED",
+			],
+		] as const) {
+			const response = await app.request(path, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+			});
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({ error: { code } });
+		}
+	});
+
+	it("rejects malformed credential-authority arm inputs as structured 400s", async () => {
+		for (const body of [
+			{ confirm: true, deploymentId: "", expectedRuntimeCount: 2 },
+			{ confirm: true, deploymentId: "candidate-v03", expectedRuntimeCount: "2" },
+			{ confirm: true, deploymentId: "candidate-v03", expectedRuntimeCount: 0 },
+			{ confirm: true, deploymentId: "candidate-v03", expectedRuntimeCount: 1.5 },
+		]) {
+			const response = await app.request(
+				"/v1/schema/credential-authority/arm",
+				{
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+				},
+			);
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "CREDENTIAL_AUTHORITY_ARM_INPUT_INVALID" },
+			});
+		}
+	});
+
+	it("rejects malformed credential-authority drain inputs as structured 400s", async () => {
+		for (const body of [
+			{ confirm: true, deploymentId: "", drainId: "drain-v03" },
+			{ confirm: true, deploymentId: "candidate-v03", drainId: "" },
+			{ confirm: true, deploymentId: "candidate-v03", drainId: 3 },
+			{
+				confirm: true,
+				deploymentId: "candidate-v03",
+				drainId: "x".repeat(201),
+			},
+		]) {
+			const response = await app.request(
+				"/v1/schema/credential-authority/drain",
+				{
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+				},
+			);
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "CREDENTIAL_AUTHORITY_DRAIN_INPUT_INVALID" },
+			});
 		}
 	});
 

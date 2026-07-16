@@ -59,6 +59,10 @@ async function assertAuthenticationSecurityPublicTypes(): Promise<void> {
 		body: { password: "password", recoveryCode: "backup-code" },
 		headers,
 	});
+	headers.set(
+		"Idempotency-Key",
+		"clr_op_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	);
 	const token = await bundle.auth.api.getToken({ headers });
 	void (await bundle.auth.api.verifyJWT({ body: { token: token.token } }))
 		.payload;

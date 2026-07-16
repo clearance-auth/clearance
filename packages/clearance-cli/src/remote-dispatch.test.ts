@@ -14,6 +14,7 @@ vi.mock("@clearance/management", async (importOriginal) => {
 		DELIVERY_OPERATIONS: source.DELIVERY_OPERATIONS,
 		WEBHOOK_ENDPOINT_OPERATIONS: source.WEBHOOK_ENDPOINT_OPERATIONS,
 		STORE_V2_OPERATIONS: source.STORE_V2_OPERATIONS,
+		SCHEMA_OPERATIONS: source.SCHEMA_OPERATIONS,
 		MANAGEMENT_OPERATIONS: source.MANAGEMENT_OPERATIONS,
 	};
 });
@@ -200,6 +201,74 @@ describe("CLI transport parity", () => {
 		expect(JSON.parse(String(calls[6]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[7]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[8]?.[1].body))).toEqual({ confirm: true });
+	});
+
+	it("routes credential-authority status, arm, and drain with exact confirmation payloads", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ phase: "legacy-open" }), { status: 200 });
+		}));
+
+		await dispatchRemoteCommand(
+			session,
+			"schema credential-authority status",
+			[],
+			{},
+			{},
+		);
+		await expect(
+			dispatchRemoteCommand(
+				session,
+				"schema credential-authority arm",
+				[],
+				{ deploymentId: "candidate-v03", expectedRuntimes: "2" },
+				{},
+			),
+		).rejects.toMatchObject({
+			code: "CREDENTIAL_AUTHORITY_ARM_CONFIRMATION_REQUIRED",
+		});
+		await dispatchRemoteCommand(
+			session,
+			"schema credential-authority arm",
+			[],
+			{ deploymentId: "candidate-v03", expectedRuntimes: "2" },
+			{ yes: true },
+		);
+		await expect(
+			dispatchRemoteCommand(
+				session,
+				"schema credential-authority drain",
+				[],
+				{ deploymentId: "candidate-v03", drainId: "drain-v03" },
+				{},
+			),
+		).rejects.toMatchObject({
+			code: "CREDENTIAL_AUTHORITY_DRAIN_CONFIRMATION_REQUIRED",
+		});
+		await dispatchRemoteCommand(
+			session,
+			"schema credential-authority drain",
+			[],
+			{ deploymentId: "candidate-v03", drainId: "drain-v03" },
+			{ yes: true },
+		);
+
+		expect(calls.map(([url]) => url)).toEqual([
+			"https://api.clearance.test/v1/schema/credential-authority",
+			"https://api.clearance.test/v1/schema/credential-authority/arm",
+			"https://api.clearance.test/v1/schema/credential-authority/drain",
+		]);
+		expect(JSON.parse(String(calls[1]?.[1].body))).toEqual({
+			deploymentId: "candidate-v03",
+			expectedRuntimeCount: 2,
+			confirm: true,
+		});
+		expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({
+			deploymentId: "candidate-v03",
+			drainId: "drain-v03",
+			confirm: true,
+		});
 	});
 
 	it("lets global dry-run override SCIM apply and rejects unsupported SSO test previews", async () => {

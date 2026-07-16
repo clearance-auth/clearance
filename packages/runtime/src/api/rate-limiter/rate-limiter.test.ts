@@ -167,6 +167,8 @@ describe("atomic concurrent enforcement", () => {
 });
 
 describe("custom rate limiting storage", async () => {
+	const namespace = "rate-limiter-storage-test";
+	const migrationEpochKey = `clearance:${namespace}:session-storage-epoch`;
 	const store = new Map<string, string>();
 	const expirationMap = new Map<string, number>();
 	const { client, testUser } = await getTestInstance({
@@ -174,6 +176,7 @@ describe("custom rate limiting storage", async () => {
 			enabled: true,
 		},
 		secondaryStorage: {
+			namespace,
 			set(key, value, ttl) {
 				store.set(key, value);
 				if (ttl) expirationMap.set(key, ttl);
@@ -190,7 +193,10 @@ describe("custom rate limiting storage", async () => {
 
 	it("should use custom storage", async () => {
 		await client.getSession();
-		expect(store.size).toBe(3);
+		expect(JSON.parse(store.get(migrationEpochKey)!)).toMatch(
+			/^digest-v1:[A-Za-z0-9_-]+$/,
+		);
+		expect(store.size).toBe(5);
 		let lastRequest = Date.now();
 		for (let i = 0; i < 4; i++) {
 			const response = await client.signIn.email({

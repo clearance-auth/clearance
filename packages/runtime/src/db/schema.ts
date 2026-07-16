@@ -117,7 +117,25 @@ export function parseSessionOutput<T extends Session>(
 	session: T,
 ) {
 	const schema = getFields(options, "session", "output");
-	return filterOutputFields(session, schema);
+	const parsed = filterOutputFields(session, schema);
+	return {
+		...parsed,
+		// Deprecated source-compatibility field. Public callers receive the stable,
+		// non-secret administrative handle; the refresh credential remains confined
+		// to the signed HttpOnly cookie and trusted internal session context.
+		token: session.id,
+	} as T;
+}
+
+/** Preserve the presented bearer only for trusted in-process session context. */
+export function parseInternalSessionOutput<T extends Session>(
+	options: ClearanceOptions,
+	session: T,
+) {
+	return {
+		...parseSessionOutput(options, session),
+		token: session.token,
+	} as T;
 }
 
 export function parseAccountOutput<T extends Account>(
@@ -294,21 +312,35 @@ export function mergeSchema<S extends ClearancePluginDBSchema>(
 		  }
 		| undefined,
 ) {
+	const mergedSchema = Object.fromEntries(
+		Object.entries(schema).map(([table, definition]) => [
+			table,
+			{
+				...definition,
+				fields: Object.fromEntries(
+					Object.entries(definition.fields).map(([field, attributes]) => [
+						field,
+						{ ...attributes },
+					]),
+				),
+			},
+		]),
+	) as S;
 	if (!newSchema) {
-		return schema;
+		return mergedSchema;
 	}
 	for (const table in newSchema) {
 		const newModelName = newSchema[table]?.modelName;
 		if (newModelName) {
-			schema[table]!.modelName = newModelName;
+			mergedSchema[table]!.modelName = newModelName;
 		}
-		for (const field in schema[table]!.fields) {
+		for (const field in mergedSchema[table]!.fields) {
 			const newField = newSchema[table]?.fields?.[field];
 			if (!newField) {
 				continue;
 			}
-			schema[table]!.fields[field]!.fieldName = newField;
+			mergedSchema[table]!.fields[field]!.fieldName = newField;
 		}
 	}
-	return schema;
+	return mergedSchema;
 }

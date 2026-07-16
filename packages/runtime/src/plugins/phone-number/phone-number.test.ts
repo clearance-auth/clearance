@@ -339,7 +339,8 @@ describe("phone auth flow", async () => {
 		});
 		expect(session?.user.phoneNumberVerified).toBe(true);
 		expect(session?.user.email).toBe("temp-+251911121314");
-		expect(session?.session.token).toBeDefined();
+		expect(session?.session.id).toBeDefined();
+		expect(session?.session.token).toBe(session?.session.id);
 	});
 
 	const headers = new Headers();

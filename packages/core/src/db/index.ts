@@ -15,6 +15,11 @@ export {
 	type Session,
 	sessionSchema,
 } from "./schema/session";
+export {
+	type BaseSessionCredential,
+	type SessionCredential,
+	sessionCredentialSchema,
+} from "./schema/session-credential";
 export { coreSchema } from "./schema/shared";
 export { type BaseUser, type User, userSchema } from "./schema/user";
 export {

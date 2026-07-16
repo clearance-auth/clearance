@@ -42,6 +42,21 @@ export type ClearanceRuntimeOrganization = {
     metadata?: Record<string, unknown> | null;
     createdAt: Date;
 };
+export type ClearanceRuntimeSession = {
+    id: string;
+    /** @deprecated Stable, non-secret compatibility alias for `id`. */
+    token: string;
+    userId: string;
+    expiresAt: Date;
+    createdAt: Date;
+    updatedAt: Date;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+};
+export type ClearanceRuntimeSessionResponse = {
+    session: ClearanceRuntimeSession;
+    user: ClearanceRuntimeUser;
+};
 export type ClearanceTwoFactorRuntimeUser = ClearanceRuntimeUser & {
     twoFactorEnabled: boolean;
 };
@@ -59,6 +74,9 @@ export type ClearanceJwtPayload = Record<string, unknown> & {
     aud?: string | string[];
     iat?: number;
     exp?: number;
+    sid?: string;
+    session_family?: string;
+    session_generation?: number;
 };
 export type ClearanceJsonWebKey = Record<string, unknown> & {
     kid: string;
@@ -129,7 +147,21 @@ export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationS
     strictSecrets?: boolean;
     onUserCreated?: (user: ClearanceRuntimeUser) => void | Promise<void>;
     socialProviders?: Record<string, SocialProviderConfig>;
+    /** Product-guarded runtime extensions such as OIDC Provider and MCP. */
+    plugins?: ClearancePlugin[];
     authenticationSecurity?: Security;
+    credentialAuthority?: {
+        /** Runtime generation admitted by the durable database fence. */
+        generation: "legacy-v1" | "digest-v1";
+        /** Immutable rollout identity shared by every replica in one deployment. */
+        deploymentId: string;
+        /** Unique process or pod identity for diagnostics and fail-closed errors. */
+        instanceId: string;
+        /** Required by the one-shot migrator when upgrading existing authority. */
+        migrationDrainId?: string;
+        /** Maximum wait for all shared runtime leases to leave. */
+        migrationLeaseTimeoutMs?: number;
+    };
     durableDelivery?: {
         projectId: string;
         environmentId: string;
@@ -151,6 +183,7 @@ export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationS
 export type ClearanceRuntimeMigrationPlan = {
     pendingTables: number;
     pendingFields: number;
+    pendingSecurityMigrations: readonly string[];
     compileSql(): Promise<string>;
     apply(): Promise<void>;
 };
@@ -165,7 +198,13 @@ export interface ClearanceAuthRuntime {
 }
 type ClearanceBaseProductApi = {
     signInEmail(input: Record<string, unknown>): Promise<unknown>;
-    getSession(input: Record<string, unknown>): Promise<unknown>;
+    getSession(input: {
+        headers?: HeadersInit;
+        query?: {
+            disableCookieCache?: boolean;
+            disableRefresh?: boolean;
+        };
+    }): Promise<ClearanceRuntimeSessionResponse | null>;
     resetPassword(input: Record<string, unknown>): Promise<unknown>;
     signUpEmail(input: {
         body: {
@@ -310,8 +349,35 @@ export type ClearanceAuthBundle<Security extends ClearanceAuthenticationSecurity
         asymmetricAccessTokens: boolean;
     };
     rateLimitEnabled: boolean;
+    credentialAuthority: {
+        status(): Promise<{
+            protocolVersion: number;
+            phase: "legacy-open" | "draining" | "migrating" | "digest-live";
+            generation: "legacy-v1" | "digest-v1";
+            drainId: string | null;
+            bridgeDeploymentId: string | null;
+            expectedRuntimeCount: number | null;
+            revision: number;
+            drainStartedAt: Date | null;
+            drainedAt: Date | null;
+            publishedAt: Date | null;
+            activeRuntimeLeases: number;
+        }>;
+        arm(input: {
+            deploymentId: string;
+            expectedRuntimeCount: number;
+        }): Promise<unknown>;
+        beginDrain(input: {
+            deploymentId: string;
+            drainId: string;
+        }): Promise<unknown>;
+        assertRuntimeServing(): Promise<void>;
+    };
+    prepareCredentialAuthorityRuntime(): Promise<void>;
     planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
-    migrate(): Promise<ClearanceRuntimeMigrationResult>;
+    migrate(input?: {
+        drainId?: string;
+    }): Promise<ClearanceRuntimeMigrationResult>;
     destroy(): Promise<void>;
 };
 export interface ClearancePlugin {
@@ -319,6 +385,17 @@ export interface ClearancePlugin {
     readonly endpoints?: Readonly<Record<string, unknown>>;
     readonly options?: unknown;
 }
+export declare function oidcProvider(options: {
+    loginPage: string;
+    consentPage?: string;
+    useJWTPlugin?: boolean;
+    [key: string]: unknown;
+}): ClearancePlugin;
+export declare function mcp(options: {
+    loginPage: string;
+    resource?: string;
+    [key: string]: unknown;
+}): ClearancePlugin;
 export type ClearanceMigrationSet = {
     toBeCreated: ReadonlyArray<{
         table: string;
@@ -330,6 +407,7 @@ export type ClearanceMigrationSet = {
         fields: Record<string, unknown>;
         order: number;
     }>;
+    pendingSecurityMigrations: readonly string[];
     runMigrations(): Promise<void>;
     compileMigrations(): Promise<string>;
 };
