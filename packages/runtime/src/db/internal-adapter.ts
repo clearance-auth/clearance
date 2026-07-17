@@ -131,9 +131,6 @@ export const createInternalAdapter = (
 	const secondarySessionKeys =
 		secondaryStorage ? getSecondarySessionKeys(options) : null;
 	const verificationConsumeLocks = new Map<string, Promise<void>>();
-	// Warn at most once when a single-use value is consumed through the
-	// non-atomic secondary-storage fallback (see consumeVerificationValue).
-	let warnedNonAtomicConsume = false;
 	let warnedManagedVerificationCleanupFailure = false;
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
 	const bindsTwoFactorSessionGeneration =
@@ -5323,15 +5320,10 @@ export const createInternalAdapter = (
 		 * is still deleted (so it cannot be replayed later) but `null` is
 		 * returned. Callers do not need their own `expiresAt` gate.
 		 *
-		 * The secondary-storage-only path (`storeInDatabase: false`) is atomic
-		 * only when the configured storage implements `getAndDelete`; otherwise
-		 * it falls back to an in-process lock around `get` then `delete` and
-		 * warns once, since that fallback cannot coordinate across processes.
-		 *
-		 * FIXME(consume-atomic): make `SecondaryStorage.getAndDelete` required
-		 * in the next breaking release, or require database-backed verification
-		 * storage for security-sensitive consume paths, so the non-atomic
-		 * fallback can be removed entirely.
+		 * Secondary-storage-only verification requires provider-level atomic
+		 * `getAndDelete`. Hashed identifier compatibility additionally requires a
+		 * provider-level exclusive lease so its hashed and legacy-plain aliases
+		 * are consumed as one logical credential across every process.
 		 */
 		consumeVerificationValue: async (
 			identifier: string,
@@ -5345,10 +5337,23 @@ export const createInternalAdapter = (
 				identifier,
 				storageOption,
 			);
-			const identifiersToTry =
-				storageOption && storageOption !== "plain"
-					? [storedIdentifier, identifier]
-					: [storedIdentifier];
+			const hashedIdentifier = await processIdentifier(identifier, "hashed");
+			// Every reader recognizes the stable hashed representation and the
+			// legacy plain representation, regardless of its current write setting.
+			// Include the configured representation as well for custom hash options.
+			const identifiersToTry = Array.from(
+				new Set([hashedIdentifier, identifier, storedIdentifier]),
+			);
+			const consumeLockName = `verification-consume-v2:${base64Url.encode(
+				new Uint8Array(
+					await createHash("SHA-256").digest(
+						new TextEncoder().encode(
+							`verification-consume-v2:${identifier}`,
+						),
+					),
+				),
+				{ padding: false },
+			)}`;
 
 			// After a JSON round-trip `expiresAt` arrives as a string, so coerce
 			// it back to a valid `Date` to match what the DB adapter returns.
@@ -5362,8 +5367,16 @@ export const createInternalAdapter = (
 							: null;
 				if (!candidate) return null;
 				const expiresAt = new Date(candidate.expiresAt);
-				if (!Number.isFinite(expiresAt.getTime())) return null;
-				return { ...candidate, expiresAt };
+				const createdAt = new Date(candidate.createdAt);
+				const updatedAt = new Date(candidate.updatedAt);
+				if (
+					!Number.isFinite(expiresAt.getTime()) ||
+					!Number.isFinite(createdAt.getTime()) ||
+					!Number.isFinite(updatedAt.getTime())
+				) {
+					return null;
+				}
+				return { ...candidate, expiresAt, createdAt, updatedAt };
 			};
 
 			if (authenticationPolicy) {
@@ -5398,80 +5411,134 @@ export const createInternalAdapter = (
 						}
 					}, adapter);
 				};
-
-				if (secondaryStorage && !options.verification?.storeInDatabase) {
-					let cached: Verification | null = null;
-					for (const stored of identifiersToTry) {
-						cached = hydrateCachedVerification(
-							await secondaryStorage.get(`verification:${stored}`),
-						);
-						if (cached) break;
-					}
-					if (
-						!cached ||
-						typeof cached.id !== "string" ||
-						cached.id.length === 0 ||
-						cached.expiresAt <= new Date()
-					) {
-						return null;
-					}
+				const selectLatestManagedVerification = (
+					candidates: Verification[],
+				): Verification | null =>
+					candidates.sort((left, right) => {
+						const createdAt =
+							right.createdAt.getTime() - left.createdAt.getTime();
+						if (createdAt !== 0) return createdAt;
+						const alias =
+							identifiersToTry.indexOf(left.identifier) -
+							identifiersToTry.indexOf(right.identifier);
+						if (alias !== 0) return alias;
+						return left.id.localeCompare(right.id);
+					})[0] ?? null;
+				const retireManagedVerificationAliasMarkers = async (
+					canonical: Verification,
+					candidates: Verification[],
+				): Promise<boolean> => {
 					const marker = await consumeManagedVerificationMarker(
 						transactionAdapter,
-						cached,
+						canonical,
 						provenance,
 					);
-					if (!marker) return null;
-					await queueSecondaryCleanup();
-					return cached;
+					if (!marker) return false;
+					for (const candidate of candidates) {
+						if (candidate.id === canonical.id) continue;
+						const aliasMarker =
+							await transactionAdapter.findOne<ManagedVerificationChallengeMarker>({
+								model: "securityMigration",
+								where: [
+									{
+										field: "key",
+										value: await managedVerificationMarkerKey(String(candidate.id)),
+									},
+								],
+							});
+						if (aliasMarker) {
+							await consumeExactManagedVerificationMarker(
+								transactionAdapter,
+								aliasMarker,
+							);
+						}
+					}
+					return true;
+				};
+
+				if (secondaryStorage && !options.verification?.storeInDatabase) {
+					if (identifiersToTry.length > 1 && !secondaryStorage.runExclusive) {
+						throw new Error(
+							"Secondary verification storage requires `runExclusive` to consume hashed managed verification identifier aliases",
+						);
+					}
+					const consumeCachedAliases = async (): Promise<Verification | null> => {
+						const cachedAliases: Verification[] = [];
+						for (const stored of identifiersToTry) {
+							const cached = hydrateCachedVerification(
+								await secondaryStorage.get(`verification:${stored}`),
+							);
+							if (cached) cachedAliases.push(cached);
+						}
+						const cached = selectLatestManagedVerification(cachedAliases);
+						if (
+							!cached ||
+							typeof cached.id !== "string" ||
+							cached.id.length === 0 ||
+							cached.expiresAt <= new Date()
+						) {
+							return null;
+						}
+						if (
+							!(await retireManagedVerificationAliasMarkers(
+								cached,
+								cachedAliases,
+							))
+						) {
+							return null;
+						}
+						await queueSecondaryCleanup();
+						return cached;
+					};
+					return identifiersToTry.length > 1
+						? secondaryStorage.runExclusive!(consumeLockName, consumeCachedAliases)
+						: consumeCachedAliases();
 				}
 
-				let latest: Verification | null = null;
-				let matchedIdentifier: string | null = null;
-				for (const stored of identifiersToTry) {
-					const rows = await transactionAdapter.findMany<Verification>({
-						model: "verification",
-						where: [{ field: "identifier", value: stored }],
-						sortBy: { field: "createdAt", direction: "desc" },
-						limit: 1,
-					});
-					if (rows[0]) {
-						latest = rows[0];
-						matchedIdentifier = stored;
-						break;
-					}
-				}
+				const allAliasRows = (
+					await Promise.all(
+						identifiersToTry.map((stored) =>
+							transactionAdapter.findMany<Verification>({
+								model: "verification",
+								where: [{ field: "identifier", value: stored }],
+							}),
+						),
+					)
+				).flat();
+				const latest = selectLatestManagedVerification(allAliasRows);
 				if (
 					!latest ||
-					!matchedIdentifier ||
 					!(latest.expiresAt instanceof Date) ||
 					latest.expiresAt <= new Date()
 				) {
 					return null;
 				}
-				const marker = await consumeManagedVerificationMarker(
-					transactionAdapter,
-					latest,
-					provenance,
-				);
-				if (!marker) return null;
+				let markerConsumed = false;
 				const consumed = await consumeOneWithHooks<Verification>(
 					"verification",
 					[{ field: "id", value: latest.id }],
 					async (currentAdapter) => {
+						markerConsumed = await retireManagedVerificationAliasMarkers(
+							latest!,
+							allAliasRows,
+						);
+						if (!markerConsumed) return null;
 						const row = await currentAdapter.consumeOne<Verification>({
 							model: "verification",
 							where: [{ field: "id", value: latest!.id }],
 						});
 						if (!row) return null;
-						await currentAdapter.deleteMany({
-							model: "verification",
-							where: [{ field: "identifier", value: matchedIdentifier! }],
-						});
+						for (const identifierAlias of identifiersToTry) {
+							await currentAdapter.deleteMany({
+								model: "verification",
+								where: [{ field: "identifier", value: identifierAlias }],
+							});
+						}
 						return row;
 					},
 					latest,
 				);
-				if (!consumed) {
+				if (!consumed && markerConsumed) {
 					throw new Error(
 						"Managed verification challenge changed during consumption",
 					);
@@ -5483,62 +5550,69 @@ export const createInternalAdapter = (
 			let consumed: Verification | null = null;
 
 			if (secondaryStorage && !options.verification?.storeInDatabase) {
-				const consumeCacheKey = async (key: string) => {
-					if (secondaryStorage.getAndDelete) {
-						return hydrateCachedVerification(
-							await secondaryStorage.getAndDelete(key),
+				if (!secondaryStorage.getAndDelete) {
+					throw new Error(
+						"Secondary verification storage requires `getAndDelete` for single-use verification consumption",
+					);
+				}
+				if (identifiersToTry.length > 1 && !secondaryStorage.runExclusive) {
+					throw new Error(
+						"Secondary verification storage requires `runExclusive` to consume hashed verification identifier aliases",
+					);
+				}
+
+				const consumeAliases = async () => {
+					for (const stored of identifiersToTry) {
+						const cached = hydrateCachedVerification(
+							await secondaryStorage.getAndDelete!(
+								`verification:${stored}`,
+							),
 						);
-					}
-					if (!warnedNonAtomicConsume) {
-						warnedNonAtomicConsume = true;
-						logger.warn(
-							"Secondary storage does not implement `getAndDelete`, so single-use verification values cannot be consumed atomically across processes. Implement `getAndDelete` or use database-backed verification storage to guarantee single use.",
+						if (!cached) continue;
+						await Promise.all(
+							identifiersToTry
+								.filter((candidate) => candidate !== stored)
+								.map((candidate) =>
+									secondaryStorage.delete(`verification:${candidate}`),
+								),
 						);
+						return cached;
 					}
-					return withVerificationConsumeLock(key, async () => {
-						const raw = await secondaryStorage.get(key);
-						const parsed = hydrateCachedVerification(raw);
-						if (!parsed) return null;
-						await secondaryStorage.delete(key);
-						return parsed;
-					});
+					return null;
 				};
 
-				for (const stored of identifiersToTry) {
-					const cacheKey = `verification:${stored}`;
-					const cached = await consumeCacheKey(cacheKey);
-					if (!cached) continue;
-					await Promise.all(
-						identifiersToTry
-							.filter((candidate) => candidate !== stored)
-							.map((candidate) =>
-								secondaryStorage.delete(`verification:${candidate}`),
-							),
-					);
-					consumed = cached;
-					break;
-				}
+				consumed =
+					identifiersToTry.length > 1
+						? await secondaryStorage.runExclusive!(consumeLockName, consumeAliases)
+						: await consumeAliases();
 			} else {
-				const consumeByIdentifier = async (
-					id: string,
-				): Promise<Verification | null> =>
-					withVerificationConsumeLock(`verification:${id}`, () =>
+				const consumeByIdentifiers = async (): Promise<Verification | null> =>
+					await withVerificationConsumeLock(consumeLockName, () =>
 						runWithTransaction(adapter, async () => {
 							const txAdapter = await getCurrentAdapter(adapter);
-							const where = [{ field: "identifier", value: id }];
-							const rows = await txAdapter.findMany<Verification>({
-								model: "verification",
-								where,
-								sortBy: { field: "createdAt", direction: "desc" },
-								limit: 1,
-							});
-							const latest = rows[0] ?? null;
+							const rows = (
+								await Promise.all(
+									identifiersToTry.map((candidate) =>
+										txAdapter.findMany<Verification>({
+											model: "verification",
+											where: [
+												{ field: "identifier", value: candidate },
+											],
+										}),
+									),
+								)
+							).flat();
+							const latest = rows.sort((left, right) => {
+								const createdAt = right.createdAt.getTime() - left.createdAt.getTime();
+								if (createdAt !== 0) return createdAt;
+								const alias =
+									identifiersToTry.indexOf(left.identifier) -
+									identifiersToTry.indexOf(right.identifier);
+								if (alias !== 0) return alias;
+								return left.id.localeCompare(right.id);
+							})[0] ?? null;
 							if (!latest) return null;
 
-							// FIXME(consume-identifier-atomic): add an adapter primitive that
-							// deletes all rows for an identifier and returns the latest row in
-							// one operation. Until then, consume the latest row as the race gate
-							// and invalidate stale rows inside the same transaction/local lock.
 							return consumeOneWithHooks<Verification>(
 								"verification",
 								[{ field: "id", value: latest.id }],
@@ -5548,10 +5622,14 @@ export const createInternalAdapter = (
 										where: [{ field: "id", value: latest.id }],
 									});
 									if (!row) return null;
-									await transactionAdapter.deleteMany({
-										model: "verification",
-										where,
-									});
+									for (const identifierAlias of identifiersToTry) {
+										await transactionAdapter.deleteMany({
+											model: "verification",
+											where: [
+												{ field: "identifier", value: identifierAlias },
+											],
+										});
+									}
 									return row;
 								},
 								latest,
@@ -5559,10 +5637,7 @@ export const createInternalAdapter = (
 						}),
 					);
 
-				for (const stored of identifiersToTry) {
-					consumed = await consumeByIdentifier(stored);
-					if (consumed) break;
-				}
+				consumed = await consumeByIdentifiers();
 
 				if (consumed && secondaryStorage) {
 					await Promise.all(
