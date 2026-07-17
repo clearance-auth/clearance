@@ -1,10 +1,16 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
-import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	queueAfterTransactionHook,
+	runWithTransaction,
+} from "@clearance/core/context";
 import type { DBTransactionAdapter, Where } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { createHMAC } from "@clearance/utils/hmac";
+import { createHash } from "@clearance/utils/hash";
 import { createOTP } from "@clearance/utils/otp";
 import * as z from "zod";
 import { sensitiveSessionMiddleware } from "../../../api";
@@ -85,6 +91,20 @@ export interface BackupCodeOptions {
 const HASHED_BACKUP_CODES_PREFIX = "clr-recovery:v1:";
 const RECOVERY_CODE_DIGEST_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_RECOVERY_CODES = 100;
+
+type RecoveryRepairAuthorityRecord = Readonly<{
+	subjectId: string;
+	twoFactorTable: string;
+	recoveryFactorId: string;
+	recoveryProofDigest: string;
+	sourceFactorFingerprint: string;
+	sourceSecretDigest: string;
+	postConsumeBackupCodesDigest: string;
+	sourceTrustDeviceGeneration: string | null;
+	transactionAdapter: object;
+}>;
+
+const recoveryRepairAuthorities = new WeakMap<object, RecoveryRepairAuthorityRecord>();
 
 type HashedBackupCodesEnvelope = {
 	version: 1;
@@ -294,6 +314,209 @@ export async function verifyBackupCode(
 			options,
 		),
 	};
+}
+
+async function recoveryRepairDigest(
+	label: "proof" | "factor",
+	parts: readonly string[],
+): Promise<string> {
+	return createHash("SHA-256", "base64urlnopad").digest(
+		JSON.stringify([`two-factor-recovery-repair-${label}:v1`, ...parts]),
+	);
+}
+
+/**
+ * Consumes a backup code only for the recovery-repair hand-off. The caller
+ * must already be inside the factor-mutation transaction; this helper never
+ * creates a login artifact and never retains the presented code.
+ */
+export async function consumeBackupCodeForRecoveryRepair(
+	ctx: GenericEndpointContext,
+	adapter: DBTransactionAdapter,
+	twoFactorTable: string,
+	factor: TwoFactorTable,
+	code: string,
+): Promise<
+	| { kind: "authorized"; authority: object }
+	| { kind: "invalid"; error: APIError }
+> {
+	if (
+		!(await isTransactionActive(ctx.context.adapter)) ||
+		(await getCurrentAdapter(ctx.context.adapter)) !== adapter
+	) {
+		throw new Error("Recovery repair proof requires the active transaction");
+	}
+	const twoFactorPlugin = ctx.context.getPlugin("two-factor");
+	const configuredOptions = twoFactorPlugin?.options as
+		| {
+				twoFactorTable?: string | undefined;
+				backupCodeOptions?: BackupCodeOptions | undefined;
+		  }
+		| undefined;
+	const configuredTable = configuredOptions?.twoFactorTable ?? "twoFactor";
+	const backupCodeOptions = configuredOptions?.backupCodeOptions;
+	if (
+		!twoFactorPlugin ||
+		twoFactorTable !== configuredTable ||
+		factor.verified !== true ||
+		typeof factor.id !== "string" ||
+		factor.id.length === 0 ||
+		typeof factor.userId !== "string" ||
+		factor.userId.length === 0 ||
+		typeof factor.secret !== "string" ||
+		factor.secret.length === 0 ||
+		typeof factor.backupCodes !== "string" ||
+		backupCodeOptions?.storeBackupCodes !== "hashed" ||
+		!isOneWayBackupCodeEnvelope(factor.backupCodes)
+	) {
+		throw APIError.from(
+			"BAD_REQUEST",
+			TWO_FACTOR_ERROR_CODES.BACKUP_CODES_NOT_ENABLED,
+		);
+	}
+	await assertTwoFactorNotLocked(ctx, twoFactorTable, factor, adapter);
+	const attempt = await reserveTwoFactorAttempt(
+		ctx,
+		twoFactorTable,
+		factor,
+		adapter,
+	);
+	let verified: Awaited<ReturnType<typeof verifyBackupCode>>;
+	try {
+		verified = await verifyBackupCode(
+			{ backupCodes: factor.backupCodes, code },
+			ctx.context.secretConfig,
+			backupCodeOptions,
+		);
+	} catch (error) {
+		await attempt.restore(adapter);
+		throw error;
+	}
+	if (!verified.status || !verified.updated) {
+		await attempt.recordFailure(adapter);
+		return {
+			kind: "invalid",
+			error: APIError.from(
+				"UNAUTHORIZED",
+				TWO_FACTOR_ERROR_CODES.INVALID_BACKUP_CODE,
+			),
+		};
+	}
+
+	const sourceTrustDeviceGeneration =
+		typeof factor.trustDeviceGeneration === "string"
+			? factor.trustDeviceGeneration
+			: null;
+	const sourceFactorFingerprint = await recoveryRepairDigest("factor", [
+		factor.id,
+		factor.userId,
+		factor.secret,
+		factor.backupCodes,
+		sourceTrustDeviceGeneration ?? "",
+		String(factor.verified ?? null),
+	]);
+	const sourceSecretDigest = await recoveryRepairDigest("factor", [
+		"secret",
+		factor.secret,
+	]);
+	const authorized = await adapter.incrementOne<TwoFactorTable>({
+		model: twoFactorTable,
+		where: [
+			{ field: "id", value: factor.id },
+			{ field: "userId", value: factor.userId },
+			{ field: "secret", value: factor.secret },
+			{ field: "backupCodes", value: factor.backupCodes },
+			{
+				field: "trustDeviceGeneration",
+				value: factor.trustDeviceGeneration ?? null,
+			},
+			{ field: "verified", value: factor.verified ?? null },
+		],
+		increment: {},
+		set: { backupCodes: verified.updated },
+	});
+	if (!authorized) {
+		await attempt.restore(adapter);
+		throw APIError.fromStatus("CONFLICT", {
+			message: "Recovery factor state changed. Please try again.",
+		});
+	}
+	await attempt.recordSuccess(adapter);
+	const postConsumeBackupCodesDigest = await recoveryRepairDigest("factor", [
+		"backup-codes",
+		verified.updated,
+	]);
+	const nonce = generateRandomString(48);
+	const recoveryProofDigest = await recoveryRepairDigest("proof", [
+		nonce,
+		twoFactorTable,
+		factor.id,
+		factor.userId,
+		factor.backupCodes,
+		verified.updated,
+	]);
+	const authority = Object.freeze({});
+	recoveryRepairAuthorities.set(
+		authority,
+		Object.freeze({
+			subjectId: factor.userId,
+			twoFactorTable,
+			recoveryFactorId: factor.id,
+			recoveryProofDigest,
+			sourceFactorFingerprint,
+			sourceSecretDigest,
+			postConsumeBackupCodesDigest,
+			sourceTrustDeviceGeneration,
+			transactionAdapter: adapter,
+		}),
+	);
+	await queueAfterTransactionHook(async () => {
+		recoveryRepairAuthorities.delete(authority);
+	}, ctx.context.adapter);
+	return { kind: "authorized", authority };
+}
+
+/**
+ * Reveals the post-CAS recovery lineage once, to the same active transaction.
+ * There is intentionally no public constructor for a valid authority.
+ */
+export async function takeBackupCodeRecoveryRepairAuthority(
+	ctx: GenericEndpointContext,
+	authority: object,
+): Promise<
+	| Readonly<{
+			subjectId: string;
+			twoFactorTable: string;
+			recoveryFactorId: string;
+			recoveryProofDigest: string;
+			sourceFactorFingerprint: string;
+			sourceSecretDigest: string;
+			postConsumeBackupCodesDigest: string;
+			sourceTrustDeviceGeneration: string | null;
+	  }>
+	| null
+> {
+	const record = recoveryRepairAuthorities.get(authority);
+	if (!record) return null;
+	// Burn before awaiting transaction checks so concurrent takes cannot both
+	// observe and reveal the same opaque authority.
+	recoveryRepairAuthorities.delete(authority);
+	if (
+		!(await isTransactionActive(ctx.context.adapter)) ||
+		(await getCurrentAdapter(ctx.context.adapter)) !== record.transactionAdapter
+	) {
+		return null;
+	}
+	return Object.freeze({
+		subjectId: record.subjectId,
+		twoFactorTable: record.twoFactorTable,
+		recoveryFactorId: record.recoveryFactorId,
+		recoveryProofDigest: record.recoveryProofDigest,
+		sourceFactorFingerprint: record.sourceFactorFingerprint,
+		sourceSecretDigest: record.sourceSecretDigest,
+		postConsumeBackupCodesDigest: record.postConsumeBackupCodesDigest,
+		sourceTrustDeviceGeneration: record.sourceTrustDeviceGeneration,
+	});
 }
 
 export async function proveFactorStepUp(
