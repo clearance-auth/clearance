@@ -205,6 +205,32 @@ afterEach(() => {
 });
 
 describe.sequential("recovery-only TOTP repair", () => {
+	it("accepts legacy factor authority and repairs its stale user marker after exact proof", async () => {
+		const runtime = await setup();
+		await runtime.context.adapter.update({
+			model: runtime.table,
+			where: [{ field: "userId", value: runtime.user.id }],
+			update: { verified: null },
+		});
+		await runtime.context.internalAdapter.updateUser(runtime.user.id, {
+			twoFactorEnabled: false,
+		});
+		const enrollment = await beginEnrollment(runtime);
+		expect(enrollment.factor.verified).toBe(false);
+		const user = await runtime.context.internalAdapter.findUserById(runtime.user.id);
+		expect((user as { twoFactorEnabled?: boolean } | null)?.twoFactorEnabled).toBe(
+			true,
+		);
+		const completed = await dispatch(
+			runtime.context,
+			runtime.endpoints.recoveryRepairTOTPVerify!,
+			enrollment.cookie,
+			{ code: await createOTP(enrollment.secret).totp() },
+		);
+		expect(completed.status, await completed.clone().text()).toBe(200);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+	});
+
 	it("requires a fresh primary after an invalid recovery code", async () => {
 		const runtime = await setup();
 		const firstPrimary = await dispatch(

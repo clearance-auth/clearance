@@ -376,7 +376,7 @@ export async function consumeBackupCodeForRecoveryRepair(
 	if (
 		!twoFactorPlugin ||
 		twoFactorTable !== configuredTable ||
-		factor.verified !== true ||
+		factor.verified === false ||
 		typeof factor.id !== "string" ||
 		factor.id.length === 0 ||
 		typeof factor.userId !== "string" ||
