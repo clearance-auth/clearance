@@ -22,6 +22,25 @@ import type {
 } from "../schema";
 import type { OrganizationOptions } from "../types";
 
+const ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED = {
+	code: "ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED",
+	message:
+		"Organization lifecycle mutations require rollback-capable database transactions",
+} as const;
+
+function requireOrganizationLifecycleTransaction(
+	context: Parameters<typeof getOrgAdapter>[0],
+) {
+	if (
+		typeof context.adapter.options?.adapterConfig.transaction !== "function"
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED,
+		);
+	}
+}
+
 const baseInvitationSchema = z.object({
 	email: z.string().meta({
 		description: "The email address of the user to invite",
@@ -709,6 +728,7 @@ export const acceptInvitation = <O extends OrganizationOptions>(options: O) =>
 		async (ctx) => {
 			const session = ctx.context.session;
 			const adapter = getOrgAdapter<O>(ctx.context, options);
+			requireOrganizationLifecycleTransaction(ctx.context);
 			const invitation = await adapter.findInvitationById(
 				ctx.body.invitationId,
 			);
@@ -751,11 +771,6 @@ export const acceptInvitation = <O extends OrganizationOptions>(options: O) =>
 				);
 			}
 
-			const membershipLimit = ctx.context.orgOptions?.membershipLimit || 100;
-			const membersCount = await adapter.countMembers({
-				organizationId: invitation.organizationId,
-			});
-
 			const organization = await adapter.findOrganizationById(
 				invitation.organizationId,
 			);
@@ -763,18 +778,6 @@ export const acceptInvitation = <O extends OrganizationOptions>(options: O) =>
 				throw APIError.from(
 					"BAD_REQUEST",
 					ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
-				);
-			}
-
-			const limit =
-				typeof membershipLimit === "number"
-					? membershipLimit
-					: await membershipLimit(session.user, organization);
-
-			if (membersCount >= limit) {
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.ORGANIZATION_MEMBERSHIP_LIMIT_REACHED,
 				);
 			}
 
@@ -787,130 +790,230 @@ export const acceptInvitation = <O extends OrganizationOptions>(options: O) =>
 				});
 			}
 
-			// Claim the invitation atomically so only one concurrent accept wins the
-			// pending -> accepted transition; the guarded update is a single statement
-			// and atomic on every adapter. The membership work then runs in a
-			// transaction so it is all-or-nothing where the adapter supports it, and if
-			// it fails the claim is released back to pending so the invitee can retry
-			// instead of being stranded as accepted with no membership.
-			const acceptedI = await adapter.updateInvitation({
-				invitationId: ctx.body.invitationId,
-				status: "accepted",
-				fromStatus: "pending",
-			});
-			if (!acceptedI) {
-				// Another request already accepted this invitation.
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.INVITATION_NOT_FOUND,
-				);
-			}
-
-			const member = await runWithTransaction(ctx.context.adapter, async () => {
-				if (
-					ctx.context.orgOptions.teams &&
-					ctx.context.orgOptions.teams.enabled &&
-					"teamId" in acceptedI &&
-					acceptedI.teamId
-				) {
-					const teamIds = (acceptedI.teamId as string).split(",");
-					const onlyOne = teamIds.length === 1;
-
-					for (const teamId of teamIds) {
-						// Confirm the team still belongs to the accepted invitation's
-						// organization before adding the member. This keeps team
-						// membership consistent with the invitation's organization,
-						// including for older invitations and for teams that were
-						// moved or removed between invite and accept.
-						const team = await adapter.findTeamById({
-							teamId,
-							organizationId: acceptedI.organizationId,
-						});
-						if (!team) {
+			type AcceptedInvitation = NonNullable<
+				Awaited<ReturnType<typeof adapter.updateInvitation>>
+			>;
+			type AcceptedMember = Awaited<ReturnType<typeof adapter.createMember>>;
+			let acceptance:
+				| {
+						invitation: AcceptedInvitation;
+						member: AcceptedMember;
+						singleTeamId: string | null;
+				  }
+				| undefined;
+			let activeSession = await adapter.setActiveOrganization(
+				session.session.token,
+				invitation.organizationId,
+				ctx,
+				{
+					afterCapture: async () => {
+						// Everything that makes an invitation accepted is owned by the same
+						// transaction as managed successor issuance. Re-read every mutable
+						// input after capture so a stale preflight can never be committed.
+						const liveInvitation = await adapter.findInvitationById(
+							ctx.body.invitationId,
+						);
+						if (
+							!liveInvitation ||
+							liveInvitation.status !== "pending" ||
+							liveInvitation.expiresAt < new Date() ||
+							liveInvitation.organizationId !== invitation.organizationId ||
+							liveInvitation.email.toLowerCase() !==
+								session.user.email.toLowerCase()
+						) {
 							throw APIError.from(
 								"BAD_REQUEST",
-								ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
+								ORGANIZATION_ERROR_CODES.INVITATION_NOT_FOUND,
+							);
+						}
+						const transaction = await getCurrentAdapter(ctx.context.adapter);
+						const organizationLock = await transaction.findOne<{
+							id: string;
+							name: string;
+						}>({
+							model: "organization",
+							where: [
+								{ field: "id", value: liveInvitation.organizationId },
+							],
+						});
+						if (!organizationLock) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+							);
+						}
+						await transaction.update({
+							model: "organization",
+							where: [{ field: "id", value: organizationLock.id }],
+							update: { name: organizationLock.name },
+						});
+						const liveOrganization = await adapter.findOrganizationById(
+							organizationLock.id,
+						);
+						if (!liveOrganization) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+							);
+						}
+						const membershipLimit =
+							ctx.context.orgOptions?.membershipLimit || 100;
+						const limit =
+							typeof membershipLimit === "number"
+								? membershipLimit
+								: await membershipLimit(session.user, liveOrganization);
+						if (
+							(await adapter.countMembers({
+								organizationId: liveInvitation.organizationId,
+							})) >= limit
+						) {
+							throw APIError.from(
+								"FORBIDDEN",
+								ORGANIZATION_ERROR_CODES.ORGANIZATION_MEMBERSHIP_LIMIT_REACHED,
+							);
+						}
+						const acceptedInvitation = await adapter.updateInvitation({
+							invitationId: liveInvitation.id,
+							status: "accepted",
+							fromStatus: "pending",
+						});
+						if (!acceptedInvitation) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								ORGANIZATION_ERROR_CODES.INVITATION_NOT_FOUND,
 							);
 						}
 
-						const maximumMembersPerTeam = await resolveMaximumMembersPerTeam(
-							ctx.context.orgOptions.teams,
-							{
-								teamId,
-								organizationId: acceptedI.organizationId,
-								session,
-							},
-						);
-						if (maximumMembersPerTeam !== undefined) {
-							const result = await adapter.addTeamMemberWithLimit({
-								teamId,
-								userId: session.user.id,
-								maximumMembersPerTeam,
-							});
-							if (result.status === "limitReached") {
-								throw APIError.from(
-									"FORBIDDEN",
-									ORGANIZATION_ERROR_CODES.TEAM_MEMBER_LIMIT_REACHED,
-								);
+						if (
+							ctx.context.orgOptions.teams &&
+							ctx.context.orgOptions.teams.enabled &&
+							"teamId" in acceptedInvitation &&
+							acceptedInvitation.teamId
+						) {
+							const teamIds = (acceptedInvitation.teamId as string).split(",");
+
+							for (const teamId of teamIds) {
+								// Confirm the team still belongs to the accepted invitation's
+								// organization before adding the member.
+								const team = await adapter.findTeamById({
+									teamId,
+									organizationId: acceptedInvitation.organizationId,
+								});
+								if (!team) {
+									throw APIError.from(
+										"BAD_REQUEST",
+										ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
+									);
+								}
+
+								const maximumMembersPerTeam =
+									await resolveMaximumMembersPerTeam(
+										ctx.context.orgOptions.teams,
+										{
+											teamId,
+											organizationId: acceptedInvitation.organizationId,
+											session,
+										},
+									);
+								if (maximumMembersPerTeam !== undefined) {
+									const result = await adapter.addTeamMemberWithLimit({
+										teamId,
+										userId: session.user.id,
+										maximumMembersPerTeam,
+									});
+									if (result.status === "limitReached") {
+										throw APIError.from(
+											"FORBIDDEN",
+											ORGANIZATION_ERROR_CODES.TEAM_MEMBER_LIMIT_REACHED,
+										);
+									}
+								} else {
+									await adapter.findOrCreateTeamMember({
+										teamId,
+										userId: session.user.id,
+									});
+								}
 							}
-						} else {
-							await adapter.findOrCreateTeamMember({
-								teamId: teamId,
-								userId: session.user.id,
-							});
 						}
-					}
 
-					if (onlyOne) {
-						const teamId = teamIds[0]!;
-						const updatedSession = await adapter.setActiveTeam(
-							session.session.token,
-							teamId,
-							ctx,
-						);
-
-						await setSessionCookie(ctx, {
-							session: updatedSession,
-							user: session.user,
+						const acceptedMember = await adapter.createMember({
+							organizationId: acceptedInvitation.organizationId,
+							userId: session.user.id,
+							role: acceptedInvitation.role,
+							createdAt: new Date(),
 						});
-					}
-				}
-
-				const createdMember = await adapter.createMember({
-					organizationId: acceptedI.organizationId,
-					userId: session.user.id,
-					role: acceptedI.role,
-					createdAt: new Date(),
-				});
-
-				await adapter.setActiveOrganization(
-					session.session.token,
-					acceptedI.organizationId,
-					ctx,
+						acceptance = {
+							invitation: acceptedInvitation as AcceptedInvitation,
+							member: acceptedMember as AcceptedMember,
+							singleTeamId:
+								"teamId" in acceptedInvitation &&
+								typeof acceptedInvitation.teamId === "string" &&
+								!acceptedInvitation.teamId.includes(",")
+									? acceptedInvitation.teamId
+									: null,
+						};
+						},
+					},
 				);
-
-				return createdMember;
-			}).catch(async (error) => {
-				// The membership work failed; release the claim so the invitation is
-				// pending again and the invitee can retry.
-				await adapter.updateInvitation({
-					invitationId: ctx.body.invitationId,
-					status: "pending",
-				});
-				throw error;
-			});
+			if (!acceptance) {
+				throw new Error("Invitation acceptance transaction did not produce a result");
+			}
+			const {
+				invitation: acceptedI,
+				member: acceptedMember,
+				singleTeamId,
+			} = acceptance;
+			if (singleTeamId) {
+				try {
+					if (
+						(activeSession as typeof activeSession & {
+							activeOrganizationId?: string | null;
+						}).activeOrganizationId !== acceptedI.organizationId
+					) {
+						throw APIError.from(
+							"FORBIDDEN",
+							ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+						);
+					}
+					const [team, teamMember] = await Promise.all([
+						adapter.findTeamById({
+							teamId: singleTeamId,
+							organizationId: acceptedI.organizationId,
+						}),
+						adapter.findTeamMember({
+							teamId: singleTeamId,
+							userId: session.user.id,
+						}),
+					]);
+					if (!team || !teamMember) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
+						);
+					}
+					activeSession = await adapter.setActiveTeam(
+						activeSession.token,
+						team.id,
+						ctx,
+					);
+				} catch (error) {
+					await setSessionCookie(ctx, { session: activeSession, user: session.user });
+					throw error;
+				}
+			}
+			await setSessionCookie(ctx, { session: activeSession, user: session.user });
 
 			if (options?.organizationHooks?.afterAcceptInvitation) {
 				await options?.organizationHooks.afterAcceptInvitation({
 					invitation: acceptedI as unknown as Invitation,
-					member,
+					member: acceptedMember,
 					user: session.user,
 					organization,
 				});
 			}
 			return ctx.json({
 				invitation: acceptedI,
-				member,
+				member: acceptedMember,
 			});
 		},
 	);

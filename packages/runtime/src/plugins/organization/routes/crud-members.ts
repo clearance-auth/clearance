@@ -1,9 +1,11 @@
 import type { LiteralString } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { whereOperators } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getSessionFromCtx, sessionMiddleware } from "../../../api";
+import { setSessionCookie } from "../../../cookies";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db/to-zod";
 import { defaultRoles } from "../access/statement";
@@ -18,6 +20,25 @@ import type {
 	Member,
 } from "../schema";
 import type { OrganizationOptions } from "../types";
+
+const ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED = {
+	code: "ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED",
+	message:
+		"Organization lifecycle mutations require rollback-capable database transactions",
+} as const;
+
+function requireOrganizationLifecycleTransaction(
+	context: Parameters<typeof getOrgAdapter>[0],
+) {
+	if (
+		typeof context.adapter.options?.adapterConfig.transaction !== "function"
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED,
+		);
+	}
+}
 
 const baseMemberSchema = z.object({
 	userId: z.coerce.string().meta({
@@ -421,6 +442,13 @@ export const removeMember = <O extends OrganizationOptions>(options: O) =>
 					message: "User not found",
 				});
 			}
+			const removesCurrentActiveMembership =
+				session.user.id === toBeRemovedMember.userId &&
+				session.session.activeOrganizationId ===
+					toBeRemovedMember.organizationId;
+			if (isOwner || removesCurrentActiveMembership) {
+				requireOrganizationLifecycleTransaction(ctx.context);
+			}
 
 			// Run beforeRemoveMember hook
 			if (options?.organizationHooks?.beforeRemoveMember) {
@@ -430,17 +458,100 @@ export const removeMember = <O extends OrganizationOptions>(options: O) =>
 					organization,
 				});
 			}
-			await adapter.deleteMember({
-				memberId: toBeRemovedMember.id,
-				organizationId: organizationId,
-				userId: toBeRemovedMember.userId,
-			});
-			if (
-				session.user.id === toBeRemovedMember.userId &&
-				session.session.activeOrganizationId ===
-					toBeRemovedMember.organizationId
-			) {
-				await adapter.setActiveOrganization(session.session.token, null, ctx);
+			const deleteMemberInOwningTransaction = async () => {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				const currentOrganization = await transaction.findOne<{
+					id: string;
+					name: string;
+				}>({
+					model: "organization",
+					where: [{ field: "id", value: organizationId }],
+				});
+				if (!currentOrganization) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+					);
+				}
+				// A same-value write is portable across adapters and serializes owner
+				// departures on the authoritative organization row before we inspect
+				// the target member and owner set.
+				await transaction.update({
+					model: "organization",
+					where: [{ field: "id", value: organizationId }],
+					update: { name: currentOrganization.name },
+				});
+				const currentActorMember = await adapter.findMemberByOrgId({
+					userId: session.user.id,
+					organizationId,
+				});
+				if (!currentActorMember) {
+					throw APIError.from(
+						"UNAUTHORIZED",
+						ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_THIS_MEMBER,
+					);
+				}
+				const canStillDeleteMember = await hasPermission(
+					{
+						role: currentActorMember.role,
+						options: ctx.context.orgOptions,
+						permissions: { member: ["delete"] },
+						organizationId,
+					},
+					ctx,
+				);
+				if (!canStillDeleteMember) {
+					throw APIError.from(
+						"UNAUTHORIZED",
+						ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_THIS_MEMBER,
+					);
+				}
+				const currentMember = await adapter.findMemberById(toBeRemovedMember.id);
+				if (
+					!currentMember ||
+					currentMember.organizationId !== organizationId ||
+					currentMember.userId !== toBeRemovedMember.userId
+				) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.MEMBER_NOT_FOUND,
+					);
+				}
+				if (currentMember.role.split(",").includes(creatorRole)) {
+					const owners = (await transaction.findMany<Member>({
+						model: "member",
+						where: [{ field: "organizationId", value: organizationId }],
+					})).filter((candidate) =>
+						candidate.role.split(",").includes(creatorRole),
+					);
+					if (owners.length <= 1) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER,
+						);
+					}
+				}
+				await adapter.deleteMember({
+					memberId: currentMember.id,
+					organizationId,
+					userId: currentMember.userId,
+				});
+			};
+			if (removesCurrentActiveMembership) {
+				const updatedSession = await adapter.setActiveOrganization(
+					session.session.token,
+					null,
+					ctx,
+					{
+						afterCapture: deleteMemberInOwningTransaction,
+					},
+				);
+				await setSessionCookie(ctx, { session: updatedSession, user: session.user });
+			} else {
+				await runWithTransaction(
+					ctx.context.adapter,
+					deleteMemberInOwningTransaction,
+				);
 			}
 
 			// Run afterRemoveMember hook
@@ -553,6 +664,7 @@ export const updateMemberRole = <O extends OrganizationOptions>(option: O) =>
 					ORGANIZATION_ERROR_CODES.NO_ACTIVE_ORGANIZATION,
 				);
 			}
+			requireOrganizationLifecycleTransaction(ctx.context);
 
 			const adapter = getOrgAdapter(ctx.context, ctx.context.orgOptions);
 			const roleToSet: string[] = (
@@ -719,6 +831,7 @@ export const updateMemberRole = <O extends OrganizationOptions>(option: O) =>
 
 			const previousRole = toBeUpdatedMember.role;
 			const newRole = parseRoles(roleToSet);
+			let roleToPersist = newRole;
 
 			// Run beforeUpdateMemberRole hook
 			if (option?.organizationHooks?.beforeUpdateMemberRole) {
@@ -731,35 +844,108 @@ export const updateMemberRole = <O extends OrganizationOptions>(option: O) =>
 					},
 				);
 				if (response && typeof response === "object" && "data" in response) {
-					// Allow the hook to modify the role
-					const updatedMember = await adapter.updateMember(
-						ctx.body.memberId,
-						response.data.role || newRole,
-					);
-					if (!updatedMember) {
+					roleToPersist = response.data.role || newRole;
+				}
+			}
+
+			const updatedMember = await runWithTransaction(
+				ctx.context.adapter,
+				async () => {
+					const transaction = await getCurrentAdapter(ctx.context.adapter);
+					const lockedOrganization = await transaction.findOne<{
+						id: string;
+						name: string;
+					}>({
+						model: "organization",
+						where: [{ field: "id", value: organizationId }],
+					});
+					if (!lockedOrganization) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+						);
+					}
+					// Serialize role mutations with every owner-removing lifecycle path.
+					await transaction.update({
+						model: "organization",
+						where: [{ field: "id", value: organizationId }],
+						update: { name: lockedOrganization.name },
+					});
+					const currentActor = await adapter.findMemberByOrgId({
+						userId: session.user.id,
+						organizationId,
+					});
+					const currentTarget = await adapter.findMemberById(ctx.body.memberId);
+					if (!currentActor || !currentTarget) {
 						throw APIError.from(
 							"BAD_REQUEST",
 							ORGANIZATION_ERROR_CODES.MEMBER_NOT_FOUND,
 						);
 					}
-
-					// Run afterUpdateMemberRole hook
-					if (option?.organizationHooks?.afterUpdateMemberRole) {
-						await option?.organizationHooks.afterUpdateMemberRole({
-							member: updatedMember,
-							previousRole,
-							user: userBeingUpdated,
-							organization,
-						});
+					if (currentTarget.organizationId !== organizationId) {
+						throw APIError.from(
+							"FORBIDDEN",
+							ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_THIS_MEMBER,
+						);
 					}
-
-					return ctx.json(updatedMember);
-				}
-			}
-
-			const updatedMember = await adapter.updateMember(
-				ctx.body.memberId,
-				newRole,
+					const actorIsCreator = currentActor.role
+						.split(",")
+						.includes(creatorRole);
+					const targetIsCreator = currentTarget.role
+						.split(",")
+						.includes(creatorRole);
+					const setsCreator = roleToPersist
+						.split(",")
+						.map((role) => role.trim())
+						.includes(creatorRole);
+					if ((targetIsCreator || setsCreator) && !actorIsCreator) {
+						throw APIError.from(
+							"FORBIDDEN",
+							ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_THIS_MEMBER,
+						);
+					}
+					const canStillUpdate = await hasPermission(
+						{
+							role: currentActor.role,
+							options: ctx.context.orgOptions,
+							permissions: { member: ["update"] },
+							allowCreatorAllPermissions: true,
+							organizationId,
+						},
+						ctx,
+					);
+					if (!canStillUpdate) {
+						throw APIError.from(
+							"FORBIDDEN",
+							ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_THIS_MEMBER,
+						);
+					}
+					if (targetIsCreator && !setsCreator) {
+						const owners = (await transaction.findMany<Member>({
+							model: "member",
+							where: [{ field: "organizationId", value: organizationId }],
+						})).filter((candidate) =>
+							candidate.role.split(",").includes(creatorRole),
+						);
+						if (owners.length <= 1) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								ORGANIZATION_ERROR_CODES.YOU_CANNOT_LEAVE_THE_ORGANIZATION_WITHOUT_AN_OWNER,
+							);
+						}
+					}
+					const result = await adapter.updateMember(
+						currentTarget.id,
+						roleToPersist,
+					);
+					if (!result) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.MEMBER_NOT_FOUND,
+						);
+					}
+					return result;
+				},
 			);
 			if (!updatedMember) {
 				throw APIError.from(
@@ -878,6 +1064,12 @@ export const leaveOrganization = <O extends OrganizationOptions>(options: O) =>
 			}
 			const creatorRole = ctx.context.orgOptions?.creatorRole || "owner";
 			const isOwnerLeaving = member.role.split(",").includes(creatorRole);
+			if (
+				isOwnerLeaving ||
+				session.session.activeOrganizationId === ctx.body.organizationId
+			) {
+				requireOrganizationLifecycleTransaction(ctx.context);
+			}
 			if (isOwnerLeaving) {
 				const members = await ctx.context.adapter.findMany<Member>({
 					model: "member",
@@ -898,13 +1090,73 @@ export const leaveOrganization = <O extends OrganizationOptions>(options: O) =>
 					);
 				}
 			}
-			await adapter.deleteMember({
-				memberId: member.id,
-				organizationId: ctx.body.organizationId,
-				userId: session.user.id,
-			});
+			const leaveInOwningTransaction = async () => {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				const currentOrganization = await transaction.findOne<{
+					id: string;
+					name: string;
+				}>({
+					model: "organization",
+					where: [{ field: "id", value: ctx.body.organizationId }],
+				});
+				if (!currentOrganization) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+					);
+				}
+				await transaction.update({
+					model: "organization",
+					where: [{ field: "id", value: ctx.body.organizationId }],
+					update: { name: currentOrganization.name },
+				});
+				const currentMember = await adapter.findMemberByOrgId({
+					userId: session.user.id,
+					organizationId: ctx.body.organizationId,
+				});
+				if (!currentMember) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.MEMBER_NOT_FOUND,
+					);
+				}
+				if (currentMember.role.split(",").includes(creatorRole)) {
+					const owners = (await transaction.findMany<Member>({
+						model: "member",
+						where: [
+							{ field: "organizationId", value: ctx.body.organizationId },
+						],
+					})).filter((candidate) =>
+						candidate.role.split(",").includes(creatorRole),
+					);
+					if (owners.length <= 1) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER,
+						);
+					}
+				}
+				await adapter.deleteMember({
+					memberId: currentMember.id,
+					organizationId: ctx.body.organizationId,
+					userId: session.user.id,
+				});
+			};
 			if (session.session.activeOrganizationId === ctx.body.organizationId) {
-				await adapter.setActiveOrganization(session.session.token, null, ctx);
+				const updatedSession = await adapter.setActiveOrganization(
+					session.session.token,
+					null,
+					ctx,
+					{
+						afterCapture: leaveInOwningTransaction,
+					},
+				);
+				await setSessionCookie(ctx, { session: updatedSession, user: session.user });
+			} else {
+				await runWithTransaction(
+					ctx.context.adapter,
+					leaveInOwningTransaction,
+				);
 			}
 			return ctx.json(member);
 		},

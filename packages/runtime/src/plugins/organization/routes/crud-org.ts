@@ -1,8 +1,13 @@
 import { createAuthEndpoint } from "@clearance/core/api";
+import {
+	AfterTransactionHookError,
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { APIError } from "@clearance/core/error";
 import * as z from "zod";
 import { getSessionFromCtx, requestOnlySessionMiddleware } from "../../../api";
-import { setSessionCookie } from "../../../cookies";
+import { deleteSessionCookie, setSessionCookie } from "../../../cookies";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db";
 import { getOrgAdapter } from "../adapter";
@@ -18,6 +23,25 @@ import type {
 	TeamMember,
 } from "../schema";
 import type { OrganizationOptions } from "../types";
+
+const ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED = {
+	code: "ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED",
+	message:
+		"Organization lifecycle mutations require rollback-capable database transactions",
+} as const;
+
+function requireOrganizationLifecycleTransaction(
+	context: Parameters<typeof getOrgAdapter>[0],
+) {
+	if (
+		typeof context.adapter.options?.adapterConfig.transaction !== "function"
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED,
+		);
+	}
+}
 
 const baseOrganizationSchema = z.object({
 	name: z.string().min(1).meta({
@@ -271,23 +295,44 @@ export const createOrganization = <O extends OrganizationOptions>(
 			}
 
 			if (ctx.context.session && !ctx.body.keepCurrentActiveOrganization) {
-				await adapter.setActiveOrganization(
+				let activeSession = await adapter.setActiveOrganization(
 					ctx.context.session.session.token,
 					organization.id,
 					ctx,
 				);
-			}
-
-			if (
-				teamMember &&
-				ctx.context.session &&
-				!ctx.body.keepCurrentActiveOrganization
-			) {
-				await adapter.setActiveTeam(
-					ctx.context.session.session.token,
-					teamMember.teamId,
-					ctx,
-				);
+				if (teamMember) {
+					// The organization transition deliberately clears team scope. Re-read
+					// the resulting scope before restoring the single default-team UX.
+					try {
+						const [selectedTeam, selectedTeamMember] = await Promise.all([
+							adapter.findTeamById({
+								teamId: teamMember.teamId,
+								organizationId: organization.id,
+							}),
+							adapter.findTeamMember({
+								teamId: teamMember.teamId,
+								userId: user.id,
+							}),
+						]);
+						if (selectedTeam && selectedTeamMember) {
+							activeSession = await adapter.setActiveTeam(
+								activeSession.token,
+								selectedTeam.id,
+								ctx,
+							);
+						}
+					} catch (error) {
+						await setSessionCookie(ctx, {
+							session: activeSession,
+							user: ctx.context.session.user,
+						});
+						throw error;
+					}
+				}
+				await setSessionCookie(ctx, {
+					session: activeSession,
+					user: ctx.context.session.user,
+				});
 			}
 
 			return ctx.json({
@@ -565,6 +610,7 @@ export const deleteOrganization = <O extends OrganizationOptions>(
 					ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
 				);
 			}
+			requireOrganizationLifecycleTransaction(ctx.context);
 			const adapter = getOrgAdapter<O>(ctx.context, options);
 			const member = await adapter.findMemberByOrgId({
 				userId: session.user.id,
@@ -593,13 +639,6 @@ export const deleteOrganization = <O extends OrganizationOptions>(
 					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_THIS_ORGANIZATION,
 				);
 			}
-			if (organizationId === session.session.activeOrganizationId) {
-				/**
-				 * If the organization is deleted, we set the active organization to null
-				 */
-				await adapter.setActiveOrganization(session.session.token, null, ctx);
-			}
-
 			const org = await adapter.findOrganizationById(organizationId);
 			if (!org) {
 				throw APIError.fromStatus("BAD_REQUEST");
@@ -613,7 +652,77 @@ export const deleteOrganization = <O extends OrganizationOptions>(
 					ctx,
 				);
 			}
-			await adapter.deleteOrganization(organizationId);
+			const deleteOrganizationInOwningTransaction = async () => {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				const lockedOrganization = await transaction.findOne<{
+					id: string;
+					name: string;
+				}>({
+					model: "organization",
+					where: [{ field: "id", value: organizationId }],
+				});
+				if (!lockedOrganization) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+					);
+				}
+				// Serialize the final authorization decision with role/membership changes.
+				await transaction.update({
+					model: "organization",
+					where: [{ field: "id", value: organizationId }],
+					update: { name: lockedOrganization.name },
+				});
+				const currentMember = await adapter.findMemberByOrgId({
+					userId: session.user.id,
+					organizationId,
+				});
+				if (!currentMember) {
+					throw APIError.from(
+						"FORBIDDEN",
+						ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+					);
+				}
+				const canStillDeleteOrg = await hasPermission(
+					{
+						role: currentMember.role,
+						permissions: { organization: ["delete"] },
+						organizationId,
+						options: ctx.context.orgOptions,
+					},
+					ctx,
+				);
+				if (!canStillDeleteOrg) {
+					throw APIError.from(
+						"FORBIDDEN",
+						ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_THIS_ORGANIZATION,
+					);
+				}
+				const currentOrganization = await adapter.findOrganizationById(organizationId);
+				if (!currentOrganization) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+					);
+				}
+				await adapter.deleteOrganization(organizationId);
+			};
+			if (organizationId === session.session.activeOrganizationId) {
+				const updatedSession = await adapter.setActiveOrganization(
+					session.session.token,
+					null,
+					ctx,
+					{
+						afterCapture: deleteOrganizationInOwningTransaction,
+					},
+				);
+				await setSessionCookie(ctx, { session: updatedSession, user: session.user });
+			} else {
+				await runWithTransaction(
+					ctx.context.adapter,
+					deleteOrganizationInOwningTransaction,
+				);
+			}
 			if (options?.organizationHooks?.afterDeleteOrganization) {
 				await options.organizationHooks.afterDeleteOrganization(
 					{
@@ -714,7 +823,39 @@ export const getFullOrganization = <O extends OrganizationOptions>(
 				organizationId: organization.id,
 			});
 			if (!isMember) {
-				await adapter.setActiveOrganization(session.session.token, null, ctx);
+				const activeOrganizationId = session.session.activeOrganizationId;
+				const sourceMembershipValid = activeOrganizationId
+					? await adapter.checkMembership({
+							userId: session.user.id,
+							organizationId: activeOrganizationId,
+						})
+					: true;
+				if (!sourceMembershipValid) {
+					try {
+						await ctx.context.internalAdapter.deleteSession(session.session.token);
+					} catch (error) {
+						if (
+							!(error instanceof AfterTransactionHookError) ||
+							(await ctx.context.internalAdapter.findSession(
+								session.session.token,
+							)) !== null
+						) {
+							throw error;
+						}
+					}
+					deleteSessionCookie(ctx);
+					ctx.context.setNewSession(null);
+					throw APIError.from(
+						"FORBIDDEN",
+						ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+					);
+				}
+				const updatedSession = await adapter.setActiveOrganization(
+					session.session.token,
+					null,
+					ctx,
+				);
+				await setSessionCookie(ctx, { session: updatedSession, user: session.user });
 				throw APIError.from(
 					"FORBIDDEN",
 					ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
@@ -792,7 +933,8 @@ export const setActiveOrganization = <O extends OrganizationOptions>(
 
 			if (organizationId === null) {
 				const sessionOrgId = session.session.activeOrganizationId;
-				if (!sessionOrgId) {
+				const sessionTeamId = session.session.activeTeamId;
+				if (!sessionOrgId && !sessionTeamId) {
 					return ctx.json(null);
 				}
 				const updatedSession = await adapter.setActiveOrganization(
@@ -839,7 +981,39 @@ export const setActiveOrganization = <O extends OrganizationOptions>(
 				organizationId,
 			});
 			if (!isMember) {
-				await adapter.setActiveOrganization(session.session.token, null, ctx);
+				const activeOrganizationId = session.session.activeOrganizationId;
+				const sourceMembershipValid = activeOrganizationId
+					? await adapter.checkMembership({
+							userId: session.user.id,
+							organizationId: activeOrganizationId,
+						})
+					: true;
+				if (!sourceMembershipValid) {
+					try {
+						await ctx.context.internalAdapter.deleteSession(session.session.token);
+					} catch (error) {
+						if (
+							!(error instanceof AfterTransactionHookError) ||
+							(await ctx.context.internalAdapter.findSession(
+								session.session.token,
+							)) !== null
+						) {
+							throw error;
+						}
+					}
+					deleteSessionCookie(ctx);
+					ctx.context.setNewSession(null);
+					throw APIError.from(
+						"FORBIDDEN",
+						ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+					);
+				}
+				const updatedSession = await adapter.setActiveOrganization(
+					session.session.token,
+					null,
+					ctx,
+				);
+				await setSessionCookie(ctx, { session: updatedSession, user: session.user });
 				throw APIError.from(
 					"FORBIDDEN",
 					ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
