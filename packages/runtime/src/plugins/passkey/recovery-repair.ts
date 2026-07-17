@@ -20,6 +20,8 @@ import {
 	inspectRecoveryFactorRepairAuthority,
 	preloadRecoveryFactorRepairCapability,
 	RECOVERY_FACTOR_REPAIR_COOKIE,
+	recoveryFactorRepairSelectionAuthorityIsExact,
+	restartRecoveryPasskeyRegistrationCapability,
 	rotateRecoveryFactorRepairCapability,
 } from "../../internal/recovery-factor-repair-context";
 import { lockAndReadActiveUser } from "../../db/user-authority";
@@ -103,6 +105,22 @@ async function expireRecoveryRepairCookie(ctx: GenericEndpointContext): Promise<
 	});
 }
 
+async function restartFailedRegistrationProof(
+	ctx: GenericEndpointContext,
+	authority: object,
+): Promise<never> {
+	try {
+		await runWithTransaction(ctx.context.adapter, () =>
+			restartRecoveryPasskeyRegistrationCapability(ctx, authority),
+		);
+	} catch (error) {
+		if (error instanceof AfterTransactionHookError) {
+			await expireRecoveryRepairCookie(ctx);
+		}
+	}
+	return recoveryRepairFailed();
+}
+
 function assertRecoveryRepairConfiguration(ctx: GenericEndpointContext): void {
 	if (
 		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" ||
@@ -157,7 +175,11 @@ export const generatePasskeyRecoveryRepairRegistrationOptions = (
 					if (
 						!initial ||
 						initial.stage !== "select_repair" ||
-						initial.repairFactor !== "passkey"
+						initial.repairFactor !== "passkey" ||
+						!(await recoveryFactorRepairSelectionAuthorityIsExact(
+							ctx,
+							authority,
+						))
 					) {
 						recoveryRepairFailed();
 					}
@@ -309,10 +331,10 @@ export const verifyPasskeyRecoveryRepairRegistration = (
 						requireUserVerification: true,
 					});
 				} catch {
-					recoveryRepairFailed();
+					return restartFailedRegistrationProof(ctx, consumed.authority);
 				}
 				if (!verification.verified || !verification.registrationInfo) {
-					recoveryRepairFailed();
+					return restartFailedRegistrationProof(ctx, consumed.authority);
 				}
 
 				const { aaguid, credential, credentialDeviceType, credentialBackedUp } =
