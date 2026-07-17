@@ -16,6 +16,10 @@ import {
 	verifyPasskeyRemediationRegistration,
 	verifyPasskeyRegistration,
 } from "./routes";
+import {
+	generatePasskeyRecoveryRepairRegistrationOptions,
+	verifyPasskeyRecoveryRepairRegistration,
+} from "./recovery-repair";
 import { schema } from "./schema";
 import type { PasskeyOptions } from "./types";
 
@@ -49,6 +53,10 @@ export const passkey = <O extends PasskeyOptions>(options?: O) => {
 				verifyPasskeyRemediationRegistration(options),
 			verifyPasskeyRemediationAuthentication:
 				verifyPasskeyRemediationAuthentication(options),
+			generatePasskeyRecoveryRepairRegistrationOptions:
+				generatePasskeyRecoveryRepairRegistrationOptions(options),
+			verifyPasskeyRecoveryRepairRegistration:
+				verifyPasskeyRecoveryRepairRegistration(options),
 			generatePasskeyAuthenticationOptions:
 				generatePasskeyAuthenticationOptions(options),
 			verifyPasskeyAuthentication: verifyPasskeyAuthentication(options),
