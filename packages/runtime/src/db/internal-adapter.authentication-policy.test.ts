@@ -79,6 +79,7 @@ function policyResult(
 		revision?: string;
 		scope?: RuntimeAuthenticationPolicyIdentity;
 		membershipOrganizationId?: string | null;
+		membershipSubjectId?: string;
 	} = {},
 ): RuntimeAuthenticationPolicyReaderResult {
 	const effective = options.policy ?? policy();
@@ -93,7 +94,7 @@ function policyResult(
 		environment: effective,
 		organizationMembership: membershipOrganizationId
 			? {
-				subjectId: input.subjectId,
+				subjectId: options.membershipSubjectId ?? input.subjectId,
 				organizationId: membershipOrganizationId,
 			}
 			: null,
@@ -1006,6 +1007,415 @@ describe("managed session issuance", () => {
 				);
 			}),
 		).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+		expect(await credentialRows(runtime)).toHaveLength(1);
+	});
+
+	it.each(["revision", "membership"] as const)(
+		"rolls an organization transition back when target %s changes before commit",
+		async (race) => {
+			let targetRevision = "8";
+			let targetMembershipPresent = true;
+			let armRace = false;
+			const runtime = await setupManagedRuntime({
+				reader: (input) =>
+					policyResult(input, {
+						revision: input.organizationId ? targetRevision : "7",
+						membershipOrganizationId: input.organizationId
+							? targetMembershipPresent
+								? input.organizationId
+								: null
+							: null,
+					}),
+				options: {
+					databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => {
+									if (!armRace) return { data };
+									if (race === "revision") targetRevision = "9";
+									else targetMembershipPresent = false;
+									return { data };
+								},
+							},
+						},
+					},
+				},
+			});
+			const source = await issuePasswordSession(runtime);
+			armRace = true;
+			await expect(
+				runWithTransaction(runtime.context.adapter, async () => {
+					const transition = await captureInternalSessionIssuanceContext(
+						runtime.context.internalAdapter,
+						{
+							purpose: "organization",
+							sourceSessionToken: source.token,
+							targetOrganizationId: "organization_b",
+						},
+					);
+					await runtime.context.internalAdapter.deleteSession(source.token);
+					await runtime.context.internalAdapter.createSession(
+						runtime.user.id,
+						false,
+						undefined,
+						false,
+						transition,
+					);
+				}),
+			).rejects.toBeInstanceOf(
+				race === "revision"
+					? ManagedSessionIssuanceError
+					: InvalidRuntimeAuthenticationPolicyError,
+			);
+			expect(await authorityRows(runtime.context)).toHaveLength(1);
+			expect(await credentialRows(runtime)).toHaveLength(1);
+		},
+	);
+
+	it("rejects forged, reused, and out-of-transaction organization contexts", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+		const forged = createInternalSessionIssuanceContext({
+			purpose: "organization",
+			sourceSessionToken: source.token,
+			targetOrganizationId: "organization_b",
+		});
+		await expect(
+			runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				forged,
+			),
+		).rejects.toMatchObject({ reason: "unsupported_purpose" });
+		await expect(
+			captureInternalSessionIssuanceContext(runtime.context.internalAdapter, {
+				purpose: "organization",
+				sourceSessionToken: source.token,
+				targetOrganizationId: "organization_b",
+			}),
+		).rejects.toMatchObject({ reason: "context_invalid" });
+
+		const capturedOutside = await runWithTransaction(
+			runtime.context.adapter,
+			() =>
+				captureInternalSessionIssuanceContext(runtime.context.internalAdapter, {
+					purpose: "organization",
+					sourceSessionToken: source.token,
+					targetOrganizationId: "organization_b",
+				}),
+		);
+		await expect(
+			runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				capturedOutside,
+			),
+		).rejects.toMatchObject({ reason: "context_invalid" });
+
+		const reusableSource = await issuePasswordSession(runtime);
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const captured = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "organization",
+					sourceSessionToken: reusableSource.token,
+					targetOrganizationId: "organization_b",
+				},
+			);
+			await runtime.context.internalAdapter.deleteSession(reusableSource.token);
+			await runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				captured,
+			);
+			await expect(
+				runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					captured,
+				),
+			).rejects.toMatchObject({ reason: "context_invalid" });
+		});
+	});
+
+	it("allows at most one organization successor from competing source captures", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+		const attempt = () =>
+			runWithTransaction(runtime.context.adapter, async () => {
+				const transition = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "organization",
+						sourceSessionToken: source.token,
+						targetOrganizationId: "organization_b",
+					},
+				);
+				await runtime.context.internalAdapter.deleteSession(source.token);
+				return runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					transition,
+				);
+			});
+		const attempts = await Promise.allSettled([attempt(), attempt()]);
+		expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(
+			1,
+		);
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+		const activeCredentials = (await credentialRows(runtime)).filter(
+			(credential) => credential.status === "active",
+		);
+		expect(activeCredentials).toHaveLength(1);
+	});
+
+	it("issues an organization-bound successor only after retiring its exact source", async () => {
+		const sourceCeiling = new Date(Date.now() + 60_000);
+		let corruptSuccessorHook = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					revision: input.organizationId === "organization_b" ? "8" : "7",
+				}),
+			options: {
+				databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => ({
+								data: corruptSuccessorHook
+									? {
+											...data,
+											activeOrganizationId: "organization_hook",
+											activeTeamId: "team_hook",
+										}
+									: data,
+							}),
+						},
+					},
+				},
+				session: {
+					additionalFields: {
+						activeOrganizationId: { type: "string", required: false },
+						activeTeamId: { type: "string", required: false },
+					},
+				},
+			},
+		});
+		const source = await runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			false,
+			{
+				activeOrganizationId: "organization_a",
+				activeTeamId: "team_a",
+				expiresAt: sourceCeiling,
+				__preserveSessionExpiresAt: true,
+			},
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: "organization_a",
+			}),
+		);
+		const [sourceAuthority] = await authorityRows(runtime.context);
+		let successor!: Session;
+		corruptSuccessorHook = true;
+
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const transition = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "organization",
+					sourceSessionToken: source.token,
+					targetOrganizationId: "organization_b",
+				},
+			);
+			await runtime.context.internalAdapter.deleteSession(source.token);
+			successor = await runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				{
+					activeOrganizationId: "organization_override",
+					activeTeamId: "team_override",
+				},
+				true,
+				transition,
+			);
+		});
+
+		const [successorAuthority] = await authorityRows(runtime.context);
+		expect(successorAuthority).toMatchObject({
+			id: successor.id,
+			activeOrganizationId: "organization_b",
+			activeTeamId: null,
+			authenticationPolicyOrganizationId: "organization_b",
+			authenticationPolicyRevision: "8",
+		});
+		expect(successorAuthority?.authenticationPrimaryAt).toEqual(
+			sourceAuthority?.authenticationPrimaryAt,
+		);
+		expect(successorAuthority?.authenticationAssuranceExpiresAt).toEqual(
+			sourceAuthority?.authenticationAssuranceExpiresAt,
+		);
+		expect(successorAuthority?.expiresAt).toEqual(sourceCeiling);
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.updateSession(successor.token, {
+				activeOrganizationId: "organization_c",
+			}),
+		).resolves.toBeNull();
+	});
+
+	it("rolls organization transition issuance back while its source remains active", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const transition = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "organization",
+						sourceSessionToken: source.token,
+						targetOrganizationId: "organization_b",
+					},
+				);
+				await runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					transition,
+				);
+			}),
+		).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+	});
+
+	it.each([
+		{ label: "null to organization", sourceOrganizationId: null, targetOrganizationId: "organization_b" },
+		{ label: "organization to null", sourceOrganizationId: "organization_a", targetOrganizationId: null },
+	])("transitions $label while clearing the active team", async (testCase) => {
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: {
+					additionalFields: {
+						activeOrganizationId: { type: "string", required: false },
+						activeTeamId: { type: "string", required: false },
+					},
+				},
+			},
+		});
+		const source = await runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			false,
+			testCase.sourceOrganizationId === null
+				? { activeTeamId: "team_a" }
+				: {
+						activeOrganizationId: testCase.sourceOrganizationId,
+						activeTeamId: "team_a",
+					},
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: testCase.sourceOrganizationId,
+			}),
+		);
+		let successor!: Session;
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const transition = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "organization",
+					sourceSessionToken: source.token,
+					targetOrganizationId: testCase.targetOrganizationId,
+				},
+			);
+			await runtime.context.internalAdapter.deleteSession(source.token);
+			successor = await runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				transition,
+			);
+		});
+		const [authority] = await authorityRows(runtime.context);
+		expect(authority).toMatchObject({
+			id: successor.id,
+			activeOrganizationId: testCase.targetOrganizationId,
+			activeTeamId: null,
+			authenticationPolicyOrganizationId: testCase.targetOrganizationId,
+		});
+	});
+
+	it.each([
+		{
+			label: "missing target membership",
+			reader: (input: RuntimeAuthenticationPolicyReaderInput) =>
+				policyResult(input, { membershipOrganizationId: null }),
+			error: InvalidRuntimeAuthenticationPolicyError,
+		},
+		{
+			label: "wrong-subject target membership",
+			reader: (input: RuntimeAuthenticationPolicyReaderInput) =>
+				policyResult(input, {
+					membershipOrganizationId: input.organizationId
+						? input.organizationId
+						: null,
+					membershipSubjectId: "user_other",
+				}),
+			error: InvalidRuntimeAuthenticationPolicyError,
+		},
+		{
+			label: "stricter target policy",
+			reader: (input: RuntimeAuthenticationPolicyReaderInput) =>
+				policyResult(input, {
+					policy: input.organizationId
+						? policy({ minimumAssurance: "multi_factor" })
+						: policy(),
+				}),
+			error: ManagedSessionIssuanceError,
+		},
+	])("rolls organization transition back for $label", async (testCase) => {
+		const runtime = await setupManagedRuntime({ reader: testCase.reader });
+		const source = await issuePasswordSession(runtime);
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const transition = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "organization",
+						sourceSessionToken: source.token,
+						targetOrganizationId: "organization_b",
+					},
+				);
+				await runtime.context.internalAdapter.deleteSession(source.token);
+				await runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					transition,
+				);
+			}),
+		).rejects.toBeInstanceOf(testCase.error);
 		expect(await authorityRows(runtime.context)).toHaveLength(1);
 		expect(await credentialRows(runtime)).toHaveLength(1);
 	});
