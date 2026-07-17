@@ -234,13 +234,19 @@ export const runWithTransaction = async <
 			if (matchingTransaction) {
 				return runInOwnerContext(als, matchingTransaction, store, fn);
 			}
-			const pendingBeforeCommitHooks: Array<() => Promise<void>> = [];
-			const pendingHooks: Array<() => Promise<void>> = [];
+			// An adapter may re-invoke its transaction callback as part of a
+			// whole-transaction retry. Keep each callback attempt's hooks local so
+			// hooks from an abandoned attempt cannot escape after the eventual
+			// commit. A successful callback replaces this reference; retrying
+			// adapters invoke callbacks serially and return the last committed result.
+			let committedPendingHooks: Array<() => Promise<void>> = [];
 			let result: Awaited<R>;
 			let error: unknown;
 			let hasError = false;
 			try {
 				result = await adapter.transaction(async (trx) => {
+					const pendingBeforeCommitHooks: Array<() => Promise<void>> = [];
+					const pendingHooks: Array<() => Promise<void>> = [];
 					const activeTransactions = new Map(
 						store?.activeTransactions ?? [],
 					);
@@ -255,13 +261,15 @@ export const runWithTransaction = async <
 					};
 					activeTransactions.set(adapter, transactionContext);
 					activeTransactions.set(trx, transactionContext);
-					return als.run(transactionContext, async () => {
+					const transactionResult = await als.run(transactionContext, async () => {
 						const transactionResult = await fn();
 						for (const hook of pendingBeforeCommitHooks) {
 							await hook();
 						}
 						return transactionResult;
 					});
+					committedPendingHooks = pendingHooks;
+					return transactionResult;
 				});
 			} catch (e) {
 				hasError = true;
@@ -271,7 +279,7 @@ export const runWithTransaction = async <
 				throw error;
 			}
 			const hookErrors: unknown[] = [];
-			for (const hook of pendingHooks) {
+			for (const hook of committedPendingHooks) {
 				try {
 					await hook();
 				} catch (error) {
