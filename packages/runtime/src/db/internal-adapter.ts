@@ -2705,7 +2705,8 @@ export const createInternalAdapter = (
 				: undefined;
 			const capturedIssuanceAuthority =
 				managedIssuanceContext?.purpose === "replacement" ||
-				managedIssuanceContext?.purpose === "device"
+				managedIssuanceContext?.purpose === "device" ||
+				managedIssuanceContext?.purpose === "organization"
 					? requireCapturedSessionIssuanceAuthority(issuanceContext)
 					: undefined;
 			if (
@@ -2793,6 +2794,10 @@ export const createInternalAdapter = (
 				capturedIssuanceAuthority.sourceExpiresAt < requestedExpiresAt
 					? new Date(capturedIssuanceAuthority.sourceExpiresAt)
 					: requestedExpiresAt;
+			const organizationTransitionTarget =
+				managedIssuanceContext?.purpose === "organization"
+					? managedIssuanceContext.targetOrganizationId
+					: undefined;
 			const buildSessionData = (
 				twoFactorSessionGeneration?: string,
 				passkeySessionGeneration?: string,
@@ -2827,6 +2832,12 @@ export const createInternalAdapter = (
 						}
 					: {}),
 				...(overrideAll ? rest : {}),
+				...(organizationTransitionTarget !== undefined
+					? {
+							activeOrganizationId: organizationTransitionTarget,
+							activeTeamId: null,
+						}
+					: {}),
 				...(passkeySessionGeneration
 					? {
 							[PASSKEY_SESSION_GENERATION_FIELD]: passkeySessionGeneration,
@@ -2874,6 +2885,12 @@ export const createInternalAdapter = (
 							}
 						: {}),
 					...(assuranceFields ?? {}),
+					...(organizationTransitionTarget !== undefined
+						? {
+								activeOrganizationId: organizationTransitionTarget,
+								activeTeamId: null,
+							}
+						: {}),
 				} as T;
 			};
 			const persistSecondarySession = async (
@@ -2990,9 +3007,13 @@ export const createInternalAdapter = (
 					authenticationPolicy &&
 					(managedIssuanceContext || stagedIssuanceAuthority)
 				) {
+					const requestedTargetOrganizationId =
+						managedIssuanceContext?.purpose === "organization"
+							? managedIssuanceContext.targetOrganizationId
+							: (capturedIssuanceAuthority?.sourceOrganizationId ??
+									managedIssuanceContext?.targetOrganizationId);
 					const targetOrganizationId =
-						(capturedIssuanceAuthority?.sourceOrganizationId ??
-							managedIssuanceContext?.targetOrganizationId) || undefined;
+						requestedTargetOrganizationId || undefined;
 					const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(
 						options,
 						{
@@ -3325,38 +3346,39 @@ export const createInternalAdapter = (
 						);
 						const finalRecord = await findSessionRecordById(persistedSessionId);
 						const { user: _finalUser, ...finalSessionData } = finalRecord ?? {};
-							const finalSession = finalSessionData as Session &
-								Record<string, unknown>;
-							let stagedPolicyUnchanged = true;
-							if (stagedIssuanceAuthority) {
-								stagedPolicyUnchanged =
-									stagedIssuanceAuthority.transactionAdapter ===
-										currentAdapter &&
-									stagedIssuanceAuthority.expiresAt > new Date();
-								const finalPolicy = await resolveRuntimeAuthenticationPolicy(
-									options,
-									{
-										subjectId: userId,
-										minimumRevision:
-											stagedIssuanceAuthority.policyRevision,
-										transaction: currentAdapter,
-									},
-								);
-								stagedPolicyUnchanged =
-									stagedPolicyUnchanged &&
-									finalPolicy.scope.projectId ===
-										stagedIssuanceAuthority.projectId &&
-									finalPolicy.scope.environmentId ===
-										stagedIssuanceAuthority.environmentId &&
-									finalPolicy.revision ===
-										stagedIssuanceAuthority.policyRevision &&
-									(await digestStagedAuthenticationPolicy(
-										finalPolicy.effective,
-									)) === stagedIssuanceAuthority.policyDigest;
-							}
-							let capturedReplacementSourceRetired = true;
+						const finalSession = finalSessionData as Session &
+							Record<string, unknown>;
+						let stagedPolicyUnchanged = true;
+						if (stagedIssuanceAuthority) {
+							stagedPolicyUnchanged =
+								stagedIssuanceAuthority.transactionAdapter ===
+									currentAdapter &&
+								stagedIssuanceAuthority.expiresAt > new Date();
+							const finalPolicy = await resolveRuntimeAuthenticationPolicy(
+								options,
+								{
+									subjectId: userId,
+									minimumRevision:
+										stagedIssuanceAuthority.policyRevision,
+									transaction: currentAdapter,
+								},
+							);
+							stagedPolicyUnchanged =
+								stagedPolicyUnchanged &&
+								finalPolicy.scope.projectId ===
+									stagedIssuanceAuthority.projectId &&
+								finalPolicy.scope.environmentId ===
+									stagedIssuanceAuthority.environmentId &&
+								finalPolicy.revision ===
+									stagedIssuanceAuthority.policyRevision &&
+								(await digestStagedAuthenticationPolicy(
+									finalPolicy.effective,
+								)) === stagedIssuanceAuthority.policyDigest;
+						}
+						let capturedReplacementSourceRetired = true;
 						if (
-							managedIssuanceContext?.purpose === "replacement" &&
+							(managedIssuanceContext?.purpose === "replacement" ||
+								managedIssuanceContext?.purpose === "organization") &&
 							capturedIssuanceAuthority
 						) {
 							const sourceSession = await currentAdapter.findOne<Session>({
@@ -3373,37 +3395,37 @@ export const createInternalAdapter = (
 							} else {
 								const activeSourceCredentials =
 									await currentAdapter.findMany<SessionCredential>({
-											model: SESSION_CREDENTIAL_MODEL,
-											where: [
-												{
-													field: "sessionId",
-													value:
-														capturedIssuanceAuthority.sourceSessionId,
-												},
-												{ field: "status", value: "active" },
-											],
+										model: SESSION_CREDENTIAL_MODEL,
+										where: [
+											{
+												field: "sessionId",
+												value:
+													capturedIssuanceAuthority.sourceSessionId,
+											},
+											{ field: "status", value: "active" },
+										],
 									});
 								const capturedSourceCredential =
-										capturedIssuanceAuthority.sourceCredentialId === null
-											? null
-											: await currentAdapter.findOne<SessionCredential>({
-													model: SESSION_CREDENTIAL_MODEL,
-													where: [
-														{
-															field: "id",
-															value:
-																capturedIssuanceAuthority.sourceCredentialId,
-														},
-													],
-												});
+									capturedIssuanceAuthority.sourceCredentialId === null
+										? null
+										: await currentAdapter.findOne<SessionCredential>({
+												model: SESSION_CREDENTIAL_MODEL,
+												where: [
+													{
+														field: "id",
+														value:
+															capturedIssuanceAuthority.sourceCredentialId,
+													},
+												],
+											});
 								capturedReplacementSourceRetired =
 									activeSourceCredentials.length === 0 &&
 									capturedSourceCredential?.status !== "active";
 							}
 						}
-							if (
-								!activeUser ||
-								!stagedPolicyUnchanged ||
+						if (
+							!activeUser ||
+							!stagedPolicyUnchanged ||
 							!capturedReplacementSourceRetired ||
 							capturedIssuanceAuthority?.sourceSessionId ===
 								persistedSessionId ||
@@ -5751,6 +5773,13 @@ export const createInternalAdapter = (
 		refreshUserSessions,
 	};
 	if (authenticationPolicy) {
+		// A single transaction can derive at most one organization successor from
+		// a source authority. Source resolution locks the user for cross-
+		// transaction contenders; this closes duplicate capture in one owner.
+		const capturedOrganizationTransitionSources = new WeakMap<
+			object,
+			Set<string>
+		>();
 		attachInternalSessionIssuanceCaptureAuthority(
 			internalAdapter,
 			async (issuanceContext) => {
@@ -5767,6 +5796,19 @@ export const createInternalAdapter = (
 				if (!source) {
 					throw new ManagedSessionIssuanceError("policy_unsatisfied");
 				}
+				if (issuanceContext.purpose === "organization") {
+					const capturedSources =
+						capturedOrganizationTransitionSources.get(transactionAdapter) ??
+						new Set<string>();
+					if (capturedSources.has(source.session.id)) {
+						throw new ManagedSessionIssuanceError("context_invalid");
+					}
+					capturedSources.add(source.session.id);
+					capturedOrganizationTransitionSources.set(
+						transactionAdapter,
+						capturedSources,
+					);
+				}
 				const sourceAssurance = source.assurance;
 				const sourceExpiresAt = source.session.expiresAt;
 				if (
@@ -5774,10 +5816,10 @@ export const createInternalAdapter = (
 					!(sourceExpiresAt instanceof Date) ||
 					!Number.isFinite(sourceExpiresAt.getTime()) ||
 					sourceExpiresAt <= new Date() ||
-					(issuanceContext.targetOrganizationId !== null &&
+					(issuanceContext.purpose !== "organization" &&
+						issuanceContext.targetOrganizationId !== null &&
 						issuanceContext.targetOrganizationId !==
-						sourceAssurance.authenticationPolicyOrganizationId
-					)
+							sourceAssurance.authenticationPolicyOrganizationId)
 				) {
 					throw new ManagedSessionIssuanceError("policy_unsatisfied");
 				}
