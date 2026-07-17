@@ -55,6 +55,7 @@ import {
 } from "./constant";
 import { TWO_FACTOR_ERROR_CODES } from "./error-code";
 import { otp2fa } from "./otp";
+import { createRecoveryFactorRepairEndpoint } from "./recovery-repair";
 import { schema } from "./schema";
 import { totp2fa } from "./totp";
 import type {
@@ -191,6 +192,9 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 		options?.totpOptions,
 	);
 	const otp = otp2fa(options?.otpOptions);
+	const recoveryFactorRepair = createRecoveryFactorRepairEndpoint({
+		twoFactorTable: resolvedOptions.twoFactorTable,
+	});
 	const passwordSchema = z.string().meta({
 		description: "User password",
 	});
@@ -234,6 +238,7 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 			...totp.endpoints,
 			...otp.endpoints,
 			...backupCode.endpoints,
+			recoveryFactorRepair,
 			/**
 			 * ### Endpoint
 			 *
