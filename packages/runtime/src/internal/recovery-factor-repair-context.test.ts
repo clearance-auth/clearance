@@ -305,6 +305,13 @@ async function rotateAndConsumeFinal(
 			preloaded!,
 		);
 		const lineage = inspectRecoveryFactorRepairAuthority(authority!);
+		expect(lineage).toMatchObject({
+			subjectId: fixture.user.id,
+			repairFactor: fixture.repairFactor,
+			twoFactorTable: fixture.twoFactorTable,
+			recoveryFactorId: fixture.factor.id,
+			trustDeviceGeneration: expect.any(String),
+		});
 		binding = await createRecoveryFactorRepairBinding(lineage!, [
 			"test-ceremony",
 			fixture.factor.id,
