@@ -1,6 +1,6 @@
 import type { ClearanceOptions } from "@clearance/core";
 import type { DBAdapter } from "@clearance/core/db/adapter";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { MemoryDB } from "./memory-adapter";
 import { memoryAdapter } from "./memory-adapter";
 
@@ -452,6 +452,129 @@ describe("memory adapter incrementOne", () => {
 });
 
 describe("memory adapter transaction isolation", () => {
+	it("serializes transaction snapshots so owner-sensitive writes observe the preceding commit", async () => {
+		const { adapter } = setup();
+		await seedWidget(adapter, "organization", "organization");
+		await seedWidget(adapter, "owner-a", "owner");
+		await seedWidget(adapter, "owner-b", "owner");
+
+		let releaseFirst: () => void = () => {};
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let signalFirstEntered: () => void = () => {};
+		const firstEntered = new Promise<void>((resolve) => {
+			signalFirstEntered = resolve;
+		});
+
+		const removeOwner = async (
+			ownerId: string,
+			gate?: Promise<void>,
+		) =>
+			adapter.transaction(async (trx) => {
+				if (gate) signalFirstEntered();
+				await trx.update({
+					model: "widget",
+					where: [{ field: "id", value: "organization" }],
+					update: { name: "organization" },
+				});
+				const owners = await trx.findMany<{ id: string; name: string }>({
+					model: "widget",
+					where: [{ field: "name", value: "owner" }],
+				});
+				if (gate) await gate;
+				if (owners.length <= 1) return false;
+				await trx.delete({
+					model: "widget",
+					where: [{ field: "id", value: ownerId }],
+				});
+				return true;
+			});
+
+		const first = removeOwner("owner-a", firstGate);
+		await firstEntered;
+		let secondEntered = false;
+		const second = adapter.transaction(async (trx) => {
+			secondEntered = true;
+			await trx.update({
+				model: "widget",
+				where: [{ field: "id", value: "organization" }],
+				update: { name: "organization" },
+			});
+			const owners = await trx.findMany<{ id: string; name: string }>({
+				model: "widget",
+				where: [{ field: "name", value: "owner" }],
+			});
+			if (owners.length <= 1) return false;
+			await trx.delete({
+				model: "widget",
+				where: [{ field: "id", value: "owner-b" }],
+			});
+			return true;
+		});
+
+		await Promise.resolve();
+		expect(secondEntered).toBe(false);
+		releaseFirst();
+
+		expect(await first).toBe(true);
+		expect(await second).toBe(false);
+		const owners = await adapter.findMany<{ id: string }>({
+			model: "widget",
+			where: [{ field: "name", value: "owner" }],
+		});
+		expect(owners.map((owner) => owner.id)).toEqual(["owner-b"]);
+	});
+
+	it("rejects captured-base reentry and releases the next queued transaction after failure", async () => {
+		const { adapter } = setup();
+		let releaseOuter: () => void = () => {};
+		const outerGate = new Promise<void>((resolve) => {
+			releaseOuter = resolve;
+		});
+		let signalOuterEntered: () => void = () => {};
+		const outerEntered = new Promise<void>((resolve) => {
+			signalOuterEntered = resolve;
+		});
+
+		const outer = adapter
+			.transaction(async (trx) => {
+				await trx.create({
+					model: "widget",
+					data: { id: "discarded", name: "outer-write" },
+					forceAllowId: true,
+				});
+				signalOuterEntered();
+				await outerGate;
+				await expect(adapter.transaction(async () => undefined)).rejects.toThrow(
+					"Memory adapter cannot re-enter a transaction through its base adapter",
+				);
+				throw new Error("outer failure");
+			})
+			.catch((error) => error);
+
+		await outerEntered;
+		let nextEntered = false;
+		const next = adapter.transaction(async (trx) => {
+			nextEntered = true;
+			await trx.create({
+				model: "widget",
+				data: { id: "next", name: "next-write" },
+				forceAllowId: true,
+			});
+		});
+
+		await Promise.resolve();
+		expect(nextEntered).toBe(false);
+		releaseOuter();
+
+		expect(await outer).toMatchObject({ message: "outer failure" });
+		await next;
+		expect(nextEntered).toBe(true);
+		const rows = await adapter.findMany<{ id: string }>({ model: "widget" });
+		expect(rows.map((row) => row.id)).toEqual(["next"]);
+	});
+
 	it("a failing transaction must not erase a write made by a concurrent in-flight operation", async () => {
 		const { adapter } = setup();
 
@@ -640,5 +763,46 @@ describe("memory adapter transaction isolation", () => {
 
 		// The reference the caller passed to memoryAdapter reflects the commit.
 		expect(db.widget?.map((r) => r.id)).toEqual(["committed"]);
+	});
+
+	it("fails closed when async context leaks a pending transaction into unrelated work", async () => {
+		class SharedAsyncLocalStorage<T> {
+			#current: T | undefined;
+
+			run<R>(store: T, fn: () => R): R {
+				const previous = this.#current;
+				this.#current = store;
+				const result = fn();
+				if (result instanceof Promise) {
+					return result.finally(() => {
+						this.#current = previous;
+					}) as R;
+				}
+				this.#current = previous;
+				return result;
+			}
+
+			getStore(): T | undefined {
+				return this.#current;
+			}
+		}
+
+		vi.resetModules();
+		vi.doMock("@clearance/core/async_hooks", () => ({
+			getAsyncLocalStorage: async () => SharedAsyncLocalStorage,
+		}));
+
+		try {
+			const { memoryAdapter: unsupportedMemoryAdapter } = await import(
+				"./memory-adapter"
+			);
+			const adapter = unsupportedMemoryAdapter({ widget: [] })(options);
+			await expect(adapter.transaction(async () => undefined)).rejects.toThrow(
+				"Memory adapter transactions require a context-local async context implementation",
+			);
+		} finally {
+			vi.doUnmock("@clearance/core/async_hooks");
+			vi.resetModules();
+		}
 	});
 });
