@@ -160,6 +160,15 @@ export type SessionIssuanceContext = (
 			sourceSessionToken: string;
 			targetOrganizationId?: string | null;
 	  }>
+	| Readonly<{
+			/**
+			 * A one-use, transaction-bound successor authority for changing the
+			 * active organization. Only the runtime capture API can mint this.
+			 */
+			purpose: "organization";
+			sourceSessionToken: string;
+			targetOrganizationId?: string | null;
+	  }>
 ) &
 	BrandedSessionIssuanceContext;
 
