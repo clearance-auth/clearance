@@ -9,6 +9,8 @@ import { makeSignature } from "../../crypto";
 import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { parseCookies, parseSetCookieHeader } from "../../cookies";
+import { digestSessionRefreshSecret } from "../../db/session-credential";
+import { getSecondarySessionKeys } from "../../db/session-credential-migration";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { jwt } from "../jwt";
 import { jwtClient } from "../jwt/client";
@@ -32,6 +34,8 @@ const managedMultiSessionPolicy = {
 async function createManagedMultiSessionRuntime(
 	maximumSessions = 5,
 	secondaryFailure?: { failKey: string | null; error: Error },
+	secondaryOnly = false,
+	preserveSessionInDatabase = false,
 ) {
 	let revision = "1";
 	let organizationMembership: string | null = null;
@@ -40,7 +44,8 @@ async function createManagedMultiSessionRuntime(
 	const secondaryStore = new Map<string, string>();
 	const options = {
 		session: {
-			storeSessionInDatabase: true,
+			storeSessionInDatabase: !secondaryOnly,
+			preserveSessionInDatabase,
 			additionalFields: {
 				activeOrganizationId: {
 					type: "string",
@@ -49,7 +54,7 @@ async function createManagedMultiSessionRuntime(
 			},
 		},
 		plugins: [multiSession({ maximumSessions })],
-		...(secondaryFailure
+		...(secondaryFailure || secondaryOnly
 			? {
 					secondaryStorage: {
 						async get(key: string) {
@@ -59,7 +64,7 @@ async function createManagedMultiSessionRuntime(
 							secondaryStore.set(key, value);
 						},
 						async delete(key: string) {
-							if (key === secondaryFailure.failKey) {
+							if (secondaryFailure && key === secondaryFailure.failKey) {
 								throw secondaryFailure.error;
 							}
 							secondaryStore.delete(key);
@@ -68,30 +73,32 @@ async function createManagedMultiSessionRuntime(
 			  }
 			: {}),
 	} satisfies ClearanceOptions;
-	attachInternalAuthenticationPolicy(options, {
-		identity: managedMultiSessionIdentity,
-		reader: {
-			async readForSubject(input) {
-				if (readerError) throw readerError;
-				return {
-					scope: managedMultiSessionIdentity,
-					subjectId: input.subjectId,
-					revision: subjectRevisions.get(input.subjectId) ?? revision,
-					environment: managedMultiSessionPolicy,
-					organizationMembership:
-						input.organizationId &&
-						organizationMembership === input.organizationId
-							? {
-									subjectId: input.subjectId,
-									organizationId: input.organizationId,
-								}
-							: null,
-					organizationOverride: null,
-					effective: managedMultiSessionPolicy,
-				};
+	if (!secondaryOnly) {
+		attachInternalAuthenticationPolicy(options, {
+			identity: managedMultiSessionIdentity,
+			reader: {
+				async readForSubject(input) {
+					if (readerError) throw readerError;
+					return {
+						scope: managedMultiSessionIdentity,
+						subjectId: input.subjectId,
+						revision: subjectRevisions.get(input.subjectId) ?? revision,
+						environment: managedMultiSessionPolicy,
+						organizationMembership:
+							input.organizationId &&
+							organizationMembership === input.organizationId
+								? {
+										subjectId: input.subjectId,
+										organizationId: input.organizationId,
+									}
+								: null,
+						organizationOverride: null,
+						effective: managedMultiSessionPolicy,
+					};
+				},
 			},
-		},
-	});
+		});
+	}
 	const runtime = await getTestInstance(options, {
 		disableTestUser: true,
 		clientOptions: { plugins: [multiSessionClient()] },
@@ -462,7 +469,7 @@ describe("multi-session", async () => {
 		expect(listed.data).toHaveLength(1);
 	});
 
-	it("evicts validated capacity overflow during JWT credential rotation", async () => {
+	it("evicts malformed signed capacity overflow during JWT credential rotation", async () => {
 		const local = await getTestInstance(
 			{
 				plugins: [
@@ -502,7 +509,7 @@ describe("multi-session", async () => {
 		);
 		headers.set(
 			"cookie",
-			`${headers.get("cookie")}; ${await signedMultiSessionCookie(context.secret, overflow)}`,
+			`${headers.get("cookie")}; ${await signedNamedMultiSessionCookie(context.secret, "clearance.session_token_multi-", overflow.token)}`,
 		);
 		const rotated = await local.client.token({
 			fetchOptions: {
@@ -1316,7 +1323,7 @@ describe("multi-session managed session authority", () => {
 		expect(await context.internalAdapter.findSession(token)).not.toBeNull();
 	});
 
-	it("rejects an over-envelope request without expiring or deleting tracked authority", async () => {
+	it("cleans invalid names beyond the authority-read budget without rejecting the request", async () => {
 		const runtime = await createManagedMultiSessionRuntime();
 		const headers = new Headers();
 		const signup = await runtime.client.signUp.email(
@@ -1351,8 +1358,12 @@ describe("multi-session managed session authority", () => {
 				},
 			},
 		});
-		expect(listed.error?.status).toBe(400);
-		expect(setCookie).toBe("");
+		expect(listed.error).toBeNull();
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				"clearance.session_token_multi-overflow-99",
+			)?.["max-age"],
+		).toBe(0);
 		const originalToken =
 			parseCookies(originalCookie)
 				.get(
@@ -1368,7 +1379,7 @@ describe("multi-session managed session authority", () => {
 		);
 	});
 
-	it("rejects over-envelope signout before session reads, deletion, or cookie expiry", async () => {
+	it("signs out over-envelope inputs without managed authority reads", async () => {
 		const runtime = await createManagedMultiSessionRuntime();
 		const headers = new Headers();
 		await runtime.client.signUp.email(
@@ -1416,16 +1427,16 @@ describe("multi-session managed session authority", () => {
 					},
 				},
 			});
-			expect(signedOut.error?.status).toBe(400);
+			expect(signedOut.error).toBeNull();
 			expect(authorityReads).toBe(0);
 		} finally {
 			lookup.mockRestore();
 		}
-		expect(setCookie).toBe("");
-		expect(await context.internalAdapter.findSession(activeToken)).not.toBeNull();
+		expect(setCookie).toContain("clearance.session_token_multi-");
+		expect(await context.internalAdapter.findSession(activeToken)).toBeNull();
 	});
 
-	it("rejects over-envelope revoke before middleware reads or mutation", async () => {
+	it("revokes over-envelope inputs within its authority-read budget", async () => {
 		const runtime = await createManagedMultiSessionRuntime();
 		const headers = new Headers();
 		await runtime.client.signUp.email(
@@ -1475,16 +1486,16 @@ describe("multi-session managed session authority", () => {
 					},
 				},
 			);
-			expect(revoked.error?.status).toBe(400);
-			expect(authorityReads).toBe(0);
+			expect(revoked.error).toBeNull();
+			expect(authorityReads).toBeLessThanOrEqual(100);
 		} finally {
 			lookup.mockRestore();
 		}
-		expect(setCookie).toBe("");
-		expect(await context.internalAdapter.findSession(activeToken)).not.toBeNull();
+		expect(setCookie).toContain("clearance.session_token_multi-");
+		expect(await context.internalAdapter.findSession(activeToken)).toBeNull();
 	});
 
-	it("signs out only validated name-bound sessions", async () => {
+	it("signs out every signature-verified token without authority gating", async () => {
 		const runtime = await createManagedMultiSessionRuntime(1);
 		const headers = new Headers();
 		const signup = await runtime.client.signUp.email(
@@ -1549,7 +1560,7 @@ describe("multi-session managed session authority", () => {
 		runtime.setSubjectRevision(otherUser.id, null);
 		expect(
 			await context.internalAdapter.findSession(policyRevisedSession.token),
-		).not.toBeNull();
+		).toBeNull();
 		expect(await context.internalAdapter.findSession(liveSession.token)).toBeNull();
 	});
 
@@ -1923,6 +1934,96 @@ describe("multi-session managed session authority", () => {
 		expect(await context.internalAdapter.findSession(secondToken)).toBeNull();
 	});
 
+	it("does not complete secondary-only signout when the credential authority remains", async () => {
+		const failure = {
+			failKey: null as string | null,
+			error: new Error("secondary credential deletion failed"),
+		};
+		const runtime = await createManagedMultiSessionRuntime(1, failure, true);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-secondary-signout@example.test",
+				password: "password",
+				name: "Secondary Signout",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const token =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		failure.failKey = getSecondarySessionKeys(context.options).credential(
+			await digestSessionRefreshSecret(token),
+		);
+		let setCookie = "";
+		await expect(
+			runtime.client.signOut({
+				fetchOptions: {
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			}),
+		).rejects.toThrow();
+		expect(await context.internalAdapter.findSession(token)).not.toBeNull();
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				Array.from(parseCookies(headers.get("cookie") || "").keys()).find((name) =>
+					name.startsWith("clearance.session_token_multi-"),
+				) || "",
+			)?.["max-age"],
+		).not.toBe(0);
+	});
+
+	it("does not publish a successor after secondary-only admission cleanup fails", async () => {
+		const failure = {
+			failKey: null as string | null,
+			error: new Error("secondary admission deletion failed"),
+		};
+		const runtime = await createManagedMultiSessionRuntime(1, failure, true);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-secondary-admission-source@example.test",
+				password: "password",
+				name: "Secondary Admission Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		failure.failKey = getSecondarySessionKeys(context.options).credential(
+			await digestSessionRefreshSecret(sourceToken),
+		);
+		let setCookie = "";
+		const admitted = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-secondary-admission-successor@example.test",
+				password: "password",
+				name: "Secondary Admission Successor",
+			},
+			{
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		);
+		expect(admitted.error).not.toBeNull();
+		expect(await context.internalAdapter.findSession(sourceToken)).not.toBeNull();
+		expect(
+			Array.from(parseSetCookieHeader(setCookie).keys()).some((name) =>
+				name.startsWith("clearance.session_token_multi-"),
+			),
+		).toBe(false);
+	});
+
 	it("propagates managed authority outages without expiring tracked cookies", async () => {
 		const runtime = await createManagedMultiSessionRuntime();
 		const headers = new Headers();
@@ -1973,7 +2074,7 @@ describe("multi-session managed session authority", () => {
 		);
 	});
 
-	it("signout cleans malformed signed names and revokes only name-bound sessions", async () => {
+	it("signout cleans malformed signed names and revokes every verified token", async () => {
 		const runtime = await createManagedMultiSessionRuntime(1);
 		const headers = new Headers();
 		await runtime.client.signUp.email(
@@ -2036,7 +2137,7 @@ describe("multi-session managed session authority", () => {
 			},
 		});
 		expect(signedOut.error).toBeNull();
-		expect(await context.internalAdapter.findSession(malformed.token)).not.toBeNull();
+		expect(await context.internalAdapter.findSession(malformed.token)).toBeNull();
 		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
 		expect(
 			parseSetCookieHeader(setCookie).get("clearance.session_token_multi-")?.[
@@ -2176,7 +2277,7 @@ describe("multi-session managed session authority", () => {
 		);
 	});
 
-	it("keeps active revoke within its request-wide authority-read budget", async () => {
+	it("keeps the 100th active-revoke fallback within its request-wide authority-read budget", async () => {
 		const runtime = await createManagedMultiSessionRuntime();
 		const headers = new Headers();
 		await runtime.client.signUp.email(
@@ -2189,6 +2290,21 @@ describe("multi-session managed session authority", () => {
 		);
 		const active = await runtime.client.getSession({ fetchOptions: { headers } });
 		const context = await runtime.auth.$context;
+		const fallbackUser = await context.internalAdapter.createUser({
+			email: "managed-multi-active-read-fallback@example.test",
+			name: "Active Read Fallback",
+		});
+		const fallback = await context.internalAdapter.createSession(
+			fallbackUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: fallbackUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
 		headers.set(
 			"cookie",
 			[
@@ -2198,6 +2314,172 @@ describe("multi-session managed session authority", () => {
 						signedNamedMultiSessionCookie(
 							context.secret,
 							`clearance.session_token_multi-unissued-${index.toString().padStart(3, "0")}`,
+							`unissued-token-${index}`,
+						),
+					),
+				),
+				await signedMultiSessionCookie(context.secret, fallback),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let calls = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (candidateToken) => {
+				calls += 1;
+				return originalFindSession(candidateToken);
+			});
+		let setCookie = "";
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: active.data!.session.id },
+				{
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			);
+			expect(revoked.error).toBeNull();
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(calls).toBeLessThanOrEqual(100);
+		expect(
+			parseSetCookieHeader(setCookie)
+				.get("clearance.session_token")
+				?.value.split(".")[0],
+		).toBe(fallback.token);
+	});
+
+	it("evicts malformed signed capacity overflow during admission", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		const source = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-malformed-admission-source@example.test",
+				password: "password",
+				name: "Malformed Admission Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const overflow = await context.internalAdapter.createSession(
+			source.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: source.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${await signedNamedMultiSessionCookie(context.secret, "clearance.session_token_multi-mismatched", overflow.token)}`,
+		);
+		const admitted = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-malformed-admission-successor@example.test",
+				password: "password",
+				name: "Malformed Admission Successor",
+			},
+			{ headers },
+		);
+		expect(admitted.error).toBeNull();
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
+	});
+
+	it("prioritizes active and non-active targets above 101 lexically earlier groups", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const source = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-nonactive-budget-source@example.test",
+				password: "password",
+				name: "Nonactive Budget Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const target = await context.internalAdapter.createSession(
+			source.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: source.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedMultiSessionCookie(context.secret, target),
+				...await Promise.all(
+					Array.from({ length: 99 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-000-unissued-${index.toString().padStart(3, "0")}`,
+							`unissued-token-${index}`,
+						),
+					),
+				),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let calls = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (token) => {
+				calls += 1;
+				return originalFindSession(token);
+			});
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: target.id },
+				{ headers },
+			);
+			expect(revoked.error).toBeNull();
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(calls).toBeLessThanOrEqual(100);
+		expect(await context.internalAdapter.findSession(target.token)).toBeNull();
+	});
+
+	it("prioritizes a deprecated active session-token alias above 101 lexically earlier groups", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-deprecated-active-budget@example.test",
+				password: "password",
+				name: "Deprecated Active Budget",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const token =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...await Promise.all(
+					Array.from({ length: 100 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-000-unissued-${index.toString().padStart(3, "0")}`,
 							`unissued-token-${index}`,
 						),
 					),
@@ -2216,7 +2498,7 @@ describe("multi-session managed session authority", () => {
 			});
 		try {
 			const revoked = await runtime.client.multiSession.revoke(
-				{ sessionId: active.data!.session.id },
+				{ sessionToken: token },
 				{ headers },
 			);
 			expect(revoked.error).toBeNull();
@@ -2224,5 +2506,267 @@ describe("multi-session managed session authority", () => {
 			lookup.mockRestore();
 		}
 		expect(calls).toBeLessThanOrEqual(100);
+	});
+
+	it("accepts proven postcommit deletion with a preserved modern raw session row", async () => {
+		const runtime = await createManagedMultiSessionRuntime(
+			1,
+			undefined,
+			false,
+			true,
+		);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-preserved-row-source@example.test",
+				password: "password",
+				name: "Preserved Row Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const context = await runtime.auth.$context;
+		const originalDeleteSessions = context.internalAdapter.deleteSessions.bind(
+			context.internalAdapter,
+		);
+		const deletion = vi
+			.spyOn(context.internalAdapter, "deleteSessions")
+			.mockImplementationOnce(async (tokens) => {
+				await originalDeleteSessions(tokens);
+				throw new AfterTransactionHookError([
+					new Error("preserved-row postcommit signal"),
+				]);
+			});
+		try {
+			const admitted = await runtime.client.signUp.email(
+				{
+					email: "managed-multi-preserved-row-successor@example.test",
+					password: "password",
+					name: "Preserved Row Successor",
+				},
+				{ headers },
+			);
+			expect(admitted.error).toBeNull();
+		} finally {
+			deletion.mockRestore();
+		}
+		expect(await context.internalAdapter.findSession(sourceToken)).toBeNull();
+	});
+
+	it("rejects exact predecessor recovery while middleware authenticates its live successor", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-predecessor-source@example.test",
+				password: "password",
+				name: "Predecessor Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		const token =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const rotated = await context.internalAdapter.rotateSessionCredential(token);
+		const successorToken = rotated?.refreshToken;
+		expect(successorToken).toEqual(expect.any(String));
+		headers.set(
+			"cookie",
+			[
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					"clearance.session_token",
+					successorToken!,
+				),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					`clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`,
+					successorToken!,
+				),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					`clearance.session_token_multi-${encodeURIComponent(token)}`,
+					token,
+				),
+			].join("; "),
+		);
+		const postcommit = new AfterTransactionHookError([
+			new Error("exact predecessor postcommit signal"),
+		]);
+		const successor = await context.internalAdapter.findSession(successorToken!);
+		expect(successor).not.toBeNull();
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		const resolution = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (candidateToken) =>
+				candidateToken === token ? successor : originalFindSession(candidateToken),
+			);
+		const deletion = vi
+			.spyOn(context.internalAdapter, "deleteSessionById")
+			.mockImplementationOnce(async () => {
+				throw postcommit;
+			});
+		let setCookie = "";
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionToken: token },
+				{
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			);
+			expect(revoked.error).not.toBeNull();
+			expect(revoked.error?.status).toBe(500);
+			expect(deletion).toHaveBeenCalledWith(active.data!.session.id);
+		} finally {
+			deletion.mockRestore();
+			resolution.mockRestore();
+		}
+		expect(setCookie).not.toContain("clearance.session_token=");
+		expect(setCookie).not.toContain("max-age=0");
+	});
+
+	it("rejects token-only overflow recovery while its predecessor family remains live", async () => {
+		const runtime = await createManagedMultiSessionRuntime(100);
+		const headers = new Headers();
+		const source = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-token-only-source@example.test",
+				password: "password",
+				name: "Token Only Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const overflow = await context.internalAdapter.createSession(
+			source.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: source.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		await context.internalAdapter.rotateSessionCredential(overflow.token);
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...await Promise.all(
+					Array.from({ length: 99 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-unissued-${index.toString().padStart(3, "0")}`,
+							`unissued-token-${index}`,
+						),
+					),
+				),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					"clearance.session_token_multi-zzzz-overflow",
+					overflow.token,
+				),
+			].join("; "),
+		);
+		const deletion = vi
+			.spyOn(context.internalAdapter, "deleteSessions")
+			.mockImplementationOnce(async () => {
+				throw new AfterTransactionHookError([
+					new Error("token-only predecessor postcommit signal"),
+				]);
+			});
+		try {
+			const admitted = await runtime.client.signUp.email(
+				{
+					email: "managed-multi-token-only-successor@example.test",
+					password: "password",
+					name: "Token Only Successor",
+				},
+				{ headers },
+			);
+			expect(admitted.error).not.toBeNull();
+		} finally {
+			deletion.mockRestore();
+		}
+	});
+
+	it("reserves middleware authority when active tracking is absent from 100 plugin groups", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const source = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-untracked-active-source@example.test",
+				password: "password",
+				name: "Untracked Active Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const target = await context.internalAdapter.createSession(
+			source.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: source.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const primaryCookie = (headers.get("cookie") || "")
+			.split(";")
+			.map((entry) => entry.trim())
+			.find((entry) => entry.startsWith("clearance.session_token="));
+		headers.set(
+			"cookie",
+			[
+				primaryCookie,
+				await signedMultiSessionCookie(context.secret, target),
+				...await Promise.all(
+					Array.from({ length: 99 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-000-unissued-${index.toString().padStart(3, "0")}`,
+							`unissued-token-${index}`,
+						),
+					),
+				),
+			]
+				.filter(Boolean)
+				.join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let calls = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (token) => {
+				calls += 1;
+				return originalFindSession(token);
+			});
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: target.id },
+				{ headers },
+			);
+			expect(revoked.error).toBeNull();
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(calls).toBeLessThanOrEqual(100);
+		expect(await context.internalAdapter.findSession(target.token)).toBeNull();
 	});
 });
