@@ -37,7 +37,7 @@ export type InternalSessionIssuanceContext =
 			targetOrganizationId: string | null;
 	  }>
 	| Readonly<{
-			purpose: "replacement" | "device";
+			purpose: "replacement" | "device" | "organization";
 			sourceSessionToken: string;
 			targetOrganizationId: string | null;
 	  }>;
@@ -62,7 +62,7 @@ export type CapturedSessionIssuanceAuthority = Readonly<{
 type SessionIssuanceCaptureAuthority = (
 	context: Extract<
 		InternalSessionIssuanceContext,
-		{ purpose: "replacement" | "device" }
+		{ purpose: "replacement" | "device" | "organization" }
 	>,
 ) => Promise<CapturedSessionIssuanceAuthority>;
 
@@ -227,7 +227,11 @@ export function createInternalSessionIssuanceContext(
 				input.targetOrganizationId,
 			),
 		});
-	} else if (base.purpose === "replacement" || base.purpose === "device") {
+	} else if (
+		base.purpose === "replacement" ||
+		base.purpose === "device" ||
+		base.purpose === "organization"
+	) {
 		const input = exactObject(value, ["purpose", "sourceSessionToken"], [
 			"targetOrganizationId",
 		]);
@@ -262,7 +266,9 @@ export async function captureInternalSessionIssuanceContext(
 	const context = readInternalSessionIssuanceContext(opaque);
 	if (
 		!context ||
-		(context.purpose !== "replacement" && context.purpose !== "device")
+		(context.purpose !== "replacement" &&
+			context.purpose !== "device" &&
+			context.purpose !== "organization")
 	) {
 		contexts.delete(opaque as object);
 		invalid();
