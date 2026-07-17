@@ -296,8 +296,10 @@ export const totp2fa = (
 	) => Boolean(ctx.context.getPlugin("passkey"));
 	const isActiveTOTP = (
 		factor: Pick<TwoFactorTable, "verified">,
-		_user: Pick<UserWithTwoFactor, "twoFactorEnabled">,
-	) => factor.verified !== false;
+		user: Pick<UserWithTwoFactor, "twoFactorEnabled">,
+	) =>
+		factor.verified === true ||
+		(factor.verified == null && user.twoFactorEnabled === true);
 	const createTOTPBinding = async (
 		lineage: NonNullable<
 			ReturnType<typeof inspectStagedAuthenticationAuthority>
@@ -970,7 +972,9 @@ export const totp2fa = (
 			// This covers fresh TOTP setup (twoFactorEnabled=false),
 			// adding TOTP to an OTP-only account (twoFactorEnabled=true),
 			// and pre-migration rows where verified is null/undefined.
-			const isEnrollmentActivation = twoFactor.verified === false;
+			const isEnrollmentActivation =
+				twoFactor.verified === false ||
+				(twoFactor.verified !== true && !user.twoFactorEnabled);
 			if (isEnrollmentActivation) {
 				const activeSession = session.session!;
 				const activated = await runWithTransaction(
