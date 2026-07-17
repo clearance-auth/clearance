@@ -350,6 +350,9 @@ export const verifyPasskeyRegistration = (options: PasskeyOptions | undefined) =
 		},
 		async (ctx) => {
 			const session = ctx.context.session;
+			const sourceSessionToken = session.session.token;
+			const sourceSessionId = session.session.id;
+			const sourceUserId = session.user.id;
 			const rpID = resolveRpID(ctx, options);
 			let requestOrigin: string;
 			try {
@@ -403,22 +406,77 @@ export const verifyPasskeyRegistration = (options: PasskeyOptions | undefined) =
 
 			let created: Passkey;
 			try {
-				created = await ctx.context.adapter.create<Omit<Passkey, "id">, Passkey>({
-					model: "passkey",
-					data: {
-						userId: session.user.id,
-						name: ctx.body.name,
-						credentialID: credential.id,
-						publicKey: base64Url.encode(credential.publicKey, { padding: false }),
-						userHandle: challengeRecord.userHandle,
-						counter: credential.counter,
-						deviceType: credentialDeviceType,
-						backedUp: credentialBackedUp,
-						transports: transports?.join(","),
-						aaguid,
-						createdAt: new Date(),
-						updatedAt: new Date(),
-					} as Omit<Passkey, "id">,
+				created = await runWithTransaction(ctx.context.adapter, async () => {
+					const adapter = await getCurrentAdapter(ctx.context.adapter);
+					const activeUser = await lockAndReadActiveUser(adapter, sourceUserId);
+					if (!activeUser || typeof sourceSessionToken !== "string") {
+						throw APIError.from(
+							"BAD_REQUEST",
+							PASSKEY_ERROR_CODES.REGISTRATION_FAILED,
+						);
+					}
+
+					// The options ceremony authenticated this request earlier. Re-resolve
+					// that exact bearer authority inside the credential-creation
+					// transaction so a revocation, rotation, deletion, or freshness lapse
+					// in the interval cannot enroll a new primary credential.
+					const authoritative = await ctx.context.internalAdapter.findSession(
+						sourceSessionToken,
+					);
+					if (
+						!authoritative ||
+						authoritative.session.id !== sourceSessionId ||
+						authoritative.session.userId !== sourceUserId ||
+						authoritative.user.id !== sourceUserId
+					) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							PASSKEY_ERROR_CODES.REGISTRATION_FAILED,
+						);
+					}
+					if (ctx.context.sessionConfig.freshAge !== 0) {
+						const createdAt = new Date(
+							authoritative.session.createdAt,
+						).getTime();
+						const freshAge = ctx.context.sessionConfig.freshAge * 1000;
+						if (!Number.isFinite(createdAt) || Date.now() - createdAt >= freshAge) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								PASSKEY_ERROR_CODES.REGISTRATION_FAILED,
+							);
+						}
+					}
+
+					const currentUserHandle = (
+						activeUser as User & { passkeyUserHandle?: unknown }
+					).passkeyUserHandle;
+					if (
+						typeof currentUserHandle !== "string" ||
+						currentUserHandle !== challengeRecord.userHandle
+					) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							PASSKEY_ERROR_CODES.REGISTRATION_FAILED,
+						);
+					}
+
+					return adapter.create<Omit<Passkey, "id">, Passkey>({
+						model: "passkey",
+						data: {
+							userId: sourceUserId,
+							name: ctx.body.name,
+							credentialID: credential.id,
+							publicKey: base64Url.encode(credential.publicKey, { padding: false }),
+							userHandle: challengeRecord.userHandle,
+							counter: credential.counter,
+							deviceType: credentialDeviceType,
+							backedUp: credentialBackedUp,
+							transports: transports?.join(","),
+							aaguid,
+							createdAt: new Date(),
+							updatedAt: new Date(),
+						} as Omit<Passkey, "id">,
+					});
 				});
 			} catch (error) {
 				// A duplicate `credentialID` is enforced by a database unique
@@ -929,13 +987,7 @@ export const verifyPasskeyRemediationRegistration = (
 									model: table,
 									where: [{ field: "userId", value: user.id }],
 								});
-								if (
-									totp &&
-									(totp.verified === true ||
-										(totp.verified == null &&
-											(user as Record<string, unknown>)
-												.twoFactorEnabled === true))
-								) {
+								if (totp && totp.verified !== false) {
 									remediationFailed();
 								}
 							}
