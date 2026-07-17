@@ -37,7 +37,6 @@ import type {
 } from "../types";
 import {
 	assertTwoFactorNotLocked,
-	consumeTotpCounter,
 	reserveTwoFactorAttempt,
 } from "../verify-two-factor";
 import type { TOTPOptions } from ".";
@@ -342,9 +341,17 @@ export const createRecoveryTOTPRepairEndpoints = (
 				counter = await createOTP(secret, { period, digits }).verifyWithCounter(
 					ctx.body.code,
 				);
-			} catch (error) {
-				await gate.attempt.restore(ctx.context.adapter);
-				throw error;
+			} catch {
+				// A provider/decryption fault is server-side, so it must neither burn a
+				// user attempt nor leave the consumed recovery authority reusable.
+				try {
+					await gate.attempt.restore(ctx.context.adapter);
+				} catch {
+					// The recovery capability is still expired below; never surface a
+					// provider-specific failure to the caller.
+				}
+				await expireRecoveryCookie(ctx);
+				return recoveryInvalid();
 			}
 			if (counter === null) {
 				try {
@@ -396,17 +403,12 @@ export const createRecoveryTOTPRepairEndpoints = (
 					) {
 						return null;
 					}
-					if (
-						!(await consumeTotpCounter(
-							ctx,
-							gate.lineage.twoFactorTable,
-							factor,
-							counter,
-							adapter,
-						))
-					) {
+					if (counter <= (factor.lastUsedTotpCounter ?? -1)) {
 						return null;
 					}
+					// Counter consumption and activation are intentionally one CAS. A
+					// counter-only write would burn a valid proof if any activation
+					// predicate changed between the two writes.
 					const activated = await adapter.incrementOne<TwoFactorTable>({
 						model: gate.lineage.twoFactorTable,
 						where: [
@@ -424,7 +426,10 @@ export const createRecoveryTOTPRepairEndpoints = (
 								field: "trustDeviceGeneration",
 								value: gate.lineage.trustDeviceGeneration,
 							},
-							{ field: "lastUsedTotpCounter", value: counter },
+							{
+								field: "lastUsedTotpCounter",
+								value: factor.lastUsedTotpCounter ?? null,
+							},
 						],
 						increment: {},
 						set: {
@@ -433,6 +438,7 @@ export const createRecoveryTOTPRepairEndpoints = (
 							pendingSecret: null,
 							pendingBackupCodes: null,
 							verified: true,
+							lastUsedTotpCounter: counter,
 							failedVerificationCount: 0,
 							activeVerificationReservations: "[]",
 							lockedUntil: null,
