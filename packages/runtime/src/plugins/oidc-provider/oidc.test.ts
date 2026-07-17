@@ -1,3 +1,4 @@
+import type { ClearancePlugin } from "@clearance/core";
 import {
 	createLocalJWKSet,
 	decodeProtectedHeader,
@@ -16,6 +17,7 @@ import {
 	test,
 } from "vitest";
 import type { AuthClient } from "../../client";
+import { createAuthMiddleware, getSessionFromCtx } from "../../api";
 import { createAuthClient } from "../../client";
 import { toNodeHandler } from "../../integrations/node";
 import { getTestInstance } from "../../test-utils/test-instance";
@@ -203,11 +205,16 @@ describe("oidc init", () => {
 describe("oidc", async () => {
 	const {
 		auth: authorizationServer,
+		client: testClient,
+		cookieSetter,
+		db,
 		signInWithTestUser,
+		signInWithUser,
 		customFetchImpl,
 		testUser,
 	} = await getTestInstance({
 		baseURL: "http://localhost:3000",
+		verification: { disableCleanup: true },
 		plugins: [
 			oidcProvider({
 				loginPage: "/login",
@@ -223,7 +230,7 @@ describe("oidc", async () => {
 			jwt(),
 		],
 	});
-	const { headers } = await signInWithTestUser();
+	const { headers, user: signedInUser } = await signInWithTestUser();
 	const serverClient = createAuthClient({
 		plugins: [oidcClient()],
 		baseURL: "http://localhost:3000",
@@ -295,6 +302,299 @@ describe("oidc", async () => {
 			name: application.name,
 			icon: null,
 		});
+	});
+
+	test.each([
+		{ accept: true, source: "body" as const },
+		{ accept: false, source: "body" as const },
+		{ accept: true, source: "cookie" as const },
+		{ accept: false, source: "cookie" as const },
+	])(
+		"keeps a victim consent code intact after cross-user $source accept=$accept",
+		async ({ accept, source }) => {
+			const suffix = `${source}-${accept ? "accept" : "deny"}`;
+			const attacker = {
+				name: `Consent attacker ${suffix}`,
+				email: `consent-attacker-${suffix}@example.test`,
+				password: "attacker-password-123",
+			};
+			await testClient.signUp.email(attacker);
+			const { headers: attackerHeaders } = await signInWithUser(
+				attacker.email,
+				attacker.password,
+			);
+
+			const registered = await serverClient.oauth2.register({
+				client_name: `consent-subject-${suffix}`,
+				redirect_uris: [`http://localhost:3000/callback/${suffix}`],
+			});
+			const clientId = registered.data?.client_id;
+			const redirectUri = registered.data?.redirect_uris[0];
+			expect(clientId).toBeTruthy();
+			expect(redirectUri).toBeTruthy();
+
+			const authorizeURL = new URL(
+				"http://localhost:3000/api/auth/oauth2/authorize",
+			);
+			authorizeURL.searchParams.set("client_id", clientId!);
+			authorizeURL.searchParams.set("redirect_uri", redirectUri!);
+			authorizeURL.searchParams.set("response_type", "code");
+			authorizeURL.searchParams.set("scope", "openid");
+			authorizeURL.searchParams.set("prompt", "consent");
+			authorizeURL.searchParams.set("code_challenge", "test-challenge");
+			authorizeURL.searchParams.set("code_challenge_method", "S256");
+
+			let consentRedirect = "";
+			const promptHeaders = new Headers();
+			await serverClient.$fetch(authorizeURL.toString(), {
+				method: "GET",
+				onError(context) {
+					consentRedirect = context.response.headers.get("Location") || "";
+					cookieSetter(promptHeaders)(context);
+				},
+			});
+			const consentCode = new URL(
+				consentRedirect,
+				"http://localhost:3000",
+			).searchParams.get("consent_code");
+			expect(consentCode).toBeTruthy();
+
+			const withPromptCookie = (sessionHeaders: Headers) => {
+				const requestHeaders = new Headers(sessionHeaders);
+				if (source === "cookie") {
+					requestHeaders.set(
+						"cookie",
+						`${sessionHeaders.get("cookie")}; ${promptHeaders.get("cookie")}`,
+					);
+				}
+				return requestHeaders;
+			};
+			const consentBody = (decision: boolean) => ({
+				accept: decision,
+				...(source === "body" ? { consent_code: consentCode } : {}),
+			});
+
+			let attackSetCookie = "";
+			const attack = await serverClient.$fetch("/oauth2/consent", {
+				method: "POST",
+				headers: withPromptCookie(attackerHeaders),
+				body: consentBody(accept),
+				onResponse(context) {
+					attackSetCookie = context.response.headers.get("set-cookie") || "";
+				},
+			});
+			expect(attack.error).toMatchObject({
+				error: "invalid_request",
+				error_description: "Invalid code",
+			});
+			expect(attackSetCookie).not.toContain("oidc_consent_prompt=;");
+			expect(
+				await db.findOne({
+					model: "oauthConsent",
+					where: [{ field: "clientId", value: clientId! }],
+				}),
+			).toBeNull();
+
+			const rightful = await serverClient.$fetch("/oauth2/consent", {
+				method: "POST",
+				headers: withPromptCookie(headers),
+				body: consentBody(true),
+			});
+			expect(rightful.error).toBeNull();
+			expect((rightful.data as { redirectURI: string }).redirectURI).toContain(
+				`${redirectUri}?code=`,
+			);
+
+			const replay = await serverClient.$fetch("/oauth2/consent", {
+				method: "POST",
+				headers: withPromptCookie(headers),
+				body: consentBody(true),
+			});
+			expect(replay.error).toMatchObject({
+				error: "invalid_request",
+				error_description: "Invalid code",
+			});
+		},
+	);
+
+	const consentValueFixture = (
+		userId: unknown,
+		overrides: Record<string, unknown> = {},
+	) =>
+		JSON.stringify({
+			clientId: "consent-shape-client",
+			redirectURI: "http://localhost:3000/callback/consent-shape",
+			scope: ["openid"],
+			userId,
+			authTime: Date.now(),
+			requireConsent: true,
+			state: null,
+			...overrides,
+		});
+
+	test.each([
+		{ label: "nonexistent", value: undefined },
+		{ label: "malformed JSON", value: "{" },
+		{ label: "null", value: "null" },
+		{ label: "missing userId", value: consentValueFixture(undefined) },
+		{
+			label: "non-string userId",
+			value: consentValueFixture(42),
+		},
+		{
+			label: "empty userId",
+			value: consentValueFixture(""),
+		},
+		{
+			label: "rightful malformed scope",
+			value: consentValueFixture(signedInUser.id, { scope: "openid" }),
+		},
+		{
+			label: "expired foreign userId",
+			value: consentValueFixture("another-user"),
+			expired: true,
+		},
+	])("rejects $label consent authority generically", async (fixture) => {
+		const identifier = `invalid-consent-${fixture.label.replaceAll(" ", "-")}`;
+		const context = await authorizationServer.$context;
+		const consentCountBefore = await db.count({ model: "oauthConsent" });
+		if (fixture.value !== undefined) {
+			await context.internalAdapter.createVerificationValue({
+				identifier,
+				value: fixture.value,
+				expiresAt: new Date(
+					Date.now() + (fixture.expired === true ? -60_000 : 60_000),
+				),
+			});
+		}
+
+		const response = await serverClient.$fetch("/oauth2/consent", {
+			method: "POST",
+			headers,
+			body: { accept: true, consent_code: identifier },
+		});
+		expect(response.error).toMatchObject({
+			error: "invalid_request",
+			error_description: "Invalid code",
+		});
+		const stored =
+			await context.internalAdapter.findVerificationValue(identifier);
+		if (fixture.value === undefined) {
+			expect(stored).toBeNull();
+		} else {
+			expect(stored).toMatchObject({
+				value: fixture.value,
+				identifier: expect.any(String),
+			});
+		}
+		expect(await db.count({ model: "oauthConsent" })).toBe(
+			consentCountBefore,
+		);
+	});
+
+	it("returns Code expired only after binding an expired code to its subject", async () => {
+		const identifier = "expired-rightful-consent";
+		const value = consentValueFixture(signedInUser.id);
+		const context = await authorizationServer.$context;
+		await context.internalAdapter.createVerificationValue({
+			identifier,
+			value,
+			expiresAt: new Date(Date.now() - 60_000),
+		});
+
+		const response = await serverClient.$fetch("/oauth2/consent", {
+			method: "POST",
+			headers,
+			body: { accept: true, consent_code: identifier },
+		});
+		expect(response.error).toMatchObject({
+			error: "invalid_request",
+			error_description: "Code expired",
+		});
+		expect(
+			await context.internalAdapter.findVerificationValue(identifier),
+		).toMatchObject({ value });
+	});
+
+	it("rejects a revoked session even while its cookie cache remains valid", async () => {
+		let revokeDuringConsent = false;
+		let preloadedSubject: string | undefined;
+		const preloadThenRevoke = {
+			id: "preload-then-revoke-consent-session",
+			hooks: {
+				before: [
+					{
+						matcher: (ctx) => ctx.path === "/oauth2/consent",
+						handler: createAuthMiddleware(async (ctx) => {
+							if (!revokeDuringConsent) return;
+							const session = await getSessionFromCtx(ctx);
+							preloadedSubject = session?.user.id;
+							if (session) {
+								await ctx.context.adapter.delete({
+									model: "session",
+									where: [{ field: "id", value: session.session.id }],
+								});
+							}
+						}),
+					},
+				],
+			},
+		} satisfies ClearancePlugin;
+		const {
+			auth,
+			client,
+			cookieSetter: setCookies,
+			db: cachedDb,
+			testUser: cachedUser,
+		} = await getTestInstance(
+			{
+				session: { cookieCache: { enabled: true, maxAge: 300 } },
+				plugins: [
+					preloadThenRevoke,
+					oidcProvider({
+						loginPage: "/login",
+						consentPage: "/oauth2/authorize",
+					}),
+				],
+			},
+			{
+				testUser: {
+					email: "cached-consent-subject@example.test",
+					name: "Cached consent subject",
+				},
+			},
+		);
+		const cachedHeaders = new Headers();
+		const signedIn = await client.signIn.email(cachedUser, {
+			onSuccess: setCookies(cachedHeaders),
+		});
+		const subject = signedIn.data!.user;
+		expect(cachedHeaders.get("cookie")).toContain("session_data");
+
+		const identifier = "revoked-cached-consent";
+		const value = consentValueFixture(subject.id);
+		const context = await auth.$context;
+		await context.internalAdapter.createVerificationValue({
+			identifier,
+			value,
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		const consentCountBefore = await cachedDb.count({ model: "oauthConsent" });
+		revokeDuringConsent = true;
+
+		const rejected = await client.$fetch("/oauth2/consent", {
+			method: "POST",
+			headers: cachedHeaders,
+			body: { accept: true, consent_code: identifier },
+		});
+		expect(preloadedSubject).toBe(subject.id);
+		expect(rejected.error).toMatchObject({ code: "UNAUTHORIZED" });
+		expect(
+			await context.internalAdapter.findVerificationValue(identifier),
+		).toMatchObject({ value });
+		expect(await cachedDb.count({ model: "oauthConsent" })).toBe(
+			consentCountBefore,
+		);
 	});
 
 	it("should sign in the user with the provider", async ({ expect }) => {

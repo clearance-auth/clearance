@@ -23,7 +23,12 @@ import { createHMAC } from "@clearance/utils/hmac";
 import type { OpenAPIParameter } from "@clearance/call";
 import { decodeJwt, jwtVerify, SignJWT } from "jose";
 import * as z from "zod";
-import { APIError, getSessionFromCtx, sessionMiddleware } from "../../api";
+import {
+	APIError,
+	getSessionFromCtx,
+	sensitiveSessionMiddleware,
+	sessionMiddleware,
+} from "../../api";
 import { expireCookie, parseSetCookieHeader } from "../../cookies";
 import {
 	constantTimeEqual,
@@ -383,6 +388,32 @@ const oAuthConsentBodySchema = z.object({
 	accept: z.boolean(),
 	consent_code: z.string().optional().nullish(),
 });
+
+const codeVerificationValueSchema = z
+	.object({
+		clientId: z.string().min(1),
+		redirectURI: z
+			.string()
+			.min(1)
+			.refine(isSafeUrlScheme)
+			.refine((value) => {
+				try {
+					new URL(value);
+					return true;
+				} catch {
+					return false;
+				}
+			}),
+		scope: z.array(z.string().min(1)).min(1),
+		userId: z.string().min(1),
+		authTime: z.number().finite().positive(),
+		requireConsent: z.boolean(),
+		state: z.string().nullish(),
+		codeChallenge: z.string().min(1).optional(),
+		codeChallengeMethod: z.enum(["s256", "sha256", "plain"]).optional(),
+		nonce: z.string().optional(),
+	})
+	.passthrough();
 
 const oAuth2TokenBodySchema = z.record(z.any(), z.any());
 
@@ -1400,7 +1431,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 					method: "POST",
 					operationId: "oauth2Consent",
 					body: oAuthConsentBodySchema,
-					use: [sessionMiddleware],
+					use: [sensitiveSessionMiddleware],
 					metadata: {
 						openapi: {
 							description:
@@ -1453,6 +1484,11 @@ export const oidcProvider = (options: OIDCOptions) => {
 					},
 				},
 				async (ctx) => {
+					const invalidCode = () =>
+						new APIError("UNAUTHORIZED", {
+							error_description: "Invalid code",
+							error: "invalid_request",
+						});
 					// Support both consent flow methods:
 					// 1. URL parameter-based: consent_code in request body (standard OAuth2 pattern)
 					// 2. Cookie-based: using signed cookie for stateful consent flows
@@ -1482,11 +1518,26 @@ export const oidcProvider = (options: OIDCOptions) => {
 							consentCode,
 						);
 					if (!verification) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "Invalid code",
-							error: "invalid_request",
-						});
+						throw invalidCode();
 					}
+
+					let parsedValue: unknown;
+					try {
+						parsedValue = JSON.parse(verification.value);
+					} catch {
+						throw invalidCode();
+					}
+					const parsed = codeVerificationValueSchema.safeParse(parsedValue);
+					const sessionSubject = ctx.context.session?.user.id;
+					if (
+						!parsed.success ||
+						typeof sessionSubject !== "string" ||
+						sessionSubject.length === 0 ||
+						sessionSubject !== parsed.data.userId
+					) {
+						throw invalidCode();
+					}
+					const value = parsed.data as unknown as CodeVerificationValue;
 					if (verification.expiresAt < new Date()) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "Code expired",
@@ -1494,13 +1545,11 @@ export const oidcProvider = (options: OIDCOptions) => {
 						});
 					}
 
-					// Clear the cookie
+					// Clear the cookie only after the code is proven to belong to this subject.
 					expireCookie(ctx, {
 						name: "oidc_consent_prompt",
 						attributes: { path: "/" },
 					});
-
-					const value = JSON.parse(verification.value) as CodeVerificationValue;
 					if (!value.requireConsent) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "Consent not required",
