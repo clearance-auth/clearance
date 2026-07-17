@@ -108,6 +108,15 @@ export interface EvaluateSessionIssuanceInput {
 	readonly sourceAssurance?: ValidatedSessionAssuranceFields | undefined;
 }
 
+export interface EvaluateStagedSessionIssuanceInput {
+	readonly policy: SessionAssurancePolicySnapshot;
+	readonly now: Date;
+	readonly primaryMethod: AuthenticationPrimaryMethod;
+	readonly primaryAt: Date;
+	readonly factorMethod: "passkey" | "totp";
+	readonly factorAt: Date;
+}
+
 export type EvaluateSessionIssuanceResult =
 	| Readonly<{
 			kind: "satisfied";
@@ -713,6 +722,70 @@ export function evaluateSessionIssuance(
 			authenticationPolicyRevision: normalizedPolicy.revision,
 			authenticationAssuranceExpiresAt: assuranceExpiresAt,
 			authenticationRecoveryRestricted: proof.recoveryRestricted,
+		}),
+	};
+}
+
+export function evaluateStagedSessionIssuance(
+	input: EvaluateStagedSessionIssuanceInput,
+): EvaluateSessionIssuanceResult {
+	const normalizedPolicy = normalizePolicySnapshot(input.policy);
+	const now = parseDate(input.now);
+	const primaryAt = parseDate(input.primaryAt);
+	const factorAt = parseDate(input.factorAt);
+	if (!normalizedPolicy || !now || !primaryAt || !factorAt) {
+		return {
+			kind: "required",
+			requirement: makeInvalidPolicyRequirement(input.policy),
+		};
+	}
+	if (
+		!isPrimaryMethod(input.primaryMethod) ||
+		input.primaryMethod === "anonymous" ||
+		input.primaryMethod === "admin_impersonation" ||
+		(input.factorMethod !== "passkey" && input.factorMethod !== "totp") ||
+		primaryAt > now ||
+		factorAt > now ||
+		factorAt < primaryAt
+	) {
+		return required(normalizedPolicy, "invalid_evidence");
+	}
+	const proof: MutableProof = {
+		primaryMethod: input.primaryMethod,
+		primaryAt,
+		factorMethod: input.factorMethod,
+		factorAt,
+		recoveryRestricted: false,
+		sourceAssuranceExpiresAt: null,
+	};
+	const reason = insufficiencyReason(
+		proof,
+		normalizedPolicy.policy,
+		"interactive",
+	);
+	if (reason) return required(normalizedPolicy, reason);
+	const assuranceExpiresAt = computeAssuranceExpiry(
+		proof,
+		normalizedPolicy.policy,
+	);
+	if (assuranceExpiresAt && assuranceExpiresAt <= now) {
+		return required(normalizedPolicy, "assurance_expired");
+	}
+	return {
+		kind: "satisfied",
+		fields: brandFields({
+			authenticationAssuranceVersion: 1,
+			authenticationPolicyProjectId: normalizedPolicy.identity.projectId,
+			authenticationPolicyEnvironmentId:
+				normalizedPolicy.identity.environmentId,
+			authenticationPrimaryMethod: input.primaryMethod,
+			authenticationPrimaryAt: primaryAt,
+			authenticationFactorMethod: input.factorMethod,
+			authenticationFactorAt: factorAt,
+			authenticationPolicyOrganizationId: normalizedPolicy.organizationId,
+			authenticationPolicyRevision: normalizedPolicy.revision,
+			authenticationAssuranceExpiresAt: assuranceExpiresAt,
+			authenticationRecoveryRestricted: false,
 		}),
 	};
 }
