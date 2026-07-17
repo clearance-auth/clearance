@@ -164,6 +164,30 @@ export const schema = {
 				returned: false,
 				input: false,
 			},
+			stagedRootFlowId: {
+				type: "string",
+				required: false,
+				returned: false,
+				input: false,
+			},
+			stagedParentDigest: {
+				type: "string",
+				required: false,
+				returned: false,
+				input: false,
+			},
+			stagedSeedFingerprint: {
+				type: "string",
+				required: false,
+				returned: false,
+				input: false,
+			},
+			stagedSubjectId: {
+				type: "string",
+				required: false,
+				returned: false,
+				input: false,
+			},
 			targetPasskeyId: {
 				type: "string",
 				required: false,
