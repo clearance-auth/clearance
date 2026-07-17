@@ -1,10 +1,133 @@
-import { describe, expect, it } from "vitest";
-import { parseSetCookieHeader } from "../../cookies";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
+import { AfterTransactionHookError } from "@clearance/core/context";
+import { describe, expect, it, vi } from "vitest";
+import { makeSignature } from "../../crypto";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import { parseCookies, parseSetCookieHeader } from "../../cookies";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { jwt } from "../jwt";
 import { jwtClient } from "../jwt/client";
 import { multiSession } from ".";
 import { multiSessionClient } from "./client";
+
+const managedMultiSessionIdentity = {
+	projectId: "multi-session-policy-project",
+	environmentId: "multi-session-policy-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedMultiSessionPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+async function createManagedMultiSessionRuntime(
+	maximumSessions = 5,
+	secondaryFailure?: { failKey: string | null; error: Error },
+) {
+	let revision = "1";
+	let organizationMembership: string | null = null;
+	let readerError: Error | null = null;
+	const subjectRevisions = new Map<string, string>();
+	const secondaryStore = new Map<string, string>();
+	const options = {
+		session: {
+			storeSessionInDatabase: true,
+			additionalFields: {
+				activeOrganizationId: {
+					type: "string",
+					required: false,
+				},
+			},
+		},
+		plugins: [multiSession({ maximumSessions })],
+		...(secondaryFailure
+			? {
+					secondaryStorage: {
+						async get(key: string) {
+							return secondaryStore.get(key) ?? null;
+						},
+						async set(key: string, value: string) {
+							secondaryStore.set(key, value);
+						},
+						async delete(key: string) {
+							if (key === secondaryFailure.failKey) {
+								throw secondaryFailure.error;
+							}
+							secondaryStore.delete(key);
+						},
+					},
+			  }
+			: {}),
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity: managedMultiSessionIdentity,
+		reader: {
+			async readForSubject(input) {
+				if (readerError) throw readerError;
+				return {
+					scope: managedMultiSessionIdentity,
+					subjectId: input.subjectId,
+					revision: subjectRevisions.get(input.subjectId) ?? revision,
+					environment: managedMultiSessionPolicy,
+					organizationMembership:
+						input.organizationId &&
+						organizationMembership === input.organizationId
+							? {
+									subjectId: input.subjectId,
+									organizationId: input.organizationId,
+								}
+							: null,
+					organizationOverride: null,
+					effective: managedMultiSessionPolicy,
+				};
+			},
+		},
+	});
+	const runtime = await getTestInstance(options, {
+		disableTestUser: true,
+		clientOptions: { plugins: [multiSessionClient()] },
+	});
+	return {
+		...runtime,
+		setRevision(value: string) {
+			revision = value;
+		},
+		setOrganizationMembership(value: string | null) {
+			organizationMembership = value;
+		},
+		setReaderError(value: Error | null) {
+			readerError = value;
+		},
+		setSubjectRevision(subjectId: string, value: string | null) {
+			if (value === null) subjectRevisions.delete(subjectId);
+			else subjectRevisions.set(subjectId, value);
+		},
+	};
+}
+
+async function signedMultiSessionCookie(
+	secret: string,
+	session: { id: string; token: string },
+) {
+	return `clearance.session_token_multi-${encodeURIComponent(session.id)}=${session.token}.${await makeSignature(session.token, secret)}`;
+}
+
+async function signedNamedMultiSessionCookie(
+	secret: string,
+	name: string,
+	token: string,
+) {
+	return `${name}=${token}.${await makeSignature(token, secret)}`;
+}
 
 describe("multi-session", async () => {
 	const { client, testUser, cookieSetter } = await getTestInstance(
@@ -28,6 +151,15 @@ describe("multi-session", async () => {
 		password: "password",
 		name: "Name",
 	};
+
+	it.each([0, -1, 1.5, 101, Number.NaN])(
+		"rejects an unsafe maximumSessions value of %s",
+		(maximumSessions) => {
+			expect(() => multiSession({ maximumSessions })).toThrow(
+				"multiSession maximumSessions must be a safe integer between 1 and 100",
+			);
+		},
+	);
 
 	it("should set multi session when there is set-cookie header", async () => {
 		await client.signIn.email(
@@ -221,8 +353,18 @@ describe("multi-session", async () => {
 			).data?.user.email,
 		).toBe(firstUser.email);
 
+		const rawTokenSwitch = await legacy.client.multiSession.setActive({
+			sessionToken: secondToken,
+			fetchOptions: {
+				headers: legacyHeaders,
+				onSuccess: legacy.cookieSetter(legacyHeaders),
+			},
+		});
+		expect(rawTokenSwitch.error).toBeNull();
+		expect(rawTokenSwitch.data?.user.email).toBe(secondUser.email);
+
 		const revoked = await legacy.client.multiSession.revoke(
-			{ sessionToken: secondLegacyHandle },
+			{ sessionToken: firstToken },
 			{ headers: legacyHeaders },
 		);
 		expect(revoked.error).toBeNull();
@@ -232,7 +374,7 @@ describe("multi-session", async () => {
 					fetchOptions: { headers: legacyHeaders },
 				})
 			).data?.user.email,
-		).toBe(firstUser.email);
+		).toBe(secondUser.email);
 		expect(
 			(
 				await legacy.client.multiSession.listDeviceSessions({
@@ -318,6 +460,58 @@ describe("multi-session", async () => {
 			fetchOptions: { headers: rotationHeaders },
 		});
 		expect(listed.data).toHaveLength(1);
+	});
+
+	it("evicts validated capacity overflow during JWT credential rotation", async () => {
+		const local = await getTestInstance(
+			{
+				plugins: [
+					multiSession({ maximumSessions: 1 }),
+					jwt({ disableSettingJwtHeader: true }),
+				],
+			},
+			{
+				disableTestUser: true,
+				clientOptions: {
+					plugins: [multiSessionClient(), jwtClient()],
+				},
+			},
+		);
+		const headers = new Headers();
+		const signup = await local.client.signUp.email(
+			{
+				email: "multi-rotation-capacity@example.test",
+				password: "password",
+				name: "Rotation Capacity",
+			},
+			{ onSuccess: local.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await local.client.getSession({ fetchOptions: { headers } });
+		const context = await local.auth.$context;
+		const overflow = await context.internalAdapter.createSession(
+			active.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: active.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${await signedMultiSessionCookie(context.secret, overflow)}`,
+		);
+		const rotated = await local.client.token({
+			fetchOptions: {
+				headers,
+				onSuccess: local.cookieSetter(headers),
+			},
+		});
+		expect(rotated.data?.token).toEqual(expect.any(String));
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
 	});
 
 	it("should sign-out all sessions", async () => {
@@ -620,6 +814,12 @@ describe("multi-session", async () => {
 			`${callerHeaders.get("cookie")}; clearance.session_token_multi-${encodeURIComponent(otherSessionId)}=${callerSignedMultiCookie}`,
 		);
 
+		const forgedActivation = await client.multiSession.setActive({
+			sessionId: otherSessionId,
+			fetchOptions: { headers: craftedHeaders },
+		});
+		expect(forgedActivation.error?.status).toBe(401);
+
 		const forgedRevoke = await client.multiSession.revoke(
 			{ sessionId: otherSessionId },
 			{ headers: craftedHeaders },
@@ -630,5 +830,1399 @@ describe("multi-session", async () => {
 			fetchOptions: { headers: otherHeaders },
 		});
 		expect(otherAfter.data?.session.id).toBe(otherSessionId);
+	});
+
+	it("ignores foreign cookie names and expires invalid exact-prefix signatures", async () => {
+		const local = await getTestInstance(
+			{ plugins: [multiSession({ maximumSessions: 2 })] },
+			{
+				disableTestUser: true,
+				clientOptions: { plugins: [multiSessionClient()] },
+			},
+		);
+		const localHeaders = new Headers();
+		const signup = await local.client.signUp.email(
+			{
+				email: "multi-cookie-name-scope@example.test",
+				password: "password",
+				name: "Cookie Name Scope",
+			},
+			{ onSuccess: local.cookieSetter(localHeaders) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await local.client.getSession({
+			fetchOptions: { headers: localHeaders },
+		});
+		const invalidName = "clearance.session_token_multi-invalid-signature";
+		const foreignName = `foreign_clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`;
+		const substringName = `clearance.session_token_shadow_multi-${encodeURIComponent(active.data!.session.id)}`;
+		localHeaders.set(
+			"cookie",
+			[
+				localHeaders.get("cookie"),
+				`${invalidName}=invalid.fake-signature`,
+				`${foreignName}=invalid.fake-signature`,
+				`${substringName}=invalid.fake-signature`,
+			]
+				.filter(Boolean)
+				.join("; "),
+		);
+		let setCookie = "";
+		const listed = await local.client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers: localHeaders,
+				onResponse(context) {
+					setCookie = context.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(listed.data).toHaveLength(1);
+		const expired = parseSetCookieHeader(setCookie);
+		expect(expired.get(invalidName)?.["max-age"]).toBe(0);
+		expect(expired.has(foreignName)).toBe(false);
+		expect(expired.has(substringName)).toBe(false);
+	});
+});
+
+describe("multi-session managed session authority", () => {
+	it("does not activate a cookie-proven session after its policy revision changes", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-activation@example.test",
+				password: "password",
+				name: "Managed Multi Activation",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const sessionId = active.data!.session.id;
+		runtime.setRevision("2");
+		let setCookie = "not-observed";
+		const result = await runtime.client.multiSession.setActive({
+			sessionId,
+			fetchOptions: {
+				headers,
+				onResponse(context) {
+					setCookie = context.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+
+		expect(result.error?.status).toBe(401);
+		expect(setCookie).not.toContain("clearance.session_token=");
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				`clearance.session_token_multi-${encodeURIComponent(sessionId)}`,
+			)?.["max-age"],
+		).toBe(0);
+	});
+
+	it("expires a policy-revised session during device-session listing", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-list-revision@example.test",
+				password: "password",
+				name: "Managed Multi List Revision",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		runtime.setRevision("2");
+		let setCookie = "";
+		const listed = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(listed.data).toEqual([]);
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				`clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`,
+			)?.["max-age"],
+		).toBe(0);
+	});
+
+	it("skips a newer current-user credential that fails managed authority", async () => {
+		vi.useFakeTimers({ now: new Date("2030-01-01T00:00:00.000Z") });
+		try {
+			const runtime = await createManagedMultiSessionRuntime();
+			const headers = new Headers();
+			const signup = await runtime.client.signUp.email(
+				{
+					email: "managed-multi-fallback@example.test",
+					password: "password",
+					name: "Managed Multi Fallback",
+				},
+				{ onSuccess: runtime.cookieSetter(headers) },
+			);
+			expect(signup.error).toBeNull();
+			const active = await runtime.client.getSession({ fetchOptions: { headers } });
+			const context = await runtime.auth.$context;
+			const issue = async (userId: string) =>
+				context.internalAdapter.createSession(
+					userId,
+					false,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: userId,
+						evidence: [{ kind: "primary", primaryMethod: "password" }],
+					}),
+				);
+			const olderCurrentUser = await issue(active.data!.user.id);
+			vi.setSystemTime(new Date("2030-01-01T00:00:01.000Z"));
+			const newestCurrentUser = await issue(active.data!.user.id);
+			vi.setSystemTime(new Date("2030-01-01T00:00:02.000Z"));
+			const otherSignup = await runtime.client.signUp.email({
+				email: "managed-multi-other@example.test",
+				password: "password",
+				name: "Managed Multi Other",
+			});
+			expect(otherSignup.error).toBeNull();
+			const newerOtherUser = await issue(otherSignup.data!.user.id);
+			const rotated = await context.internalAdapter.rotateSessionCredential(
+				newestCurrentUser.token,
+			);
+			expect(rotated?.refreshToken).toEqual(expect.any(String));
+			const secret = context.secret;
+			headers.set(
+				"cookie",
+				[
+					headers.get("cookie"),
+					await signedMultiSessionCookie(secret, olderCurrentUser),
+					await signedMultiSessionCookie(secret, newestCurrentUser),
+					await signedMultiSessionCookie(secret, newerOtherUser),
+				]
+					.filter(Boolean)
+					.join("; "),
+			);
+
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: active.data!.session.id },
+				{
+					headers,
+					onSuccess: runtime.cookieSetter(headers),
+				},
+			);
+			expect(revoked.error).toBeNull();
+			const fallback = await runtime.client.getSession({
+				fetchOptions: { headers },
+			});
+			expect(fallback.data?.session.id).toBe(olderCurrentUser.id);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("cleans malformed, duplicate, and authority-invalid tracked cookies", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-cleanup@example.test",
+				password: "password",
+				name: "Managed Multi Cleanup",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		const invalid = await context.internalAdapter.createSession(
+			active.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: active.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		await context.internalAdapter.rotateSessionCredential(invalid.token);
+		const invalidName = `clearance.session_token_multi-${encodeURIComponent(invalid.id)}`;
+		const duplicateName = "clearance.session_token_multi-duplicate";
+		const malformedName = "clearance.session_token_multi-";
+		const invalidCookie = await signedMultiSessionCookie(context.secret, invalid);
+		const activeCookie = Object.fromEntries(
+			parseCookies(headers.get("cookie") || ""),
+		)["clearance.session_token_multi-" + encodeURIComponent(active.data!.session.id)]!;
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				`${duplicateName}=${activeCookie}`,
+				invalidCookie,
+				`${malformedName}=garbage`,
+			]
+				.filter(Boolean)
+				.join("; "),
+		);
+		let setCookie = "";
+		const revoked = await runtime.client.multiSession.revoke(
+			{ sessionId: active.data!.session.id },
+			{
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		);
+		expect(revoked.error).toBeNull();
+		const expired = parseSetCookieHeader(setCookie);
+		expect(expired.get(duplicateName)?.["max-age"]).toBe(0);
+		expect(expired.get(invalidName)?.["max-age"]).toBe(0);
+		expect(expired.get(malformedName)?.["max-age"]).toBe(0);
+		expect(expired.get("clearance.session_token")?.["max-age"]).toBe(0);
+	});
+
+	it("revokes verified overflow credentials when a lowered session cap signs out", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-lowered-signout@example.test",
+				password: "password",
+				name: "Managed Multi Lowered Signout",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const context = await runtime.auth.$context;
+		const sourceToken =
+			Object.fromEntries(parseCookies(headers.get("cookie") || ""))["clearance.session_token"]
+				?.split(".")[0] || "";
+		const overflow = await context.internalAdapter.createSession(
+			signup.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: signup.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${await signedMultiSessionCookie(context.secret, overflow)}`,
+		);
+		const signedOut = await runtime.client.signOut({ fetchOptions: { headers } });
+		expect(signedOut.error).toBeNull();
+		expect(await context.internalAdapter.findSession(sourceToken)).toBeNull();
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
+	});
+
+	it("revokes verified overflow credentials when admitting a new session under a lowered cap", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-lowered-admission-source@example.test",
+				password: "password",
+				name: "Managed Multi Lowered Admission Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const context = await runtime.auth.$context;
+		const sourceToken =
+			Object.fromEntries(parseCookies(headers.get("cookie") || ""))["clearance.session_token"]
+				?.split(".")[0] || "";
+		const overflow = await context.internalAdapter.createSession(
+			signup.data!.user.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: signup.data!.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${await signedMultiSessionCookie(context.secret, overflow)}`,
+		);
+		const admitted = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-lowered-admission-next@example.test",
+				password: "password",
+				name: "Managed Multi Lowered Admission Next",
+			},
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(admitted.error).toBeNull();
+		expect(await context.internalAdapter.findSession(sourceToken)).toBeNull();
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
+	});
+
+	it("cleans invalid cookies after finding the set-active target", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-set-active-cleanup@example.test",
+				password: "password",
+				name: "Managed Multi Set Active Cleanup",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const createSession = () =>
+			context.internalAdapter.createSession(
+				signup.data!.user.id,
+				false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: signup.data!.user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
+			);
+		const target = await createSession();
+		const invalid = await createSession();
+		await context.internalAdapter.rotateSessionCredential(invalid.token);
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedMultiSessionCookie(context.secret, target),
+				await signedMultiSessionCookie(context.secret, invalid),
+			].join("; "),
+		);
+		let setCookie = "";
+		const activated = await runtime.client.multiSession.setActive({
+			sessionId: target.id,
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(activated.error).toBeNull();
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				`clearance.session_token_multi-${encodeURIComponent(invalid.id)}`,
+			)?.["max-age"],
+		).toBe(0);
+	});
+
+	it("cleans invalid cookies after finding a non-active revoke target", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-revoke-cleanup@example.test",
+				password: "password",
+				name: "Managed Multi Revoke Cleanup",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const createSession = () =>
+			context.internalAdapter.createSession(
+				signup.data!.user.id,
+				false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: signup.data!.user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
+			);
+		const target = await createSession();
+		const invalid = await createSession();
+		await context.internalAdapter.rotateSessionCredential(invalid.token);
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedMultiSessionCookie(context.secret, target),
+				await signedMultiSessionCookie(context.secret, invalid),
+			].join("; "),
+		);
+		let setCookie = "";
+		const revoked = await runtime.client.multiSession.revoke(
+			{ sessionId: target.id },
+			{
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		);
+		expect(revoked.error).toBeNull();
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				`clearance.session_token_multi-${encodeURIComponent(invalid.id)}`,
+			)?.["max-age"],
+		).toBe(0);
+	});
+
+	it("retains a canonical live cookie behind a lexically earlier mismatched duplicate", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-canonical-duplicate@example.test",
+				password: "password",
+				name: "Managed Multi Canonical Duplicate",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		const token =
+			parseCookies(headers.get("cookie") || "")
+				.get(
+					`clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`,
+				)
+				?.split(".")[0] || "";
+		const duplicateName = "clearance.session_token_multi-000-mismatch";
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${await signedNamedMultiSessionCookie(context.secret, duplicateName, token)}`,
+		);
+		let setCookie = "";
+		const listed = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(listed.data?.map((entry) => entry.session.id)).toContain(
+			active.data!.session.id,
+		);
+		expect(parseSetCookieHeader(setCookie).get(duplicateName)?.["max-age"]).toBe(
+			0,
+		);
+		expect(await context.internalAdapter.findSession(token)).not.toBeNull();
+	});
+
+	it("rejects an over-envelope request without expiring or deleting tracked authority", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-input-envelope@example.test",
+				password: "password",
+				name: "Managed Multi Input Envelope",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const originalCookie = headers.get("cookie") || "";
+		const attackHeaders = new Headers(headers);
+		attackHeaders.set(
+			"cookie",
+			[
+				originalCookie,
+				...Array.from(
+					{ length: 101 },
+					(_, index) =>
+						`clearance.session_token_multi-overflow-${index}=invalid.invalid`,
+				),
+			].join("; "),
+		);
+		let setCookie = "";
+		const listed = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers: attackHeaders,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(listed.error?.status).toBe(400);
+		expect(setCookie).toBe("");
+		const originalToken =
+			parseCookies(originalCookie)
+				.get(
+					`clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`,
+				)
+				?.split(".")[0] || "";
+		expect(await (await runtime.auth.$context).internalAdapter.findSession(originalToken)).not.toBeNull();
+		const recovered = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: { headers: new Headers({ cookie: originalCookie }) },
+		});
+		expect(recovered.data?.map((entry) => entry.session.id)).toContain(
+			active.data!.session.id,
+		);
+	});
+
+	it("rejects over-envelope signout before session reads, deletion, or cookie expiry", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-signout-envelope@example.test",
+				password: "password",
+				name: "Managed Multi Signout Envelope",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const activeToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const attackHeaders = new Headers(headers);
+		attackHeaders.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...Array.from(
+					{ length: 100 },
+					(_, index) =>
+						`clearance.session_token_multi-signout-overflow-${index}=invalid.invalid`,
+				),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let authorityReads = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (token) => {
+				authorityReads += 1;
+				return originalFindSession(token);
+			});
+		let setCookie = "";
+		try {
+			const signedOut = await runtime.client.signOut({
+				fetchOptions: {
+					headers: attackHeaders,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			});
+			expect(signedOut.error?.status).toBe(400);
+			expect(authorityReads).toBe(0);
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(setCookie).toBe("");
+		expect(await context.internalAdapter.findSession(activeToken)).not.toBeNull();
+	});
+
+	it("rejects over-envelope revoke before middleware reads or mutation", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-revoke-envelope@example.test",
+				password: "password",
+				name: "Managed Multi Revoke Envelope",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		const activeToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const attackHeaders = new Headers(headers);
+		attackHeaders.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...Array.from(
+					{ length: 100 },
+					(_, index) =>
+						`clearance.session_token_multi-revoke-overflow-${index}=invalid.invalid`,
+				),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let authorityReads = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (token) => {
+				authorityReads += 1;
+				return originalFindSession(token);
+			});
+		let setCookie = "";
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: active.data!.session.id },
+				{
+					headers: attackHeaders,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			);
+			expect(revoked.error?.status).toBe(400);
+			expect(authorityReads).toBe(0);
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(setCookie).toBe("");
+		expect(await context.internalAdapter.findSession(activeToken)).not.toBeNull();
+	});
+
+	it("signs out only validated name-bound sessions", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-invalid-signout@example.test",
+				password: "password",
+				name: "Managed Multi Invalid Signout",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const context = await runtime.auth.$context;
+		const otherUser = await context.internalAdapter.createUser({
+			email: "managed-multi-invalid-signout-other@example.test",
+			name: "Managed Multi Invalid Signout Other",
+		});
+		const policyRevisedSession = await context.internalAdapter.createSession(
+			otherUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: otherUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const liveUser = await context.internalAdapter.createUser({
+			email: "managed-multi-live-signout@example.test",
+			name: "Managed Multi Live Signout",
+		});
+		const liveSession = await context.internalAdapter.createSession(
+			liveUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: liveUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedMultiSessionCookie(context.secret, policyRevisedSession),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					"clearance.session_token_multi-000-live-duplicate",
+					liveSession.token,
+				),
+				await signedMultiSessionCookie(context.secret, liveSession),
+			].join("; "),
+		);
+		runtime.setSubjectRevision(otherUser.id, "2");
+		expect(
+			await context.internalAdapter.findSession(policyRevisedSession.token),
+		).toBeNull();
+		const signedOut = await runtime.client.signOut({ fetchOptions: { headers } });
+		expect(signedOut.error).toBeNull();
+		runtime.setSubjectRevision(otherUser.id, null);
+		expect(
+			await context.internalAdapter.findSession(policyRevisedSession.token),
+		).not.toBeNull();
+		expect(await context.internalAdapter.findSession(liveSession.token)).toBeNull();
+	});
+
+	it("validates stale-first cookies before evicting the oldest live admission", async () => {
+		vi.useFakeTimers({ now: new Date("2030-01-01T00:00:00.000Z") });
+		try {
+			const runtime = await createManagedMultiSessionRuntime(2);
+			const context = await runtime.auth.$context;
+			const issue = async (label: string) => {
+				const user = await context.internalAdapter.createUser({
+					email: `managed-multi-${label}@example.test`,
+					name: label,
+				});
+				return context.internalAdapter.createSession(
+					user.id,
+					false,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: user.id,
+						evidence: [{ kind: "primary", primaryMethod: "password" }],
+					}),
+				);
+			};
+			const stale = await issue("stale-admission");
+			await context.internalAdapter.rotateSessionCredential(stale.token);
+			vi.setSystemTime(new Date("2030-01-01T00:00:01.000Z"));
+			const older = await issue("older-admission");
+			vi.setSystemTime(new Date("2030-01-01T00:00:02.000Z"));
+			const newer = await issue("newer-admission");
+			const headers = new Headers({
+				cookie: [
+					await signedMultiSessionCookie(context.secret, stale),
+					await signedMultiSessionCookie(context.secret, older),
+					await signedNamedMultiSessionCookie(
+						context.secret,
+						"clearance.session_token_multi-000-newer-duplicate",
+						newer.token,
+					),
+					await signedMultiSessionCookie(context.secret, newer),
+				].join("; "),
+			});
+			vi.setSystemTime(new Date("2030-01-01T00:00:03.000Z"));
+			const admitted = await runtime.client.signUp.email(
+				{
+					email: "managed-multi-new-admission@example.test",
+					password: "password",
+					name: "New Admission",
+				},
+				{ headers },
+			);
+			expect(admitted.error).toBeNull();
+			expect(await context.internalAdapter.findSession(older.token)).toBeNull();
+			expect(await context.internalAdapter.findSession(newer.token)).not.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("selects a live fallback behind a stale-first cookie", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-fallback-active@example.test",
+				password: "password",
+				name: "Fallback Active",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		const issue = async (email: string) => {
+			const user = await context.internalAdapter.createUser({ email, name: email });
+			return context.internalAdapter.createSession(
+				user.id,
+				false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
+			);
+		};
+		const stale = await issue("managed-multi-fallback-stale@example.test");
+		await context.internalAdapter.rotateSessionCredential(stale.token);
+		const fallback = await issue("managed-multi-fallback-live@example.test");
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedMultiSessionCookie(context.secret, stale),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					"clearance.session_token_multi-000-fallback-duplicate",
+					fallback.token,
+				),
+				await signedMultiSessionCookie(context.secret, fallback),
+			].join("; "),
+		);
+		let fallbackSetCookie = "";
+		const revoked = await runtime.client.multiSession.revoke(
+			{ sessionId: active.data!.session.id },
+			{
+				headers,
+				onResponse(response) {
+					fallbackSetCookie = response.response.headers.get("set-cookie") || "";
+					runtime.cookieSetter(headers)(response);
+				},
+			},
+		);
+		expect(revoked.error).toBeNull();
+		expect(
+			parseSetCookieHeader(fallbackSetCookie)
+				.get("clearance.session_token")
+				?.value.split(".")[0],
+		).toBe(fallback.token);
+		expect(await context.internalAdapter.findSession(fallback.token)).not.toBeNull();
+		expect(signup.error).toBeNull();
+	});
+
+	it("rejects false postcommit active-revoke recovery when raw authority remains", async () => {
+		const runtime = await createManagedMultiSessionRuntime(2);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-false-revoke-first@example.test",
+				password: "password",
+				name: "False Revoke First",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-false-revoke-second@example.test",
+				password: "password",
+				name: "False Revoke Second",
+			},
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const activeToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const context = await runtime.auth.$context;
+		const stagedCleanupName =
+			"clearance.session_token_multi-invalid-staged-cleanup";
+		headers.set(
+			"cookie",
+			`${headers.get("cookie")}; ${stagedCleanupName}=invalid.invalid`,
+		);
+		const deletion = vi
+			.spyOn(context.internalAdapter, "deleteSessionById")
+			.mockImplementationOnce(async () => {
+				runtime.setSubjectRevision(active.data!.user.id, "2");
+				throw new AfterTransactionHookError([
+					new Error("false active-revoke postcommit signal"),
+				]);
+			});
+		let setCookie = "";
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: active.data!.session.id },
+				{
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			);
+			expect(revoked.error).not.toBeNull();
+		} finally {
+			deletion.mockRestore();
+		}
+		expect(
+			parseSetCookieHeader(setCookie).get(
+				`clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`,
+			)?.["max-age"],
+		).not.toBe(0);
+		expect(
+			parseSetCookieHeader(setCookie).get(stagedCleanupName)?.["max-age"],
+		).not.toBe(0);
+		expect(setCookie).not.toMatch(/clearance\.session_token=[^;]+/);
+		runtime.setSubjectRevision(active.data!.user.id, null);
+		expect(await context.internalAdapter.findSession(activeToken)).not.toBeNull();
+	});
+
+	it("rejects false postcommit admission recovery without publishing tracking state", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-false-admission-source@example.test",
+				password: "password",
+				name: "False Admission Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const source = await runtime.client.getSession({ fetchOptions: { headers } });
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const context = await runtime.auth.$context;
+		const deletion = vi
+			.spyOn(context.internalAdapter, "deleteSessions")
+			.mockImplementationOnce(async () => {
+				runtime.setSubjectRevision(source.data!.user.id, "2");
+				throw new AfterTransactionHookError([
+					new Error("false admission postcommit signal"),
+				]);
+			});
+		let setCookie = "";
+		try {
+			const admitted = await runtime.client.signUp.email(
+				{
+					email: "managed-multi-false-admission-new@example.test",
+					password: "password",
+					name: "False Admission New",
+				},
+				{
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			);
+			expect(admitted.error).not.toBeNull();
+		} finally {
+			deletion.mockRestore();
+		}
+		const responseCookies = parseSetCookieHeader(setCookie);
+		expect(
+			Array.from(responseCookies.keys()).some((name) =>
+				name.startsWith("clearance.session_token_multi-"),
+			),
+		).toBe(false);
+		expect(
+			responseCookies.get(
+				`clearance.session_token_multi-${encodeURIComponent(source.data!.session.id)}`,
+			)?.["max-age"],
+		).not.toBe(0);
+		runtime.setSubjectRevision(source.data!.user.id, null);
+		expect(await context.internalAdapter.findSession(sourceToken)).not.toBeNull();
+	});
+
+	it("publishes active-revoke fallback after secondary cleanup fails postcommit", async () => {
+		const failure = {
+			failKey: null as string | null,
+			error: new Error("active revoke secondary cleanup failed"),
+		};
+		const runtime = await createManagedMultiSessionRuntime(2, failure);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-revoke-fallback-first@example.test",
+				password: "password",
+				name: "First Fallback",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-revoke-fallback-second@example.test",
+				password: "password",
+				name: "Second Fallback",
+			},
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const activeToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		failure.failKey = `session-handle:${active.data!.session.id}`;
+		const revoked = await runtime.client.multiSession.revoke(
+			{ sessionId: active.data!.session.id },
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(revoked.error).toBeNull();
+		const context = await runtime.auth.$context;
+		expect(await context.internalAdapter.findSession(activeToken)).toBeNull();
+		const fallback = await runtime.client.getSession({ fetchOptions: { headers } });
+		expect(fallback.data?.session.id).not.toBe(active.data!.session.id);
+	});
+
+	it("publishes overflow admission after secondary cleanup fails postcommit", async () => {
+		const failure = {
+			failKey: null as string | null,
+			error: new Error("overflow admission secondary cleanup failed"),
+		};
+		const runtime = await createManagedMultiSessionRuntime(1, failure);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-overflow-source@example.test",
+				password: "password",
+				name: "Overflow Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const source = await runtime.client.getSession({ fetchOptions: { headers } });
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		failure.failKey = `session-handle:${source.data!.session.id}`;
+		const admitted = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-overflow-successor@example.test",
+				password: "password",
+				name: "Overflow Successor",
+			},
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(admitted.error).toBeNull();
+		const context = await runtime.auth.$context;
+		expect(await context.internalAdapter.findSession(sourceToken)).toBeNull();
+		const listed = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: { headers },
+		});
+		expect(listed.data).toHaveLength(1);
+		expect(listed.data?.[0]?.user.email).toBe(
+			"managed-multi-overflow-successor@example.test",
+		);
+	});
+
+	it("finishes signout after tracked-session cleanup fails postcommit", async () => {
+		const failure = {
+			failKey: null as string | null,
+			error: new Error("signout secondary cleanup failed"),
+		};
+		const runtime = await createManagedMultiSessionRuntime(2, failure);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-signout-first@example.test",
+				password: "password",
+				name: "Signout First",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const first = await runtime.client.getSession({ fetchOptions: { headers } });
+		const firstToken =
+			Array.from(parseCookies(headers.get("cookie") || "").entries())
+				.find(([name]) =>
+					name.startsWith("clearance.session_token_multi-"),
+				)?.[1]
+				.split(".")[0] || "";
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-signout-second@example.test",
+				password: "password",
+				name: "Signout Second",
+			},
+			{ headers, onSuccess: runtime.cookieSetter(headers) },
+		);
+		const secondToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		failure.failKey = `session-handle:${first.data!.session.id}`;
+		const signedOut = await runtime.client.signOut({ fetchOptions: { headers } });
+		expect(signedOut.error).toBeNull();
+		const context = await runtime.auth.$context;
+		expect(await context.internalAdapter.findSession(firstToken)).toBeNull();
+		expect(await context.internalAdapter.findSession(secondToken)).toBeNull();
+	});
+
+	it("propagates managed authority outages without expiring tracked cookies", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		const signup = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-reader-outage@example.test",
+				password: "password",
+				name: "Managed Multi Reader Outage",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		expect(signup.error).toBeNull();
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const cookieName = `clearance.session_token_multi-${encodeURIComponent(active.data!.session.id)}`;
+		runtime.setReaderError(new Error("policy reader unavailable"));
+		let listSetCookie = "";
+		const listed = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					listSetCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(listed.error).not.toBeNull();
+		let activationSetCookie = "";
+		const activated = await runtime.client.multiSession.setActive({
+			sessionId: active.data!.session.id,
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					activationSetCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(activated.error).not.toBeNull();
+		for (const setCookie of [listSetCookie, activationSetCookie]) {
+			expect(parseSetCookieHeader(setCookie).get(cookieName)?.["max-age"]).not.toBe(
+				0,
+			);
+		}
+		runtime.setReaderError(null);
+		const listedAfterRecovery = await runtime.client.multiSession.listDeviceSessions({
+			fetchOptions: { headers },
+		});
+		expect(listedAfterRecovery.data?.map((entry) => entry.session.id)).toContain(
+			active.data!.session.id,
+		);
+	});
+
+	it("signout cleans malformed signed names and revokes only name-bound sessions", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-signed-malformed-source@example.test",
+				password: "password",
+				name: "Signed Malformed Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const issue = async (email: string) => {
+			const user = await context.internalAdapter.createUser({ email, name: email });
+			return context.internalAdapter.createSession(
+				user.id,
+				false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
+			);
+		};
+		const malformed = await issue("managed-multi-signed-malformed@example.test");
+		const overflow = await issue("managed-multi-signed-overflow@example.test");
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...await Promise.all(
+					Array.from({ length: 97 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-alias-${index.toString().padStart(3, "0")}`,
+							sourceToken,
+						),
+					),
+				),
+				await signedNamedMultiSessionCookie(
+					context.secret,
+					"clearance.session_token_multi-",
+					malformed.token,
+				),
+				await signedMultiSessionCookie(context.secret, overflow),
+			].join("; "),
+		);
+		let setCookie = "";
+		const signedOut = await runtime.client.signOut({
+			fetchOptions: {
+				headers,
+				onResponse(response) {
+					setCookie = response.response.headers.get("set-cookie") || "";
+				},
+			},
+		});
+		expect(signedOut.error).toBeNull();
+		expect(await context.internalAdapter.findSession(malformed.token)).not.toBeNull();
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
+		expect(
+			parseSetCookieHeader(setCookie).get("clearance.session_token_multi-")?.[
+				"max-age"
+			],
+		).toBe(0);
+	});
+
+	it("admission reaches distinct valid sessions behind copied aliases", async () => {
+		const runtime = await createManagedMultiSessionRuntime(1);
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-alias-admission-source@example.test",
+				password: "password",
+				name: "Alias Admission Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const overflowUser = await context.internalAdapter.createUser({
+			email: "managed-multi-alias-admission-overflow@example.test",
+			name: "Alias Admission Overflow",
+		});
+		const overflow = await context.internalAdapter.createSession(
+			overflowUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: overflowUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const sourceToken =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...await Promise.all(
+					Array.from({ length: 98 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-alias-${index.toString().padStart(3, "0")}`,
+							sourceToken,
+						),
+					),
+				),
+				await signedMultiSessionCookie(context.secret, overflow),
+			].join("; "),
+		);
+		const admitted = await runtime.client.signUp.email(
+			{
+				email: "managed-multi-alias-admission-successor@example.test",
+				password: "password",
+				name: "Alias Admission Successor",
+			},
+			{ headers },
+		);
+		expect(admitted.error).toBeNull();
+		expect(await context.internalAdapter.findSession(overflow.token)).toBeNull();
+	});
+
+	it("does not commit staged cleanup when a later authority lookup fails", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-late-outage-source@example.test",
+				password: "password",
+				name: "Late Outage Source",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const context = await runtime.auth.$context;
+		const source = await runtime.client.getSession({ fetchOptions: { headers } });
+		const token =
+			parseCookies(headers.get("cookie") || "")
+				.get("clearance.session_token")
+				?.split(".")[0] || "";
+		const laterUser = await context.internalAdapter.createUser({
+			email: "managed-multi-late-outage-later@example.test",
+			name: "Late Outage Later",
+		});
+		const later = await context.internalAdapter.createSession(
+			laterUser.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: laterUser.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const duplicateName = "clearance.session_token_multi-000-staged-cleanup";
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				await signedNamedMultiSessionCookie(context.secret, duplicateName, token),
+				await signedMultiSessionCookie(context.secret, later),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let calls = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (candidateToken) => {
+				calls += 1;
+				if (calls === 2) throw new Error("later authority outage");
+				return originalFindSession(candidateToken);
+			});
+		let setCookie = "";
+		try {
+			const listed = await runtime.client.multiSession.listDeviceSessions({
+				fetchOptions: {
+					headers,
+					onResponse(response) {
+						setCookie = response.response.headers.get("set-cookie") || "";
+					},
+				},
+			});
+			expect(listed.error).not.toBeNull();
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(source.data).not.toBeNull();
+		expect(parseSetCookieHeader(setCookie).get(duplicateName)?.["max-age"]).not.toBe(
+			0,
+		);
+	});
+
+	it("keeps active revoke within its request-wide authority-read budget", async () => {
+		const runtime = await createManagedMultiSessionRuntime();
+		const headers = new Headers();
+		await runtime.client.signUp.email(
+			{
+				email: "managed-multi-active-read-budget@example.test",
+				password: "password",
+				name: "Active Read Budget",
+			},
+			{ onSuccess: runtime.cookieSetter(headers) },
+		);
+		const active = await runtime.client.getSession({ fetchOptions: { headers } });
+		const context = await runtime.auth.$context;
+		headers.set(
+			"cookie",
+			[
+				headers.get("cookie"),
+				...await Promise.all(
+					Array.from({ length: 98 }, (_, index) =>
+						signedNamedMultiSessionCookie(
+							context.secret,
+							`clearance.session_token_multi-unissued-${index.toString().padStart(3, "0")}`,
+							`unissued-token-${index}`,
+						),
+					),
+				),
+			].join("; "),
+		);
+		const originalFindSession = context.internalAdapter.findSession.bind(
+			context.internalAdapter,
+		);
+		let calls = 0;
+		const lookup = vi
+			.spyOn(context.internalAdapter, "findSession")
+			.mockImplementation(async (candidateToken) => {
+				calls += 1;
+				return originalFindSession(candidateToken);
+			});
+		try {
+			const revoked = await runtime.client.multiSession.revoke(
+				{ sessionId: active.data!.session.id },
+				{ headers },
+			);
+			expect(revoked.error).toBeNull();
+		} finally {
+			lookup.mockRestore();
+		}
+		expect(calls).toBeLessThanOrEqual(100);
 	});
 });
