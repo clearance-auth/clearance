@@ -54,6 +54,7 @@ import {
 	resetTwoFactorFailures,
 	verifyTwoFactor,
 } from "../verify-two-factor";
+import { createRecoveryTOTPRepairEndpoints } from "./recovery-repair";
 
 export type TOTPOptions = {
 	/**
@@ -140,6 +141,11 @@ export const totp2fa = (
 	const twoFactorTable = managedOptions?.twoFactorTable ?? "twoFactor";
 	const managedBackupCodeOptions = managedOptions?.backupCodeOptions ??
 		options?.backupCodes;
+	const recoveryTOTPRepair = createRecoveryTOTPRepairEndpoints({
+		options,
+		twoFactorTable,
+		backupCodeOptions: managedBackupCodeOptions,
+	});
 
 	const generateTOTP = createAuthEndpoint.serverOnly(
 		{
@@ -1063,6 +1069,8 @@ export const totp2fa = (
 		id: "totp",
 		version: PACKAGE_VERSION,
 		endpoints: {
+			recoveryRepairTOTPOptions: recoveryTOTPRepair.options,
+			recoveryRepairTOTPVerify: recoveryTOTPRepair.verify,
 			beginStagedTOTP,
 			verifyStagedTOTP,
 			/**
