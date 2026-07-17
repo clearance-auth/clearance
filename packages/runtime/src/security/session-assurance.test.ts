@@ -130,7 +130,12 @@ describe("evaluateSessionIssuance", () => {
 	});
 
 	it("rejects the admin impersonation primary outside impersonation purpose", () => {
-		for (const purpose of ["interactive", "replacement", "device"] as const) {
+		for (const purpose of [
+			"interactive",
+			"replacement",
+			"device",
+			"organization",
+		] as const) {
 			const source =
 				purpose === "interactive"
 					? undefined
@@ -147,6 +152,48 @@ describe("evaluateSessionIssuance", () => {
 				requirement: { reason: "invalid_evidence" },
 			});
 		}
+	});
+
+	it("re-evaluates a source proof against the target organization policy", () => {
+		const source = satisfied(
+			[
+				{ kind: "primary", primaryMethod: "password" },
+				{ kind: "factor", factorMethod: "totp" },
+			],
+			snapshot({ organizationId: "organization-a", revision: "7" }),
+		);
+		const target = evaluateSessionIssuance({
+			purpose: "organization",
+			policy: snapshot({ organizationId: "organization-b", revision: "8" }),
+			now: NOW,
+			evidence: [],
+			sourceAssurance: source,
+		});
+		expect(target).toMatchObject({
+			kind: "satisfied",
+			fields: {
+				authenticationPolicyOrganizationId: "organization-b",
+				authenticationPolicyRevision: "8",
+				authenticationPrimaryAt: NOW,
+				authenticationFactorAt: NOW,
+			},
+		});
+
+		const stricter = evaluateSessionIssuance({
+			purpose: "organization",
+			policy: snapshot({
+				organizationId: "organization-b",
+				revision: "8",
+				policy: policy({ minimumAssurance: "phishing_resistant" }),
+			}),
+			now: NOW,
+			evidence: [],
+			sourceAssurance: source,
+		});
+		expect(stricter).toMatchObject({
+			kind: "required",
+			requirement: { reason: "phishing_resistant_required" },
+		});
 	});
 
 	it("fails closed on malformed, out-of-bounds, and inconsistent policy", () => {
