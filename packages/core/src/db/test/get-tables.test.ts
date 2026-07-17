@@ -129,6 +129,198 @@ describe("getAuthTables", () => {
 		}
 	});
 
+	it("keeps shared factor lifecycle generations authoritative with one factor plugin", () => {
+		const tables = getAuthTables({
+			plugins: [
+				{
+					id: "passkey",
+					schema: {
+						user: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "passkey_generation",
+								},
+							},
+						},
+						session: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "session_passkey_generation",
+								},
+							},
+						},
+					},
+				},
+			],
+		});
+
+		for (const model of ["user", "session"] as const) {
+			const passkey = tables[model]!.fields.passkeySessionGeneration!;
+			const twoFactor = tables[model]!.fields.twoFactorSessionGeneration!;
+			expect(passkey).toMatchObject({
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			});
+			expect(twoFactor).toMatchObject({
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			});
+			expect(passkey.fieldName).toBe(
+				model === "user"
+					? "passkey_generation"
+					: "session_passkey_generation",
+			);
+			expect(twoFactor.fieldName).toBeUndefined();
+		}
+	});
+
+	it("rejects non-owner factor generation schema overrides", () => {
+		const maliciousFields = {
+			passkeySessionGeneration: {
+				type: "json",
+				required: true,
+				input: true,
+				returned: true,
+				defaultValue: "attacker-controlled",
+				fieldName: "attacker_passkey_generation",
+			},
+			twoFactorSessionGeneration: {
+				type: "json",
+				required: true,
+				input: true,
+				returned: true,
+				defaultValue: "attacker-controlled",
+				fieldName: "attacker_two_factor_generation",
+			},
+		} as const;
+		const tables = getAuthTables({
+			user: { additionalFields: maliciousFields },
+			session: { additionalFields: maliciousFields },
+			plugins: [
+				{
+					id: "passkey",
+					schema: {
+						user: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "owned_passkey_generation",
+								},
+							},
+						},
+						session: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "owned_session_passkey_generation",
+								},
+							},
+						},
+					},
+				},
+				{
+					id: "two-factor",
+					schema: {
+						user: {
+							fields: {
+								twoFactorSessionGeneration: {
+									type: "string",
+									fieldName: "owned_two_factor_generation",
+								},
+							},
+						},
+						session: {
+							fields: {
+								twoFactorSessionGeneration: {
+									type: "string",
+									fieldName: "owned_session_two_factor_generation",
+								},
+							},
+						},
+					},
+				},
+				{
+					id: "unrelated-malicious-plugin",
+					schema: {
+						user: { fields: maliciousFields },
+						session: { fields: maliciousFields },
+					},
+				},
+			],
+		});
+
+		for (const model of ["user", "session"] as const) {
+			for (const field of [
+				"passkeySessionGeneration",
+				"twoFactorSessionGeneration",
+			] as const) {
+				const attributes = tables[model]!.fields[field]!;
+				expect(attributes.type).toBe("string");
+				expect(attributes.required).toBe(false);
+				expect(attributes.input).toBe(false);
+				expect(attributes.returned).toBe(false);
+				expect(attributes.defaultValue).toBeUndefined();
+			}
+			expect(
+				tables[model]!.fields.passkeySessionGeneration!.fieldName,
+			).toBe(
+				model === "user"
+					? "owned_passkey_generation"
+					: "owned_session_passkey_generation",
+			);
+			expect(
+				tables[model]!.fields.twoFactorSessionGeneration!.fieldName,
+			).toBe(
+				model === "user"
+					? "owned_two_factor_generation"
+					: "owned_session_two_factor_generation",
+			);
+		}
+	});
+
+	it("keeps the first factor plugin authoritative when an ID is duplicated", () => {
+		const tables = getAuthTables({
+			plugins: [
+				{
+					id: "passkey",
+					schema: {
+						user: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "active_passkey_generation",
+								},
+							},
+						},
+					},
+				},
+				{
+					id: "passkey",
+					schema: {
+						user: {
+							fields: {
+								passkeySessionGeneration: {
+									type: "string",
+									fieldName: "shadow_passkey_generation",
+								},
+							},
+						},
+					},
+				},
+			],
+		});
+
+		expect(
+			tables.user!.fields.passkeySessionGeneration!.fieldName,
+		).toBe("active_passkey_generation");
+	});
+
 	it("should exclude verification table when secondaryStorage is configured", () => {
 		const tables = getAuthTables({
 			secondaryStorage: {
