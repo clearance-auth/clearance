@@ -564,7 +564,8 @@ export async function startRecoveryFactorRepair(
 	if (
 		!user ||
 		!factor ||
-		factor.verified === false ||
+		(user as Record<string, unknown>).twoFactorEnabled !== true ||
+		factor.verified !== true ||
 		typeof factor.secret !== "string" ||
 		typeof factor.backupCodes !== "string" ||
 		factor.trustDeviceGeneration !== proof.sourceTrustDeviceGeneration ||
@@ -594,34 +595,6 @@ export async function startRecoveryFactorRepair(
 		twoFactorSessionGeneration,
 	);
 	if (!rotatedUser) throw new Error("Recovery user lifecycle changed");
-	const observedTwoFactorEnabled = (rotatedUser as Record<string, unknown>)
-		.twoFactorEnabled;
-	if (observedTwoFactorEnabled !== true) {
-		if (observedTwoFactorEnabled !== false && observedTwoFactorEnabled != null) {
-			throw new Error("Recovery user factor marker is invalid");
-		}
-		const normalizedUser = await adapter.incrementOne({
-			model: "user",
-			where: [
-				{ field: "id", value: staged.subjectId },
-				{
-					field: "passkeySessionGeneration",
-					value: passkeySessionGeneration,
-				},
-				{
-					field: "twoFactorSessionGeneration",
-					value: twoFactorSessionGeneration,
-				},
-				{
-					field: "twoFactorEnabled",
-					value: observedTwoFactorEnabled ?? null,
-				},
-			],
-			increment: {},
-			set: { twoFactorEnabled: true },
-		});
-		if (!normalizedUser) throw new Error("Recovery user factor marker changed");
-	}
 	const rotatedFactor = await adapter.incrementOne<TwoFactorTable>({
 		model: proof.twoFactorTable,
 		where: [
