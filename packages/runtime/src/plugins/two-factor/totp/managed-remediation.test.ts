@@ -287,12 +287,11 @@ describe.sequential("managed TOTP remediation", () => {
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
 	});
 
-	it("uses a legacy-null TOTP in verification-only mode despite a stale user marker", async () => {
+	it("uses a verified TOTP in verification-only mode with a custom table", async () => {
 		const secret = "verified-custom-table-totp-secret";
 		const runtime = await setup({
 			customTable: true,
 			verifiedSecret: secret,
-			twoFactorEnabled: false,
 		});
 		await runtime.context.adapter.update<TwoFactorTable>({
 			model: runtime.table,
@@ -341,15 +340,11 @@ describe.sequential("managed TOTP remediation", () => {
 		expect(await response.json()).toMatchObject({ mode: "verification" });
 	});
 
-	it("replaces an explicitly disabled TOTP instead of accepting it as proof", async () => {
+	it("replaces a disabled legacy-null TOTP instead of accepting it as proof", async () => {
 		const runtime = await setup({
 			verifiedSecret: "disabled-legacy-null-totp-secret",
+			legacyNull: true,
 			twoFactorEnabled: false,
-		});
-		await runtime.context.adapter.update<TwoFactorTable>({
-			model: runtime.table,
-			where: [{ field: "userId", value: runtime.user.id }],
-			update: { verified: false },
 		});
 		const options = await dispatch(
 			runtime.context,
