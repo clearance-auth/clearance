@@ -610,10 +610,8 @@ export async function getStagedAuthenticationFactorInventory(
 	if (!activeUser) return null;
 	const passkeyEnabled =
 		snapshot.metadata.allowedFactors.includes("passkey") &&
-		ctx.context.options.plugins?.some((plugin) => plugin.id === "passkey");
-	const twoFactorPlugin = ctx.context.options.plugins?.find(
-		(plugin) => plugin.id === "two-factor",
-	);
+		Boolean(ctx.context.getPlugin("passkey"));
+	const twoFactorPlugin = ctx.context.getPlugin("two-factor");
 	const totpEnabled =
 		snapshot.metadata.allowedFactors.includes("totp") &&
 		twoFactorPlugin &&
@@ -645,7 +643,8 @@ export async function getStagedAuthenticationFactorInventory(
 	const totpRecord =
 		rawTotp &&
 		(rawTotp.verified === true ||
-			(rawTotp.verified == null && activeUser.twoFactorEnabled === true)) &&
+			(rawTotp.verified == null &&
+				(activeUser as Record<string, unknown>).twoFactorEnabled === true)) &&
 		identifier(rawTotp.id) &&
 		identifier(rawTotp.secret, 65_536)
 			? Object.freeze({ id: rawTotp.id, secret: rawTotp.secret })
