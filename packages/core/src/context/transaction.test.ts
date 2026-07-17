@@ -358,6 +358,50 @@ describe("runWithTransaction", () => {
 		expect(hookRuns).toBe(0);
 	});
 
+	it("retains hooks only from the committed whole-transaction retry attempt", async () => {
+		const events: string[] = [];
+		const transactionAdapter = {} as DBTransactionAdapter;
+		let callbackAttempts = 0;
+		const adapter = {
+			transaction: async <R>(
+				callback: (trx: DBTransactionAdapter) => Promise<R>,
+			) => {
+				await callback(transactionAdapter);
+				return callback(transactionAdapter);
+			},
+		} as DBAdapter;
+
+		const result = await runWithTransaction(adapter, async () => {
+			callbackAttempts += 1;
+			const attempt = callbackAttempts;
+			await queueBeforeTransactionCommitHook(async () => {
+				events.push(`before-${attempt}`);
+			});
+			await runWithTransaction(adapter, async () => {
+				await queueBeforeTransactionCommitHook(async () => {
+					events.push(`nested-before-${attempt}`);
+				});
+				await queueAfterTransactionHook(async () => {
+					events.push(`nested-after-${attempt}`);
+				});
+			});
+			await queueAfterTransactionHook(async () => {
+				events.push(`after-${attempt}`);
+			});
+			return `result-${attempt}`;
+		});
+
+		expect(result).toBe("result-2");
+		expect(events).toEqual([
+			"before-1",
+			"nested-before-1",
+			"before-2",
+			"nested-before-2",
+			"nested-after-2",
+			"after-2",
+		]);
+	});
+
 	it("runs rollback-critical hooks after the body and before commit", async () => {
 		const events: string[] = [];
 		const transactionAdapter = {} as DBTransactionAdapter;
