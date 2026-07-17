@@ -9,7 +9,7 @@ import {
 import { runWithTransaction } from "@clearance/core/context";
 import * as z from "zod";
 import { sessionMiddleware } from "../../api";
-import { setSessionCookie } from "../../cookies";
+import { setSessionCookie, splitSetCookieHeader } from "../../cookies";
 import { generateRandomString } from "../../crypto";
 import {
 	consumeInternalVerificationChallenge,
@@ -78,6 +78,42 @@ const verifyOneTimeTokenBodySchema = z.object({
 		description: 'The token to verify. Eg: "some-token"',
 	}),
 });
+
+type CookieHeaderScope = GenericEndpointContext & {
+	responseHeaders?: Headers;
+};
+
+function responseCookieHeaders(ctx: GenericEndpointContext) {
+	const scoped = ctx as CookieHeaderScope;
+	const headers = new Set<Headers>();
+	if (scoped.responseHeaders) headers.add(scoped.responseHeaders);
+	if (scoped.context.responseHeaders) headers.add(scoped.context.responseHeaders);
+	return headers;
+}
+
+function snapshotResponseCookies(ctx: GenericEndpointContext) {
+	return new Map(
+		[...responseCookieHeaders(ctx)].map((headers) => [
+			headers,
+			typeof headers.getSetCookie === "function"
+				? headers.getSetCookie()
+				: splitSetCookieHeader(headers.get("set-cookie") || ""),
+		]),
+	);
+}
+
+function restoreResponseCookies(
+	ctx: GenericEndpointContext,
+	snapshot: Map<Headers, string[]>,
+) {
+	const headers = new Set([...snapshot.keys(), ...responseCookieHeaders(ctx)]);
+	for (const responseHeaders of headers) {
+		responseHeaders.delete("set-cookie");
+		for (const cookie of snapshot.get(responseHeaders) || []) {
+			responseHeaders.append("set-cookie", cookie);
+		}
+	}
+}
 
 export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 	const opts = {
@@ -187,10 +223,10 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 					const { token } = c.body;
 					const storedToken = await storeToken(c, token);
 					const identifier = `one-time-token:${storedToken}`;
-					// Atomically burn the single-use record before issuing a session,
-					// so two concurrent redemptions of the same token resolve to one
-					// success. A null return means missing or expired (already burned).
-					const session = await runWithTransaction(
+					// Commit the challenge consumption independently from source-session
+					// authority. Throwing within this transaction would roll the challenge
+					// back when the source is no longer usable, making the token reusable.
+					const redemption = await runWithTransaction(
 						c.context.adapter,
 						async () => {
 							const verificationValue =
@@ -203,28 +239,51 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 									},
 								);
 							if (!verificationValue) {
-								throw c.error("BAD_REQUEST", {
-									message: "Invalid token",
-								});
+								return { kind: "invalid-token" } as const;
 							}
-							const found = await c.context.internalAdapter.findSession(
-								verificationValue.value,
-							);
+							let found: Awaited<
+								ReturnType<typeof c.context.internalAdapter.findSession>
+							>;
+							try {
+								found = await c.context.internalAdapter.findSession(
+									verificationValue.value,
+								);
+							} catch (error) {
+								return { kind: "authority-error", error } as const;
+							}
 							if (!found) {
-								throw c.error("BAD_REQUEST", {
-									message: "Session not found",
-								});
+								return { kind: "session-not-found" } as const;
 							}
 							if (found.session.expiresAt < new Date()) {
-								throw c.error("BAD_REQUEST", {
-									message: "Session expired",
-								});
+								return { kind: "session-expired" } as const;
 							}
-							return found;
+							return { kind: "success", session: found } as const;
 						},
 					);
+					if (redemption.kind === "authority-error") {
+						throw redemption.error;
+					}
+					if (redemption.kind === "invalid-token") {
+						throw c.error("BAD_REQUEST", { message: "Invalid token" });
+					}
+					if (redemption.kind === "session-not-found") {
+						throw c.error("BAD_REQUEST", { message: "Session not found" });
+					}
+					if (redemption.kind === "session-expired") {
+						throw c.error("BAD_REQUEST", { message: "Session expired" });
+					}
+					const session = redemption.session;
 					if (!opts?.disableSetSessionCookie) {
-						await setSessionCookie(c, session);
+						// setSessionCookie publishes the credential before potentially fallible
+						// cache versioning and account-cookie work. Restore the prior cookies if
+						// that publication fails so an error response cannot carry credentials.
+						const cookieSnapshot = snapshotResponseCookies(c);
+						try {
+							await setSessionCookie(c, session);
+						} catch (error) {
+							restoreResponseCookies(c, cookieSnapshot);
+							throw error;
+						}
 					}
 
 					return c.json(session);
