@@ -101,7 +101,12 @@ export interface SessionAssuranceRequirement {
 }
 
 export interface EvaluateSessionIssuanceInput {
-	readonly purpose: "interactive" | "impersonation" | "replacement" | "device";
+	readonly purpose:
+		| "interactive"
+		| "impersonation"
+		| "replacement"
+		| "device"
+		| "organization";
 	readonly policy: SessionAssurancePolicySnapshot;
 	readonly now: Date;
 	readonly evidence: readonly VerifiedAuthenticationEvidence[];
@@ -662,7 +667,15 @@ export function evaluateSessionIssuance(
 		if (source.authenticationPrimaryMethod === "admin_impersonation") {
 			return required(normalizedPolicy, "invalid_source_assurance");
 		}
-		if (!scopeMatches(source, normalizedPolicy)) {
+		const sourceMatchesTargetScope =
+			source.authenticationPolicyProjectId ===
+				normalizedPolicy.identity.projectId &&
+			source.authenticationPolicyEnvironmentId ===
+				normalizedPolicy.identity.environmentId &&
+			(normalizedInput.purpose === "organization" ||
+				source.authenticationPolicyOrganizationId ===
+					normalizedPolicy.organizationId);
+		if (!sourceMatchesTargetScope) {
 			return required(normalizedPolicy, "source_scope_mismatch");
 		}
 		if (
@@ -673,7 +686,10 @@ export function evaluateSessionIssuance(
 		) {
 			return required(normalizedPolicy, "invalid_source_assurance");
 		}
-		if (source.authenticationPolicyRevision !== normalizedPolicy.revision) {
+		if (
+			normalizedInput.purpose !== "organization" &&
+			source.authenticationPolicyRevision !== normalizedPolicy.revision
+		) {
 			return required(normalizedPolicy, "policy_revision_changed");
 		}
 	}
