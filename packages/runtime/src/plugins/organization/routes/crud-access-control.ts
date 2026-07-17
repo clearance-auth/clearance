@@ -1,5 +1,10 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	runWithTransaction,
+} from "@clearance/core/context";
 import type { Where } from "@clearance/core/db/adapter";
 import { APIError } from "@clearance/core/error";
 import * as z from "zod";
@@ -10,7 +15,7 @@ import type { AccessControl } from "../../access";
 import { orgSessionMiddleware } from "../call";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
 import { hasPermission } from "../has-permission";
-import type { Member, OrganizationRole } from "../schema";
+import type { Invitation, Member, OrganizationRole } from "../schema";
 import type { OrganizationOptions } from "../types";
 
 type IsExactlyEmptyObject<T> = keyof T extends never // no keys
@@ -21,8 +26,120 @@ type IsExactlyEmptyObject<T> = keyof T extends never // no keys
 		: false
 	: false;
 
-const normalizeRoleName = (role: string) => role.toLowerCase();
+function normalizeRoleName(role: string): string {
+	const normalized = role.trim().toLowerCase();
+	if (normalized.length === 0 || normalized.includes(",")) {
+		throw APIError.fromStatus("BAD_REQUEST");
+	}
+	return normalized;
+}
 const DEFAULT_MAXIMUM_ROLES_PER_ORGANIZATION = Number.POSITIVE_INFINITY;
+
+const parseRoleAssignments = (roles: string) =>
+	roles.split(",").map((role) => role.trim());
+
+const hasExactRoleAssignment = (roles: string, role: string) =>
+	parseRoleAssignments(roles).includes(role);
+
+async function hasDynamicRoleReference(
+	ctx: GenericEndpointContext,
+	organizationId: string,
+	role: string,
+): Promise<boolean> {
+	const [members, invitations] = await Promise.all([
+		ctx.context.adapter.findMany<Member>({
+			model: "member",
+			where: [
+				{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+				{ field: "role", value: role, operator: "contains" },
+			],
+		}),
+		ctx.context.adapter.findMany<Invitation>({
+			model: "invitation",
+			where: [
+				{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+				{ field: "status", value: "pending", operator: "eq", connector: "AND" },
+				{ field: "role", value: role, operator: "contains" },
+			],
+		}),
+	]);
+	return (
+		members.some((member) => hasExactRoleAssignment(member.role, role)) ||
+		invitations.some(
+			(invitation) =>
+				hasExactRoleAssignment(invitation.role, role) &&
+				(!invitation.expiresAt || invitation.expiresAt > new Date()),
+		)
+	);
+}
+
+async function withOrganizationRoleMutationLock<T>(
+	ctx: GenericEndpointContext,
+	organizationId: string,
+	mutation: (lockedCtx: GenericEndpointContext, transaction: Awaited<ReturnType<typeof getCurrentAdapter>>) => Promise<T>,
+): Promise<T> {
+	if (
+		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" &&
+		!(await isTransactionActive(ctx.context.adapter))
+	) {
+		throw APIError.from("INTERNAL_SERVER_ERROR", {
+			code: "ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED",
+			message:
+				"Organization role mutations require rollback-capable database transactions",
+		});
+	}
+	const runLockedMutation = async () => {
+		const transaction = await getCurrentAdapter(ctx.context.adapter);
+		const organization = await transaction.update({
+			model: "organization",
+			where: [{ field: "id", value: organizationId }],
+			update: { updatedAt: new Date() },
+		});
+		if (!organization) {
+			throw APIError.from(
+				"BAD_REQUEST",
+				ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+			);
+		}
+		return mutation({
+			...ctx,
+			context: { ...ctx.context, adapter: transaction },
+		} as GenericEndpointContext, transaction);
+	};
+	return runWithTransaction(ctx.context.adapter, runLockedMutation);
+}
+
+async function getLockedRoleMutationMember(
+	ctx: GenericEndpointContext,
+	organizationId: string,
+	userId: string,
+	options: OrganizationOptions,
+	action: "create" | "update" | "delete",
+): Promise<Member> {
+	const member = await ctx.context.adapter.findOne<Member>({
+		model: "member",
+		where: [
+			{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+			{ field: "userId", value: userId, operator: "eq", connector: "AND" },
+		],
+	});
+	if (!member) {
+		throw APIError.from("FORBIDDEN", ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION);
+	}
+	const allowed = await hasPermission(
+		{ options, organizationId, permissions: { ac: [action] }, role: member.role },
+		ctx,
+	);
+	if (!allowed) {
+		const error = action === "create"
+			? ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_CREATE_A_ROLE
+			: action === "update"
+				? ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_A_ROLE
+				: ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_A_ROLE;
+		throw APIError.from("FORBIDDEN", error);
+	}
+	return member;
+}
 
 const getAdditionalFields = <
 	O extends OrganizationOptions,
@@ -134,138 +251,34 @@ export const createOrgRole = <O extends OrganizationOptions>(options: O) => {
 
 			roleName = normalizeRoleName(roleName);
 
-			await checkIfRoleNameIsTakenByPreDefinedRole({
-				role: roleName,
-				organizationId,
-				options,
-				ctx,
-			});
-
-			// Get the user's role associated with the organization.
-			// This also serves as a check to ensure the org id is valid.
-			const member = await ctx.context.adapter.findOne<Member>({
-				model: "member",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					{
-						field: "userId",
-						value: user.id,
-						operator: "eq",
-						connector: "AND",
-					},
-				],
-			});
-			if (!member) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not a member of the organization to create a role.`,
-					{
-						userId: user.id,
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION,
-				);
-			}
-
-			const canCreateRole = await hasPermission(
-				{
-					options,
-					organizationId,
-					permissions: {
-						ac: ["create"],
-					},
-					role: member.role,
-				},
-				ctx,
-			);
-			if (!canCreateRole) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not permitted to create a role. If this is unexpected, please make sure the role associated to that member has the "ac" resource with the "create" permission.`,
-					{
-						userId: user.id,
-						organizationId,
-						role: member.role,
-					},
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_CREATE_A_ROLE,
-				);
-			}
-
-			const maximumRolesPerOrganization =
-				typeof options.dynamicAccessControl?.maximumRolesPerOrganization ===
-				"function"
-					? await options.dynamicAccessControl.maximumRolesPerOrganization(
-							organizationId,
-						)
-					: (options.dynamicAccessControl?.maximumRolesPerOrganization ??
-						DEFAULT_MAXIMUM_ROLES_PER_ORGANIZATION);
-			const rolesInDB = await ctx.context.adapter.count({
-				model: "organizationRole",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-				],
-			});
-			if (rolesInDB >= maximumRolesPerOrganization) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] Failed to create a new role, the organization has too many roles. Maximum allowed roles is ${maximumRolesPerOrganization}.`,
-					{
-						organizationId,
-						maximumRolesPerOrganization,
-						rolesInDB,
-					},
-				);
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.TOO_MANY_ROLES,
-				);
-			}
-
-			await checkForInvalidResources({ ac, ctx, permission });
-
-			await checkIfMemberHasPermission({
-				ctx,
-				member,
-				options,
-				organizationId,
-				permissionRequired: permission,
-				user,
-				action: "create",
-			});
-
-			await checkIfRoleNameIsTakenByRoleInDB({
-				ctx,
-				organizationId,
-				role: roleName,
-			});
-
 			const newRole = ac.newRole(permission);
 
-			const newRoleInDB = await ctx.context.adapter.create<
-				Omit<OrganizationRole, "permission"> & { permission: string }
-			>({
-				model: "organizationRole",
-				data: {
-					createdAt: new Date(),
-					organizationId,
-					permission: JSON.stringify(permission),
-					role: roleName,
-					...additionalFields,
+			const newRoleInDB = await withOrganizationRoleMutationLock(
+				ctx,
+				organizationId,
+				async (lockedCtx, transaction) => {
+					await checkIfRoleNameIsTakenByPreDefinedRole({ role: roleName, organizationId, options, ctx: lockedCtx });
+					const lockedMember = await getLockedRoleMutationMember(
+						lockedCtx, organizationId, user.id, options, "create",
+					);
+					const liveMaximum = typeof options.dynamicAccessControl?.maximumRolesPerOrganization === "function"
+						? await options.dynamicAccessControl.maximumRolesPerOrganization(organizationId)
+						: (options.dynamicAccessControl?.maximumRolesPerOrganization ?? DEFAULT_MAXIMUM_ROLES_PER_ORGANIZATION);
+					if (await lockedCtx.context.adapter.count({ model: "organizationRole", where: [{ field: "organizationId", value: organizationId }] }) >= liveMaximum) {
+						throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.TOO_MANY_ROLES);
+					}
+					await checkForInvalidResources({ ac, ctx: lockedCtx, permission });
+					await checkIfMemberHasPermission({ ctx: lockedCtx, member: lockedMember, options, organizationId, permissionRequired: permission, user, action: "create" });
+					await checkIfRoleNameIsTakenByRoleInDB({ ctx: lockedCtx, organizationId, role: roleName });
+					const created = await transaction.create<
+						Omit<OrganizationRole, "permission"> & { permission: string }
+					>({
+						model: "organizationRole",
+						data: { createdAt: new Date(), organizationId, permission: JSON.stringify(permission), role: roleName, ...additionalFields },
+					});
+					return created;
 				},
-			});
+			);
 
 			const data = {
 				...newRoleInDB,
@@ -335,89 +348,14 @@ export const deleteOrgRole = <O extends OrganizationOptions>(options: O) => {
 				);
 			}
 
-			const member = await ctx.context.adapter.findOne<Member>({
-				model: "member",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					{
-						field: "userId",
-						value: user.id,
-						operator: "eq",
-						connector: "AND",
-					},
-				],
-			});
-			if (!member) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not a member of the organization to delete a role.`,
-					{
-						userId: user.id,
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION,
-				);
-			}
-
-			const canDeleteRole = await hasPermission(
-				{
-					options,
-					organizationId,
-					permissions: {
-						ac: ["delete"],
-					},
-					role: member.role,
-				},
-				ctx,
-			);
-			if (!canDeleteRole) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not permitted to delete a role. If this is unexpected, please make sure the role associated to that member has the "ac" resource with the "delete" permission.`,
-					{
-						userId: user.id,
-						organizationId,
-						role: member.role,
-					},
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_A_ROLE,
-				);
-			}
-
-			if (ctx.body.roleName) {
-				const roleName = ctx.body.roleName;
-				const defaultRoles = options.roles
-					? Object.keys(options.roles)
-					: ["owner", "admin", "member"];
-				if (defaultRoles.includes(roleName)) {
-					ctx.context.logger.error(
-						`[Dynamic Access Control] Cannot delete a pre-defined role.`,
-						{
-							roleName,
-							organizationId,
-							defaultRoles,
-						},
-					);
-					throw APIError.from(
-						"BAD_REQUEST",
-						ORGANIZATION_ERROR_CODES.CANNOT_DELETE_A_PRE_DEFINED_ROLE,
-					);
-				}
-			}
-
 			let condition: Where;
-			if (ctx.body.roleName) {
+			const roleName = ctx.body.roleName === undefined
+				? undefined
+				: normalizeRoleName(ctx.body.roleName);
+			if (roleName !== undefined) {
 				condition = {
 					field: "role",
-					value: ctx.body.roleName,
+					value: roleName,
 					operator: "eq",
 					connector: "AND",
 				};
@@ -439,86 +377,34 @@ export const deleteOrgRole = <O extends OrganizationOptions>(options: O) => {
 					ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND,
 				);
 			}
-			const existingRoleInDB =
-				await ctx.context.adapter.findOne<OrganizationRole>({
+			await withOrganizationRoleMutationLock(ctx, organizationId, async (lockedCtx) => {
+				await getLockedRoleMutationMember(lockedCtx, organizationId, user.id, options, "delete");
+				if (roleName !== undefined) {
+					const defaultRoles = options.roles
+						? Object.keys(options.roles)
+						: ["owner", "admin", "member"];
+					if (defaultRoles.map((role) => role.trim().toLowerCase()).includes(roleName)) {
+						throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.CANNOT_DELETE_A_PRE_DEFINED_ROLE);
+					}
+				}
+				const liveRole = await lockedCtx.context.adapter.findOne<OrganizationRole>({
 					model: "organizationRole",
 					where: [
-						{
-							field: "organizationId",
-							value: organizationId,
-							operator: "eq",
-							connector: "AND",
-						},
+						{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
 						condition,
 					],
 				});
-			if (!existingRoleInDB) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The role name/id does not exist in the database.`,
-					{
-						...("roleName" in ctx.body
-							? { roleName: ctx.body.roleName }
-							: { roleId: ctx.body.roleId }),
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND,
-				);
-			}
-
-			existingRoleInDB.permission = JSON.parse(
-				existingRoleInDB.permission as never as string,
-			);
-
-			// Check if any members are assigned to this role
-			const roleToDelete = existingRoleInDB.role;
-			const members = await ctx.context.adapter.findMany<Member>({
-				model: "member",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					{
-						field: "role",
-						value: roleToDelete,
-						operator: "contains",
-					},
-				],
-			});
-			const memberWithRole = members.find((member) => {
-				const memberRoles = member.role.split(",").map((r) => r.trim());
-				return memberRoles.includes(roleToDelete);
-			});
-			if (memberWithRole) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] Cannot delete a role that is assigned to members.`,
-					{
-						role: existingRoleInDB.role,
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS,
-				);
-			}
-
-			await ctx.context.adapter.delete({
-				model: "organizationRole",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					condition,
-				],
+				if (!liveRole) throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND);
+				if (await hasDynamicRoleReference(lockedCtx, organizationId, liveRole.role)) {
+					throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS);
+				}
+				await lockedCtx.context.adapter.delete({
+					model: "organizationRole",
+					where: [
+						{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+						condition,
+					],
+				});
 			});
 
 			return ctx.json({
@@ -761,10 +647,13 @@ export const getOrgRole = <O extends OrganizationOptions>(options: O) => {
 			}
 
 			let condition: Where;
-			if (ctx.query.roleName) {
+			const roleName = ctx.query?.roleName === undefined
+				? undefined
+				: normalizeRoleName(ctx.query.roleName);
+			if (roleName !== undefined) {
 				condition = {
 					field: "role",
-					value: ctx.query.roleName,
+					value: roleName,
 					operator: "eq",
 					connector: "AND",
 				};
@@ -907,63 +796,14 @@ export const updateOrgRole = <O extends OrganizationOptions>(options: O) => {
 				);
 			}
 
-			const member = await ctx.context.adapter.findOne<Member>({
-				model: "member",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					{
-						field: "userId",
-						value: user.id,
-						operator: "eq",
-						connector: "AND",
-					},
-				],
-			});
-			if (!member) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not a member of the organization to update a role.`,
-					{
-						userId: user.id,
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_A_MEMBER_OF_THIS_ORGANIZATION,
-				);
-			}
-
-			const canUpdateRole = await hasPermission(
-				{
-					options,
-					organizationId,
-					role: member.role,
-					permissions: {
-						ac: ["update"],
-					},
-				},
-				ctx,
-			);
-			if (!canUpdateRole) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The user is not permitted to update a role.`,
-				);
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_A_ROLE,
-				);
-			}
-
 			let condition: Where;
-			if (ctx.body.roleName) {
+			const roleName = ctx.body.roleName === undefined
+				? undefined
+				: normalizeRoleName(ctx.body.roleName);
+			if (roleName !== undefined) {
 				condition = {
 					field: "role",
-					value: ctx.body.roleName,
+					value: roleName,
 					operator: "eq",
 					connector: "AND",
 				};
@@ -985,37 +825,6 @@ export const updateOrgRole = <O extends OrganizationOptions>(options: O) => {
 					ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND,
 				);
 			}
-			const role = await ctx.context.adapter.findOne<OrganizationRole>({
-				model: "organizationRole",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					condition,
-				],
-			});
-			if (!role) {
-				ctx.context.logger.error(
-					`[Dynamic Access Control] The role name/id does not exist in the database.`,
-					{
-						...("roleName" in ctx.body
-							? { roleName: ctx.body.roleName }
-							: { roleId: ctx.body.roleId }),
-						organizationId,
-					},
-				);
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND,
-				);
-			}
-			role.permission = role.permission
-				? JSON.parse(role.permission as never as string)
-				: undefined;
-
 			const {
 				permission: _,
 				roleName: __,
@@ -1026,41 +835,15 @@ export const updateOrgRole = <O extends OrganizationOptions>(options: O) => {
 				...additionalFields,
 			};
 
-			if (ctx.body.data.permission) {
+			if (ctx.body.data.permission !== undefined) {
 				const newPermission = ctx.body.data.permission;
 
 				await checkForInvalidResources({ ac, ctx, permission: newPermission });
 
-				await checkIfMemberHasPermission({
-					ctx,
-					member,
-					options,
-					organizationId,
-					permissionRequired: newPermission,
-					user,
-					action: "update",
-				});
-
 				updateData.permission = newPermission;
 			}
-			if (ctx.body.data.roleName) {
-				let newRoleName = ctx.body.data.roleName;
-
-				newRoleName = normalizeRoleName(newRoleName);
-
-				await checkIfRoleNameIsTakenByPreDefinedRole({
-					role: newRoleName,
-					organizationId,
-					options,
-					ctx,
-				});
-				await checkIfRoleNameIsTakenByRoleInDB({
-					role: newRoleName,
-					organizationId,
-					ctx,
-				});
-
-				updateData.role = newRoleName;
+			if (ctx.body.data.roleName !== undefined) {
+				updateData.role = normalizeRoleName(ctx.body.data.roleName);
 			}
 
 			// -----
@@ -1073,18 +856,41 @@ export const updateOrgRole = <O extends OrganizationOptions>(options: O) => {
 			};
 			// Scoped by organization + role: updateMany applies the multi-clause
 			// filter portably, where a multi-clause `update` does not across adapters.
-			await ctx.context.adapter.updateMany({
-				model: "organizationRole",
-				where: [
-					{
-						field: "organizationId",
-						value: organizationId,
-						operator: "eq",
-						connector: "AND",
-					},
-					condition,
-				],
-				update,
+			const role = await withOrganizationRoleMutationLock(ctx, organizationId, async (lockedCtx) => {
+				const lockedMember = await getLockedRoleMutationMember(lockedCtx, organizationId, user.id, options, "update");
+				const liveRole = await lockedCtx.context.adapter.findOne<OrganizationRole>({
+					model: "organizationRole",
+					where: [
+						{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+						condition,
+					],
+				});
+				if (!liveRole) throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND);
+				const previousRole = {
+					...liveRole,
+					permission: liveRole.permission
+						? JSON.parse(liveRole.permission as never as string)
+						: undefined,
+				};
+				if (ctx.body.data.permission !== undefined) {
+					await checkIfMemberHasPermission({ ctx: lockedCtx, member: lockedMember, options, organizationId, permissionRequired: ctx.body.data.permission, user, action: "update" });
+				}
+				if (updateData.role) {
+					await checkIfRoleNameIsTakenByPreDefinedRole({ ctx: lockedCtx, options, organizationId, role: updateData.role });
+					await checkIfRoleNameIsTakenByRoleInDB({ ctx: lockedCtx, organizationId, role: updateData.role, excludeRoleId: liveRole.id });
+					if (updateData.role !== liveRole.role && await hasDynamicRoleReference(lockedCtx, organizationId, liveRole.role)) {
+						throw APIError.from("BAD_REQUEST", ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS);
+					}
+				}
+				await lockedCtx.context.adapter.updateMany({
+					model: "organizationRole",
+					where: [
+						{ field: "organizationId", value: organizationId, operator: "eq", connector: "AND" },
+						condition,
+					],
+					update,
+				});
+				return previousRole;
 			});
 
 			// -----
@@ -1161,7 +967,6 @@ async function checkIfMemberHasPermission({
 						options,
 						organizationId,
 						permissions: { [resource]: [perm] },
-						useMemoryCache: true,
 						role: member.role,
 					},
 					ctx,
@@ -1220,7 +1025,7 @@ async function checkIfRoleNameIsTakenByPreDefinedRole({
 	const defaultRoles = options.roles
 		? Object.keys(options.roles)
 		: ["owner", "admin", "member"];
-	if (defaultRoles.includes(role)) {
+	if (defaultRoles.map((defaultRole) => defaultRole.trim().toLowerCase()).includes(role)) {
 		ctx.context.logger.error(
 			`[Dynamic Access Control] The role name "${role}" is already taken by a pre-defined role.`,
 			{
@@ -1239,11 +1044,13 @@ async function checkIfRoleNameIsTakenByPreDefinedRole({
 async function checkIfRoleNameIsTakenByRoleInDB({
 	organizationId,
 	role,
+	excludeRoleId,
 	ctx,
 }: {
 	ctx: GenericEndpointContext;
 	organizationId: string;
 	role: string;
+	excludeRoleId?: string;
 }) {
 	const existingRoleInDB = await ctx.context.adapter.findOne<OrganizationRole>({
 		model: "organizationRole",
@@ -1262,7 +1069,7 @@ async function checkIfRoleNameIsTakenByRoleInDB({
 			},
 		],
 	});
-	if (existingRoleInDB) {
+	if (existingRoleInDB && existingRoleInDB.id !== excludeRoleId) {
 		ctx.context.logger.error(
 			`[Dynamic Access Control] The role name "${role}" is already taken by a role in the database.`,
 			{
