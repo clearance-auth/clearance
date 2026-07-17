@@ -358,7 +358,7 @@ describe("passkey staged remediation", () => {
 		await context.adapter.update({
 			model: "user",
 			where: [{ field: "id", value: user.id }],
-			update: { twoFactorEnabled: false },
+			update: { twoFactorEnabled: true },
 		});
 		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
 		await expect(
@@ -371,6 +371,51 @@ describe("passkey staged remediation", () => {
 		).rejects.toMatchObject({ body: { code: "REMEDIATION_FAILED" } });
 		expect(await context.adapter.count({ model: "passkey" })).toBe(0);
 		expect(await context.adapter.count({ model: "session" })).toBe(0);
+	});
+
+	it("allows registration when a disabled legacy custom-table TOTP appears after options", async () => {
+		const runtime = await setupManaged({ customTwoFactor: true, totp: true });
+		const { instance, user } = runtime;
+		const initial = await stagedHeaders(
+			instance as never,
+			user.id,
+			runtime.policyInput(),
+			["passkey", "totp"],
+		);
+		const optionsResponse = await (instance.auth.api as any)
+			.generatePasskeyRemediationRegistrationOptions({
+				headers: initial,
+				asResponse: true,
+			});
+		const options = await optionsResponse.json();
+		const successor = convertSetCookieToCookie(optionsResponse.headers);
+		successor.set("origin", ORIGIN);
+		const context = await instance.auth.$context;
+		await context.adapter.create<Record<string, unknown>>({
+			model: runtime.twoFactorTable,
+			data: {
+				userId: user.id,
+				secret: "disabled-legacy-ciphertext",
+				backupCodes: "legacy-backup-codes",
+				verified: null,
+			},
+		});
+		await context.adapter.update({
+			model: "user",
+			where: [{ field: "id", value: user.id }],
+			update: { twoFactorEnabled: false },
+		});
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		await expect(
+			(instance.auth.api as any).verifyPasskeyRemediationRegistration({
+				headers: successor,
+				body: {
+					response: authenticator.registrationResponse(options.challenge),
+				},
+			}),
+		).resolves.toBeDefined();
+		expect(await context.adapter.count({ model: "passkey" })).toBe(1);
+		expect(await context.adapter.count({ model: "session" })).toBe(1);
 	});
 
 	it("commits exact managed staged assurance, credential, and one session", async () => {
