@@ -1,4 +1,5 @@
 import type { GenericEndpointContext } from "@clearance/core";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { base64Url } from "@clearance/utils/base64";
 
 const USER_HANDLE_FIELD = "passkeyUserHandle";
@@ -44,7 +45,14 @@ export async function ensurePasskeyUserHandle(
 	ctx: GenericEndpointContext,
 	userId: string,
 ): Promise<string> {
-	const existing = await ctx.context.adapter.findOne<{
+	return ensurePasskeyUserHandleForAdapter(ctx.context.adapter, userId);
+}
+
+export async function ensurePasskeyUserHandleForAdapter(
+	adapter: DBTransactionAdapter<any>,
+	userId: string,
+): Promise<string> {
+	const existing = await adapter.findOne<{
 		passkeyUserHandle?: string | null;
 	}>({
 		model: "user",
@@ -56,7 +64,7 @@ export async function ensurePasskeyUserHandle(
 	}
 
 	const proposed = generateCanonicalUserHandle();
-	const initialized = await ctx.context.adapter.incrementOne<{
+	const initialized = await adapter.incrementOne<{
 		passkeyUserHandle?: string | null;
 	}>({
 		model: "user",
@@ -72,7 +80,7 @@ export async function ensurePasskeyUserHandle(
 	}
 
 	// Someone else initialized it concurrently; re-read the winning value.
-	const winner = await ctx.context.adapter.findOne<{
+	const winner = await adapter.findOne<{
 		passkeyUserHandle?: string | null;
 	}>({
 		model: "user",
