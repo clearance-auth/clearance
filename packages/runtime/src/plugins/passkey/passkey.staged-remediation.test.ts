@@ -373,7 +373,7 @@ describe("passkey staged remediation", () => {
 		expect(await context.adapter.count({ model: "session" })).toBe(0);
 	});
 
-	it("allows registration when an explicitly disabled custom-table TOTP appears after options", async () => {
+	it("allows registration when a disabled legacy custom-table TOTP appears after options", async () => {
 		const runtime = await setupManaged({ customTwoFactor: true, totp: true });
 		const { instance, user } = runtime;
 		const initial = await stagedHeaders(
@@ -397,7 +397,7 @@ describe("passkey staged remediation", () => {
 				userId: user.id,
 				secret: "disabled-legacy-ciphertext",
 				backupCodes: "legacy-backup-codes",
-				verified: false,
+				verified: null,
 			},
 		});
 		await context.adapter.update({
