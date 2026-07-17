@@ -31,11 +31,13 @@ import {
 } from "../internal/session-issuance-context";
 import {
 	consumeInternalVerificationChallenge,
+	createInternalVerificationChallengeContext,
 	createInternalVerificationChallenge,
 	ManagedVerificationChallengeError,
 } from "../internal/verification-challenge-context";
 import { attachInternalCredentialAuthority } from "../internal/credential-authority";
 import { getMigrations } from "./get-migration";
+import { createInternalAdapter } from "./internal-adapter";
 import { generateCredentialOperationKey } from "../utils/operation-key";
 import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../security/session-assurance";
 import type { Session, User } from "../types";
@@ -341,17 +343,30 @@ afterEach(() => {
 describe("managed verification challenge authority", () => {
 	const createChallenge = (
 		runtime: ManagedRuntime,
-		data: { identifier: string; value: string; expiresAt: Date },
+		data: {
+			identifier: string;
+			value: string;
+			expiresAt: Date;
+			createdAt?: Date;
+		},
 		binding: { purpose: string; subject: string } = {
 			purpose: "managed-test-challenge",
 			subject: data.identifier,
 		},
-	) =>
-		createInternalVerificationChallenge(
-			runtime.context.internalAdapter,
-			binding,
-			data,
+	) => {
+		const { createdAt, ...challenge } = data;
+		if (!createdAt) {
+			return createInternalVerificationChallenge(
+				runtime.context.internalAdapter,
+				binding,
+				challenge,
+			);
+		}
+		return runtime.context.internalAdapter.createVerificationValue(
+			{ ...challenge, createdAt },
+			createInternalVerificationChallengeContext({ ...binding, ...challenge }),
 		);
+	};
 	const consumeChallenge = (
 		runtime: ManagedRuntime,
 		identifier: string,
@@ -367,7 +382,9 @@ describe("managed verification challenge authority", () => {
 
 	function secondaryStorage(
 		store: Map<string, string>,
-		controls: { failDelete?: boolean } = {},
+		controls: {
+			failDelete?: boolean | ((key: string) => boolean);
+		} = {},
 	) {
 		return {
 			namespace: `managed-verification-${databases.length}`,
@@ -376,13 +393,95 @@ describe("managed verification challenge authority", () => {
 				store.set(key, value);
 			},
 			delete: async (key: string) => {
-				if (controls.failDelete) throw new Error("cache delete failed");
+				if (
+					controls.failDelete === true ||
+					(typeof controls.failDelete === "function" &&
+						controls.failDelete(key))
+				) {
+					throw new Error("cache delete failed");
+				}
 				store.delete(key);
 			},
 			runExclusive<T>(_name: string, operation: () => T): T {
 				return operation();
 			},
 			assertNoLegacySessionWriters() {},
+		};
+	}
+
+	function serializingSecondaryStorage(
+		store: Map<string, string>,
+		controls: {
+			failDelete?: boolean | ((key: string) => boolean);
+		} = {},
+	) {
+		const storage = secondaryStorage(store, controls);
+		const leases = new Map<string, Promise<void>>();
+		storage.runExclusive = (async (name, operation) => {
+			const previous = leases.get(name) ?? Promise.resolve();
+			let release!: () => void;
+			const current = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const next = previous.catch(() => {}).then(() => current);
+			leases.set(name, next);
+			await previous.catch(() => {});
+			try {
+				return await operation();
+			} finally {
+				release();
+				if (leases.get(name) === next) leases.delete(name);
+			}
+		}) as typeof storage.runExclusive;
+		return storage;
+	}
+
+	async function setupMixedAliasRuntimes(input: {
+		verification: NonNullable<ClearanceOptions["verification"]>;
+		secondaryStorage: NonNullable<ClearanceOptions["secondaryStorage"]>;
+	}) {
+		const database = new DatabaseSync(":memory:");
+		databases.push(database);
+		const makeOptions = (storeIdentifier: "plain" | "hashed") => {
+			const options = {
+				baseURL: "http://localhost:3000",
+				secret: "managed-mixed-alias-integration-secret",
+				database,
+				session: { storeSessionInDatabase: true },
+				verification: { ...input.verification, storeIdentifier },
+				secondaryStorage: input.secondaryStorage,
+			} satisfies ClearanceOptions;
+			const readForSubject = vi.fn(
+				async (request: RuntimeAuthenticationPolicyReaderInput) =>
+					policyResult(request),
+			);
+			attachInternalAuthenticationPolicy(options, {
+				identity,
+			reader: { readForSubject } satisfies RuntimeAuthenticationPolicyReader,
+			});
+			return options;
+		};
+		const plainOptions = makeOptions("plain");
+		const hashedOptions = makeOptions("hashed");
+		await (await getMigrations(hashedOptions)).runMigrations();
+		const hashedContext = await init(hashedOptions);
+		const plainContext = {
+			...hashedContext,
+			options: plainOptions,
+			internalAdapter: createInternalAdapter(hashedContext.adapter, {
+				options: plainOptions,
+				logger: hashedContext.logger,
+				hooks: [],
+				generateId: hashedContext.generateId,
+				secretConfig: hashedContext.secretConfig,
+			}),
+		};
+		return {
+			plain: { context: plainContext, runtimeOptions: plainOptions } as ManagedRuntime,
+			hashed: {
+				context: hashedContext,
+				runtimeOptions: hashedOptions,
+			} as ManagedRuntime,
 		};
 	}
 
@@ -555,6 +654,161 @@ describe("managed verification challenge authority", () => {
 		]);
 		expect(results.filter(Boolean)).toHaveLength(1);
 		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it("atomically consumes mixed-config database aliases through one managed marker gate", async () => {
+		const store = new Map<string, string>();
+		const storage = serializingSecondaryStorage(store);
+		const { plain, hashed } = await setupMixedAliasRuntimes({
+			verification: { storeInDatabase: true },
+			secondaryStorage: storage,
+		});
+		const identifier = "managed-database-hashed-alias";
+		const createdAt = new Date(Date.now());
+		const legacyPlain = await createChallenge(plain, {
+			identifier,
+			value: "legacy-plain-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt,
+		});
+		const hashedChallenge = await createChallenge(hashed, {
+			identifier,
+			value: "hashed-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt: new Date(createdAt.getTime() + 1),
+		});
+		expect(await challengeMarkers(plain)).toHaveLength(2);
+		const start = deferred();
+		const consume = async (runtime: ManagedRuntime) => {
+			await start.promise;
+			return runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			);
+		};
+		const plainConsume = consume(plain);
+		const hashedConsume = consume(hashed);
+		start.resolve();
+		const results = await Promise.all([plainConsume, hashedConsume]);
+
+		expect(results.filter(Boolean)).toHaveLength(1);
+		expect(results.find(Boolean)?.id).toBe(hashedChallenge.id);
+		expect(results.find(Boolean)?.id).not.toBe(legacyPlain.id);
+		expect(await challengeMarkers(plain)).toHaveLength(0);
+		expect(
+			await plain.context.adapter.findMany({ model: "verification" }),
+		).toHaveLength(0);
+		expect(store.has(`verification:${hashedChallenge.identifier}`)).toBe(false);
+		expect(store.has(`verification:${identifier}`)).toBe(false);
+	});
+
+	it("serializes mixed-config managed secondary aliases and retires every marker", async () => {
+		const store = new Map<string, string>();
+		const storage = serializingSecondaryStorage(store);
+		const runExclusive = vi.spyOn(storage, "runExclusive");
+		const { plain, hashed } = await setupMixedAliasRuntimes({
+			verification: { storeInDatabase: false },
+			secondaryStorage: storage,
+		});
+		const identifier = "managed-secondary-hashed-alias";
+		const createdAt = new Date(Date.now());
+		const legacyPlain = await createChallenge(plain, {
+			identifier,
+			value: "legacy-plain-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt,
+		});
+		const hashedChallenge = await createChallenge(hashed, {
+			identifier,
+			value: "hashed-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt: new Date(createdAt.getTime() + 1),
+		});
+		expect(await challengeMarkers(plain)).toHaveLength(2);
+		runExclusive.mockClear();
+		const start = deferred();
+		const consume = async (runtime: ManagedRuntime) => {
+			await start.promise;
+			return runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			);
+		};
+		const plainConsume = consume(plain);
+		const hashedConsume = consume(hashed);
+		start.resolve();
+		const results = await Promise.all([plainConsume, hashedConsume]);
+
+		expect(results.filter(Boolean)).toHaveLength(1);
+		expect(results.find(Boolean)?.id).toBe(hashedChallenge.id);
+		expect(results.find(Boolean)?.id).not.toBe(legacyPlain.id);
+		expect(runExclusive).toHaveBeenCalledTimes(2);
+		expect(
+			runExclusive.mock.calls.every(([name]) =>
+				/^verification-consume-v2:/.test(name),
+			),
+		).toBe(true);
+		expect(await challengeMarkers(plain)).toHaveLength(0);
+		expect(store.has(`verification:${hashedChallenge.identifier}`)).toBe(false);
+		expect(store.has(`verification:${identifier}`)).toBe(false);
+	});
+
+	it("burns every managed alias marker when post-commit cleanup partially fails", async () => {
+		const store = new Map<string, string>();
+		const controls: {
+			failDelete?: boolean | ((key: string) => boolean);
+		} = {};
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: secondaryStorage(store, controls),
+			},
+		});
+		const identifier = "managed-secondary-partial-cleanup";
+		const createdAt = new Date(Date.now());
+		runtime.runtimeOptions.verification!.storeIdentifier = "plain";
+		const legacyPlain = await createChallenge(runtime, {
+			identifier,
+			value: "legacy-plain-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt,
+		});
+		runtime.runtimeOptions.verification!.storeIdentifier = "hashed";
+		const hashed = await createChallenge(runtime, {
+			identifier,
+			value: "hashed-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt: new Date(createdAt.getTime() + 1),
+		});
+		controls.failDelete = (key) => key === `verification:${identifier}`;
+
+		expect(
+			await runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).toMatchObject({ id: hashed.id });
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+		expect(store.has(`verification:${hashed.identifier}`)).toBe(false);
+		expect(store.has(`verification:${identifier}`)).toBe(true);
+		expect(
+			await runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).toBeNull();
+		expect(store.has(`verification:${identifier}`)).toBe(true);
+		controls.failDelete = false;
+		const replacement = await createChallenge(runtime, {
+			identifier,
+			value: "fresh-proof",
+			expiresAt: new Date(Date.now() + 60_000),
+			createdAt: new Date(createdAt.getTime() + 2),
+		});
+		runtime.runtimeOptions.verification!.storeIdentifier = "plain";
+		expect(
+			await runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).toMatchObject({ id: replacement.id });
+		expect(replacement.id).not.toBe(legacyPlain.id);
 	});
 
 	it("publishes a consume-then-recreate replacement after cache deletion", async () => {
