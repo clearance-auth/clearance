@@ -9,7 +9,7 @@ import { createAuthEndpoint } from "@clearance/core/api";
 import { runWithRequestState } from "@clearance/core/context";
 import type { Endpoint } from "@clearance/call";
 import { createOTP } from "@clearance/utils/otp";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { dispatchAuthEndpoint } from "../../../api/dispatch";
 import { init } from "../../../context/init";
 import { symmetricDecrypt, symmetricEncrypt } from "../../../crypto";
@@ -20,7 +20,6 @@ import {
 } from "../../../internal/authentication-policy";
 import { createInternalSessionIssuanceContext } from "../../../internal/session-issuance-context";
 import { generateBackupCodes } from "../backup-codes";
-import { schema as passkeySchema } from "../../passkey/schema";
 import { twoFactor } from "..";
 import type { TwoFactorTable } from "../types";
 
@@ -60,7 +59,7 @@ async function setup(
 		baseURL: "http://localhost:3000",
 		secret: "recovery-totp-test-secret-with-sufficient-length",
 		database,
-		plugins: [{ id: "passkey", schema: passkeySchema }, plugin],
+		plugins: [plugin],
 	} satisfies ClearanceOptions;
 	const reader = {
 		async readForSubject(
@@ -338,6 +337,34 @@ describe.sequential("recovery-only TOTP repair", () => {
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
 	});
 
+	it("maps corrupt pending secret material to a generic terminal recovery failure", async () => {
+		const runtime = await setup();
+		const enrollment = await beginEnrollment(runtime);
+		await runtime.context.adapter.update({
+			model: runtime.table,
+			where: [{ field: "id", value: enrollment.factor.id }],
+			update: { pendingSecret: "corrupt-recovery-secret-envelope" },
+		});
+		const response = await dispatch(
+			runtime.context,
+			runtime.endpoints.recoveryRepairTOTPVerify!,
+			enrollment.cookie,
+			{ code: "123456" },
+		);
+		expect(response.status).toBe(401);
+		expect(await response.clone().json()).toMatchObject({
+			code: "INVALID_STAGED_AUTHENTICATION",
+		});
+		const factor = (await runtime.context.adapter.findOne<TwoFactorTable>({
+			model: runtime.table,
+			where: [{ field: "id", value: enrollment.factor.id }],
+		}))!;
+		expect(factor.verified).toBe(false);
+		expect(factor.failedVerificationCount).toBe(0);
+		expect(factor.activeVerificationReservations).toBe("[]");
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+	});
+
 	it("enforces recovery lockout while invalid attempts rotate one-use retries", async () => {
 		const runtime = await setup();
 		const enrollment = await beginEnrollment(runtime);
@@ -516,6 +543,63 @@ describe.sequential("recovery-only TOTP repair", () => {
 			),
 		]);
 		expect(responses.filter((response) => response.status === 200)).toHaveLength(1);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
+	});
+
+	it("does not partially consume the counter when activation loses its exact CAS", async () => {
+		const runtime = await setup();
+		const enrollment = await beginEnrollment(runtime);
+		const originalTransaction = runtime.context.adapter.transaction.bind(
+			runtime.context.adapter,
+		);
+		let injectedRace = false;
+		vi.spyOn(runtime.context.adapter, "transaction").mockImplementation(
+			async (callback) =>
+				originalTransaction(async (transactionAdapter) => {
+					const originalIncrementOne = transactionAdapter.incrementOne.bind(
+						transactionAdapter,
+					);
+					const incrementOne: typeof transactionAdapter.incrementOne = async (
+						input,
+					) => {
+						const set = input.set as Record<string, unknown> | undefined;
+						if (
+							!injectedRace &&
+							input.model === runtime.table &&
+							set?.pendingSecret === null &&
+							typeof set.lastUsedTotpCounter === "number"
+						) {
+							injectedRace = true;
+							await transactionAdapter.update({
+								model: runtime.table,
+								where: [{ field: "id", value: enrollment.factor.id }],
+								update: { backupCodes: "concurrently-replaced-backup-codes" },
+							});
+						}
+						return originalIncrementOne(input);
+					};
+					transactionAdapter.incrementOne = incrementOne;
+					return callback(transactionAdapter);
+				}),
+		);
+
+		const response = await dispatch(
+			runtime.context,
+			runtime.endpoints.recoveryRepairTOTPVerify!,
+			enrollment.cookie,
+			{ code: await createOTP(enrollment.secret).totp() },
+		);
+		expect(response.status).toBe(401);
+		expect(injectedRace).toBe(true);
+		const factor = (await runtime.context.adapter.findOne<TwoFactorTable>({
+			model: runtime.table,
+			where: [{ field: "id", value: enrollment.factor.id }],
+		}))!;
+		expect(factor.verified).toBe(false);
+		expect(factor.pendingSecret).toBeTruthy();
+		expect(factor.pendingBackupCodes).toBeTruthy();
+		expect(factor.lastUsedTotpCounter).toBe(-1);
+		expect(factor.activeVerificationReservations).toBe("[]");
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
 	});
 });
