@@ -22,4 +22,8 @@ export const TWO_FACTOR_ERROR_CODES = defineErrorCodes({
 	LAST_FACTOR_PROTECTED:
 		"A password or passkey must remain before two-factor authentication can be disabled",
 	LIFECYCLE_CONFLICT: "Recovery factor state changed. Please try again",
+	INVALID_STAGED_AUTHENTICATION:
+		"This authentication step is invalid or has expired. Start again.",
+	STAGED_FACTOR_VERIFICATION_REQUIRED:
+		"An existing authentication factor must be verified before enrollment.",
 });
