@@ -15,6 +15,16 @@ import type {
 	TeamMember,
 } from "./schema";
 
+/**
+ * Additional fields must use names outside a model's built-in schema. The
+ * runtime rejects reserved names before endpoint input schemas are built.
+ */
+type NonCoreAdditionalFields<ReservedField extends string> = Omit<
+	Record<string, DBFieldAttribute>,
+	ReservedField
+> &
+	Partial<Record<ReservedField, never>>;
+
 export interface OrganizationOptions {
 	/**
 	 * Configure whether new users are able to create new organizations.
@@ -301,38 +311,38 @@ export interface OrganizationOptions {
 				organization?: {
 					modelName?: string;
 					fields?: {
-						[key in keyof Omit<Organization, "id">]?: string;
+						[key in keyof Omit<Organization, "id"> | "updatedAt"]?: string;
 					};
-					additionalFields?: {
-						[key in string]: DBFieldAttribute;
-					};
+					additionalFields?: NonCoreAdditionalFields<
+						keyof Organization | "id" | "_id" | "updatedAt"
+					>;
 				};
 				member?: {
 					modelName?: string;
 					fields?: {
 						[key in keyof Omit<Member, "id">]?: string;
 					};
-					additionalFields?: {
-						[key in string]: DBFieldAttribute;
-					};
+					additionalFields?: NonCoreAdditionalFields<
+						keyof Member | "id" | "_id"
+					>;
 				};
 				invitation?: {
 					modelName?: string;
 					fields?: {
 						[key in keyof Omit<Invitation, "id">]?: string;
 					};
-					additionalFields?: {
-						[key in string]: DBFieldAttribute;
-					};
+					additionalFields?: NonCoreAdditionalFields<
+						keyof Invitation | "id" | "_id"
+					>;
 				};
 				team?: {
 					modelName?: string;
 					fields?: {
 						[key in keyof Omit<Team, "id">]?: string;
 					};
-					additionalFields?: {
-						[key in string]: DBFieldAttribute;
-					};
+					additionalFields?: NonCoreAdditionalFields<
+						keyof Team | "id" | "_id"
+					>;
 				};
 				teamMember?: {
 					modelName?: string;
@@ -345,9 +355,9 @@ export interface OrganizationOptions {
 					fields?: {
 						[key in keyof Omit<OrganizationRole, "id">]?: string;
 					};
-					additionalFields?: {
-						[key in string]: DBFieldAttribute;
-					};
+					additionalFields?: NonCoreAdditionalFields<
+						keyof OrganizationRole | "id" | "_id"
+					>;
 				};
 		  }
 		| undefined;
