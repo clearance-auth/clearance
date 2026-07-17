@@ -97,6 +97,7 @@ type RecoveryRepairAuthorityRecord = Readonly<{
 	twoFactorTable: string;
 	recoveryFactorId: string;
 	recoveryProofDigest: string;
+	consumedRecoveryCodeDigest: string;
 	sourceFactorFingerprint: string;
 	sourceSecretDigest: string;
 	postConsumeBackupCodesDigest: string;
@@ -105,6 +106,23 @@ type RecoveryRepairAuthorityRecord = Readonly<{
 }>;
 
 const recoveryRepairAuthorities = new WeakMap<object, RecoveryRepairAuthorityRecord>();
+
+export function digestRecoveryRepairCode(
+	ctx: GenericEndpointContext,
+	twoFactorTable: string,
+	recoveryFactorId: string,
+	code: string,
+): Promise<string> {
+	return createHMAC("SHA-256", "base64urlnopad").sign(
+		ctx.context.secret,
+		JSON.stringify([
+			"two-factor-recovery-repair-consumed-code:v1",
+			twoFactorTable,
+			recoveryFactorId,
+			code,
+		]),
+	);
+}
 
 type HashedBackupCodesEnvelope = {
 	version: 1;
@@ -455,6 +473,12 @@ export async function consumeBackupCodeForRecoveryRepair(
 		factor.backupCodes,
 		verified.updated,
 	]);
+	const consumedRecoveryCodeDigest = await digestRecoveryRepairCode(
+		ctx,
+		twoFactorTable,
+		factor.id,
+		code,
+	);
 	const authority = Object.freeze({});
 	recoveryRepairAuthorities.set(
 		authority,
@@ -466,6 +490,7 @@ export async function consumeBackupCodeForRecoveryRepair(
 			sourceFactorFingerprint,
 			sourceSecretDigest,
 			postConsumeBackupCodesDigest,
+			consumedRecoveryCodeDigest,
 			sourceTrustDeviceGeneration,
 			transactionAdapter: adapter,
 		}),
@@ -489,6 +514,7 @@ export async function takeBackupCodeRecoveryRepairAuthority(
 			twoFactorTable: string;
 			recoveryFactorId: string;
 			recoveryProofDigest: string;
+			consumedRecoveryCodeDigest: string;
 			sourceFactorFingerprint: string;
 			sourceSecretDigest: string;
 			postConsumeBackupCodesDigest: string;
@@ -512,6 +538,7 @@ export async function takeBackupCodeRecoveryRepairAuthority(
 		twoFactorTable: record.twoFactorTable,
 		recoveryFactorId: record.recoveryFactorId,
 		recoveryProofDigest: record.recoveryProofDigest,
+		consumedRecoveryCodeDigest: record.consumedRecoveryCodeDigest,
 		sourceFactorFingerprint: record.sourceFactorFingerprint,
 		sourceSecretDigest: record.sourceSecretDigest,
 		postConsumeBackupCodesDigest: record.postConsumeBackupCodesDigest,
