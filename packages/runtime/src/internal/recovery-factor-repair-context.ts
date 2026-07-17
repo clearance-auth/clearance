@@ -42,6 +42,9 @@ export type RecoveryFactorRepairIntent = "passkey" | "totp";
 export type RecoveryFactorRepairLineage = Readonly<{
 	subjectId: string;
 	repairFactor: RecoveryFactorRepairIntent;
+	twoFactorTable: string;
+	recoveryFactorId: string;
+	trustDeviceGeneration: string;
 	stage: RecoveryFactorRepairStage;
 	binding: string;
 	rootFlowId: string;
@@ -290,6 +293,9 @@ function lineageView(metadata: RecoveryMetadata): RecoveryFactorRepairLineage {
 	return Object.freeze({
 		subjectId: metadata.subjectId,
 		repairFactor: metadata.repairFactor,
+		twoFactorTable: metadata.twoFactorTable,
+		recoveryFactorId: metadata.recoveryFactorId,
+		trustDeviceGeneration: metadata.trustDeviceGeneration,
 		stage: metadata.stage,
 		binding: metadata.binding,
 		rootFlowId: metadata.rootFlowId,
@@ -305,6 +311,9 @@ export function createRecoveryFactorRepairBinding(
 ): Promise<string> {
 	if (
 		!text(lineage.subjectId) ||
+		!TABLE.test(lineage.twoFactorTable) ||
+		!text(lineage.recoveryFactorId, 512) ||
+		!text(lineage.trustDeviceGeneration, 128) ||
 		!text(lineage.rootFlowId, 128) ||
 		!DIGEST.test(lineage.parentDigest) ||
 		!DIGEST.test(lineage.seedFingerprint) ||
@@ -319,6 +328,9 @@ export function createRecoveryFactorRepairBinding(
 			"recovery-factor-repair-binding:v1",
 			lineage.subjectId,
 			lineage.repairFactor,
+			lineage.twoFactorTable,
+			lineage.recoveryFactorId,
+			lineage.trustDeviceGeneration,
 			lineage.rootFlowId,
 			lineage.seedFingerprint,
 			lineage.expiresAt.toISOString(),
