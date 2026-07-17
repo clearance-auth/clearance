@@ -340,9 +340,10 @@ describe.sequential("managed TOTP remediation", () => {
 		expect(await response.json()).toMatchObject({ mode: "verification" });
 	});
 
-	it("replaces a disabled legacy-null TOTP instead of accepting it as proof", async () => {
+	it("uses a legacy-null TOTP despite a stale disabled user marker", async () => {
+		const secret = "disabled-legacy-null-totp-secret";
 		const runtime = await setup({
-			verifiedSecret: "disabled-legacy-null-totp-secret",
+			verifiedSecret: secret,
 			legacyNull: true,
 			twoFactorEnabled: false,
 		});
@@ -352,22 +353,21 @@ describe.sequential("managed TOTP remediation", () => {
 			await start(runtime),
 		);
 		expect(options.status, await options.clone().text()).toBe(200);
-		expect(await options.clone().json()).toMatchObject({ mode: "enrollment" });
-		const factor = (await rows(runtime))[0]!;
-		expect(factor.verified).toBe(false);
-		const replacementSecret = await symmetricDecrypt({
-			key: runtime.context.secretConfig,
-			data: factor.secret,
-		});
-		expect(replacementSecret).not.toBe("disabled-legacy-null-totp-secret");
+		expect(await options.clone().json()).toMatchObject({ mode: "verification" });
 		const verified = await dispatch(
 			runtime.context,
 			runtime.verify,
 			cookie(options),
-			{ code: await createOTP(replacementSecret).totp() },
+			{ code: await createOTP(secret).totp() },
 		);
 		expect(verified.status, await verified.clone().text()).toBe(200);
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+		expect((await rows(runtime))[0]!.verified).toBe(true);
+		expect(
+			(await runtime.context.internalAdapter.findUserById(runtime.user.id) as {
+				twoFactorEnabled?: boolean;
+			}).twoFactorEnabled,
+		).toBe(true);
 	});
 
 	it("burns invalid verification and durably records the account failure", async () => {

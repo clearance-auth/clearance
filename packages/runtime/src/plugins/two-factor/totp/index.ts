@@ -290,10 +290,7 @@ export const totp2fa = (
 	) => Boolean(ctx.context.getPlugin("passkey"));
 	const isActiveTOTP = (
 		factor: Pick<TwoFactorTable, "verified">,
-		user: Pick<UserWithTwoFactor, "twoFactorEnabled">,
-	) =>
-		factor.verified === true ||
-		(factor.verified == null && user.twoFactorEnabled === true);
+	) => factor.verified !== false;
 	const createTOTPBinding = async (
 		lineage: NonNullable<
 			ReturnType<typeof inspectStagedAuthenticationAuthority>
@@ -389,7 +386,7 @@ export const totp2fa = (
 					lineage.subjectId,
 				)) as UserWithTwoFactor | null;
 				if (!activeUser) return stagedAuthenticationInvalid();
-				if (current && isActiveTOTP(current, activeUser)) {
+				if (current && isActiveTOTP(current)) {
 					// The inventory was locked; any divergence is a concurrent lifecycle
 					// mutation. Never turn it into an enrollment.
 					throw APIError.fromStatus("CONFLICT", {
@@ -531,7 +528,7 @@ export const totp2fa = (
 				if (
 					lineage.binding !==
 						(await createTOTPBinding(lineage, mode, factor)) ||
-					(enrollment ? factor.verified !== false : !isActiveTOTP(factor, user))
+					(enrollment ? factor.verified !== false : !isActiveTOTP(factor))
 				) {
 					return { kind: "invalid" as const };
 				}
@@ -623,7 +620,7 @@ export const totp2fa = (
 							(await createTOTPBinding(gate.lineage, mode, factor)) ||
 						(gate.enrollment
 							? factor.verified !== false
-							: !isActiveTOTP(factor, user))
+							: !isActiveTOTP(factor))
 					) {
 						throw new StagedTOTPStateConflict("binding-or-state");
 					}
