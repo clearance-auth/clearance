@@ -6,6 +6,8 @@ import {
 	parseInternalSessionOutput,
 	parseSessionInput,
 	parseSessionOutput,
+	parseUserInput,
+	parseUserOutput,
 } from "./schema";
 
 const reservedAuthority = {
@@ -71,5 +73,73 @@ describe("reserved session assurance projection", () => {
 		expect(parseInternalSessionOutput(options, session).token).toBe(
 			session.token,
 		);
+	});
+
+	it("keeps shared factor lifecycle generations private and non-writable despite hostile schemas", () => {
+		const maliciousFactorFields = Object.fromEntries(
+			[
+				"passkeySessionGeneration",
+				"twoFactorSessionGeneration",
+			].map((field) => [
+				field,
+				{
+					type: "json",
+					required: true,
+					input: true,
+					returned: true,
+					defaultValue: "attacker-controlled",
+					fieldName: `attacker_${field}`,
+				},
+			]),
+		);
+		const options = {
+			baseURL: "http://localhost:3000",
+			secret: "hostile-factor-schema-secret",
+			user: { additionalFields: maliciousFactorFields },
+			session: { additionalFields: maliciousFactorFields },
+			plugins: [
+				{
+					id: "unrelated-malicious-plugin",
+					schema: {
+						user: { fields: maliciousFactorFields },
+						session: { fields: maliciousFactorFields },
+					},
+				},
+			],
+		} as ClearanceOptions;
+		const generations = {
+			passkeySessionGeneration: "attacker-passkey-generation",
+			twoFactorSessionGeneration: "attacker-two-factor-generation",
+		};
+
+		expect(() => parseUserInput(options, generations, "update")).toThrow(
+			"passkeySessionGeneration is not allowed to be set",
+		);
+		expect(() => parseSessionInput(options, generations as never, "update")).toThrow(
+			"passkeySessionGeneration is not allowed to be set",
+		);
+		expect(
+			parseUserOutput(options, {
+				id: "user_1",
+				name: "Factor user",
+				email: "factor@example.test",
+				emailVerified: true,
+				image: null,
+				createdAt: new Date("2026-07-17T00:00:00.000Z"),
+				updatedAt: new Date("2026-07-17T00:00:00.000Z"),
+				...generations,
+			}),
+		).not.toHaveProperty("passkeySessionGeneration");
+		expect(
+			parseSessionOutput(options, {
+				id: "session_1",
+				token: "presented-secret",
+				userId: "user_1",
+				expiresAt: new Date("2026-07-18T00:00:00.000Z"),
+				createdAt: new Date("2026-07-17T00:00:00.000Z"),
+				updatedAt: new Date("2026-07-17T00:00:00.000Z"),
+				...generations,
+			} as Session),
+		).not.toHaveProperty("twoFactorSessionGeneration");
 	});
 });
