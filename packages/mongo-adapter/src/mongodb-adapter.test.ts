@@ -1,5 +1,6 @@
 import { ObjectId, UUID } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
+import { runWithTransaction } from "@clearance/core/context";
 import { mongodbAdapter } from "./mongodb-adapter";
 
 type TestIndex = {
@@ -142,6 +143,20 @@ async function createPasskeyIndexedAdapter() {
 	return { adapter, db };
 }
 
+function createTransactionAdapter(session: {
+	withTransaction: any;
+	endSession: () => Promise<void>;
+}) {
+	const client = {
+		startSession: vi.fn(() => session),
+	};
+	const adapter = mongodbAdapter(
+		{ collection: vi.fn() } as any,
+		{ client: client as any },
+	)({});
+	return { adapter, client };
+}
+
 describe("mongodb-adapter", () => {
 	it("should create mongodb adapter", () => {
 		const db = {
@@ -149,6 +164,123 @@ describe("mongodb-adapter", () => {
 		} as any;
 		const adapter = mongodbAdapter(db);
 		expect(adapter).toBeDefined();
+	});
+
+	it("re-runs the complete transaction callback when the driver retries a transient conflict", async () => {
+		let attempts = 0;
+		const transientConflict = Object.assign(new Error("write conflict"), {
+			hasErrorLabel: (label: string) => label === "TransientTransactionError",
+		});
+		const session = {
+			withTransaction: vi.fn(async <T,>(callback: () => Promise<T>) => {
+				try {
+					return await callback();
+				} catch (error) {
+					if (
+						error === transientConflict &&
+						transientConflict.hasErrorLabel("TransientTransactionError")
+					) {
+						return callback();
+					}
+					throw error;
+				}
+			}),
+			startTransaction: vi.fn(),
+			commitTransaction: vi.fn(async () => {}),
+			abortTransaction: vi.fn(async () => {}),
+			endSession: vi.fn(async () => {}),
+		};
+		const { adapter, client } = createTransactionAdapter(session);
+
+		const result = await adapter.transaction(async () => {
+			attempts += 1;
+			if (attempts === 1) throw transientConflict;
+			return { outcome: "team-cap-domain-result" };
+		});
+
+		expect(result).toEqual({ outcome: "team-cap-domain-result" });
+		expect(attempts).toBe(2);
+		expect(session.withTransaction).toHaveBeenCalledTimes(1);
+		expect(client.startSession).toHaveBeenCalledTimes(1);
+		expect(session.startTransaction).not.toHaveBeenCalled();
+		expect(session.commitTransaction).not.toHaveBeenCalled();
+		expect(session.abortTransaction).not.toHaveBeenCalled();
+		expect(session.endSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not retry non-transient transaction callback errors", async () => {
+		let attempts = 0;
+		const applicationError = new Error("organization role is invalid");
+		const session = {
+			withTransaction: vi.fn(async <T,>(callback: () => Promise<T>) => callback()),
+			startTransaction: vi.fn(),
+			commitTransaction: vi.fn(async () => {}),
+			abortTransaction: vi.fn(async () => {}),
+			endSession: vi.fn(async () => {}),
+		};
+		const { adapter } = createTransactionAdapter(session);
+
+		await expect(
+			adapter.transaction(async () => {
+				attempts += 1;
+				throw applicationError;
+			}),
+		).rejects.toBe(applicationError);
+
+		expect(attempts).toBe(1);
+		expect(session.withTransaction).toHaveBeenCalledTimes(1);
+		expect(session.abortTransaction).not.toHaveBeenCalled();
+		expect(session.endSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets the driver retry uncertain commits without re-running the callback", async () => {
+		let callbackAttempts = 0;
+		let commitAttempts = 0;
+		const session = {
+			withTransaction: vi.fn(async <T,>(callback: () => Promise<T>) => {
+				const result = await callback();
+				// MongoDB's driver handles UnknownTransactionCommitResult by retrying
+				// commitTransaction internally, without invoking the callback again.
+				commitAttempts += 1;
+				commitAttempts += 1;
+				return result;
+			}),
+			startTransaction: vi.fn(),
+			commitTransaction: vi.fn(async () => {}),
+			abortTransaction: vi.fn(async () => {}),
+			endSession: vi.fn(async () => {}),
+		};
+		const { adapter } = createTransactionAdapter(session);
+
+		await expect(
+			adapter.transaction(async () => {
+				callbackAttempts += 1;
+				return "committed";
+			}),
+		).resolves.toBe("committed");
+
+		expect(callbackAttempts).toBe(1);
+		expect(commitAttempts).toBe(2);
+		expect(session.commitTransaction).not.toHaveBeenCalled();
+		expect(session.endSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps nested transaction contexts inside the active driver transaction", async () => {
+		const session = {
+			withTransaction: vi.fn(async <T,>(callback: () => Promise<T>) => callback()),
+			endSession: vi.fn(async () => {}),
+		};
+		const { adapter, client } = createTransactionAdapter(session);
+
+		await expect(
+			runWithTransaction(adapter, () =>
+				runWithTransaction(adapter, () => "nested transaction result"),
+			),
+		).resolves.toBe("nested transaction result");
+
+		expect(session.withTransaction).toHaveBeenCalledTimes(1);
+		expect(client.startSession).toHaveBeenCalledTimes(1);
+		expect(session.endSession).toHaveBeenCalledTimes(1);
 	});
 
 	it("consumeOne returns the deleted document from Mongo metadata", async () => {
