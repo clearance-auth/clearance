@@ -12,6 +12,7 @@ import {
 	attachStagedAuthenticationContinuation,
 	consumePreloadedStagedAuthenticationCapability,
 	createStagedAuthenticationBinding,
+	createStagedAuthenticationRecoveryRepairBridge,
 	createStagedSessionIssuanceContext,
 	expireStagedAuthenticationCookie,
 	getStagedAuthenticationFactorInventory,
@@ -20,6 +21,7 @@ import {
 	preloadStagedAuthenticationCapability,
 	readStagedAuthenticationLineage,
 	rotateStagedAuthenticationCapability,
+	takeStagedAuthenticationRecoveryRepairBridge,
 	takeStagedAuthenticationContinuation,
 } from "./staged-authentication-context";
 
@@ -376,6 +378,78 @@ describe("staged authentication continuation authority", () => {
 			totp: false,
 			totpRecord: null,
 		});
+	});
+
+	it("commits a one-shot recovery bridge that is rollback-safe and session-ineligible", async () => {
+		const context = await createContext();
+		const issued = await issue(context, { allowedFactors: ["passkey"] });
+		const ctx = endpoint(context, issued.bearer);
+		const preloaded = await preloadStagedAuthenticationCapability(ctx, {
+			stage: "select_factor",
+		});
+		let stagedAuthority: object | null = null;
+		const bridge = await runWithTransaction(context.adapter, async () => {
+			stagedAuthority = await consumePreloadedStagedAuthenticationCapability(
+				ctx,
+				preloaded!,
+			);
+			return createStagedAuthenticationRecoveryRepairBridge(
+				ctx,
+				stagedAuthority!,
+				"passkey",
+			);
+		});
+		await expect(
+			createStagedSessionIssuanceContext(ctx, stagedAuthority!, {
+				factorMethod: "passkey",
+				factorAt: new Date(),
+				binding: "initial",
+			}),
+		).rejects.toThrow("Invalid staged authentication authority");
+		const taken = await runWithTransaction(context.adapter, () =>
+			takeStagedAuthenticationRecoveryRepairBridge(ctx, bridge),
+		);
+		expect(taken).toMatchObject({
+			subjectId: "user_1",
+			repairFactor: "passkey",
+			projectId: "project_1",
+			environmentId: "environment_1",
+		});
+		expect(
+			await runWithTransaction(context.adapter, () =>
+				takeStagedAuthenticationRecoveryRepairBridge(ctx, bridge),
+			),
+		).toBeNull();
+
+		const rolledIssue = await issue(context, { allowedFactors: ["passkey"] });
+		const rolledCtx = endpoint(context, rolledIssue.bearer);
+		const rolledPreload = await preloadStagedAuthenticationCapability(rolledCtx, {
+			stage: "select_factor",
+		});
+		let rolledBridge: object | null = null;
+		await expect(
+			runWithTransaction(context.adapter, async () => {
+				const authority =
+					await consumePreloadedStagedAuthenticationCapability(
+						rolledCtx,
+						rolledPreload!,
+					);
+				rolledBridge = await createStagedAuthenticationRecoveryRepairBridge(
+					rolledCtx,
+					authority!,
+					"passkey",
+				);
+				throw new Error("rollback");
+			}),
+		).rejects.toThrow("rollback");
+		expect(
+			await runWithTransaction(context.adapter, () =>
+				takeStagedAuthenticationRecoveryRepairBridge(
+					rolledCtx,
+					rolledBridge!,
+				),
+			),
+		).toBeNull();
 	});
 
 	it("reads eligible TOTP authority from the configured custom table", async () => {
