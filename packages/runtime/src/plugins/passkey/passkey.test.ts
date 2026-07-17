@@ -1,5 +1,6 @@
 import { base64Url } from "@clearance/utils/base64";
 import { describe, expect, it, vi } from "vitest";
+import { getSessionCookie } from "../../cookies";
 import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
@@ -7,6 +8,25 @@ import { admin } from "../admin";
 import { passkey } from ".";
 import type { Passkey, PublicPasskey } from "./types";
 import { createVirtualAuthenticator } from "./virtual-authenticator.test-utils";
+
+const registrationTransactionControl = vi.hoisted(() => ({
+	beforeNext: null as (() => Promise<void>) | null,
+}));
+
+vi.mock("@clearance/core/context", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@clearance/core/context")>();
+	return {
+		...actual,
+		runWithTransaction: async (
+			...args: Parameters<typeof actual.runWithTransaction>
+		) => {
+			const beforeNext = registrationTransactionControl.beforeNext;
+			registrationTransactionControl.beforeNext = null;
+			if (beforeNext) await beforeNext();
+			return actual.runWithTransaction(...args);
+		},
+	};
+});
 
 const ORIGIN = "http://localhost:3300";
 
@@ -712,31 +732,109 @@ describe("passkey: authoritative recent-enrollment session gate", () => {
 		).rejects.toThrow();
 	});
 
-	it("rejects verifying a registration once the session has been revoked from the database", async () => {
+	it("rejects a source session revoked after registration options without creating a credential", async () => {
+		const { auth, headers } = await setup();
+		const context = await auth.$context;
+		const token = getSessionCookie(headers)?.split(".")[0];
+		if (!token) throw new Error("presented session token missing");
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const options = await auth.api.generatePasskeyRegistrationOptions({ headers });
+		registrationTransactionControl.beforeNext = async () => {
+			await context.internalAdapter.deleteSession(token);
+		};
+
+		const response = await auth.api.verifyPasskeyRegistration({
+			headers,
+			body: {
+				response: authenticator.registrationResponse(options.challenge),
+			},
+			asResponse: true,
+		});
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ code: "REGISTRATION_FAILED" });
+		await expect(context.adapter.count({ model: "passkey" })).resolves.toBe(0);
+	});
+
+	it("rejects a source session made stale after registration options without creating a credential", async () => {
+		const instance = await getTestInstance(
+			{
+				baseURL: ORIGIN,
+				session: { freshAge: 60 },
+				plugins: [passkey()],
+			},
+			{ port: 3300 },
+		);
+		const signedIn = await instance.signInWithTestUser();
+		signedIn.headers.set("origin", ORIGIN);
+		const context = await instance.auth.$context;
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const options = await instance.auth.api.generatePasskeyRegistrationOptions({
+			headers: signedIn.headers,
+		});
+		registrationTransactionControl.beforeNext = async () => {
+			await context.adapter.update({
+				model: "session",
+				where: [{ field: "id", value: signedIn.session.id }],
+				update: { createdAt: new Date(Date.now() - 60_001) },
+			});
+		};
+
+		const response = await instance.auth.api.verifyPasskeyRegistration({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.registrationResponse(options.challenge),
+			},
+			asResponse: true,
+		});
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ code: "REGISTRATION_FAILED" });
+		await expect(context.adapter.count({ model: "passkey" })).resolves.toBe(0);
+	});
+
+	it("rejects a changed user handle after registration options without creating a credential", async () => {
 		const { auth, headers } = await setup();
 		const context = await auth.$context;
 		const user = await context.internalAdapter
 			.findUserByEmail("test@test.com")
-			.then((res) => res?.user);
-		await context.internalAdapter.deleteUserSessions(user!.id);
+			.then((result) => result?.user);
+		if (!user) throw new Error("test user missing");
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const options = await auth.api.generatePasskeyRegistrationOptions({ headers });
+		registrationTransactionControl.beforeNext = async () => {
+			await context.adapter.update({
+				model: "user",
+				where: [{ field: "id", value: user.id }],
+				update: { passkeyUserHandle: `changed-${Math.random()}` },
+			});
+		};
+
+		const response = await auth.api.verifyPasskeyRegistration({
+			headers,
+			body: {
+				response: authenticator.registrationResponse(options.challenge),
+			},
+			asResponse: true,
+		});
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ code: "REGISTRATION_FAILED" });
+		await expect(context.adapter.count({ model: "passkey" })).resolves.toBe(0);
+	});
+
+	it("creates a credential when the authoritative source session and user handle remain stable", async () => {
+		const { auth, headers } = await setup();
+		const context = await auth.$context;
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const options = await auth.api.generatePasskeyRegistrationOptions({ headers });
 
 		await expect(
 			auth.api.verifyPasskeyRegistration({
 				headers,
 				body: {
-					response: {
-						id: "some-id",
-						rawId: "some-id",
-						type: "public-key",
-						clientExtensionResults: {},
-						response: {
-							clientDataJSON: clientDataFor("webauthn.create", "does-not-matter"),
-							attestationObject: base64Url.encode("attestation", { padding: false }),
-						},
-					},
+					response: authenticator.registrationResponse(options.challenge),
 				},
 			}),
-		).rejects.toThrow();
+		).resolves.toMatchObject({ id: expect.any(String) });
+		await expect(context.adapter.count({ model: "passkey" })).resolves.toBe(1);
 	});
 });
 
