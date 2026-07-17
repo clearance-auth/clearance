@@ -17,6 +17,7 @@ import { encodeBackupCodes } from "../two-factor/backup-codes";
 import { twoFactor } from "../two-factor";
 import type { TwoFactorTable } from "../two-factor/types";
 import { passkey } from ".";
+import { digestPasskeyChallenge } from "./challenge";
 import { createVirtualAuthenticator } from "./virtual-authenticator.test-utils";
 
 const ORIGIN = "http://localhost:3300";
@@ -171,6 +172,23 @@ async function options(
 	return { body, next, response };
 }
 
+async function challengeExpiry(
+	fixture: Awaited<ReturnType<typeof setup>>,
+	challenge: string,
+): Promise<Date> {
+	const record = await fixture.context.adapter.findOne<{ expiresAt: Date }>({
+		model: "passkeyChallenge",
+		where: [
+			{
+				field: "digestId",
+				value: await digestPasskeyChallenge("recovery-registration", challenge),
+			},
+		],
+	});
+	expect(record).toBeTruthy();
+	return new Date(record!.expiresAt);
+}
+
 describe("passkey recovery repair", () => {
 	it("refuses passkey recovery when durable attempt lockout is disabled", async () => {
 		const fixture = await setup(false);
@@ -220,47 +238,134 @@ describe("passkey recovery repair", () => {
 		).toBe(1);
 	});
 
-	it("burns a failed proof and issues a recovery-only retry ceremony", async () => {
+	it("burns every rejected proof and issues a deadline-preserving recovery-only retry", async () => {
 		const fixture = await setup();
 		const issued = await options(fixture, await beginRepair(fixture));
+		const deadline = await challengeExpiry(fixture, issued.body.challenge);
 		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
 		const wrongOrigin = new Headers(issued.next);
 		wrongOrigin.set("origin", "http://wrong.example.test");
-		await expect(
-			(fixture.instance.auth.api as any).verifyPasskeyRecoveryRepairRegistration({
+		const rejectedOrigin = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
 				headers: wrongOrigin,
 				body: { response: authenticator.registrationResponse(issued.body.challenge) },
-			}),
-		).rejects.toMatchObject({ body: { code: "REMEDIATION_FAILED" } });
-		const failed = await (fixture.instance.auth.api as any)
+				asResponse: true,
+			});
+		expect(rejectedOrigin.status).toBe(401);
+		expect(rejectedOrigin.headers.get("set-cookie")).toContain(
+			"recovery_factor_repair",
+		);
+		const predecessorReplay = await (fixture.instance.auth.api as any)
 			.verifyPasskeyRecoveryRepairRegistration({
 				headers: issued.next,
+				body: { response: authenticator.registrationResponse(issued.body.challenge) },
+				asResponse: true,
+			});
+		expect(predecessorReplay.status).toBe(401);
+
+		const retryHeaders = convertSetCookieToCookie(rejectedOrigin.headers);
+		retryHeaders.set("origin", ORIGIN);
+		const retried = await options(fixture, retryHeaders);
+		expect(await challengeExpiry(fixture, retried.body.challenge)).toEqual(deadline);
+		const retryAuthenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const rejectedUv = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: retried.next,
 				body: {
-					response: authenticator.registrationResponse(issued.body.challenge, {
+					response: retryAuthenticator.registrationResponse(retried.body.challenge, {
 						userVerified: false,
 					}),
 				},
 				asResponse: true,
 			});
-		expect(failed.status).toBe(401);
-		expect((await failed.clone().json()).code).toBe("REMEDIATION_FAILED");
-		expect(failed.headers.get("set-cookie")).toContain("recovery_factor_repair");
-		const replay = await (fixture.instance.auth.api as any)
+		expect(rejectedUv.status).toBe(401);
+		expect((await rejectedUv.clone().json()).code).toBe("REMEDIATION_FAILED");
+		expect(rejectedUv.headers.get("set-cookie")).toContain("recovery_factor_repair");
+		const rejectedUvReplay = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: retried.next,
+				body: { response: retryAuthenticator.registrationResponse(retried.body.challenge) },
+				asResponse: true,
+			});
+		expect(rejectedUvReplay.status).toBe(401);
+
+		const secondRetryHeaders = convertSetCookieToCookie(rejectedUv.headers);
+		secondRetryHeaders.set("origin", ORIGIN);
+		const secondRetry = await options(fixture, secondRetryHeaders);
+		expect(await challengeExpiry(fixture, secondRetry.body.challenge)).toEqual(deadline);
+		const successfulAuthenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const completed = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: secondRetry.next,
+				body: {
+					response: successfulAuthenticator.registrationResponse(secondRetry.body.challenge),
+				},
+				asResponse: true,
+			});
+		expect(completed.status).toBe(200);
+		expect(await fixture.context.adapter.count({ model: "passkey" })).toBe(1);
+		expect(await fixture.context.adapter.count({ model: "session" })).toBe(0);
+	});
+
+	it("burns malformed client data before it can replay and permits a fresh registration", async () => {
+		const fixture = await setup();
+		const issued = await options(fixture, await beginRepair(fixture));
+		const deadline = await challengeExpiry(fixture, issued.body.challenge);
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const malformed = authenticator.registrationResponse(issued.body.challenge);
+		malformed.response.clientDataJSON = "definitely-not-base64url";
+		const rejected = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: issued.next,
+				body: { response: malformed },
+				asResponse: true,
+			});
+		expect(rejected.status).toBe(401);
+		expect(rejected.headers.get("set-cookie")).toContain("recovery_factor_repair");
+
+		const predecessorReplay = await (fixture.instance.auth.api as any)
 			.verifyPasskeyRecoveryRepairRegistration({
 				headers: issued.next,
 				body: { response: authenticator.registrationResponse(issued.body.challenge) },
 				asResponse: true,
 			});
-		expect(replay.status).toBe(401);
-		const retryHeaders = convertSetCookieToCookie(failed.headers);
+		expect(predecessorReplay.status).toBe(401);
+		const retryHeaders = convertSetCookieToCookie(rejected.headers);
 		retryHeaders.set("origin", ORIGIN);
-		const retried = await options(fixture, retryHeaders);
-		const retryAuthenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const retry = await options(fixture, retryHeaders);
+		expect(await challengeExpiry(fixture, retry.body.challenge)).toEqual(deadline);
+		// The malformed proof could not identify and delete its original
+		// challenge. A successor capability must still reject that challenge
+		// because its durable binding is to the newly issued ceremony only.
+		const bindingMismatch = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: retry.next,
+				body: { response: authenticator.registrationResponse(issued.body.challenge) },
+				asResponse: true,
+			});
+		expect(bindingMismatch.status).toBe(401);
+		expect(bindingMismatch.headers.get("set-cookie")).toContain(
+			"recovery_factor_repair",
+		);
+		const bindingPredecessorReplay = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: retry.next,
+				body: { response: authenticator.registrationResponse(retry.body.challenge) },
+				asResponse: true,
+			});
+		expect(bindingPredecessorReplay.status).toBe(401);
+		const finalRetryHeaders = convertSetCookieToCookie(bindingMismatch.headers);
+		finalRetryHeaders.set("origin", ORIGIN);
+		const finalRetry = await options(fixture, finalRetryHeaders);
+		expect(await challengeExpiry(fixture, finalRetry.body.challenge)).toEqual(deadline);
+		const successfulAuthenticator = createVirtualAuthenticator(ORIGIN, "localhost");
 		const completed = await (fixture.instance.auth.api as any)
 			.verifyPasskeyRecoveryRepairRegistration({
-				headers: retried.next,
+				headers: finalRetry.next,
 				body: {
-					response: retryAuthenticator.registrationResponse(retried.body.challenge),
+					response: successfulAuthenticator.registrationResponse(
+						finalRetry.body.challenge,
+					),
 				},
 				asResponse: true,
 			});
