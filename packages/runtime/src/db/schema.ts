@@ -54,6 +54,23 @@ function getFields(
 			};
 		}
 	}
+	// Factor lifecycle generations are shared authentication authority. Their
+	// base schema entry is deliberately restored after extension schemas so user
+	// additional fields and non-owning plugins cannot make either fence writable,
+	// public, required, or map it to another physical column. getAuthTables
+	// preserves the owning passkey/two-factor plugin's explicit fieldName.
+	if (modelName === "user" || modelName === "session") {
+		const factorFields = getAuthTables(options)[modelName]?.fields;
+		for (const field of [
+			"passkeySessionGeneration",
+			"twoFactorSessionGeneration",
+		] as const) {
+			const attributes = factorFields?.[field];
+			if (attributes) {
+				schema[field] = { ...attributes };
+			}
+		}
+	}
 	tableCache.set(cacheKey, schema);
 	return schema;
 }
