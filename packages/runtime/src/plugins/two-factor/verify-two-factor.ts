@@ -378,9 +378,9 @@ export async function reserveTwoFactorAttempt(
 	twoFactor: TwoFactorTable,
 	adapter: DBTransactionAdapter = ctx.context.adapter,
 ): Promise<{
-	restore: () => Promise<void>;
-	recordFailure: () => Promise<void>;
-	recordSuccess: () => Promise<void>;
+	restore: (settlementAdapter?: DBTransactionAdapter) => Promise<void>;
+	recordFailure: (settlementAdapter?: DBTransactionAdapter) => Promise<void>;
+	recordSuccess: (settlementAdapter?: DBTransactionAdapter) => Promise<void>;
 }> {
 	const { enabled, maxFailedAttempts, durationMs } =
 		resolveAccountLockoutConfig(ctx);
@@ -458,11 +458,14 @@ export async function reserveTwoFactorAttempt(
 		if (!reserved) continue;
 
 		let settled = false;
-		const settle = async (failure: boolean) => {
+		const settle = async (
+			failure: boolean,
+			settlementAdapter: DBTransactionAdapter = adapter,
+		) => {
 			if (settled) return;
 			settled = true;
 			for (let retry = 0; retry < 8; retry++) {
-				const latest = await adapter.findOne<TwoFactorTable>({
+				const latest = await settlementAdapter.findOne<TwoFactorTable>({
 					model: twoFactorTable,
 					where: [{ field: "id", value: twoFactor.id }],
 				});
@@ -474,40 +477,41 @@ export async function reserveTwoFactorAttempt(
 				if (index === -1) {
 					if (!failure) return;
 					const nextFailureCount = latestCount + 1;
-					const recorded = await adapter.incrementOne<TwoFactorTable>({
-						model: twoFactorTable,
-						where: [
-							{ field: "id", value: twoFactor.id },
-							{
-								field: "failedVerificationCount",
-								value: latest.failedVerificationCount ?? null,
+					const recorded =
+						await settlementAdapter.incrementOne<TwoFactorTable>({
+							model: twoFactorTable,
+							where: [
+								{ field: "id", value: twoFactor.id },
+								{
+									field: "failedVerificationCount",
+									value: latest.failedVerificationCount ?? null,
+								},
+								{
+									field: "activeVerificationReservations",
+									value: latest.activeVerificationReservations ?? null,
+								},
+								{ field: "lockedUntil", value: null },
+							],
+							increment:
+								latest.failedVerificationCount == null
+									? {}
+									: { failedVerificationCount: 1 },
+							set: {
+								...(latest.failedVerificationCount == null
+									? { failedVerificationCount: 1 }
+									: {}),
+								lockedUntil:
+									nextFailureCount >= maxFailedAttempts
+										? new Date(Date.now() + durationMs)
+										: null,
 							},
-							{
-								field: "activeVerificationReservations",
-								value: latest.activeVerificationReservations ?? null,
-							},
-							{ field: "lockedUntil", value: null },
-						],
-						increment:
-							latest.failedVerificationCount == null
-								? {}
-								: { failedVerificationCount: 1 },
-						set: {
-							...(latest.failedVerificationCount == null
-								? { failedVerificationCount: 1 }
-								: {}),
-							lockedUntil:
-								nextFailureCount >= maxFailedAttempts
-									? new Date(Date.now() + durationMs)
-									: null,
-						},
-					});
+						});
 					if (recorded) return;
 					continue;
 				}
 				const remaining = active.filter((entry) => entry !== reservation);
 				const nextCount = failure ? latestCount : Math.max(0, latestCount - 1);
-				const updated = await adapter.incrementOne<TwoFactorTable>({
+				const updated = await settlementAdapter.incrementOne<TwoFactorTable>({
 					model: twoFactorTable,
 					where: [
 						{ field: "id", value: twoFactor.id },
@@ -535,12 +539,12 @@ export async function reserveTwoFactorAttempt(
 			}
 		};
 		return {
-			restore: () => settle(false),
-			recordFailure: () => settle(true),
-			recordSuccess: async () => {
+			restore: (settlementAdapter) => settle(false, settlementAdapter),
+			recordFailure: (settlementAdapter) => settle(true, settlementAdapter),
+			recordSuccess: async (settlementAdapter = adapter) => {
 				if (settled) return;
 				settled = true;
-				await adapter.update({
+				await settlementAdapter.update({
 					model: twoFactorTable,
 					where: [{ field: "id", value: twoFactor.id }],
 					update: {
@@ -567,10 +571,11 @@ export async function resetTwoFactorFailures(
 	ctx: GenericEndpointContext,
 	twoFactorTable: string,
 	twoFactor: TwoFactorTable,
+	adapter: DBTransactionAdapter = ctx.context.adapter,
 ): Promise<void> {
 	const { enabled } = resolveAccountLockoutConfig(ctx);
 	if (!enabled) return;
-	await ctx.context.adapter.update({
+	await adapter.update({
 		model: twoFactorTable,
 		where: [{ field: "id", value: twoFactor.id }],
 		update: {
@@ -586,10 +591,11 @@ export async function consumeTotpCounter(
 	twoFactorTable: string,
 	twoFactor: TwoFactorTable,
 	counter: number,
+	adapter: DBTransactionAdapter = ctx.context.adapter,
 ): Promise<boolean> {
 	if (counter <= (twoFactor.lastUsedTotpCounter ?? -1)) return false;
 	if (twoFactor.lastUsedTotpCounter == null) {
-		await ctx.context.adapter.incrementOne<TwoFactorTable>({
+		await adapter.incrementOne<TwoFactorTable>({
 			model: twoFactorTable,
 			where: [
 				{ field: "id", value: twoFactor.id },
@@ -604,7 +610,7 @@ export async function consumeTotpCounter(
 			set: { lastUsedTotpCounter: -1 },
 		});
 	}
-	const updated = await ctx.context.adapter.incrementOne<TwoFactorTable>({
+	const updated = await adapter.incrementOne<TwoFactorTable>({
 		model: twoFactorTable,
 		where: [
 			{ field: "id", value: twoFactor.id },
