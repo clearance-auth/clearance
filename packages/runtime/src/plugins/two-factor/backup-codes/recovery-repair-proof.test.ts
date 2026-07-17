@@ -275,28 +275,29 @@ describe("backup-code recovery repair proof authority", () => {
 		expect(result.kind).toBe("authorized");
 	});
 
-	it("accepts a legacy-null row despite a stale user-level factor marker", async () => {
+	it("rejects a legacy-null row when the user-level factor marker is disabled", async () => {
 		const { context, table, factor, code, ctx } = await setup({
 			verified: null,
 			twoFactorEnabled: false,
 		});
-		const result = await runWithTransaction(context.adapter, async () => {
-			const current = await currentFactor(context, table, factor.id);
-			expect(current.factor.verified).toBeNull();
-			return consumeBackupCodeForRecoveryRepair(
-				ctx,
-				current.adapter,
-				table,
-				current.factor,
-				code,
-			);
-		});
-		expect(result.kind).toBe("authorized");
+		await expect(
+			runWithTransaction(context.adapter, async () => {
+				const current = await currentFactor(context, table, factor.id);
+				expect(current.factor.verified).toBeNull();
+				return consumeBackupCodeForRecoveryRepair(
+					ctx,
+					current.adapter,
+					table,
+					current.factor,
+					code,
+				);
+			}),
+		).rejects.toMatchObject({ status: "BAD_REQUEST" });
 		const persisted = await context.adapter.findOne<TwoFactorTable>({
 			model: table,
 			where: [{ field: "id", value: factor.id }],
 		});
-		expect(persisted?.backupCodes).not.toBe(factor.backupCodes);
+		expect(persisted?.backupCodes).toBe(factor.backupCodes);
 	});
 
 	it("rejects an explicitly disabled factor before consuming its recovery code", async () => {
