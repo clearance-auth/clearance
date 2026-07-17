@@ -889,23 +889,21 @@ export const mongodbAdapter = (
 							const session = config.client.startSession();
 
 							try {
-								session.startTransaction();
+								// The driver owns retry semantics here. `withTransaction` retries
+								// the complete callback for TransientTransactionError and retries
+								// only commit for UnknownTransactionCommitResult. A hand-rolled
+								// start/commit pair leaks transient conflicts to callers.
+								return await session.withTransaction(async () => {
+									const adapter = createAdapterFactory({
+										config: {
+											...adapterOptions!.config,
+											transaction: false,
+										},
+										adapter: createCustomAdapter(db, session),
+									})(lazyOptions!);
 
-								const adapter = createAdapterFactory({
-									config: {
-										...adapterOptions!.config,
-										transaction: false,
-									},
-									adapter: createCustomAdapter(db, session),
-								})(lazyOptions!);
-
-								const result = await cb(adapter);
-
-								await session.commitTransaction();
-								return result;
-							} catch (err) {
-								await session.abortTransaction();
-								throw err;
+									return cb(adapter);
+								});
 							} finally {
 								await session.endSession();
 							}
