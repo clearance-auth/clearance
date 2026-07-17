@@ -757,7 +757,9 @@ export async function getStagedAuthenticationFactorInventory(
 		: null;
 	const totpRecord =
 		rawTotp &&
-		rawTotp.verified !== false &&
+		(rawTotp.verified === true ||
+			(rawTotp.verified == null &&
+				(activeUser as Record<string, unknown>).twoFactorEnabled === true)) &&
 		identifier(rawTotp.id) &&
 		identifier(rawTotp.secret, 65_536)
 			? Object.freeze({ id: rawTotp.id, secret: rawTotp.secret })
