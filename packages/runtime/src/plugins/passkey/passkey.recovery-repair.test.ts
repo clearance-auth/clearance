@@ -36,14 +36,17 @@ function policy(passkeyAllowed = true) {
 	};
 }
 
-async function setup() {
+async function setup(lockoutEnabled = true) {
 	let revision = "1";
 	let effective = policy();
 	const options = {
 		baseURL: ORIGIN,
 		plugins: [
 			passkey(),
-			twoFactor({ backupCodeOptions: { storeBackupCodes: "hashed" } }),
+			twoFactor({
+				backupCodeOptions: { storeBackupCodes: "hashed" },
+				accountLockout: { enabled: lockoutEnabled },
+			}),
 		],
 	};
 	attachInternalAuthenticationPolicy(options, {
@@ -86,6 +89,7 @@ async function setup() {
 			trustDeviceGeneration: "recovery-repair-trust-generation",
 		},
 	});
+	await context.internalAdapter.updateUser(user.id, { twoFactorEnabled: true });
 	return {
 		instance,
 		context,
@@ -168,6 +172,18 @@ async function options(
 }
 
 describe("passkey recovery repair", () => {
+	it("refuses passkey recovery when durable attempt lockout is disabled", async () => {
+		const fixture = await setup(false);
+		const response = await (fixture.instance.auth.api as any).recoveryFactorRepair({
+			headers: await stagedHeaders(fixture),
+			body: { repairFactor: "passkey", recoveryCode: fixture.recoveryCode },
+			asResponse: true,
+		});
+		expect(response.status).toBe(401);
+		expect(await fixture.context.adapter.count({ model: "session" })).toBe(0);
+		expect(await fixture.context.adapter.count({ model: "passkey" })).toBe(0);
+	});
+
 	it("repairs with exactly one passkey, never creates a session, and returns only completion", async () => {
 		const fixture = await setup();
 		expect(await fixture.context.adapter.count({ model: "session" })).toBe(0);
@@ -204,7 +220,7 @@ describe("passkey recovery repair", () => {
 		).toBe(1);
 	});
 
-	it("burns the capability and challenge on a failed proof, including a wrong origin or missing UV", async () => {
+	it("burns a failed proof and issues a recovery-only retry ceremony", async () => {
 		const fixture = await setup();
 		const issued = await options(fixture, await beginRepair(fixture));
 		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
@@ -216,23 +232,40 @@ describe("passkey recovery repair", () => {
 				body: { response: authenticator.registrationResponse(issued.body.challenge) },
 			}),
 		).rejects.toMatchObject({ body: { code: "REMEDIATION_FAILED" } });
-		await expect(
-			(fixture.instance.auth.api as any).verifyPasskeyRecoveryRepairRegistration({
+		const failed = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
 				headers: issued.next,
 				body: {
 					response: authenticator.registrationResponse(issued.body.challenge, {
 						userVerified: false,
 					}),
 				},
-			}),
-		).rejects.toMatchObject({ body: { code: "REMEDIATION_FAILED" } });
-		await expect(
-			(fixture.instance.auth.api as any).verifyPasskeyRecoveryRepairRegistration({
+				asResponse: true,
+			});
+		expect(failed.status).toBe(401);
+		expect((await failed.clone().json()).code).toBe("REMEDIATION_FAILED");
+		expect(failed.headers.get("set-cookie")).toContain("recovery_factor_repair");
+		const replay = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
 				headers: issued.next,
 				body: { response: authenticator.registrationResponse(issued.body.challenge) },
-			}),
-		).rejects.toMatchObject({ body: { code: "REMEDIATION_FAILED" } });
-		expect(await fixture.context.adapter.count({ model: "passkey" })).toBe(0);
+				asResponse: true,
+			});
+		expect(replay.status).toBe(401);
+		const retryHeaders = convertSetCookieToCookie(failed.headers);
+		retryHeaders.set("origin", ORIGIN);
+		const retried = await options(fixture, retryHeaders);
+		const retryAuthenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const completed = await (fixture.instance.auth.api as any)
+			.verifyPasskeyRecoveryRepairRegistration({
+				headers: retried.next,
+				body: {
+					response: retryAuthenticator.registrationResponse(retried.body.challenge),
+				},
+				asResponse: true,
+			});
+		expect(completed.status).toBe(200);
+		expect(await fixture.context.adapter.count({ model: "passkey" })).toBe(1);
 		expect(await fixture.context.adapter.count({ model: "session" })).toBe(0);
 	});
 
