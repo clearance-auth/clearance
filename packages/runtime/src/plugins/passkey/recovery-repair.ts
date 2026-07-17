@@ -113,10 +113,12 @@ async function restartFailedRegistrationProof(
 		await runWithTransaction(ctx.context.adapter, () =>
 			restartRecoveryPasskeyRegistrationCapability(ctx, authority),
 		);
-	} catch (error) {
-		if (error instanceof AfterTransactionHookError) {
-			await expireRecoveryRepairCookie(ctx);
-		}
+	} catch {
+		// The presented bearer has already been consumed. Clear it whenever the
+		// recovery-only successor cannot be published, including an
+		// after-commit cookie-publication failure, so a client never retains a
+		// stale capability cookie after a failed retry handoff.
+		await expireRecoveryRepairCookie(ctx);
 	}
 	return recoveryRepairFailed();
 }
@@ -166,89 +168,89 @@ export const generatePasskeyRecoveryRepairRegistrationOptions = (
 
 				try {
 					return await runWithTransaction(ctx.context.adapter, async () => {
-					const authority = await consumePreloadedRecoveryFactorRepairCapability(
-						ctx,
-						preloaded,
-					);
-					if (!authority) recoveryRepairFailed();
-					const initial = inspectRecoveryFactorRepairAuthority(authority);
-					if (
-						!initial ||
-						initial.stage !== "select_repair" ||
-						initial.repairFactor !== "passkey" ||
-						!(await recoveryFactorRepairSelectionAuthorityIsExact(
+						const authority = await consumePreloadedRecoveryFactorRepairCapability(
 							ctx,
-							authority,
-						))
-					) {
-						recoveryRepairFailed();
-					}
-					const adapter = await getCurrentAdapter(ctx.context.adapter);
-					const user = await lockAndReadActiveUser(adapter, initial.subjectId);
-					if (!user) recoveryRepairFailed();
-					const recoveryFactor = await adapter.findOne<TwoFactorTable>({
-						model: initial.twoFactorTable,
-						where: [
-							{ field: "id", value: initial.recoveryFactorId },
-							{ field: "userId", value: user.id },
-						],
-					});
-					if (
-						!recoveryFactor ||
-						recoveryFactor.verified !== true ||
-						typeof recoveryFactor.secret !== "string" ||
-						typeof recoveryFactor.backupCodes !== "string" ||
-						recoveryFactor.trustDeviceGeneration !== initial.trustDeviceGeneration
-					) {
-						recoveryRepairFailed();
-					}
-					const existingPasskeys = await adapter.findMany<Passkey>({
-						model: "passkey",
-						where: [{ field: "userId", value: user.id }],
-						limit: 1,
-					});
-					if (existingPasskeys.length !== 0) recoveryRepairFailed();
-					const userHandle = await ensurePasskeyUserHandleForAdapter(adapter, user.id);
-					const registrationOptions = await generateRegistrationOptions({
-						rpName: options?.rpName || ctx.context.appName,
-						rpID,
-						userID: new Uint8Array(decodeCanonicalUserHandle(userHandle)),
-						userName: user.email || user.id,
-						userDisplayName: user.name || user.email || user.id,
-						attestationType: "none",
-						timeout: CHALLENGE_TTL_SECONDS * 1_000,
-						excludeCredentials: [],
-						authenticatorSelection: {
-							...options?.authenticatorSelection,
-							...(ctx.body?.authenticatorAttachment
-								? { authenticatorAttachment: ctx.body.authenticatorAttachment }
-								: {}),
-							residentKey: "required",
-							requireResidentKey: true,
-							userVerification: "required",
-						},
-					});
-					const issued = await createChallenge(
-						ctx,
-						"recovery-registration",
-						registrationOptions.challenge,
-						{
-						rpID,
-						origin,
-						userId: user.id,
-						userHandle,
-							expiresAt: initial.expiresAt,
-						},
-					);
-					const binding = await createRecoveryFactorRepairBinding(initial, [
-						"recovery-registration",
-						issued.digestId,
-					]);
-					await rotateRecoveryFactorRepairCapability(ctx, authority, {
-						stage: "passkey_registration",
-						binding,
-					});
-					return registrationOptions;
+							preloaded,
+						);
+						if (!authority) recoveryRepairFailed();
+						const initial = inspectRecoveryFactorRepairAuthority(authority);
+						if (
+							!initial ||
+							initial.stage !== "select_repair" ||
+							initial.repairFactor !== "passkey" ||
+							!(await recoveryFactorRepairSelectionAuthorityIsExact(
+								ctx,
+								authority,
+							))
+						) {
+							recoveryRepairFailed();
+						}
+						const adapter = await getCurrentAdapter(ctx.context.adapter);
+						const user = await lockAndReadActiveUser(adapter, initial.subjectId);
+						if (!user) recoveryRepairFailed();
+						const recoveryFactor = await adapter.findOne<TwoFactorTable>({
+							model: initial.twoFactorTable,
+							where: [
+								{ field: "id", value: initial.recoveryFactorId },
+								{ field: "userId", value: user.id },
+							],
+						});
+						if (
+							!recoveryFactor ||
+							recoveryFactor.verified !== true ||
+							typeof recoveryFactor.secret !== "string" ||
+							typeof recoveryFactor.backupCodes !== "string" ||
+							recoveryFactor.trustDeviceGeneration !== initial.trustDeviceGeneration
+						) {
+							recoveryRepairFailed();
+						}
+						const existingPasskeys = await adapter.findMany<Passkey>({
+							model: "passkey",
+							where: [{ field: "userId", value: user.id }],
+							limit: 1,
+						});
+						if (existingPasskeys.length !== 0) recoveryRepairFailed();
+						const userHandle = await ensurePasskeyUserHandleForAdapter(adapter, user.id);
+						const registrationOptions = await generateRegistrationOptions({
+							rpName: options?.rpName || ctx.context.appName,
+							rpID,
+							userID: new Uint8Array(decodeCanonicalUserHandle(userHandle)),
+							userName: user.email || user.id,
+							userDisplayName: user.name || user.email || user.id,
+							attestationType: "none",
+							timeout: CHALLENGE_TTL_SECONDS * 1_000,
+							excludeCredentials: [],
+							authenticatorSelection: {
+								...options?.authenticatorSelection,
+								...(ctx.body?.authenticatorAttachment
+									? { authenticatorAttachment: ctx.body.authenticatorAttachment }
+									: {}),
+								residentKey: "required",
+								requireResidentKey: true,
+								userVerification: "required",
+							},
+						});
+						const issued = await createChallenge(
+							ctx,
+							"recovery-registration",
+							registrationOptions.challenge,
+							{
+								rpID,
+								origin,
+								userId: user.id,
+								userHandle,
+								expiresAt: initial.expiresAt,
+							},
+						);
+						const binding = await createRecoveryFactorRepairBinding(initial, [
+							"recovery-registration",
+							issued.digestId,
+						]);
+						await rotateRecoveryFactorRepairCapability(ctx, authority, {
+							stage: "passkey_registration",
+							binding,
+						});
+						return registrationOptions;
 					});
 				} catch (error) {
 					if (error instanceof AfterTransactionHookError) {
@@ -276,50 +278,65 @@ export const verifyPasskeyRecoveryRepairRegistration = (
 			setRecoveryRepairHeaders(ctx);
 			return withRecoveryRepairFailureBoundary(async () => {
 				assertRecoveryRepairConfiguration(ctx);
-				const rpID = resolveRpID(ctx, options);
-				const origin = assertTrustedOrigin(ctx, options, rpID);
-				const challenge = parseClientDataChallenge(
-					ctx.body.response.response.clientDataJSON,
-				);
-				if (!challenge) recoveryRepairFailed();
 				const preloaded = await preloadRecoveryFactorRepairCapability(ctx, {
 					stage: "passkey_registration",
 					repairFactor: "passkey",
 				});
 				if (!preloaded) recoveryRepairFailed();
+				// Consume recovery authority before parsing or trusting any proof input.
+				// A malformed clientDataJSON has no safe challenge identifier to delete,
+				// yet it must still burn the bearer that authorized this ceremony. Any
+				// parseable challenge is consumed in the same transaction as that bearer.
+				const challenge = parseClientDataChallenge(
+					ctx.body.response.response.clientDataJSON,
+				);
 
 				const consumed = await runWithTransaction(ctx.context.adapter, async () => {
 					const authority = await consumePreloadedRecoveryFactorRepairCapability(
 						ctx,
 						preloaded,
 					);
-					const challengeRecord = await consumeChallengeByParsedChallenge(
-						ctx,
-						"recovery-registration",
-						challenge,
-					);
-					const expectedBinding = authority
-						? await registrationBinding(authority, challengeRecord ?? { digestId: "" })
+					const challengeRecord = challenge
+						? await consumeChallengeByParsedChallenge(
+								ctx,
+								"recovery-registration",
+								challenge,
+							)
 						: null;
-					const lineage = authority
-						? inspectRecoveryFactorRepairAuthority(authority)
-						: null;
-					if (
-						!authority ||
-						!lineage ||
-						!challengeRecord ||
-						!expectedBinding ||
-						lineage.binding !== expectedBinding ||
-						lineage.subjectId !== challengeRecord.userId ||
-						challengeRecord.rpID !== rpID ||
-						challengeRecord.origin !== origin ||
-						!challengeRecord.userHandle ||
-						challengeRecord.expiresAt > lineage.expiresAt
-					) {
-						recoveryRepairFailed();
-					}
 					return { authority, challengeRecord };
 				});
+				const authority = consumed.authority;
+				if (!authority) recoveryRepairFailed();
+
+				let rpID: string;
+				let origin: string;
+				let lineage: ReturnType<typeof inspectRecoveryFactorRepairAuthority>;
+				let expectedBinding: string | null;
+				try {
+					rpID = resolveRpID(ctx, options);
+					origin = assertTrustedOrigin(ctx, options, rpID);
+					lineage = inspectRecoveryFactorRepairAuthority(authority);
+					expectedBinding = consumed.challengeRecord
+						? await registrationBinding(authority, consumed.challengeRecord)
+						: null;
+				} catch {
+					return restartFailedRegistrationProof(ctx, authority);
+				}
+				if (
+					!challenge ||
+					!lineage ||
+					!consumed.challengeRecord ||
+					!expectedBinding ||
+					lineage.binding !== expectedBinding ||
+					lineage.subjectId !== consumed.challengeRecord.userId ||
+					consumed.challengeRecord.rpID !== rpID ||
+					consumed.challengeRecord.origin !== origin ||
+					!consumed.challengeRecord.userHandle ||
+					consumed.challengeRecord.expiresAt > lineage.expiresAt
+				) {
+					return restartFailedRegistrationProof(ctx, authority);
+				}
+				const challengeRecord = consumed.challengeRecord;
 
 				let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
 				try {
@@ -331,75 +348,75 @@ export const verifyPasskeyRecoveryRepairRegistration = (
 						requireUserVerification: true,
 					});
 				} catch {
-					return restartFailedRegistrationProof(ctx, consumed.authority);
+					return restartFailedRegistrationProof(ctx, authority);
 				}
 				if (!verification.verified || !verification.registrationInfo) {
-					return restartFailedRegistrationProof(ctx, consumed.authority);
+					return restartFailedRegistrationProof(ctx, authority);
 				}
 
 				const { aaguid, credential, credentialDeviceType, credentialBackedUp } =
 					verification.registrationInfo;
 				try {
 					return await runWithTransaction(ctx.context.adapter, async () => {
-					const lineage = inspectRecoveryFactorRepairAuthority(consumed.authority);
-					if (
-						!lineage ||
-						lineage.stage !== "passkey_registration" ||
-						lineage.repairFactor !== "passkey" ||
-						lineage.subjectId !== consumed.challengeRecord.userId
-					) {
-						recoveryRepairFailed();
-					}
-					const binding = await registrationBinding(
-						consumed.authority,
-						consumed.challengeRecord,
-					);
-					if (!binding || binding !== lineage.binding) recoveryRepairFailed();
-					const adapter = await getCurrentAdapter(ctx.context.adapter);
-					const user = await lockAndReadActiveUser(adapter, lineage.subjectId);
-					if (!user || !consumed.challengeRecord.userHandle) recoveryRepairFailed();
-					const userHandle = await ensurePasskeyUserHandleForAdapter(adapter, user.id);
-					if (userHandle !== consumed.challengeRecord.userHandle) recoveryRepairFailed();
-					const existingPasskey = await adapter.findOne<Passkey>({
-						model: "passkey",
-						where: [{ field: "userId", value: user.id }],
-					});
-					if (existingPasskey) recoveryRepairFailed();
-					const existingCredential = await adapter.findOne<Passkey>({
-						model: "passkey",
-						where: [{ field: "credentialID", value: credential.id }],
-					});
-					if (existingCredential) recoveryRepairFailed();
-
-					let created: Passkey;
-					try {
-						created = await adapter.create<Omit<Passkey, "id">, Passkey>({
+						const lineage = inspectRecoveryFactorRepairAuthority(authority);
+						if (
+							!lineage ||
+							lineage.stage !== "passkey_registration" ||
+							lineage.repairFactor !== "passkey" ||
+							lineage.subjectId !== challengeRecord.userId
+						) {
+							recoveryRepairFailed();
+						}
+						const binding = await registrationBinding(
+							authority,
+							challengeRecord,
+						);
+						if (!binding || binding !== lineage.binding) recoveryRepairFailed();
+						const adapter = await getCurrentAdapter(ctx.context.adapter);
+						const user = await lockAndReadActiveUser(adapter, lineage.subjectId);
+						if (!user || !challengeRecord.userHandle) recoveryRepairFailed();
+						const userHandle = await ensurePasskeyUserHandleForAdapter(adapter, user.id);
+						if (userHandle !== challengeRecord.userHandle) recoveryRepairFailed();
+						const existingPasskey = await adapter.findOne<Passkey>({
 							model: "passkey",
-							data: {
-								userId: user.id,
-								name: ctx.body.name,
-								credentialID: credential.id,
-								publicKey: base64Url.encode(credential.publicKey, { padding: false }),
-								userHandle,
-								counter: credential.counter,
-								deviceType: credentialDeviceType,
-								backedUp: credentialBackedUp,
-								transports: ctx.body.response.response.transports?.join(","),
-								aaguid,
-								createdAt: new Date(),
-								updatedAt: new Date(),
-							} as Omit<Passkey, "id">,
+							where: [{ field: "userId", value: user.id }],
 						});
-					} catch {
-						const conflicting = await adapter.findOne<Passkey>({
+						if (existingPasskey) recoveryRepairFailed();
+						const existingCredential = await adapter.findOne<Passkey>({
 							model: "passkey",
 							where: [{ field: "credentialID", value: credential.id }],
 						});
-						if (conflicting) recoveryRepairFailed();
-						throw new Error("Recovery repair credential creation failed");
-					}
-					if (!created || created.userId !== user.id) recoveryRepairFailed();
-						return completeRecoveryFactorRepair(ctx, consumed.authority, {
+						if (existingCredential) recoveryRepairFailed();
+
+						let created: Passkey;
+						try {
+							created = await adapter.create<Omit<Passkey, "id">, Passkey>({
+								model: "passkey",
+								data: {
+									userId: user.id,
+									name: ctx.body.name,
+									credentialID: credential.id,
+									publicKey: base64Url.encode(credential.publicKey, { padding: false }),
+									userHandle,
+									counter: credential.counter,
+									deviceType: credentialDeviceType,
+									backedUp: credentialBackedUp,
+									transports: ctx.body.response.response.transports?.join(","),
+									aaguid,
+									createdAt: new Date(),
+									updatedAt: new Date(),
+								} as Omit<Passkey, "id">,
+							});
+						} catch {
+							const conflicting = await adapter.findOne<Passkey>({
+								model: "passkey",
+								where: [{ field: "credentialID", value: credential.id }],
+							});
+							if (conflicting) recoveryRepairFailed();
+							throw new Error("Recovery repair credential creation failed");
+						}
+						if (!created || created.userId !== user.id) recoveryRepairFailed();
+						return completeRecoveryFactorRepair(ctx, authority, {
 							binding,
 							repairFactor: "passkey",
 							repairedFactorId: created.id,
