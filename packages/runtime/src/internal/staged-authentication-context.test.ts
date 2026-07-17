@@ -327,7 +327,7 @@ describe("staged authentication continuation authority", () => {
 		);
 	});
 
-	it("treats a legacy verified TOTP row as eligible despite a stale user marker", async () => {
+	it("accepts legacy TOTP only while the user-level factor marker remains enabled", async () => {
 		const context = await createContext([passkey(), twoFactor()]);
 		const user = await context.internalAdapter.createUser({
 			email: "staged-inventory@example.test",
@@ -373,8 +373,8 @@ describe("staged authentication continuation authority", () => {
 		});
 		expect(await readInventory()).toMatchObject({
 			passkey: false,
-			totp: true,
-			totpRecord: { secret: "legacy-ciphertext" },
+			totp: false,
+			totpRecord: null,
 		});
 	});
 
