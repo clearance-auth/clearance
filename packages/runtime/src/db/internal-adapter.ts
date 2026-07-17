@@ -82,6 +82,12 @@ import {
 	requireInternalSessionIssuanceContext,
 } from "../internal/session-issuance-context";
 import {
+	attachStagedAuthenticationContinuation,
+	digestStagedAuthenticationPolicy,
+	requireStagedSessionIssuanceAuthority,
+	STAGED_AUTHENTICATION_TTL_SECONDS,
+} from "../internal/staged-authentication-context";
+import {
 	ManagedVerificationChallengeError,
 	requireInternalVerificationChallengeContext,
 	requireInternalVerificationConsumptionContext,
@@ -89,6 +95,7 @@ import {
 } from "../internal/verification-challenge-context";
 import {
 	evaluateSessionIssuance,
+	evaluateStagedSessionIssuance,
 	SESSION_ASSURANCE_RESERVED_FIELDS,
 	stripReservedSessionAuthority,
 	type SessionAssuranceFields,
@@ -2690,7 +2697,10 @@ export const createInternalAdapter = (
 			overrideAll?: boolean | undefined,
 			issuanceContext?: SessionIssuanceContext | undefined,
 		) => {
-			const managedIssuanceContext = authenticationPolicy
+			const stagedIssuanceAuthority = authenticationPolicy
+				? requireStagedSessionIssuanceAuthority(issuanceContext)
+				: null;
+			const managedIssuanceContext = authenticationPolicy && !stagedIssuanceAuthority
 				? requireInternalSessionIssuanceContext(issuanceContext)
 				: undefined;
 			const capturedIssuanceAuthority =
@@ -2708,6 +2718,13 @@ export const createInternalAdapter = (
 			if (
 				capturedIssuanceAuthority &&
 				capturedIssuanceAuthority.sourceSubjectId !== userId
+			) {
+				throw new ManagedSessionIssuanceError("subject_mismatch");
+			}
+			if (
+				stagedIssuanceAuthority &&
+				(stagedIssuanceAuthority.subjectId !== userId ||
+					stagedIssuanceAuthority.dontRememberMe !== Boolean(dontRememberMe))
 			) {
 				throw new ManagedSessionIssuanceError("subject_mismatch");
 			}
@@ -2961,11 +2978,21 @@ export const createInternalAdapter = (
 				) {
 					throw new ManagedSessionIssuanceError("context_invalid");
 				}
+				if (
+					stagedIssuanceAuthority &&
+					(stagedIssuanceAuthority.transactionAdapter !== currentAdapter ||
+						stagedIssuanceAuthority.expiresAt <= new Date())
+				) {
+					throw new ManagedSessionIssuanceError("context_invalid");
+				}
 				let assuranceFields: SessionAssuranceFields | undefined;
-				if (authenticationPolicy && managedIssuanceContext) {
+				if (
+					authenticationPolicy &&
+					(managedIssuanceContext || stagedIssuanceAuthority)
+				) {
 					const targetOrganizationId =
 						(capturedIssuanceAuthority?.sourceOrganizationId ??
-							managedIssuanceContext.targetOrganizationId) || undefined;
+							managedIssuanceContext?.targetOrganizationId) || undefined;
 					const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(
 						options,
 						{
@@ -2973,34 +3000,130 @@ export const createInternalAdapter = (
 							...(targetOrganizationId
 								? { organizationId: targetOrganizationId }
 								: {}),
+							...(stagedIssuanceAuthority
+								? { minimumRevision: stagedIssuanceAuthority.policyRevision }
+								: {}),
 							transaction: currentAdapter,
 						},
 					);
-					const evaluation = evaluateSessionIssuance({
-						purpose: managedIssuanceContext.purpose,
-						policy: {
-							identity: resolvedPolicy.scope,
-							organizationId: targetOrganizationId ?? null,
-							revision: resolvedPolicy.revision,
-							policy: resolvedPolicy.effective,
-						},
-						now: new Date(),
-						evidence:
-							managedIssuanceContext.purpose === "interactive" ||
-							managedIssuanceContext.purpose === "impersonation"
-								? managedIssuanceContext.evidence
-								: [],
-						...(capturedIssuanceAuthority
-							? {
-									sourceAssurance:
-										capturedIssuanceAuthority.sourceAssurance,
-								}
-							: {}),
-					});
+					const policySnapshot = {
+						identity: resolvedPolicy.scope,
+						organizationId: targetOrganizationId ?? null,
+						revision: resolvedPolicy.revision,
+						policy: resolvedPolicy.effective,
+					} as const;
+					if (stagedIssuanceAuthority) {
+						if (
+							resolvedPolicy.scope.projectId !==
+								stagedIssuanceAuthority.projectId ||
+							resolvedPolicy.scope.environmentId !==
+								stagedIssuanceAuthority.environmentId ||
+							resolvedPolicy.revision !==
+								stagedIssuanceAuthority.policyRevision ||
+							(await digestStagedAuthenticationPolicy(
+								resolvedPolicy.effective,
+							)) !== stagedIssuanceAuthority.policyDigest
+						) {
+							throw new ManagedSessionIssuanceError("policy_unsatisfied");
+						}
+					}
+					const issuanceNow = new Date();
+					const evaluation = stagedIssuanceAuthority
+						? evaluateStagedSessionIssuance({
+								policy: policySnapshot,
+								now: issuanceNow,
+								primaryMethod: stagedIssuanceAuthority.primaryMethod,
+								primaryAt: stagedIssuanceAuthority.primaryAt,
+								factorMethod: stagedIssuanceAuthority.factorMethod,
+								factorAt: stagedIssuanceAuthority.factorAt,
+							})
+						: evaluateSessionIssuance({
+								purpose: managedIssuanceContext!.purpose,
+								policy: policySnapshot,
+								now: issuanceNow,
+								evidence:
+									managedIssuanceContext!.purpose === "interactive" ||
+									managedIssuanceContext!.purpose === "impersonation"
+										? managedIssuanceContext!.evidence
+										: [],
+								...(capturedIssuanceAuthority
+									? {
+											sourceAssurance:
+												capturedIssuanceAuthority.sourceAssurance,
+										}
+									: {}),
+							});
 					if (evaluation.kind !== "satisfied") {
-						throw new ManagedSessionIssuanceError("policy_unsatisfied", {
+						const failure = new ManagedSessionIssuanceError("policy_unsatisfied", {
 							requirement: evaluation.requirement,
 						});
+						const evidence =
+							managedIssuanceContext?.purpose === "interactive"
+								? managedIssuanceContext.evidence
+								: [];
+						const primary = evidence.length === 1 ? evidence[0] : undefined;
+						const passkeyAvailable = Boolean(
+							options.plugins?.some((plugin) => plugin.id === "passkey"),
+						);
+						const twoFactorPlugin = options.plugins?.find(
+							(plugin) => plugin.id === "two-factor",
+						);
+						const totpAvailable = Boolean(
+							twoFactorPlugin &&
+								(
+									twoFactorPlugin.options as
+										| { totpOptions?: { disable?: boolean } }
+										| undefined
+								)?.totpOptions?.disable !== true,
+						);
+						const allowedFactors = (
+							evaluation.requirement.reason === "phishing_resistant_required"
+								? (["passkey"] as const)
+								: ([
+										...(evaluation.requirement.allowedFactors.passkey
+											? (["passkey"] as const)
+											: []),
+										...(evaluation.requirement.allowedFactors.totp
+											? (["totp"] as const)
+											: []),
+									] as const)
+						).filter(
+							(factor) =>
+								(factor === "passkey" && passkeyAvailable) ||
+								(factor === "totp" && totpAvailable),
+						);
+						if (
+							!stagedIssuanceAuthority &&
+							managedIssuanceContext?.purpose === "interactive" &&
+							managedIssuanceContext.targetOrganizationId === null &&
+							primary?.kind === "primary" &&
+							primary.primaryMethod !== "anonymous" &&
+							primary.primaryMethod !== "admin_impersonation" &&
+							(evaluation.requirement.reason === "factor_required" ||
+								evaluation.requirement.reason ===
+									"phishing_resistant_required") &&
+							allowedFactors.length > 0
+						) {
+							await attachStagedAuthenticationContinuation(failure, {
+								subjectId: userId,
+								projectId: resolvedPolicy.scope.projectId,
+								environmentId: resolvedPolicy.scope.environmentId,
+								organizationId: null,
+								policyRevision: resolvedPolicy.revision,
+								policyDigest: await digestStagedAuthenticationPolicy(
+									resolvedPolicy.effective,
+								),
+								primaryMethod: primary.primaryMethod,
+								primaryAt: issuanceNow,
+								dontRememberMe: Boolean(dontRememberMe),
+								allowedFactors,
+								expiresAt: new Date(
+									issuanceNow.getTime() +
+										STAGED_AUTHENTICATION_TTL_SECONDS * 1_000,
+								),
+							});
+						}
+						throw failure;
 					}
 					assuranceFields = evaluation.fields;
 				}
@@ -3202,9 +3325,36 @@ export const createInternalAdapter = (
 						);
 						const finalRecord = await findSessionRecordById(persistedSessionId);
 						const { user: _finalUser, ...finalSessionData } = finalRecord ?? {};
-						const finalSession = finalSessionData as Session &
-							Record<string, unknown>;
-						let capturedReplacementSourceRetired = true;
+							const finalSession = finalSessionData as Session &
+								Record<string, unknown>;
+							let stagedPolicyUnchanged = true;
+							if (stagedIssuanceAuthority) {
+								stagedPolicyUnchanged =
+									stagedIssuanceAuthority.transactionAdapter ===
+										currentAdapter &&
+									stagedIssuanceAuthority.expiresAt > new Date();
+								const finalPolicy = await resolveRuntimeAuthenticationPolicy(
+									options,
+									{
+										subjectId: userId,
+										minimumRevision:
+											stagedIssuanceAuthority.policyRevision,
+										transaction: currentAdapter,
+									},
+								);
+								stagedPolicyUnchanged =
+									stagedPolicyUnchanged &&
+									finalPolicy.scope.projectId ===
+										stagedIssuanceAuthority.projectId &&
+									finalPolicy.scope.environmentId ===
+										stagedIssuanceAuthority.environmentId &&
+									finalPolicy.revision ===
+										stagedIssuanceAuthority.policyRevision &&
+									(await digestStagedAuthenticationPolicy(
+										finalPolicy.effective,
+									)) === stagedIssuanceAuthority.policyDigest;
+							}
+							let capturedReplacementSourceRetired = true;
 						if (
 							managedIssuanceContext?.purpose === "replacement" &&
 							capturedIssuanceAuthority
@@ -3251,8 +3401,9 @@ export const createInternalAdapter = (
 									capturedSourceCredential?.status !== "active";
 							}
 						}
-						if (
-							!activeUser ||
+							if (
+								!activeUser ||
+								!stagedPolicyUnchanged ||
 							!capturedReplacementSourceRetired ||
 							capturedIssuanceAuthority?.sourceSessionId ===
 								persistedSessionId ||
