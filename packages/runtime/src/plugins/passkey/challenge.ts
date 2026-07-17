@@ -13,6 +13,8 @@ const DECODED_CLIENT_DATA_MAX_BYTES = 4_096;
 const CHALLENGE_MAX_LENGTH = 512;
 
 export interface ChallengeRecord {
+	/** Opaque digest identifier; the raw challenge is never persisted. */
+	digestId: string;
 	ceremony: PasskeyCeremony;
 	rpID: string;
 	origin: string;
@@ -22,7 +24,22 @@ export interface ChallengeRecord {
 	userHandle?: string;
 	/** Present only for deletion: the credential row selected for removal. */
 	targetPasskeyId?: string;
+	/** Present only for staged passkey remediation ceremonies. */
+	stagedRootFlowId?: string;
+	stagedParentDigest?: string;
+	stagedSeedFingerprint?: string;
+	stagedSubjectId?: string;
+	expiresAt: Date;
 }
+
+export type ChallengeIssueRecord = Omit<
+	ChallengeRecord,
+	"ceremony" | "digestId" | "expiresAt"
+> &
+	Readonly<{
+		/** Never permits the ceremony to outlive a staged root flow. */
+		expiresAt?: Date;
+	}>;
 
 /**
  * A bounded, defensive extraction of the `challenge` field from a WebAuthn
@@ -78,7 +95,7 @@ export function parseClientDataChallenge(
  * consumed by the authentication verifier (or vice versa) even if the
  * underlying random challenge string were ever to collide.
  */
-async function digestChallengeId(
+export async function digestPasskeyChallenge(
 	ceremony: PasskeyCeremony,
 	challenge: string,
 ): Promise<string> {
@@ -100,10 +117,19 @@ export async function createChallenge(
 	ctx: GenericEndpointContext,
 	ceremony: PasskeyCeremony,
 	challenge: string,
-	record: Omit<ChallengeRecord, "ceremony">,
-): Promise<void> {
+	record: ChallengeIssueRecord,
+): Promise<Readonly<{ digestId: string; expiresAt: Date }>> {
 	const now = new Date();
-	const digestId = await digestChallengeId(ceremony, challenge);
+	const digestId = await digestPasskeyChallenge(ceremony, challenge);
+	const expiresAt = new Date(
+		Math.min(
+			now.getTime() + CHALLENGE_TTL_SECONDS * 1_000,
+			record.expiresAt?.getTime() ?? Number.POSITIVE_INFINITY,
+		),
+	);
+	if (!Number.isFinite(expiresAt.getTime()) || expiresAt <= now) {
+		throw new Error("Passkey challenge expiry is invalid");
+	}
 	const adapter = await getCurrentAdapter(ctx.context.adapter);
 	// Bound durable storage without a background worker. The indexed predicate
 	// makes cleanup proportional to expired rows, and every new ceremony
@@ -122,11 +148,16 @@ export async function createChallenge(
 			userId: record.userId,
 			userHandle: record.userHandle,
 			targetPasskeyId: record.targetPasskeyId,
-			expiresAt: new Date(now.getTime() + CHALLENGE_TTL_SECONDS * 1000),
+			stagedRootFlowId: record.stagedRootFlowId,
+			stagedParentDigest: record.stagedParentDigest,
+			stagedSeedFingerprint: record.stagedSeedFingerprint,
+			stagedSubjectId: record.stagedSubjectId,
+			expiresAt,
 			createdAt: now,
 			updatedAt: now,
 		},
 	});
+	return Object.freeze({ digestId, expiresAt: new Date(expiresAt) });
 }
 
 /**
@@ -147,7 +178,7 @@ export async function consumeChallengeByParsedChallenge(
 	ceremony: PasskeyCeremony,
 	challenge: string,
 ): Promise<ChallengeRecord | null> {
-	const digestId = await digestChallengeId(ceremony, challenge);
+	const digestId = await digestPasskeyChallenge(ceremony, challenge);
 	const adapter = await getCurrentAdapter(ctx.context.adapter);
 	const consumed = await adapter.consumeOne<{
 		ceremony: string;
@@ -156,6 +187,10 @@ export async function consumeChallengeByParsedChallenge(
 		userId?: string | null;
 		userHandle?: string | null;
 		targetPasskeyId?: string | null;
+		stagedRootFlowId?: string | null;
+		stagedParentDigest?: string | null;
+		stagedSeedFingerprint?: string | null;
+		stagedSubjectId?: string | null;
 		expiresAt: Date;
 	}>({
 		model: "passkeyChallenge",
@@ -175,11 +210,17 @@ export async function consumeChallengeByParsedChallenge(
 		return null;
 	}
 	return {
+		digestId,
 		ceremony,
 		rpID: consumed.rpID,
 		origin: consumed.origin,
 		userId: consumed.userId ?? undefined,
 		userHandle: consumed.userHandle ?? undefined,
 		targetPasskeyId: consumed.targetPasskeyId ?? undefined,
+		stagedRootFlowId: consumed.stagedRootFlowId ?? undefined,
+		stagedParentDigest: consumed.stagedParentDigest ?? undefined,
+		stagedSeedFingerprint: consumed.stagedSeedFingerprint ?? undefined,
+		stagedSubjectId: consumed.stagedSubjectId ?? undefined,
+		expiresAt: new Date(consumed.expiresAt),
 	} satisfies ChallengeRecord;
 }
