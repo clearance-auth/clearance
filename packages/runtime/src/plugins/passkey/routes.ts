@@ -929,7 +929,15 @@ export const verifyPasskeyRemediationRegistration = (
 									model: table,
 									where: [{ field: "userId", value: user.id }],
 								});
-								if (totp && totp.verified !== false) remediationFailed();
+								if (
+									totp &&
+									(totp.verified === true ||
+										(totp.verified == null &&
+											(user as Record<string, unknown>)
+												.twoFactorEnabled === true))
+								) {
+									remediationFailed();
+								}
 							}
 						}
 						const userHandle = await ensurePasskeyUserHandleForAdapter(adapter, user.id);
