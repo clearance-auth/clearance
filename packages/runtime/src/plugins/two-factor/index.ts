@@ -171,11 +171,17 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 		storeBackupCodes: "encrypted",
 		...options?.backupCodeOptions,
 	} satisfies BackupCodeOptions;
-	const totp = totp2fa({
-		...options?.totpOptions,
-		allowPasswordless:
-			options?.totpOptions?.allowPasswordless ?? allowPasswordless,
-	});
+	const totp = totp2fa(
+		{
+			...options?.totpOptions,
+			allowPasswordless:
+				options?.totpOptions?.allowPasswordless ?? allowPasswordless,
+		},
+		{
+			twoFactorTable: resolvedOptions.twoFactorTable,
+			backupCodeOptions,
+		},
+	);
 	const backupCode = backupCode2fa(
 		{
 			...backupCodeOptions,
