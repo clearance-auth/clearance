@@ -34,6 +34,53 @@ export const getAuthTables = (options: ClearanceOptions): ClearanceDBSchema => {
 	);
 
 	const shouldAddRateLimitTable = options.rateLimit?.storage === "database";
+	/**
+	 * Factor lifecycle generations fence every authenticated session, including
+	 * installations that currently enable only one factor.  The fields therefore
+	 * belong to the base user/session shape, rather than to the optional factor
+	 * plugin schemas.  A factor plugin may still rename its own column through
+	 * its documented schema option; an unrelated extension must never choose the
+	 * physical column used for this authority.
+	 */
+	const ownedFactorFieldName = (
+		ownerPluginId: "passkey" | "two-factor",
+		model: "user" | "session",
+		field: "passkeySessionGeneration" | "twoFactorSessionGeneration",
+	) => {
+		const owner = options.plugins?.find(
+			(plugin) => plugin.id === ownerPluginId,
+		);
+		const fieldName = owner?.schema?.[model]?.fields?.[field]?.fieldName;
+		return typeof fieldName === "string" ? fieldName : undefined;
+	};
+	const sharedFactorSessionGenerationFields = (model: "user" | "session") =>
+		({
+			passkeySessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+				fieldName: ownedFactorFieldName(
+					"passkey",
+					model,
+					"passkeySessionGeneration",
+				),
+			},
+			twoFactorSessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+				fieldName: ownedFactorFieldName(
+					"two-factor",
+					model,
+					"twoFactorSessionGeneration",
+				),
+			},
+		}) satisfies Record<
+			"passkeySessionGeneration" | "twoFactorSessionGeneration",
+			DBFieldAttribute
+		>;
 	const runtimeAuthenticationSessionFields = {
 		authenticationAssuranceVersion: {
 			type: "number",
@@ -241,6 +288,7 @@ export const getAuthTables = (options: ClearanceOptions): ClearanceDBSchema => {
 				// compatibility. It is applied after extension fields so plugins and
 				// user options cannot expose, require, or default authority metadata.
 				...runtimeAuthenticationSessionFields,
+				...sharedFactorSessionGenerationFields("session"),
 			},
 			order: 2,
 		},
@@ -518,6 +566,10 @@ export const getAuthTables = (options: ClearanceOptions): ClearanceDBSchema => {
 				},
 				...user?.fields,
 				...options.user?.additionalFields,
+				// Factor lifecycle fences are shared authentication authority. Apply
+				// them after every extension so only the owning factor plugin can
+				// retain its configured physical column name.
+				...sharedFactorSessionGenerationFields("user"),
 			},
 			order: 1,
 		},
