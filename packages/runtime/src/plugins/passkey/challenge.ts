@@ -3,7 +3,11 @@ import { getCurrentAdapter } from "@clearance/core/context";
 import { base64Url } from "@clearance/utils/base64";
 import { createHash } from "@clearance/utils/hash";
 
-export type PasskeyCeremony = "registration" | "authentication" | "deletion";
+export type PasskeyCeremony =
+	| "registration"
+	| "recovery-registration"
+	| "authentication"
+	| "deletion";
 
 /** 2 minutes: short-lived, well within the 5-minute upper bound. */
 export const CHALLENGE_TTL_SECONDS = 120;
