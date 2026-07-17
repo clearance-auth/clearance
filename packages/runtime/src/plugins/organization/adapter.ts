@@ -544,6 +544,24 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 			const dontRememberMe =
 				orchestration?.dontRememberMe ?? Boolean(dontRememberMarker);
 			const managed = Boolean(readInternalAuthenticationPolicy(context.options));
+			const requestSession = ctx.context.session;
+			if (
+				!requestSession ||
+				requestSession.session.token !== sessionToken ||
+				requestSession.user.id !== requestSession.session.userId
+			) {
+				throw new ClearanceError(
+					"Organization transitions require the exact presenting session context",
+				);
+			}
+			if (
+				orchestration?.afterCapture &&
+				typeof context.adapter.options?.adapterConfig.transaction !== "function"
+			) {
+				throw new ClearanceError(
+					"Organization transition lifecycle work requires a rollback-capable database transaction",
+				);
+			}
 			if (!managed) {
 				const updateLegacySession = async () => {
 					await orchestration?.afterCapture?.();
@@ -551,6 +569,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 						sessionToken,
 						{
 							activeOrganizationId: organizationId,
+							activeTeamId: null,
 						},
 					);
 					if (!session) {
@@ -560,8 +579,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					}
 					return session as Session;
 				};
-				return orchestration?.afterCapture &&
-					typeof context.adapter.options?.adapterConfig.transaction === "function"
+				return orchestration?.afterCapture
 					? runWithTransaction(context.adapter, updateLegacySession)
 					: updateLegacySession();
 			}
@@ -610,13 +628,11 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 						}
 
 						const source = await context.internalAdapter.findSession(sessionToken);
-						const requestSession = ctx.context.session;
 						if (
 							!source ||
 							source.session.token !== sessionToken ||
-							requestSession?.session.token !== sessionToken ||
-							source.user.id !== requestSession?.user.id ||
-							source.session.id !== requestSession?.session.id
+							source.user.id !== requestSession.user.id ||
+							source.session.id !== requestSession.session.id
 						) {
 							throw new ClearanceError(
 								"The presented session changed during this organization transition",
