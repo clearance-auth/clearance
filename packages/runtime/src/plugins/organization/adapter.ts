@@ -1,5 +1,6 @@
 import type { AuthContext, GenericEndpointContext } from "@clearance/core";
 import {
+	AfterTransactionHookError,
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
@@ -8,6 +9,15 @@ import { ClearanceError } from "@clearance/core/error";
 import { filterOutputFields } from "@clearance/core/utils/db";
 import { parseJSON } from "../../client/parser";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../db";
+import {
+	digestSessionRefreshSecret,
+	SESSION_CREDENTIAL_MODEL,
+	type SessionCredential,
+} from "../../db/session-credential";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalCredentialAuthority } from "../../internal/credential-authority";
+import { captureInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../../security/session-assurance";
 import type { Session, User } from "../../types";
 import { getDate } from "../../utils/date";
 import type {
@@ -24,6 +34,34 @@ import type {
 	TeamMember,
 } from "./schema";
 import type { OrganizationOptions } from "./types";
+
+export type ActiveOrganizationTransitionOrchestration = Readonly<{
+	/**
+	 * Runs after managed source authority has been captured and while its owning
+	 * transaction is still active. Lifecycle routes use this seam for membership
+	 * or organization mutations that must commit with the successor session.
+	 * In unmanaged mode it runs immediately before the legacy in-place update.
+	 */
+	afterCapture?: (() => void | Promise<void>) | undefined;
+	/**
+	 * Trusted server callers can provide the source cookie intent when no request
+	 * cookie is available. When omitted, the signed request marker is authoritative
+	 * and absence means a remembered session.
+	 */
+	dontRememberMe?: boolean | undefined;
+	/**
+	 * Exposes the prepared successor secret to an outer transaction owner. The
+	 * owner must discard it on rollback and may recover it only when its own
+	 * boundary reports AfterTransactionHookError after commit.
+	 */
+	onSuccessorPrepared?: ((successor: Session) => void) | undefined;
+}>;
+
+type ActiveManagedTransition = { reentrantAttempted: boolean };
+const activeManagedTransitions = new WeakMap<
+	object,
+	Map<string, ActiveManagedTransition>
+>();
 
 /**
  * Resolves the configured per-team member cap to a concrete number for a given
@@ -478,14 +516,229 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 			sessionToken: string,
 			organizationId: string | null,
 			ctx: GenericEndpointContext,
+			orchestration?: ActiveOrganizationTransitionOrchestration | undefined,
 		) => {
-			const session = await context.internalAdapter.updateSession(
-				sessionToken,
-				{
-					activeOrganizationId: organizationId,
-				},
-			);
-			return session as Session;
+			if (
+				ctx.context.options !== context.options ||
+				ctx.context.adapter !== context.adapter
+			) {
+				throw new ClearanceError(
+					"Organization transitions require the adapter's authoritative endpoint context",
+				);
+			}
+			if (
+				orchestration?.dontRememberMe !== undefined &&
+				typeof orchestration.dontRememberMe !== "boolean"
+			) {
+				throw new ClearanceError(
+					"Organization transition dontRememberMe must be a boolean",
+				);
+			}
+			const dontRememberMarker =
+				typeof ctx.getSignedCookie === "function"
+					? await ctx.getSignedCookie(
+							ctx.context.authCookies.dontRememberToken.name,
+							ctx.context.secret,
+						)
+					: null;
+			const dontRememberMe =
+				orchestration?.dontRememberMe ?? Boolean(dontRememberMarker);
+			const managed = Boolean(readInternalAuthenticationPolicy(context.options));
+			if (!managed) {
+				const updateLegacySession = async () => {
+					await orchestration?.afterCapture?.();
+					const session = await context.internalAdapter.updateSession(
+						sessionToken,
+						{
+							activeOrganizationId: organizationId,
+						},
+					);
+					if (!session) {
+						throw new ClearanceError(
+							"The presented session is no longer active for this organization transition",
+						);
+					}
+					return session as Session;
+				};
+				return orchestration?.afterCapture &&
+					typeof context.adapter.options?.adapterConfig.transaction === "function"
+					? runWithTransaction(context.adapter, updateLegacySession)
+					: updateLegacySession();
+			}
+			if (
+				typeof context.adapter.options?.adapterConfig.transaction !== "function"
+			) {
+				throw new Error(
+					"Managed authentication requires rollback-capable database transactions",
+				);
+			}
+
+			let committedSuccessor: Session | undefined;
+			try {
+				return await runWithTransaction(context.adapter, async () => {
+					const transactionAdapter = await getCurrentAdapter(context.adapter);
+					const transactionTransitions =
+						activeManagedTransitions.get(transactionAdapter) ?? new Map();
+					const existingTransition = transactionTransitions.get(sessionToken);
+					if (existingTransition) {
+						existingTransition.reentrantAttempted = true;
+						throw new ClearanceError(
+							"Recursive organization transitions from the same source are not allowed",
+						);
+					}
+					const transition: ActiveManagedTransition = {
+						reentrantAttempted: false,
+					};
+					transactionTransitions.set(sessionToken, transition);
+					activeManagedTransitions.set(
+						transactionAdapter,
+						transactionTransitions,
+					);
+					try {
+						const issuanceContext = await captureInternalSessionIssuanceContext(
+							context.internalAdapter,
+							{
+								purpose: "organization",
+								sourceSessionToken: sessionToken,
+								targetOrganizationId: organizationId,
+							},
+						);
+						if (!issuanceContext) {
+							throw new ClearanceError(
+								"Managed organization transitions require captured session issuance authority",
+							);
+						}
+
+						const source = await context.internalAdapter.findSession(sessionToken);
+						const requestSession = ctx.context.session;
+						if (
+							!source ||
+							source.session.token !== sessionToken ||
+							requestSession?.session.token !== sessionToken ||
+							source.user.id !== requestSession?.user.id ||
+							source.session.id !== requestSession?.session.id
+						) {
+							throw new ClearanceError(
+								"The presented session changed during this organization transition",
+							);
+						}
+						const sourceExpiresAt = new Date(source.session.expiresAt);
+						if (!Number.isFinite(sourceExpiresAt.getTime())) {
+							throw new ClearanceError(
+								"The presented session changed during this organization transition",
+							);
+						}
+						const legacyCredentialAuthority =
+							readInternalCredentialAuthority(context.options)?.generation ===
+							"legacy-v1";
+						const rawSource = await transactionAdapter.findOne<Session>({
+							model: "session",
+							where: [{ field: "id", value: source.session.id }],
+						});
+						const sourceCredential = legacyCredentialAuthority
+							? null
+							: await transactionAdapter.findOne<SessionCredential>({
+									model: SESSION_CREDENTIAL_MODEL,
+									where: [
+										{
+											field: "secretDigest",
+											value: await digestSessionRefreshSecret(sessionToken),
+										},
+									],
+								});
+						if (
+							!rawSource ||
+							(legacyCredentialAuthority
+								? rawSource.token !== sessionToken
+								: !sourceCredential ||
+									sourceCredential.status !== "active" ||
+									sourceCredential.sessionId !== source.session.id)
+						) {
+							throw new ClearanceError(
+								"The presented session changed during this organization transition",
+							);
+						}
+						const sourceAuthority = Object.fromEntries(
+							SESSION_ASSURANCE_RESERVED_FIELDS.map((field) => [
+								field,
+								(rawSource as unknown as Record<string, unknown>)[field],
+							]),
+						);
+
+						await orchestration?.afterCapture?.();
+						const currentRawSource = await transactionAdapter.findOne<Session>({
+							model: "session",
+							where: [{ field: "id", value: source.session.id }],
+						});
+						const currentCredential = sourceCredential
+							? await transactionAdapter.findOne<SessionCredential>({
+									model: SESSION_CREDENTIAL_MODEL,
+									where: [{ field: "id", value: sourceCredential.id }],
+								})
+							: null;
+						const authorityUnchanged = SESSION_ASSURANCE_RESERVED_FIELDS.every(
+							(field) => {
+								const before = sourceAuthority[field];
+								const after = (
+									currentRawSource as unknown as
+										| Record<string, unknown>
+										| undefined
+								)?.[field];
+								return before instanceof Date || after instanceof Date
+									? new Date(before as string | number | Date).getTime() ===
+											new Date(after as string | number | Date).getTime()
+									: Object.is(before, after);
+							},
+						);
+						if (
+							transition.reentrantAttempted ||
+							!currentRawSource ||
+							currentRawSource.id !== rawSource.id ||
+							currentRawSource.userId !== rawSource.userId ||
+							new Date(currentRawSource.expiresAt).getTime() !==
+								sourceExpiresAt.getTime() ||
+							(legacyCredentialAuthority
+								? currentRawSource.token !== sessionToken
+								: !currentCredential ||
+									currentCredential.status !== "active" ||
+									currentCredential.sessionId !== source.session.id ||
+									currentCredential.secretDigest !==
+										sourceCredential?.secretDigest) ||
+							!authorityUnchanged
+						) {
+							throw new ClearanceError(
+								"The source session changed during organization transition lifecycle work",
+							);
+						}
+
+						await context.internalAdapter.deleteSession(sessionToken);
+						const successor = await context.internalAdapter.createSession(
+							source.user.id,
+							dontRememberMe,
+							{
+								...source.session,
+								expiresAt: sourceExpiresAt,
+								__preserveSessionExpiresAt: true,
+							},
+							true,
+							issuanceContext,
+						);
+						committedSuccessor = successor;
+						orchestration?.onSuccessorPrepared?.(successor);
+						return successor;
+					} finally {
+						transactionTransitions.delete(sessionToken);
+						if (transactionTransitions.size === 0) {
+							activeManagedTransitions.delete(transactionAdapter);
+						}
+					}
+				});
+			} catch (error) {
+				if (error instanceof AfterTransactionHookError && committedSuccessor) {
+					return committedSuccessor;
+				}
+				throw error;
+			}
 		},
 		findOrganizationById: async (
 			organizationId: string,
@@ -821,6 +1074,11 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					activeTeamId: teamId,
 				},
 			);
+			if (!session) {
+				throw new ClearanceError(
+					"The presented session is no longer active for this team transition",
+				);
+			}
 			return session as Session;
 		},
 

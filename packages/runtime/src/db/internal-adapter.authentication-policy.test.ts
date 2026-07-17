@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
 	ClearanceOptions,
+	GenericEndpointContext,
 	RuntimeAuthenticationPolicy,
 	RuntimeAuthenticationPolicyIdentity,
 	RuntimeAuthenticationPolicyReader,
@@ -11,8 +12,10 @@ import type {
 import {
 	AfterTransactionHookError,
 	getCurrentAdapter,
+	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
+import { ClearanceError } from "@clearance/core/error";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { init } from "../context/init";
@@ -36,6 +39,7 @@ import { getMigrations } from "./get-migration";
 import { generateCredentialOperationKey } from "../utils/operation-key";
 import { SESSION_ASSURANCE_RESERVED_FIELDS } from "../security/session-assurance";
 import type { Session, User } from "../types";
+import { getOrgAdapter } from "../plugins/organization/adapter";
 import { schema as passkeySchema } from "../plugins/passkey/schema";
 import { schema as twoFactorSchema } from "../plugins/two-factor/schema";
 import {
@@ -215,6 +219,18 @@ async function issuePasswordSession(
 			targetOrganizationId: options.targetOrganizationId,
 		}),
 	);
+}
+
+function organizationEndpointContext(
+	runtime: ManagedRuntime,
+	session: Session,
+): GenericEndpointContext {
+	return {
+		context: {
+			...runtime.context,
+			session: { session, user: runtime.user },
+		},
+	} as unknown as GenericEndpointContext;
 }
 
 async function credentialRows(runtime: ManagedRuntime) {
@@ -2602,6 +2618,423 @@ describe("managed session issuance", () => {
 			await runtime.context.adapter.count({ model: "sessionCredential" }),
 		).toBe(1);
 		expect(secondarySet).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("managed organization adapter transitions", () => {
+	const sessionFields = {
+		activeOrganizationId: { type: "string", required: false },
+		activeTeamId: { type: "string", required: false },
+		transitionMetadata: {
+			type: "string",
+			required: false,
+			defaultValue: "configured-default",
+		},
+	} as const;
+
+	async function issueOrganizationSource(
+		runtime: ManagedRuntime,
+		expiresAt = new Date(Date.now() + 120_000),
+		dontRememberMe = false,
+	) {
+		return runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			dontRememberMe,
+			{
+				activeOrganizationId: "organization_a",
+				activeTeamId: "team_a",
+				transitionMetadata: "preserve-me",
+				expiresAt,
+				__preserveSessionExpiresAt: true,
+			},
+			true,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: "organization_a",
+			}),
+		);
+	}
+
+	it.each([
+		{ label: "organization to organization", target: "organization_b" },
+		{ label: "organization to environment", target: null },
+	])(
+		"rotates the exact adapter source for $label while preserving its ceiling and custom fields",
+		async ({ target }) => {
+			const runtime = await setupManagedRuntime({
+				reader: (input) =>
+					policyResult(input, {
+						revision: input.organizationId === "organization_b" ? "8" : "7",
+					}),
+				options: { session: { additionalFields: sessionFields } },
+			});
+			const sourceCeiling = new Date(Date.now() + 120_000);
+			const source = await issueOrganizationSource(runtime, sourceCeiling);
+			const successor = await getOrgAdapter(runtime.context).setActiveOrganization(
+				source.token,
+				target,
+				organizationEndpointContext(runtime, source),
+			);
+
+			expect(successor.id).not.toBe(source.id);
+			expect(successor.token).not.toBe(source.token);
+			expect(successor).toMatchObject({
+				userId: runtime.user.id,
+				activeOrganizationId: target,
+				activeTeamId: null,
+				transitionMetadata: "preserve-me",
+				authenticationPolicyOrganizationId: target,
+				authenticationPolicyRevision: target ? "8" : "7",
+			});
+			expect(successor.expiresAt).toEqual(sourceCeiling);
+			await expect(
+				runtime.context.internalAdapter.findSession(source.token),
+			).resolves.toBeNull();
+			await expect(
+				runtime.context.internalAdapter.findSession(successor.token),
+			).resolves.toMatchObject({ session: { id: successor.id } });
+			expect(await authorityRows(runtime.context)).toHaveLength(1);
+			expect(
+				(await credentialRows(runtime)).filter(
+					(credential) => credential.status === "active",
+				),
+			).toHaveLength(1);
+		},
+	);
+
+	it("allows exactly one successor from concurrent adapter transitions", async () => {
+		const runtime = await setupManagedRuntime({
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		const orgAdapter = getOrgAdapter(runtime.context);
+		const transition = () =>
+			orgAdapter.setActiveOrganization(
+				source.token,
+				"organization_b",
+				organizationEndpointContext(runtime, source),
+			);
+		const outcomes = await Promise.allSettled([transition(), transition()]);
+
+		expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(
+			1,
+		);
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+		expect(
+			(await credentialRows(runtime)).filter(
+				(credential) => credential.status === "active",
+			),
+		).toHaveLength(1);
+	});
+
+	it("runs lifecycle work after capture in the owning transaction", async () => {
+		const runtime = await setupManagedRuntime({
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		let callbackRan = false;
+
+		await getOrgAdapter(runtime.context).setActiveOrganization(
+			source.token,
+			"organization_b",
+			organizationEndpointContext(runtime, source),
+			{
+				afterCapture: async () => {
+					callbackRan = true;
+					expect(await getCurrentAdapter(runtime.context.adapter)).not.toBe(
+						runtime.context.adapter,
+					);
+					expect(runtime.readForSubject).toHaveBeenCalled();
+					await (
+						await getCurrentAdapter(runtime.context.adapter)
+					).update<User>({
+						model: "user",
+						where: [{ field: "id", value: runtime.user.id }],
+						update: { name: "Lifecycle callback committed" },
+					});
+				},
+			},
+		);
+
+		expect(callbackRan).toBe(true);
+		await expect(runtime.context.internalAdapter.findUserById(runtime.user.id)).resolves
+			.toMatchObject({ name: "Lifecycle callback committed" });
+	});
+
+	it("rolls the source and lifecycle work back when the callback fails", async () => {
+		const runtime = await setupManagedRuntime({
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		const failure = new Error("lifecycle callback failed");
+
+		await expect(
+			getOrgAdapter(runtime.context).setActiveOrganization(
+				source.token,
+				"organization_b",
+				organizationEndpointContext(runtime, source),
+				{
+					afterCapture: async () => {
+						await (
+							await getCurrentAdapter(runtime.context.adapter)
+						).update<User>({
+							model: "user",
+							where: [{ field: "id", value: runtime.user.id }],
+							update: { name: "Must roll back" },
+						});
+						throw failure;
+					},
+				},
+			),
+		).rejects.toBe(failure);
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toMatchObject({ session: { id: source.id } });
+		await expect(runtime.context.internalAdapter.findUserById(runtime.user.id)).resolves
+			.toMatchObject({ name: runtime.user.name });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+	});
+
+	it.each(["delete", "rotate", "recursive"] as const)(
+		"rejects and rolls back lifecycle callback %s misuse",
+		async (misuse) => {
+			const runtime = await setupManagedRuntime({
+				options: { session: { additionalFields: sessionFields } },
+			});
+			const source = await issueOrganizationSource(runtime);
+			const adapter = getOrgAdapter(runtime.context);
+
+			await expect(
+				adapter.setActiveOrganization(
+					source.token,
+					"organization_b",
+					organizationEndpointContext(runtime, source),
+					{
+						afterCapture: async () => {
+							if (misuse === "delete") {
+								await runtime.context.internalAdapter.deleteSession(source.token);
+								return;
+							}
+							if (misuse === "rotate") {
+								await runtime.context.internalAdapter.rotateSessionCredential(
+									source.token,
+									generateCredentialOperationKey(),
+								);
+								return;
+							}
+							try {
+								await adapter.setActiveOrganization(
+									source.token,
+									"organization_b",
+									organizationEndpointContext(runtime, source),
+								);
+							} catch {
+								// The outer transition must remain tainted even if misuse is swallowed.
+							}
+						},
+					},
+				),
+			).rejects.toBeInstanceOf(ClearanceError);
+			await expect(
+				runtime.context.internalAdapter.findSession(source.token),
+			).resolves.toMatchObject({ session: { id: source.id } });
+			expect(await authorityRows(runtime.context)).toHaveLength(1);
+			expect(
+				(await credentialRows(runtime)).filter(
+					(credential) => credential.status === "active",
+				),
+			).toHaveLength(1);
+		},
+	);
+
+	it("rejects downgraded contexts and non-exact request bearers", async () => {
+		const runtime = await setupManagedRuntime({
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		const adapter = getOrgAdapter(runtime.context);
+		const downgraded = organizationEndpointContext(runtime, source);
+		downgraded.context.options = {};
+		await expect(
+			adapter.setActiveOrganization(source.token, "organization_b", downgraded),
+		).rejects.toBeInstanceOf(ClearanceError);
+
+		const wrongBearer = organizationEndpointContext(runtime, {
+			...source,
+			token: "another-presented-bearer",
+		});
+		await expect(
+			adapter.setActiveOrganization(source.token, "organization_b", wrongBearer),
+		).rejects.toBeInstanceOf(ClearanceError);
+		await expect(
+			adapter.setActiveOrganization(
+				source.token,
+				"organization_b",
+				organizationEndpointContext(runtime, source),
+				{ dontRememberMe: "true" as never },
+			),
+		).rejects.toBeInstanceOf(ClearanceError);
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toMatchObject({ session: { id: source.id } });
+	});
+
+	it.each([true, false])(
+		"passes explicit dontRememberMe=%s through trusted server orchestration",
+		async (dontRememberMe) => {
+			const runtime = await setupManagedRuntime({
+				options: { session: { additionalFields: sessionFields } },
+			});
+			const source = await issueOrganizationSource(
+				runtime,
+				new Date(Date.now() + 120_000),
+				dontRememberMe,
+			);
+			const createSession = vi.spyOn(runtime.context.internalAdapter, "createSession");
+			await getOrgAdapter(runtime.context).setActiveOrganization(
+				source.token,
+				"organization_b",
+				organizationEndpointContext(runtime, source),
+				{ dontRememberMe },
+			);
+			expect(createSession.mock.calls.at(-1)?.[1]).toBe(dontRememberMe);
+		},
+	);
+
+	it("exposes a prepared successor to an outer transaction owner", async () => {
+		const runtime = await setupManagedRuntime({
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		let prepared: Session | undefined;
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await getOrgAdapter(runtime.context).setActiveOrganization(
+					source.token,
+					"organization_b",
+					organizationEndpointContext(runtime, source),
+					{ onSuccessorPrepared: (successor) => (prepared = successor) },
+				);
+				await queueAfterTransactionHook(async () => {
+					throw new Error("outer publication failed");
+				}, runtime.context.adapter);
+			}),
+		).rejects.toBeInstanceOf(AfterTransactionHookError);
+		expect(prepared).toBeDefined();
+		await expect(
+			runtime.context.internalAdapter.findSession(prepared!.token),
+		).resolves.toMatchObject({ session: { id: prepared!.id } });
+	});
+
+	it("rolls lifecycle work and source retirement back when target issuance fails", async () => {
+		let rejectTarget = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					membershipOrganizationId:
+						rejectTarget && input.organizationId === "organization_b"
+							? null
+							: undefined,
+				}),
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+
+		await expect(
+			getOrgAdapter(runtime.context).setActiveOrganization(
+				source.token,
+				"organization_b",
+				organizationEndpointContext(runtime, source),
+				{
+					afterCapture: async () => {
+						await (
+							await getCurrentAdapter(runtime.context.adapter)
+						).update<User>({
+							model: "user",
+							where: [{ field: "id", value: runtime.user.id }],
+							update: { name: "Issuance must roll back" },
+						});
+						rejectTarget = true;
+					},
+				},
+			),
+		).rejects.toBeInstanceOf(InvalidRuntimeAuthenticationPolicyError);
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toMatchObject({ session: { id: source.id } });
+		await expect(runtime.context.internalAdapter.findUserById(runtime.user.id)).resolves
+			.toMatchObject({ name: runtime.user.name });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+	});
+
+	it("allows atomic current-membership removal before issuing the environment successor", async () => {
+		let currentMembershipExists = true;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					membershipOrganizationId:
+						input.organizationId === "organization_a" &&
+						!currentMembershipExists
+							? null
+							: undefined,
+				}),
+			options: { session: { additionalFields: sessionFields } },
+		});
+		const source = await issueOrganizationSource(runtime);
+		const successor = await getOrgAdapter(runtime.context).setActiveOrganization(
+			source.token,
+			null,
+			organizationEndpointContext(runtime, source),
+			{
+				afterCapture: () => {
+					currentMembershipExists = false;
+				},
+			},
+		);
+
+		expect((successor as Session & { activeOrganizationId: string | null }).activeOrganizationId)
+			.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.findSession(successor.token),
+		).resolves.toMatchObject({ session: { id: successor.id } });
+	});
+
+	it("returns the committed successor when source cache cleanup fails after commit", async () => {
+		let failCleanup = true;
+		const setup = await setupManagedDeletionRuntime({
+			namespace: "organization-transition-publication-failure",
+			options: { session: { additionalFields: sessionFields } },
+			delete: async () => {
+				if (failCleanup) throw new Error("source cache cleanup failed");
+			},
+		});
+		const source = await issueOrganizationSource(setup.runtime);
+
+		const successor = await getOrgAdapter(
+			setup.runtime.context,
+		).setActiveOrganization(
+			source.token,
+			"organization_b",
+			organizationEndpointContext(setup.runtime, source),
+		);
+
+		expect(successor.id).not.toBe(source.id);
+		failCleanup = false;
+		await expect(
+			setup.runtime.context.internalAdapter.findSession(successor.token),
+		).resolves.toMatchObject({ session: { id: successor.id } });
+		await expect(
+			setup.runtime.context.internalAdapter.findSession(source.token),
+		).resolves.toBeNull();
 	});
 });
 
