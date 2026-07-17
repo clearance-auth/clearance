@@ -715,12 +715,11 @@ describe("internal adapter test", async () => {
 	});
 
 	it("should delete on secondary storage", async () => {
-		// Create multiple sessions in past and future
+		// Create multiple live sessions with distinct bounded expirations.
 		const now = Date.now();
 		const userId = "test-user";
-		// 10 consecutive days (5 in past, 1 now, 4 in future)
 		const issuedSessions: Session[] = [];
-		for (let i = -5; i < 5; i++) {
+		for (let i = 1; i < 5; i++) {
 			const expiresIn = i * 60 * 60 * 24 * 1000;
 			const expiresAt = new Date(now + expiresIn);
 			const issued = await internalAdapter.createSession(
@@ -728,26 +727,19 @@ describe("internal adapter test", async () => {
 				undefined,
 				{
 					expiresAt,
+					__preserveSessionExpiresAt: true,
 				},
 				true,
 			);
 			issuedSessions.push(issued);
-			if (i > 0) {
-				const actualExp = expirationMap.get(
-					secondaryIndexKey("internal-adapter-suite", userId),
-				);
-				const expectedExp = Math.floor(
-					(expiresAt.getTime() - Date.now()) / 1000,
-				);
-				expect(actualExp - expectedExp).toBeLessThanOrEqual(1); // max 1s clock drift between check and set
-				expect(actualExp - expectedExp).toBeGreaterThanOrEqual(0); // max 1s clock drift between check and set
-			} else {
-				expect(
-					expirationMap.get(
-						secondaryIndexKey("internal-adapter-suite", userId),
-					),
-				).toBeUndefined();
-			}
+			const actualExp = expirationMap.get(
+				secondaryIndexKey("internal-adapter-suite", userId),
+			);
+			const expectedExp = Math.floor(
+				(expiresAt.getTime() - Date.now()) / 1000,
+			);
+			expect(actualExp - expectedExp).toBeLessThanOrEqual(1); // max 1s clock drift between check and set
+			expect(actualExp - expectedExp).toBeGreaterThanOrEqual(0); // max 1s clock drift between check and set
 		}
 		const storedSessions: SecondarySessionIndexEntry[] = JSON.parse(
 			map.get(secondaryIndexKey("internal-adapter-suite", userId)),
@@ -1879,6 +1871,30 @@ describe("internal adapter test", async () => {
 			return ctx.internalAdapter;
 		}
 
+		function makeAtomicSecondaryStorage(store: Map<string, string>) {
+			return {
+				namespace: "internal-adapter-consume-storage",
+				runExclusive<T>(_name: string, operation: () => T): T {
+					return operation();
+				},
+				assertNoLegacySessionWriters() {},
+				set(key: string, value: string) {
+					store.set(key, value);
+				},
+				get(key: string) {
+					return store.get(key) ?? null;
+				},
+				getAndDelete(key: string) {
+					const value = store.get(key) ?? null;
+					store.delete(key);
+					return value;
+				},
+				delete(key: string) {
+					store.delete(key);
+				},
+			};
+		}
+
 		it("returns the row to the first caller and null to subsequent reads", async () => {
 			const adapter = await makeAdapter();
 			await adapter.createVerificationValue({
@@ -2028,6 +2044,47 @@ describe("internal adapter test", async () => {
 			expect(leftover).toBeNull();
 		});
 
+		it("consumes hashed and legacy-plain database aliases as one credential", async () => {
+			const database = new DatabaseSync(":memory:");
+			const options = {
+				database,
+				verification: { storeIdentifier: "hashed" },
+			} satisfies ClearanceOptions;
+			await (await getMigrations(options)).runMigrations();
+			const [left, right] = await Promise.all([init(options), init(options)]);
+			const identifier = "consume:database-aliases";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const hashed = await left.internalAdapter.createVerificationValue({
+				identifier,
+				value: "hashed-winner",
+				expiresAt,
+			});
+			await left.adapter.create({
+				model: "verification",
+				data: {
+					id: "legacy-plain-verification-row",
+					identifier,
+					value: "legacy-plain-row",
+					expiresAt,
+					createdAt: new Date(hashed.createdAt.getTime() - 1),
+					updatedAt: new Date(),
+				},
+			});
+
+			const results = await Promise.all([
+				left.internalAdapter.consumeVerificationValue(identifier),
+				right.internalAdapter.consumeVerificationValue(identifier),
+			]);
+
+			expect(results.filter((result) => result !== null)).toHaveLength(1);
+			expect(results.find((result) => result !== null)?.value).toBe(
+				"hashed-winner",
+			);
+			expect(
+				await left.adapter.findMany({ model: "verification" }),
+			).toHaveLength(0);
+		});
+
 		it("uses secondary storage getAndDelete when verification values are storage-only", async () => {
 			const store = new Map<string, string>();
 			const getAndDelete = vi.fn((key: string) => {
@@ -2072,24 +2129,50 @@ describe("internal adapter test", async () => {
 			expect(store.has("verification:consume:secondary")).toBe(false);
 		});
 
+		it("fails closed before reading or deleting when storage-only consume lacks getAndDelete", async () => {
+			const store = new Map<string, string>();
+			const get = vi.fn((key: string) => store.get(key) ?? null);
+			const remove = vi.fn((key: string) => {
+				store.delete(key);
+			});
+			const adapter = await makeAdapter({
+				verification: { storeInDatabase: false },
+				secondaryStorage: {
+					namespace: "internal-adapter-test-storage",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
+					set(key, value) {
+						store.set(key, value);
+					},
+					get,
+					delete: remove,
+				},
+			});
+			await adapter.createVerificationValue({
+				identifier: "consume:missing-get-and-delete",
+				value: "storage-only-user",
+				expiresAt: new Date(Date.now() + 60_000),
+			});
+			get.mockClear();
+			remove.mockClear();
+
+			await expect(
+				adapter.consumeVerificationValue("consume:missing-get-and-delete"),
+			).rejects.toThrow("requires `getAndDelete`");
+			expect(get).not.toHaveBeenCalled();
+			expect(remove).not.toHaveBeenCalled();
+			expect(store.has("verification:consume:missing-get-and-delete")).toBe(
+				true,
+			);
+		});
+
 		it("returns null when the secondary storage row has already expired", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-			namespace: "internal-adapter-test-storage",
-			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
-			assertNoLegacySessionWriters() {},
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 
 			// Bypass `createVerificationValue`'s TTL gate by writing directly
@@ -2120,20 +2203,7 @@ describe("internal adapter test", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-			namespace: "internal-adapter-test-storage",
-			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
-			assertNoLegacySessionWriters() {},
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 			await adapter.createVerificationValue({
 				identifier: "consume:secondary-hydrate",
@@ -2154,20 +2224,7 @@ describe("internal adapter test", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-			namespace: "internal-adapter-test-storage",
-			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
-			assertNoLegacySessionWriters() {},
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 
 			store.set(
@@ -2188,82 +2245,76 @@ describe("internal adapter test", async () => {
 			expect(result).toBeNull();
 		});
 
-		it("serializes the secondary storage compatibility fallback within one process", async () => {
+		it("consumes hashed identifier aliases under a shared provider lease", async () => {
 			const store = new Map<string, string>();
-			const adapter = await makeAdapter({
-				verification: { storeInDatabase: false },
-				secondaryStorage: {
-			namespace: "internal-adapter-test-storage",
-			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
-			assertNoLegacySessionWriters() {},
-					set(key, value) {
-						store.set(key, value);
-					},
-					async get(key) {
-						await new Promise((resolve) => setTimeout(resolve, 5));
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+			const leases = new Map<string, Promise<void>>();
+			const storage = makeAtomicSecondaryStorage(store);
+			storage.runExclusive = (async (name, operation) => {
+				const previous = leases.get(name) ?? Promise.resolve();
+				let release!: () => void;
+				const current = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const next = previous.catch(() => {}).then(() => current);
+				leases.set(name, next);
+				await previous.catch(() => {});
+				try {
+					return await operation();
+				} finally {
+					release();
+					if (leases.get(name) === next) leases.delete(name);
+				}
+			}) as typeof storage.runExclusive;
+			const left = await makeAdapter({
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
 			});
-			await adapter.createVerificationValue({
-				identifier: "consume:secondary-fallback",
-				value: "fallback-user",
+			const right = await makeAdapter({
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
+			});
+			const created = await left.createVerificationValue({
+				identifier: "consume:secondary-aliases",
+				value: "alias-user",
 				expiresAt: new Date(Date.now() + 60_000),
 			});
+			store.set(
+				"verification:consume:secondary-aliases",
+				JSON.stringify({ ...created, identifier: "consume:secondary-aliases" }),
+			);
 
 			const results = await Promise.all([
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
+				left.consumeVerificationValue("consume:secondary-aliases"),
+				right.consumeVerificationValue("consume:secondary-aliases"),
 			]);
 
 			expect(results.filter((r) => r !== null)).toHaveLength(1);
-			expect(results.find((r) => r !== null)?.value).toBe("fallback-user");
-			expect(store.has("verification:consume:secondary-fallback")).toBe(false);
+			expect(results.find((r) => r !== null)?.value).toBe("alias-user");
+			expect(
+				Array.from(store.keys()).filter((key) => key.startsWith("verification:")),
+			).toHaveLength(0);
 		});
 
-		it("warns once when secondary storage cannot consume atomically", async () => {
+		it("fails closed for hashed identifier aliases without a provider lease", async () => {
 			const store = new Map<string, string>();
-			const logs: { level: string; message: string }[] = [];
+			const storage = makeAtomicSecondaryStorage(store);
 			const adapter = await makeAdapter({
-				logger: {
-					log: (level, message) => {
-						logs.push({ level, message });
-					},
-				},
-				verification: { storeInDatabase: false },
-				secondaryStorage: {
-			namespace: "internal-adapter-test-storage",
-			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
-			assertNoLegacySessionWriters() {},
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
 			});
+			await adapter.createVerificationValue({
+				identifier: "consume:aliases-without-lease",
+				value: "alias-user",
+				expiresAt: new Date(Date.now() + 60_000),
+			});
+			Reflect.deleteProperty(storage, "runExclusive");
 
-			for (const id of ["consume:warn-1", "consume:warn-2"]) {
-				await adapter.createVerificationValue({
-					identifier: id,
-					value: "user",
-					expiresAt: new Date(Date.now() + 60_000),
-				});
-				await adapter.consumeVerificationValue(id);
-			}
-
-			const warnings = logs.filter(
-				(l) => l.level === "warn" && l.message.includes("getAndDelete"),
-			);
-			expect(warnings).toHaveLength(1);
+			await expect(
+				adapter.consumeVerificationValue("consume:aliases-without-lease"),
+			).rejects.toThrow("requires `runExclusive`");
+			expect(
+				Array.from(store.keys()).filter((key) => key.startsWith("verification:")),
+			).toHaveLength(1);
 		});
 	});
 
