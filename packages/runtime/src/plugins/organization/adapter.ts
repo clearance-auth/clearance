@@ -517,7 +517,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 			organizationId: string | null,
 			ctx: GenericEndpointContext,
 			orchestration?: ActiveOrganizationTransitionOrchestration | undefined,
-		) => {
+		): Promise<Session> => {
 			if (
 				ctx.context.options !== context.options ||
 				ctx.context.adapter !== context.adapter
@@ -563,7 +563,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 				);
 			}
 			if (!managed) {
-				const updateLegacySession = async () => {
+				const updateLegacySession = async (): Promise<Session> => {
 					await orchestration?.afterCapture?.();
 					const session = await context.internalAdapter.updateSession(
 						sessionToken,
