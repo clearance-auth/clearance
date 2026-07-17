@@ -1,10 +1,12 @@
 import type { ClearanceOptions } from "@clearance/core";
+import type { AsyncLocalStorage } from "@clearance/core/async_hooks";
 import type {
 	CleanedWhere,
 	DBAdapterDebugLogOption,
 	JoinConfig,
 } from "@clearance/core/db/adapter";
 import { createAdapterFactory } from "@clearance/core/db/adapter";
+import { getAsyncLocalStorage } from "@clearance/core/async_hooks";
 import { logger } from "@clearance/core/env";
 import { ClearanceError } from "@clearance/core/error";
 import {
@@ -127,11 +129,71 @@ function rowChanged(baseRow: any, cloneRow: any): boolean {
 	return JSON.stringify(baseRow) !== JSON.stringify(cloneRow);
 }
 
+/**
+ * Confirm that an async-context implementation keeps a pending callback's
+ * store out of unrelated work. The lightweight browser shim intentionally
+ * keeps one shared store until a promise settles, which cannot distinguish a
+ * captured-adapter reentry from a separate concurrent transaction.
+ */
+async function supportsIsolatedAsyncContexts(
+	storage: AsyncLocalStorage<symbol>,
+): Promise<boolean> {
+	const scope = Symbol("memory-adapter-context-probe");
+	let release: () => void = () => {};
+	const pending = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const active = storage.run(scope, async () => {
+		await pending;
+		return storage.getStore() === scope;
+	});
+
+	// `run` calls its callback synchronously, so one microtask is enough to
+	// inspect unrelated work while the callback is suspended at `pending`.
+	await Promise.resolve();
+	const isolatesConcurrentWork = storage.getStore() === undefined;
+	release();
+	return isolatesConcurrentWork && (await active);
+}
+
 export const memoryAdapter = (
 	db: MemoryDB,
 	config?: MemoryAdapterConfig | undefined,
 ) => {
 	let lazyOptions: ClearanceOptions | null = null;
+	let transactionTail: Promise<void> = Promise.resolve();
+	const transactionScope = Symbol("memory-adapter-transaction");
+	let transactionScopeStorage: Promise<AsyncLocalStorage<symbol>> | null =
+		null;
+
+	const getTransactionScopeStorage = () => {
+		transactionScopeStorage ??= getAsyncLocalStorage().then(
+			async (AsyncLocalStorage) => {
+				const storage = new AsyncLocalStorage<symbol>();
+				if (!(await supportsIsolatedAsyncContexts(storage))) {
+					throw new ClearanceError(
+						"Memory adapter transactions require a context-local async context implementation",
+					);
+				}
+				return storage;
+			},
+		);
+		return transactionScopeStorage;
+	};
+
+	const serializeTransaction = async <T>(operation: () => Promise<T>) => {
+		let release: () => void = () => {};
+		const predecessor = transactionTail;
+		transactionTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await predecessor;
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
+	};
 
 	/**
 	 * Build an adapter factory whose operations read and write `activeDb`.
@@ -139,10 +201,11 @@ export const memoryAdapter = (
 	 * targets an isolated clone so its uncommitted writes are invisible to
 	 * concurrent operations against the live `db`. A failed transaction leaves
 	 * the live `db` untouched, and a committed one replays only its own
-	 * row/table changes, so a concurrent write that interleaved at an `await`
-	 * point survives either outcome. Isolation is at row/table granularity:
-	 * the in-memory adapter does not serialize writes, so two operations that
-	 * edit the same row resolve last-writer-wins. It is built for development
+	 * row/table changes, so a concurrent non-transactional write that interleaved
+	 * at an `await` point survives either outcome. Top-level transactions are
+	 * serialized in admission order so each snapshot observes the preceding
+	 * commit. Writes made outside a transaction can still interleave and same-row
+	 * conflicts remain last-writer-wins; this adapter is intended for development
 	 * and tests, not production concurrency control.
 	 */
 	const buildAdapterFactory = (activeDb: MemoryDB, inTransaction = false) =>
@@ -167,18 +230,37 @@ export const memoryAdapter = (
 					return props.data;
 				},
 				transaction: async (cb) => {
-					// Copy-on-write isolation: run the callback against a clone, then
-					// replay its delta onto the live db on success. On failure the clone
-					// is discarded and the live db is never touched. `base` captures the
-					// pre-transaction state so the commit can apply only the rows the
-					// transaction changed, preserving writes that interleaved at an
-					// `await` point.
-					const base = structuredClone(activeDb);
-					const clone = structuredClone(activeDb);
-					const trxAdapter = buildAdapterFactory(clone, true)(lazyOptions!);
-					const result = await cb(trxAdapter);
-					mergeTransactionInto(activeDb, base, clone);
-					return result;
+					const scopeStorage = await getTransactionScopeStorage();
+					// A callback which retained the base adapter cannot safely start a
+					// nested transaction: reusing the outer clone would lose the inner
+					// transaction's independent rollback boundary, while queueing it would
+					// wait behind the callback that is awaiting it. The transaction adapter
+					// supplied to `cb` remains the supported nested-transaction path.
+					if (!inTransaction && scopeStorage.getStore() === transactionScope) {
+						throw new ClearanceError(
+							"Memory adapter cannot re-enter a transaction through its base adapter; use the transaction adapter supplied to the callback",
+						);
+					}
+
+					const execute = async () => {
+						// Copy-on-write isolation: run the callback against a clone, then
+						// replay its delta onto the live db on success. On failure the clone
+						// is discarded and the live db is never touched. `base` captures the
+						// pre-transaction state so the commit can apply only the rows the
+						// transaction changed, preserving writes that interleaved at an
+						// `await` point.
+						const base = structuredClone(activeDb);
+						const clone = structuredClone(activeDb);
+						const trxAdapter = buildAdapterFactory(clone, true)(lazyOptions!);
+						const result = await cb(trxAdapter);
+						mergeTransactionInto(activeDb, base, clone);
+						return result;
+					};
+					return inTransaction
+						? execute()
+						: serializeTransaction(() =>
+							scopeStorage.run(transactionScope, execute),
+						);
 				},
 			},
 			adapter: ({
