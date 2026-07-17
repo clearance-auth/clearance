@@ -1,6 +1,9 @@
 import type { AuthContext, HookEndpointContext } from "@clearance/core";
 import type { AuthMiddleware } from "@clearance/core/api";
-import { runWithEndpointContext } from "@clearance/core/context";
+import {
+	runWithEndpointContext,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { shouldPublishLog } from "@clearance/core/env";
 import { APIError } from "@clearance/core/error";
 import {
@@ -11,12 +14,20 @@ import {
 	withSpan,
 } from "@clearance/core/instrumentation";
 import type { Endpoint, EndpointContext, InputContext } from "@clearance/call";
-import { kAPIErrorHeaderSymbol, toResponse } from "@clearance/call";
+import {
+	kAPIErrorHeaderSymbol,
+	serializeSignedCookie,
+	toResponse,
+} from "@clearance/call";
 import { createDefu } from "defu";
 import { isAPIError } from "../utils/is-api-error";
 import { isRequestLike } from "../utils/url";
 import { assertSessionCredentialMigrationComplete } from "../db/session-credential-migration";
 import { readInternalCredentialAuthority } from "../internal/credential-authority";
+import {
+	issueInitialStagedAuthenticationCapability,
+	takeStagedAuthenticationContinuation,
+} from "../internal/staged-authentication-context";
 const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
 
 async function assertDispatchCredentialAuthority(context: AuthContext) {
@@ -415,24 +426,58 @@ export async function dispatchAuthEndpoint(
 				internalContext.returnHeaders = true;
 				internalContext.returnStatus = true;
 				const result = (await runWithEndpointContext(internalContext, () =>
-					withSpan(
-						`handler ${route}`,
-						{
-							[ATTR_HTTP_ROUTE]: route,
-							[ATTR_OPERATION_ID]: operationId,
-						},
-						() => (endpoint as any)(internalContext as any),
-					),
-				).catch((e: unknown) => {
-					if (isAPIError(e)) {
-						return {
-							response: e,
-							status: e.statusCode,
-							headers: mergeAPIErrorHeaders(e),
-						};
-					}
-					throw e;
-				})) as
+						withSpan(
+							`handler ${route}`,
+							{
+								[ATTR_HTTP_ROUTE]: route,
+								[ATTR_OPERATION_ID]: operationId,
+							},
+							() => (endpoint as any)(internalContext as any),
+						),
+					).catch(async (e: unknown) => {
+						if (isAPIError(e)) {
+							return {
+								response: e,
+								status: e.statusCode,
+								headers: mergeAPIErrorHeaders(e),
+							};
+						}
+						const continuation = takeStagedAuthenticationContinuation(e);
+						if (continuation) {
+							const issued = await runWithTransaction(
+								internalContext.context.adapter,
+								() =>
+									issueInitialStagedAuthenticationCapability(
+										internalContext.context,
+										continuation,
+									),
+							);
+							const headers = new Headers();
+							headers.append(
+								"set-cookie",
+								await serializeSignedCookie(
+									issued.cookie.name,
+									issued.bearer,
+									internalContext.context.secret,
+									issued.cookie.attributes,
+								),
+							);
+							headers.set("cache-control", "no-store");
+							headers.set("pragma", "no-cache");
+							const error = new APIError("FORBIDDEN", {
+								code: "MANAGED_AUTHENTICATION_REQUIRED",
+								message: "Additional authentication is required",
+								allowedFactors: issued.allowedFactors,
+								expiresAt: issued.expiresAt.toISOString(),
+							});
+							return {
+								response: error,
+								status: error.statusCode,
+								headers,
+							};
+						}
+						throw e;
+					})) as
 					| Response
 					| { headers: Headers | null; response: any; status?: number };
 
@@ -444,12 +489,20 @@ export async function dispatchAuthEndpoint(
 				internalContext.context.returned = result.response;
 				internalContext.context.responseHeaders = result.headers ?? undefined;
 
-				const after = await runAfterHooks(
-					internalContext,
-					afterHooks,
-					endpoint,
-					operationId,
-				);
+				const managedRemediation =
+						isAPIError(result.response) &&
+						result.response.body?.code === "MANAGED_AUTHENTICATION_REQUIRED";
+				const after = managedRemediation
+						? {
+								response: result.response,
+								headers: result.headers,
+							}
+						: await runAfterHooks(
+								internalContext,
+								afterHooks,
+								endpoint,
+								operationId,
+							);
 				if (after.response !== undefined) {
 					result.response = after.response;
 				}
