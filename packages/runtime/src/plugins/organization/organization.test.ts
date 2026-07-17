@@ -33,6 +33,361 @@ describe("organization type", () => {
 		expectTypeOf({ schema: {} } satisfies OrganizationOptions);
 	});
 
+	it("rejects reserved additional-field keys at compile time", () => {
+		if (false) {
+			const invalidOptions: OrganizationOptions = {
+				schema: {
+					organization: {
+						additionalFields: {
+							// @ts-expect-error Core schema keys cannot be additional fields.
+							slug: { type: "string", required: false },
+							// @ts-expect-error Mongo's implicit ID alias cannot be an additional field.
+							_id: { type: "string", required: false },
+							// @ts-expect-error The internal serialization timestamp cannot be an additional field.
+							updatedAt: { type: "date", required: false },
+						},
+					},
+				},
+			};
+			void invalidOptions;
+		}
+	});
+
+	it("rejects logical and physical core-column aliases during plugin initialization", () => {
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						additionalFields: {
+							customSlug: { type: "string", fieldName: "slug" },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "slug" is assigned to both core field "slug" and additional field "customSlug"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						fields: { updatedAt: "organization_updated_at" },
+						additionalFields: {
+							exposedUpdatedAt: {
+								type: "date",
+								fieldName: "organization_updated_at",
+							},
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "organization_updated_at" is assigned to both core field "updatedAt" and additional field "exposedUpdatedAt"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					member: {
+						fields: { organizationId: "member_organization_id" },
+						additionalFields: {
+							crossTenantMember: {
+								type: "string",
+								fieldName: "member_organization_id",
+							},
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.member physical column "member_organization_id" is assigned to both core field "organizationId" and additional field "crossTenantMember"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					invitation: {
+						fields: { expiresAt: "invitation_expires_at" },
+						additionalFields: {
+							exposedExpiry: {
+								type: "date",
+								fieldName: "invitation_expires_at",
+							},
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.invitation physical column "invitation_expires_at" is assigned to both core field "expiresAt" and additional field "exposedExpiry"',
+		);
+
+		expect(() =>
+			organization({
+				teams: { enabled: true },
+				schema: {
+					team: {
+						fields: { organizationId: "team_organization_id" },
+						additionalFields: {
+							crossTenantTeam: {
+								type: "string",
+								fieldName: "team_organization_id",
+							},
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.team physical column "team_organization_id" is assigned to both core field "organizationId" and additional field "crossTenantTeam"',
+		);
+
+		expect(() =>
+			organization({
+				dynamicAccessControl: { enabled: true },
+				schema: {
+					organizationRole: {
+						fields: { role: "role_name" },
+						additionalFields: {
+							exposedRole: { type: "string", fieldName: "role_name" },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organizationRole physical column "role_name" is assigned to both core field "role" and additional field "exposedRole"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						additionalFields: {
+							// Runtime validation protects JavaScript callers too.
+							slug: { type: "string", required: false },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "slug" is assigned to both core field "slug" and additional field "slug"',
+		);
+
+		expect(() =>
+			organization({
+				schema: { organization: { fields: { name: "shared", slug: "SHARED" } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "SHARED" is assigned to both core field "name" and core field "slug"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						additionalFields: {
+							one: { type: "string", fieldName: "custom_column" },
+							two: { type: "string", fieldName: "CUSTOM_COLUMN" },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "CUSTOM_COLUMN" is assigned to both additional field "one" and additional field "two"',
+		);
+
+		expect(() =>
+			organization({
+				schema: { session: { fields: { activeOrganizationId: "session_org", activeTeamId: "SESSION_ORG" } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.session physical column "SESSION_ORG" is assigned to both core field "activeOrganizationId" and core field "activeTeamId"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					team: { fields: { name: "team_column", organizationId: "TEAM_COLUMN" } },
+					teamMember: { fields: { teamId: "membership", userId: "MEMBERSHIP" } },
+					organizationRole: { fields: { organizationId: "role_column", role: "ROLE_COLUMN" } },
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.team physical column "TEAM_COLUMN" is assigned to both core field "name" and core field "organizationId"',
+		);
+
+		expect(() =>
+			organization({
+				schema: { teamMember: { fields: { teamId: "membership", userId: "MEMBERSHIP" } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.teamMember physical column "MEMBERSHIP" is assigned to both core field "teamId" and core field "userId"',
+		);
+
+		expect(() =>
+			organization({
+				schema: { organizationRole: { fields: { organizationId: "role_column", role: "ROLE_COLUMN" } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organizationRole physical column "ROLE_COLUMN" is assigned to both core field "organizationId" and core field "role"',
+		);
+
+		expect(() =>
+			organization({ schema: { organization: { fields: { slug: "" } } } } as never),
+		).toThrow(
+			'Organization plugin schema.organization core field "slug" must use a non-empty, whitespace-free physical column name',
+		);
+
+		expect(() =>
+			organization({
+				schema: { organization: { additionalFields: { custom: { type: "string", fieldName: " " } } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization additional field "custom" must use a non-empty, whitespace-free physical column name',
+		);
+
+		expect(() =>
+			organization({
+				schema: { organization: { additionalFields: { customId: { type: "string", fieldName: "_id" } } } },
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization physical column "_id" is assigned to both core field "_id" and additional field "customId"',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						fields: { id: "custom_id" },
+						additionalFields: {
+							customId: { type: "string", fieldName: "id" },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization core field "id" cannot be mapped',
+		);
+
+		expect(() =>
+			organization({
+				schema: {
+					organization: {
+						fields: { _id: "custom_mongo_id" },
+						additionalFields: {
+							customMongoId: { type: "string", fieldName: "_id" },
+						},
+					},
+				},
+			} as never),
+		).toThrow(
+			'Organization plugin schema.organization core field "_id" cannot be mapped',
+		);
+	});
+
+	it("keeps valid additional fields and core serialization invariants", () => {
+		const plugin = organization({
+			teams: { enabled: true },
+			dynamicAccessControl: { enabled: true },
+			schema: {
+				organization: {
+					fields: { updatedAt: "organization_updated_at" },
+					additionalFields: {
+						organizationCustomField: { type: "string", required: false },
+					},
+				},
+				member: {
+					additionalFields: {
+						memberCustomField: { type: "string", required: false },
+					},
+				},
+				invitation: {
+					additionalFields: {
+						invitationCustomField: { type: "string", required: false },
+					},
+				},
+				team: {
+					fields: { organizationId: "team_organization_id" },
+					additionalFields: {
+						teamCustomField: { type: "string", required: false },
+					},
+				},
+				organizationRole: {
+					additionalFields: {
+						organizationRoleCustomField: { type: "string", required: false },
+					},
+				},
+			},
+		}) as any;
+
+		expect(plugin.schema.organization.fields.slug).toMatchObject({
+			type: "string",
+			required: true,
+			unique: true,
+		});
+		expect(plugin.schema.organization.fields.updatedAt).toMatchObject({
+			type: "date",
+			required: false,
+			input: false,
+			returned: false,
+			fieldName: "organization_updated_at",
+		});
+		expect(plugin.schema.member.fields.organizationId).toMatchObject({
+			type: "string",
+			required: true,
+			references: { model: "organization", field: "id" },
+		});
+		expect(plugin.schema.invitation.fields.expiresAt).toMatchObject({
+			type: "date",
+			required: true,
+		});
+		expect(plugin.schema.team.fields.organizationId).toMatchObject({
+			type: "string",
+			required: true,
+			references: { model: "organization", field: "id" },
+			fieldName: "team_organization_id",
+		});
+		expect(plugin.schema.teamMember.fields.teamId).toMatchObject({
+			type: "string",
+			required: true,
+			references: { model: "team", field: "id" },
+		});
+		expect(plugin.schema.organizationRole.fields.role).toMatchObject({
+			type: "string",
+			required: true,
+		});
+		expect(plugin.schema.session.fields.activeOrganizationId).toMatchObject({
+			type: "string",
+			required: false,
+			input: false,
+		});
+		expect(plugin.schema.session.fields.activeTeamId).toMatchObject({
+			type: "string",
+			required: false,
+			input: false,
+		});
+
+		expect(plugin.schema.organization.fields.organizationCustomField).toEqual({
+			type: "string",
+			required: false,
+		});
+		expect(plugin.schema.member.fields.memberCustomField).toEqual({
+			type: "string",
+			required: false,
+		});
+		expect(plugin.schema.invitation.fields.invitationCustomField).toEqual({
+			type: "string",
+			required: false,
+		});
+		expect(plugin.schema.team.fields.teamCustomField).toEqual({
+			type: "string",
+			required: false,
+		});
+		expect(plugin.schema.organizationRole.fields.organizationRoleCustomField).toEqual({
+			type: "string",
+			required: false,
+		});
+	});
+
 	/**
 	 * @see https://github.com/clearance-auth/clearance
 	 */
@@ -2313,13 +2668,34 @@ describe("owner can update roles", async () => {
 				password: userPassword,
 			},
 		});
+		const context = await auth.$context;
+
+		await expect(
+			auth.api.addMember({
+				headers: { cookie: adminCookie },
+				body: {
+					organizationId: org.id,
+					userId: user.id,
+					role: [],
+				},
+			}),
+		).rejects.toMatchObject({ status: "BAD_REQUEST" });
+		await expect(
+			context.adapter.findOne({
+				model: "member",
+				where: [
+					{ field: "organizationId", value: org.id },
+					{ field: "userId", value: user.id },
+				],
+			}),
+		).resolves.toBeNull();
 
 		const addMemberRes = await auth.api.addMember({
 			headers: { cookie: adminCookie },
 			body: {
 				organizationId: org.id,
 				userId: user.id,
-				role: [],
+				role: "custom",
 			},
 		});
 
@@ -3787,7 +4163,7 @@ describe("organization additionalFields with returned: false", async () => {
 					schema: {
 						organization: {
 							additionalFields: {
-								logo: { type: "string", required: false },
+								safeCustomField: { type: "string", required: false },
 							},
 						},
 						session: {
