@@ -119,6 +119,32 @@ describe("passkey challenge storage (database-backed, single-use)", () => {
 		expect(correctCeremony).not.toBeNull();
 	});
 
+	it("isolates recovery registration from normal registration", async () => {
+		const ctx = await fakeCtx();
+		const challenge = "challenge-recovery-registration";
+		await createChallenge(ctx, "recovery-registration", challenge, {
+			rpID: "app.example.com",
+			origin: "https://app.example.com",
+			userId: "user-1",
+			userHandle: "handle-1",
+		});
+
+		await expect(
+			consumeChallengeByParsedChallenge(ctx, "registration", challenge),
+		).resolves.toBeNull();
+		await expect(
+			consumeChallengeByParsedChallenge(
+				ctx,
+				"recovery-registration",
+				challenge,
+			),
+		).resolves.toMatchObject({
+			ceremony: "recovery-registration",
+			userId: "user-1",
+			userHandle: "handle-1",
+		});
+	});
+
 	it("keeps deletion challenges ceremony-scoped and bound to user and target", async () => {
 		const ctx = await fakeCtx();
 		const challenge = "challenge-deletion-binding";
