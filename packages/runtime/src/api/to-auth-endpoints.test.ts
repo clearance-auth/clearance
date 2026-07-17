@@ -1,7 +1,9 @@
+import type { AuthContext } from "@clearance/core";
 import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError } from "@clearance/core/error";
 import { kAPIErrorHeaderSymbol } from "@clearance/call";
 import { describe, expect, it } from "vitest";
@@ -9,7 +11,120 @@ import * as z from "zod";
 import { init } from "../context/init";
 import { getTestInstance } from "../test-utils/test-instance";
 import { isAPIError } from "../utils/is-api-error";
+import { shimContext } from "../utils/shim";
+import { rejectActiveTransactionEndpoint } from "./dispatch";
 import { toAuthEndpoints } from "./to-auth-endpoints";
+
+describe("transaction-bound direct dispatch", () => {
+	it("preserves guarded endpoint descriptors through shimming and rejects before global hooks", async () => {
+		let beforeHookCalls = 0;
+		const instance = await getTestInstance({
+			hooks: {
+				before: createAuthMiddleware(async () => {
+					beforeHookCalls += 1;
+				}),
+			},
+		});
+		const authContext = await instance.auth.$context;
+		beforeHookCalls = 0;
+		const guarded = rejectActiveTransactionEndpoint(
+			createAuthEndpoint(
+				"/guarded-transaction-probe",
+				{ method: "POST" },
+				async () => ({ reached: true }),
+			),
+			() =>
+				new APIError(
+					"INTERNAL_SERVER_ERROR",
+					{
+						code: "NESTED_TRANSACTION_REJECTED",
+						message: "This endpoint must not run inside an outer transaction",
+					},
+					{ "x-transaction-guard": "rejected" },
+				),
+		);
+		const marker = Symbol.for("clearance.endpoint.reject-active-transaction");
+		const originalMarker = Object.getOwnPropertyDescriptor(guarded, marker);
+		const shimmed = shimContext({ guarded }, { orgOptions: {} });
+		const shimmedMarker = Object.getOwnPropertyDescriptor(
+			shimmed.guarded,
+			marker,
+		);
+		expect(shimmedMarker).toEqual(originalMarker);
+		expect(shimmedMarker).toMatchObject({
+			configurable: false,
+			enumerable: false,
+			writable: false,
+		});
+
+		const api = toAuthEndpoints(shimmed, authContext as AuthContext);
+		await runWithTransaction(authContext.adapter, async () => {
+			const response = await api.guarded({ asResponse: true });
+			expect(response).toBeInstanceOf(Response);
+			expect(response.status).toBe(500);
+			expect(response.headers.get("x-transaction-guard")).toBe("rejected");
+			expect(await response.json()).toMatchObject({
+				code: "NESTED_TRANSACTION_REJECTED",
+			});
+
+			const returnHeadersError = await api
+				.guarded({ returnHeaders: true })
+				.catch((error) => error);
+			expect(isAPIError(returnHeadersError)).toBe(true);
+			expect(
+				(returnHeadersError as { [kAPIErrorHeaderSymbol]?: Headers })[
+					kAPIErrorHeaderSymbol
+				]?.get("x-transaction-guard"),
+			).toBe("rejected");
+
+			const plainError = await api.guarded().catch((error) => error);
+			expect(isAPIError(plainError)).toBe(true);
+			expect((plainError as APIError).body?.code).toBe(
+				"NESTED_TRANSACTION_REJECTED",
+			);
+		});
+		expect(beforeHookCalls).toBe(0);
+	});
+
+	it("finds the exact owner below another adapter transaction and never aliases an unrelated guard", async () => {
+		const first = await getTestInstance({});
+		const second = await getTestInstance({});
+		const firstContext = await first.auth.$context;
+		const secondContext = await second.auth.$context;
+		let expectedSecondTransaction: object | null = null;
+		const probe = createAuthEndpoint(
+			"/transaction-owner-probe",
+			{ method: "GET" },
+			async (ctx) => ctx.context.adapter === expectedSecondTransaction,
+		);
+		const guardedProbe = rejectActiveTransactionEndpoint(
+			probe,
+			() =>
+				APIError.from("INTERNAL_SERVER_ERROR", {
+					code: "UNRELATED_TRANSACTION_REJECTED",
+					message: "An unrelated transaction must not own this endpoint",
+				}),
+		);
+		const api = toAuthEndpoints(
+			shimContext({ probe, guardedProbe }, { orgOptions: {} }),
+			secondContext,
+		);
+
+		await runWithTransaction(secondContext.adapter, async () => {
+			expectedSecondTransaction = await getCurrentAdapter(
+				secondContext.adapter,
+			);
+			await runWithTransaction(firstContext.adapter, async () => {
+				await expect(api.probe()).resolves.toBe(true);
+			});
+		});
+
+		expectedSecondTransaction = secondContext.adapter;
+		await runWithTransaction(firstContext.adapter, async () => {
+			await expect(api.guardedProbe()).resolves.toBe(true);
+		});
+	});
+});
 
 describe("before hook", async () => {
 	describe("context", async () => {
