@@ -121,4 +121,17 @@ describe("internal session issuance context", () => {
 			targetOrganizationId: null,
 		});
 	});
+
+	it("canonicalizes organization-transition authority with an explicit nullable target", () => {
+		const context = createInternalSessionIssuanceContext({
+			purpose: "organization",
+			sourceSessionToken: "source-secret",
+			targetOrganizationId: null,
+		});
+		expect(requireInternalSessionIssuanceContext(context)).toEqual({
+			purpose: "organization",
+			sourceSessionToken: "source-secret",
+			targetOrganizationId: null,
+		});
+	});
 });
