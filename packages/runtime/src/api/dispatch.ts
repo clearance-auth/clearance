@@ -1,6 +1,8 @@
 import type { AuthContext, HookEndpointContext } from "@clearance/core";
 import type { AuthMiddleware } from "@clearance/core/api";
 import {
+	getCurrentDBAdapterAsyncLocalStorage,
+	isTransactionActive,
 	runWithEndpointContext,
 	runWithTransaction,
 } from "@clearance/core/context";
@@ -21,6 +23,7 @@ import {
 } from "@clearance/call";
 import { createDefu } from "defu";
 import { isAPIError } from "../utils/is-api-error";
+import { copyEndpointMetadata } from "../utils/shim";
 import { isRequestLike } from "../utils/url";
 import { assertSessionCredentialMigrationComplete } from "../db/session-credential-migration";
 import { readInternalCredentialAuthority } from "../internal/credential-authority";
@@ -29,6 +32,84 @@ import {
 	takeStagedAuthenticationContinuation,
 } from "../internal/staged-authentication-context";
 const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
+
+const rejectActiveTransactionSymbol = Symbol.for(
+	"clearance.endpoint.reject-active-transaction",
+);
+
+type ActiveTransactionStore = {
+	rootAdapter?: object | undefined;
+	adapter?: AuthContext["adapter"] | undefined;
+	activeTransactions?: ReadonlyMap<object, ActiveTransactionStore> | undefined;
+	isTransactionActive?: boolean | undefined;
+};
+type ActiveDispatchTransaction = ActiveTransactionStore & {
+	adapter: AuthContext["adapter"];
+	isTransactionActive: true;
+};
+
+type ActiveTransactionRejection = () => APIError;
+
+/**
+ * Mark an endpoint that must reject before dispatch performs any authority or
+ * hook work inside an already-active transaction. Cookie-bearing lifecycle
+ * routes use this because their response headers cannot be published safely by
+ * an outer transaction that outlives the endpoint response.
+ */
+export function rejectActiveTransactionEndpoint<T extends Endpoint>(
+	endpoint: T,
+	createError: ActiveTransactionRejection,
+): T {
+	const guarded = copyEndpointMetadata((async (...args: any[]) => {
+		const adapter = (args[0] as { context?: { adapter?: object } } | undefined)
+			?.context?.adapter;
+		if (adapter && (await isTransactionActive(adapter))) throw createError();
+		return (endpoint as (...args: any[]) => unknown)(...args);
+	}) as T, endpoint);
+	Object.defineProperty(guarded, rejectActiveTransactionSymbol, {
+		configurable: false,
+		enumerable: false,
+		value: createError,
+		writable: false,
+	});
+	return guarded;
+}
+
+function normalizePreflightAPIError(
+	error: APIError,
+	shouldReturnResponse: boolean,
+): Response | never {
+	const headers = mergeAPIErrorHeaders(error);
+	if (!shouldReturnResponse) {
+		if (headers) {
+			Object.defineProperty(error, kAPIErrorHeaderSymbol, {
+				enumerable: false,
+				configurable: true,
+				writable: false,
+				value: headers,
+			});
+		}
+		throw error;
+	}
+	return toResponse(error, {
+		headers: headers ?? undefined,
+		status: error.statusCode,
+	});
+}
+
+async function activeDispatchTransaction(
+	context: AuthContext,
+): Promise<ActiveDispatchTransaction | null> {
+	const store = (
+		await getCurrentDBAdapterAsyncLocalStorage()
+	).getStore() as ActiveTransactionStore | undefined;
+	const owner =
+		store?.activeTransactions?.get(context.adapter) ??
+		(store?.rootAdapter === context.adapter ? store : undefined);
+	return owner?.isTransactionActive && owner.adapter
+		? (owner as ActiveDispatchTransaction)
+		: null;
+}
 
 async function assertDispatchCredentialAuthority(context: AuthContext) {
 	const authority = readInternalCredentialAuthority(context.options);
@@ -353,6 +434,12 @@ export async function dispatchAuthEndpoint(
 	endpoint: Endpoint,
 	input: DispatchContext,
 ): Promise<unknown> {
+	const activeTransaction = await activeDispatchTransaction(input.context);
+	const createActiveTransactionError = (
+		endpoint as Endpoint & {
+			[rejectActiveTransactionSymbol]?: ActiveTransactionRejection;
+		}
+	)[rejectActiveTransactionSymbol];
 	const operationId = input.operationId ?? getOperationId(endpoint);
 	const route = endpoint.path ?? "/:virtual";
 	const endpointMethod = endpoint.options?.method;
@@ -362,11 +449,21 @@ export async function dispatchAuthEndpoint(
 	const methodName =
 		input.method ?? input.request?.method ?? defaultMethod ?? "?";
 	const shouldReturnResponse = input.asResponse ?? isRequestLike(input.request);
+	if (activeTransaction && createActiveTransactionError) {
+		return normalizePreflightAPIError(
+			createActiveTransactionError(),
+			shouldReturnResponse,
+		);
+	}
 
 	let internalContext: InternalContext = {
 		...input,
 		context: {
 			...input.context,
+			// Direct auth.api calls may enter with a wrapper around the root
+			// adapter. Reuse the owning transaction adapter so every nested
+			// authority read, mutation, and after-commit hook joins that owner.
+			adapter: activeTransaction?.adapter ?? input.context.adapter,
 			returned: undefined,
 			responseHeaders: undefined,
 			// A fresh dispatch (shared context) has no session; a resumed dispatch
@@ -411,6 +508,11 @@ export async function dispatchAuthEndpoint(
 						});
 					}
 					internalContext = defuReplaceArrays(rest, internalContext);
+					if (activeTransaction) {
+						// Hook context overrides may not escape the transaction that owns this
+						// direct API dispatch.
+						internalContext.context.adapter = activeTransaction.adapter;
+					}
 				} else if (before) {
 					// A before hook short-circuited. Serialize the response headers it
 					// accumulated (`c.setHeader` / `c.setCookie`), not the request headers.
