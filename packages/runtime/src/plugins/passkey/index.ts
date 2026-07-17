@@ -6,10 +6,14 @@ import {
 	generatePasskeyAuthenticationOptions,
 	generatePasskeyDeletionOptions,
 	generatePasskeyRegistrationOptions,
+	generatePasskeyRemediationAuthenticationOptions,
+	generatePasskeyRemediationRegistrationOptions,
 	listPasskeys,
 	deletePasskey,
 	updatePasskey,
 	verifyPasskeyAuthentication,
+	verifyPasskeyRemediationAuthentication,
+	verifyPasskeyRemediationRegistration,
 	verifyPasskeyRegistration,
 } from "./routes";
 import { schema } from "./schema";
@@ -37,6 +41,14 @@ export const passkey = <O extends PasskeyOptions>(options?: O) => {
 			generatePasskeyRegistrationOptions:
 				generatePasskeyRegistrationOptions(options),
 			verifyPasskeyRegistration: verifyPasskeyRegistration(options),
+			generatePasskeyRemediationRegistrationOptions:
+				generatePasskeyRemediationRegistrationOptions(options),
+			generatePasskeyRemediationAuthenticationOptions:
+				generatePasskeyRemediationAuthenticationOptions(options),
+			verifyPasskeyRemediationRegistration:
+				verifyPasskeyRemediationRegistration(options),
+			verifyPasskeyRemediationAuthentication:
+				verifyPasskeyRemediationAuthentication(options),
 			generatePasskeyAuthenticationOptions:
 				generatePasskeyAuthenticationOptions(options),
 			verifyPasskeyAuthentication: verifyPasskeyAuthentication(options),
