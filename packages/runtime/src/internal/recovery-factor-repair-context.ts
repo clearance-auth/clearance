@@ -44,6 +44,7 @@ export type RecoveryFactorRepairLineage = Readonly<{
 	repairFactor: RecoveryFactorRepairIntent;
 	twoFactorTable: string;
 	recoveryFactorId: string;
+	consumedRecoveryCodeDigest: string;
 	trustDeviceGeneration: string;
 	stage: RecoveryFactorRepairStage;
 	binding: string;
@@ -75,6 +76,7 @@ type RecoveryMetadata = Readonly<{
 	twoFactorTable: string;
 	recoveryFactorId: string;
 	recoveryProofDigest: string;
+	consumedRecoveryCodeDigest: string;
 	sourceFactorFingerprint: string;
 	sourceSecretDigest: string;
 	postConsumeBackupCodesDigest: string;
@@ -121,6 +123,7 @@ const METADATA_KEYS = [
 	"twoFactorTable",
 	"recoveryFactorId",
 	"recoveryProofDigest",
+	"consumedRecoveryCodeDigest",
 	"sourceFactorFingerprint",
 	"sourceSecretDigest",
 	"postConsumeBackupCodesDigest",
@@ -227,6 +230,8 @@ function parseMetadata(value: unknown, now = new Date()): RecoveryMetadata | nul
 		!text(record.recoveryFactorId, 512) ||
 		typeof record.recoveryProofDigest !== "string" ||
 		!DIGEST.test(record.recoveryProofDigest) ||
+		typeof record.consumedRecoveryCodeDigest !== "string" ||
+		!DIGEST.test(record.consumedRecoveryCodeDigest) ||
 		typeof record.sourceFactorFingerprint !== "string" ||
 		!DIGEST.test(record.sourceFactorFingerprint) ||
 		typeof record.sourceSecretDigest !== "string" ||
@@ -295,6 +300,7 @@ function lineageView(metadata: RecoveryMetadata): RecoveryFactorRepairLineage {
 		repairFactor: metadata.repairFactor,
 		twoFactorTable: metadata.twoFactorTable,
 		recoveryFactorId: metadata.recoveryFactorId,
+		consumedRecoveryCodeDigest: metadata.consumedRecoveryCodeDigest,
 		trustDeviceGeneration: metadata.trustDeviceGeneration,
 		stage: metadata.stage,
 		binding: metadata.binding,
@@ -313,6 +319,7 @@ export function createRecoveryFactorRepairBinding(
 		!text(lineage.subjectId) ||
 		!TABLE.test(lineage.twoFactorTable) ||
 		!text(lineage.recoveryFactorId, 512) ||
+		!DIGEST.test(lineage.consumedRecoveryCodeDigest) ||
 		!text(lineage.trustDeviceGeneration, 128) ||
 		!text(lineage.rootFlowId, 128) ||
 		!DIGEST.test(lineage.parentDigest) ||
@@ -330,6 +337,7 @@ export function createRecoveryFactorRepairBinding(
 			lineage.repairFactor,
 			lineage.twoFactorTable,
 			lineage.recoveryFactorId,
+			lineage.consumedRecoveryCodeDigest,
 			lineage.trustDeviceGeneration,
 			lineage.rootFlowId,
 			lineage.seedFingerprint,
@@ -337,6 +345,38 @@ export function createRecoveryFactorRepairBinding(
 			...parts,
 		]),
 	);
+}
+
+export async function createRecoveryTOTPEnrollmentBinding(
+	lineage: RecoveryFactorRepairLineage,
+	factor: Pick<
+		TwoFactorTable,
+		"id" | "pendingSecret" | "pendingBackupCodes" | "trustDeviceGeneration"
+	>,
+): Promise<string> {
+	if (
+		factor.id !== lineage.recoveryFactorId ||
+		typeof factor.pendingSecret !== "string" ||
+		factor.pendingSecret.length === 0 ||
+		typeof factor.pendingBackupCodes !== "string" ||
+		factor.pendingBackupCodes.length === 0 ||
+		factor.trustDeviceGeneration !== lineage.trustDeviceGeneration
+	) {
+		throw new Error("Invalid recovery TOTP enrollment state");
+	}
+	const enrollmentDigest = await digest(
+		JSON.stringify([
+			"recovery-totp-enrollment:v1",
+			factor.id,
+			factor.pendingSecret,
+			factor.pendingBackupCodes,
+		]),
+	);
+	return createRecoveryFactorRepairBinding(lineage, [
+		"totp-enrollment:v1",
+		factor.id,
+		enrollmentDigest,
+	]);
 }
 
 function assertRecoveryConfiguration(ctx: GenericEndpointContext): void {
@@ -406,6 +446,7 @@ async function recoveryStartStateIsExact(
 	if (
 		!user ||
 		!factor ||
+		user.twoFactorEnabled !== true ||
 		user.passkeySessionGeneration !== metadata.passkeySessionGeneration ||
 		user.twoFactorSessionGeneration !== metadata.twoFactorSessionGeneration ||
 		factor.trustDeviceGeneration !== metadata.trustDeviceGeneration ||
@@ -467,11 +508,15 @@ export async function startRecoveryFactorRepair(
 				backupCodeOptions?: {
 					storeBackupCodes?: unknown;
 				};
+				accountLockout?: {
+					enabled?: unknown;
+				};
 		  }
 		| undefined;
 	if (
 		!twoFactorPlugin ||
-		twoFactorOptions?.backupCodeOptions?.storeBackupCodes !== "hashed"
+		twoFactorOptions?.backupCodeOptions?.storeBackupCodes !== "hashed" ||
+		twoFactorOptions.accountLockout?.enabled === false
 	) {
 		throw new Error("Recovery repair requires one-way recovery-code storage");
 	}
@@ -519,7 +564,8 @@ export async function startRecoveryFactorRepair(
 	if (
 		!user ||
 		!factor ||
-		factor.verified === false ||
+		(user as Record<string, unknown>).twoFactorEnabled !== true ||
+		factor.verified !== true ||
 		typeof factor.secret !== "string" ||
 		typeof factor.backupCodes !== "string" ||
 		factor.trustDeviceGeneration !== proof.sourceTrustDeviceGeneration ||
@@ -636,6 +682,7 @@ export async function startRecoveryFactorRepair(
 		twoFactorTable: proof.twoFactorTable,
 		recoveryFactorId: proof.recoveryFactorId,
 		recoveryProofDigest: proof.recoveryProofDigest,
+		consumedRecoveryCodeDigest: proof.consumedRecoveryCodeDigest,
 		sourceFactorFingerprint: proof.sourceFactorFingerprint,
 		sourceSecretDigest: proof.sourceSecretDigest,
 		postConsumeBackupCodesDigest: proof.postConsumeBackupCodesDigest,
@@ -828,6 +875,217 @@ export function inspectRecoveryFactorRepairAuthority(
 	return snapshot ? lineageView(snapshot.metadata) : null;
 }
 
+export async function recoveryFactorRepairSelectionAuthorityIsExact(
+	ctx: GenericEndpointContext,
+	authority: object,
+): Promise<boolean> {
+	const snapshot = consumedCapabilities.get(authority);
+	if (
+		!snapshot ||
+		snapshot.state !== "pending" ||
+		snapshot.metadata.stage !== "select_repair" ||
+		!(await isTransactionActive(ctx.context.adapter)) ||
+		(await getCurrentAdapter(ctx.context.adapter)) !== snapshot.transactionAdapter ||
+		!validDeadline(new Date(snapshot.metadata.expiresAt)) ||
+		!(await policyStillAuthorizesRepair(ctx, snapshot.metadata)) ||
+		!(await lockAndReadActiveUser(
+			await getCurrentAdapter(ctx.context.adapter),
+			snapshot.metadata.subjectId,
+		))
+	) {
+		return false;
+	}
+	return recoveryStartStateIsExact(ctx, snapshot.metadata);
+}
+
+async function recoveryTOTPAttemptStateIsExact(
+	ctx: GenericEndpointContext,
+	metadata: RecoveryMetadata,
+): Promise<boolean> {
+	const adapter = await getCurrentAdapter(ctx.context.adapter);
+	const user = await adapter.findOne<Record<string, unknown>>({
+		model: "user",
+		where: [{ field: "id", value: metadata.subjectId }],
+	});
+	const factor = await adapter.findOne<TwoFactorTable>({
+		model: metadata.twoFactorTable,
+		where: [
+			{ field: "id", value: metadata.recoveryFactorId },
+			{ field: "userId", value: metadata.subjectId },
+		],
+	});
+	if (
+		!user ||
+		!factor ||
+		user.twoFactorEnabled !== true ||
+		user.passkeySessionGeneration !== metadata.passkeySessionGeneration ||
+		user.twoFactorSessionGeneration !== metadata.twoFactorSessionGeneration ||
+		factor.trustDeviceGeneration !== metadata.trustDeviceGeneration ||
+		factor.verified !== false ||
+		typeof factor.secret !== "string" ||
+		typeof factor.backupCodes !== "string" ||
+		typeof factor.pendingSecret !== "string" ||
+		typeof factor.pendingBackupCodes !== "string" ||
+		factor.lastUsedTotpCounter !== -1 ||
+		(await factorValueDigest("secret", factor.secret)) !==
+			metadata.sourceSecretDigest ||
+		(await factorValueDigest("backup-codes", factor.backupCodes)) !==
+			metadata.postConsumeBackupCodesDigest ||
+		(await createRecoveryTOTPEnrollmentBinding(lineageView(metadata), factor)) !==
+			metadata.binding
+	) {
+		return false;
+	}
+	return (
+		await adapter.count({
+			model: "session",
+			where: [{ field: "userId", value: metadata.subjectId }],
+		})
+	) === 0;
+}
+
+export async function recoveryTOTPVerificationAuthorityIsExact(
+	ctx: GenericEndpointContext,
+	authority: object,
+): Promise<boolean> {
+	const snapshot = consumedCapabilities.get(authority);
+	if (
+		!snapshot ||
+		snapshot.metadata.stage !== "totp_enrollment_verification" ||
+		snapshot.metadata.repairFactor !== "totp" ||
+		!(await isTransactionActive(ctx.context.adapter)) ||
+		!validDeadline(new Date(snapshot.metadata.expiresAt)) ||
+		!(await policyStillAuthorizesRepair(ctx, snapshot.metadata)) ||
+		!(await lockAndReadActiveUser(
+			await getCurrentAdapter(ctx.context.adapter),
+			snapshot.metadata.subjectId,
+		))
+	) {
+		return false;
+	}
+	return recoveryTOTPAttemptStateIsExact(ctx, snapshot.metadata);
+}
+
+/**
+ * Replaces a failed one-use TOTP verification capability with another
+ * digest-only capability for the exact same recovery enrollment. Failure
+ * accounting belongs in this same transaction, so callers cannot publish a
+ * retry without first durably settling the attempt reservation.
+ */
+export async function reissueRecoveryTOTPVerificationCapability(
+	ctx: GenericEndpointContext,
+	authority: object,
+	binding: string,
+): Promise<RecoveryFactorRepairLineage> {
+	assertRecoveryConfiguration(ctx);
+	const snapshot = await takeCommittedAuthority(ctx, authority);
+	if (
+		!snapshot ||
+		snapshot.metadata.stage !== "totp_enrollment_verification" ||
+		snapshot.metadata.repairFactor !== "totp" ||
+		binding !== snapshot.metadata.binding ||
+		!text(binding, 512) ||
+		!validDeadline(new Date(snapshot.metadata.expiresAt)) ||
+		!(await policyStillAuthorizesRepair(ctx, snapshot.metadata)) ||
+		!(await lockAndReadActiveUser(
+			await getCurrentAdapter(ctx.context.adapter),
+			snapshot.metadata.subjectId,
+		)) ||
+		!(await recoveryTOTPAttemptStateIsExact(ctx, snapshot.metadata))
+	) {
+		throw new Error("Invalid recovery TOTP retry authority");
+	}
+
+	const bearer = generateRandomString(48);
+	const identifier = await capabilityIdentifier(bearer);
+	const metadata: RecoveryMetadata = Object.freeze({
+		...snapshot.metadata,
+		parentDigest: await digest(snapshot.identifier),
+	});
+	const expiresAt = new Date(metadata.expiresAt);
+	await createInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		{ purpose: challengePurpose(metadata.stage), subject: metadata.subjectId },
+		{ identifier, value: JSON.stringify(metadata), expiresAt },
+	);
+	await queueBeforeTransactionCommitHook(async () => {
+		if (
+			!validDeadline(expiresAt) ||
+			!(await policyStillAuthorizesRepair(ctx, metadata)) ||
+			!(await recoveryTOTPAttemptStateIsExact(ctx, metadata))
+		) {
+			throw new Error("Recovery TOTP retry authority changed before commit");
+		}
+	}, ctx.context.adapter);
+	const cookie = recoveryCookie(ctx.context, expiresAt);
+	await queueAfterTransactionHook(async () => {
+		await ctx.setSignedCookie(
+			cookie.name,
+			bearer,
+			ctx.context.secret,
+			cookie.attributes,
+		);
+	}, ctx.context.adapter);
+	return lineageView(metadata);
+}
+
+/** Returns an ordinary failed WebAuthn proof to the recovery-only options stage. */
+export async function restartRecoveryPasskeyRegistrationCapability(
+	ctx: GenericEndpointContext,
+	authority: object,
+): Promise<RecoveryFactorRepairLineage> {
+	assertRecoveryConfiguration(ctx);
+	const snapshot = await takeCommittedAuthority(ctx, authority);
+	if (
+		!snapshot ||
+		snapshot.metadata.stage !== "passkey_registration" ||
+		snapshot.metadata.repairFactor !== "passkey" ||
+		!validDeadline(new Date(snapshot.metadata.expiresAt)) ||
+		!(await policyStillAuthorizesRepair(ctx, snapshot.metadata)) ||
+		!(await lockAndReadActiveUser(
+			await getCurrentAdapter(ctx.context.adapter),
+			snapshot.metadata.subjectId,
+		)) ||
+		!(await recoveryStartStateIsExact(ctx, snapshot.metadata))
+	) {
+		throw new Error("Invalid recovery passkey retry authority");
+	}
+
+	const bearer = generateRandomString(48);
+	const identifier = await capabilityIdentifier(bearer);
+	const metadata: RecoveryMetadata = Object.freeze({
+		...snapshot.metadata,
+		stage: "select_repair",
+		binding: "initial",
+		parentDigest: await digest(snapshot.identifier),
+	});
+	const expiresAt = new Date(metadata.expiresAt);
+	await createInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		{ purpose: challengePurpose(metadata.stage), subject: metadata.subjectId },
+		{ identifier, value: JSON.stringify(metadata), expiresAt },
+	);
+	await queueBeforeTransactionCommitHook(async () => {
+		if (
+			!validDeadline(expiresAt) ||
+			!(await policyStillAuthorizesRepair(ctx, metadata)) ||
+			!(await recoveryStartStateIsExact(ctx, metadata))
+		) {
+			throw new Error("Recovery passkey retry authority changed before commit");
+		}
+	}, ctx.context.adapter);
+	const cookie = recoveryCookie(ctx.context, expiresAt);
+	await queueAfterTransactionHook(async () => {
+		await ctx.setSignedCookie(
+			cookie.name,
+			bearer,
+			ctx.context.secret,
+			cookie.attributes,
+		);
+	}, ctx.context.adapter);
+	return lineageView(metadata);
+}
+
 export async function rotateRecoveryFactorRepairCapability(
 	ctx: GenericEndpointContext,
 	authority: object,
@@ -844,7 +1102,10 @@ export async function rotateRecoveryFactorRepairCapability(
 		throw new Error("Invalid recovery repair transition");
 	}
 	const expiresAt = new Date(snapshot.metadata.expiresAt);
-	if (!validDeadline(expiresAt)) {
+	if (
+		!validDeadline(expiresAt) ||
+		!(await policyStillAuthorizesRepair(ctx, snapshot.metadata))
+	) {
 		throw new Error("Recovery repair authority expired");
 	}
 	const bearer = generateRandomString(48);
@@ -861,7 +1122,10 @@ export async function rotateRecoveryFactorRepairCapability(
 		{ identifier, value: JSON.stringify(metadata), expiresAt },
 	);
 	await queueBeforeTransactionCommitHook(async () => {
-		if (!validDeadline(expiresAt)) {
+		if (
+			!validDeadline(expiresAt) ||
+			!(await policyStillAuthorizesRepair(ctx, metadata))
+		) {
 			throw new Error("Recovery repair authority expired before commit");
 		}
 	}, ctx.context.adapter);
@@ -898,6 +1162,7 @@ async function recoveryCompletionStateIsExact(
 	if (
 		!user ||
 		!factor ||
+		user.twoFactorEnabled !== true ||
 		user.passkeySessionGeneration !== metadata.passkeySessionGeneration ||
 		user.twoFactorSessionGeneration !== metadata.twoFactorSessionGeneration ||
 		factor.trustDeviceGeneration !== metadata.trustDeviceGeneration
