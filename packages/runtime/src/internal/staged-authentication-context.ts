@@ -96,6 +96,30 @@ type ConsumedStagedSnapshot = PreloadedSnapshot & {
 	transactionAdapter: object;
 };
 
+type StagedAuthenticationRecoveryRepairBridge = Readonly<{
+	subjectId: string;
+	projectId: string;
+	environmentId: string;
+	organizationId: null;
+	repairFactor: StagedAuthenticationFactor;
+	policyRevision: string;
+	policyDigest: string;
+	rootFlowId: string;
+	parentDigest: string;
+	seedFingerprint: string;
+	primaryCapabilityIdentifier: string;
+	expiresAt: Date;
+	transactionAdapter: object;
+}>;
+
+type CapturedStagedAuthenticationRecoveryRepairBridge = Omit<
+	StagedAuthenticationRecoveryRepairBridge,
+	"transactionAdapter"
+> & {
+	state: "pending" | "committed";
+	creationTransactionAdapter: object;
+};
+
 export type StagedAuthenticationFactorInventory = Readonly<{
 	passkey: boolean;
 	totp: boolean;
@@ -123,6 +147,10 @@ const continuationSeeds = new WeakMap<Error, StagedContinuationSnapshot>();
 const issuedContinuationSeeds = new WeakMap<object, StagedContinuationSnapshot>();
 const preloadedCapabilities = new WeakMap<object, PreloadedSnapshot>();
 const consumedAuthorities = new WeakMap<object, ConsumedStagedSnapshot>();
+const recoveryRepairBridges = new WeakMap<
+	object,
+	CapturedStagedAuthenticationRecoveryRepairBridge
+>();
 const stagedSessionIssuanceAuthorities = new WeakMap<
 	object,
 	CapturedStagedSessionIssuanceAuthority
@@ -582,6 +610,93 @@ export function inspectStagedAuthenticationAuthority(
 export function stagedAuthenticationExpiresAt(authority: object): Date | null {
 	const metadata = consumedAuthorities.get(authority)?.metadata;
 	return metadata ? new Date(metadata.expiresAt) : null;
+}
+
+/**
+ * Irreversibly converts a consumed primary-plus-select authority into a
+ * recovery-repair-only bridge. The returned handle has no entry in the staged
+ * session authority maps and therefore cannot become session evidence.
+ */
+export async function createStagedAuthenticationRecoveryRepairBridge(
+	ctx: GenericEndpointContext,
+	authority: object,
+	repairFactor: StagedAuthenticationFactor,
+): Promise<object> {
+	const snapshot = await requirePendingStagedAuthority(ctx, authority);
+	if (
+		!snapshot ||
+		snapshot.metadata.stage !== "select_factor" ||
+		!FACTORS.has(repairFactor) ||
+		!snapshot.metadata.allowedFactors.includes(repairFactor) ||
+		new Date(snapshot.metadata.expiresAt) <= new Date()
+	) {
+		throw new Error("Invalid staged recovery repair bridge");
+	}
+	consumedAuthorities.delete(authority);
+	const opaque = Object.freeze({});
+	const bridge: CapturedStagedAuthenticationRecoveryRepairBridge = {
+			subjectId: snapshot.metadata.subjectId,
+			projectId: snapshot.metadata.projectId,
+			environmentId: snapshot.metadata.environmentId,
+			organizationId: null,
+			repairFactor,
+			policyRevision: snapshot.metadata.policyRevision,
+			policyDigest: snapshot.metadata.policyDigest,
+			rootFlowId: snapshot.metadata.rootFlowId,
+			parentDigest: snapshot.metadata.parentDigest,
+			seedFingerprint: snapshot.metadata.seedFingerprint,
+			primaryCapabilityIdentifier: snapshot.identifier,
+			expiresAt: new Date(snapshot.metadata.expiresAt),
+			state: "pending",
+			creationTransactionAdapter: snapshot.transactionAdapter,
+		};
+	recoveryRepairBridges.set(opaque, bridge);
+	await queueAfterTransactionHook(async () => {
+		const current = recoveryRepairBridges.get(opaque);
+		if (current === bridge && current.state === "pending") {
+			current.state = "committed";
+		}
+	}, ctx.context.adapter);
+	return opaque;
+}
+
+/** Internal one-shot bridge take used only by recovery-factor-repair-context. */
+export async function takeStagedAuthenticationRecoveryRepairBridge(
+	ctx: GenericEndpointContext,
+	bridge: object,
+): Promise<StagedAuthenticationRecoveryRepairBridge | null> {
+	const snapshot = recoveryRepairBridges.get(bridge);
+	if (!snapshot) return null;
+	recoveryRepairBridges.delete(bridge);
+	const active = await isTransactionActive(ctx.context.adapter);
+	const transactionAdapter = active
+		? await getCurrentAdapter(ctx.context.adapter)
+		: null;
+	if (
+		!active ||
+		!transactionAdapter ||
+		(snapshot.state !== "committed" &&
+			(snapshot.state !== "pending" ||
+				transactionAdapter !== snapshot.creationTransactionAdapter)) ||
+		snapshot.expiresAt <= new Date()
+	) {
+		return null;
+	}
+	return Object.freeze({
+		subjectId: snapshot.subjectId,
+		projectId: snapshot.projectId,
+		environmentId: snapshot.environmentId,
+		organizationId: snapshot.organizationId,
+		repairFactor: snapshot.repairFactor,
+		policyRevision: snapshot.policyRevision,
+		policyDigest: snapshot.policyDigest,
+		rootFlowId: snapshot.rootFlowId,
+		parentDigest: snapshot.parentDigest,
+		seedFingerprint: snapshot.seedFingerprint,
+		primaryCapabilityIdentifier: snapshot.primaryCapabilityIdentifier,
+		expiresAt: new Date(snapshot.expiresAt),
+		transactionAdapter,
+	});
 }
 
 async function requirePendingStagedAuthority(
