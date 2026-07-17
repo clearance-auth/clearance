@@ -1,8 +1,384 @@
+import { DatabaseSync } from "node:sqlite";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearance } from "../../auth/full";
+import { getMigrations } from "../../db/get-migration";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { bearer } from "../bearer";
 import { phoneNumber } from ".";
 import { phoneNumberClient } from "./client";
+
+async function managedPhoneTestRuntime(input: {
+	minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"];
+	verifyOTP?: (data: { phoneNumber: string; code: string }) => Promise<boolean>;
+	callbackOnVerification?: () => Promise<void>;
+}) {
+	const database = new DatabaseSync(":memory:");
+	let otp = "";
+	let minimumAssurance = input.minimumAssurance;
+	const callbackOnVerification = input.callbackOnVerification ?? vi.fn();
+	const identity = {
+		projectId: "phone-policy-project",
+		environmentId: "phone-policy-environment",
+	} satisfies RuntimeAuthenticationPolicyIdentity;
+	const policy = {
+		passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		minimumAssurance: input.minimumAssurance,
+		allowedFactors: { totp: true, passkey: true },
+		trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+		assuranceMaxAgeSeconds: 300,
+	} satisfies RuntimeAuthenticationPolicy;
+	const options = {
+		baseURL: "http://localhost:3000",
+		secret: "managed-phone-test-secret",
+		database,
+		plugins: [
+			phoneNumber({
+				async sendOTP(input) {
+					otp = input.code;
+				},
+				...(input.verifyOTP ? { verifyOTP: input.verifyOTP } : {}),
+				callbackOnVerification,
+				signUpOnVerification: {
+					getTempEmail(value) {
+						return `managed-${value}@example.test`;
+					},
+				},
+			}),
+		],
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity,
+		reader: {
+			async readForSubject(request) {
+				const effectivePolicy = { ...policy, minimumAssurance };
+				return {
+					scope: identity,
+					subjectId: request.subjectId,
+					revision: "1",
+					environment: effectivePolicy,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective: effectivePolicy,
+				};
+			},
+		},
+	});
+	await (await getMigrations(options)).runMigrations();
+	return {
+		auth: clearance(options),
+		database,
+		callbackOnVerification,
+		readOTP: () => otp,
+		setMinimumAssurance(value: RuntimeAuthenticationPolicy["minimumAssurance"]) {
+			minimumAssurance = value;
+		},
+	};
+}
+
+describe("phone managed authentication transactions", () => {
+	it("rolls back phone adoption and callbacks when policy rejects", async () => {
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "multi_factor",
+		});
+		const value = "+15550001001";
+		try {
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: { phoneNumber: value, code: runtime.readOTP() },
+				}),
+			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "account" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			expect(runtime.callbackOnVerification).not.toHaveBeenCalled();
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("lets exactly one concurrent custom verifier claim the managed challenge", async () => {
+		let entered = 0;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const verifyOTP = vi.fn(async () => {
+			entered += 1;
+			await gate;
+			return true;
+		});
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "single_factor",
+			verifyOTP,
+		});
+		const value = "+15550001002";
+		try {
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			const attempts = [1, 2].map(() =>
+				runtime.auth.api.verifyPhoneNumber({
+					body: { phoneNumber: value, code: "provider-approved" },
+				}),
+			);
+			await vi.waitFor(() => expect(entered).toBe(2));
+			release();
+			const settled = await Promise.allSettled(attempts);
+			expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(
+				1,
+			);
+			expect(settled.filter((result) => result.status === "rejected")).toHaveLength(
+				1,
+			);
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(1);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+			expect(runtime.callbackOnVerification).toHaveBeenCalledTimes(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("restores a custom-verifier challenge on rollback and allows one retry", async () => {
+		const verifyOTP = vi.fn(async () => true);
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "multi_factor",
+			verifyOTP,
+		});
+		const value = "+15550001004";
+		try {
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: { phoneNumber: value, code: "provider-approved" },
+				}),
+			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+			const context = await runtime.auth.$context;
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.not.toBeNull();
+			await expect(
+				context.adapter.findMany({
+					model: "securityMigration",
+					where: [
+						{
+							field: "state",
+							value: "managed-verification-challenge-v2",
+						},
+					],
+				}),
+			).resolves.toHaveLength(1);
+
+			runtime.setMinimumAssurance("single_factor");
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: { phoneNumber: value, code: "provider-approved" },
+				}),
+			).resolves.toMatchObject({ token: expect.any(String) });
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: { phoneNumber: value, code: "provider-approved" },
+				}),
+			).rejects.toBeDefined();
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.toBeNull();
+			await expect(
+				context.adapter.findMany({
+					model: "securityMigration",
+					where: [
+						{
+							field: "state",
+							value: "managed-verification-challenge-v2",
+						},
+					],
+				}),
+			).resolves.toHaveLength(0);
+			expect(runtime.callbackOnVerification).toHaveBeenCalledTimes(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("returns the committed session when the post-commit callback throws", async () => {
+		const callbackOnVerification = vi.fn(async () => {
+			throw new Error("callback failure");
+		});
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "single_factor",
+			callbackOnVerification,
+		});
+		const value = "+15550001003";
+		try {
+			const context = await runtime.auth.$context;
+			const logger = vi.spyOn(context.logger, "error").mockImplementation(() => {});
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			const response = await runtime.auth.api.verifyPhoneNumber({
+				body: { phoneNumber: value, code: runtime.readOTP() },
+				asResponse: true,
+			});
+			expect(response.status).toBe(200);
+			expect(response.headers.get("set-cookie")).toContain("session_token");
+			await expect(response.json()).resolves.toMatchObject({
+				token: expect.any(String),
+			});
+			expect(callbackOnVerification).toHaveBeenCalledTimes(1);
+			expect(logger).toHaveBeenCalledWith(
+				"Managed phone verification post-commit callback failed",
+			);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back disable-session adoption failure and retries without a session", async () => {
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "single_factor",
+		});
+		const value = "+15550001005";
+		try {
+			const context = await runtime.auth.$context;
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			const originalCreateUser = context.internalAdapter.createUser.bind(
+				context.internalAdapter,
+			);
+			const createUser = vi
+				.spyOn(context.internalAdapter, "createUser")
+				.mockRejectedValueOnce(new Error("forced phone adoption failure"))
+				.mockImplementation(originalCreateUser);
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: {
+						phoneNumber: value,
+						code: runtime.readOTP(),
+						disableSession: true,
+					},
+				}),
+			).rejects.toThrow("forced phone adoption failure");
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.not.toBeNull();
+			createUser.mockRestore();
+
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: {
+						phoneNumber: value,
+						code: runtime.readOTP(),
+						disableSession: true,
+					},
+				}),
+			).resolves.toMatchObject({ status: true, token: null });
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("fails before consuming disable-session OTP without transaction support", async () => {
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "single_factor",
+		});
+		const value = "+15550001006";
+		try {
+			const context = await runtime.auth.$context;
+			await runtime.auth.api.sendPhoneNumberOTP({ body: { phoneNumber: value } });
+			context.adapter.options!.adapterConfig.transaction = false;
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					body: {
+						phoneNumber: value,
+						code: runtime.readOTP(),
+						disableSession: true,
+					},
+				}),
+			).rejects.toThrow("rollback-capable database transactions");
+			await expect(
+				context.internalAdapter.findVerificationValue(value),
+			).resolves.not.toBeNull();
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back update-phone mutation failure and preserves the OTP for retry", async () => {
+		const runtime = await managedPhoneTestRuntime({
+			minimumAssurance: "single_factor",
+		});
+		const initial = "+15550001007";
+		const replacement = "+15550001008";
+		try {
+			const context = await runtime.auth.$context;
+			await runtime.auth.api.sendPhoneNumberOTP({
+				body: { phoneNumber: initial },
+			});
+			const signedIn = await runtime.auth.api.verifyPhoneNumber({
+				body: { phoneNumber: initial, code: runtime.readOTP() },
+				asResponse: true,
+			});
+			const cookie = signedIn.headers.get("set-cookie")?.split(";")[0];
+			expect(cookie).toBeTruthy();
+			const headers = new Headers({ cookie: cookie! });
+			await runtime.auth.api.sendPhoneNumberOTP({
+				headers,
+				body: { phoneNumber: replacement },
+			});
+			const originalUpdateUser = context.internalAdapter.updateUser.bind(
+				context.internalAdapter,
+			);
+			const updateUser = vi
+				.spyOn(context.internalAdapter, "updateUser")
+				.mockRejectedValueOnce(new Error("forced phone update failure"))
+				.mockImplementation(originalUpdateUser);
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					headers,
+					body: {
+						phoneNumber: replacement,
+						code: runtime.readOTP(),
+						updatePhoneNumber: true,
+					},
+				}),
+			).rejects.toThrow("forced phone update failure");
+			await expect(
+				context.internalAdapter.findVerificationValue(replacement),
+			).resolves.not.toBeNull();
+			updateUser.mockRestore();
+
+			await expect(
+				runtime.auth.api.verifyPhoneNumber({
+					headers,
+					body: {
+						phoneNumber: replacement,
+						code: runtime.readOTP(),
+						updatePhoneNumber: true,
+					},
+				}),
+			).resolves.toMatchObject({ status: true });
+			await expect(
+				context.internalAdapter.findVerificationValue(replacement),
+			).resolves.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+});
 
 describe("phone-number", async () => {
 	let otp = "";
@@ -322,6 +698,38 @@ describe("phone auth flow", async () => {
 		});
 		expect(res.error).toBe(null);
 		expect(otp).toHaveLength(6);
+	});
+
+	it("binds verified phone OTP evidence to the issued session", async () => {
+		const context = await auth.$context;
+		const originalCreateSession = context.internalAdapter.createSession.bind(
+			context.internalAdapter,
+		);
+		const createSession = vi
+			.spyOn(context.internalAdapter, "createSession")
+			.mockImplementation((...args) => originalCreateSession(...args));
+		const phoneNumber = "+251911121399";
+		const previousOtp = otp;
+
+		try {
+			await client.phoneNumber.sendOtp({ phoneNumber });
+			const result = await client.phoneNumber.verify({ phoneNumber, code: otp });
+			expect(result.error).toBeNull();
+			expect(result.data?.user).toBeDefined();
+			const authoritativeUserId = result.data!.user!.id;
+			expect(createSession).toHaveBeenCalledOnce();
+			const [subjectId, , , , issuanceContext] = createSession.mock.calls[0]!;
+			expect(subjectId).toBe(authoritativeUserId);
+			expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: authoritativeUserId,
+				evidence: [{ kind: "primary", primaryMethod: "phone_otp" }],
+				targetOrganizationId: null,
+			});
+		} finally {
+			createSession.mockRestore();
+			otp = previousOtp;
+		}
 	});
 
 	it("should verify phone number and create user & session", async () => {

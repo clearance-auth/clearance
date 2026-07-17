@@ -121,13 +121,15 @@ describe("plugin-init managed authentication policy normalization", () => {
 			issuanceContext,
 		);
 
-		expect(readForSubject).toHaveBeenCalledOnce();
-		expect(readForSubject).toHaveBeenCalledWith(
-			expect.objectContaining({
-				subjectId: user.id,
-				transaction: expect.any(Object),
-			}),
-		);
+		expect(readForSubject).toHaveBeenCalledTimes(2);
+		for (const [input] of readForSubject.mock.calls) {
+			expect(input).toEqual(
+				expect.objectContaining({
+					subjectId: user.id,
+					transaction: expect.any(Object),
+				}),
+			);
+		}
 		expect(
 			await context.adapter.findMany<Record<string, unknown>>({
 				model: "session",

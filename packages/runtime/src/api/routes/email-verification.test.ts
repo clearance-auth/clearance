@@ -1,6 +1,14 @@
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyReaderInput,
+} from "@clearance/core";
 import { APIError } from "@clearance/core/error";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { createEmailVerificationToken } from "./email-verification";
 
 /**
  * @see https://github.com/clearance-auth/clearance
@@ -187,6 +195,173 @@ describe("Email Verification - Request body consumption bug", () => {
 	});
 });
 
+async function managedEmailVerificationRuntime(
+	minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+	afterEmailVerification?: NonNullable<
+		ClearanceOptions["emailVerification"]
+	>["afterEmailVerification"],
+) {
+	const identity = {
+		projectId: `email-link-project-${minimumAssurance}`,
+		environmentId: `email-link-environment-${minimumAssurance}`,
+	};
+	const effective: RuntimeAuthenticationPolicy = {
+		passwordLockout: {
+			enabled: true,
+			maxFailedAttempts: 10,
+			durationSeconds: 900,
+		},
+		factorLockout: {
+			enabled: true,
+			maxFailedAttempts: 10,
+			durationSeconds: 900,
+		},
+		minimumAssurance,
+		allowedFactors: { totp: true, passkey: true },
+		trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+		assuranceMaxAgeSeconds: 300,
+	};
+	const options = {
+		emailAndPassword: { enabled: true },
+		emailVerification: {
+			autoSignInAfterVerification: true,
+			...(afterEmailVerification ? { afterEmailVerification } : {}),
+		},
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity,
+		reader: {
+			async readForSubject(input: RuntimeAuthenticationPolicyReaderInput) {
+				return {
+					scope: identity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: effective,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective,
+				};
+			},
+		},
+	});
+	return getTestInstance(options, { disableTestUser: true });
+}
+
+describe("email-link managed authentication transaction", () => {
+	it("serializes the same JTI without aborting the managed transaction", async () => {
+		const { auth } = await managedEmailVerificationRuntime("single_factor");
+		const context = await auth.$context;
+		const email = "managed-email-link-concurrent@example.test";
+		const user = await context.internalAdapter.createUser({
+			email,
+			emailVerified: false,
+			name: "Managed Concurrent Email Link User",
+		});
+		const token = await createEmailVerificationToken(
+			context.secret,
+			email,
+			undefined,
+			3600,
+			{ jti: "managed-email-link-concurrent-jti-1234" },
+		);
+
+		const results = await Promise.allSettled([
+			auth.api.verifyEmail({ query: { token } }),
+			auth.api.verifyEmail({ query: { token } }),
+		]);
+
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+			1,
+		);
+		expect(results.filter((result) => result.status === "rejected")).toHaveLength(
+			1,
+		);
+		expect((await context.internalAdapter.findUserById(user.id))?.emailVerified).toBe(
+			true,
+		);
+		await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+	});
+
+	it("rolls the JTI reservation and identity mutation back with rejected issuance", async () => {
+		const { auth } = await managedEmailVerificationRuntime("multi_factor");
+		const context = await auth.$context;
+		const email = "managed-email-link-rejected@example.test";
+		const user = await context.internalAdapter.createUser({
+			email,
+			emailVerified: false,
+			name: "Managed Email Link User",
+		});
+		const jti = "managed-email-link-rejected-jti-1234";
+		const token = await createEmailVerificationToken(
+			context.secret,
+			email,
+			undefined,
+			3600,
+			{ jti },
+		);
+
+		await expect(
+			auth.api.verifyEmail({ query: { token } }),
+		).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		const persisted = await context.internalAdapter.findUserById(user.id);
+		expect(persisted?.emailVerified).toBe(false);
+		await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+		const reservation = {
+			identifier: `email-verification-jti:${jti}`,
+			value: jti,
+			expiresAt: new Date(Date.now() + 60_000),
+		};
+		await expect(
+			context.internalAdapter.reserveVerificationValue(reservation),
+		).resolves.toBe(true);
+		await expect(
+			context.internalAdapter.reserveVerificationValue(reservation),
+		).resolves.toBe(false);
+	});
+
+	it("returns the committed managed session when the post-commit callback throws", async () => {
+		const callback = vi.fn(async () => {
+			throw new Error("post-commit callback failure");
+		});
+		const { auth, client, cookieSetter } =
+			await managedEmailVerificationRuntime("single_factor", callback);
+		const context = await auth.$context;
+		const logger = vi.spyOn(context.logger, "error").mockImplementation(() => {});
+		const email = "managed-email-link-callback@example.test";
+		await context.internalAdapter.createUser({
+			email,
+			emailVerified: false,
+			name: "Managed Email Link Callback User",
+		});
+		const token = await createEmailVerificationToken(
+			context.secret,
+			email,
+			undefined,
+			3600,
+			{ jti: "managed-email-link-callback-jti-1234" },
+		);
+		const headers = new Headers();
+
+		try {
+			const result = await client.verifyEmail({
+				query: { token },
+				fetchOptions: { onSuccess: cookieSetter(headers) },
+			});
+			expect(result.error).toBeNull();
+			expect(result.data?.status).toBe(true);
+			expect(callback).toHaveBeenCalledOnce();
+			expect(logger).toHaveBeenCalledWith(
+				"Managed email verification post-commit callback failed",
+			);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+			const session = await client.getSession({ fetchOptions: { headers } });
+			expect(session.data?.user.email).toBe(email);
+		} finally {
+			logger.mockRestore();
+		}
+	});
+});
+
 describe("Email Verification", async () => {
 	const mockSendEmail = vi.fn();
 	let token: string;
@@ -277,10 +452,22 @@ describe("Email Verification", async () => {
 	});
 
 	it("should redirect to callback", async () => {
-		await client.verifyEmail(
+		let redirectToken = "";
+		const { client: isolatedClient } = await getTestInstance({
+			emailAndPassword: {
+				enabled: true,
+				requireEmailVerification: true,
+			},
+			emailVerification: {
+				async sendVerificationEmail({ token: sentToken }) {
+					redirectToken = sentToken;
+				},
+			},
+		});
+		await isolatedClient.verifyEmail(
 			{
 				query: {
-					token,
+					token: redirectToken,
 					callbackURL: "/callback",
 				},
 			},
@@ -293,8 +480,171 @@ describe("Email Verification", async () => {
 		);
 	});
 
+	it("allows only one concurrent auto-sign-in for the same verification JWT", async () => {
+		let verificationToken = "";
+		const { auth, testUser } = await getTestInstance({
+			emailAndPassword: {
+				enabled: true,
+				requireEmailVerification: true,
+			},
+			emailVerification: {
+				autoSignInAfterVerification: true,
+				async sendVerificationEmail({ token: sentToken }) {
+					verificationToken = sentToken;
+				},
+			},
+		});
+		const adapter = (await auth.$context).internalAdapter;
+		const authoritativeUser = await adapter.findUserByEmail(testUser.email);
+		expect(authoritativeUser).not.toBeNull();
+		const reserveVerificationValue = vi.spyOn(
+			adapter,
+			"reserveVerificationValue",
+		);
+		const createSession = vi.spyOn(adapter, "createSession");
+
+		const results = await Promise.allSettled([
+			auth.api.verifyEmail({ query: { token: verificationToken } }),
+			auth.api.verifyEmail({ query: { token: verificationToken } }),
+		]);
+
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+			1,
+		);
+		expect(results.filter((result) => result.status === "rejected")).toHaveLength(
+			1,
+		);
+		expect(reserveVerificationValue).toHaveBeenCalledTimes(2);
+		for (const [reservation] of reserveVerificationValue.mock.calls) {
+			expect(reservation.value).not.toBe(verificationToken);
+			expect(reservation.identifier).toBe(
+				`email-verification-jti:${reservation.value}`,
+			);
+		}
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(createSession.mock.calls[0]?.[0]).toBe(authoritativeUser!.user.id);
+		await expect(
+			auth.api.verifyEmail({ query: { token: verificationToken } }),
+		).rejects.toBeInstanceOf(APIError);
+		expect(createSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects a signed verification JWT without a canonical jti", async () => {
+		const { auth, testUser } = await getTestInstance();
+		const context = await auth.$context;
+		const createSession = vi.spyOn(
+			context.internalAdapter,
+			"createSession",
+		);
+		const tokenWithoutJti = await createEmailVerificationToken(
+			context.secret,
+			testUser.email,
+		);
+
+		await expect(
+			auth.api.verifyEmail({ query: { token: tokenWithoutJti } }),
+		).rejects.toBeInstanceOf(APIError);
+		expect(createSession).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{
+			label: "two-step email change",
+			requestType: "change-email-verification",
+		},
+		{ label: "legacy email change", requestType: undefined },
+	])(
+		"allows only one concurrent session for a $label JWT",
+		async ({ label, requestType }) => {
+			const { auth, testUser } = await getTestInstance({
+				emailVerification: {
+					async sendVerificationEmail() {},
+				},
+			});
+			const context = await auth.$context;
+			const adapter = context.internalAdapter;
+			const createSession = vi.spyOn(adapter, "createSession");
+			const newEmail = `${label.replaceAll(" ", "-")}@example.test`;
+			const changeToken = await createEmailVerificationToken(
+				context.secret,
+				testUser.email,
+				newEmail,
+				3600,
+				{
+					...(requestType ? { requestType } : {}),
+					jti: `email-change-${requestType ?? "legacy"}-jwt-123456789`,
+				},
+			);
+
+			const results = await Promise.allSettled([
+				auth.api.verifyEmail({ query: { token: changeToken } }),
+				auth.api.verifyEmail({ query: { token: changeToken } }),
+			]);
+
+			expect(
+				results.filter((result) => result.status === "fulfilled"),
+			).toHaveLength(1);
+			expect(
+				results.filter((result) => result.status === "rejected"),
+			).toHaveLength(1);
+			expect(createSession).toHaveBeenCalledTimes(1);
+			const updated = await adapter.findUserByEmail(newEmail);
+			expect(updated?.user.id).toBe(createSession.mock.calls[0]?.[0]);
+			await expect(
+				auth.api.verifyEmail({ query: { token: changeToken } }),
+			).rejects.toBeInstanceOf(APIError);
+			expect(createSession).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it("dispatches only one follow-up token for concurrent confirmation replay", async () => {
+		const sendVerificationEmail = vi.fn();
+		let confirmationToken = "";
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			emailVerification: { sendVerificationEmail },
+			user: {
+				changeEmail: {
+					enabled: true,
+					async sendChangeEmailConfirmation({ token: sentToken }) {
+						confirmationToken = sentToken;
+					},
+				},
+			},
+		});
+		const context = await auth.$context;
+		const user = await context.internalAdapter.findUserByEmail(testUser.email);
+		expect(user).not.toBeNull();
+		await context.internalAdapter.updateUser(user!.user.id, {
+			emailVerified: true,
+		});
+		const { headers } = await signInWithTestUser();
+		await auth.api.changeEmail({
+			body: { newEmail: "confirmed-once@example.test" },
+			headers,
+		});
+		sendVerificationEmail.mockClear();
+		const createSession = vi.spyOn(
+			context.internalAdapter,
+			"createSession",
+		);
+
+		const results = await Promise.allSettled([
+			auth.api.verifyEmail({ query: { token: confirmationToken } }),
+			auth.api.verifyEmail({ query: { token: confirmationToken } }),
+		]);
+
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+			1,
+		);
+		expect(results.filter((result) => result.status === "rejected")).toHaveLength(
+			1,
+		);
+		expect(sendVerificationEmail).toHaveBeenCalledTimes(1);
+		expect(createSession).not.toHaveBeenCalled();
+	});
+
 	it("should sign after verification", async () => {
-		const { testUser, client, sessionSetter, runWithUser } =
+		const { testUser, client, sessionSetter, runWithUser, auth } =
 			await getTestInstance({
 				emailAndPassword: {
 					enabled: true,
@@ -308,6 +658,10 @@ describe("Email Verification", async () => {
 					autoSignInAfterVerification: true,
 				},
 			});
+		const adapter = (await auth.$context).internalAdapter;
+		const authoritativeUser = await adapter.findUserByEmail(testUser.email);
+		expect(authoritativeUser).not.toBeNull();
+		const createSession = vi.spyOn(adapter, "createSession");
 
 		// Attempt to update user info (should fail before verification)
 		await runWithUser(testUser.email, testUser.password, async () => {
@@ -332,6 +686,21 @@ describe("Email Verification", async () => {
 					sessionSetter(verifyHeaders)(context);
 				},
 			},
+		});
+		expect(createSession).toHaveBeenCalledTimes(1);
+		const [subjectId, dontRememberMe, override, overrideAll, issuanceContext] =
+			createSession.mock.calls[0]!;
+		expect([subjectId, dontRememberMe, override, overrideAll]).toEqual([
+			authoritativeUser!.user.id,
+			false,
+			undefined,
+			false,
+		]);
+		expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+			purpose: "interactive",
+			subjectId: authoritativeUser!.user.id,
+			evidence: [{ kind: "primary", primaryMethod: "email_link" }],
+			targetOrganizationId: null,
 		});
 		expect(sessionToken.length).toBeGreaterThan(10);
 		const session = await client.getSession({

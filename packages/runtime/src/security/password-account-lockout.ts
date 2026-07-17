@@ -14,7 +14,11 @@ type PasswordAccount = Account & {
 	passwordLockedUntil?: Date | null;
 };
 
-type Reservation = { id: string; expiresAt: number };
+type Reservation = {
+	id: string;
+	expiresAt: number;
+	failureFenced?: boolean;
+};
 
 function lockoutError(): never {
 	throw APIError.from("TOO_MANY_REQUESTS", BASE_ERROR_CODES.PASSWORD_ACCOUNT_LOCKED);
@@ -65,7 +69,9 @@ function parseReservations(value: string | null | undefined): Reservation[] | nu
 					typeof (entry as Reservation).id === "string" &&
 					(entry as Reservation).id.length > 0 &&
 					Number.isSafeInteger((entry as Reservation).expiresAt) &&
-					(entry as Reservation).expiresAt > 0,
+					(entry as Reservation).expiresAt > 0 &&
+					((entry as Reservation).failureFenced === undefined ||
+						typeof (entry as Reservation).failureFenced === "boolean"),
 			)
 		) {
 			return null;
@@ -228,17 +234,25 @@ async function reservePasswordAttempt(
 				);
 				if (!active) stateError();
 				if (!validFailureCount(latest.failedPasswordAttempts ?? 0)) stateError();
-				if (!active.some((entry) => entry.id === reservationId)) {
+				const reservation = active.find((entry) => entry.id === reservationId);
+				if (!reservation) {
 					return outcome !== "success";
 				}
 				const remaining = active.filter((entry) => entry.id !== reservationId);
 				const currentFailures = latest.failedPasswordAttempts ?? 0;
 				const nextFailures =
-					outcome === "failure"
+					outcome === "failure" && !reservation.failureFenced
 						? Math.min(policy.maxFailedAttempts, currentFailures + 1)
 						: outcome === "success"
 							? 0
 							: currentFailures;
+				const nextReservations =
+					outcome === "success"
+						? remaining.map((entry) => ({
+								...entry,
+								failureFenced: true,
+							}))
+						: remaining;
 				const updated = await ctx.context.adapter.incrementOne<PasswordAccount>({
 					model: "account",
 					where: [
@@ -261,9 +275,10 @@ async function reservePasswordAttempt(
 					set: {
 						failedPasswordAttempts: nextFailures,
 						activePasswordAttemptReservations:
-							outcome === "success" ? "[]" : JSON.stringify(remaining),
+							JSON.stringify(nextReservations),
 						passwordLockedUntil:
 							outcome === "failure" &&
+							!reservation.failureFenced &&
 							nextFailures >= policy.maxFailedAttempts
 								? latest.passwordLockedUntil ??
 									new Date(Date.now() + policy.durationMs)

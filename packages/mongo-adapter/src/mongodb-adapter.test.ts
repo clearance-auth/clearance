@@ -179,6 +179,70 @@ describe("mongodb-adapter", () => {
 		);
 	});
 
+	it("createIfAbsent compares independently transformed ObjectId attempts by value", async () => {
+		let stored: Record<string, unknown> | null = null;
+		const findOneAndUpdate = vi.fn(
+			async (
+				_filter: Record<string, unknown>,
+				update: { $setOnInsert: Record<string, unknown> },
+			) => {
+				if (!stored) stored = { ...update.$setOnInsert };
+				return { value: { ...stored } };
+			},
+		);
+		const db = {
+			collection: vi.fn(() => ({ findOneAndUpdate })),
+		} as any;
+		const adapter = mongodbAdapter(db, { transaction: false })({});
+		const expiresAt = new Date("2026-07-17T00:00:00.000Z");
+		const winner = {
+			userId: "507f1f77bcf86cd799439011",
+			token: "shared",
+			expiresAt,
+		};
+		const loser = {
+			userId: "507f1f77bcf86cd799439012",
+			token: "shared",
+			expiresAt,
+		};
+
+		expect(
+			await adapter.createIfAbsent({
+				model: "session",
+				data: winner,
+				uniqueBy: { field: "token", value: winner.token },
+				attemptBy: { field: "userId", value: winner.userId },
+			}),
+		).toMatchObject(winner);
+		const beforeLoser = {
+			...(stored as unknown as Record<string, unknown>),
+		};
+		expect(
+			await adapter.createIfAbsent({
+				model: "session",
+				data: loser,
+				uniqueBy: { field: "token", value: loser.token },
+				attemptBy: { field: "userId", value: loser.userId },
+			}),
+		).toBeNull();
+		expect(stored).toEqual(beforeLoser);
+		expect(findOneAndUpdate).toHaveBeenCalledWith(
+			{ token: "shared" },
+			expect.objectContaining({
+				$setOnInsert: expect.objectContaining({
+					_id: expect.any(ObjectId),
+					token: "shared",
+					userId: expect.any(ObjectId),
+				}),
+			}),
+			expect.objectContaining({
+				upsert: true,
+				returnDocument: "after",
+				includeResultMetadata: true,
+			}),
+		);
+	});
+
 	const rateLimitOptions = { rateLimit: { storage: "database" } } as any;
 
 	it("incrementOne applies $inc and $set atomically against the guard filter", async () => {

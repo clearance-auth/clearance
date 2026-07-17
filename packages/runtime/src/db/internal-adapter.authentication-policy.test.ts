@@ -22,9 +22,15 @@ import {
 	RuntimeAuthenticationPolicyReaderError,
 } from "../internal/authentication-policy";
 import {
+	captureInternalSessionIssuanceContext,
 	createInternalSessionIssuanceContext,
 	ManagedSessionIssuanceError,
 } from "../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+	ManagedVerificationChallengeError,
+} from "../internal/verification-challenge-context";
 import { attachInternalCredentialAuthority } from "../internal/credential-authority";
 import { getMigrations } from "./get-migration";
 import { generateCredentialOperationKey } from "../utils/operation-key";
@@ -35,6 +41,7 @@ import { schema as twoFactorSchema } from "../plugins/two-factor/schema";
 import {
 	createSessionHandle,
 	digestSessionRefreshSecret,
+	digestSessionRotationNonce,
 	SESSION_ROTATION_RECOVERY_WINDOW_MS,
 } from "./session-credential";
 
@@ -170,6 +177,22 @@ async function expectNoIssuance(
 
 type ManagedRuntime = Awaited<ReturnType<typeof setupManagedRuntime>>;
 
+function spyOnManagedPublicationFailure(runtime: ManagedRuntime) {
+	return vi
+		.spyOn(runtime.context.logger, "error")
+		.mockImplementation(() => {});
+}
+
+function expectManagedPublicationFailure(
+	logger: ReturnType<typeof spyOnManagedPublicationFailure>,
+	message = "Managed session publication authority became invalid after commit",
+) {
+	expect(logger).toHaveBeenCalledWith(
+		message,
+		expect.any(Error),
+	);
+}
+
 async function issuePasswordSession(
 	runtime: ManagedRuntime,
 	options: {
@@ -296,6 +319,400 @@ afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	for (const database of databases.splice(0)) database.close();
+});
+
+describe("managed verification challenge authority", () => {
+	const createChallenge = (
+		runtime: ManagedRuntime,
+		data: { identifier: string; value: string; expiresAt: Date },
+		binding: { purpose: string; subject: string } = {
+			purpose: "managed-test-challenge",
+			subject: data.identifier,
+		},
+	) =>
+		createInternalVerificationChallenge(
+			runtime.context.internalAdapter,
+			binding,
+			data,
+		);
+	const consumeChallenge = (
+		runtime: ManagedRuntime,
+		identifier: string,
+		binding: { purpose: string; subject: string } = {
+			purpose: "managed-test-challenge",
+			subject: identifier,
+		},
+	) =>
+		consumeInternalVerificationChallenge(runtime.context.internalAdapter, {
+			...binding,
+			identifier,
+		});
+
+	function secondaryStorage(
+		store: Map<string, string>,
+		controls: { failDelete?: boolean } = {},
+	) {
+		return {
+			namespace: `managed-verification-${databases.length}`,
+			get: async (key: string) => store.get(key) ?? null,
+			set: async (key: string, value: string) => {
+				store.set(key, value);
+			},
+			delete: async (key: string) => {
+				if (controls.failDelete) throw new Error("cache delete failed");
+				store.delete(key);
+			},
+			runExclusive<T>(_name: string, operation: () => T): T {
+				return operation();
+			},
+			assertNoLegacySessionWriters() {},
+		};
+	}
+
+	async function challengeMarkers(runtime: ManagedRuntime) {
+		return runtime.context.adapter.findMany<Record<string, unknown>>({
+			model: "securityMigration",
+			where: [
+				{
+					field: "state",
+					value: "managed-verification-challenge-v2",
+				},
+			],
+		});
+	}
+
+	it("publishes neither marker nor secondary proof when issuance rolls back", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store),
+			},
+		});
+		const identifier = "managed-secondary-issuance-rollback";
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				await createChallenge(runtime, {
+					identifier,
+					value: "proof-value",
+					expiresAt: new Date(Date.now() + 60_000),
+				});
+				expect(store.has(`verification:${identifier}`)).toBe(false);
+				throw new Error("rollback managed issuance");
+			}),
+		).rejects.toThrow("rollback managed issuance");
+		expect(store.has(`verification:${identifier}`)).toBe(false);
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it("keeps a secondary-only proof and marker on rollback, then consumes both on retry", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store),
+			},
+		});
+		const identifier = "managed-secondary-rollback";
+		const created = await createChallenge(runtime, {
+			identifier,
+			value: "proof-value",
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		expect(created.id).toEqual(expect.any(String));
+		expect(store.has(`verification:${identifier}`)).toBe(true);
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const consumed = await consumeChallenge(runtime, identifier);
+				expect(consumed?.id).toBe(created.id);
+				throw new Error("rollback managed verification");
+			}),
+		).rejects.toThrow("rollback managed verification");
+		expect(store.has(`verification:${identifier}`)).toBe(true);
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+
+		const retried = await runWithTransaction(runtime.context.adapter, () =>
+			consumeChallenge(runtime, identifier),
+		);
+		expect(retried?.id).toBe(created.id);
+		expect(store.has(`verification:${identifier}`)).toBe(false);
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it("rolls back and retries exact database-backed challenge consumption", async () => {
+		const runtime = await setupManagedRuntime();
+		const identifier = "managed-database-rollback";
+		const created = await createChallenge(runtime, {
+			identifier,
+			value: "proof-value",
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const consumed = await consumeChallenge(runtime, identifier);
+				expect(consumed?.id).toBe(created.id);
+				throw new Error("rollback database verification");
+			}),
+		).rejects.toThrow("rollback database verification");
+		await expect(
+			runtime.context.internalAdapter.findVerificationValue(identifier),
+		).resolves.toMatchObject({ id: created.id });
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).resolves.toMatchObject({ id: created.id });
+		await expect(
+			runtime.context.internalAdapter.findVerificationValue(identifier),
+		).resolves.toBeNull();
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it("removes primary authority even when post-commit cache deletion fails", async () => {
+		const store = new Map<string, string>();
+		const controls = { failDelete: false };
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store, controls),
+			},
+		});
+		const identifier = "managed-secondary-delete-failure";
+		await createChallenge(runtime, {
+			identifier,
+			value: "proof-value",
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		controls.failDelete = true;
+		const logger = vi
+			.spyOn(runtime.context.logger, "error")
+			.mockImplementation(() => {});
+		expect(
+			await runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).not.toBeNull();
+		expect(store.has(`verification:${identifier}`)).toBe(true);
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+		expect(
+			await runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		).toBeNull();
+		expect(logger).toHaveBeenCalledWith(
+			"Managed verification cache cleanup failed after commit",
+		);
+	});
+
+	it("has one primary winner under concurrent managed secondary consume", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store),
+			},
+		});
+		const identifier = "managed-secondary-concurrent";
+		await createChallenge(runtime, {
+			identifier,
+			value: "proof-value",
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		const results = await Promise.all([
+			runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+			runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier),
+			),
+		]);
+		expect(results.filter(Boolean)).toHaveLength(1);
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it("publishes a consume-then-recreate replacement after cache deletion", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store),
+			},
+		});
+		const identifier = "managed-secondary-wrong-attempt";
+		await createChallenge(runtime, {
+			identifier,
+			value: "otp:0",
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		const replacement = await runWithTransaction(
+			runtime.context.adapter,
+			async () => {
+				const consumed = await consumeChallenge(runtime, identifier);
+				expect(consumed?.value).toBe("otp:0");
+				return createChallenge(runtime, {
+					identifier,
+					value: "otp:1",
+					expiresAt: consumed!.expiresAt,
+				});
+			},
+		);
+		const cached = JSON.parse(store.get(`verification:${identifier}`)!) as {
+			id: string;
+			value: string;
+		};
+		expect(cached).toMatchObject({ id: replacement.id, value: "otp:1" });
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+	});
+
+	it("stores only opaque marker metadata and rejects consumption outside a transaction", async () => {
+		const store = new Map<string, string>();
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: { storeSessionInDatabase: true },
+				verification: { storeInDatabase: false },
+				secondaryStorage: secondaryStorage(store),
+			},
+		});
+		const identifier = "raw-phone-or-email@example.test";
+		const value = "raw-otp-or-proof";
+		await createChallenge(runtime, {
+			identifier,
+			value,
+			expiresAt: new Date(Date.now() + 60_000),
+		});
+		const [marker] = await challengeMarkers(runtime);
+		expect(marker?.state).toBe("managed-verification-challenge-v2");
+		expect(JSON.stringify(marker)).not.toContain(identifier);
+		expect(JSON.stringify(marker)).not.toContain(value);
+		await expect(
+			consumeChallenge(runtime, identifier),
+		).rejects.toThrow("requires an active primary transaction");
+	});
+
+	it("rejects caller-forged managed challenge creation without runtime provenance", async () => {
+		const runtime = await setupManagedRuntime();
+		const identifier = "forged-email-otp:target@example.test";
+		await expect(
+			runtime.context.internalAdapter.createVerificationValue({
+				identifier,
+				value: "known-attacker-proof",
+				expiresAt: new Date(Date.now() + 60_000),
+			}),
+		).rejects.toMatchObject({
+			name: "ManagedVerificationChallengeError",
+			reason: "context_required",
+		});
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+		await expect(
+			runtime.context.internalAdapter.findVerificationValue(identifier),
+		).resolves.toBeNull();
+	});
+
+	it("rejects verification hooks that substitute the runtime-issued proof", async () => {
+		const runtime = await setupManagedRuntime({
+			options: {
+				databaseHooks: {
+					verification: {
+						create: {
+							before: async (data) => ({
+								data: { ...data, value: "hook-forged-proof" },
+							}),
+						},
+					},
+				},
+			},
+		});
+		const identifier = "managed-hook-substitution";
+		await expect(
+			createChallenge(runtime, {
+				identifier,
+				value: "runtime-proof",
+				expiresAt: new Date(Date.now() + 60_000),
+			}),
+		).rejects.toBeInstanceOf(ManagedVerificationChallengeError);
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+		await expect(
+			runtime.context.internalAdapter.findVerificationValue(identifier),
+		).resolves.toBeNull();
+	});
+
+	it("binds managed consumption to the issuing purpose and subject", async () => {
+		const runtime = await setupManagedRuntime();
+		const identifier = "email-otp:target@example.test";
+		await createChallenge(
+			runtime,
+			{
+				identifier,
+				value: "opaque-proof",
+				expiresAt: new Date(Date.now() + 60_000),
+			},
+			{ purpose: "email-otp-sign-in", subject: "target@example.test" },
+		);
+		await expect(
+			runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier, {
+					purpose: "password-reset",
+					subject: "target@example.test",
+				}),
+			),
+		).resolves.toBeNull();
+		expect(await challengeMarkers(runtime)).toHaveLength(1);
+		await expect(
+			runWithTransaction(runtime.context.adapter, () =>
+				consumeChallenge(runtime, identifier, {
+					purpose: "email-otp-sign-in",
+					subject: "target@example.test",
+				}),
+			),
+		).resolves.toMatchObject({ value: "opaque-proof" });
+		expect(await challengeMarkers(runtime)).toHaveLength(0);
+	});
+
+	it.each(["serial", "uuid"] as const)(
+		"supports %s-generated security marker ids with opaque secondary challenge ids",
+		async (generateIdStrategy) => {
+			const store = new Map<string, string>();
+			const runtime = await setupManagedRuntime({
+				options: {
+					advanced: { database: { generateId: generateIdStrategy } },
+					session: { storeSessionInDatabase: true },
+					verification: { storeInDatabase: false },
+					secondaryStorage: secondaryStorage(store),
+				},
+			});
+			const identifier = `managed-${generateIdStrategy}-challenge`;
+			const created = await createChallenge(runtime, {
+				identifier,
+				value: "proof-value",
+				expiresAt: new Date(Date.now() + 60_000),
+			});
+			expect(created.id).toMatch(/^[A-Za-z0-9_-]+$/);
+			const [marker] = await challengeMarkers(runtime);
+			if (generateIdStrategy === "serial") {
+				expect(marker?.id).toMatch(/^\d+$/);
+			} else {
+				expect(marker?.id).toMatch(
+					/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+				);
+			}
+			expect(
+				await runWithTransaction(runtime.context.adapter, () =>
+					consumeChallenge(runtime, identifier),
+				),
+			).not.toBeNull();
+		},
+	);
 });
 
 describe("managed session issuance", () => {
@@ -494,6 +911,184 @@ describe("managed session issuance", () => {
 		expect(Object.isFrozen(failure.requirement.allowedFactors)).toBe(true);
 		await expectNoIssuance(context);
 		expect(secondarySet).not.toHaveBeenCalled();
+	});
+
+	it("captures replacement authority only in the live source transaction and preserves its exact assurance and lifetime ceiling", async () => {
+		const runtime = await setupManagedRuntime({
+			options: {
+				databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => ({
+								data: {
+									...data,
+									expiresAt: new Date(
+										new Date(data.expiresAt).getTime() + 86_400_000,
+									),
+								},
+							}),
+						},
+					},
+				},
+			},
+		});
+		const sourceCeiling = new Date(Date.now() + 60_000);
+		const source = await runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			false,
+			{
+				expiresAt: sourceCeiling,
+				__preserveSessionExpiresAt: true,
+			},
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const [sourceAuthority] = await authorityRows(runtime.context);
+		let successor!: Session;
+
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const replacement = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "replacement",
+					sourceSessionToken: source.token,
+				},
+			);
+			await runtime.context.internalAdapter.deleteSession(source.token);
+			successor = await runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				replacement,
+			);
+		});
+
+		const [successorAuthority] = await authorityRows(runtime.context);
+		expect(successorAuthority).toMatchObject({
+			id: successor.id,
+			authenticationPrimaryMethod: "password",
+			authenticationFactorMethod: null,
+			authenticationPolicyRevision: "7",
+		});
+		expect(successorAuthority?.authenticationPrimaryAt).toEqual(
+			sourceAuthority?.authenticationPrimaryAt,
+		);
+		expect(successorAuthority?.authenticationAssuranceExpiresAt).toEqual(
+			sourceAuthority?.authenticationAssuranceExpiresAt,
+		);
+		expect(successorAuthority?.expiresAt).toEqual(sourceCeiling);
+	});
+
+	it("rolls replacement issuance back when its captured source remains authoritative", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const captured = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "replacement",
+						sourceSessionToken: source.token,
+					},
+				);
+				await runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					captured,
+				);
+			}),
+		).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+		expect(await credentialRows(runtime)).toHaveLength(1);
+	});
+
+	it("rejects replacement capture outside a transaction and use outside the capturing transaction", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+
+		await expect(
+			captureInternalSessionIssuanceContext(runtime.context.internalAdapter, {
+				purpose: "replacement",
+				sourceSessionToken: source.token,
+			}),
+		).rejects.toMatchObject({ reason: "context_invalid" });
+
+		const captured = await runWithTransaction(runtime.context.adapter, () =>
+			captureInternalSessionIssuanceContext(runtime.context.internalAdapter, {
+				purpose: "replacement",
+				sourceSessionToken: source.token,
+			}),
+		);
+		await expect(
+			runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				captured,
+			),
+		).rejects.toMatchObject({ reason: "context_invalid" });
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+	});
+
+	it("binds captured replacement authority to the source subject and the live policy revision", async () => {
+		let revision = "7";
+		const runtime = await setupManagedRuntime({
+			reader: (input) => policyResult(input, { revision }),
+		});
+		const otherUser = await runtime.context.internalAdapter.createUser({
+			email: "managed-replacement-other@example.com",
+			name: "Other Managed User",
+		});
+		const source = await issuePasswordSession(runtime);
+
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const captured = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "replacement",
+					sourceSessionToken: source.token,
+				},
+			);
+			await expect(
+				runtime.context.internalAdapter.createSession(
+					otherUser.id,
+					false,
+					undefined,
+					false,
+					captured,
+				),
+			).rejects.toMatchObject({ reason: "subject_mismatch" });
+		});
+
+		await runWithTransaction(runtime.context.adapter, async () => {
+			const captured = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "replacement",
+					sourceSessionToken: source.token,
+				},
+			);
+			revision = "8";
+			await expect(
+				runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					captured,
+				),
+			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		});
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
 	});
 
 	it.each([
@@ -1076,7 +1671,6 @@ describe("managed session issuance", () => {
 				},
 			},
 		});
-
 		const pendingCreate = issuePasswordSession(runtime);
 		await createHookEntered.promise;
 		try {
@@ -1112,101 +1706,191 @@ describe("managed session issuance", () => {
 		expect(persistedSession.ipAddress).toBe("192.0.2.90");
 	});
 
-	it("publishes a verified rotation descendant committed before create publication", async () => {
-		const store = new Map<string, string>();
-		const createHookEntered = deferred();
-		const createHookRelease = deferred();
-		let createdSessionId = "";
-		const runtime = await setupManagedRuntime({
-			options: {
-				databaseHooks: {
-					session: {
-						create: {
-							after: async (created) => {
-								createdSessionId = created.id;
-								createHookEntered.resolve();
-								await createHookRelease.promise;
+	it.each([
+		{
+			label: "valid",
+			successorDigest: `v1:${"C".repeat(43)}`,
+			publishes: true,
+		},
+		{ label: "malformed", successorDigest: "malformed", publishes: false },
+	])(
+		"handles a $label rotation descendant committed before create publication",
+		async ({ label, successorDigest, publishes }) => {
+			const store = new Map<string, string>();
+			const createHookEntered = deferred();
+			const createHookRelease = deferred();
+			let createdSessionId = "";
+			const namespace = `managed-create-newer-${label}-successor-test`;
+			let malformedCleanupState: {
+				credentialKey: string;
+				handleKey: string;
+				indexKey: string;
+				sentinelKey: string;
+				sentinelValue: string;
+			} | null = null;
+			const runtime = await setupManagedRuntime({
+				options: {
+					databaseHooks: {
+						session: {
+							create: {
+								after: async (created) => {
+									createdSessionId = created.id;
+									createHookEntered.resolve();
+									await createHookRelease.promise;
+								},
 							},
 						},
 					},
+					session: { storeSessionInDatabase: true },
+					secondaryStorage: {
+						namespace,
+						get: async (key) => store.get(key) ?? null,
+						set: async (key, value) => {
+							store.set(key, value);
+						},
+						delete: async (key) => {
+							store.delete(key);
+						},
+					},
 				},
-				session: { storeSessionInDatabase: true },
-				secondaryStorage: {
-					namespace: "managed-create-newer-successor-test",
-					get: async (key) => store.get(key) ?? null,
-					set: async (key, value) => {
-						store.set(key, value);
-					},
-					delete: async (key) => {
-						store.delete(key);
-					},
-				},
-			},
-		});
-
-		const pendingCreate = issuePasswordSession(runtime);
-		await createHookEntered.promise;
-		let successorDigest = "";
-		try {
-			await runWithTransaction(runtime.context.adapter, async () => {
-				const currentAdapter = await getCurrentAdapter(runtime.context.adapter);
-				const root = await currentAdapter.findOne<Record<string, unknown>>({
-					model: "sessionCredential",
-					where: [{ field: "sessionId", value: createdSessionId }],
-				});
-				const now = new Date();
-				await currentAdapter.update({
-					model: "sessionCredential",
-					where: [{ field: "id", value: String(root!.id) }],
-					update: {
-						status: "consumed",
-						consumedAt: now,
-						rotationNonceDigest: "create-race-operation",
-						recoveryExpiresAt: new Date(
-							now.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
-						),
-						updatedAt: now,
-					},
-				});
-				const successorId = `create-race-${String(root!.id)}`;
-				successorDigest = `digest-${successorId}`;
-				await currentAdapter.create({
-					model: "sessionCredential",
-					forceAllowId: true,
-					data: {
-						...root,
-						id: successorId,
-						selector: `selector-${successorId}`,
-						secretDigest: successorDigest,
-						status: "active",
-						rotationCounter: 1,
-						parentCredentialId: root!.id,
-						consumedAt: null,
-						revokedAt: null,
-						reuseDetectedAt: null,
-						rotationNonceDigest: null,
-						recoverySecretCiphertext: null,
-						recoveryExpiresAt: null,
-						createdAt: now,
-						updatedAt: now,
-					},
-				});
 			});
-		} finally {
-			createHookRelease.resolve();
-		}
-		const issued = await pendingCreate;
-		const handleKey = [...store.keys()].find((key) =>
-			key.endsWith(`:session-handle:${issued.id}`),
-		)!;
-		const successorKey =
-			`clearance:managed-create-newer-successor-test:` +
-			`session-credential:${successorDigest}`;
-		expect(JSON.parse(store.get(handleKey)!)).toEqual({
-			credentialKey: successorKey,
-		});
-		expect(store.has(successorKey)).toBe(true);
-	});
+			const publicationLogger = spyOnManagedPublicationFailure(runtime);
+
+			const pendingCreate = issuePasswordSession(runtime);
+			await createHookEntered.promise;
+			try {
+				await runWithTransaction(runtime.context.adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(runtime.context.adapter);
+					const root = await currentAdapter.findOne<Record<string, unknown>>({
+						model: "sessionCredential",
+						where: [{ field: "sessionId", value: createdSessionId }],
+					});
+					const now = new Date();
+					await currentAdapter.update({
+						model: "sessionCredential",
+						where: [{ field: "id", value: String(root!.id) }],
+						update: {
+							status: "consumed",
+							consumedAt: now,
+							rotationNonceDigest: await digestSessionRotationNonce(
+								"create-race-operation",
+							),
+							recoveryExpiresAt: new Date(
+								now.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
+							),
+							updatedAt: now,
+						},
+					});
+					const successorId = `create-race-${String(root!.id)}`;
+					await currentAdapter.create({
+						model: "sessionCredential",
+						forceAllowId: true,
+						data: {
+							...root,
+							id: successorId,
+							selector: `selector-${successorId}`,
+							secretDigest: successorDigest,
+							status: "active",
+							rotationCounter: 1,
+							parentCredentialId: root!.id,
+							consumedAt: null,
+							revokedAt: null,
+							reuseDetectedAt: null,
+							rotationNonceDigest: null,
+							recoverySecretCiphertext: null,
+							recoveryExpiresAt: null,
+							createdAt: now,
+							updatedAt: now,
+						},
+					});
+				});
+				if (!publishes) {
+					const root = (await credentialRows(runtime)).find(
+						(credential) => credential.rotationCounter === 0,
+					)!;
+					const persistedSession = (await authorityRows(runtime.context))[0]!;
+					const persistedUser = await runtime.context.adapter.findOne<
+						Record<string, unknown>
+					>({
+						model: "user",
+						where: [{ field: "id", value: runtime.user.id }],
+					});
+					const credentialKey =
+						`clearance:${namespace}:session-credential:${String(root.secretDigest)}`;
+					const handleKey =
+						`clearance:${namespace}:session-handle:${createdSessionId}`;
+					const indexKey =
+						`clearance:${namespace}:active-sessions:${runtime.user.id}`;
+					const sentinelKey = `clearance:${namespace}:unrelated-sentinel`;
+					const sentinelValue = JSON.stringify({ owner: "unrelated" });
+					store.set(
+						credentialKey,
+						JSON.stringify({
+							session: JSON.parse(
+								JSON.stringify({ ...persistedSession, token: null }),
+							),
+							user: JSON.parse(JSON.stringify(persistedUser)),
+						}),
+					);
+					store.set(handleKey, JSON.stringify({ credentialKey }));
+					store.set(
+						indexKey,
+						JSON.stringify([
+							{
+								sessionId: createdSessionId,
+								credentialKey,
+								expiresAt: (persistedSession.expiresAt as Date).getTime(),
+							},
+						]),
+					);
+					store.set(sentinelKey, sentinelValue);
+					malformedCleanupState = {
+						credentialKey,
+						handleKey,
+						indexKey,
+						sentinelKey,
+						sentinelValue,
+					};
+				}
+			} finally {
+				createHookRelease.resolve();
+			}
+			if (!publishes) {
+				const issued = await pendingCreate;
+				expect(issued.id).toBe(createdSessionId);
+				expectManagedPublicationFailure(publicationLogger);
+				expect(malformedCleanupState).not.toBeNull();
+				const cleanupState = malformedCleanupState!;
+				expect(store.has(cleanupState.credentialKey)).toBe(false);
+				expect(store.has(cleanupState.handleKey)).toBe(false);
+				expect(store.has(cleanupState.indexKey)).toBe(false);
+				expect(store.get(cleanupState.sentinelKey)).toBe(
+					cleanupState.sentinelValue,
+				);
+				expect(store).toEqual(
+					new Map([
+						[cleanupState.sentinelKey, cleanupState.sentinelValue],
+					]),
+				);
+				expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+				expect(
+					await runtime.context.adapter.count({ model: "sessionCredential" }),
+				).toBe(2);
+				return;
+			}
+			const issued = await pendingCreate;
+			expect(publicationLogger).not.toHaveBeenCalled();
+			const handleKey = [...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${issued.id}`),
+			)!;
+			const successorKey =
+				`clearance:${namespace}:session-credential:${successorDigest}`;
+			expect(JSON.parse(store.get(handleKey)!)).toEqual({
+				credentialKey: successorKey,
+			});
+			expect(store.has(successorKey)).toBe(true);
+		},
+	);
 
 	it.each(["policy", "delete"] as const)(
 		"cleans owned create publication state after a committed %s invalidation",
@@ -1244,6 +1928,7 @@ describe("managed session issuance", () => {
 					},
 				},
 			});
+			const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
 			const pendingCreate = issuePasswordSession(runtime);
 			await createHookEntered.promise;
@@ -1291,9 +1976,9 @@ describe("managed session issuance", () => {
 			} finally {
 				createHookRelease.resolve();
 			}
-			await expect(pendingCreate).rejects.toBeInstanceOf(
-				AfterTransactionHookError,
-			);
+			const issued = await pendingCreate;
+			expect(issued.id).toBe(createdSessionId);
+			expectManagedPublicationFailure(publicationLogger);
 			expect(store.has(expectedKey)).toBe(false);
 			expect(store.has(mappedKey)).toBe(false);
 			expect(store.has(handleKey)).toBe(false);
@@ -1307,6 +1992,14 @@ describe("managed session issuance", () => {
 					expiresAt: expect.any(Number),
 				},
 			]);
+			expect(
+				await runtime.context.adapter.count({ model: "session" }),
+			).toBe(invalidation === "policy" ? 1 : 0);
+			const committedCredentials = await credentialRows(runtime);
+			expect(committedCredentials).toHaveLength(1);
+			expect(committedCredentials[0]!.status).toBe(
+				invalidation === "policy" ? "active" : "revoked",
+			);
 		},
 	);
 
@@ -1350,6 +2043,7 @@ describe("managed session issuance", () => {
 				},
 			},
 		});
+		const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
 		const pendingCreate = issuePasswordSession(runtime);
 		await createHookEntered.promise;
@@ -1449,9 +2143,9 @@ describe("managed session issuance", () => {
 		} finally {
 			createHookRelease.resolve();
 		}
-		await expect(pendingCreate).rejects.toBeInstanceOf(
-			AfterTransactionHookError,
-		);
+		const issued = await pendingCreate;
+		expect(issued.id).toBe(createdSessionId);
+		expectManagedPublicationFailure(publicationLogger);
 		expect(store.has(expectedKey)).toBe(false);
 		expect(store.has(unexpectedKey)).toBe(false);
 		expect(store.get(malformedKey)).toBe("not-json");
@@ -1466,6 +2160,8 @@ describe("managed session issuance", () => {
 				expiresAt: expect.any(Number),
 			},
 		]);
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
+		expect(await credentialRows(runtime)).toHaveLength(3);
 	});
 
 	it("reports create publication failure after committing exact database authority", async () => {
@@ -1483,9 +2179,13 @@ describe("managed session issuance", () => {
 				},
 			},
 		});
+		const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
-		await expect(issuePasswordSession(runtime)).rejects.toBeInstanceOf(
-			AfterTransactionHookError,
+		const issued = await issuePasswordSession(runtime);
+		expect(issued.token).toMatch(/^clr_rt_/);
+		expectManagedPublicationFailure(
+			publicationLogger,
+			"Managed session cache publication failed after commit",
 		);
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
 		expect(
@@ -1583,10 +2283,6 @@ describe("managed stored session authority", () => {
 		expect(runtime.readForSubject.mock.calls[0]?.[0].transaction).toBe(
 			ownerTransaction,
 		);
-		await expect(
-			runtime.context.internalAdapter.findSession(session.token),
-		).resolves.toMatchObject({ session: { id: session.id } });
-		expect(runtime.readForSubject).toHaveBeenCalledTimes(2);
 	});
 
 	it("fails the same stored session after revision, policy, expiry, or authority corruption", async () => {
@@ -1723,6 +2419,59 @@ describe("managed stored session authority", () => {
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
 		expect(secondarySet).not.toHaveBeenCalled();
 		expect(secondaryDelete).not.toHaveBeenCalled();
+	});
+
+	it("rolls rotation back when policy changes after successor validation but before commit", async () => {
+		let rotationReads = 0;
+		let rotating = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					revision: rotating && ++rotationReads >= 3 ? "8" : "7",
+				}),
+		});
+		const session = await issuePasswordSession(runtime);
+		const before = structuredClone(await credentialRows(runtime));
+		rotating = true;
+
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				generateCredentialOperationKey(),
+			),
+		).resolves.toBeNull();
+		expect(rotationReads).toBeGreaterThanOrEqual(3);
+		expect(await credentialRows(runtime)).toEqual(before);
+		expect(await authorityRows(runtime.context)).toHaveLength(1);
+		expect((await authorityRows(runtime.context))[0]?.id).toBe(session.id);
+	});
+
+	it("withholds idempotent recovery when policy changes before commit", async () => {
+		let recoveryReads = 0;
+		let recovering = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					revision: recovering && ++recoveryReads >= 2 ? "8" : "7",
+				}),
+		});
+		const session = await issuePasswordSession(runtime);
+		const operationKey = generateCredentialOperationKey();
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.not.toBeNull();
+		recovering = true;
+
+		await expect(
+			runtime.context.internalAdapter.recoverSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toBeNull();
+		expect(recoveryReads).toBeGreaterThanOrEqual(2);
 	});
 
 	it("does not rotate after the matched credential expires during a delayed reader", async () => {
@@ -1969,7 +2718,7 @@ describe("managed stored session authority", () => {
 			reader: async (input) => {
 				if (gatePublication) {
 					rotationPolicyReads += 1;
-					if (rotationPolicyReads === 3) {
+					if (rotationPolicyReads === 4) {
 						publicationEntered.resolve();
 						await publicationRelease.promise;
 					}
@@ -2026,7 +2775,7 @@ describe("managed stored session authority", () => {
 		const runtime = await setupManagedRuntime({
 			reader: async (input) => {
 				if (invalidatePublication) rotationPolicyReads += 1;
-				if (invalidatePublication && rotationPolicyReads === 3) {
+				if (invalidatePublication && rotationPolicyReads === 4) {
 					const active = await input.transaction!.findOne<
 						Record<string, unknown>
 					>({
@@ -2043,7 +2792,7 @@ describe("managed stored session authority", () => {
 				}
 				return policyResult(input, {
 					revision:
-						invalidatePublication && rotationPolicyReads === 3 ? "8" : "7",
+						invalidatePublication && rotationPolicyReads === 4 ? "8" : "7",
 				});
 			},
 			options: {
@@ -2097,14 +2846,21 @@ describe("managed stored session authority", () => {
 			]),
 		);
 		invalidatePublication = true;
+		const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
-		await expect(
-			runtime.context.internalAdapter.rotateSessionCredential(
+		const rotated =
+			await runtime.context.internalAdapter.rotateSessionCredential(
 				session.token,
 				generateCredentialOperationKey(),
-			),
-		).rejects.toBeInstanceOf(AfterTransactionHookError);
-		expect(await credentialRows(runtime)).toHaveLength(2);
+			);
+		expect(rotated).toMatchObject({ rotationCounter: 1 });
+		expectManagedPublicationFailure(publicationLogger);
+		const committedCredentials = await credentialRows(runtime);
+		expect(committedCredentials).toHaveLength(2);
+		expect(committedCredentials.map((row) => row.status).sort()).toEqual([
+			"active",
+			"consumed",
+		]);
 		expect(store.has(oldCredentialKey)).toBe(false);
 		expect(store.has(handleKey)).toBe(false);
 		expect(store.has(indexKey)).toBe(false);
@@ -2127,7 +2883,7 @@ describe("managed stored session authority", () => {
 			reader: async (input) => {
 				if (interleaveNewerSuccessor) {
 					rotationPolicyReads += 1;
-					if (rotationPolicyReads === 3) {
+					if (rotationPolicyReads === 4) {
 						publicationEntered.resolve();
 						await newerCommitted.promise;
 						const active = await input.transaction!.findOne<
@@ -2146,7 +2902,9 @@ describe("managed stored session authority", () => {
 							update: {
 								status: "consumed",
 								consumedAt: now,
-								rotationNonceDigest: "newer-operation",
+								rotationNonceDigest: await digestSessionRotationNonce(
+									"newer-operation",
+								),
 								recoveryExpiresAt: new Date(
 									now.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
 								),
@@ -2154,6 +2912,7 @@ describe("managed stored session authority", () => {
 							},
 						});
 						const newerId = `newer-${String(active!.id)}`;
+						const newerDigest = `v1:${"D".repeat(43)}`;
 						await input.transaction!.create({
 							model: "sessionCredential",
 							forceAllowId: true,
@@ -2161,7 +2920,7 @@ describe("managed stored session authority", () => {
 								...active,
 								id: newerId,
 								selector: `selector-${newerId}`,
-								secretDigest: `digest-${newerId}`,
+								secretDigest: newerDigest,
 								status: "active",
 								rotationCounter: Number(active!.rotationCounter) + 1,
 								parentCredentialId: active!.id,
@@ -2175,6 +2934,23 @@ describe("managed stored session authority", () => {
 								updatedAt: now,
 							},
 						});
+						if (active!.parentCredentialId) {
+							await input.transaction!.update({
+								model: "sessionCredential",
+								where: [
+									{
+										field: "id",
+										value: String(active!.parentCredentialId),
+									},
+								],
+								update: {
+									rotationNonceDigest: null,
+									recoverySecretCiphertext: null,
+									recoveryExpiresAt: null,
+									updatedAt: now,
+								},
+							});
+						}
 						const storedSession = await input.transaction!.findOne<
 							Record<string, unknown>
 						>({
@@ -2189,7 +2965,7 @@ describe("managed stored session authority", () => {
 						});
 						newerCredentialKey =
 							`clearance:managed-rotation-newer-successor-test:` +
-							`session-credential:digest-${newerId}`;
+							`session-credential:${newerDigest}`;
 						capturedSuccessorCredentialKey =
 							`clearance:managed-rotation-newer-successor-test:` +
 							`session-credential:${String(active!.secretDigest)}`;
@@ -2294,17 +3070,17 @@ describe("managed stored session authority", () => {
 		expect(store.has(capturedSuccessorCredentialKey)).toBe(false);
 	});
 
-	it("cleans secondary authority and errors on broken newer lineage", async () => {
+	it("rolls back contradictory publication metadata and returns the committed rotation", async () => {
 		const store = new Map<string, string>();
 		let rotationPolicyReads = 0;
-		let breakPublicationLineage = false;
+		let breakPublicationLifecycle = false;
 		let sessionId = "";
 		let successorCredentialKey = "";
 		const runtime = await setupManagedRuntime({
 			reader: async (input) => {
-				if (breakPublicationLineage) {
+				if (breakPublicationLifecycle) {
 					rotationPolicyReads += 1;
-					if (rotationPolicyReads === 3) {
+					if (rotationPolicyReads === 4) {
 						const active = await input.transaction!.findOne<
 							Record<string, unknown>
 						>({
@@ -2321,11 +3097,11 @@ describe("managed stored session authority", () => {
 							successorCredentialKey,
 							JSON.stringify({ session: { id: sessionId }, stale: true }),
 						);
-						await input.transaction!.update({
-							model: "sessionCredential",
-							where: [{ field: "id", value: String(active!.id) }],
-							update: { parentCredentialId: null },
-						});
+					await input.transaction!.update({
+						model: "sessionCredential",
+						where: [{ field: "id", value: String(active!.id) }],
+						update: { consumedAt: new Date() },
+					});
 					}
 				}
 				return policyResult(input);
@@ -2355,23 +3131,27 @@ describe("managed stored session authority", () => {
 		const indexKey = [...store.keys()].find((key) =>
 			key.endsWith(`:active-sessions:${runtime.user.id}`),
 		)!;
-		breakPublicationLineage = true;
+		breakPublicationLifecycle = true;
+		const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
-		await expect(
-			runtime.context.internalAdapter.rotateSessionCredential(
+		const rotated =
+			await runtime.context.internalAdapter.rotateSessionCredential(
 				session.token,
 				generateCredentialOperationKey(),
-			),
-		).rejects.toBeInstanceOf(AfterTransactionHookError);
+			);
+		expect(rotated).toMatchObject({ rotationCounter: 1 });
+		expectManagedPublicationFailure(publicationLogger);
 		expect(store.has(oldCredentialKey)).toBe(false);
 		expect(store.has(successorCredentialKey)).toBe(false);
 		expect(store.has(handleKey)).toBe(false);
 		expect(store.has(indexKey)).toBe(false);
 		const rows = await credentialRows(runtime);
 		expect(rows).toHaveLength(2);
-		expect(rows.find((row) => row.status === "active")!.parentCredentialId).toBe(
+		const active = rows.find((row) => row.status === "active")!;
+		expect(active.parentCredentialId).toBe(
 			rows.find((row) => row.status === "consumed")!.id,
 		);
+		expect(active.consumedAt).toBeNull();
 	});
 
 	it("publishes rotation only after outer commit and repairs both recovery paths", async () => {
@@ -2574,13 +3354,18 @@ describe("managed stored session authority", () => {
 		secondarySet.mockClear();
 		secondaryDelete.mockClear();
 		failPublication = true;
+		const publicationLogger = spyOnManagedPublicationFailure(runtime);
 
-		await expect(
-			runtime.context.internalAdapter.rotateSessionCredential(
+		const rotated =
+			await runtime.context.internalAdapter.rotateSessionCredential(
 				session.token,
 				operationKey,
-			),
-		).rejects.toBeInstanceOf(AfterTransactionHookError);
+			);
+		expect(rotated).toMatchObject({ rotationCounter: 1 });
+		expectManagedPublicationFailure(
+			publicationLogger,
+			"Managed session cache publication failed after commit",
+		);
 		const committedRows = await credentialRows(runtime);
 		expect(committedRows).toHaveLength(2);
 		expect(committedRows.map((row) => row.status).sort()).toEqual([
@@ -2818,21 +3603,12 @@ describe("managed stored session authority", () => {
 			},
 		});
 		const session = await issuePasswordSession(runtime);
-		const originalCredential = (await credentialRows(runtime))[0]!;
-		await runtime.context.adapter.create({
-			model: "sessionCredential",
-			forceAllowId: true,
-			data: {
-				...originalCredential,
-				id: `${originalCredential.id}-consumed`,
-				selector: `${originalCredential.selector}-consumed`,
-				secretDigest: `${originalCredential.secretDigest}-consumed`,
-				status: "consumed",
-				rotationCounter: 1,
-				parentCredentialId: originalCredential.id,
-				consumedAt: new Date(),
-			},
-		});
+		const rotated = await runtime.context.internalAdapter.rotateSessionCredential(
+			session.token,
+			generateCredentialOperationKey(),
+		);
+		expect(rotated).not.toBeNull();
+		const currentToken = rotated!.refreshToken;
 		const before = (await authorityRows(runtime.context))[0]!;
 		const newExpiry = new Date(session.expiresAt.getTime() + 60_000);
 		const directForgery = Object.fromEntries(
@@ -2840,7 +3616,7 @@ describe("managed stored session authority", () => {
 		);
 
 		await expect(
-			runtime.context.internalAdapter.updateSession(session.token, {
+			runtime.context.internalAdapter.updateSession(currentToken, {
 				...directForgery,
 				id: "direct-id",
 				token: "direct-token",
@@ -2849,7 +3625,7 @@ describe("managed stored session authority", () => {
 				passkeySessionGeneration: "direct-passkey",
 				expiresAt: newExpiry,
 			} as never),
-		).resolves.toMatchObject({ id: session.id, token: session.token });
+		).resolves.toMatchObject({ id: session.id, token: currentToken });
 
 		const after = (await authorityRows(runtime.context))[0]!;
 		for (const field of [
@@ -2874,7 +3650,7 @@ describe("managed stored session authority", () => {
 		const stableSession = structuredClone(await authorityRows(runtime.context));
 		const stableCredentials = structuredClone(await credentialRows(runtime));
 		await expect(
-			runtime.context.internalAdapter.updateSession(session.token, {
+			runtime.context.internalAdapter.updateSession(currentToken, {
 				expiresAt: new Date(Number.NaN),
 			}),
 		).resolves.toBeNull();
@@ -3122,13 +3898,19 @@ describe("managed stored session authority", () => {
 		};
 
 		const sessionDeadline = await issuePasswordSession(runtime);
+		const sessionDeadlineAt = new Date(Date.now() + 1_000);
 		await runtime.context.adapter.update({
 			model: "session",
 			where: [{ field: "id", value: sessionDeadline.id }],
 			update: {
-				expiresAt: new Date(Date.now() + 1_000),
-				authenticationAssuranceExpiresAt: new Date(Date.now() + 1_000),
+				expiresAt: sessionDeadlineAt,
+				authenticationAssuranceExpiresAt: sessionDeadlineAt,
 			},
+		});
+		await runtime.context.adapter.updateMany({
+			model: "sessionCredential",
+			where: [{ field: "sessionId", value: sessionDeadline.id }],
+			update: { expiresAt: sessionDeadlineAt },
 		});
 		let stableSession = structuredClone(await authorityRows(runtime.context));
 		let stableCredentials = structuredClone(await credentialRows(runtime));
@@ -3137,10 +3919,16 @@ describe("managed stored session authority", () => {
 		expect(await credentialRows(runtime)).toEqual(stableCredentials);
 
 		const credentialDeadline = await issuePasswordSession(runtime);
+		const credentialDeadlineAt = new Date(Date.now() + 1_000);
+		await runtime.context.adapter.update({
+			model: "session",
+			where: [{ field: "id", value: credentialDeadline.id }],
+			update: { expiresAt: credentialDeadlineAt },
+		});
 		await runtime.context.adapter.updateMany({
 			model: "sessionCredential",
 			where: [{ field: "sessionId", value: credentialDeadline.id }],
-			update: { expiresAt: new Date(Date.now() + 1_000) },
+			update: { expiresAt: credentialDeadlineAt },
 		});
 		stableSession = structuredClone(await authorityRows(runtime.context));
 		stableCredentials = structuredClone(await credentialRows(runtime));
@@ -3180,6 +3968,140 @@ describe("managed stored session authority", () => {
 		).resolves.toBeNull();
 		expect(await authorityRows(runtime.context)).toEqual(beforeSession);
 		expect(await credentialRows(runtime)).toEqual(beforeCredentials);
+	});
+
+	it.each(["update", "rotate"] as const)(
+		"rejects a disconnected managed lineage before %s mutation without secondary storage",
+		async (operation) => {
+			const runtime = await setupManagedRuntime();
+			const session = await issuePasswordSession(runtime);
+			const credential = (await credentialRows(runtime))[0]!;
+			await runtime.context.adapter.create({
+				model: "sessionCredential",
+				forceAllowId: true,
+				data: {
+					...credential,
+					id: `${credential.id}-disconnected`,
+					selector: "D".repeat(32),
+					secretDigest: await digestSessionRefreshSecret(
+						`disconnected-${operation}`,
+					),
+					status: "consumed",
+					familyId: `${credential.familyId}-disconnected`,
+					parentCredentialId: null,
+					rotationCounter: 0,
+					consumedAt: new Date(),
+				},
+			});
+			const stableSessions = structuredClone(
+				await authorityRows(runtime.context),
+			);
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+
+			await expect(
+				runtime.context.internalAdapter.findSession(session.token),
+			).resolves.toBeNull();
+			const result =
+				operation === "update"
+					? runtime.context.internalAdapter.updateSession(session.token, {
+							ipAddress: "192.0.2.200",
+						})
+					: runtime.context.internalAdapter.rotateSessionCredential(
+							session.token,
+							generateCredentialOperationKey(),
+						);
+			await expect(result).resolves.toBeNull();
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		},
+	);
+
+	it.each(["update", "rotate"] as const)(
+		"rejects contradictory active lifecycle metadata before %s mutation",
+		async (operation) => {
+			const runtime = await setupManagedRuntime();
+			const session = await issuePasswordSession(runtime);
+			await runtime.context.adapter.updateMany({
+				model: "sessionCredential",
+				where: [{ field: "sessionId", value: session.id }],
+				update: { consumedAt: new Date() },
+			});
+			const stableSessions = structuredClone(
+				await authorityRows(runtime.context),
+			);
+			const stableCredentials = structuredClone(await credentialRows(runtime));
+
+			await expect(
+				runtime.context.internalAdapter.findSession(session.token),
+			).resolves.toBeNull();
+			const result =
+				operation === "update"
+					? runtime.context.internalAdapter.updateSession(session.token, {
+							ipAddress: "192.0.2.201",
+						})
+					: runtime.context.internalAdapter.rotateSessionCredential(
+							session.token,
+							generateCredentialOperationKey(),
+						);
+			await expect(result).resolves.toBeNull();
+			expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+			expect(await credentialRows(runtime)).toEqual(stableCredentials);
+		},
+	);
+
+	it("rejects contradictory consumed lifecycle metadata in both DB-only recovery paths", async () => {
+		const runtime = await setupManagedRuntime();
+		const session = await issuePasswordSession(runtime);
+		const operationKey = generateCredentialOperationKey();
+		const rotated = await runtime.context.internalAdapter.rotateSessionCredential(
+			session.token,
+			operationKey,
+		);
+		expect(rotated).not.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.findSession(rotated!.refreshToken),
+		).resolves.toMatchObject({ session: { id: session.id } });
+		await expect(
+			runtime.context.internalAdapter.recoverSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toMatchObject({ refreshToken: rotated!.refreshToken });
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toMatchObject({ refreshToken: rotated!.refreshToken });
+
+		const parent = (await credentialRows(runtime)).find(
+			(credential) => credential.status === "consumed",
+		)!;
+		await runtime.context.adapter.update({
+			model: "sessionCredential",
+			where: [{ field: "id", value: String(parent.id) }],
+			update: { recoverySecretCiphertext: "contradictory-ciphertext" },
+		});
+		const stableSessions = structuredClone(await authorityRows(runtime.context));
+		const stableCredentials = structuredClone(await credentialRows(runtime));
+
+		await expect(
+			runtime.context.internalAdapter.findSession(rotated!.refreshToken),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.recoverSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toBeNull();
+		await expect(
+			runtime.context.internalAdapter.rotateSessionCredential(
+				session.token,
+				operationKey,
+			),
+		).resolves.toBeNull();
+		expect(await authorityRows(runtime.context)).toEqual(stableSessions);
+		expect(await credentialRows(runtime)).toEqual(stableCredentials);
 	});
 
 	it("publishes the final DB snapshot only after outer commit and never on rollback", async () => {
@@ -3732,6 +4654,7 @@ describe("managed stored session authority", () => {
 		expect(secondarySet).not.toHaveBeenCalled();
 		expect(secondaryDelete).not.toHaveBeenCalled();
 	});
+
 });
 
 describe("managed single-session authoritative revocation", () => {

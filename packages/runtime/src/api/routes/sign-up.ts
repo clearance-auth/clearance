@@ -8,6 +8,7 @@ import * as z from "zod";
 import { setSessionCookie } from "../../cookies";
 import { parseUserInput } from "../../db";
 import { buildSyntheticUserOutput, parseUserOutput } from "../../db/schema";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import type { AdditionalUserFieldsInput, User } from "../../types";
 import { isAPIError } from "../../utils/is-api-error";
 import { safeCloneRequest } from "../../utils/request";
@@ -408,6 +409,15 @@ export const signUpEmail = <O extends ClearanceOptions>() =>
 				const session = await ctx.context.internalAdapter.createSession(
 					createdUser.id,
 					rememberMe === false,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: createdUser.id,
+						evidence: [
+							{ kind: "primary", primaryMethod: "password_enrollment" },
+						],
+					}),
 				);
 				if (!session) {
 					throw APIError.from(

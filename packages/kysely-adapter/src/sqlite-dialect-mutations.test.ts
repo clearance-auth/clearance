@@ -4,6 +4,7 @@ import type { Generated } from "kysely";
 import { Kysely } from "kysely";
 import { describe, expect, it } from "vitest";
 import { BunSqliteDialect } from "./bun-sqlite-dialect";
+import { kyselyAdapter } from "./kysely-adapter";
 import { NodeSqliteDialect } from "./node-sqlite-dialect";
 
 interface UsersTable {
@@ -162,6 +163,117 @@ describe("BunSqliteDialect mutation metadata", () => {
 			.returningAll()
 			.executeTakeFirst();
 		expect(inserted?.name).toBe("bob");
+
+		await db.destroy();
+	});
+});
+
+describe("Kysely SQLite createIfAbsent", () => {
+	it("returns exactly one winner, preserves it, and rolls back with its caller", async () => {
+		const sqlite = new DatabaseSync(":memory:");
+		sqlite.exec(
+			"CREATE TABLE claim (id TEXT PRIMARY KEY, claim_key TEXT NOT NULL UNIQUE, attempt_id TEXT NOT NULL, value TEXT NOT NULL)",
+		);
+		const db = new Kysely({
+			dialect: new NodeSqliteDialect({ database: sqlite }),
+		});
+		const adapter = kyselyAdapter(db, {
+			type: "sqlite",
+			transaction: true,
+		})({
+			plugins: [
+				{
+					id: "claim-test",
+					schema: {
+						claim: {
+							fields: {
+								key: {
+									type: "string",
+									required: true,
+									unique: true,
+									fieldName: "claim_key",
+								},
+								attempt: {
+									type: "string",
+									required: true,
+									fieldName: "attempt_id",
+								},
+								value: { type: "string", required: true },
+							},
+						},
+					},
+				},
+			],
+		} as any);
+
+		const contenders = Array.from({ length: 12 }, (_, index) => ({
+			id: `id-${index}`,
+			key: "shared",
+			attempt: `attempt-${index}`,
+			value: `value-${index}`,
+		}));
+		const results = await Promise.all(
+			contenders.map((data) =>
+				adapter.createIfAbsent<typeof data>({
+					model: "claim",
+					data,
+					uniqueBy: { field: "key", value: data.key },
+					attemptBy: { field: "attempt", value: data.attempt },
+					forceAllowId: true,
+				}),
+			),
+		);
+		const winners = results.filter((row) => row !== null);
+		expect(winners).toHaveLength(1);
+		const stored = await adapter.findOne<typeof contenders[number]>({
+			model: "claim",
+			where: [{ field: "key", value: "shared" }],
+		});
+		expect(stored).toEqual(winners[0]);
+
+		const loser = await adapter.createIfAbsent({
+			model: "claim",
+			data: {
+				id: "late-id",
+				key: "shared",
+				attempt: "late-attempt",
+				value: "late-value",
+			},
+			uniqueBy: { field: "key", value: "shared" },
+			attemptBy: { field: "attempt", value: "late-attempt" },
+			forceAllowId: true,
+		});
+		expect(loser).toBeNull();
+		expect(
+			await adapter.findOne({
+				model: "claim",
+				where: [{ field: "key", value: "shared" }],
+			}),
+		).toEqual(stored);
+
+		await expect(
+			adapter.transaction(async (trx) => {
+				await trx.createIfAbsent({
+					model: "claim",
+					data: {
+						id: "rollback-id",
+						key: "rollback",
+						attempt: "rollback-attempt",
+						value: "rollback-value",
+					},
+					uniqueBy: { field: "key", value: "rollback" },
+					attemptBy: { field: "attempt", value: "rollback-attempt" },
+					forceAllowId: true,
+				});
+				throw new Error("rollback");
+			}),
+		).rejects.toThrow("rollback");
+		expect(
+			await adapter.findOne({
+				model: "claim",
+				where: [{ field: "key", value: "rollback" }],
+			}),
+		).toBeNull();
 
 		await db.destroy();
 	});

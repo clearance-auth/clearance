@@ -17,6 +17,9 @@ import {
 } from "../../../crypto";
 import { generateRandomString } from "../../../crypto/random";
 import { parseUserOutput } from "../../../db/schema";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../../internal/session-issuance-context";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import {
@@ -804,6 +807,15 @@ export const backupCode2fa = (
 					const rotated = await runWithTransaction(
 						ctx.context.adapter,
 						async () => {
+							const replacementIssuanceContext =
+								await captureInternalSessionIssuanceContext(
+									ctx.context.internalAdapter,
+									{
+										purpose: "replacement",
+										sourceSessionToken:
+											ctx.context.session.session.token,
+									},
+								);
 							const adapter = await getCurrentAdapter(ctx.context.adapter);
 							const generated = await generateBackupCodes(
 								ctx.context.secretConfig,
@@ -859,6 +871,8 @@ export const backupCode2fa = (
 									user.id,
 									false,
 									preserveSessionLifetime(ctx.context.session.session),
+									false,
+									replacementIssuanceContext,
 								);
 							return { generated, replacementSession, updatedUser };
 						},

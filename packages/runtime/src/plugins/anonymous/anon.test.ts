@@ -1,3 +1,9 @@
+import { DatabaseSync } from "node:sqlite";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import type { GoogleProfile } from "@clearance/core/social-providers";
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
@@ -11,7 +17,11 @@ import {
 	vi,
 } from "vitest";
 import * as apiModule from "../../api";
+import { clearance } from "../../auth/full";
 import { signJWT } from "../../crypto";
+import { getMigrations } from "../../db/get-migration";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { anonymous } from ".";
@@ -97,6 +107,162 @@ describe("anonymous", async () => {
 			},
 		);
 	const headers = new Headers();
+
+	it("passes anonymous evidence bound to the server-created user", async () => {
+		const { auth, client } = await getTestInstance(
+			{ plugins: [anonymous()] },
+			{
+				disableTestUser: true,
+				clientOptions: { plugins: [anonymousClient()] },
+			},
+		);
+		const context = await auth.$context;
+		const originalCreateSession = context.internalAdapter.createSession.bind(
+			context.internalAdapter,
+		);
+		const createSession = vi
+			.spyOn(context.internalAdapter, "createSession")
+			.mockImplementation((...args) => originalCreateSession(...args));
+
+		try {
+			const response = await client.signIn.anonymous();
+			expect(response.error).toBeNull();
+			expect(response.data?.user).toBeDefined();
+			const authoritativeUserId = response.data!.user.id;
+			expect(createSession).toHaveBeenCalledOnce();
+			const [subjectId, , , , issuanceContext] = createSession.mock.calls[0]!;
+			expect(subjectId).toBe(authoritativeUserId);
+			expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: authoritativeUserId,
+				evidence: [{ kind: "primary", primaryMethod: "anonymous" }],
+				targetOrganizationId: null,
+			});
+		} finally {
+			createSession.mockRestore();
+		}
+	});
+
+	it("reaches anonymous_not_allowed under managed policy", async () => {
+		const database = new DatabaseSync(":memory:");
+		const identity = {
+			projectId: "anonymous-policy-project",
+			environmentId: "anonymous-policy-environment",
+		} satisfies RuntimeAuthenticationPolicyIdentity;
+		const policy = {
+			passwordLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			factorLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			minimumAssurance: "single_factor",
+			allowedFactors: { totp: true, passkey: true },
+			trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+			assuranceMaxAgeSeconds: 300,
+		} satisfies RuntimeAuthenticationPolicy;
+		const options = {
+			baseURL: "http://localhost:3000",
+			secret: "managed-anonymous-issuance-test-secret",
+			database,
+			plugins: [anonymous()],
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(options, {
+			identity,
+			reader: {
+				async readForSubject(input) {
+					return {
+						scope: identity,
+						subjectId: input.subjectId,
+						revision: "1",
+						environment: policy,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective: policy,
+					};
+				},
+			},
+		});
+
+		try {
+			await (await getMigrations(options)).runMigrations();
+			const auth = clearance(options);
+			const context = await auth.$context;
+			await expect(auth.api.signInAnonymous()).rejects.toMatchObject({
+				reason: "policy_unsatisfied",
+				requirement: { reason: "anonymous_not_allowed" },
+			});
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+		} finally {
+			database.close();
+		}
+	});
+
+	it("preflights managed transaction support before creating an anonymous user", async () => {
+		const database = new DatabaseSync(":memory:");
+		const identity = {
+			projectId: "anonymous-no-transaction-project",
+			environmentId: "anonymous-no-transaction-environment",
+		} satisfies RuntimeAuthenticationPolicyIdentity;
+		const policy = {
+			passwordLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			factorLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			minimumAssurance: "single_factor",
+			allowedFactors: { totp: true, passkey: true },
+			trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+			assuranceMaxAgeSeconds: 300,
+		} satisfies RuntimeAuthenticationPolicy;
+		const options = {
+			baseURL: "http://localhost:3000",
+			secret: "managed-anonymous-no-transaction-test-secret",
+			database,
+			plugins: [anonymous()],
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(options, {
+			identity,
+			reader: {
+				async readForSubject(input) {
+					return {
+						scope: identity,
+						subjectId: input.subjectId,
+						revision: "1",
+						environment: policy,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective: policy,
+					};
+				},
+			},
+		});
+
+		try {
+			await (await getMigrations(options)).runMigrations();
+			const auth = clearance(options);
+			const context = await auth.$context;
+			context.adapter.options!.adapterConfig.transaction = false;
+
+			await expect(auth.api.signInAnonymous()).rejects.toThrow(
+				"Managed anonymous sign-in requires rollback-capable database transactions",
+			);
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+		} finally {
+			database.close();
+		}
+	});
 
 	it("should sign in anonymously", async () => {
 		await client.signIn.anonymous({

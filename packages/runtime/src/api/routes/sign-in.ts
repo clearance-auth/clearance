@@ -8,6 +8,7 @@ import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
 import { setSessionCookie } from "../../cookies";
 import { parseUserOutput } from "../../db/schema";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { missingEmailLogMessage } from "../../oauth2/errors";
 import { handleOAuthUserInfo } from "../../oauth2/link-account";
 import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
@@ -574,6 +575,13 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 			const session = await ctx.context.internalAdapter.createSession(
 				user.user.id,
 				ctx.body.rememberMe === false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: user.user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
 			);
 
 			if (!session) {

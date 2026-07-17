@@ -8,6 +8,9 @@ import { expireCookie, setSessionCookie } from "../../../cookies";
 import { symmetricDecrypt } from "../../../crypto";
 import { generateRandomString } from "../../../crypto/random";
 import { parseUserOutput } from "../../../db/schema";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../../internal/session-issuance-context";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import type { BackupCodeOptions } from "../backup-codes";
@@ -343,6 +346,14 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 				const replaced = await runWithTransaction(
 					ctx.context.adapter,
 					async () => {
+						const replacementIssuanceContext =
+							await captureInternalSessionIssuanceContext(
+								ctx.context.internalAdapter,
+								{
+									purpose: "replacement",
+									sourceSessionToken: activeSession.token,
+								},
+							);
 						const adapter = await getCurrentAdapter(ctx.context.adapter);
 						const replaced = await adapter.incrementOne<TwoFactorTable>({
 							model: twoFactorTable,
@@ -405,6 +416,8 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 								user.id,
 								false,
 								preserveSessionLifetime(activeSession),
+								false,
+								replacementIssuanceContext,
 							);
 						return { replacementSession, updatedUser };
 					},
@@ -454,6 +467,14 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 				const activated = await runWithTransaction(
 					ctx.context.adapter,
 					async () => {
+						const replacementIssuanceContext =
+							await captureInternalSessionIssuanceContext(
+								ctx.context.internalAdapter,
+								{
+									purpose: "replacement",
+									sourceSessionToken: activeSession.token,
+								},
+							);
 						const adapter = await getCurrentAdapter(ctx.context.adapter);
 						const factor = await adapter.incrementOne<TwoFactorTable>({
 							model: twoFactorTable,
@@ -495,6 +516,8 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 							user.id,
 							false,
 							preserveSessionLifetime(activeSession),
+							false,
+							replacementIssuanceContext,
 						);
 						return { newSession, updatedUser };
 					},

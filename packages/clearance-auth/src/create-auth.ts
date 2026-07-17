@@ -26,6 +26,8 @@ import {
 } from "../../runtime/src/plugins/index.js";
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
+import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
+import { attachSSOInternalVerificationChallengeAuthority } from "../../sso/src/internal/verification-challenge-authority.js";
 import { sso } from "@clearance/sso";
 import { scim } from "@clearance/scim";
 import { Kysely, PostgresDialect } from "kysely";
@@ -653,19 +655,24 @@ export function createClearanceAuth<
 			: []),
 		...(options.enableSso !== false
 			? [
-					sso({
-						saml: {
-							enableInResponseToValidation: true,
-							allowIdpInitiated: false,
-							requireTimestamps: true,
-						},
-						storeOIDCClientSecret: {
-							encrypt: (secret) =>
-								encryptRuntimeCredential(secret, options.secret),
-							decrypt: (ciphertext) =>
-								decryptRuntimeCredential(ciphertext, options.secret),
-						},
-					}),
+					sso(
+						attachSSOInternalVerificationChallengeAuthority(
+							{
+								saml: {
+									enableInResponseToValidation: true,
+									allowIdpInitiated: false,
+									requireTimestamps: true,
+								},
+								storeOIDCClientSecret: {
+									encrypt: (secret: string) =>
+										encryptRuntimeCredential(secret, options.secret),
+									decrypt: (ciphertext: string) =>
+										decryptRuntimeCredential(ciphertext, options.secret),
+								},
+							},
+							createInternalVerificationChallengeAuthority(),
+						),
+					),
 				]
 			: []),
 		...(options.enableScim !== false
@@ -1539,12 +1546,28 @@ export function createClearanceAuth<
 			credentialAuthority.beginDrain(input),
 		assertRuntimeServing: () => assertProductRuntimeServing(),
 	});
+	const passwordSetupFacade = Object.freeze({
+		async create(input: { userId: string; token: string; expiresAt: Date }) {
+			const identifier = `reset-password:${input.token}`;
+			const authContext = await auth.$context;
+			await createInternalVerificationChallengeAuthority().create(
+				authContext.internalAdapter,
+				{ purpose: "password-reset", subject: identifier },
+				{
+					identifier,
+					value: input.userId,
+					expiresAt: input.expiresAt,
+				},
+			);
+		},
+	});
 
 	return {
 		auth: auth as unknown as ClearanceProductAuthRuntime<Security, Passkeys>,
 		pool,
 		db,
 		credentialAuthority: credentialAuthorityFacade,
+		passwordSetup: passwordSetupFacade,
 		plugins: {
 			organization: true,
 			sso: options.enableSso !== false,

@@ -552,6 +552,14 @@ export type ClearanceAuthBundle<Security extends ClearanceAuthenticationSecurity
         }): Promise<unknown>;
         assertRuntimeServing(): Promise<void>;
     };
+    passwordSetup: {
+        /** Issue the stock single-use password-reset ceremony for an operator-created user. */
+        create(input: {
+            userId: string;
+            token: string;
+            expiresAt: Date;
+        }): Promise<void>;
+    };
     prepareCredentialAuthorityRuntime(): Promise<void>;
     planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
     migrate(input?: {

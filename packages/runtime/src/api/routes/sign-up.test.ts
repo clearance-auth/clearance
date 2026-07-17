@@ -1,5 +1,6 @@
 import { BASE_ERROR_CODES } from "@clearance/core/error";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { admin } from "../../plugins/admin/admin";
 import { getTestInstance } from "../../test-utils/test-instance";
 
@@ -43,6 +44,41 @@ it("hashes the password before opening the durable signup transaction", async ()
 
 	expect(order.indexOf("hash")).toBeLessThan(order.indexOf("transaction"));
 	expect(order).toContain("enqueue");
+});
+
+it("binds password enrollment evidence to the newly persisted user", async () => {
+	const { auth } = await getTestInstance(undefined, { disableTestUser: true });
+	const context = await auth.$context;
+	const originalCreateSession = context.internalAdapter.createSession.bind(
+		context.internalAdapter,
+	);
+	const createSession = vi
+		.spyOn(context.internalAdapter, "createSession")
+		.mockImplementation((...args) => originalCreateSession(...args));
+
+	try {
+		const result = await auth.api.signUpEmail({
+			body: {
+				email: "issuance-enrollment@example.test",
+				password: "password123",
+				name: "Enrollment Evidence",
+			},
+		});
+		expect(createSession).toHaveBeenCalledOnce();
+		const [subjectId, , , , issuanceContext] = createSession.mock.calls[0]!;
+		expect(subjectId).toBe(result.user.id);
+
+		expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+			purpose: "interactive",
+			subjectId: result.user.id,
+			evidence: [
+				{ kind: "primary", primaryMethod: "password_enrollment" },
+			],
+			targetOrganizationId: null,
+		});
+	} finally {
+		createSession.mockRestore();
+	}
 });
 
 describe("sign-up with custom fields", async () => {

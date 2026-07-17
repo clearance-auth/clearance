@@ -1,7 +1,20 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { base64Url } from "@clearance/utils/base64";
 import { createHash } from "@clearance/utils/hash";
+import { runManagedAuthenticationTransaction } from "../../internal/managed-authentication-transaction";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import type { Session } from "../../types";
+
+export const TWO_FACTOR_CHALLENGE_PURPOSE = {
+	signIn: "two-factor.sign-in",
+	attemptBudget: "two-factor.attempt-budget",
+	otp: "two-factor.otp",
+	trustDevice: "two-factor.trust-device",
+	trustGeneration: "two-factor.trust-generation",
+} as const;
 
 export const defaultKeyHasher = async (token: string) => {
 	const hash = await createHash("SHA-256").digest(
@@ -24,11 +37,19 @@ export async function recordTrustGeneration(
 	generation: string,
 	expiresAt: Date,
 ): Promise<void> {
-	await ctx.context.internalAdapter.createVerificationValue({
-		identifier: trustGenerationMarkerIdentifier(userId, generation),
-		value: `${userId}!${generation}`,
-		expiresAt,
-	});
+	const identifier = trustGenerationMarkerIdentifier(userId, generation);
+	await createInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		{
+			purpose: TWO_FACTOR_CHALLENGE_PURPOSE.trustGeneration,
+			subject: userId,
+		},
+		{
+			identifier,
+			value: `${userId}!${generation}`,
+			expiresAt,
+		},
+	);
 }
 
 export async function revokeTrustGeneration(
@@ -37,11 +58,14 @@ export async function revokeTrustGeneration(
 	generation: string | null | undefined,
 ): Promise<void> {
 	if (!generation) return;
-	await ctx.context.internalAdapter
-		.consumeVerificationValue(
-			trustGenerationMarkerIdentifier(userId, generation),
-		)
-		.catch(() => null);
+	const identifier = trustGenerationMarkerIdentifier(userId, generation);
+	await runManagedAuthenticationTransaction(ctx, () =>
+		consumeInternalVerificationChallenge(ctx.context.internalAdapter, {
+			purpose: TWO_FACTOR_CHALLENGE_PURPOSE.trustGeneration,
+			subject: userId,
+			identifier,
+		}),
+	);
 }
 
 export function preserveSessionLifetime(

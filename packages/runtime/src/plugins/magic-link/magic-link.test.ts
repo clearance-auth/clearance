@@ -1,5 +1,15 @@
+import { DatabaseSync } from "node:sqlite";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearance } from "../../auth/full";
 import { createAuthClient } from "../../client";
+import { getMigrations } from "../../db/get-migration";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { magicLink } from ".";
 import { magicLinkClient } from "./client";
@@ -11,6 +21,103 @@ type VerificationEmail = {
 	url: string;
 	metadata?: Record<string, any>;
 };
+
+async function managedMagicLinkTestRuntime(
+	minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+) {
+	const database = new DatabaseSync(":memory:");
+	let sent: VerificationEmail = { email: "", token: "", url: "" };
+	const identity = {
+		projectId: "magic-link-policy-project",
+		environmentId: "magic-link-policy-environment",
+	} satisfies RuntimeAuthenticationPolicyIdentity;
+	const policy = {
+		passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		minimumAssurance,
+		allowedFactors: { totp: true, passkey: true },
+		trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+		assuranceMaxAgeSeconds: 300,
+	} satisfies RuntimeAuthenticationPolicy;
+	const options = {
+		baseURL: "http://localhost:3000",
+		secret: "managed-magic-link-test-secret",
+		database,
+		plugins: [
+			magicLink({
+				async sendMagicLink(data) {
+					sent = data;
+				},
+			}),
+		],
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity,
+		reader: {
+			async readForSubject(input) {
+				return {
+					scope: identity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: policy,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective: policy,
+				};
+			},
+		},
+	});
+	await (await getMigrations(options)).runMigrations();
+	return { auth: clearance(options), database, readSent: () => sent };
+}
+
+describe("magic-link managed authentication transactions", () => {
+	it("rolls back token adoption and identity creation when policy rejects", async () => {
+		const runtime = await managedMagicLinkTestRuntime("multi_factor");
+		const email = "managed-magic-link-reject@example.test";
+		try {
+			await runtime.auth.api.signInMagicLink({
+				body: { email },
+				headers: new Headers(),
+			});
+			await expect(
+				runtime.auth.api.magicLinkVerify({
+					query: { token: runtime.readSent().token },
+					headers: new Headers(),
+				}),
+			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "account" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			await expect(
+				context.internalAdapter.findVerificationValue(runtime.readSent().token),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("issues a managed session when single-factor policy allows email links", async () => {
+		const runtime = await managedMagicLinkTestRuntime("single_factor");
+		try {
+			await runtime.auth.api.signInMagicLink({
+				body: { email: "managed-magic-link-allow@example.test" },
+				headers: new Headers(),
+			});
+			const response = await runtime.auth.api.magicLinkVerify({
+				query: { token: runtime.readSent().token },
+				headers: new Headers(),
+			});
+			expect(response.token).toEqual(expect.any(String));
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(1);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+});
 
 describe("magic link", async () => {
 	let verificationEmail: VerificationEmail = {
@@ -82,6 +189,63 @@ describe("magic link", async () => {
 		expect(response.data?.token).toBeDefined();
 		const clearanceCookie = headers.get("set-cookie");
 		expect(clearanceCookie).toBeDefined();
+	});
+
+	it("passes consumed email-link evidence to the real session boundary", async () => {
+		let sent: VerificationEmail = { email: "", token: "", url: "" };
+		const { auth, customFetchImpl, testUser } = await getTestInstance({
+			plugins: [
+				magicLink({
+					async sendMagicLink(data) {
+						sent = data;
+					},
+				}),
+			],
+		});
+		const adapter = (await auth.$context).internalAdapter;
+		const authoritativeUser = await adapter.findUserByEmail(testUser.email);
+		expect(authoritativeUser).not.toBeNull();
+		const consumeVerificationValue = vi.spyOn(
+			adapter,
+			"consumeVerificationValue",
+		);
+		const createSession = vi.spyOn(adapter, "createSession");
+		const isolatedClient = createAuthClient({
+			plugins: [magicLinkClient()],
+			fetchOptions: { customFetchImpl },
+			baseURL: "http://localhost:3000",
+			basePath: "/api/auth",
+		});
+
+		await isolatedClient.magicLink.verify({ query: { token: "invalid-token" } });
+		expect(createSession).not.toHaveBeenCalled();
+
+		await isolatedClient.signIn.magicLink({ email: testUser.email });
+		const response = await isolatedClient.magicLink.verify({
+			query: { token: sent.token },
+		});
+		expect(response.data?.token).toBeDefined();
+		expect(consumeVerificationValue).toHaveBeenCalledWith(sent.token, {
+			purpose: "magic-link:sign-in",
+			subject: sent.token,
+			identifier: sent.token,
+		});
+		expect(await adapter.findVerificationValue(sent.token)).toBeNull();
+		expect(createSession).toHaveBeenCalledTimes(1);
+		const [subjectId, dontRememberMe, override, overrideAll, issuanceContext] =
+			createSession.mock.calls[0]!;
+		expect([subjectId, dontRememberMe, override, overrideAll]).toEqual([
+			authoritativeUser!.user.id,
+			false,
+			undefined,
+			false,
+		]);
+		expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+			purpose: "interactive",
+			subjectId: authoritativeUser!.user.id,
+			evidence: [{ kind: "primary", primaryMethod: "email_link" }],
+			targetOrganizationId: null,
+		});
 	});
 
 	it("shouldn't verify magic link with the same token", async () => {

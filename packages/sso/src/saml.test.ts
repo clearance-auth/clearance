@@ -1411,6 +1411,7 @@ describe("SAML SSO", async () => {
 					user: [],
 					session: [],
 					verification: [],
+					securityMigration: [],
 					account: [],
 					ssoProvider: [],
 				}),

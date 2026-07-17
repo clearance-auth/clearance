@@ -3,6 +3,7 @@ import { APIError } from "@clearance/core/error";
 import { isBrowserFetchRequest } from "@clearance/core/utils/fetch-metadata";
 import { getSessionFromCtx } from "../../api";
 import { generateRandomString } from "../../crypto";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { InvalidClient, InvalidRequest } from "./error";
 import { getClient } from "./index";
 import type { AuthorizationQuery, OIDCOptions } from "./types";
@@ -322,7 +323,10 @@ export async function authorize(
 		/**
 		 * Save the code in the database
 		 */
-		await ctx.context.internalAdapter.createVerificationValue({
+		await createInternalVerificationChallenge(
+			ctx.context.internalAdapter,
+			{ purpose: "oidc-authorization-code", subject: client.clientId },
+			{
 			value: JSON.stringify({
 				clientId: client.clientId,
 				redirectURI: query.redirect_uri,
@@ -346,7 +350,8 @@ export async function authorize(
 			}),
 			identifier: code,
 			expiresAt,
-		});
+			},
+		);
 	} catch {
 		return handleRedirect(
 			formatErrorURL(

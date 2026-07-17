@@ -10,6 +10,9 @@ import * as z from "zod";
 import { setSessionCookie } from "../../cookies";
 import { signJWT } from "../../crypto/jwt";
 import { parseUserOutput } from "../../db/schema";
+import { lockAndReadUser } from "../../db/user-authority";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import type { User } from "../../types";
 import { safeCloneRequest } from "../../utils/request";
 import { originCheck } from "../middlewares";
@@ -375,12 +378,58 @@ export const verifyEmail = createAuthEndpoint(
 			email: z.email(),
 			updateTo: z.string().optional(),
 			requestType: z.string().optional(),
+			jti: z.string().regex(/^[A-Za-z0-9_-]{16,256}$/),
+			exp: z.number().int().positive(),
 		});
-		const parsed = schema.parse(jwt.payload);
+		const parsedPayload = schema.safeParse(jwt.payload);
+		if (!parsedPayload.success) {
+			return redirectOnError(BASE_ERROR_CODES.INVALID_TOKEN);
+		}
+		const parsed = parsedPayload.data;
+		const expiresAt = new Date(parsed.exp * 1_000);
+		if (!Number.isFinite(expiresAt.getTime())) {
+			return redirectOnError(BASE_ERROR_CODES.INVALID_TOKEN);
+		}
+		const reservation = {
+				identifier: `email-verification-jti:${parsed.jti}`,
+				value: parsed.jti,
+				expiresAt,
+		};
+		const managedAuthentication = Boolean(
+			readInternalAuthenticationPolicy(ctx.context.options),
+		);
+		const reserveToken = () =>
+			ctx.context.internalAdapter.reserveVerificationValue(reservation);
+		const requireManagedReservation = async () => {
+			if (!managedAuthentication) return;
+			if (!(await reserveToken())) {
+				return redirectOnError(BASE_ERROR_CODES.INVALID_TOKEN);
+			}
+		};
+		if (!managedAuthentication && !(await reserveToken())) {
+			return redirectOnError(BASE_ERROR_CODES.INVALID_TOKEN);
+		}
+		const runAfterEmailVerification = async (verifiedUser: User) => {
+			const callback =
+				ctx.context.options.emailVerification?.afterEmailVerification;
+			if (!callback) return;
+			if (!managedAuthentication) {
+				await callback(verifiedUser, ctx.request);
+				return;
+			}
+			try {
+				await callback(verifiedUser, ctx.request);
+			} catch {
+				ctx.context.logger.error(
+					"Managed email verification post-commit callback failed",
+				);
+			}
+		};
 		const user = await ctx.context.internalAdapter.findUserByEmail(
 			parsed.email,
 		);
 		if (!user) {
+			await requireManagedReservation();
 			return redirectOnError(BASE_ERROR_CODES.USER_NOT_FOUND);
 		}
 		if (parsed.updateTo) {
@@ -393,6 +442,7 @@ export const verifyEmail = createAuthEndpoint(
 				 * User clicks confirmation -> sends verification to new email
 				 */
 				case "change-email-confirmation": {
+					await requireManagedReservation();
 					const newToken = await createEmailVerificationToken(
 						ctx.context.secret,
 						parsed.email,
@@ -427,33 +477,62 @@ export const verifyEmail = createAuthEndpoint(
 				 * User clicks verification -> updates email
 				 */
 				case "change-email-verification": {
-					let activeSession = session;
-					if (!activeSession) {
-						const newSession = await ctx.context.internalAdapter.createSession(
-							user.user.id,
-						);
-						if (!newSession) {
-							throw APIError.from(
-								"INTERNAL_SERVER_ERROR",
-								BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+					const committed = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							const transaction = await getCurrentAdapter(ctx.context.adapter);
+							const authoritativeUser = await lockAndReadUser(
+								transaction,
+								user.user.id,
 							);
-						}
-						activeSession = {
-							session: newSession,
-							user: user.user,
-						};
+							await requireManagedReservation();
+							if (!authoritativeUser || authoritativeUser.email !== parsed.email) {
+								return null;
+							}
+							const updatedUser =
+								await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
+									email: parsed.updateTo,
+									emailVerified: true,
+								});
+							let activeSession =
+								session?.user.id === authoritativeUser.id ? session : null;
+							if (!activeSession) {
+								const newSession =
+									await ctx.context.internalAdapter.createSession(
+										authoritativeUser.id,
+										false,
+										undefined,
+										false,
+										createInternalSessionIssuanceContext({
+											purpose: "interactive",
+											subjectId: authoritativeUser.id,
+											evidence: [
+												{
+													kind: "primary",
+													primaryMethod: "email_link",
+												},
+											],
+										}),
+									);
+								if (!newSession) {
+									throw APIError.from(
+										"INTERNAL_SERVER_ERROR",
+										BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+									);
+								}
+								activeSession = {
+									session: newSession,
+									user: authoritativeUser,
+								};
+							}
+							return { activeSession, updatedUser };
+						},
+					);
+					if (!committed) {
+						return redirectOnError(BASE_ERROR_CODES.USER_NOT_FOUND);
 					}
-					const updatedUser =
-						await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
-							email: parsed.updateTo,
-							emailVerified: true,
-						});
-					if (ctx.context.options.emailVerification?.afterEmailVerification) {
-						await ctx.context.options.emailVerification.afterEmailVerification(
-							updatedUser,
-							ctx.request,
-						);
-					}
+					const { activeSession, updatedUser } = committed;
+					await runAfterEmailVerification(updatedUser);
 					await setSessionCookie(ctx, {
 						session: activeSession.session,
 						user: {
@@ -477,22 +556,6 @@ export const verifyEmail = createAuthEndpoint(
 				 * - updates email immediately
 				 */
 				default: {
-					let activeSession = session;
-					if (!activeSession) {
-						const newSession = await ctx.context.internalAdapter.createSession(
-							user.user.id,
-						);
-						if (!newSession) {
-							throw APIError.from(
-								"INTERNAL_SERVER_ERROR",
-								BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
-							);
-						}
-						activeSession = {
-							session: newSession,
-							user: user.user,
-						};
-					}
 					const newToken = await createEmailVerificationToken(
 						ctx.context.secret,
 						parsed.updateTo,
@@ -503,28 +566,78 @@ export const verifyEmail = createAuthEndpoint(
 					const updateCallbackURL = ctx.query.callbackURL
 						? encodeURIComponent(ctx.query.callbackURL)
 						: encodeURIComponent("/");
-					const updateAndDispatch = async () => {
-						const updated =
+					const updateAndIssue = async () => {
+						const transaction = await getCurrentAdapter(ctx.context.adapter);
+						const authoritativeUser = await lockAndReadUser(
+							transaction,
+							user.user.id,
+						);
+						await requireManagedReservation();
+						if (!authoritativeUser || authoritativeUser.email !== parsed.email) {
+							return null;
+						}
+						const updatedUser =
 							await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
 								email: parsed.updateTo,
 								emailVerified: false,
 							});
-						if (
-							ctx.context.options.durableDelivery ||
-							ctx.context.options.emailVerification?.sendVerificationEmail
-						) {
+						if (ctx.context.options.durableDelivery) {
 							await dispatchVerificationEmail(ctx, {
-								user: updated,
+								user: updatedUser,
 								url: `${ctx.context.baseURL}/verify-email?token=${newToken}&callbackURL=${updateCallbackURL}`,
 								token: newToken,
 								template: "email-change-verification",
 							});
 						}
-						return updated;
+						let activeSession =
+							session?.user.id === authoritativeUser.id ? session : null;
+						if (!activeSession) {
+							const newSession =
+								await ctx.context.internalAdapter.createSession(
+									authoritativeUser.id,
+									false,
+									undefined,
+									false,
+									createInternalSessionIssuanceContext({
+										purpose: "interactive",
+										subjectId: authoritativeUser.id,
+										evidence: [
+											{ kind: "primary", primaryMethod: "email_link" },
+										],
+									}),
+								);
+							if (!newSession) {
+								throw APIError.from(
+									"INTERNAL_SERVER_ERROR",
+									BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+								);
+							}
+							activeSession = {
+								session: newSession,
+								user: authoritativeUser,
+							};
+						}
+						return { activeSession, updatedUser };
 					};
-					const updatedUser = ctx.context.options.durableDelivery
-						? await runWithTransaction(ctx.context.adapter, updateAndDispatch)
-						: await updateAndDispatch();
+					const committed = await runWithTransaction(
+						ctx.context.adapter,
+						updateAndIssue,
+					);
+					if (!committed) {
+						return redirectOnError(BASE_ERROR_CODES.USER_NOT_FOUND);
+					}
+					const { activeSession, updatedUser } = committed;
+					if (
+						!ctx.context.options.durableDelivery &&
+						ctx.context.options.emailVerification?.sendVerificationEmail
+					) {
+						await dispatchVerificationEmail(ctx, {
+							user: updatedUser,
+							url: `${ctx.context.baseURL}/verify-email?token=${newToken}&callbackURL=${updateCallbackURL}`,
+							token: newToken,
+							template: "email-change-verification",
+						});
+					}
 					await setSessionCookie(ctx, {
 						session: activeSession.session,
 						user: {
@@ -544,6 +657,7 @@ export const verifyEmail = createAuthEndpoint(
 			}
 		}
 		if (user.user.emailVerified) {
+			await requireManagedReservation();
 			if (ctx.query.callbackURL) {
 				throw ctx.redirect(ctx.query.callbackURL);
 			}
@@ -552,44 +666,95 @@ export const verifyEmail = createAuthEndpoint(
 				user: null,
 			});
 		}
-		if (ctx.context.options.emailVerification?.beforeEmailVerification) {
-			await ctx.context.options.emailVerification.beforeEmailVerification(
-				user.user,
-				ctx.request,
+		const autoSignIn =
+			ctx.context.options.emailVerification?.autoSignInAfterVerification;
+		if (
+			managedAuthentication &&
+			ctx.context.options.emailVerification?.beforeEmailVerification
+		) {
+			throw new Error(
+				"Managed email verification cannot execute beforeEmailVerification outside the atomic authentication transaction",
 			);
 		}
-		const updatedUser = await ctx.context.internalAdapter.updateUserByEmail(
-			parsed.email,
-			{
-				emailVerified: true,
-			},
-		);
-		if (ctx.context.options.emailVerification?.afterEmailVerification) {
-			await ctx.context.options.emailVerification.afterEmailVerification(
-				updatedUser,
-				ctx.request,
-			);
-		}
-		if (ctx.context.options.emailVerification?.autoSignInAfterVerification) {
-			const currentSession = await getSessionFromCtx(ctx);
-			if (!currentSession || currentSession.user.email !== parsed.email) {
-				const session = await ctx.context.internalAdapter.createSession(
+		const currentSession = autoSignIn ? await getSessionFromCtx(ctx) : null;
+		const committed = await runWithTransaction(
+			ctx.context.adapter,
+			async () => {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				const authoritativeUser = await lockAndReadUser(
+					transaction,
 					user.user.id,
 				);
-				if (!session) {
-					throw APIError.from(
-						"INTERNAL_SERVER_ERROR",
-						BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+				await requireManagedReservation();
+				if (
+					!authoritativeUser ||
+					authoritativeUser.email !== parsed.email ||
+					authoritativeUser.emailVerified
+				) {
+					return null;
+				}
+				if (
+					!managedAuthentication &&
+					ctx.context.options.emailVerification?.beforeEmailVerification
+				) {
+					await ctx.context.options.emailVerification.beforeEmailVerification(
+						authoritativeUser,
+						ctx.request,
 					);
 				}
+				const updatedUser =
+					await ctx.context.internalAdapter.updateUserByEmail(parsed.email, {
+						emailVerified: true,
+					});
+				let newSession = null;
+				if (
+					autoSignIn &&
+					currentSession?.user.id !== authoritativeUser.id
+				) {
+					newSession = await ctx.context.internalAdapter.createSession(
+						authoritativeUser.id,
+						false,
+						undefined,
+						false,
+						createInternalSessionIssuanceContext({
+							purpose: "interactive",
+							subjectId: authoritativeUser.id,
+							evidence: [
+								{ kind: "primary", primaryMethod: "email_link" },
+							],
+						}),
+					);
+					if (!newSession) {
+						throw APIError.from(
+							"INTERNAL_SERVER_ERROR",
+							BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+						);
+					}
+				}
+				return { newSession, updatedUser };
+			},
+		);
+		if (!committed) {
+			if (ctx.query.callbackURL) {
+				throw ctx.redirect(ctx.query.callbackURL);
+			}
+			return ctx.json({
+				status: true,
+				user: null,
+			});
+		}
+		const { newSession, updatedUser } = committed;
+		await runAfterEmailVerification(updatedUser);
+		if (autoSignIn) {
+			if (newSession) {
 				await setSessionCookie(ctx, {
-					session,
+					session: newSession,
 					user: {
-						...user.user,
+						...updatedUser,
 						emailVerified: true,
 					},
 				});
-			} else {
+			} else if (currentSession) {
 				await setSessionCookie(ctx, {
 					session: currentSession.session,
 					user: {

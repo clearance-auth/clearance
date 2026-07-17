@@ -1,7 +1,141 @@
+import { DatabaseSync } from "node:sqlite";
 import { APIError } from "@clearance/call";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearance } from "../../auth/full";
+import { getMigrations } from "../../db/get-migration";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getTestInstance } from "../../test-utils";
 import type { Account } from "../../types";
+
+async function managedPasswordResetRuntime() {
+	const database = new DatabaseSync(":memory:");
+	let token = "";
+	const identity = {
+		projectId: "password-reset-policy-project",
+		environmentId: "password-reset-policy-environment",
+	} satisfies RuntimeAuthenticationPolicyIdentity;
+	const policy = {
+		passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		minimumAssurance: "single_factor",
+		allowedFactors: { totp: true, passkey: true },
+		trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+		assuranceMaxAgeSeconds: 300,
+	} satisfies RuntimeAuthenticationPolicy;
+	const options = {
+		baseURL: "http://localhost:3000",
+		secret: "managed-password-reset-test-secret",
+		database,
+		emailAndPassword: {
+			enabled: true,
+			async sendResetPassword({ url }) {
+				token = url.split("?")[0]!.split("/").pop() || "";
+			},
+		},
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity,
+		reader: {
+			async readForSubject(input) {
+				return {
+					scope: identity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: policy,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective: policy,
+				};
+			},
+		},
+	});
+	await (await getMigrations(options)).runMigrations();
+	return { auth: clearance(options), database, readToken: () => token };
+}
+
+describe("managed password reset transaction", () => {
+	async function provision(runtime: Awaited<ReturnType<typeof managedPasswordResetRuntime>>, email: string) {
+		const context = await runtime.auth.$context;
+		const user = await context.internalAdapter.createUser({
+			email,
+			emailVerified: true,
+			name: "Managed password reset",
+		});
+		await context.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "credential",
+			accountId: user.id,
+			password: await context.password.hash("original-password"),
+		});
+		await runtime.auth.api.requestPasswordReset({ body: { email } });
+		return { context, user, token: runtime.readToken() };
+	}
+
+	it("rolls back password mutation failure and preserves the token for retry", async () => {
+		const runtime = await managedPasswordResetRuntime();
+		try {
+			const { context, token } = await provision(
+				runtime,
+				"managed-core-reset@example.test",
+			);
+			const identifier = `reset-password:${token}`;
+			const originalUpdatePassword = context.internalAdapter.updatePassword.bind(
+				context.internalAdapter,
+			);
+			const updatePassword = vi
+				.spyOn(context.internalAdapter, "updatePassword")
+				.mockRejectedValueOnce(new Error("forced password update failure"))
+				.mockImplementation(originalUpdatePassword);
+			await expect(
+				runtime.auth.api.resetPassword({
+					body: { token, newPassword: "replacement-password" },
+				}),
+			).rejects.toThrow("forced password update failure");
+			await expect(
+				context.internalAdapter.findVerificationValue(identifier),
+			).resolves.not.toBeNull();
+			updatePassword.mockRestore();
+
+			await expect(
+				runtime.auth.api.resetPassword({
+					body: { token, newPassword: "replacement-password" },
+				}),
+			).resolves.toMatchObject({ status: true });
+			await expect(
+				context.internalAdapter.findVerificationValue(identifier),
+			).resolves.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("fails before consuming the reset token when transactions disappear", async () => {
+		const runtime = await managedPasswordResetRuntime();
+		try {
+			const { context, token } = await provision(
+				runtime,
+				"managed-core-reset-no-transaction@example.test",
+			);
+			const identifier = `reset-password:${token}`;
+			context.adapter.options!.adapterConfig.transaction = false;
+			await expect(
+				runtime.auth.api.resetPassword({
+					body: { token, newPassword: "replacement-password" },
+				}),
+			).rejects.toThrow("rollback-capable database transactions");
+			await expect(
+				context.internalAdapter.findVerificationValue(identifier),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+});
 
 describe("forgot password", async () => {
 	const mockSendEmail = vi.fn();

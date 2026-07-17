@@ -37,6 +37,10 @@ import { validateConfigAlgorithms } from "../saml";
 import { SAML_ERROR_CODES } from "../saml/error-codes";
 import { generateRelayState } from "../saml-state";
 import { saml } from "../samlify";
+import {
+	createSSOVerificationChallenge,
+	runSSOVerificationTransaction,
+} from "../internal/verification-challenge-authority";
 import type {
 	AuthnRequestRecord,
 	Member,
@@ -891,11 +895,23 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
 				domainVerified = false;
 				domainVerificationToken = generateRandomString(24);
 
-				await ctx.context.internalAdapter.createVerificationValue({
-					identifier: getVerificationIdentifier(options, provider.providerId),
-					value: domainVerificationToken as string,
-					expiresAt: new Date(Date.now() + 3600 * 24 * 7 * 1000), // 1 week
-				});
+				const identifier = getVerificationIdentifier(
+					options,
+					provider.providerId,
+				);
+				await createSSOVerificationChallenge(
+					options,
+					ctx.context.internalAdapter,
+					{
+						purpose: "sso-domain-verification",
+						subject: provider.providerId,
+					},
+					{
+						identifier,
+						value: domainVerificationToken as string,
+						expiresAt: new Date(Date.now() + 3600 * 24 * 7 * 1000),
+					},
+				);
 			}
 
 			type SSOProviderResponse = {
@@ -1423,11 +1439,19 @@ export const signInSSO = (options?: SSOOptions) => {
 						createdAt: Date.now(),
 						expiresAt: Date.now() + ttl,
 					};
-					await ctx.context.internalAdapter.createVerificationValue({
-						identifier: `${constants.AUTHN_REQUEST_KEY_PREFIX}${record.id}`,
-						value: JSON.stringify(record),
-						expiresAt: new Date(record.expiresAt),
-					});
+					await createSSOVerificationChallenge(
+						options,
+						ctx.context.internalAdapter,
+						{
+							purpose: "saml-authn-request",
+							subject: provider.providerId,
+						},
+						{
+							identifier: `${constants.AUTHN_REQUEST_KEY_PREFIX}${record.id}`,
+							value: JSON.stringify(record),
+							expiresAt: new Date(record.expiresAt),
+						},
+					);
 				}
 
 				return ctx.json({
@@ -1977,16 +2001,23 @@ export const callbackSSOSAML = (options?: SSOOptions) => {
 					message: "SAMLResponse is required for POST requests",
 				});
 			}
+			const samlResponse = ctx.body.SAMLResponse;
+			const relayState = ctx.body.RelayState;
 
-			const safeRedirectUrl = await processSAMLResponse(
-				ctx,
-				{
-					SAMLResponse: ctx.body.SAMLResponse,
-					RelayState: ctx.body.RelayState,
-					providerId,
-					currentCallbackPath,
-				},
+			const safeRedirectUrl = await runSSOVerificationTransaction(
 				options,
+				ctx,
+				() =>
+					processSAMLResponse(
+						ctx,
+						{
+							SAMLResponse: samlResponse,
+							RelayState: relayState,
+							providerId,
+							currentCallbackPath,
+						},
+						options,
+					),
 			);
 			throw ctx.redirect(safeRedirectUrl);
 		},
@@ -2026,19 +2057,26 @@ export const acsEndpoint = (options?: SSOOptions) => {
 		},
 		async (ctx) => {
 			const { providerId } = ctx.params;
+			const samlResponse = ctx.body.SAMLResponse;
+			const relayState = ctx.body.RelayState;
 			const currentCallbackPath = `${ctx.context.baseURL}/sso/saml2/sp/acs/${providerId}`;
 			const appOrigin = new URL(ctx.context.baseURL).origin;
 
 			try {
-				const safeRedirectUrl = await processSAMLResponse(
-					ctx,
-					{
-						SAMLResponse: ctx.body.SAMLResponse,
-						RelayState: ctx.body.RelayState,
-						providerId,
-						currentCallbackPath,
-					},
+				const safeRedirectUrl = await runSSOVerificationTransaction(
 					options,
+					ctx,
+					() =>
+						processSAMLResponse(
+							ctx,
+							{
+								SAMLResponse: samlResponse,
+								RelayState: relayState,
+								providerId,
+								currentCallbackPath,
+							},
+							options,
+						),
 				);
 				throw ctx.redirect(safeRedirectUrl);
 			} catch (error) {
@@ -2433,11 +2471,16 @@ export const initiateSLO = (options?: SSOOptions) => {
 			const ttl =
 				options?.saml?.logoutRequestTTL ??
 				constants.DEFAULT_LOGOUT_REQUEST_TTL_MS;
-			await ctx.context.internalAdapter.createVerificationValue({
-				identifier: `${constants.LOGOUT_REQUEST_KEY_PREFIX}${logoutRequest.id}`,
-				value: providerId,
-				expiresAt: new Date(Date.now() + ttl),
-			});
+			await createSSOVerificationChallenge(
+				options,
+				ctx.context.internalAdapter,
+				{ purpose: "saml-logout-request", subject: providerId },
+				{
+					identifier: `${constants.LOGOUT_REQUEST_KEY_PREFIX}${logoutRequest.id}`,
+					value: providerId,
+					expiresAt: new Date(Date.now() + ttl),
+				},
+			);
 
 			if (samlSessionKey) {
 				await ctx.context.internalAdapter

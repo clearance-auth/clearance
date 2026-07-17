@@ -162,3 +162,16 @@ export type SessionIssuanceContext = (
 	  }>
 ) &
 	BrandedSessionIssuanceContext;
+
+declare const verificationChallengeCreationContextBrand: unique symbol;
+declare const verificationChallengeConsumptionContextBrand: unique symbol;
+
+/** Opaque runtime provenance for a managed verification challenge creation. */
+export type VerificationChallengeCreationContext = Readonly<{
+	[verificationChallengeCreationContextBrand]: true;
+}>;
+
+/** Opaque runtime provenance for a managed verification challenge consumption. */
+export type VerificationChallengeConsumptionContext = Readonly<{
+	[verificationChallengeConsumptionContextBrand]: true;
+}>;

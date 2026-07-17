@@ -20,6 +20,7 @@ import { initGetIdField } from "./get-id-field";
 import { initGetModelName } from "./get-model-name";
 import type {
 	CleanedWhere,
+	CreateIfAbsentAttemptValue,
 	DBAdapter,
 	DBTransactionAdapter,
 	JoinConfig,
@@ -951,6 +952,116 @@ export const createAdapterFactory =
 					{ model, data: transformed },
 				);
 				return transformed;
+			},
+			createIfAbsent: async <T extends Record<string, any>, R = T>({
+				model: unsafeModel,
+				data: unsafeData,
+				uniqueBy: unsafeUniqueBy,
+				attemptBy: unsafeAttemptBy,
+				forceAllowId = false,
+			}: {
+				model: string;
+				data: T;
+				uniqueBy: { field: string; value: Where["value"] };
+				attemptBy: { field: string; value: CreateIfAbsentAttemptValue };
+				forceAllowId?: boolean;
+			}): Promise<R | null> => {
+				const defaultModel = getDefaultModelName(unsafeModel);
+				const uniqueAttributes = getFieldAttributes({
+					model: defaultModel,
+					field: unsafeUniqueBy.field,
+				});
+				getFieldAttributes({
+					model: defaultModel,
+					field: unsafeAttemptBy.field,
+				});
+				if (!uniqueAttributes.unique && unsafeUniqueBy.field !== "id") {
+					throw new ClearanceError(
+						`createIfAbsent requires a schema-declared unique field; ${unsafeUniqueBy.field} is not unique on ${defaultModel}`,
+					);
+				}
+				if (
+					(typeof unsafeAttemptBy.value !== "string" &&
+						typeof unsafeAttemptBy.value !== "number" &&
+						typeof unsafeAttemptBy.value !== "boolean") ||
+					(typeof unsafeAttemptBy.value === "number" &&
+						!Number.isFinite(unsafeAttemptBy.value))
+				) {
+					throw new ClearanceError(
+						"createIfAbsent attemptBy must be a string, finite number, or boolean",
+					);
+				}
+				if (
+					!Object.hasOwn(unsafeData, unsafeUniqueBy.field) ||
+					!Object.is(unsafeData[unsafeUniqueBy.field], unsafeUniqueBy.value)
+				) {
+					throw new ClearanceError(
+						"createIfAbsent uniqueBy must exactly match the corresponding data field",
+					);
+				}
+				if (
+					!Object.hasOwn(unsafeData, unsafeAttemptBy.field) ||
+					unsafeData[unsafeAttemptBy.field] !== unsafeAttemptBy.value
+				) {
+					throw new ClearanceError(
+						"createIfAbsent attemptBy must exactly match the corresponding data field",
+					);
+				}
+				if (!adapterInstance.createIfAbsent) {
+					throw new ClearanceError(
+						`Adapter "${config.adapterId}" does not support atomic createIfAbsent`,
+					);
+				}
+
+				let data = unsafeData;
+				if (!config.disableTransformInput) {
+					data = (await transformInput(
+						unsafeData,
+						defaultModel,
+						"create",
+						forceAllowId,
+					)) as T;
+				}
+				const uniqueWhere = transformWhereClause({
+					model: defaultModel,
+					where: [{ field: unsafeUniqueBy.field, value: unsafeUniqueBy.value }],
+					action: "create",
+				})!;
+				const attemptWhere = transformWhereClause({
+					model: defaultModel,
+					where: [{ field: unsafeAttemptBy.field, value: unsafeAttemptBy.value }],
+					action: "create",
+				})!;
+				const uniqueBy = uniqueWhere[0]!;
+				const attemptBy = attemptWhere[0]!;
+				const model = getModelName(defaultModel);
+				const result = await withSpan(
+					`db createIfAbsent ${model}`,
+					{
+						[ATTR_DB_OPERATION_NAME]: "createIfAbsent",
+						[ATTR_DB_COLLECTION_NAME]: model,
+					},
+					() =>
+						adapterInstance.createIfAbsent!<T>({
+							model,
+							data,
+							uniqueBy: {
+								field: uniqueBy!.field,
+								value: uniqueBy!.value,
+							},
+							attemptBy: {
+								field: attemptBy!.field,
+								value: attemptBy!.value,
+							},
+						}),
+				);
+				if (!result || config.disableTransformOutput) return result as R | null;
+				return (await transformOutput(
+					result,
+					defaultModel,
+					undefined,
+					undefined,
+				)) as R;
 			},
 			update: async <T>({
 				model: unsafeModel,

@@ -48,6 +48,7 @@ import {
 	setNoStoreTokenResponseHeaders,
 } from "../oidc-provider/token-response";
 import { lockAndReadActiveUser } from "../../db/user-authority";
+import { consumeInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import {
 	attachInternalCredentialAuthority,
 	readInternalCredentialAuthority,
@@ -894,10 +895,14 @@ export const mcp = (options: MCPOptions) => {
 					const issued = await runWithTransaction(
 						ctx.context.adapter,
 						async () => {
-							const consumed =
-								await ctx.context.internalAdapter.consumeVerificationValue(
-									code.toString(),
-								);
+							const consumed = await consumeInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: "mcp-authorization-code",
+									subject: client_id.toString(),
+									identifier: code.toString(),
+								},
+							);
 							if (
 								!consumed ||
 								!constantTimeEqual(consumed.value, verificationValue.value)

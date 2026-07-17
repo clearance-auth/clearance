@@ -2,6 +2,7 @@ import type { GenericEndpointContext } from "@clearance/core";
 import { APIError } from "@clearance/core/error";
 import { getSessionFromCtx } from "../../api";
 import { generateRandomString } from "../../crypto";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import type { OAuthApplication } from "../oidc-provider/schema";
 import type {
 	AuthorizationQuery,
@@ -199,7 +200,10 @@ export async function authorizeMCPOAuth(
 		/**
 		 * Save the code in the database
 		 */
-		await ctx.context.internalAdapter.createVerificationValue({
+		await createInternalVerificationChallenge(
+			ctx.context.internalAdapter,
+			{ purpose: "mcp-authorization-code", subject: client.clientId },
+			{
 			value: JSON.stringify({
 				clientId: client.clientId,
 				redirectURI: query.redirect_uri,
@@ -226,7 +230,8 @@ export async function authorizeMCPOAuth(
 			}),
 			identifier: code,
 			expiresAt,
-		});
+			},
+		);
 	} catch {
 		throw ctx.redirect(
 			redirectErrorURL(

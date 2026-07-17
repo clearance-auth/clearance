@@ -1,5 +1,6 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getSessionFromCtx } from "../../api";
@@ -7,6 +8,15 @@ import { setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto/random";
 import { parseUserInput } from "../../db";
 import { parseUserOutput } from "../../db/schema";
+import {
+	requireManagedAuthenticationTransaction,
+	runManagedAuthenticationTransaction,
+} from "../../internal/managed-authentication-transaction";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import type { Account } from "../../types";
 import { getDate } from "../../utils/date";
@@ -21,6 +31,14 @@ export type RequiredPhoneNumberOptions = PhoneNumberOptions & {
 	code: string;
 	createdAt: string;
 };
+
+function phoneNumberChallenge(
+	purpose: "phone-number:verify" | "phone-number:password-reset",
+	subject: string,
+	identifier = subject,
+) {
+	return { purpose, subject, identifier } as const;
+}
 
 const signInPhoneNumberBodySchema = z.object({
 	phoneNumber: z.string().meta({
@@ -121,11 +139,19 @@ export const signInPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 			if (opts.requireVerification) {
 				if (!user.phoneNumberVerified) {
 					const otp = generateOTP(opts.otpLength);
-					await ctx.context.internalAdapter.createVerificationValue({
-						value: otp,
-						identifier: phoneNumber,
-						expiresAt: getDate(opts.expiresIn, "sec"),
-					});
+					const challenge = phoneNumberChallenge(
+						"phone-number:verify",
+						phoneNumber,
+					);
+					await createInternalVerificationChallenge(
+						ctx.context.internalAdapter,
+						challenge,
+						{
+							value: otp,
+							identifier: challenge.identifier,
+							expiresAt: getDate(opts.expiresIn, "sec"),
+						},
+					);
 					if (opts.sendOTP) {
 						await ctx.context.runInBackgroundOrAwait(
 							opts.sendOTP(
@@ -179,6 +205,13 @@ export const signInPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 			const session = await ctx.context.internalAdapter.createSession(
 				user.id,
 				ctx.body.rememberMe === false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
 			);
 			if (!session) {
 				ctx.context.logger.error("Failed to create session");
@@ -276,11 +309,19 @@ export const sendPhoneNumberOTP = (opts: RequiredPhoneNumberOptions) =>
 			}
 
 			const code = generateOTP(opts.otpLength);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${code}:0`,
-				identifier: ctx.body.phoneNumber,
-				expiresAt: getDate(opts.expiresIn, "sec"),
-			});
+			const challenge = phoneNumberChallenge(
+				"phone-number:verify",
+				ctx.body.phoneNumber,
+			);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				challenge,
+				{
+					value: `${code}:0`,
+					identifier: challenge.identifier,
+					expiresAt: getDate(opts.expiresIn, "sec"),
+				},
+			);
 			const sendOTPResult = opts.sendOTP(
 				{
 					phoneNumber: ctx.body.phoneNumber,
@@ -464,10 +505,25 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 					},
 				},
 			},
-		},
-		async (ctx) => {
-			if (opts?.verifyOTP) {
-				// Use custom verifyOTP if provided
+			},
+			async (ctx) => {
+				const managed = requireManagedAuthenticationTransaction(ctx);
+				let managedCustomChallengeId: string | undefined;
+
+				if (opts?.verifyOTP) {
+					if (managed) {
+					const challenge =
+						await ctx.context.internalAdapter.findVerificationValue(
+							ctx.body.phoneNumber,
+						);
+					if (!challenge || challenge.expiresAt <= new Date()) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							PHONE_NUMBER_ERROR_CODES.OTP_NOT_FOUND,
+						);
+					}
+					managedCustomChallengeId = challenge.id;
+				}
 				const isValid = await opts.verifyOTP(
 					{
 						phoneNumber: ctx.body.phoneNumber,
@@ -475,92 +531,125 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 					},
 					ctx,
 				);
-
 				if (!isValid) {
 					throw APIError.from(
 						"BAD_REQUEST",
 						PHONE_NUMBER_ERROR_CODES.INVALID_OTP,
 					);
 				}
-
-				// Clean up verification value
-				const otp = await ctx.context.internalAdapter.findVerificationValue(
-					ctx.body.phoneNumber,
-				);
-				if (otp) {
-					await ctx.context.internalAdapter.deleteVerificationByIdentifier(
+					if (!managed) {
+					const otp = await ctx.context.internalAdapter.findVerificationValue(
 						ctx.body.phoneNumber,
 					);
+					if (otp) {
+						await ctx.context.internalAdapter.deleteVerificationByIdentifier(
+							ctx.body.phoneNumber,
+						);
+					}
 				}
-			} else {
+				} else if (!managed) {
 				await verifyPhoneNumberOTP(
 					ctx,
 					opts,
-					ctx.body.phoneNumber,
+					phoneNumberChallenge(
+						"phone-number:verify",
+						ctx.body.phoneNumber,
+					),
 					ctx.body.code,
 				);
 			}
 
-			if (ctx.body.updatePhoneNumber) {
-				const session = await getSessionFromCtx(ctx);
-				if (!session) {
-					throw APIError.from("UNAUTHORIZED", BASE_ERROR_CODES.USER_NOT_FOUND);
-				}
-				const existingUser =
-					await ctx.context.adapter.findMany<UserWithPhoneNumber>({
-						model: "user",
-						where: [
-							{
-								field: "phoneNumber",
-								value: ctx.body.phoneNumber,
-							},
-						],
-					});
-				if (existingUser.length) {
-					throw APIError.from(
-						"BAD_REQUEST",
-						PHONE_NUMBER_ERROR_CODES.PHONE_NUMBER_EXIST,
-					);
-				}
-				const user =
-					await ctx.context.internalAdapter.updateUser<UserWithPhoneNumber>(
-						session.user.id,
-						{
-							[opts.phoneNumber]: ctx.body.phoneNumber,
-							[opts.phoneNumberVerified]: true,
-						},
-					);
-				if (!user) {
-					throw APIError.from(
-						"INTERNAL_SERVER_ERROR",
-						BASE_ERROR_CODES.FAILED_TO_UPDATE_USER,
-					);
-				}
-				await opts?.callbackOnVerification?.(
-					{
-						phoneNumber: ctx.body.phoneNumber,
-						user,
-					},
-					ctx,
-				);
-				return ctx.json({
-					status: true,
-					token: session.session.token,
-					user: parseUserOutput(ctx.context.options, user),
-				});
-			}
+				const result = await runManagedAuthenticationTransaction(ctx, async () => {
+					if (managed) {
+					if (managedCustomChallengeId) {
+						const consumed = await consumeInternalVerificationChallenge(
+							ctx.context.internalAdapter,
+							phoneNumberChallenge(
+								"phone-number:verify",
+								ctx.body.phoneNumber,
+							),
+						);
+						if (
+							!consumed ||
+							consumed.id !== managedCustomChallengeId
+						) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								PHONE_NUMBER_ERROR_CODES.INVALID_OTP,
+							);
+						}
+					} else {
+						try {
+							await verifyPhoneNumberOTP(
+								ctx,
+								opts,
+								phoneNumberChallenge(
+									"phone-number:verify",
+									ctx.body.phoneNumber,
+								),
+								ctx.body.code,
+							);
+						} catch (verificationError) {
+							return { verificationError };
+						}
+					}
+					}
 
-			let user = await ctx.context.adapter.findOne<UserWithPhoneNumber>({
-				model: "user",
-				where: [
-					{
-						value: ctx.body.phoneNumber,
-						field: opts.phoneNumber,
-					},
-				],
-			});
-			if (!user) {
-				if (opts?.signUpOnVerification) {
+					const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+					if (ctx.body.updatePhoneNumber) {
+						const currentSession = await getSessionFromCtx(ctx);
+						if (!currentSession) {
+							throw APIError.from(
+								"UNAUTHORIZED",
+								BASE_ERROR_CODES.USER_NOT_FOUND,
+							);
+						}
+						const existingUser =
+							await transactionAdapter.findMany<UserWithPhoneNumber>({
+								model: "user",
+								where: [
+									{
+										field: opts.phoneNumber,
+										value: ctx.body.phoneNumber,
+									},
+								],
+							});
+						if (existingUser.length) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								PHONE_NUMBER_ERROR_CODES.PHONE_NUMBER_EXIST,
+							);
+						}
+						const user =
+							await ctx.context.internalAdapter.updateUser<UserWithPhoneNumber>(
+								currentSession.user.id,
+								{
+									[opts.phoneNumber]: ctx.body.phoneNumber,
+									[opts.phoneNumberVerified]: true,
+								},
+							);
+						if (!user) {
+							throw APIError.from(
+								"INTERNAL_SERVER_ERROR",
+								BASE_ERROR_CODES.FAILED_TO_UPDATE_USER,
+							);
+						}
+						if (!managed) {
+							await opts?.callbackOnVerification?.(
+								{ phoneNumber: ctx.body.phoneNumber, user },
+								ctx,
+							);
+						}
+						return { user, session: null, currentSession };
+					}
+					let user = await transactionAdapter.findOne<UserWithPhoneNumber>({
+					model: "user",
+					where: [
+						{ value: ctx.body.phoneNumber, field: opts.phoneNumber },
+					],
+				});
+				const creatingUser = !user && Boolean(opts?.signUpOnVerification);
+				if (!user && opts?.signUpOnVerification) {
 					const {
 						phoneNumber,
 						code,
@@ -585,40 +674,40 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 							[opts.phoneNumber]: ctx.body.phoneNumber,
 							[opts.phoneNumberVerified]: true,
 						});
-					if (!user) {
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
+				} else if (user) {
+					user =
+						await ctx.context.internalAdapter.updateUser<UserWithPhoneNumber>(
+							user.id,
+							{ [opts.phoneNumberVerified]: true },
 						);
-					}
 				}
-			} else {
-				user =
-					await ctx.context.internalAdapter.updateUser<UserWithPhoneNumber>(
-						user.id,
-						{
-							[opts.phoneNumberVerified]: true,
-						},
+				if (!user) {
+					throw APIError.from(
+						"INTERNAL_SERVER_ERROR",
+						creatingUser
+							? BASE_ERROR_CODES.FAILED_TO_CREATE_USER
+							: BASE_ERROR_CODES.FAILED_TO_UPDATE_USER,
 					);
-			}
-			if (!user) {
-				throw APIError.from(
-					"INTERNAL_SERVER_ERROR",
-					BASE_ERROR_CODES.FAILED_TO_UPDATE_USER,
-				);
-			}
-
-			await opts?.callbackOnVerification?.(
-				{
-					phoneNumber: ctx.body.phoneNumber,
-					user,
-				},
-				ctx,
-			);
-
-			if (!ctx.body.disableSession) {
+				}
+					if (!managed) {
+					await opts?.callbackOnVerification?.(
+						{ phoneNumber: ctx.body.phoneNumber, user },
+						ctx,
+					);
+				}
+					if (ctx.body.disableSession) {
+						return { user, session: null, currentSession: null };
+					}
 				const session = await ctx.context.internalAdapter.createSession(
 					user.id,
+					undefined,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: user.id,
+						evidence: [{ kind: "primary", primaryMethod: "phone_otp" }],
+					}),
 				);
 				if (!session) {
 					throw APIError.from(
@@ -626,6 +715,31 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 						BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
 					);
 				}
+					return { user, session, currentSession: null };
+				});
+				if ("verificationError" in result) throw result.verificationError;
+				const { currentSession, session, user } = result;
+				if (managed) {
+				try {
+					await opts?.callbackOnVerification?.(
+						{ phoneNumber: ctx.body.phoneNumber, user },
+						ctx,
+					);
+				} catch {
+					ctx.context.logger.error(
+						"Managed phone verification post-commit callback failed",
+					);
+					}
+				}
+				if (currentSession) {
+					return ctx.json({
+						status: true,
+						token: currentSession.session.token,
+						user: parseUserOutput(ctx.context.options, user),
+					});
+				}
+
+			if (session) {
 				await setSessionCookie(ctx, {
 					session,
 					user,
@@ -695,11 +809,20 @@ export const requestPasswordResetPhoneNumber = (
 				],
 			});
 			const code = generateOTP(opts.otpLength);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${code}:0`,
-				identifier: `${ctx.body.phoneNumber}-request-password-reset`,
-				expiresAt: getDate(opts.expiresIn, "sec"),
-			});
+			const challenge = phoneNumberChallenge(
+				"phone-number:password-reset",
+				ctx.body.phoneNumber,
+				`${ctx.body.phoneNumber}-request-password-reset`,
+			);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				challenge,
+				{
+					value: `${code}:0`,
+					identifier: challenge.identifier,
+					expiresAt: getDate(opts.expiresIn, "sec"),
+				},
+			);
 			// to avoid leaking the existence of the phone number
 			if (!user) {
 				return ctx.json({
@@ -771,65 +894,89 @@ export const resetPasswordPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 		},
 		async (ctx) => {
 			const phoneResetIdentifier = `${ctx.body.phoneNumber}-request-password-reset`;
-			await verifyPhoneNumberOTP(ctx, opts, phoneResetIdentifier, ctx.body.otp);
-			const userRes = await ctx.context.adapter.findOne<
-				UserWithPhoneNumber & { account: Account[] | undefined }
-			>({
-				model: "user",
-				where: [
-					{
-						field: "phoneNumber",
-						value: ctx.body.phoneNumber,
-					},
-				],
-				join: {
-					account: true,
-				},
-			});
-			if (!userRes) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					PHONE_NUMBER_ERROR_CODES.UNEXPECTED_ERROR,
-				);
-			}
-			const { account: accounts = [], ...user } = userRes;
-			const minLength = ctx.context.password.config.minPasswordLength;
-			const maxLength = ctx.context.password.config.maxPasswordLength;
-			if (ctx.body.newPassword.length < minLength) {
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_SHORT);
-			}
-			if (ctx.body.newPassword.length > maxLength) {
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_LONG);
-			}
-			const hashedPassword = await ctx.context.password.hash(
-				ctx.body.newPassword,
-			);
-			const account = accounts.find(
-				(account) => account.providerId === "credential",
-			);
-			if (!account) {
-				await ctx.context.internalAdapter.createAccount({
-					userId: user.id,
-					providerId: "credential",
-					accountId: user.id,
-					password: hashedPassword,
+			const managed = requireManagedAuthenticationTransaction(ctx);
+			const result = await runManagedAuthenticationTransaction(ctx, async () => {
+				try {
+					await verifyPhoneNumberOTP(
+						ctx,
+						opts,
+						phoneNumberChallenge(
+							"phone-number:password-reset",
+							ctx.body.phoneNumber,
+							phoneResetIdentifier,
+						),
+						ctx.body.otp,
+					);
+				} catch (verificationError) {
+					return { verificationError };
+				}
+				const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+				const userRes = await transactionAdapter.findOne<
+					UserWithPhoneNumber & { account: Account[] | undefined }
+				>({
+					model: "user",
+					where: [
+						{ field: opts.phoneNumber, value: ctx.body.phoneNumber },
+					],
+					join: { account: true },
 				});
-			} else {
-				await ctx.context.internalAdapter.updatePassword(
-					user.id,
-					hashedPassword,
+				if (!userRes) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						PHONE_NUMBER_ERROR_CODES.UNEXPECTED_ERROR,
+					);
+				}
+				const { account: accounts = [], ...user } = userRes;
+				const minLength = ctx.context.password.config.minPasswordLength;
+				const maxLength = ctx.context.password.config.maxPasswordLength;
+				if (ctx.body.newPassword.length < minLength) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_SHORT);
+				}
+				if (ctx.body.newPassword.length > maxLength) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_LONG);
+				}
+				const hashedPassword = await ctx.context.password.hash(
+					ctx.body.newPassword,
 				);
-			}
-
-			if (ctx.context.options.emailAndPassword?.onPasswordReset) {
-				await ctx.context.options.emailAndPassword.onPasswordReset(
-					{ user },
-					ctx.request,
+				const account = accounts.find(
+					(account) => account.providerId === "credential",
 				);
-			}
-
-			if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
-				await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				if (!account) {
+					await ctx.context.internalAdapter.createAccount({
+						userId: user.id,
+						providerId: "credential",
+						accountId: user.id,
+						password: hashedPassword,
+					});
+				} else {
+					await ctx.context.internalAdapter.updatePassword(
+						user.id,
+						hashedPassword,
+					);
+				}
+				if (!managed && ctx.context.options.emailAndPassword?.onPasswordReset) {
+					await ctx.context.options.emailAndPassword.onPasswordReset(
+						{ user },
+						ctx.request,
+					);
+				}
+				if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
+					await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				}
+				return { user };
+			});
+			if ("verificationError" in result) throw result.verificationError;
+			if (managed && ctx.context.options.emailAndPassword?.onPasswordReset) {
+				try {
+					await ctx.context.options.emailAndPassword.onPasswordReset(
+						{ user: result.user },
+						ctx.request,
+					);
+				} catch {
+					ctx.context.logger.error(
+						"Managed password reset post-commit callback failed",
+					);
+				}
 			}
 
 			return ctx.json({
@@ -851,9 +998,10 @@ export const resetPasswordPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 async function verifyPhoneNumberOTP(
 	ctx: GenericEndpointContext,
 	opts: RequiredPhoneNumberOptions,
-	identifier: string,
+	challenge: ReturnType<typeof phoneNumberChallenge>,
 	providedCode: string,
 ): Promise<void> {
+	const { identifier } = challenge;
 	const existing =
 		await ctx.context.internalAdapter.findVerificationValue(identifier);
 	if (!existing) {
@@ -878,8 +1026,10 @@ async function verifyPhoneNumberOTP(
 		);
 	}
 
-	const consumed =
-		await ctx.context.internalAdapter.consumeVerificationValue(identifier);
+	const consumed = await consumeInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		challenge,
+	);
 	if (!consumed) {
 		throw APIError.from("BAD_REQUEST", PHONE_NUMBER_ERROR_CODES.INVALID_OTP);
 	}
@@ -892,11 +1042,15 @@ async function verifyPhoneNumberOTP(
 		);
 	}
 	if (otpValue !== providedCode) {
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: `${otpValue}:${parseInt(attempts || "0") + 1}`,
-			identifier,
-			expiresAt: consumed.expiresAt,
-		});
+		await createInternalVerificationChallenge(
+			ctx.context.internalAdapter,
+			challenge,
+			{
+				value: `${otpValue}:${parseInt(attempts || "0") + 1}`,
+				identifier,
+				expiresAt: consumed.expiresAt,
+			},
+		);
 		throw APIError.from("BAD_REQUEST", PHONE_NUMBER_ERROR_CODES.INVALID_OTP);
 	}
 }

@@ -15,6 +15,7 @@ import {
 import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema, parseUserOutput } from "../../db";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import type { InferOptionSchema } from "../../types/plugins";
 import { PACKAGE_VERSION } from "../../version";
@@ -534,6 +535,13 @@ export const username = (options?: UsernameOptions | undefined) => {
 					const session = await ctx.context.internalAdapter.createSession(
 						user.id,
 						ctx.body.rememberMe === false,
+						undefined,
+						false,
+						createInternalSessionIssuanceContext({
+							purpose: "interactive",
+							subjectId: user.id,
+							evidence: [{ kind: "primary", primaryMethod: "password" }],
+						}),
 					);
 					if (!session) {
 						throw APIError.from(

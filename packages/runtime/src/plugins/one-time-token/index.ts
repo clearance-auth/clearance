@@ -6,10 +6,15 @@ import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import * as z from "zod";
 import { sessionMiddleware } from "../../api";
 import { setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import type { Session, User } from "../../types";
 import { PACKAGE_VERSION } from "../../version";
 import { defaultKeyHasher } from "./utils";
@@ -107,11 +112,16 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 			: generateRandomString(32);
 		const expiresAt = new Date(Date.now() + (opts?.expiresIn ?? 3) * 60 * 1000);
 		const storedToken = await storeToken(c, token);
-		await c.context.internalAdapter.createVerificationValue({
-			value: session.session.token,
-			identifier: `one-time-token:${storedToken}`,
+		const identifier = `one-time-token:${storedToken}`;
+		await createInternalVerificationChallenge(
+			c.context.internalAdapter,
+			{ purpose: "one-time-token", subject: identifier },
+			{
+				value: session.session.token,
+				identifier,
 			expiresAt,
-		});
+			},
+		);
 		return token;
 	}
 
@@ -176,34 +186,45 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 				async (c) => {
 					const { token } = c.body;
 					const storedToken = await storeToken(c, token);
+					const identifier = `one-time-token:${storedToken}`;
 					// Atomically burn the single-use record before issuing a session,
 					// so two concurrent redemptions of the same token resolve to one
 					// success. A null return means missing or expired (already burned).
-					const verificationValue =
-						await c.context.internalAdapter.consumeVerificationValue(
-							`one-time-token:${storedToken}`,
-						);
-					if (!verificationValue) {
-						throw c.error("BAD_REQUEST", {
-							message: "Invalid token",
-						});
-					}
-					const session = await c.context.internalAdapter.findSession(
-						verificationValue.value,
+					const session = await runWithTransaction(
+						c.context.adapter,
+						async () => {
+							const verificationValue =
+								await consumeInternalVerificationChallenge(
+									c.context.internalAdapter,
+									{
+										purpose: "one-time-token",
+										subject: identifier,
+										identifier,
+									},
+								);
+							if (!verificationValue) {
+								throw c.error("BAD_REQUEST", {
+									message: "Invalid token",
+								});
+							}
+							const found = await c.context.internalAdapter.findSession(
+								verificationValue.value,
+							);
+							if (!found) {
+								throw c.error("BAD_REQUEST", {
+									message: "Session not found",
+								});
+							}
+							if (found.session.expiresAt < new Date()) {
+								throw c.error("BAD_REQUEST", {
+									message: "Session expired",
+								});
+							}
+							return found;
+						},
 					);
-					if (!session) {
-						throw c.error("BAD_REQUEST", {
-							message: "Session not found",
-						});
-					}
 					if (!opts?.disableSetSessionCookie) {
 						await setSessionCookie(c, session);
-					}
-
-					if (session.session.expiresAt < new Date()) {
-						throw c.error("BAD_REQUEST", {
-							message: "Session expired",
-						});
 					}
 
 					return c.json(session);

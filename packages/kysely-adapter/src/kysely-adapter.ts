@@ -66,6 +66,13 @@ interface KyselyAdapterConfig {
 	transaction?: boolean | undefined;
 }
 
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
+
 export const kyselyAdapter = (
 	db: Kysely<any>,
 	config?: KyselyAdapterConfig | undefined,
@@ -563,6 +570,62 @@ export const kyselyAdapter = (
 					const builder = db.insertInto(model).values(data);
 					const returned = await withReturning(data, builder, model, []);
 					return returned;
+				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					const matchesAttempt = (row: any) =>
+						row != null && row[attemptBy.field] === attemptBy.value;
+
+					if (config?.type === "mysql") {
+						await db
+							.insertInto(model)
+							.values(data)
+							.onDuplicateKeyUpdate({
+								[uniqueBy.field]: sql.ref(uniqueBy.field),
+							})
+							.executeTakeFirst();
+						const row = await db
+							.selectFrom(model)
+							.selectAll()
+							.where(uniqueBy.field, "=", uniqueBy.value)
+							.limit(1)
+							.executeTakeFirst();
+						return matchesAttempt(row) ? (row as T) : null;
+					}
+
+					if (config?.type === "mssql") {
+						const claimFromTransaction = async (trx: any) => {
+							const existing = await sql<any>`SELECT TOP (1) * FROM ${sql.table(
+								model,
+							)} WITH (UPDLOCK, HOLDLOCK) WHERE ${sql.ref(
+								uniqueBy.field,
+							)} = ${uniqueBy.value}`.execute(trx);
+							if (existing.rows[0]) return null;
+							const inserted = await trx
+								.insertInto(model)
+								.values(data)
+								.outputAll("inserted")
+								.executeTakeFirst();
+							return matchesAttempt(inserted) ? (inserted as T) : null;
+						};
+						return inTransaction
+							? claimFromTransaction(db)
+							: db.transaction().execute(claimFromTransaction);
+					}
+
+					const inserted = await db
+						.insertInto(model)
+						.values(data)
+						.onConflict((conflict: any) =>
+							conflict.column(uniqueBy.field).doNothing(),
+						)
+						.returningAll()
+						.executeTakeFirst();
+					return matchesAttempt(inserted) ? (inserted as T) : null;
 				},
 				async findOne({ model, where, select, join }) {
 					const { and, or } = convertWhereClause(model, where);

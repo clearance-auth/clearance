@@ -15,6 +15,9 @@ import {
 	setSessionCookie,
 } from "../../cookies";
 import { parseSessionOutput, parseUserOutput } from "../../db/schema";
+import {
+	createInternalSessionIssuanceContext,
+} from "../../internal/session-issuance-context";
 import { getDate } from "../../utils/date";
 import type { AccessControl, ArrayElement } from "../access";
 import type { defaultStatements } from "./access";
@@ -1309,6 +1312,16 @@ export const impersonateUser = (opts: AdminOptions) =>
 						: getDate(60 * 60, "sec"), // 1 hour
 				},
 				true,
+				createInternalSessionIssuanceContext({
+					purpose: "impersonation",
+					subjectId: targetUser.id,
+					evidence: [
+						{
+							kind: "primary",
+							primaryMethod: "admin_impersonation",
+						},
+					],
+				}),
 			);
 			if (!session) {
 				throw APIError.from(

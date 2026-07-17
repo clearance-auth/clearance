@@ -76,14 +76,23 @@ import {
 	resolveRuntimeAuthenticationPolicy,
 } from "../internal/authentication-policy";
 import {
+	attachInternalSessionIssuanceCaptureAuthority,
 	ManagedSessionIssuanceError,
+	requireCapturedSessionIssuanceAuthority,
 	requireInternalSessionIssuanceContext,
 } from "../internal/session-issuance-context";
+import {
+	ManagedVerificationChallengeError,
+	requireInternalVerificationChallengeContext,
+	requireInternalVerificationConsumptionContext,
+	type InternalVerificationChallengeBinding,
+} from "../internal/verification-challenge-context";
 import {
 	evaluateSessionIssuance,
 	SESSION_ASSURANCE_RESERVED_FIELDS,
 	stripReservedSessionAuthority,
 	type SessionAssuranceFields,
+	type ValidatedSessionAssuranceFields,
 	validateStoredSessionAssurance,
 } from "../security/session-assurance";
 
@@ -118,6 +127,7 @@ export const createInternalAdapter = (
 	// Warn at most once when a single-use value is consumed through the
 	// non-atomic secondary-storage fallback (see consumeVerificationValue).
 	let warnedNonAtomicConsume = false;
+	let warnedManagedVerificationCleanupFailure = false;
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
 	const bindsTwoFactorSessionGeneration =
 		hasTwoFactorSessionGeneration(options);
@@ -135,6 +145,28 @@ export const createInternalAdapter = (
 		credentialKey: string;
 		expiresAt: number;
 	};
+	type VerificationReservationTombstone = {
+		id: string;
+		key: string;
+		state: "verification-reservation-v1";
+		phase: string;
+		cursor: string;
+		revision: number;
+		completedAt: Date;
+		createdAt: Date;
+		updatedAt: Date;
+	};
+	type ManagedVerificationChallengeMarker = {
+		id: string;
+		key: string;
+		state: "managed-verification-challenge-v2";
+		phase: string;
+		cursor: string;
+		revision: 2;
+		completedAt: Date;
+		createdAt: Date;
+		updatedAt: Date;
+	};
 	type SessionRotationResult = {
 		session: Session;
 		user: User;
@@ -146,6 +178,12 @@ export const createInternalAdapter = (
 		parentCredential: SessionCredential;
 		successorCredential: SessionCredential;
 	};
+	class ManagedSessionPublicationAuthorityInvalid extends Error {
+		constructor() {
+			super("Managed session publication authority is invalid");
+			this.name = "ManagedSessionPublicationAuthorityInvalid";
+		}
+	}
 	const recoveryCredentialRejected = Symbol("recovery-credential-rejected");
 	type SessionRecoveryAttempt =
 		| SessionRotationResult
@@ -163,25 +201,18 @@ export const createInternalAdapter = (
 		(!bindsPasskeySessionGeneration ||
 			sessionMatchesPasskeyGeneration(session, user));
 
-	async function validateRawSessionAuthority(
+	async function resolveRawSessionAssurance(
 		session: Record<string, unknown>,
 		user: User & Record<string, unknown>,
 		allowExpiredSession = false,
-	): Promise<boolean> {
+	): Promise<ValidatedSessionAssuranceFields | null> {
 		if (
 			(user as User & { banned?: boolean | null }).banned === true ||
 			!sessionMatchesSecurityGenerations(session, user)
 		) {
-			return false;
+			return null;
 		}
-		if (!authenticationPolicy) {
-			const now = new Date();
-			return (
-				session.expiresAt instanceof Date &&
-				Number.isFinite(session.expiresAt.getTime()) &&
-				session.expiresAt > now
-			);
-		}
+		if (!authenticationPolicy) return null;
 
 		const storedOrganizationId = session.authenticationPolicyOrganizationId;
 		if (
@@ -192,7 +223,7 @@ export const createInternalAdapter = (
 				storedOrganizationId.trim() !== storedOrganizationId ||
 				storedOrganizationId.includes("\0"))
 		) {
-			return false;
+			return null;
 		}
 		const organizationId = storedOrganizationId as string | null;
 		const activeOrganizationId = session.activeOrganizationId;
@@ -202,7 +233,7 @@ export const createInternalAdapter = (
 			(typeof activeOrganizationId !== "string" ||
 				activeOrganizationId !== organizationId)
 		) {
-			return false;
+			return null;
 		}
 
 		const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(options, {
@@ -216,19 +247,42 @@ export const createInternalAdapter = (
 			!Number.isFinite(session.expiresAt.getTime()) ||
 			(!allowExpiredSession && session.expiresAt <= now)
 		) {
-			return false;
+			return null;
+		}
+		const validation = validateStoredSessionAssurance({
+			stored: session,
+			policy: {
+				identity: resolvedPolicy.scope,
+				organizationId,
+				revision: resolvedPolicy.revision,
+				policy: resolvedPolicy.effective,
+			},
+			now,
+		});
+		return validation.kind === "accepted" ? validation.fields : null;
+	}
+
+	async function validateRawSessionAuthority(
+		session: Record<string, unknown>,
+		user: User & Record<string, unknown>,
+		allowExpiredSession = false,
+	): Promise<boolean> {
+		if (!authenticationPolicy) {
+			const now = new Date();
+			return (
+				(user as User & { banned?: boolean | null }).banned !== true &&
+				sessionMatchesSecurityGenerations(session, user) &&
+				session.expiresAt instanceof Date &&
+				Number.isFinite(session.expiresAt.getTime()) &&
+				(allowExpiredSession || session.expiresAt > now)
+			);
 		}
 		return (
-			validateStoredSessionAssurance({
-				stored: session,
-				policy: {
-					identity: resolvedPolicy.scope,
-					organizationId,
-					revision: resolvedPolicy.revision,
-					policy: resolvedPolicy.effective,
-				},
-				now,
-			}).kind === "accepted"
+			(await resolveRawSessionAssurance(
+				session,
+				user,
+				allowExpiredSession,
+			)) !== null
 		);
 	}
 
@@ -278,11 +332,14 @@ export const createInternalAdapter = (
 		session: Session & Record<string, unknown>;
 		user: User & Record<string, unknown>;
 	};
+	type AssuredValidatedSessionAuthority = ValidatedSessionAuthority & {
+		assurance: ValidatedSessionAssuranceFields | null;
+	};
 
 	async function loadValidatedSessionAuthority(
 		sessionId: string,
 		allowExpiredSession = false,
-	): Promise<ValidatedSessionAuthority | null> {
+	): Promise<AssuredValidatedSessionAuthority | null> {
 		const record = await findSessionRecordById(sessionId);
 		if (!record?.user) return null;
 		const activeUser = await lockAndReadActiveUser(
@@ -291,22 +348,32 @@ export const createInternalAdapter = (
 		);
 		if (!activeUser) return null;
 		const { user: _, ...session } = record;
+		const assurance = authenticationPolicy
+			? await resolveRawSessionAssurance(
+					session as Record<string, unknown>,
+					activeUser as User & Record<string, unknown>,
+					allowExpiredSession,
+				)
+			: null;
 		if (
-			!(await validateRawSessionAuthority(
-				session as Record<string, unknown>,
-				activeUser as User & Record<string, unknown>,
-				allowExpiredSession,
-			))
+			authenticationPolicy
+				? assurance === null
+				: !(await validateRawSessionAuthority(
+						session as Record<string, unknown>,
+						activeUser as User & Record<string, unknown>,
+						allowExpiredSession,
+					))
 		) {
 			return null;
 		}
 		return {
 			session: session as Session & Record<string, unknown>,
 			user: activeUser as User & Record<string, unknown>,
+			assurance,
 		};
 	}
 
-	type ManagedSessionUpdateAuthority = ValidatedSessionAuthority & {
+	type ManagedSessionUpdateAuthority = AssuredValidatedSessionAuthority & {
 		credential: SessionCredential | null;
 	};
 
@@ -390,23 +457,28 @@ export const createInternalAdapter = (
 			sessionId = legacy?.id ?? null;
 		}
 		if (!sessionId) return null;
+		if (!legacyCredentialAuthority) {
+			if (!credential) return null;
+			const authority = await loadStrictManagedSessionAuthority(
+				sessionId,
+				[credential],
+				allowExpired,
+			);
+			if (!authority || authority.lineage.active.id !== credential.id) {
+				return null;
+			}
+			return {
+				session: authority.session,
+				user: authority.user,
+				assurance: authority.assurance,
+				credential: authority.lineage.active,
+			};
+		}
 		const authority = await loadValidatedSessionAuthority(
 			sessionId,
 			allowExpired,
 		);
-		if (!authority) return null;
-		if (credential) {
-			const currentCredential = await findUniqueFutureActiveCredential(
-				sessionId,
-				credential,
-				!allowExpired,
-			);
-			if (!currentCredential || currentCredential.sessionId !== sessionId) {
-				return null;
-			}
-			credential = currentCredential;
-		}
-		return { ...authority, credential };
+		return authority ? { ...authority, credential: null } : null;
 	}
 
 	const immutableSessionUpdateFields = (
@@ -704,6 +776,10 @@ export const createInternalAdapter = (
 		new RegExp(
 			`^v${SESSION_CREDENTIAL_DIGEST_VERSION}:[A-Za-z0-9_-]{43}$`,
 		).test(value);
+	const isValidRotationNonceDigest = (value: unknown): value is string =>
+		typeof value === "string" && /^v1:[A-Za-z0-9_-]{43}$/.test(value);
+	const isValidCredentialDate = (value: unknown): value is Date =>
+		value instanceof Date && Number.isFinite(value.getTime());
 
 	async function findCanonicalManagedCredentialLineage(input: {
 		session: Session & Record<string, unknown>;
@@ -805,10 +881,100 @@ export const createInternalAdapter = (
 			child = parent;
 		}
 		if (chain.length !== all.length) return null;
+		const activeCredential = chain[0]!;
+		if (
+			!isValidCredentialDate(activeCredential.createdAt) ||
+			!isValidCredentialDate(activeCredential.updatedAt) ||
+			activeCredential.updatedAt < activeCredential.createdAt ||
+			activeCredential.consumedAt !== null ||
+			activeCredential.revokedAt !== null ||
+			activeCredential.reuseDetectedAt !== null ||
+			activeCredential.rotationNonceDigest !== null ||
+			activeCredential.recoverySecretCiphertext !== null ||
+			activeCredential.recoveryExpiresAt !== null
+		) {
+			return null;
+		}
+		for (let index = 1; index < chain.length; index += 1) {
+			const credential = chain[index]!;
+			if (
+				!isValidCredentialDate(credential.createdAt) ||
+				!isValidCredentialDate(credential.updatedAt) ||
+				!isValidCredentialDate(credential.consumedAt) ||
+				credential.updatedAt < credential.createdAt ||
+				credential.consumedAt < credential.createdAt ||
+				credential.updatedAt < credential.consumedAt ||
+				credential.revokedAt !== null ||
+				credential.reuseDetectedAt !== null ||
+				credential.recoverySecretCiphertext !== null
+			) {
+				return null;
+			}
+			const hasNoRecoveryTuple =
+				credential.rotationNonceDigest === null &&
+				credential.recoveryExpiresAt === null;
+			if (index > 1) {
+				if (!hasNoRecoveryTuple) return null;
+				continue;
+			}
+			const hasCompleteRecoveryTuple =
+				isValidRotationNonceDigest(credential.rotationNonceDigest) &&
+				isValidCredentialDate(credential.recoveryExpiresAt) &&
+				credential.recoveryExpiresAt > credential.consumedAt &&
+				credential.recoveryExpiresAt.getTime() <=
+					credential.consumedAt.getTime() +
+						SESSION_ROTATION_RECOVERY_WINDOW_MS;
+			if (!hasNoRecoveryTuple && !hasCompleteRecoveryTuple) return null;
+		}
 		return {
-			active: active[0]!,
+			active: activeCredential,
 			consumed: chain.filter((credential) => credential.status === "consumed"),
 		};
+	}
+
+	type StrictManagedSessionAuthority = AssuredValidatedSessionAuthority & {
+		lineage: {
+			active: SessionCredential;
+			consumed: SessionCredential[];
+		};
+	};
+
+	async function loadStrictManagedSessionAuthority(
+		sessionId: string,
+		credentialAnchors: readonly SessionCredential[],
+		allowExpiredSession = false,
+	): Promise<StrictManagedSessionAuthority | null> {
+		if (legacyCredentialAuthority || credentialAnchors.length === 0) return null;
+		let authority = await loadValidatedSessionAuthority(
+			sessionId,
+			allowExpiredSession,
+		);
+		if (!authority) return null;
+		const validateLineage = () =>
+			findCanonicalManagedCredentialLineage({
+				session: authority!.session,
+				credentialAnchors,
+				allowExpiredSession,
+				requireValidDigests: true,
+			});
+		let lineage = await validateLineage();
+		if (!lineage) {
+			const refreshed = await findSessionRecordById(sessionId);
+			const refreshedExpiresAt = refreshed?.expiresAt;
+			if (
+				refreshed?.user &&
+				refreshedExpiresAt instanceof Date &&
+				refreshedExpiresAt.getTime() !== authority.session.expiresAt.getTime()
+			) {
+				authority = await loadValidatedSessionAuthority(
+					sessionId,
+					allowExpiredSession,
+				);
+				if (!authority) return null;
+				lineage = await validateLineage();
+			}
+		}
+		return lineage ? { ...authority, lineage } : null;
 	}
 
 	async function publishManagedSessionAfterCommit(
@@ -869,6 +1035,7 @@ export const createInternalAdapter = (
 					session: authority.session,
 					credentialAnchors: expectation.credentialAnchors,
 					allowExpiredSession: expectation.allowExpiredSession,
+					requireValidDigests: true,
 					credentials,
 				});
 				if (lineage) {
@@ -896,8 +1063,23 @@ export const createInternalAdapter = (
 					...discoveredCredentialKeys,
 				],
 			});
-			throw new Error("Managed session publication authority is invalid");
+			throw new ManagedSessionPublicationAuthorityInvalid();
 		});
+	}
+
+	async function publishManagedSessionAfterCommitSafely(
+		expectation: ManagedSessionPublicationExpectation,
+	): Promise<void> {
+		try {
+			await publishManagedSessionAfterCommit(expectation);
+		} catch (error) {
+			logger.error(
+				error instanceof ManagedSessionPublicationAuthorityInvalid
+					? "Managed session publication authority became invalid after commit"
+					: "Managed session cache publication failed after commit",
+				error,
+			);
+		}
 	}
 
 	async function allSessionCredentialExpiriesMatch(
@@ -1009,6 +1191,163 @@ export const createInternalAdapter = (
 		deleteManyWithHooks,
 		consumeOneWithHooks,
 	} = getWithHooks(adapter, ctx);
+
+	const managedVerificationMarkerKey = async (verificationId: string) => {
+		const digest = base64Url.encode(
+			new Uint8Array(
+				await createHash("SHA-256").digest(
+					new TextEncoder().encode(
+						`managed-verification-challenge-v2:${verificationId}`,
+					),
+				),
+			),
+			{ padding: false },
+		);
+		return `managed-verification-challenge-v2:${digest}`;
+	};
+
+	const managedVerificationBindingDigest = async (
+		binding: InternalVerificationChallengeBinding,
+		verification: Verification,
+	) =>
+		base64Url.encode(
+			new Uint8Array(
+				await createHash("SHA-256").digest(
+					new TextEncoder().encode(
+						JSON.stringify([
+							"managed-verification-challenge-v2",
+							binding.purpose,
+							binding.subject,
+							binding.identifier,
+							verification.value,
+							verification.expiresAt.toISOString(),
+						]),
+					),
+				),
+			),
+			{ padding: false },
+		);
+
+	const consumeExactManagedVerificationMarker = async (
+		transactionAdapter: DBTransactionAdapter<ClearanceOptions>,
+		marker: ManagedVerificationChallengeMarker,
+	) =>
+		transactionAdapter.consumeOne<ManagedVerificationChallengeMarker>({
+			model: "securityMigration",
+			where: [
+				{ field: "id", value: marker.id },
+				{ field: "key", value: marker.key },
+				{ field: "state", value: marker.state },
+				{ field: "phase", value: marker.phase },
+				{ field: "cursor", value: marker.cursor },
+				{ field: "revision", value: marker.revision },
+				{ field: "completedAt", value: marker.completedAt },
+				{ field: "createdAt", value: marker.createdAt },
+				{ field: "updatedAt", value: marker.updatedAt },
+			],
+		});
+
+	async function reclaimExpiredManagedVerificationMarkers(
+		transactionAdapter: DBTransactionAdapter<ClearanceOptions>,
+		now: Date,
+	): Promise<void> {
+		const expired =
+			await transactionAdapter.findMany<ManagedVerificationChallengeMarker>({
+				model: "securityMigration",
+				where: [
+					{ field: "state", value: "managed-verification-challenge-v2" },
+					{ field: "completedAt", value: now, operator: "lte" },
+				],
+				sortBy: { field: "completedAt", direction: "asc" },
+				limit: 8,
+			});
+		for (const marker of expired) {
+			if (
+				marker.state !== "managed-verification-challenge-v2" ||
+				!(marker.completedAt instanceof Date) ||
+				!Number.isFinite(marker.completedAt.getTime()) ||
+				marker.completedAt > now
+			) {
+				continue;
+			}
+			await consumeExactManagedVerificationMarker(transactionAdapter, marker);
+		}
+	}
+
+	async function createManagedVerificationMarker(
+		transactionAdapter: DBTransactionAdapter<ClearanceOptions>,
+		verification: Verification,
+		binding: InternalVerificationChallengeBinding,
+	): Promise<void> {
+		const verificationId = String(verification.id ?? "");
+		if (
+			verificationId.length === 0 ||
+			!(verification.expiresAt instanceof Date) ||
+			!Number.isFinite(verification.expiresAt.getTime())
+		) {
+			throw new Error("Managed verification challenge is malformed");
+		}
+		const now = new Date();
+		await reclaimExpiredManagedVerificationMarkers(transactionAdapter, now);
+		const idStrategy = options.advanced?.database?.generateId;
+		const databaseGeneratesId = idStrategy === "serial" || idStrategy === "uuid";
+		await transactionAdapter.create({
+			model: "securityMigration",
+			forceAllowId: !databaseGeneratesId,
+			data: {
+				...(databaseGeneratesId ? {} : { id: generateId() }),
+				key: await managedVerificationMarkerKey(verificationId),
+				state: "managed-verification-challenge-v2",
+				phase: generateId(),
+				cursor: await managedVerificationBindingDigest(binding, verification),
+				revision: 2,
+				completedAt: verification.expiresAt,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+	}
+
+	async function consumeManagedVerificationMarker(
+		transactionAdapter: DBTransactionAdapter<ClearanceOptions>,
+		verification: Verification,
+		binding: InternalVerificationChallengeBinding,
+	): Promise<ManagedVerificationChallengeMarker | null> {
+		const verificationId = String(verification.id ?? "");
+		if (
+			verificationId.length === 0 ||
+			!(verification.expiresAt instanceof Date) ||
+			!Number.isFinite(verification.expiresAt.getTime()) ||
+			verification.expiresAt <= new Date()
+		) {
+			return null;
+		}
+		const key = await managedVerificationMarkerKey(verificationId);
+		const bindingDigest = await managedVerificationBindingDigest(
+			binding,
+			verification,
+		);
+		const marker =
+			await transactionAdapter.findOne<ManagedVerificationChallengeMarker>({
+				model: "securityMigration",
+				where: [{ field: "key", value: key }],
+			});
+		if (
+			!marker ||
+			marker.key !== key ||
+			marker.state !== "managed-verification-challenge-v2" ||
+			typeof marker.phase !== "string" ||
+			marker.phase.length === 0 ||
+			marker.cursor !== bindingDigest ||
+			marker.revision !== 2 ||
+			!(marker.completedAt instanceof Date) ||
+			marker.completedAt.getTime() !== verification.expiresAt.getTime() ||
+			marker.completedAt <= new Date()
+		) {
+			return null;
+		}
+		return consumeExactManagedVerificationMarker(transactionAdapter, marker);
+	}
 
 	async function refreshUserSessions(user: User) {
 		if (!secondaryStorage) return;
@@ -1942,6 +2281,18 @@ export const createInternalAdapter = (
 			if (successor.expiresAt <= new Date()) {
 				return recoveryCredentialRejected;
 			}
+			const lineage = await findCanonicalManagedCredentialLineage({
+				session: authority.session,
+				credentialAnchors: [parent, successor],
+				requireValidDigests: true,
+			});
+			if (
+				!lineage ||
+				lineage.active.id !== successor.id ||
+				!lineage.consumed.some((candidate) => candidate.id === parent.id)
+			) {
+				return recoveryCredentialRejected;
+			}
 			return { parent, successor };
 		};
 
@@ -1986,10 +2337,31 @@ export const createInternalAdapter = (
 	async function queueManagedRotationPublication(
 		rotation: SessionRotationResult,
 	): Promise<void> {
+		const expectedSession = {
+			...rotation.session,
+			token: createSessionHandle(rotation.session.id),
+		} as Session & Record<string, unknown>;
+		await queueBeforeTransactionCommitHook(async () => {
+			const authority = await loadStrictManagedSessionAuthority(
+				rotation.session.id,
+				[rotation.parentCredential, rotation.successorCredential],
+			);
+			if (
+				!authority ||
+				authority.user.id !== rotation.user.id ||
+				authority.lineage.active.id !== rotation.successorCredential.id ||
+				!authority.lineage.consumed.some(
+					(candidate) => candidate.id === rotation.parentCredential.id,
+				) ||
+				!sameImmutableSessionAuthority(authority.session, expectedSession)
+			) {
+				throw new ManagedSessionRotationRejected();
+			}
+		}, adapter);
 		if (!secondaryStorage) return;
 		await queueAfterTransactionHook(
 			() =>
-				publishManagedSessionAfterCommit({
+				publishManagedSessionAfterCommitSafely({
 					session: {
 						...rotation.session,
 						token: createSessionHandle(rotation.session.id),
@@ -2321,6 +2693,11 @@ export const createInternalAdapter = (
 			const managedIssuanceContext = authenticationPolicy
 				? requireInternalSessionIssuanceContext(issuanceContext)
 				: undefined;
+			const capturedIssuanceAuthority =
+				managedIssuanceContext?.purpose === "replacement" ||
+				managedIssuanceContext?.purpose === "device"
+					? requireCapturedSessionIssuanceAuthority(issuanceContext)
+					: undefined;
 			if (
 				(managedIssuanceContext?.purpose === "interactive" ||
 					managedIssuanceContext?.purpose === "impersonation") &&
@@ -2329,16 +2706,11 @@ export const createInternalAdapter = (
 				throw new ManagedSessionIssuanceError("subject_mismatch");
 			}
 			if (
-				managedIssuanceContext?.purpose === "replacement" ||
-				managedIssuanceContext?.purpose === "device"
+				capturedIssuanceAuthority &&
+				capturedIssuanceAuthority.sourceSubjectId !== userId
 			) {
-				throw new ManagedSessionIssuanceError("unsupported_purpose");
+				throw new ManagedSessionIssuanceError("subject_mismatch");
 			}
-			const supportedManagedIssuanceContext =
-				managedIssuanceContext?.purpose === "interactive" ||
-				managedIssuanceContext?.purpose === "impersonation"
-					? managedIssuanceContext
-					: undefined;
 			const headers: Headers | undefined = await (async () => {
 				const ctx = await getCurrentAuthContext().catch(() => null);
 				return ctx?.headers || ctx?.request?.headers;
@@ -2392,13 +2764,18 @@ export const createInternalAdapter = (
 			const inheritedExpiresAt = new Date(
 				(rest.expiresAt as string | number | Date | undefined) ?? Number.NaN,
 			);
-			const expiresAt =
+			const requestedExpiresAt =
 				__preserveSessionExpiresAt === true &&
 				Number.isFinite(inheritedExpiresAt.getTime()) &&
 				inheritedExpiresAt > new Date() &&
 				inheritedExpiresAt < policyExpiresAt
 					? inheritedExpiresAt
 					: policyExpiresAt;
+			const expiresAt =
+				capturedIssuanceAuthority?.sourceExpiresAt &&
+				capturedIssuanceAuthority.sourceExpiresAt < requestedExpiresAt
+					? new Date(capturedIssuanceAuthority.sourceExpiresAt)
+					: requestedExpiresAt;
 			const buildSessionData = (
 				twoFactorSessionGeneration?: string,
 				passkeySessionGeneration?: string,
@@ -2461,6 +2838,7 @@ export const createInternalAdapter = (
 				return {
 					...safeHookedData,
 					...(requestedSessionId ? { id: requestedSessionId } : {}),
+					expiresAt,
 					userId,
 					token: legacyCredentialAuthority
 						? refreshSecret
@@ -2576,10 +2954,18 @@ export const createInternalAdapter = (
 					}
 				}
 				const currentAdapter = await getCurrentAdapter(adapter);
+				if (
+					capturedIssuanceAuthority &&
+					(capturedIssuanceAuthority.transactionAdapter !== currentAdapter ||
+						capturedIssuanceAuthority.sourceExpiresAt <= new Date())
+				) {
+					throw new ManagedSessionIssuanceError("context_invalid");
+				}
 				let assuranceFields: SessionAssuranceFields | undefined;
-				if (authenticationPolicy && supportedManagedIssuanceContext) {
+				if (authenticationPolicy && managedIssuanceContext) {
 					const targetOrganizationId =
-						supportedManagedIssuanceContext.targetOrganizationId ?? undefined;
+						(capturedIssuanceAuthority?.sourceOrganizationId ??
+							managedIssuanceContext.targetOrganizationId) || undefined;
 					const resolvedPolicy = await resolveRuntimeAuthenticationPolicy(
 						options,
 						{
@@ -2591,7 +2977,7 @@ export const createInternalAdapter = (
 						},
 					);
 					const evaluation = evaluateSessionIssuance({
-						purpose: supportedManagedIssuanceContext.purpose,
+						purpose: managedIssuanceContext.purpose,
 						policy: {
 							identity: resolvedPolicy.scope,
 							organizationId: targetOrganizationId ?? null,
@@ -2599,7 +2985,17 @@ export const createInternalAdapter = (
 							policy: resolvedPolicy.effective,
 						},
 						now: new Date(),
-						evidence: supportedManagedIssuanceContext.evidence,
+						evidence:
+							managedIssuanceContext.purpose === "interactive" ||
+							managedIssuanceContext.purpose === "impersonation"
+								? managedIssuanceContext.evidence
+								: [],
+						...(capturedIssuanceAuthority
+							? {
+									sourceAssurance:
+										capturedIssuanceAuthority.sourceAssurance,
+								}
+							: {}),
 					});
 					if (evaluation.kind !== "satisfied") {
 						throw new ManagedSessionIssuanceError("policy_unsatisfied", {
@@ -2808,8 +3204,58 @@ export const createInternalAdapter = (
 						const { user: _finalUser, ...finalSessionData } = finalRecord ?? {};
 						const finalSession = finalSessionData as Session &
 							Record<string, unknown>;
+						let capturedReplacementSourceRetired = true;
+						if (
+							managedIssuanceContext?.purpose === "replacement" &&
+							capturedIssuanceAuthority
+						) {
+							const sourceSession = await currentAdapter.findOne<Session>({
+								model: "session",
+								where: [
+									{
+										field: "id",
+										value: capturedIssuanceAuthority.sourceSessionId,
+									},
+								],
+							});
+							if (legacyCredentialAuthority) {
+								capturedReplacementSourceRetired = sourceSession === null;
+							} else {
+								const activeSourceCredentials =
+									await currentAdapter.findMany<SessionCredential>({
+											model: SESSION_CREDENTIAL_MODEL,
+											where: [
+												{
+													field: "sessionId",
+													value:
+														capturedIssuanceAuthority.sourceSessionId,
+												},
+												{ field: "status", value: "active" },
+											],
+									});
+								const capturedSourceCredential =
+										capturedIssuanceAuthority.sourceCredentialId === null
+											? null
+											: await currentAdapter.findOne<SessionCredential>({
+													model: SESSION_CREDENTIAL_MODEL,
+													where: [
+														{
+															field: "id",
+															value:
+																capturedIssuanceAuthority.sourceCredentialId,
+														},
+													],
+												});
+								capturedReplacementSourceRetired =
+									activeSourceCredentials.length === 0 &&
+									capturedSourceCredential?.status !== "active";
+							}
+						}
 						if (
 							!activeUser ||
+							!capturedReplacementSourceRetired ||
+							capturedIssuanceAuthority?.sourceSessionId ===
+								persistedSessionId ||
 							finalRecord?.user?.id !== activeUser.id ||
 							!(await validateRawSessionAuthority(
 								finalSession,
@@ -2850,6 +3296,7 @@ export const createInternalAdapter = (
 							const lineage = await findCanonicalManagedCredentialLineage({
 								session: finalSession,
 								credentialAnchors: [expectedCredential],
+								requireValidDigests: true,
 							});
 							if (
 								!lineage ||
@@ -2873,7 +3320,7 @@ export const createInternalAdapter = (
 						if (secondaryStorage) {
 							await queueAfterTransactionHook(
 								() =>
-									publishManagedSessionAfterCommit({
+									publishManagedSessionAfterCommitSafely({
 										session: finalSession,
 										userId,
 										credentialAnchors: expectedCredential
@@ -3143,8 +3590,10 @@ export const createInternalAdapter = (
 			if (!storesSessionsInDatabase) return null;
 			const operationKey = parseCredentialOperationKey(idempotencyKey);
 			if (!operationKey) return null;
-			const recovered = await runWithTransaction(adapter, async () => {
-				const currentAdapter = await getCurrentAdapter(adapter);
+			let recovered: SessionRecoveryAttempt;
+			try {
+				recovered = await runWithTransaction(adapter, async () => {
+					const currentAdapter = await getCurrentAdapter(adapter);
 				const digest = await digestSessionRefreshSecret(token);
 				const credentialId = credentialIdFromRefreshSecret(token);
 				const credential = credentialId
@@ -3172,8 +3621,12 @@ export const createInternalAdapter = (
 				if (recovery && recovery !== recoveryCredentialRejected) {
 					await queueManagedRotationPublication(recovery);
 				}
-				return recovery;
-			});
+					return recovery;
+				});
+			} catch (error) {
+				if (error instanceof ManagedSessionRotationRejected) return null;
+				throw error;
+			}
 			if (!recovered || recovered === recoveryCredentialRejected) return null;
 			const {
 				oldDigest: _,
@@ -3235,37 +3688,53 @@ export const createInternalAdapter = (
 				) {
 					return null;
 				}
+				const recoverConsumedCredential = async (
+					consumedCredential: SessionCredential,
+					validatedAuthority: ValidatedSessionAuthority,
+				): Promise<SessionRotationResult | null> => {
+					const recovered = await recoverRecentSessionRotation(
+						consumedCredential,
+						rotationNonceDigest,
+						rotationOperation,
+						digest,
+						validatedAuthority,
+					);
+					if (recovered === recoveryCredentialRejected) return null;
+					if (recovered) {
+						await queueManagedRotationPublication(recovered);
+						return recovered;
+					}
+					await revokeAndDeleteSessionById(
+						consumedCredential.sessionId!,
+						new Date(),
+					);
+					return null;
+				};
 				if (credential.status !== "active") {
 					if (credential.status === "consumed") {
-						const authority = await loadValidatedSessionAuthority(
-							credential.sessionId,
-						);
+						const authority = await loadValidatedSessionAuthority(credential.sessionId);
 						if (!authority) return null;
-						const recovered = await recoverRecentSessionRotation(
-							credential,
-							rotationNonceDigest,
-							rotationOperation,
-							digest,
-							authority,
-						);
-						if (recovered === recoveryCredentialRejected) return null;
-						if (recovered) {
-							await queueManagedRotationPublication(recovered);
-							return recovered;
-						}
-						await revokeAndDeleteSessionById(
-							credential.sessionId,
-							new Date(),
-						);
+						return recoverConsumedCredential(credential, authority);
 					}
 					return null;
 				}
 				if (credential.expiresAt <= new Date()) return null;
 
-				const authority = await loadValidatedSessionAuthority(
+				const authority = await loadStrictManagedSessionAuthority(
 					credential.sessionId,
+					[credential],
 				);
 				if (!authority) return null;
+				if (authority.lineage.active.id !== credential.id) {
+					const transitionedCredential = await rereadExactCredential(credential);
+					if (transitionedCredential?.status === "consumed") {
+						return recoverConsumedCredential(
+							transitionedCredential,
+							authority,
+						);
+					}
+					return null;
+				}
 
 				const [derivedSuccessor] = await deriveRotationSuccessors(
 					credential,
@@ -3285,25 +3754,31 @@ export const createInternalAdapter = (
 				const recoveryExpiresAt = new Date(
 					consumedAt.getTime() + SESSION_ROTATION_RECOVERY_WINDOW_MS,
 				);
+				const rotationGuard: Where[] = [
+					{ field: "id", value: activeCredential.id },
+					{ field: "sessionId", value: activeSessionId },
+					{ field: "status", value: "active" },
+					{ field: "secretDigest", value: digest },
+					{ field: "familyId", value: activeCredential.familyId },
+					{
+						field: "rotationCounter",
+						value: activeCredential.rotationCounter,
+					},
+					{ field: "expiresAt", value: activeCredential.expiresAt },
+					{ field: "expiresAt", value: consumedAt, operator: "gt" },
+				];
+				// Serial-ID adapters transform reference operands through Number().
+				// Omitting the already-validated root null avoids turning SQL NULL into 0;
+				// every non-root rotation still binds the exact parent foreign key.
+				if (activeCredential.parentCredentialId != null) {
+					rotationGuard.push({
+						field: "parentCredentialId",
+						value: activeCredential.parentCredentialId,
+					});
+				}
 				const consumed = await currentAdapter.incrementOne<SessionCredential>({
 					model: SESSION_CREDENTIAL_MODEL,
-					where: [
-						{ field: "id", value: activeCredential.id },
-						{ field: "sessionId", value: activeSessionId },
-						{ field: "status", value: "active" },
-						{ field: "secretDigest", value: digest },
-						{ field: "familyId", value: activeCredential.familyId },
-						{
-							field: "rotationCounter",
-							value: activeCredential.rotationCounter,
-						},
-						{
-							field: "parentCredentialId",
-							value: activeCredential.parentCredentialId ?? null,
-						},
-						{ field: "expiresAt", value: activeCredential.expiresAt },
-						{ field: "expiresAt", value: consumedAt, operator: "gt" },
-					],
+					where: rotationGuard,
 					increment: {},
 					set: {
 						status: "consumed",
@@ -3338,17 +3813,11 @@ export const createInternalAdapter = (
 					return null;
 				}
 
-				const committedAuthority = await loadValidatedSessionAuthority(
-					activeSessionId,
-				);
 				const persistedParent = await rereadExactCredential(consumed);
 				if (
 					!persistedParent ||
 					persistedParent.status !== "consumed" ||
-					persistedParent.expiresAt <= consumedAt ||
-					!committedAuthority ||
-					committedAuthority.session.expiresAt.getTime() !==
-						persistedParent.expiresAt.getTime()
+					persistedParent.expiresAt <= consumedAt
 				) {
 					throw new ManagedSessionRotationRejected();
 				}
@@ -3389,6 +3858,19 @@ export const createInternalAdapter = (
 							updatedAt: consumedAt,
 						},
 					});
+				}
+				const committedAuthority = await loadStrictManagedSessionAuthority(
+					activeSessionId,
+					[persistedParent, persistedSuccessor],
+				);
+				if (
+					!committedAuthority ||
+					committedAuthority.lineage.active.id !== persistedSuccessor.id ||
+					!committedAuthority.lineage.consumed.some(
+						(candidate) => candidate.id === persistedParent.id,
+					)
+				) {
+					throw new ManagedSessionRotationRejected();
 				}
 				const result: SessionRotationResult = {
 					session: {
@@ -3657,7 +4139,7 @@ export const createInternalAdapter = (
 										);
 								await queueAfterTransactionHook(
 									() =>
-										publishManagedSessionAfterCommit({
+										publishManagedSessionAfterCommitSafely({
 											session: final.session,
 											userId: final.session.userId,
 											credentialAnchors: committedCredential
@@ -4437,6 +4919,7 @@ export const createInternalAdapter = (
 		createVerificationValue: async (
 			data: Omit<Verification, "createdAt" | "id" | "updatedAt"> &
 				Partial<Verification>,
+			challengeContext,
 		) => {
 			const storageOption = getStorageOption(
 				data.identifier,
@@ -4446,6 +4929,92 @@ export const createInternalAdapter = (
 				data.identifier,
 				storageOption,
 			);
+			if (authenticationPolicy) {
+				const provenance = requireInternalVerificationChallengeContext(
+					challengeContext,
+				);
+				if (
+					provenance.identifier !== data.identifier ||
+					provenance.value !== data.value ||
+					!(data.expiresAt instanceof Date) ||
+					provenance.expiresAt.getTime() !== data.expiresAt.getTime()
+				) {
+					throw new ManagedVerificationChallengeError("challenge_mismatch");
+				}
+				if (
+					typeof adapter.options?.adapterConfig.transaction !== "function"
+				) {
+					throw new Error(
+						"Managed verification challenge issuance requires rollback-capable database transactions",
+					);
+				}
+				return runWithTransaction(adapter, async () => {
+					const secondaryOnly =
+						Boolean(secondaryStorage) &&
+						options.verification?.storeInDatabase !== true;
+					const now = new Date();
+					const assertUnchangedChallenge = (
+						verification: Verification,
+					) => {
+						if (
+							verification.identifier !== storedIdentifier ||
+							verification.value !== provenance.value ||
+							!(verification.expiresAt instanceof Date) ||
+							verification.expiresAt.getTime() !==
+								provenance.expiresAt.getTime()
+						) {
+							throw new ManagedVerificationChallengeError(
+								"challenge_mismatch",
+							);
+						}
+					};
+					const verification = (await createWithHooks(
+						{
+							...data,
+							...(secondaryOnly ? { id: generateId() } : {}),
+							identifier: storedIdentifier,
+							createdAt: data.createdAt ?? now,
+							updatedAt: data.updatedAt ?? now,
+						},
+						"verification",
+						secondaryStorage
+							? {
+									executeMainFn:
+										options.verification?.storeInDatabase === true,
+									usesTransactionAdapter: true,
+									async fn(verificationData, transactionAdapter) {
+										const created = verificationData as Verification;
+										assertUnchangedChallenge(created);
+										await createManagedVerificationMarker(
+											transactionAdapter,
+											created,
+											provenance,
+										);
+										await queueAfterTransactionHook(async () => {
+											const ttl = getTTLSeconds(created.expiresAt);
+											if (ttl <= 0) return;
+											await secondaryStorage.set(
+												`verification:${storedIdentifier}`,
+												JSON.stringify(created),
+												ttl,
+											);
+										}, adapter);
+										return created;
+									},
+								}
+								: undefined,
+					)) as Verification;
+					assertUnchangedChallenge(verification);
+					if (!secondaryStorage) {
+						await createManagedVerificationMarker(
+							await getCurrentAdapter(adapter),
+							verification,
+							provenance,
+						);
+					}
+					return verification;
+				});
+			}
 
 			const verification = await createWithHooks(
 				{
@@ -4593,6 +5162,7 @@ export const createInternalAdapter = (
 		 */
 		consumeVerificationValue: async (
 			identifier: string,
+			challengeContext,
 		): Promise<Verification | null> => {
 			const storageOption = getStorageOption(
 				identifier,
@@ -4622,6 +5192,120 @@ export const createInternalAdapter = (
 				if (!Number.isFinite(expiresAt.getTime())) return null;
 				return { ...candidate, expiresAt };
 			};
+
+			if (authenticationPolicy) {
+				if (!(await isTransactionActive(adapter))) {
+					throw new Error(
+						"Managed verification challenge consumption requires an active primary transaction",
+					);
+				}
+				const provenance = requireInternalVerificationConsumptionContext(
+					challengeContext,
+				);
+				if (provenance.identifier !== identifier) {
+					throw new ManagedVerificationChallengeError("binding_mismatch");
+				}
+				const transactionAdapter = await getCurrentAdapter(adapter);
+				const queueSecondaryCleanup = async () => {
+					if (!secondaryStorage) return;
+					await queueAfterTransactionHook(async () => {
+						try {
+							await Promise.all(
+								identifiersToTry.map((stored) =>
+									secondaryStorage.delete(`verification:${stored}`),
+								),
+							);
+						} catch {
+							if (!warnedManagedVerificationCleanupFailure) {
+								warnedManagedVerificationCleanupFailure = true;
+								logger.error(
+									"Managed verification cache cleanup failed after commit",
+								);
+							}
+						}
+					}, adapter);
+				};
+
+				if (secondaryStorage && !options.verification?.storeInDatabase) {
+					let cached: Verification | null = null;
+					for (const stored of identifiersToTry) {
+						cached = hydrateCachedVerification(
+							await secondaryStorage.get(`verification:${stored}`),
+						);
+						if (cached) break;
+					}
+					if (
+						!cached ||
+						typeof cached.id !== "string" ||
+						cached.id.length === 0 ||
+						cached.expiresAt <= new Date()
+					) {
+						return null;
+					}
+					const marker = await consumeManagedVerificationMarker(
+						transactionAdapter,
+						cached,
+						provenance,
+					);
+					if (!marker) return null;
+					await queueSecondaryCleanup();
+					return cached;
+				}
+
+				let latest: Verification | null = null;
+				let matchedIdentifier: string | null = null;
+				for (const stored of identifiersToTry) {
+					const rows = await transactionAdapter.findMany<Verification>({
+						model: "verification",
+						where: [{ field: "identifier", value: stored }],
+						sortBy: { field: "createdAt", direction: "desc" },
+						limit: 1,
+					});
+					if (rows[0]) {
+						latest = rows[0];
+						matchedIdentifier = stored;
+						break;
+					}
+				}
+				if (
+					!latest ||
+					!matchedIdentifier ||
+					!(latest.expiresAt instanceof Date) ||
+					latest.expiresAt <= new Date()
+				) {
+					return null;
+				}
+				const marker = await consumeManagedVerificationMarker(
+					transactionAdapter,
+					latest,
+					provenance,
+				);
+				if (!marker) return null;
+				const consumed = await consumeOneWithHooks<Verification>(
+					"verification",
+					[{ field: "id", value: latest.id }],
+					async (currentAdapter) => {
+						const row = await currentAdapter.consumeOne<Verification>({
+							model: "verification",
+							where: [{ field: "id", value: latest!.id }],
+						});
+						if (!row) return null;
+						await currentAdapter.deleteMany({
+							model: "verification",
+							where: [{ field: "identifier", value: matchedIdentifier! }],
+						});
+						return row;
+					},
+					latest,
+				);
+				if (!consumed) {
+					throw new Error(
+						"Managed verification challenge changed during consumption",
+					);
+				}
+				await queueSecondaryCleanup();
+				return consumed;
+			}
 
 			let consumed: Verification | null = null;
 
@@ -4722,7 +5406,7 @@ export const createInternalAdapter = (
 			return consumed;
 		},
 		/**
-		 * First-writer-wins create keyed by a deterministic primary key derived
+		 * First-writer-wins create keyed by a deterministic database key derived
 		 * from `identifier`. Returns `true` when this caller created the row and
 		 * `false` when a row for the same identifier already existed.
 		 *
@@ -4732,24 +5416,21 @@ export const createInternalAdapter = (
 		 * first caller wins and every later caller must observe that the marker is
 		 * already taken.
 		 *
-		 * The `verification.identifier` column is non-unique, so uniqueness comes
-		 * from a deterministic primary key (`SHA-256` of `reserve:<identifier>`).
-		 * The database path is atomic: the primary key turns the INSERT into the
-		 * first-writer-wins gate, and a duplicate is detected portably by
-		 * re-reading the row rather than matching adapter-specific errors. The
-		 * secondary-storage-only path has no primary key to enforce uniqueness, so
-		 * it is best-effort under concurrency.
+		 * Uniqueness comes from a digest-keyed row in the always-present primary
+		 * security ledger. Its unique `key` is authoritative for every configured id
+		 * strategy and verification storage mode. The reservation primitive never
+		 * copies raw replay material into secondary storage.
 		 *
-		 * The atomic guarantee requires the configured adapter to reject a
-		 * duplicate primary key on insert, which every real database enforces. The
-		 * in-memory adapter does not enforce primary-key uniqueness, so reservation
-		 * is best-effort there (it is intended for development and tests).
+		 * The adapter's native create-if-absent operation classifies an expected
+		 * conflict without raising a uniqueness error, so losers remain usable even
+		 * inside PostgreSQL transactions.
 		 */
 		reserveVerificationValue: async (data: {
 			identifier: string;
 			value: string;
 			expiresAt: Date;
 		}): Promise<boolean> => {
+			const primaryReservationAdapter = await getCurrentAdapter(adapter);
 			const reservationId = base64Url.encode(
 				new Uint8Array(
 					await createHash("SHA-256").digest(
@@ -4758,82 +5439,113 @@ export const createInternalAdapter = (
 				),
 				{ padding: false },
 			);
-			const storageOption = getStorageOption(
-				data.identifier,
-				options.verification?.storeIdentifier,
+			// Use the always-present primary security ledger as the reservation gate
+			// for every id strategy and storage mode. Only digests enter this row.
+			const tombstoneKey = `verification-reservation-v1:${reservationId}`;
+			const idStrategy = options.advanced?.database?.generateId;
+			const databaseGeneratesTombstoneId =
+				idStrategy === "serial" || idStrategy === "uuid";
+			const valueDigest = base64Url.encode(
+				new Uint8Array(
+					await createHash("SHA-256").digest(
+						new TextEncoder().encode("value:" + data.value),
+					),
+				),
+				{ padding: false },
 			);
-			const storedIdentifier = await processIdentifier(
-				data.identifier,
-				storageOption,
-			);
-
-			if (secondaryStorage && !options.verification?.storeInDatabase) {
-				// Best-effort under concurrency: without a database primary key there
-				// is no first-writer-wins gate, so two callers racing a get-then-set
-				// can both observe an empty key and both win (mirrors the non-atomic
-				// secondary fallback in consumeVerificationValue).
-				// FIXME(reserve-secondary-atomic): require an atomic conditional set
-				// (set-if-absent) on SecondaryStorage, or require database-backed
-				// verification storage for reservations, so this path can guarantee
-				// first-writer-wins across processes.
-				const cacheKey = `verification:${storedIdentifier}`;
-				const existing = await secondaryStorage.get(cacheKey);
-				if (existing) return false;
-				await secondaryStorage.set(
-					cacheKey,
-					JSON.stringify({
-						id: reservationId,
-						identifier: storedIdentifier,
-						value: data.value,
-						expiresAt: data.expiresAt,
+			const reclaimExact = async (
+				tombstone: VerificationReservationTombstone,
+			): Promise<boolean> =>
+				Boolean(
+					await primaryReservationAdapter.consumeOne<VerificationReservationTombstone>({
+						model: "securityMigration",
+						where: [
+							{ field: "id", value: tombstone.id },
+							{ field: "key", value: tombstone.key },
+							{ field: "state", value: tombstone.state },
+							{ field: "phase", value: tombstone.phase },
+							{ field: "cursor", value: tombstone.cursor },
+							{ field: "revision", value: tombstone.revision },
+							{ field: "completedAt", value: tombstone.completedAt },
+							{ field: "updatedAt", value: tombstone.updatedAt },
+						],
 					}),
-					getTTLSeconds(data.expiresAt),
 				);
-				return true;
+
+			// Reclaim a bounded global batch because one-time JTIs rarely collide again.
+			// Exact predicates keep a concurrently replaced row safe.
+			const gcNow = new Date();
+			const expired =
+				await primaryReservationAdapter.findMany<VerificationReservationTombstone>({
+					model: "securityMigration",
+					where: [
+						{ field: "state", value: "verification-reservation-v1" },
+						{ field: "completedAt", value: gcNow, operator: "lte" },
+					],
+					sortBy: { field: "completedAt", direction: "asc" },
+					limit: 8,
+				});
+			for (const tombstone of expired) {
+				await reclaimExact(tombstone);
 			}
 
-			try {
-				await adapter.create({
-					model: "verification",
-					data: {
-						id: reservationId,
-						identifier: storedIdentifier,
-						value: data.value,
-						expiresAt: data.expiresAt,
-						createdAt: new Date(),
-						updatedAt: new Date(),
-					},
-					forceAllowId: true,
-				});
-			} catch (error) {
-				// A create error is ambiguous across adapters: confirm it was a
-				// duplicate (the row exists) rather than a real failure before
-				// reporting "lost".
-				const existing = await adapter.findOne<Verification>({
-					model: "verification",
-					where: [{ field: "id", value: reservationId }],
-				});
-				if (existing) return false;
-				throw error;
-			}
-
-			if (secondaryStorage) {
-				const ttl = getTTLSeconds(data.expiresAt);
-				if (ttl > 0) {
-					await secondaryStorage.set(
-						`verification:${storedIdentifier}`,
-						JSON.stringify({
-							id: reservationId,
-							identifier: storedIdentifier,
-							value: data.value,
-							expiresAt: data.expiresAt,
-						}),
-						ttl,
-					);
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				const now = new Date();
+				const existing =
+					await primaryReservationAdapter.findOne<VerificationReservationTombstone>({
+						model: "securityMigration",
+						where: [{ field: "key", value: tombstoneKey }],
+					});
+				if (existing) {
+					if (
+						existing.state !== "verification-reservation-v1" ||
+						existing.key !== tombstoneKey
+					) {
+						throw new Error("Verification reservation key is occupied");
+					}
+					if (existing.completedAt > now) return false;
+					if (!(await reclaimExact(existing))) return false;
 				}
-			}
 
-			return true;
+				const cleanupNonce = generateId();
+				const candidate = {
+					...(databaseGeneratesTombstoneId ? {} : { id: reservationId }),
+					key: tombstoneKey,
+					state: "verification-reservation-v1" as const,
+					phase: cleanupNonce,
+					cursor: valueDigest,
+					revision: 1,
+					completedAt: data.expiresAt,
+					createdAt: now,
+					updatedAt: now,
+				};
+				const claimed =
+					await primaryReservationAdapter.createIfAbsent<VerificationReservationTombstone>({
+						model: "securityMigration",
+						data: candidate as VerificationReservationTombstone,
+						uniqueBy: { field: "key", value: tombstoneKey },
+						attemptBy: { field: "phase", value: cleanupNonce },
+						forceAllowId: !databaseGeneratesTombstoneId,
+					});
+				if (claimed) return true;
+
+				const winner =
+					await primaryReservationAdapter.findOne<VerificationReservationTombstone>({
+						model: "securityMigration",
+						where: [{ field: "key", value: tombstoneKey }],
+					});
+				if (!winner) continue;
+				if (
+					winner.state !== "verification-reservation-v1" ||
+					winner.key !== tombstoneKey
+				) {
+					throw new Error("Verification reservation key is occupied");
+				}
+				if (winner.completedAt > new Date()) return false;
+				if (attempt === 0 && (await reclaimExact(winner))) continue;
+				return false;
+			}
+			return false;
 		},
 		updateVerificationByIdentifier: async (
 			identifier: string,
@@ -4887,5 +5599,49 @@ export const createInternalAdapter = (
 		},
 		refreshUserSessions,
 	};
+	if (authenticationPolicy) {
+		attachInternalSessionIssuanceCaptureAuthority(
+			internalAdapter,
+			async (issuanceContext) => {
+				if (!(await isTransactionActive(adapter))) {
+					throw new ManagedSessionIssuanceError("context_invalid");
+				}
+				const transactionAdapter = await getCurrentAdapter(adapter);
+				if (transactionAdapter === adapter) {
+					throw new ManagedSessionIssuanceError("context_invalid");
+				}
+				const source = await resolveManagedSessionUpdateAuthority(
+					issuanceContext.sourceSessionToken,
+				);
+				if (!source) {
+					throw new ManagedSessionIssuanceError("policy_unsatisfied");
+				}
+				const sourceAssurance = source.assurance;
+				const sourceExpiresAt = source.session.expiresAt;
+				if (
+					!sourceAssurance ||
+					!(sourceExpiresAt instanceof Date) ||
+					!Number.isFinite(sourceExpiresAt.getTime()) ||
+					sourceExpiresAt <= new Date() ||
+					(issuanceContext.targetOrganizationId !== null &&
+						issuanceContext.targetOrganizationId !==
+						sourceAssurance.authenticationPolicyOrganizationId
+					)
+				) {
+					throw new ManagedSessionIssuanceError("policy_unsatisfied");
+				}
+				return Object.freeze({
+					sourceSessionId: source.session.id,
+					sourceCredentialId: source.credential?.id ?? null,
+					sourceSubjectId: source.user.id,
+					sourceOrganizationId:
+						sourceAssurance.authenticationPolicyOrganizationId,
+					sourceExpiresAt: new Date(sourceExpiresAt),
+					sourceAssurance,
+					transactionAdapter,
+				});
+			},
+		);
+	}
 	return internalAdapter;
 };

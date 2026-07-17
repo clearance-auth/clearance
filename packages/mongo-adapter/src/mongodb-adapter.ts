@@ -31,6 +31,24 @@ const CREDENTIAL_AUTHORITY_MODELS = new Set([
 	"oauthAccessToken",
 ]);
 
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
+
+function createIfAbsentAttemptMatches(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (left instanceof ObjectId && right instanceof ObjectId) {
+		return left.equals(right);
+	}
+	if (left instanceof UUID && right instanceof UUID) {
+		return left.toString() === right.toString();
+	}
+	return false;
+}
+
 const PASSKEY_AUTHORITY_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
 	user: new Set(["passkeyUserHandle"]),
 	passkey: new Set(["credentialID"]),
@@ -497,6 +515,31 @@ export const mongodbAdapter = (
 					const res = await db.collection(model).insertOne(values, { session });
 					const insertedData = { _id: res.insertedId.toString(), ...values };
 					return insertedData as any;
+				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data: values,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					const result = await db.collection(model).findOneAndUpdate(
+						{ [uniqueBy.field]: uniqueBy.value },
+						{ $setOnInsert: values },
+						{
+							session,
+							upsert: true,
+							returnDocument: "after",
+							includeResultMetadata: true,
+						},
+					);
+					const row = (result as any)?.value ?? null;
+					return row &&
+						createIfAbsentAttemptMatches(
+							row[attemptBy.field],
+							attemptBy.value,
+						)
+						? (row as T)
+						: null;
 				},
 				async findOne({ model, where, select, join }) {
 					const matchStage = where

@@ -16,6 +16,10 @@ import { getAdapter } from "../db/adapter-kysely";
 import { migrateCredentialAuthorities } from "../db/credential-authority-migration";
 import { getMigrations } from "../db/get-migration";
 import { bearer } from "../plugins";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+} from "../internal/authentication-policy";
 import type { Session, User } from "../types";
 import { getBaseURL, isDynamicBaseURLConfig } from "../utils/url";
 
@@ -187,12 +191,22 @@ export async function getTestInstance<
 			}
 		: options;
 
-	const auth = clearance({
+	const authOptions = {
 		baseURL: "http://localhost:" + (config?.port || 3000),
 		...opts,
 		...testOptions,
 		plugins: [bearer(), ...(testOptions?.plugins || [])],
-	} as unknown as O);
+	} as unknown as O;
+	const authenticationPolicy = options
+		? readInternalAuthenticationPolicy(options)
+		: undefined;
+	if (authenticationPolicy) {
+		attachCapturedInternalAuthenticationPolicy(
+			authOptions,
+			authenticationPolicy,
+		);
+	}
+	const auth = clearance(authOptions);
 
 	const testUser = {
 		email: "test@test.com",

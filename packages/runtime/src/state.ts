@@ -7,6 +7,7 @@ import {
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "./crypto";
+import { createInternalVerificationChallenge } from "./internal/verification-challenge-context";
 
 const stateDataSchema = z.looseObject({
 	callbackURL: z.string(),
@@ -123,14 +124,19 @@ export async function generateGenericState(
 	const expiresAt = new Date();
 	expiresAt.setMinutes(expiresAt.getMinutes() + 10);
 
-	const verification = await c.context.internalAdapter.createVerificationValue({
-		value: JSON.stringify({
+	const value = JSON.stringify({
 			...stateData,
 			oauthState: state,
-		} satisfies StateData),
+		} satisfies StateData);
+	const verification = await createInternalVerificationChallenge(
+		c.context.internalAdapter,
+		{ purpose: "oauth-state", subject: state },
+		{
+		value,
 		identifier: state,
 		expiresAt,
-	});
+		},
+	);
 
 	if (!verification) {
 		throw new StateError(

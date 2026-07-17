@@ -13,6 +13,15 @@ import {
 	parseUserOutput,
 	revokeUnprovenAccountAccess,
 } from "../../db";
+import {
+	requireManagedAuthenticationTransaction,
+	runManagedAuthenticationTransaction,
+} from "../../internal/managed-authentication-transaction";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import { PACKAGE_VERSION } from "../../version";
 import { defaultKeyHasher } from "./utils";
 
@@ -158,6 +167,7 @@ const magicLinkVerifyQuerySchema = z.object({
 		.optional(),
 });
 export const magicLink = (options: MagicLinkOptions) => {
+	const challengePurpose = "magic-link:sign-in";
 	const opts = {
 		storeToken: "plain",
 		allowedAttempts: 1,
@@ -240,11 +250,17 @@ export const magicLink = (options: MagicLinkOptions) => {
 						? await opts.generateToken(email)
 						: generateRandomString(32, "a-z", "A-Z");
 					const storedToken = await storeToken(ctx, verificationToken);
-					await ctx.context.internalAdapter.createVerificationValue({
-						identifier: storedToken,
-						value: JSON.stringify({ email, name: ctx.body.name }),
-						expiresAt: new Date(Date.now() + (opts.expiresIn || 60 * 5) * 1000),
-					});
+					await createInternalVerificationChallenge(
+						ctx.context.internalAdapter,
+						{ purpose: challengePurpose, subject: storedToken },
+						{
+							identifier: storedToken,
+							value: JSON.stringify({ email, name: ctx.body.name }),
+							expiresAt: new Date(
+								Date.now() + (opts.expiresIn || 60 * 5) * 1000,
+							),
+						},
+					);
 					const realBaseURL = new URL(ctx.context.baseURL);
 					const pathname =
 						realBaseURL.pathname === "/" ? "" : realBaseURL.pathname;
@@ -373,54 +389,65 @@ export const magicLink = (options: MagicLinkOptions) => {
 						ctx.context.baseURL,
 					).toString();
 					const storedToken = await storeToken(ctx, token);
-					const tokenValue =
-						await ctx.context.internalAdapter.consumeVerificationValue(
-							storedToken,
-						);
-					if (!tokenValue) {
-						redirectWithError("INVALID_TOKEN");
-					}
-					const { email, name } = JSON.parse(tokenValue.value) as {
-						email: string;
-						name?: string | undefined;
-					};
-
-					let isNewUser = false;
-					let user = await ctx.context.internalAdapter
-						.findUserByEmail(email)
-						.then((res) => res?.user);
-
-					if (!user) {
-						if (!opts.disableSignUp) {
-							const newUser = await ctx.context.internalAdapter.createUser({
-								email: email,
-								emailVerified: true,
-								name: name || "",
-							});
-							isNewUser = true;
-							user = newUser;
-							if (!user) {
-								redirectWithError("failed_to_create_user");
+					requireManagedAuthenticationTransaction(ctx);
+					const { isNewUser, session, user } =
+						await runManagedAuthenticationTransaction(ctx, async () => {
+							const tokenValue = await consumeInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: challengePurpose,
+									subject: storedToken,
+									identifier: storedToken,
+								},
+							);
+							if (!tokenValue) {
+								redirectWithError("INVALID_TOKEN");
 							}
-						} else {
-							redirectWithError("new_user_signup_disabled");
-						}
-					}
-
-					if (!user.emailVerified) {
-						await revokeUnprovenAccountAccess(ctx, user.id);
-						user = await ctx.context.internalAdapter.updateUser(user.id, {
-							emailVerified: true,
+							const { email, name } = JSON.parse(tokenValue.value) as {
+								email: string;
+								name?: string | undefined;
+							};
+							let isNewUser = false;
+							let user = await ctx.context.internalAdapter
+								.findUserByEmail(email)
+								.then((res) => res?.user);
+							if (!user) {
+								if (opts.disableSignUp) {
+									redirectWithError("new_user_signup_disabled");
+								}
+								user = await ctx.context.internalAdapter.createUser({
+									email,
+									emailVerified: true,
+									name: name || "",
+								});
+								isNewUser = true;
+								if (!user) {
+									redirectWithError("failed_to_create_user");
+								}
+							} else if (!user.emailVerified) {
+								await revokeUnprovenAccountAccess(ctx, user.id);
+								user = await ctx.context.internalAdapter.updateUser(user.id, {
+									emailVerified: true,
+								});
+							}
+							const session = await ctx.context.internalAdapter.createSession(
+								user.id,
+								false,
+								undefined,
+								false,
+								createInternalSessionIssuanceContext({
+									purpose: "interactive",
+									subjectId: user.id,
+									evidence: [
+										{ kind: "primary", primaryMethod: "email_link" },
+									],
+								}),
+							);
+							if (!session) {
+								redirectWithError("failed_to_create_session");
+							}
+							return { isNewUser, session, user };
 						});
-					}
-
-					const session = await ctx.context.internalAdapter.createSession(
-						user.id,
-					);
-
-					if (!session) {
-						redirectWithError("failed_to_create_session");
-					}
 
 					await setSessionCookie(ctx, {
 						session,

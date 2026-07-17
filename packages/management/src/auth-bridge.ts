@@ -313,23 +313,11 @@ export async function createUserWithPasswordSetupInAuth(input: {
 	});
 	const token = randomBytes(32).toString("base64url");
 	const expiresAt = new Date(Date.now() + PASSWORD_SETUP_TTL_SECONDS * 1000);
-	const identifier = `reset-password:${token}`;
-	const authContext = (await b.auth.$context) as {
-		internalAdapter: {
-			createVerificationValue(input: {
-				identifier: string;
-				value: string;
-				expiresAt: Date;
-			}): Promise<unknown>;
-			deleteVerificationByIdentifier(identifier: string): Promise<void>;
-			deleteUser(userId: string): Promise<void>;
-		};
-	};
 
 	try {
-		await authContext.internalAdapter.createVerificationValue({
-			identifier,
-			value: user.id,
+		await b.passwordSetup.create({
+			userId: user.id,
+			token,
 			expiresAt,
 		});
 		const durableUser = input.managementStore
@@ -344,8 +332,14 @@ export async function createUserWithPasswordSetupInAuth(input: {
 			passwordSetup: { token, expiresAt: expiresAt.toISOString() },
 		};
 	} catch (cause) {
+		const authContext = (await b.auth.$context) as {
+			internalAdapter: {
+				deleteVerificationByIdentifier(identifier: string): Promise<void>;
+				deleteUser(userId: string): Promise<void>;
+			};
+		};
 		await authContext.internalAdapter
-			.deleteVerificationByIdentifier(identifier)
+			.deleteVerificationByIdentifier(`reset-password:${token}`)
 			.catch(() => undefined);
 		await authContext.internalAdapter.deleteUser(user.id).catch(() => undefined);
 		throw cause;

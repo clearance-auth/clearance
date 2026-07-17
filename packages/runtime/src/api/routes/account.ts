@@ -29,6 +29,9 @@ import {
 	TWO_FACTOR_SESSION_GENERATION_FIELD,
 } from "../../db/two-factor-session-generation";
 import { lockAndReadUser } from "../../db/user-authority";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../internal/session-issuance-context";
 import { missingEmailLogMessage } from "../../oauth2/errors";
 import { applyUpdateUserInfoOnLink } from "../../oauth2/link-account";
 import { generateState } from "../../oauth2/state";
@@ -577,6 +580,14 @@ export const unlinkAccount = createAuthEndpoint(
 					],
 				});
 				if (!authoritativeSession) factorLifecycleConflict();
+				const replacementIssuanceContext =
+					await captureInternalSessionIssuanceContext(
+						ctx.context.internalAdapter,
+						{
+							purpose: "replacement",
+							sourceSessionToken: ctx.context.session.session.token,
+						},
+					);
 
 				const currentAccounts = await adapter.findMany<Account>({
 					model: "account",
@@ -701,10 +712,16 @@ export const unlinkAccount = createAuthEndpoint(
 
 				await ctx.context.internalAdapter.deleteUserSessions(userId);
 				const replacementSession =
-					await ctx.context.internalAdapter.createSession(userId, false, {
-						expiresAt: originalExpiresAt,
-						__preserveSessionExpiresAt: true,
-					});
+					await ctx.context.internalAdapter.createSession(
+						userId,
+						false,
+						{
+							expiresAt: originalExpiresAt,
+							__preserveSessionExpiresAt: true,
+						},
+						undefined,
+						replacementIssuanceContext,
+					);
 				if (
 					new Date(replacementSession.expiresAt).getTime() !==
 					originalExpiresAtMs

@@ -1,5 +1,9 @@
 import type { Awaitable, GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import {
+	getCurrentAdapter,
+	queueAfterTransactionHook,
+} from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { setSessionCookie } from "../../../cookies";
@@ -10,6 +14,17 @@ import {
 	symmetricEncrypt,
 } from "../../../crypto";
 import { parseUserOutput } from "../../../db/schema";
+import {
+	runManagedAuthenticationTransaction,
+	usesManagedAuthenticationPolicy,
+} from "../../../internal/managed-authentication-transaction";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../../internal/verification-challenge-context";
 import { PACKAGE_VERSION } from "../../../version";
 import { TWO_FACTOR_ERROR_CODES } from "../error-code";
 import type {
@@ -17,11 +32,10 @@ import type {
 	TwoFactorTable,
 	UserWithTwoFactor,
 } from "../types";
-import { defaultKeyHasher } from "../utils";
+import { defaultKeyHasher, TWO_FACTOR_CHALLENGE_PURPOSE } from "../utils";
 import {
 	assertTwoFactorNotLocked,
 	reserveTwoFactorAttempt,
-	resetTwoFactorFailures,
 	verifyTwoFactor,
 } from "../verify-two-factor";
 
@@ -217,11 +231,18 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 			const { session, key } = await verifyTwoFactor(ctx);
 			const code = generateRandomString(opts.digits, "0-9");
 			const hashedCode = await storeOTP(ctx, code);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${hashedCode}:0`,
-				identifier: `2fa-otp-${key}`,
-				expiresAt: new Date(Date.now() + opts.period),
-			});
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{
+					purpose: TWO_FACTOR_CHALLENGE_PURPOSE.otp,
+					subject: session.user.id,
+				},
+				{
+					value: `${hashedCode}:0`,
+					identifier: `2fa-otp-${key}`,
+					expiresAt: new Date(Date.now() + opts.period),
+				},
+			);
 			const sendOTPResult = options.sendOTP(
 				{ user: session.user as UserWithTwoFactor, otp: code },
 				ctx,
@@ -315,125 +336,180 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 		},
 		async (ctx) => {
 			const { session, key, valid, invalid } = await verifyTwoFactor(ctx);
+			const managed = usesManagedAuthenticationPolicy(ctx);
 			const isSignIn = !session.session;
 			const twoFactorTable = "twoFactor";
-			// Account-level lockout shares one counter across all factors, so OTP
-			// failures count toward and are blocked by the same lock as TOTP and
-			// backup codes. Fail closed on a sign-in if the record is missing.
-			let twoFactor: TwoFactorTable | null = null;
-			if (isSignIn) {
-				twoFactor = await ctx.context.adapter.findOne<TwoFactorTable>({
-					model: twoFactorTable,
-					where: [{ field: "userId", value: session.user.id }],
-				});
-				if (!twoFactor) {
-					throw APIError.from(
-						"BAD_REQUEST",
-						TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
+			const identifier = `2fa-otp-${key}`;
+			const outcome = await runManagedAuthenticationTransaction(ctx, async () => {
+				const adapter = await getCurrentAdapter(ctx.context.adapter);
+				// Account-level lockout shares one counter across all factors. In
+				// managed mode the reservation, OTP consume, and authorized mutation
+				// all use this same primary transaction.
+				let twoFactor: TwoFactorTable | null = null;
+				if (isSignIn) {
+					twoFactor = await adapter.findOne<TwoFactorTable>({
+						model: twoFactorTable,
+						where: [{ field: "userId", value: session.user.id }],
+					});
+					if (!twoFactor) {
+						return { kind: "not-enabled" as const };
+					}
+					await assertTwoFactorNotLocked(
+						ctx,
+						twoFactorTable,
+						twoFactor,
+						adapter,
 					);
 				}
-				await assertTwoFactorNotLocked(ctx, twoFactorTable, twoFactor);
-			}
-			// Consume the OTP row atomically as the race gate. The first concurrent
-			// submission wins the row; every other racer receives null and is
-			// rejected, so a burst of guesses cannot all read the same attempt
-			// counter before any write lands. Expiry is gated inside the consume,
-			// so a stale row returns null without minting a session.
-			const consumed =
-				await ctx.context.internalAdapter.consumeVerificationValue(
-					`2fa-otp-${key}`,
+
+				const consumed = await consumeInternalVerificationChallenge(
+					ctx.context.internalAdapter,
+					{
+						purpose: TWO_FACTOR_CHALLENGE_PURPOSE.otp,
+						subject: session.user.id,
+						identifier,
+					},
 				);
-			if (!consumed) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					TWO_FACTOR_ERROR_CODES.OTP_HAS_EXPIRED,
-				);
-			}
-			const [otp, counter] = consumed.value?.split(":") ?? [];
-			const allowedAttempts = options?.allowedAttempts || 5;
-			const attempts = parseInt(counter!, 10) || 0;
-			if (attempts >= allowedAttempts) {
-				// The budget is spent. The row stays consumed, so the next
-				// submission is rejected as expired/already-consumed.
-				throw APIError.from(
-					"BAD_REQUEST",
-					TWO_FACTOR_ERROR_CODES.TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE,
-				);
-			}
-			const accountAttempt = twoFactor
-				? await reserveTwoFactorAttempt(ctx, twoFactorTable, twoFactor)
-				: null;
-			let storedValue: string;
-			let inputValue: string;
-			try {
-				[storedValue, inputValue] = await decryptOrHashForComparison(
-					ctx,
-					otp!,
-					ctx.body.code,
-				);
-			} catch (error) {
-				await accountAttempt?.restore();
-				await ctx.context.internalAdapter.createVerificationValue({
-					value: consumed.value,
-					identifier: `2fa-otp-${key}`,
-					expiresAt: consumed.expiresAt,
-				});
-				throw error;
-			}
-			const isCodeValid = constantTimeEqual(
-				new TextEncoder().encode(storedValue),
-				new TextEncoder().encode(inputValue),
-			);
-			if (isCodeValid) {
-				if (accountAttempt) {
-					await accountAttempt.recordSuccess();
-				} else if (twoFactor) {
-					await resetTwoFactorFailures(ctx, twoFactorTable, twoFactor);
+				if (!consumed) return { kind: "expired" as const };
+
+				const [otp, counter] = consumed.value?.split(":") ?? [];
+				const allowedAttempts = options?.allowedAttempts || 5;
+				const attempts = parseInt(counter!, 10) || 0;
+				if (attempts >= allowedAttempts) {
+					// Returning commits the terminal consume before the API error is
+					// raised outside the transaction.
+					return { kind: "spent" as const };
 				}
-				// Leave the row consumed: a valid OTP is single-use.
+				const accountAttempt = twoFactor
+					? await reserveTwoFactorAttempt(
+							ctx,
+							twoFactorTable,
+							twoFactor,
+							adapter,
+						)
+					: null;
+				let storedValue: string;
+				let inputValue: string;
+				try {
+					[storedValue, inputValue] = await decryptOrHashForComparison(
+						ctx,
+						otp!,
+						ctx.body.code,
+					);
+				} catch (error) {
+					await accountAttempt?.restore();
+					await createInternalVerificationChallenge(
+						ctx.context.internalAdapter,
+						{
+							purpose: TWO_FACTOR_CHALLENGE_PURPOSE.otp,
+							subject: session.user.id,
+						},
+						{
+							value: consumed.value,
+							identifier,
+							expiresAt: consumed.expiresAt,
+						},
+					);
+					return { kind: "internal-error" as const, error };
+				}
+				const isCodeValid = constantTimeEqual(
+					new TextEncoder().encode(storedValue),
+					new TextEncoder().encode(inputValue),
+				);
+				if (!isCodeValid) {
+					await accountAttempt?.recordFailure();
+					await createInternalVerificationChallenge(
+						ctx.context.internalAdapter,
+						{
+							purpose: TWO_FACTOR_CHALLENGE_PURPOSE.otp,
+							subject: session.user.id,
+						},
+						{
+							value: `${otp}:${attempts + 1}`,
+							identifier,
+							expiresAt: consumed.expiresAt,
+						},
+					);
+					return { kind: "invalid" as const };
+				}
+
+				await accountAttempt?.recordSuccess();
+				// Leave the OTP consumed: a valid code is single-use.
 				if (!session.user.twoFactorEnabled) {
-					if (!session.session) {
-						throw APIError.from(
-							"BAD_REQUEST",
-							BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+					if (!session.session) return { kind: "session-missing" as const };
+					const replacementIssuanceContext =
+						await captureInternalSessionIssuanceContext(
+							ctx.context.internalAdapter,
+							{
+								purpose: "replacement",
+								sourceSessionToken: session.session.token,
+							},
 						);
-					}
 					const updatedUser = await ctx.context.internalAdapter.updateUser(
 						session.user.id,
-						{
-							twoFactorEnabled: true,
-						},
+						{ twoFactorEnabled: true },
 					);
 					const newSession = await ctx.context.internalAdapter.createSession(
 						session.user.id,
 						false,
 						session.session,
+						false,
+						replacementIssuanceContext,
 					);
-					await setSessionCookie(ctx, {
-						session: newSession,
-						user: updatedUser,
-					});
 					await ctx.context.internalAdapter.deleteSession(
 						session.session.token,
 					);
-					return ctx.json({
-						token: newSession.token,
-						user: parseUserOutput(ctx.context.options, updatedUser),
-					});
+					const publishSessionCookie = () =>
+						setSessionCookie(ctx, {
+							session: newSession,
+							user: updatedUser,
+						});
+					if (managed) {
+						await queueAfterTransactionHook(
+							publishSessionCookie,
+							ctx.context.adapter,
+						);
+					} else {
+						await publishSessionCookie();
+					}
+					return { kind: "enabled" as const, newSession, updatedUser };
 				}
-				return valid(ctx);
-			}
-			await accountAttempt?.recordFailure();
-			// Wrong code within budget: re-arm the row with the incremented counter
-			// and the original expiry. The recreated counter is the durable record
-			// of the attempt, so the next submission either keeps guessing or hits
-			// the lock-out guard above. The original expiry caps the whole burst.
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${otp}:${attempts + 1}`,
-				identifier: `2fa-otp-${key}`,
-				expiresAt: consumed.expiresAt,
+				return { kind: "verified" as const, response: await valid(ctx) };
 			});
-			return invalid("INVALID_CODE");
+
+			if (outcome.kind === "not-enabled") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					TWO_FACTOR_ERROR_CODES.TWO_FACTOR_NOT_ENABLED,
+				);
+			}
+			if (outcome.kind === "expired") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					TWO_FACTOR_ERROR_CODES.OTP_HAS_EXPIRED,
+				);
+			}
+			if (outcome.kind === "spent") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					TWO_FACTOR_ERROR_CODES.TOO_MANY_ATTEMPTS_REQUEST_NEW_CODE,
+				);
+			}
+			if (outcome.kind === "internal-error") throw outcome.error;
+			if (outcome.kind === "invalid") return invalid("INVALID_CODE");
+			if (outcome.kind === "session-missing") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+				);
+			}
+			if (outcome.kind === "enabled") {
+				return ctx.json({
+					token: outcome.newSession.token,
+					user: parseUserOutput(ctx.context.options, outcome.updatedUser),
+				});
+			}
+			return outcome.response;
 		},
 	);
 

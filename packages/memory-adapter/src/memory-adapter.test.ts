@@ -15,8 +15,11 @@ const widgetPlugin = {
 		widget: {
 			fields: {
 				name: { type: "string" as const, required: false },
+				key: { type: "string" as const, required: false, unique: true },
+				attempt: { type: "string" as const, required: false },
 				tag: { type: "string" as const, required: false },
 				count: { type: "number" as const, required: false },
+				enabled: { type: "boolean" as const, required: false },
 				remaining: { type: "number" as const, required: false },
 			},
 		},
@@ -44,6 +47,185 @@ async function seedWidget(
 		forceAllowId: true,
 	});
 }
+
+describe("memory adapter createIfAbsent", () => {
+	it("returns only the first writer and leaves the winner byte-for-byte unchanged", async () => {
+		const { adapter } = setup();
+		const winner = await adapter.createIfAbsent<{
+			id: string;
+			key: string;
+			attempt: string;
+			name: string;
+		}>({
+			model: "widget",
+			data: {
+				id: "winner-id",
+				key: "shared",
+				attempt: "winner-attempt",
+				name: "winner",
+			},
+			uniqueBy: { field: "key", value: "shared" },
+			attemptBy: { field: "attempt", value: "winner-attempt" },
+			forceAllowId: true,
+		});
+		const beforeLoser = structuredClone(winner);
+		const loser = await adapter.createIfAbsent({
+			model: "widget",
+			data: {
+				id: "loser-id",
+				key: "shared",
+				attempt: "loser-attempt",
+				name: "loser",
+			},
+			uniqueBy: { field: "key", value: "shared" },
+			attemptBy: { field: "attempt", value: "loser-attempt" },
+			forceAllowId: true,
+		});
+
+		expect(winner?.id).toBe("winner-id");
+		expect(loser).toBeNull();
+		expect(
+			await adapter.findOne({
+				model: "widget",
+				where: [{ field: "key", value: "shared" }],
+			}),
+		).toEqual(beforeLoser);
+	});
+
+	it("admits exactly one concurrent caller and generates UUID-shaped ids", async () => {
+		const db: MemoryDB = { widget: [] };
+		const adapter = memoryAdapter(db)({
+			...options,
+			advanced: { database: { generateId: "uuid" } },
+		});
+		const results = await Promise.all(
+			Array.from({ length: 16 }, (_, index) =>
+				adapter.createIfAbsent({
+					model: "widget",
+					data: {
+						key: "shared",
+						attempt: `attempt-${index}`,
+					},
+					uniqueBy: { field: "key", value: "shared" },
+					attemptBy: { field: "attempt", value: `attempt-${index}` },
+				}),
+			),
+		);
+
+		const winners = results.filter((row) => row !== null);
+		expect(winners).toHaveLength(1);
+		expect((winners[0] as { id?: string })?.id).toMatch(/^[0-9a-f-]{36}$/i);
+		expect(await adapter.findMany({ model: "widget" })).toHaveLength(1);
+	});
+
+	it("supports serial ids and fails closed inside snapshot transactions", async () => {
+		const db: MemoryDB = { widget: [] };
+		const adapter = memoryAdapter(db)({
+			...options,
+			advanced: { database: { generateId: "serial" } },
+		});
+		const winner = await adapter.createIfAbsent({
+			model: "widget",
+			data: { key: "serial", attempt: "serial-attempt" },
+			uniqueBy: { field: "key", value: "serial" },
+			attemptBy: { field: "attempt", value: "serial-attempt" },
+		});
+
+		expect((winner as { id?: string })?.id).toBe("1");
+		await expect(
+			adapter.transaction((trx) =>
+				trx.createIfAbsent({
+					model: "widget",
+					data: { key: "tx", attempt: "tx-attempt" },
+					uniqueBy: { field: "key", value: "tx" },
+					attemptBy: { field: "attempt", value: "tx-attempt" },
+				}),
+			),
+		).rejects.toThrow("cannot guarantee createIfAbsent");
+		expect(await adapter.findMany({ model: "widget" })).toHaveLength(1);
+	});
+
+	it("rejects non-unique, unknown, and mismatched selectors before storage", async () => {
+		const { adapter } = setup();
+		const data = { key: "key", attempt: "attempt", name: "name" };
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data,
+				uniqueBy: { field: "name", value: "name" },
+				attemptBy: { field: "attempt", value: "attempt" },
+			}),
+		).rejects.toThrow("schema-declared unique field");
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data,
+				uniqueBy: { field: "key", value: "key" },
+				attemptBy: { field: "missing", value: "attempt" },
+			}),
+		).rejects.toThrow("Field missing not found in model widget");
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data,
+				uniqueBy: { field: "key", value: "different" },
+				attemptBy: { field: "attempt", value: "attempt" },
+			}),
+		).rejects.toThrow("uniqueBy must exactly match");
+		expect(await adapter.findMany({ model: "widget" })).toHaveLength(0);
+	});
+
+	it("rejects reference-valued and non-finite attempt selectors before storage", async () => {
+		const { adapter } = setup();
+		const createdAt = new Date("2026-07-17T00:00:00.000Z");
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data: { key: "date", attempt: createdAt },
+				uniqueBy: { field: "key", value: "date" },
+				// @ts-expect-error createIfAbsent attempts require a stable primitive scalar.
+				attemptBy: { field: "attempt", value: createdAt },
+			}),
+		).rejects.toThrow("must be a string, finite number, or boolean");
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data: { key: "array", attempt: ["array-attempt"] },
+				uniqueBy: { field: "key", value: "array" },
+				// @ts-expect-error createIfAbsent attempts reject reference identity.
+				attemptBy: { field: "attempt", value: ["array-attempt"] },
+			}),
+		).rejects.toThrow("must be a string, finite number, or boolean");
+		await expect(
+			adapter.createIfAbsent({
+				model: "widget",
+				data: { key: "nan", attempt: Number.NaN },
+				uniqueBy: { field: "key", value: "nan" },
+				attemptBy: { field: "attempt", value: Number.NaN },
+			}),
+		).rejects.toThrow("must be a string, finite number, or boolean");
+		expect(await adapter.findMany({ model: "widget" })).toHaveLength(0);
+	});
+
+	it("classifies finite-number and boolean attempts by scalar value", async () => {
+		const { adapter } = setup();
+		const numberWinner = await adapter.createIfAbsent({
+			model: "widget",
+			data: { key: "number", count: -0 },
+			uniqueBy: { field: "key", value: "number" },
+			attemptBy: { field: "count", value: -0 },
+		});
+		const booleanWinner = await adapter.createIfAbsent({
+			model: "widget",
+			data: { key: "boolean", enabled: false },
+			uniqueBy: { field: "key", value: "boolean" },
+			attemptBy: { field: "enabled", value: false },
+		});
+
+		expect(numberWinner).toMatchObject({ key: "number", count: -0 });
+		expect(booleanWinner).toMatchObject({ key: "boolean", enabled: false });
+	});
+});
 
 describe("memory adapter singular mutation with empty predicate", () => {
 	it("singular update with an empty where is a no-op and leaves every row untouched", async () => {

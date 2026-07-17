@@ -1,6 +1,7 @@
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { describe, expect, it, vi } from "vitest";
 import { parseSetCookieHeader } from "../../cookies";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 
 /**
@@ -20,6 +21,58 @@ describe("sign-in", async () => {
 		const setCookie = signInRes.headers.get("set-cookie");
 		const parsed = parseSetCookieHeader(setCookie || "");
 		expect(parsed.get("clearance.session_token")).toBeDefined();
+	});
+
+	it("passes fresh server-derived password evidence to session issuance", async () => {
+		const context = await auth.$context;
+		const originalCreateSession = context.internalAdapter.createSession.bind(
+			context.internalAdapter,
+		);
+		const createSession = vi
+			.spyOn(context.internalAdapter, "createSession")
+			.mockImplementation((...args) => originalCreateSession(...args));
+
+		try {
+			const first = await auth.api.signInEmail({
+				body: {
+					email: testUser.email,
+					password: testUser.password,
+					subjectId: "request-controlled-subject",
+					evidence: [{ kind: "primary", primaryMethod: "anonymous" }],
+				} as never,
+			});
+			expect(createSession).toHaveBeenCalledOnce();
+			const [firstSubjectId, , , , firstIssuanceContext] =
+				createSession.mock.calls[0]!;
+			expect(firstSubjectId).toBe(first.user.id);
+			expect(readInternalSessionIssuanceContext(firstIssuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: first.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: null,
+			});
+
+			createSession.mockClear();
+			const second = await auth.api.signInEmail({
+				body: {
+					email: testUser.email,
+					password: testUser.password,
+				} as never,
+			});
+			expect(createSession).toHaveBeenCalledOnce();
+			const [secondSubjectId, , , , secondIssuanceContext] =
+				createSession.mock.calls[0]!;
+			expect(secondSubjectId).toBe(second.user.id);
+			expect(readInternalSessionIssuanceContext(secondIssuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: second.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: null,
+			});
+			expect(firstIssuanceContext).not.toBe(secondIssuanceContext);
+		} finally {
+			createSession.mockRestore();
+		}
 	});
 
 	it("should read the ip address and user agent from the headers", async () => {

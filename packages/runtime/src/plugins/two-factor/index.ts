@@ -3,7 +3,6 @@ import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
 import {
 	AfterTransactionHookError,
 	getCurrentAdapter,
-	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
@@ -32,6 +31,14 @@ import {
 } from "../../db/two-factor-session-generation";
 import { mergeSchema } from "../../db/schema";
 import { lockAndReadUser } from "../../db/user-authority";
+import { runManagedAuthenticationTransaction } from "../../internal/managed-authentication-transaction";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import type { Session, User } from "../../types";
 import { shouldRequirePassword, validatePassword } from "../../utils/password";
 import { PACKAGE_VERSION } from "../../version";
@@ -58,6 +65,8 @@ import type {
 import {
 	preserveSessionLifetime,
 	recordTrustGeneration,
+	revokeTrustGeneration,
+	TWO_FACTOR_CHALLENGE_PURPOSE,
 	trustGenerationMarkerIdentifier,
 } from "./utils";
 import {
@@ -517,6 +526,14 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 						const activated = await runWithTransaction(
 							ctx.context.adapter,
 							async () => {
+								const replacementIssuanceContext =
+									await captureInternalSessionIssuanceContext(
+										ctx.context.internalAdapter,
+										{
+											purpose: "replacement",
+											sourceSessionToken: activeSession.token,
+										},
+									);
 								const adapter = await getCurrentAdapter(ctx.context.adapter);
 								const generation = generateRandomString(32);
 								const factor = await adapter.incrementOne<TwoFactorTable>({
@@ -552,6 +569,8 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 										updatedUser.id,
 										false,
 										preserveSessionLifetime(activeSession),
+										false,
+										replacementIssuanceContext,
 									);
 								return { newSession, updatedUser };
 							},
@@ -692,6 +711,15 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 										],
 									});
 									if (!authoritativeSession) twoFactorLifecycleConflict();
+									const replacementIssuanceContext =
+										await captureInternalSessionIssuanceContext(
+											ctx.context.internalAdapter,
+											{
+												purpose: "replacement",
+												sourceSessionToken:
+													ctx.context.session.session.token,
+											},
+										);
 									if (authoritativeUser.twoFactorEnabled !== true) {
 										throw APIError.from(
 											"BAD_REQUEST",
@@ -844,36 +872,29 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 										if (!rotatedUser) twoFactorLifecycleConflict();
 									}
 
-									if (
-										factor.trustDeviceGeneration &&
-										(!ctx.context.options.secondaryStorage ||
-											ctx.context.options.verification?.storeInDatabase === true)
-									) {
-										await adapter.deleteMany({
-											model: "verification",
-											where: [
-												{
-													field: "value",
-													value: `${user.id}!${factor.trustDeviceGeneration}`,
-												},
-											],
-										});
-									}
-									if (
-										factor.trustDeviceGeneration &&
-										ctx.context.options.secondaryStorage
-									) {
-										const marker = trustGenerationMarkerIdentifier(
+									if (factor.trustDeviceGeneration) {
+										// Revoke the managed generation marker in the lifecycle
+										// transaction. Secondary cleanup is derived from the committed
+										// primary consume; failures are no longer silently ignored.
+										await revokeTrustGeneration(
+											ctx,
 											user.id,
 											factor.trustDeviceGeneration,
 										);
-										await queueAfterTransactionHook(
-											() =>
-												ctx.context.internalAdapter.deleteVerificationByIdentifier(
-													marker,
-												),
-											adapter,
-										);
+										if (
+											!ctx.context.options.secondaryStorage ||
+											ctx.context.options.verification?.storeInDatabase === true
+										) {
+											await adapter.deleteMany({
+												model: "verification",
+												where: [
+													{
+														field: "value",
+														value: `${user.id}!${factor.trustDeviceGeneration}`,
+													},
+												],
+											});
+										}
 									}
 
 									const deletedFactor = await adapter.consumeOne<TwoFactorTable>({
@@ -903,6 +924,8 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 												...ctx.context.session.session,
 												expiresAt: originalExpiresAt,
 											}),
+											false,
+											replacementIssuanceContext,
 										);
 									if (
 										new Date(replacementSession.expiresAt).getTime() !==
@@ -996,11 +1019,6 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 								trustIdentifier &&
 								trustGeneration
 							) {
-								const factor =
-									await ctx.context.adapter.findOne<TwoFactorTable>({
-										model: opts.twoFactorTable,
-										where: [{ field: "userId", value: data.user.id }],
-									});
 								const expectedToken = await createHMAC(
 									"SHA-256",
 									"base64urlnopad",
@@ -1009,61 +1027,85 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 									`${data.user.id}!${trustIdentifier}!${trustGeneration}`,
 								);
 
-								if (
-									constantTimeEqual(token, expectedToken) &&
-									factor?.trustDeviceGeneration === trustGeneration
-								) {
-									const generationMarker =
-										await ctx.context.internalAdapter.findVerificationValue(
-											trustGenerationMarkerIdentifier(
+								if (constantTimeEqual(token, expectedToken)) {
+									const rotation = await runManagedAuthenticationTransaction(
+										ctx,
+										async () => {
+											const adapter = await getCurrentAdapter(ctx.context.adapter);
+											const factor = await adapter.findOne<TwoFactorTable>({
+												model: opts.twoFactorTable,
+												where: [{ field: "userId", value: data.user.id }],
+											});
+											if (factor?.trustDeviceGeneration !== trustGeneration) {
+												return null;
+											}
+											const generationMarker =
+												await ctx.context.internalAdapter.findVerificationValue(
+													trustGenerationMarkerIdentifier(
+														data.user.id,
+														trustGeneration,
+													),
+												);
+											const verificationRecord =
+												await consumeInternalVerificationChallenge(
+													ctx.context.internalAdapter,
+													{
+														purpose: TWO_FACTOR_CHALLENGE_PURPOSE.trustDevice,
+														subject: data.user.id,
+														identifier: trustIdentifier,
+													},
+												);
+											if (
+												generationMarker?.value !==
+													`${data.user.id}!${trustGeneration}` ||
+												generationMarker.expiresAt <= new Date() ||
+												!verificationRecord ||
+												verificationRecord.value !==
+													`${data.user.id}!${trustGeneration}` ||
+												verificationRecord.expiresAt <= new Date()
+											) {
+												return null;
+											}
+											const identifier = `trust-device-${generateRandomString(32)}`;
+											const expiresAt = new Date(
+												Date.now() + trustDeviceMaxAge * 1000,
+											);
+											const nextToken = await createHMAC(
+												"SHA-256",
+												"base64urlnopad",
+											).sign(
+												ctx.context.secret,
+												`${data.user.id}!${identifier}!${trustGeneration}`,
+											);
+											await createInternalVerificationChallenge(
+												ctx.context.internalAdapter,
+												{
+													purpose: TWO_FACTOR_CHALLENGE_PURPOSE.trustDevice,
+													subject: data.user.id,
+												},
+												{
+													value: `${data.user.id}!${trustGeneration}`,
+													identifier,
+													expiresAt,
+												},
+											);
+											await recordTrustGeneration(
+												ctx,
 												data.user.id,
 												trustGeneration,
-											),
-										);
-									const verificationRecord =
-										await ctx.context.internalAdapter.consumeVerificationValue(
-											trustIdentifier,
-										);
-									if (
-										generationMarker?.value ===
-											`${data.user.id}!${trustGeneration}` &&
-										generationMarker.expiresAt > new Date() &&
-										verificationRecord &&
-										verificationRecord.value ===
-											`${data.user.id}!${trustGeneration}` &&
-										verificationRecord.expiresAt > new Date()
-									) {
-										const newTrustIdentifier = `trust-device-${generateRandomString(32)}`;
-										const newToken = await createHMAC(
-											"SHA-256",
-											"base64urlnopad",
-										).sign(
-											ctx.context.secret,
-											`${data.user.id}!${newTrustIdentifier}!${trustGeneration}`,
-										);
-										const trustExpiresAt = new Date(
-											Date.now() + trustDeviceMaxAge * 1000,
-										);
-										await ctx.context.internalAdapter.createVerificationValue({
-											value: `${data.user.id}!${trustGeneration}`,
-											identifier: newTrustIdentifier,
-											expiresAt: trustExpiresAt,
-										});
-										await recordTrustGeneration(
-											ctx,
-											data.user.id,
-											trustGeneration,
-											trustExpiresAt,
-										);
-										const newTrustDeviceCookie = ctx.context.createAuthCookie(
-											TRUST_DEVICE_COOKIE_NAME,
-											{
+												expiresAt,
+											);
+											return { identifier, nextToken };
+										},
+									);
+									if (rotation) {
+										const newTrustDeviceCookie =
+											ctx.context.createAuthCookie(TRUST_DEVICE_COOKIE_NAME, {
 												maxAge: trustDeviceMaxAge,
-											},
-										);
+											});
 										await ctx.setSignedCookie(
 											newTrustDeviceCookie.name,
-											`${newToken}!${newTrustIdentifier}!${trustGeneration}`,
+											`${rotation.nextToken}!${rotation.identifier}!${trustGeneration}`,
 											ctx.context.secret,
 											trustDeviceCookieAttrs.attributes,
 										);
@@ -1085,9 +1127,6 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 						 * sign-in must therefore null-check it: it is `null` while a
 						 * 2FA challenge is in flight (no authenticated session yet).
 						 */
-						deleteSessionCookie(ctx, true);
-						await ctx.context.internalAdapter.deleteSession(data.session.token);
-						ctx.context.setNewSession(null);
 						const maxAge = options?.twoFactorCookieMaxAge ?? 10 * 60; // 10 minutes
 						const twoFactorCookie = ctx.context.createAuthCookie(
 							TWO_FACTOR_COOKIE_NAME,
@@ -1097,19 +1136,37 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 						);
 						const identifier = `2fa-${generateRandomString(20)}`;
 						const expiresAt = new Date(Date.now() + maxAge * 1000);
-						await ctx.context.internalAdapter.createVerificationValue({
-							value: data.user.id,
-							identifier,
-							expiresAt,
+						await runManagedAuthenticationTransaction(ctx, async () => {
+							await ctx.context.internalAdapter.deleteSession(data.session.token);
+							await createInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: TWO_FACTOR_CHALLENGE_PURPOSE.signIn,
+									subject: data.user.id,
+								},
+								{
+									value: data.user.id,
+									identifier,
+									expiresAt,
+								},
+							);
+							// Per-challenge attempt counter, consumed atomically by
+							// verify-totp and verify-backup-code as their race gate.
+							await createInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: TWO_FACTOR_CHALLENGE_PURPOSE.attemptBudget,
+									subject: data.user.id,
+								},
+								{
+									value: "0",
+									identifier: `2fa-attempts-${identifier}`,
+									expiresAt,
+								},
+							);
 						});
-						// Per-challenge attempt counter, consumed atomically by
-						// verify-totp and verify-backup-code as the race gate so a
-						// concurrent burst cannot exceed the budget.
-						await ctx.context.internalAdapter.createVerificationValue({
-							value: "0",
-							identifier: `2fa-attempts-${identifier}`,
-							expiresAt,
-						});
+						deleteSessionCookie(ctx, true);
+						ctx.context.setNewSession(null);
 						await ctx.setSignedCookie(
 							twoFactorCookie.name,
 							identifier,

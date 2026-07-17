@@ -17,6 +17,7 @@ import type { InternalLogger } from "@clearance/core/env";
 import {
 	ATTR_CONTEXT,
 	ATTR_DB_COLLECTION_NAME,
+	ATTR_DB_OPERATION_NAME,
 	ATTR_HOOK_TYPE,
 	withSpan,
 } from "@clearance/core/instrumentation";
@@ -451,7 +452,17 @@ export function getWithHooks(
 		}
 
 		const customDeleted = customDeleteFn
-			? await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
+			? customDeleteFn.executeMainFn === false
+				? await withSpan(
+						`db deleteMany ${model}`,
+						{
+							[ATTR_DB_OPERATION_NAME]: "deleteMany",
+							[ATTR_DB_COLLECTION_NAME]: model,
+						},
+						async () =>
+							customDeleteFn.fn(where, await getCurrentAdapter(adapter)),
+					)
+				: await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
 			: null;
 
 		const deleted =

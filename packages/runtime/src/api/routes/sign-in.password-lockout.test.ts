@@ -144,6 +144,45 @@ describe("password account lockout", () => {
 		expect(account.passwordLockedUntil).not.toBeNull();
 	});
 
+	it("allows every concurrently reserved correct password to settle successfully", async () => {
+		const { auth, db, testUser, user } = await setup({
+			maxFailedAttempts: 8,
+			durationSeconds: 30,
+		});
+		const context = await auth.$context;
+		const originalVerify = context.password.verify.bind(context.password);
+		let comparisons = 0;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		context.password.verify = async (input) => {
+			comparisons++;
+			await gate;
+			return originalVerify(input);
+		};
+		const sessionsBefore = await db.count({ model: "session" });
+
+		const attempts = Array.from({ length: 5 }, () =>
+			auth.api.signInEmail({
+				body: { email: testUser.email, password: testUser.password },
+				asResponse: true,
+			}),
+		);
+		await vi.waitFor(() => expect(comparisons).toBe(5));
+		release();
+		const responses = await Promise.all(attempts);
+
+		expect(responses.map((response) => response.status)).toEqual([
+			200, 200, 200, 200, 200,
+		]);
+		expect(await db.count({ model: "session" })).toBe(sessionsBefore + 5);
+		const account = await readCredentialAccount(db, user.id);
+		expect(account.failedPasswordAttempts).toBe(0);
+		expect(account.activePasswordAttemptReservations).toBe("[]");
+		expect(account.passwordLockedUntil).toBeNull();
+	});
+
 	it("successful settlement clears state and a late failure cannot relock it", async () => {
 		const { auth, db, testUser, user } = await setup();
 		const firstFailure = await auth.api.signInEmail({

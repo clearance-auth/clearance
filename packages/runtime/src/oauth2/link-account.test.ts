@@ -1,4 +1,9 @@
 import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyReaderInput,
+} from "@clearance/core";
+import type {
 	DiscordProfile,
 	GoogleProfile,
 } from "@clearance/core/social-providers";
@@ -15,6 +20,7 @@ import {
 } from "vitest";
 import * as z from "zod";
 import { signJWT } from "../crypto";
+import { attachInternalAuthenticationPolicy } from "../internal/authentication-policy";
 import { getTestInstance } from "../test-utils/test-instance";
 import type { User } from "../types";
 import { DEFAULT_SECRET } from "../utils/constants";
@@ -2138,5 +2144,144 @@ describe("oauth2 - account-linking logs use the configured logger", async () => 
 			"Unable to link account",
 			expect.anything(),
 		);
+	});
+});
+
+describe("oauth2 - managed authentication transaction boundary", () => {
+	const managedOptions = (
+		minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+	) => {
+		const identity = {
+			projectId: `oauth-project-${minimumAssurance}`,
+			environmentId: `oauth-environment-${minimumAssurance}`,
+		};
+		const effective: RuntimeAuthenticationPolicy = {
+			passwordLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			factorLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			minimumAssurance,
+			allowedFactors: { totp: true, passkey: true },
+			trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+			assuranceMaxAgeSeconds: 300,
+		};
+		const options = {
+			socialProviders: {
+				google: {
+					clientId: "managed-oauth-client",
+					clientSecret: "managed-oauth-secret",
+					enabled: true,
+				},
+			},
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(options, {
+			identity,
+			reader: {
+				async readForSubject(input: RuntimeAuthenticationPolicyReaderInput) {
+					return {
+						scope: identity,
+						subjectId: input.subjectId,
+						revision: "1",
+						environment: effective,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective,
+					};
+				},
+			},
+		});
+		return options;
+	};
+
+	async function runManagedGoogleCallback(
+		minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+		email: string,
+	) {
+		const { auth, client, cookieSetter } = await getTestInstance(
+			managedOptions(minimumAssurance),
+			{ disableTestUser: true },
+		);
+		const context = await auth.$context;
+		server.use(
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const profile: GoogleProfile = {
+					email,
+					email_verified: true,
+					name: "Managed OAuth User",
+					picture: "",
+					exp: 1,
+					sub: `managed-${minimumAssurance}`,
+					iat: 1,
+					aud: "managed-oauth-client",
+					azp: "managed-oauth-client",
+					nbf: 1,
+					iss: "test",
+					locale: "en",
+					jti: `managed-${minimumAssurance}`,
+					given_name: "Managed",
+					family_name: "OAuth",
+				};
+				return HttpResponse.json({
+					access_token: "managed-access-token",
+					refresh_token: "managed-refresh-token",
+					id_token: await signJWT(profile, DEFAULT_SECRET),
+				});
+			}),
+		);
+		const headers = new Headers();
+		const signIn = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state = new URL(signIn.data!.url!).searchParams.get("state") ?? "";
+		let location = "";
+		let status = 0;
+		await client.$fetch("/callback/google", {
+			method: "GET",
+			query: { state, code: "managed-code" },
+			headers,
+			onError(callbackContext) {
+				status = callbackContext.response.status;
+				location = callbackContext.response.headers.get("location") ?? "";
+			},
+		});
+		return { context, location, status };
+	}
+
+	it("rolls back a new federated identity when managed assurance rejects session issuance", async () => {
+		const { context, status } = await runManagedGoogleCallback(
+			"multi_factor",
+			"managed-oauth-rejected@example.com",
+		);
+		expect(status).toBe(500);
+		await expect(
+			Promise.all(
+				["user", "account", "session"].map((model) =>
+					context.adapter.count({ model }),
+				),
+			),
+		).resolves.toEqual([0, 0, 0]);
+	});
+
+	it("commits a new federated identity and session when managed assurance is satisfied", async () => {
+		const { context, location } = await runManagedGoogleCallback(
+			"single_factor",
+			"managed-oauth-accepted@example.com",
+		);
+		expect(location).not.toContain("error=");
+		await expect(
+			Promise.all(
+				["user", "account", "session"].map((model) =>
+					context.adapter.count({ model }),
+				),
+			),
+		).resolves.toEqual([1, 1, 1]);
 	});
 });

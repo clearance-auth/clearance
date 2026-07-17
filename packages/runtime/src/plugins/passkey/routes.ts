@@ -25,6 +25,10 @@ import { getAuthoritativeSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { parseSessionOutput, parseUserOutput } from "../../db";
 import {
+	captureInternalSessionIssuanceContext,
+	createInternalSessionIssuanceContext,
+} from "../../internal/session-issuance-context";
+import {
 	PASSKEY_SESSION_GENERATION_FIELD,
 	rotatePasskeySessionGeneration,
 } from "../../db/passkey-session-generation";
@@ -534,6 +538,14 @@ export const verifyPasskeyAuthentication = (options: PasskeyOptions | undefined)
 
 						const newSession = await ctx.context.internalAdapter.createSession(
 							passkey.userId,
+							undefined,
+							undefined,
+							false,
+							createInternalSessionIssuanceContext({
+								purpose: "interactive",
+								subjectId: passkey.userId,
+								evidence: [{ kind: "primary", primaryMethod: "passkey" }],
+							}),
 						);
 						if (!newSession) {
 							throw APIError.from(
@@ -759,6 +771,14 @@ export const deletePasskey = (options: PasskeyOptions | undefined) =>
 					) {
 						lifecycleConflict();
 					}
+					const replacementIssuanceContext =
+						await captureInternalSessionIssuanceContext(
+							ctx.context.internalAdapter,
+							{
+								purpose: "replacement",
+								sourceSessionToken: presentedSessionToken,
+							},
+						);
 
 					const currentTarget = await adapter.findOne<Passkey>({
 						model: "passkey",
@@ -914,10 +934,16 @@ export const deletePasskey = (options: PasskeyOptions | undefined) =>
 
 					await ctx.context.internalAdapter.deleteUserSessions(userId);
 					const replacementSession =
-						await ctx.context.internalAdapter.createSession(userId, false, {
-							expiresAt: originalExpiresAt,
-							__preserveSessionExpiresAt: true,
-						});
+						await ctx.context.internalAdapter.createSession(
+							userId,
+							false,
+							{
+								expiresAt: originalExpiresAt,
+								__preserveSessionExpiresAt: true,
+							},
+							undefined,
+							replacementIssuanceContext,
+						);
 					if (
 						new Date(replacementSession.expiresAt).getTime() !==
 						originalExpiresAtTime

@@ -348,6 +348,14 @@ export type Where = {
 };
 
 /**
+ * Stable scalar used to distinguish one create-if-absent attempt from every
+ * concurrent contender. Reference-valued selectors cannot classify a row
+ * returned through a database driver reliably, and `null` cannot identify one
+ * particular attempt. Numbers must be finite.
+ */
+export type CreateIfAbsentAttemptValue = string | number | boolean;
+
+/**
  * JoinOption configuration for relational queries.
  *
  * Allows you to join related tables/models in a single query operation.
@@ -423,6 +431,24 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 		 */
 		forceAllowId?: boolean | undefined;
 	}) => Promise<R>;
+	/**
+	 * Atomically create a row only when the supplied schema-declared unique
+	 * equality selector is absent. The inserted row is returned only to the
+	 * winner; concurrent losers return `null` without mutating the winner or
+	 * raising an expected uniqueness error.
+	 *
+	 * `attemptBy` identifies this particular insertion attempt and must be a
+	 * string, finite number, or boolean already present in `data`. Adapters whose
+	 * native upsert returns the existing row use it to distinguish the inserter
+	 * from a loser without changing that row.
+	 */
+	createIfAbsent: <T extends Record<string, any>, R = T>(data: {
+		model: string;
+		data: T;
+		uniqueBy: { field: string; value: Where["value"] };
+		attemptBy: { field: string; value: CreateIfAbsentAttemptValue };
+		forceAllowId?: boolean | undefined;
+	}) => Promise<R | null>;
 	findOne: <T>(data: {
 		model: string;
 		where: Where[];
@@ -557,6 +583,14 @@ export interface CustomAdapter {
 		data: T;
 		select?: string[] | undefined;
 	}) => Promise<T>;
+	/** Native first-writer-wins insert. The factory intentionally has no unsafe fallback. */
+	createIfAbsent?: <T extends Record<string, any>>(data: {
+		model: string;
+		data: T;
+		uniqueBy: { field: string; value: Where["value"] };
+		/** May contain an adapter-specific representation after input transforms. */
+		attemptBy: { field: string; value: unknown };
+	}) => Promise<T | null>;
 	update: <T>(data: {
 		model: string;
 		where: CleanedWhere[];

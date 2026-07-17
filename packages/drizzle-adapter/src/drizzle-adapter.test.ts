@@ -83,6 +83,101 @@ describe("drizzle-adapter", () => {
 		expect(adapter).toBeDefined();
 	});
 
+	it("createIfAbsent uses the mapped unique column and returns only the inserted attempt", async () => {
+		const claimTable = {
+			id: { name: "id" },
+			claim_key: { name: "claim_key" },
+			attempt_id: { name: "attempt_id" },
+			value: { name: "value" },
+		};
+		let stored: Record<string, unknown> | null = null;
+		const onConflictDoNothing = vi.fn((config: Record<string, unknown>) => ({
+			returning: vi.fn(async () => {
+				if (stored) return [];
+				stored = pendingValues;
+				return [stored];
+			}),
+			config,
+		}));
+		let pendingValues: Record<string, unknown> = {};
+		const values = vi.fn((next: Record<string, unknown>) => {
+			pendingValues = next;
+			return { onConflictDoNothing };
+		});
+		const db = {
+			_: { fullSchema: { claim: claimTable } },
+			insert: vi.fn(() => ({ values })),
+		} as any;
+		const adapter = drizzleAdapter(db, {
+			provider: "pg",
+			schema: { claim: claimTable },
+		})({
+			plugins: [
+				{
+					id: "claim-test",
+					schema: {
+						claim: {
+							fields: {
+								key: {
+									type: "string",
+									required: true,
+									unique: true,
+									fieldName: "claim_key",
+								},
+								attempt: {
+									type: "string",
+									required: true,
+									fieldName: "attempt_id",
+								},
+								value: { type: "string", required: true },
+							},
+						},
+					},
+				},
+			],
+		} as any);
+		const first = {
+			id: "winner-id",
+			key: "shared",
+			attempt: "winner-attempt",
+			value: "winner-value",
+		};
+		const second = {
+			id: "loser-id",
+			key: "shared",
+			attempt: "loser-attempt",
+			value: "loser-value",
+		};
+
+		expect(
+			await adapter.createIfAbsent({
+				model: "claim",
+				data: first,
+				uniqueBy: { field: "key", value: first.key },
+				attemptBy: { field: "attempt", value: first.attempt },
+				forceAllowId: true,
+			}),
+		).toEqual(first);
+		expect(
+			await adapter.createIfAbsent({
+				model: "claim",
+				data: second,
+				uniqueBy: { field: "key", value: second.key },
+				attemptBy: { field: "attempt", value: second.attempt },
+				forceAllowId: true,
+			}),
+		).toBeNull();
+		expect(onConflictDoNothing).toHaveBeenCalledWith({
+			target: claimTable.claim_key,
+		});
+		expect(stored).toEqual({
+			id: "winner-id",
+			claim_key: "shared",
+			attempt_id: "winner-attempt",
+			value: "winner-value",
+		});
+	});
+
 	it("should use unique column fallback for MySQL creates without an id", async () => {
 		const userRow = {
 			id: 42,

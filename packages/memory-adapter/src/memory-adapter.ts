@@ -6,6 +6,7 @@ import type {
 } from "@clearance/core/db/adapter";
 import { createAdapterFactory } from "@clearance/core/db/adapter";
 import { logger } from "@clearance/core/env";
+import { ClearanceError } from "@clearance/core/error";
 import {
 	insensitiveCompare,
 	insensitiveContains,
@@ -22,6 +23,13 @@ export interface MemoryDB {
 export interface MemoryAdapterConfig {
 	debugLogs?: DBAdapterDebugLogOption | undefined;
 }
+
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
 
 /**
  * Index a table's rows by their `id` for row-level reconciliation. Every
@@ -137,7 +145,7 @@ export const memoryAdapter = (
 	 * edit the same row resolve last-writer-wins. It is built for development
 	 * and tests, not production concurrency control.
 	 */
-	const buildAdapterFactory = (activeDb: MemoryDB) =>
+	const buildAdapterFactory = (activeDb: MemoryDB, inTransaction = false) =>
 		createAdapterFactory({
 			config: {
 				adapterId: "memory",
@@ -167,7 +175,7 @@ export const memoryAdapter = (
 					// `await` point.
 					const base = structuredClone(activeDb);
 					const clone = structuredClone(activeDb);
-					const trxAdapter = buildAdapterFactory(clone)(lazyOptions!);
+					const trxAdapter = buildAdapterFactory(clone, true)(lazyOptions!);
 					const result = await cb(trxAdapter);
 					mergeTransactionInto(activeDb, base, clone);
 					return result;
@@ -428,6 +436,28 @@ export const memoryAdapter = (
 						}
 						activeDb[model]!.push(data);
 						return data;
+					},
+					createIfAbsent: async <T extends Record<string, any>>({
+						model,
+						data,
+						uniqueBy,
+						attemptBy,
+					}: CreateIfAbsentInput<T>): Promise<T | null> => {
+						if (inTransaction) {
+							throw new ClearanceError(
+								"Memory adapter cannot guarantee createIfAbsent across concurrent transaction snapshots",
+							);
+						}
+						if (!activeDb[model]) activeDb[model] = [];
+						if (
+							activeDb[model]!.some((row) =>
+								Object.is(row[uniqueBy.field], uniqueBy.value),
+							)
+						) {
+							return null;
+						}
+						activeDb[model]!.push(data);
+						return data[attemptBy.field] === attemptBy.value ? data : null;
 					},
 					findOne: async ({ model, where, select, join }) => {
 						const res = convertWhereClause(where, model, join, select);

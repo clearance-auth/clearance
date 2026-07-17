@@ -1,5 +1,6 @@
 import { base64Url } from "@clearance/utils/base64";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { admin } from "../admin";
@@ -43,6 +44,68 @@ describe("passkey: discoverable options and mandatory user verification", () => 
 		const res = await auth.api.generatePasskeyAuthenticationOptions({ headers });
 		expect(res.allowCredentials).toBeUndefined();
 		expect(res.userVerification).toBe("required");
+	});
+});
+
+describe("passkey: interactive issuance evidence", () => {
+	it("binds verified WebAuthn evidence to the credential owner", async () => {
+		const instance = await getTestInstance(
+			{ baseURL: ORIGIN, plugins: [passkey()] },
+			{ port: 3300 },
+		);
+		const signedIn = await instance.signInWithTestUser();
+		signedIn.headers.set("origin", ORIGIN);
+		const authenticator = createVirtualAuthenticator(ORIGIN, "localhost");
+		const registrationOptions =
+			await instance.auth.api.generatePasskeyRegistrationOptions({
+				headers: signedIn.headers,
+			});
+		await instance.auth.api.verifyPasskeyRegistration({
+			headers: signedIn.headers,
+			body: {
+				response: authenticator.registrationResponse(
+					registrationOptions.challenge,
+				),
+			},
+		});
+		const context = await instance.auth.$context;
+		const originalCreateSession = context.internalAdapter.createSession.bind(
+			context.internalAdapter,
+		);
+		const createSession = vi
+			.spyOn(context.internalAdapter, "createSession")
+			.mockImplementation((...args) => originalCreateSession(...args));
+
+		try {
+			const authenticationOptions =
+				await instance.auth.api.generatePasskeyAuthenticationOptions({
+					headers: signedIn.headers,
+				});
+			await instance.auth.api.verifyPasskeyAuthentication({
+				headers: signedIn.headers,
+				body: {
+					response: authenticator.authenticationResponse(
+						authenticationOptions.challenge,
+						registrationOptions.user.id,
+						1,
+					),
+				},
+			});
+
+			expect(createSession).toHaveBeenCalledOnce();
+			const call = createSession.mock.calls[0];
+			expect(call).toBeDefined();
+			const [subjectId, , , , issuanceContext] = call!;
+			expect(subjectId).toBe(signedIn.user.id);
+			expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: signedIn.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "passkey" }],
+				targetOrganizationId: null,
+			});
+		} finally {
+			createSession.mockRestore();
+		}
 	});
 });
 

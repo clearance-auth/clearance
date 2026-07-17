@@ -14,6 +14,8 @@ import type { OAuthProvider } from "../oauth2";
 import type {
 	RuntimeAuthenticationSessionMutationGuard,
 	SessionIssuanceContext,
+	VerificationChallengeConsumptionContext,
+	VerificationChallengeCreationContext,
 } from "./authentication-policy";
 import type { ClearanceCookie, ClearanceCookies } from "./cookie";
 import type { Awaitable, LiteralString } from "./helper";
@@ -256,9 +258,16 @@ export interface InternalAdapter<
 
 	updateAccount(id: string, data: Partial<Account>): Promise<Account>;
 
+	/**
+	 * Creates a verification challenge. With managed authentication policy this
+	 * also creates a digest-keyed primary replay marker in the same rollback-capable
+	 * transaction. Secondary publication completes after commit before the call
+	 * resolves; no raw identifier or proof value is copied into the marker.
+	 */
 	createVerificationValue(
 		data: Omit<Verification, "createdAt" | "id" | "updatedAt"> &
 			Partial<Verification>,
+		challengeContext?: VerificationChallengeCreationContext,
 	): Promise<Verification>;
 
 	findVerificationValue(identifier: string): Promise<Verification | null>;
@@ -277,19 +286,28 @@ export interface InternalAdapter<
 	 *
 	 * Replaces the racy `findVerificationValue` + `deleteVerificationByIdentifier`
 	 * pair at single-use credential consumption sites.
+	 *
+	 * With managed authentication policy, callers must already own an active
+	 * primary transaction. Success atomically consumes both the exact challenge
+	 * and its primary marker; secondary cleanup is deferred until commit.
 	 */
-	consumeVerificationValue(identifier: string): Promise<Verification | null>;
+	consumeVerificationValue(
+		identifier: string,
+		challengeContext?: VerificationChallengeConsumptionContext,
+	): Promise<Verification | null>;
 
 	/**
-	 * First-writer-wins create keyed by a deterministic primary key derived from
+	 * First-writer-wins create keyed by a deterministic database key derived from
 	 * `identifier`. Returns `true` when this caller created the row and `false`
 	 * when a row for the same identifier already existed.
 	 *
 	 * The dual of `consumeVerificationValue`: reserve races to create a marker
 	 * exactly once, where consume races to delete one exactly once. Use it for
 	 * replay tombstones (a SAML assertion id, a JWT `jti`) where the first caller
-	 * wins. The database path is atomic via the primary key; the
-	 * secondary-storage-only path is best-effort under concurrency.
+	 * wins. The primary database is always the atomic authority via a digest-keyed
+	 * unique security-ledger row, independent of the configured id strategy and
+	 * verification storage mode. Raw identifiers and replay values are never
+	 * copied into secondary storage by this reservation primitive.
 	 */
 	reserveVerificationValue(data: {
 		identifier: string;

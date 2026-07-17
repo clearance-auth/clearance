@@ -1,10 +1,14 @@
 import type {
 	AuthenticationFactorMethod,
 	AuthenticationPrimaryMethod,
+	InternalAdapter,
 	SessionIssuanceContext,
 	VerifiedAuthenticationEvidence,
 } from "@clearance/core";
-import type { SessionAssuranceRequirement } from "../security/session-assurance";
+import type {
+	SessionAssuranceRequirement,
+	ValidatedSessionAssuranceFields,
+} from "../security/session-assurance";
 
 const PRIMARY_METHODS = new Set<AuthenticationPrimaryMethod>([
 	"password",
@@ -45,6 +49,23 @@ export type ManagedSessionIssuanceFailureReason =
 	| "unsupported_purpose"
 	| "policy_unsatisfied";
 
+export type CapturedSessionIssuanceAuthority = Readonly<{
+	sourceSessionId: string;
+	sourceCredentialId: string | null;
+	sourceSubjectId: string;
+	sourceOrganizationId: string | null;
+	sourceExpiresAt: Date;
+	sourceAssurance: ValidatedSessionAssuranceFields;
+	transactionAdapter: object;
+}>;
+
+type SessionIssuanceCaptureAuthority = (
+	context: Extract<
+		InternalSessionIssuanceContext,
+		{ purpose: "replacement" | "device" }
+	>,
+) => Promise<CapturedSessionIssuanceAuthority>;
+
 export class ManagedSessionIssuanceError extends Error {
 	readonly code = "MANAGED_SESSION_ISSUANCE_FAILED" as const;
 
@@ -68,6 +89,11 @@ export class ManagedSessionIssuanceError extends Error {
 }
 
 const contexts = new WeakMap<object, InternalSessionIssuanceContext>();
+const captureAuthorities = new WeakMap<object, SessionIssuanceCaptureAuthority>();
+const capturedAuthorities = new WeakMap<
+	object,
+	CapturedSessionIssuanceAuthority
+>();
 
 function invalid(): never {
 	throw new ManagedSessionIssuanceError("context_invalid");
@@ -220,6 +246,42 @@ export function createInternalSessionIssuanceContext(
 	return opaque;
 }
 
+export function attachInternalSessionIssuanceCaptureAuthority(
+	internalAdapter: InternalAdapter,
+	capture: SessionIssuanceCaptureAuthority,
+): void {
+	if (captureAuthorities.has(internalAdapter)) invalid();
+	captureAuthorities.set(internalAdapter, capture);
+}
+
+export async function captureInternalSessionIssuanceContext(
+	internalAdapter: InternalAdapter,
+	value: unknown,
+): Promise<SessionIssuanceContext | undefined> {
+	const opaque = createInternalSessionIssuanceContext(value);
+	const context = readInternalSessionIssuanceContext(opaque);
+	if (
+		!context ||
+		(context.purpose !== "replacement" && context.purpose !== "device")
+	) {
+		contexts.delete(opaque as object);
+		invalid();
+	}
+	const capture = captureAuthorities.get(internalAdapter);
+	if (!capture) {
+		contexts.delete(opaque as object);
+		return undefined;
+	}
+	try {
+		const authority = await capture(context);
+		capturedAuthorities.set(opaque as object, authority);
+		return opaque;
+	} catch (error) {
+		contexts.delete(opaque as object);
+		throw error;
+	}
+}
+
 export function readInternalSessionIssuanceContext(
 	value: unknown,
 ): InternalSessionIssuanceContext | undefined {
@@ -238,4 +300,16 @@ export function requireInternalSessionIssuanceContext(
 	if (!context) throw new ManagedSessionIssuanceError("context_invalid");
 	contexts.delete(value as object);
 	return context;
+}
+
+export function requireCapturedSessionIssuanceAuthority(
+	value: unknown,
+): CapturedSessionIssuanceAuthority {
+	if (typeof value !== "object" || value === null) invalid();
+	const authority = capturedAuthorities.get(value);
+	if (!authority) {
+		throw new ManagedSessionIssuanceError("unsupported_purpose");
+	}
+	capturedAuthorities.delete(value);
+	return authority;
 }

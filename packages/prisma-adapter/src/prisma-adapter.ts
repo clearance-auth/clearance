@@ -48,6 +48,13 @@ export interface PrismaConfig {
 
 interface PrismaClient {}
 
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
+
 // Prisma raises `P2025` for every "record not found" surface area we care
 // about (`update`, `delete`, and `incrementOne`) with the actual cause
 // distinguishable via `meta.cause` (e.g. "Record to update not found." vs
@@ -65,6 +72,7 @@ type PrismaClientInternal = {
 } & {
 	[model: string]: {
 		create: (data: any) => Promise<any>;
+		upsert: (data: any) => Promise<any>;
 		findFirst: (data: any) => Promise<any>;
 		findMany: (data: any) => Promise<any>;
 		update: (data: any) => Promise<any>;
@@ -412,6 +420,27 @@ export const prismaAdapter = (prisma: PrismaClient, config: PrismaConfig) => {
 						select: convertSelect(select, model),
 					});
 					return result;
+				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data: values,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					if (!db[model]) {
+						throw new ClearanceError(
+							`Model ${model} does not exist in the database. If you haven't generated the Prisma client, you need to run 'npx prisma generate'`,
+						);
+					}
+					const row = await db[model]!.upsert({
+						where: { [uniqueBy.field]: uniqueBy.value },
+						create: values,
+						// An empty update preserves the existing winner byte-for-byte.
+						update: {},
+					});
+					return row && row[attemptBy.field] === attemptBy.value
+						? (row as T)
+						: null;
 				},
 				async findOne({ model, where, select, join }) {
 					// this is just "JoinOption" type because we disabled join transformation in adapter config

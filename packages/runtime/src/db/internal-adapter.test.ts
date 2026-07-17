@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import type { GenericEndpointContext } from "@clearance/core";
+import { runWithTransaction } from "@clearance/core/context";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { clearance } from "../auth/full";
@@ -2267,29 +2268,91 @@ describe("internal adapter test", async () => {
 	});
 
 	describe("reserveVerificationValue", () => {
-		async function makeAdapter(overrides?: Partial<ClearanceOptions>) {
+		async function makeContext(overrides?: Partial<ClearanceOptions>) {
 			const opts = {
 				database: new DatabaseSync(":memory:"),
 				...overrides,
 			} satisfies ClearanceOptions;
 			await (await getMigrations(opts)).runMigrations();
-			const ctx = await init(opts);
-			return ctx.internalAdapter;
+			return init(opts);
 		}
 
-		it("returns true the first time and the row is findable", async () => {
-			const adapter = await makeAdapter();
+		async function makeAdapter(overrides?: Partial<ClearanceOptions>) {
+			return (await makeContext(overrides)).internalAdapter;
+		}
 
-			const reserved = await adapter.reserveVerificationValue({
+		function makeSecondaryStorage(
+			store: Map<string, string>,
+			options: { failVerificationAccess?: boolean } = {},
+		) {
+			return {
+				namespace: "reserve-verification-test-storage",
+				runExclusive<T>(_name: string, operation: () => T): T {
+					return operation();
+				},
+				assertNoLegacySessionWriters() {},
+				set(key: string, value: string) {
+					if (
+						options.failVerificationAccess &&
+						key.startsWith("verification:")
+					) {
+						throw new Error("secondary verification storage unavailable");
+					}
+					store.set(key, value);
+				},
+				get(key: string) {
+					if (
+						options.failVerificationAccess &&
+						key.startsWith("verification:")
+					) {
+						throw new Error("secondary verification storage unavailable");
+					}
+					return store.get(key) ?? null;
+				},
+				delete(key: string) {
+					store.delete(key);
+				},
+			};
+		}
+
+		type ReservationTombstone = {
+			id: string;
+			key: string;
+			state: string;
+			phase: string;
+			cursor: string;
+			revision: number;
+			completedAt: Date;
+			updatedAt: Date;
+		};
+
+		async function findReservationTombstones(
+			context: Awaited<ReturnType<typeof makeContext>>,
+		) {
+			return context.adapter.findMany<ReservationTombstone>({
+				model: "securityMigration",
+				where: [
+					{
+						field: "state",
+						value: "verification-reservation-v1",
+					},
+				],
+			});
+		}
+
+		it("returns true the first time and persists only a digest tombstone", async () => {
+			const context = await makeContext();
+
+			const reserved = await context.internalAdapter.reserveVerificationValue({
 				identifier: "reserve:fresh",
 				value: "jti-1",
 				expiresAt: new Date(Date.now() + 60_000),
 			});
 			expect(reserved).toBe(true);
-
-			const found = await adapter.findVerificationValue("reserve:fresh");
-			expect(found).not.toBeNull();
-			expect(found!.value).toBe("jti-1");
+			const [tombstone] = await findReservationTombstones(context);
+			expect(tombstone).toBeDefined();
+			expect(JSON.stringify(tombstone)).not.toContain("reserve:fresh");
+			expect(JSON.stringify(tombstone)).not.toContain("jti-1");
 		});
 
 		it("returns false the second time for the same identifier", async () => {
@@ -2346,6 +2409,386 @@ describe("internal adapter test", async () => {
 
 			expect(first).toBe(true);
 			expect(second).toBe(true);
+		});
+
+		it("uses one primary tombstone winner in secondary-only mode", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+
+			const results = await Promise.all(
+				Array.from({ length: 8 }, (_, index) =>
+					context.internalAdapter.reserveVerificationValue({
+						identifier: "reserve:secondary-race",
+						value: `secondary-jti-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				),
+			);
+
+			expect(results.filter(Boolean)).toHaveLength(1);
+			expect(await findReservationTombstones(context)).toHaveLength(1);
+		});
+
+		it("rolls primary reservation authority back without secondary replay material", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+			const identifier = "reserve:transaction-rollback";
+			const markerKey = `verification:${identifier}`;
+
+			await expect(
+				runWithTransaction(context.adapter, async () => {
+					expect(
+						await context.internalAdapter.reserveVerificationValue({
+							identifier,
+							value: "transactional-winner",
+							expiresAt: new Date(Date.now() + 60_000),
+						}),
+					).toBe(true);
+					expect(store.has(markerKey)).toBe(false);
+					throw new Error("rollback reservation");
+				}),
+			).rejects.toThrow("rollback reservation");
+
+			expect(await findReservationTombstones(context)).toHaveLength(0);
+			expect(store.has(markerKey)).toBe(false);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier,
+					value: "replacement-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(store.has(markerKey)).toBe(false);
+		});
+
+		it("uses one raw-identifier gate across different storage transformations", async () => {
+			const storagePairs = [
+				["plain", "hashed"],
+				[
+					"hashed",
+					{
+						hash: async (identifier: string) =>
+							`custom-${identifier.length}`,
+					},
+				],
+				[
+					"plain",
+					{
+						hash: async (identifier: string) =>
+							`custom-${identifier.length}`,
+					},
+				],
+			] as const;
+
+			for (const [index, [leftStorage, rightStorage]] of storagePairs.entries()) {
+				const database = new DatabaseSync(":memory:");
+				const leftOptions = {
+					database,
+					verification: {
+						storeInDatabase: false,
+						storeIdentifier: leftStorage,
+					},
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				} satisfies ClearanceOptions;
+				const rightOptions = {
+					database,
+					verification: {
+						storeInDatabase: false,
+						storeIdentifier: rightStorage,
+					},
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				} satisfies ClearanceOptions;
+
+				await (await getMigrations(leftOptions)).runMigrations();
+				const [leftContext, rightContext] = await Promise.all([
+					init(leftOptions),
+					init(rightOptions),
+				]);
+				const identifier = `reserve:storage-transform-${index}`;
+				const results = await Promise.all([
+					leftContext.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: `left-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+					rightContext.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: `right-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				]);
+
+				expect(results.filter(Boolean)).toHaveLength(1);
+				expect(await findReservationTombstones(leftContext)).toHaveLength(1);
+			}
+		});
+
+		it.each(["serial", "uuid"] as const)(
+			"supports %s-generated tombstone ids for replay and expiry",
+			async (generateIdStrategy) => {
+				const context = await makeContext({
+					advanced: { database: { generateId: generateIdStrategy } },
+					verification: { storeInDatabase: false },
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				});
+				const identifier = `reserve:${generateIdStrategy}-id`;
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "expired-generated-id-value",
+						expiresAt: new Date(Date.now() - 1_000),
+					}),
+				).toBe(true);
+				const [expired] = await findReservationTombstones(context);
+				expect(expired).toBeDefined();
+				if (generateIdStrategy === "serial") {
+					expect(expired!.id).toMatch(/^\d+$/);
+				} else {
+					expect(expired!.id).toMatch(
+						/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+					);
+				}
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "replacement-generated-id-value",
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				).toBe(true);
+				const [replacement] = await findReservationTombstones(context);
+				expect(replacement).toBeDefined();
+				expect(replacement!.cursor).not.toBe(expired!.cursor);
+				expect(replacement!.phase).not.toBe(expired!.phase);
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "generated-id-replay",
+						expiresAt: new Date(Date.now() + 120_000),
+					}),
+				).toBe(false);
+				expect(await findReservationTombstones(context)).toEqual([
+					replacement,
+				]);
+			},
+		);
+
+		it.each(["serial", "uuid"] as const)(
+			"uses the unique security ledger under default storage with %s ids",
+			async (generateIdStrategy) => {
+				const context = await makeContext({
+					advanced: { database: { generateId: generateIdStrategy } },
+				});
+				const identifier = `reserve:default-storage-${generateIdStrategy}`;
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "default-storage-winner",
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				).toBe(true);
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "default-storage-replay",
+						expiresAt: new Date(Date.now() + 120_000),
+					}),
+				).toBe(false);
+				expect(await findReservationTombstones(context)).toHaveLength(1);
+			},
+		);
+
+		it("uses the supplied digest id when automatic id generation is disabled", async () => {
+			const database = new DatabaseSync(":memory:");
+			const secondaryStorage = makeSecondaryStorage(new Map());
+			const migrationOptions = {
+				database,
+				verification: { storeInDatabase: false },
+				secondaryStorage,
+			} satisfies ClearanceOptions;
+			await (await getMigrations(migrationOptions)).runMigrations();
+			const context = await init({
+				...migrationOptions,
+				advanced: { database: { generateId: false } },
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:disabled-id-generation",
+					value: "disabled-id-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			const [tombstone] = await findReservationTombstones(context);
+			expect(tombstone).toBeDefined();
+			expect(tombstone!.key).toBe(
+				`verification-reservation-v1:${tombstone!.id}`,
+			);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:disabled-id-generation",
+					value: "disabled-id-replay",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(false);
+		});
+
+		it("keeps the primary tombstone authoritative without a secondary mirror", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: {
+					storeInDatabase: false,
+					storeIdentifier: {
+						hash: async (identifier) => `stored-${identifier.length}`,
+					},
+				},
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+			const rawIdentifier = "raw-reservation-bearer-identifier";
+			const winningValue = "raw-reservation-winning-value";
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: rawIdentifier,
+					value: winningValue,
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(store.has(`verification:stored-${rawIdentifier.length}`)).toBe(
+				false,
+			);
+			const [before] = await findReservationTombstones(context);
+			expect(before).toBeDefined();
+			expect(JSON.stringify(before)).not.toContain(rawIdentifier);
+			expect(JSON.stringify(before)).not.toContain(winningValue);
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: rawIdentifier,
+					value: "raw-reservation-losing-value",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(false);
+
+			const [after] = await findReservationTombstones(context);
+			expect(after).toEqual(before);
+			expect(store.has(`verification:stored-${rawIdentifier.length}`)).toBe(
+				false,
+			);
+		});
+
+		it("reclaims a bounded batch of unique expired reservations", async () => {
+			const context = await makeContext();
+			const expiredAt = new Date(Date.now() - 60_000);
+			for (let index = 0; index < 12; index += 1) {
+				const timestamp = new Date(Date.now() - 120_000 + index);
+				await context.adapter.create({
+					model: "securityMigration",
+					forceAllowId: true,
+					data: {
+						id: `expired-reservation-${index}`,
+						key: `verification-reservation-v1:expired-${index}`,
+						state: "verification-reservation-v1",
+						phase: `phase-${index}`,
+						cursor: `cursor-${index}`,
+						revision: 1,
+						completedAt: expiredAt,
+						createdAt: timestamp,
+						updatedAt: timestamp,
+					},
+				});
+			}
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:gc-trigger",
+					value: "gc-trigger-value",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+
+			const remaining = await findReservationTombstones(context);
+			expect(
+				remaining.filter((row) => row.completedAt <= new Date()),
+			).toHaveLength(4);
+			expect(
+				remaining.filter((row) => row.completedAt > new Date()),
+			).toHaveLength(1);
+		});
+
+		it("rejects replay when the secondary verification cache is unavailable", async () => {
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(new Map(), {
+					failVerificationAccess: true,
+				}),
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:cache-unavailable",
+					value: "cache-unavailable-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:cache-unavailable",
+					value: "cache-unavailable-replay",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(false);
+			expect(await findReservationTombstones(context)).toHaveLength(1);
+		});
+
+		it("reclaims only an expired primary tombstone with a bounded retry", async () => {
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(new Map()),
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:expired-tombstone",
+					value: "expired-value",
+					expiresAt: new Date(Date.now() - 1_000),
+				}),
+			).toBe(true);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:valid-neighbor",
+					value: "valid-neighbor-value",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			const before = await findReservationTombstones(context);
+			const validNeighbor = before.find((row) =>
+				row.completedAt.getTime() > Date.now(),
+			);
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:expired-tombstone",
+					value: "replacement-value",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(true);
+
+			const after = await findReservationTombstones(context);
+			expect(after).toHaveLength(2);
+			expect(after).toContainEqual(validNeighbor);
+			expect(
+				after.some((row) => row.completedAt.getTime() > Date.now() + 60_000),
+			).toBe(true);
 		});
 	});
 });

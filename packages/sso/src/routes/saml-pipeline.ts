@@ -9,6 +9,10 @@ import type { FlowResult } from "samlify/types/src/flow";
 import * as constants from "../constants";
 import { assignOrganizationFromProvider } from "../linking";
 import {
+	consumeSSOVerificationChallenge,
+	createSSOVerificationChallenge,
+} from "../internal/verification-challenge-authority";
+import {
 	getSAMLPostAssertionConsumerServiceUrls,
 	hasSAMLEncryptedAssertion,
 	SAML_HTTP_POST_BINDING,
@@ -390,10 +394,16 @@ export async function processSAMLResponse(
 			// submissions cannot both match one outstanding request. The consume
 			// returns null for missing or expired rows, so no separate expiry gate
 			// is needed.
-			const consumed =
-				await ctx.context.internalAdapter.consumeVerificationValue(
-					`${constants.AUTHN_REQUEST_KEY_PREFIX}${inResponseTo}`,
-				);
+			const identifier = `${constants.AUTHN_REQUEST_KEY_PREFIX}${inResponseTo}`;
+			const consumed = await consumeSSOVerificationChallenge(
+				options,
+				ctx.context.internalAdapter,
+				{
+					purpose: "saml-authn-request",
+					subject: providerId,
+					identifier,
+				},
+			);
 
 			let storedRequest: AuthnRequestRecord | null = null;
 			if (consumed) {
@@ -639,23 +649,31 @@ export async function processSAMLResponse(
 			nameID: extract.nameID,
 			sessionIndex: (extract as SAMLAssertionExtract).sessionIndex,
 		};
-		await ctx.context.internalAdapter
-			.createVerificationValue({
+		await createSSOVerificationChallenge(
+			options,
+			ctx.context.internalAdapter,
+			{ purpose: "saml-session", subject: session.id },
+			{
 				identifier: samlSessionKey,
 				value: JSON.stringify(samlSessionData),
 				expiresAt: session.expiresAt,
-			})
+			},
+		)
 			.catch((e: unknown) =>
 				ctx.context.logger.warn("Failed to create SAML session record", {
 					error: e,
 				}),
 			);
-		await ctx.context.internalAdapter
-			.createVerificationValue({
+		await createSSOVerificationChallenge(
+			options,
+			ctx.context.internalAdapter,
+			{ purpose: "saml-session", subject: session.id },
+			{
 				identifier: `${constants.SAML_SESSION_BY_ID_PREFIX}${session.id}`,
 				value: samlSessionKey,
 				expiresAt: session.expiresAt,
-			})
+			},
+		)
 			.catch((e: unknown) =>
 				ctx.context.logger.warn(
 					"Failed to create SAML session lookup record",

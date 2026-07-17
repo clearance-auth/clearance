@@ -12,11 +12,24 @@ import { setCookieCache, setSessionCookie } from "../../cookies";
 import { generateRandomString, symmetricDecrypt } from "../../crypto";
 import { revokeUnprovenAccountAccess } from "../../db/revoke-unproven-account-access";
 import { parseUserInput, parseUserOutput } from "../../db/schema";
+import {
+	requireManagedAuthenticationTransaction,
+	runManagedAuthenticationTransaction,
+} from "../../internal/managed-authentication-transaction";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import { getDate } from "../../utils/date";
 import { EMAIL_OTP_ERROR_CODES as ERROR_CODES } from "./error-codes";
 import { storeOTP, tryReuseOTP, verifyStoredOTP } from "./otp-token";
 import type { EmailOTPOptions, RequiredEmailOTPOptions } from "./types";
-import { splitAtLastColon, toOTPIdentifier } from "./utils";
+import {
+	emailOTPChallenge,
+	splitAtLastColon,
+	toOTPIdentifier,
+} from "./utils";
 
 const types = [
 	"email-verification",
@@ -38,9 +51,10 @@ async function resolveOTP(
 	type: (typeof types)[number],
 ): Promise<string> {
 	const identifier = toOTPIdentifier(type, email);
+	const challenge = emailOTPChallenge(type, email);
 
 	if (opts.resendStrategy === "reuse") {
-		const reused = await tryReuseOTP(ctx, opts, identifier);
+		const reused = await tryReuseOTP(ctx, opts, challenge);
 		if (reused) return reused;
 	}
 
@@ -48,21 +62,28 @@ async function resolveOTP(
 		opts.generateOTP({ email, type }, ctx) || defaultOTPGenerator(opts);
 	const storedOTP = await storeOTP(ctx, opts, otp);
 
-	await ctx.context.internalAdapter
-		.createVerificationValue({
+	await createInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		challenge,
+		{
 			value: `${storedOTP}:0`,
 			identifier,
 			expiresAt: getDate(opts.expiresIn, "sec"),
-		})
+		},
+	)
 		.catch(async () => {
 			await ctx.context.internalAdapter.deleteVerificationByIdentifier(
 				identifier,
 			);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${storedOTP}:0`,
-				identifier,
-				expiresAt: getDate(opts.expiresIn, "sec"),
-			});
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				challenge,
+				{
+					value: `${storedOTP}:0`,
+					identifier,
+					expiresAt: getDate(opts.expiresIn, "sec"),
+				},
+			);
 		});
 
 	return otp;
@@ -203,11 +224,16 @@ export const createVerificationOTP = (opts: RequiredEmailOTPOptions) =>
 				opts.generateOTP({ email, type: ctx.body.type }, ctx) ||
 				defaultOTPGenerator(opts);
 			const storedOTP = await storeOTP(ctx, opts, otp);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${storedOTP}:0`,
-				identifier: toOTPIdentifier(ctx.body.type, email),
-				expiresAt: getDate(opts.expiresIn, "sec"),
-			});
+			const challenge = emailOTPChallenge(ctx.body.type, email);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				challenge,
+				{
+					value: `${storedOTP}:0`,
+					identifier: challenge.identifier,
+					expiresAt: getDate(opts.expiresIn, "sec"),
+				},
+			);
 			return otp;
 		},
 	);
@@ -483,45 +509,83 @@ export const verifyEmailOTP = (opts: RequiredEmailOTPOptions) =>
 				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_EMAIL);
 			}
 
-			// Use atomic verification to prevent race conditions
-			await atomicVerifyOTP(
-				ctx,
-				opts,
-				toOTPIdentifier("email-verification", email),
-				ctx.body.otp,
-			);
-
-			const user = await ctx.context.internalAdapter.findUserByEmail(email);
-			if (!user) {
-				/**
-				 * safe to leak the existence of a user, given the user has already the OTP from the
-				 * email
-				 */
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
-			}
-			if (ctx.context.options.emailVerification?.beforeEmailVerification) {
-				await ctx.context.options.emailVerification.beforeEmailVerification(
-					user.user,
-					ctx.request,
-				);
-			}
-			const updatedUser = await ctx.context.internalAdapter.updateUser(
-				user.user.id,
-				{
-					email,
-					emailVerified: true,
-				},
-			);
-
-			await ctx.context.options.emailVerification?.afterEmailVerification?.(
-				updatedUser,
-				ctx.request,
-			);
-
 			if (ctx.context.options.emailVerification?.autoSignInAfterVerification) {
-				const session = await ctx.context.internalAdapter.createSession(
-					updatedUser.id,
+				const managed = requireManagedAuthenticationTransaction(ctx);
+				if (
+					managed &&
+					ctx.context.options.emailVerification?.beforeEmailVerification
+				) {
+					throw new Error(
+						"Managed email verification cannot execute beforeEmailVerification outside the atomic authentication transaction",
+					);
+				}
+				const result = await runManagedAuthenticationTransaction(
+					ctx,
+					async () => {
+						try {
+							await atomicVerifyOTP(
+								ctx,
+								opts,
+								emailOTPChallenge("email-verification", email),
+								ctx.body.otp,
+							);
+						} catch (verificationError) {
+							return { verificationError };
+						}
+						const user =
+							await ctx.context.internalAdapter.findUserByEmail(email);
+						if (!user) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								BASE_ERROR_CODES.USER_NOT_FOUND,
+							);
+						}
+						if (!managed) {
+							await ctx.context.options.emailVerification?.beforeEmailVerification?.(
+								user.user,
+								ctx.request,
+							);
+						}
+						const updatedUser = await ctx.context.internalAdapter.updateUser(
+							user.user.id,
+							{ email, emailVerified: true },
+						);
+						if (!managed) {
+							await ctx.context.options.emailVerification?.afterEmailVerification?.(
+								updatedUser,
+								ctx.request,
+							);
+						}
+						const session = await ctx.context.internalAdapter.createSession(
+							updatedUser.id,
+							false,
+							undefined,
+							false,
+							createInternalSessionIssuanceContext({
+								purpose: "interactive",
+								subjectId: updatedUser.id,
+								evidence: [
+									{ kind: "primary", primaryMethod: "email_otp" },
+								],
+							}),
+						);
+						return { session, updatedUser };
+					},
 				);
+				if ("verificationError" in result) throw result.verificationError;
+				const { session, updatedUser } = result;
+				if (managed) {
+					try {
+						await ctx.context.options.emailVerification?.afterEmailVerification?.(
+							updatedUser,
+							ctx.request,
+						);
+					} catch {
+						ctx.context.logger.error(
+							"Managed email verification post-commit callback failed",
+						);
+					}
+				}
 				await setSessionCookie(ctx, {
 					session,
 					user: updatedUser,
@@ -531,6 +595,63 @@ export const verifyEmailOTP = (opts: RequiredEmailOTPOptions) =>
 					token: session.token,
 					user: parseUserOutput(ctx.context.options, updatedUser),
 				});
+			}
+
+			const managed = requireManagedAuthenticationTransaction(ctx);
+			if (
+				managed &&
+				ctx.context.options.emailVerification?.beforeEmailVerification
+			) {
+				throw new Error(
+					"Managed email verification cannot execute beforeEmailVerification outside the atomic authentication transaction",
+				);
+			}
+			const result = await runManagedAuthenticationTransaction(ctx, async () => {
+				try {
+					await atomicVerifyOTP(
+						ctx,
+						opts,
+						emailOTPChallenge("email-verification", email),
+						ctx.body.otp,
+					);
+				} catch (verificationError) {
+					return { verificationError };
+				}
+				const user = await ctx.context.internalAdapter.findUserByEmail(email);
+				if (!user) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
+				}
+				if (!managed) {
+					await ctx.context.options.emailVerification?.beforeEmailVerification?.(
+						user.user,
+						ctx.request,
+					);
+				}
+				const updatedUser = await ctx.context.internalAdapter.updateUser(
+					user.user.id,
+					{ email, emailVerified: true },
+				);
+				if (!managed) {
+					await ctx.context.options.emailVerification?.afterEmailVerification?.(
+						updatedUser,
+						ctx.request,
+					);
+				}
+				return { updatedUser };
+			});
+			if ("verificationError" in result) throw result.verificationError;
+			const { updatedUser } = result;
+			if (managed) {
+				try {
+					await ctx.context.options.emailVerification?.afterEmailVerification?.(
+						updatedUser,
+						ctx.request,
+					);
+				} catch {
+					ctx.context.logger.error(
+						"Managed email verification post-commit callback failed",
+					);
+				}
 			}
 			const currentSession = await getSessionFromCtx(ctx);
 			if (
@@ -642,57 +763,70 @@ export const signInEmailOTP = (opts: RequiredEmailOTPOptions) =>
 		async (ctx) => {
 			const { email: rawEmail, otp, name, image, ...rest } = ctx.body;
 			const email = rawEmail.toLowerCase();
-
-			// Use atomic verification to prevent race conditions
-			await atomicVerifyOTP(ctx, opts, toOTPIdentifier("sign-in", email), otp);
-
-			const user = await ctx.context.internalAdapter.findUserByEmail(email);
-			if (!user) {
-				if (opts.disableSignUp) {
-					throw APIError.from("BAD_REQUEST", ERROR_CODES.INVALID_OTP);
-				}
-				const additionalFields = parseUserInput(
-					ctx.context.options,
-					rest,
-					"create",
-				);
-				const newUser = await ctx.context.internalAdapter.createUser({
-					...additionalFields,
-					email,
-					emailVerified: true,
-					name: name || "",
-					image,
-				});
-				const session = await ctx.context.internalAdapter.createSession(
-					newUser.id,
-				);
-				await setSessionCookie(ctx, {
-					session,
-					user: newUser,
-				});
-				return ctx.json({
-					token: session.token,
-					user: parseUserOutput(ctx.context.options, newUser),
-				});
-			}
-
-			if (!user.user.emailVerified) {
-				await revokeUnprovenAccountAccess(ctx, user.user.id);
-				await ctx.context.internalAdapter.updateUser(user.user.id, {
-					emailVerified: true,
-				});
-			}
-
-			const session = await ctx.context.internalAdapter.createSession(
-				user.user.id,
+			requireManagedAuthenticationTransaction(ctx);
+			const result = await runManagedAuthenticationTransaction(
+				ctx,
+				async () => {
+					try {
+						await atomicVerifyOTP(
+							ctx,
+							opts,
+							emailOTPChallenge("sign-in", email),
+							otp,
+						);
+					} catch (verificationError) {
+						return { verificationError };
+					}
+					const found =
+						await ctx.context.internalAdapter.findUserByEmail(email);
+					let user = found?.user;
+					if (!user) {
+						if (opts.disableSignUp) {
+							throw APIError.from("BAD_REQUEST", ERROR_CODES.INVALID_OTP);
+						}
+						const additionalFields = parseUserInput(
+							ctx.context.options,
+							rest,
+							"create",
+						);
+						user = await ctx.context.internalAdapter.createUser({
+							...additionalFields,
+							email,
+							emailVerified: true,
+							name: name || "",
+							image,
+						});
+					} else if (!user.emailVerified) {
+						await revokeUnprovenAccountAccess(ctx, user.id);
+						user = await ctx.context.internalAdapter.updateUser(user.id, {
+							emailVerified: true,
+						});
+					}
+					const session = await ctx.context.internalAdapter.createSession(
+						user.id,
+						false,
+						undefined,
+						false,
+						createInternalSessionIssuanceContext({
+							purpose: "interactive",
+							subjectId: user.id,
+							evidence: [
+								{ kind: "primary", primaryMethod: "email_otp" },
+							],
+						}),
+					);
+					return { session, user };
+				},
 			);
+			if ("verificationError" in result) throw result.verificationError;
+			const { session, user } = result;
 			await setSessionCookie(ctx, {
 				session,
-				user: user.user,
+				user,
 			});
 			return ctx.json({
 				token: session.token,
-				user: parseUserOutput(ctx.context.options, user.user),
+				user: parseUserOutput(ctx.context.options, user),
 			});
 		},
 	);
@@ -931,64 +1065,79 @@ export const resetPasswordEmailOTP = (opts: RequiredEmailOTPOptions) =>
 		},
 		async (ctx) => {
 			const email = ctx.body.email.toLowerCase();
+			const managed = requireManagedAuthenticationTransaction(ctx);
+			const result = await runManagedAuthenticationTransaction(ctx, async () => {
+				try {
+					await atomicVerifyOTP(
+						ctx,
+						opts,
+						emailOTPChallenge("forget-password", email),
+						ctx.body.otp,
+					);
+				} catch (verificationError) {
+					return { verificationError };
+				}
 
-			// Use atomic verification to prevent race conditions
-			await atomicVerifyOTP(
-				ctx,
-				opts,
-				toOTPIdentifier("forget-password", email),
-				ctx.body.otp,
-			);
+				const user = await ctx.context.internalAdapter.findUserByEmail(email, {
+					includeAccounts: true,
+				});
+				if (!user) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
+				}
+				const minPasswordLength = ctx.context.password.config.minPasswordLength;
+				if (ctx.body.password.length < minPasswordLength) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_SHORT);
+				}
+				const maxPasswordLength = ctx.context.password.config.maxPasswordLength;
+				if (ctx.body.password.length > maxPasswordLength) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_LONG);
+				}
+				const passwordHash = await ctx.context.password.hash(ctx.body.password);
+				const account = user.accounts?.find(
+					(account) => account.providerId === "credential",
+				);
+				if (!account) {
+					await ctx.context.internalAdapter.createAccount({
+						userId: user.user.id,
+						providerId: "credential",
+						accountId: user.user.id,
+						password: passwordHash,
+					});
+				} else {
+					await ctx.context.internalAdapter.updatePassword(
+						user.user.id,
+						passwordHash,
+					);
+				}
 
-			const user = await ctx.context.internalAdapter.findUserByEmail(email, {
-				includeAccounts: true,
+				if (!managed && ctx.context.options.emailAndPassword?.onPasswordReset) {
+					await ctx.context.options.emailAndPassword.onPasswordReset(
+						{ user: user.user },
+						ctx.request,
+					);
+				}
+				if (!user.user.emailVerified) {
+					await ctx.context.internalAdapter.updateUser(user.user.id, {
+						emailVerified: true,
+					});
+				}
+				if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
+					await ctx.context.internalAdapter.deleteUserSessions(user.user.id);
+				}
+				return { user: user.user };
 			});
-			if (!user) {
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
-			}
-			const minPasswordLength = ctx.context.password.config.minPasswordLength;
-			if (ctx.body.password.length < minPasswordLength) {
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_SHORT);
-			}
-			const maxPasswordLength = ctx.context.password.config.maxPasswordLength;
-			if (ctx.body.password.length > maxPasswordLength) {
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_LONG);
-			}
-			const passwordHash = await ctx.context.password.hash(ctx.body.password);
-			const account = user.accounts?.find(
-				(account) => account.providerId === "credential",
-			);
-			if (!account) {
-				await ctx.context.internalAdapter.createAccount({
-					userId: user.user.id,
-					providerId: "credential",
-					accountId: user.user.id,
-					password: passwordHash,
-				});
-			} else {
-				await ctx.context.internalAdapter.updatePassword(
-					user.user.id,
-					passwordHash,
-				);
-			}
-
-			if (ctx.context.options.emailAndPassword?.onPasswordReset) {
-				await ctx.context.options.emailAndPassword.onPasswordReset(
-					{
-						user: user.user,
-					},
-					ctx.request,
-				);
-			}
-
-			if (!user.user.emailVerified) {
-				await ctx.context.internalAdapter.updateUser(user.user.id, {
-					emailVerified: true,
-				});
-			}
-
-			if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
-				await ctx.context.internalAdapter.deleteUserSessions(user.user.id);
+			if ("verificationError" in result) throw result.verificationError;
+			if (managed && ctx.context.options.emailAndPassword?.onPasswordReset) {
+				try {
+					await ctx.context.options.emailAndPassword.onPasswordReset(
+						{ user: result.user },
+						ctx.request,
+					);
+				} catch {
+					ctx.context.logger.error(
+						"Managed password reset post-commit callback failed",
+					);
+				}
 			}
 			return ctx.json({
 				success: true,
@@ -1074,18 +1223,66 @@ export const requestEmailChangeEmailOTP = (opts: RequiredEmailOTPOptions) =>
 				});
 			}
 
-			if (opts.changeEmail?.verifyCurrentEmail) {
-				if (!ctx.body.otp) {
-					throw APIError.fromStatus("BAD_REQUEST", {
-						message: "OTP is required to verify current email",
-					});
+			if (opts.changeEmail?.verifyCurrentEmail && !ctx.body.otp) {
+				throw APIError.fromStatus("BAD_REQUEST", {
+					message: "OTP is required to verify current email",
+				});
+			}
+			const managed = opts.changeEmail?.verifyCurrentEmail
+				? requireManagedAuthenticationTransaction(ctx)
+				: false;
+			if (managed) {
+				const result = await runManagedAuthenticationTransaction(ctx, async () => {
+					try {
+						await atomicVerifyOTP(
+							ctx,
+							opts,
+							emailOTPChallenge("email-verification", email),
+							ctx.body.otp!,
+						);
+					} catch (verificationError) {
+						return { verificationError };
+					}
+					const existing =
+						await ctx.context.internalAdapter.findUserByEmail(newEmail);
+					if (existing) return { otp: null };
+					const otp =
+						opts.generateOTP({ email: newEmail, type: "change-email" }, ctx) ||
+						defaultOTPGenerator(opts);
+					const storedOTP = await storeOTP(ctx, opts, otp);
+					const challenge = emailOTPChallenge(
+						"change-email",
+						`${email}-${newEmail}`,
+					);
+					await createInternalVerificationChallenge(
+						ctx.context.internalAdapter,
+						challenge,
+						{
+							value: `${storedOTP}:0`,
+							identifier: challenge.identifier,
+							expiresAt: getDate(opts.expiresIn, "sec"),
+						},
+					);
+					return { otp };
+				});
+				if ("verificationError" in result) throw result.verificationError;
+				if (result.otp) {
+					await ctx.context.runInBackgroundOrAwait(
+						opts.sendVerificationOTP(
+							{ email: newEmail, otp: result.otp, type: "change-email" },
+							ctx,
+						),
+					);
 				}
+				return ctx.json({ success: true });
+			}
 
+			if (opts.changeEmail?.verifyCurrentEmail) {
 				await atomicVerifyOTP(
 					ctx,
 					opts,
-					toOTPIdentifier("email-verification", email),
-					ctx.body.otp,
+					emailOTPChallenge("email-verification", email),
+					ctx.body.otp!,
 				);
 			} else {
 				if (ctx.body.otp) {
@@ -1101,11 +1298,19 @@ export const requestEmailChangeEmailOTP = (opts: RequiredEmailOTPOptions) =>
 				opts.generateOTP({ email: newEmail, type: "change-email" }, ctx) ||
 				defaultOTPGenerator(opts);
 			const storedOTP = await storeOTP(ctx, opts, otp);
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: `${storedOTP}:0`,
-				identifier: toOTPIdentifier("change-email", `${email}-${newEmail}`),
-				expiresAt: getDate(opts.expiresIn, "sec"),
-			});
+			const challenge = emailOTPChallenge(
+				"change-email",
+				`${email}-${newEmail}`,
+			);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				challenge,
+				{
+					value: `${storedOTP}:0`,
+					identifier: challenge.identifier,
+					expiresAt: getDate(opts.expiresIn, "sec"),
+				},
+			);
 
 			const user = await ctx.context.internalAdapter.findUserByEmail(newEmail);
 			if (user) {
@@ -1212,51 +1417,70 @@ export const changeEmailEmailOTP = (opts: RequiredEmailOTPOptions) =>
 				});
 			}
 
-			await atomicVerifyOTP(
-				ctx,
-				opts,
-				toOTPIdentifier("change-email", `${email}-${newEmail}`),
-				ctx.body.otp,
-			);
-
-			const currentUser =
-				await ctx.context.internalAdapter.findUserByEmail(email);
-			if (!currentUser) {
-				/**
-				 * safe to leak the existence of a user as a valid OTP has been provided
-				 */
-				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
-			}
-
-			const existingUserWithNewEmail =
-				await ctx.context.internalAdapter.findUserByEmail(newEmail);
-			if (existingUserWithNewEmail) {
-				/**
-				 * safe to leak the existence of a user as a valid OTP has been provided
-				 */
-				throw APIError.fromStatus("BAD_REQUEST", {
-					message: "Email already in use",
-				});
-			}
-
-			if (ctx.context.options.emailVerification?.beforeEmailVerification) {
-				await ctx.context.options.emailVerification.beforeEmailVerification(
-					currentUser.user,
-					ctx.request,
+			const managed = requireManagedAuthenticationTransaction(ctx);
+			if (
+				managed &&
+				ctx.context.options.emailVerification?.beforeEmailVerification
+			) {
+				throw new Error(
+					"Managed email verification cannot execute beforeEmailVerification outside the atomic authentication transaction",
 				);
 			}
-			const updatedUser = await ctx.context.internalAdapter.updateUser(
-				currentUser.user.id,
-				{
-					email: newEmail,
-					emailVerified: true,
-				},
-			);
-			if (ctx.context.options.emailVerification?.afterEmailVerification) {
-				await ctx.context.options.emailVerification.afterEmailVerification(
-					updatedUser,
-					ctx.request,
+			const result = await runManagedAuthenticationTransaction(ctx, async () => {
+				try {
+					await atomicVerifyOTP(
+						ctx,
+						opts,
+						emailOTPChallenge("change-email", `${email}-${newEmail}`),
+						ctx.body.otp,
+					);
+				} catch (verificationError) {
+					return { verificationError };
+				}
+
+				const currentUser =
+					await ctx.context.internalAdapter.findUserByEmail(email);
+				if (!currentUser) {
+					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.USER_NOT_FOUND);
+				}
+				const existingUserWithNewEmail =
+					await ctx.context.internalAdapter.findUserByEmail(newEmail);
+				if (existingUserWithNewEmail) {
+					throw APIError.fromStatus("BAD_REQUEST", {
+						message: "Email already in use",
+					});
+				}
+				if (!managed) {
+					await ctx.context.options.emailVerification?.beforeEmailVerification?.(
+						currentUser.user,
+						ctx.request,
+					);
+				}
+				const updatedUser = await ctx.context.internalAdapter.updateUser(
+					currentUser.user.id,
+					{ email: newEmail, emailVerified: true },
 				);
+				if (!managed) {
+					await ctx.context.options.emailVerification?.afterEmailVerification?.(
+						updatedUser,
+						ctx.request,
+					);
+				}
+				return { updatedUser };
+			});
+			if ("verificationError" in result) throw result.verificationError;
+			const { updatedUser } = result;
+			if (managed) {
+				try {
+					await ctx.context.options.emailVerification?.afterEmailVerification?.(
+						updatedUser,
+						ctx.request,
+					);
+				} catch {
+					ctx.context.logger.error(
+						"Managed email verification post-commit callback failed",
+					);
+				}
 			}
 			await setSessionCookie(ctx, {
 				session: session.session,
@@ -1290,9 +1514,10 @@ const defaultOTPGenerator = (options: EmailOTPOptions) =>
 async function atomicVerifyOTP(
 	ctx: GenericEndpointContext,
 	opts: RequiredEmailOTPOptions,
-	identifier: string,
+	challenge: ReturnType<typeof emailOTPChallenge>,
 	providedOTP: string,
 ): Promise<void> {
+	const { identifier } = challenge;
 	// Surface the OTP_EXPIRED error shape before consuming. The consume itself
 	// drops expired rows and returns null, which would otherwise be
 	// indistinguishable from a missing record; this read only reports expiry
@@ -1306,8 +1531,10 @@ async function atomicVerifyOTP(
 		throw APIError.from("BAD_REQUEST", ERROR_CODES.OTP_EXPIRED);
 	}
 
-	const consumed =
-		await ctx.context.internalAdapter.consumeVerificationValue(identifier);
+	const consumed = await consumeInternalVerificationChallenge(
+		ctx.context.internalAdapter,
+		challenge,
+	);
 
 	// A null result means the record was missing, already consumed by a racing
 	// request, or expired: there is nothing valid left to verify against.
@@ -1328,11 +1555,15 @@ async function atomicVerifyOTP(
 	const verified = await verifyStoredOTP(ctx, opts, otpValue, providedOTP);
 
 	if (!verified) {
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: `${otpValue}:${usedAttempts + 1}`,
-			identifier,
-			expiresAt: consumed.expiresAt,
-		});
+		await createInternalVerificationChallenge(
+			ctx.context.internalAdapter,
+			challenge,
+			{
+				value: `${otpValue}:${usedAttempts + 1}`,
+				identifier,
+				expiresAt: consumed.expiresAt,
+			},
+		);
 		throw APIError.from("BAD_REQUEST", ERROR_CODES.INVALID_OTP);
 	}
 }

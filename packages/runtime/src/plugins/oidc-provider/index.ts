@@ -49,6 +49,7 @@ import type { OAuthApplication } from "./schema";
 import { schema } from "./schema";
 import { setNoStoreTokenResponseHeaders } from "./token-response";
 import { lockAndReadActiveUser } from "../../db/user-authority";
+import { consumeInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import {
 	attachInternalCredentialAuthority,
 	readInternalCredentialAuthority,
@@ -1992,10 +1993,14 @@ export const oidcProvider = (options: OIDCOptions) => {
 					const issued = await runWithTransaction(
 						ctx.context.adapter,
 						async () => {
-							const consumed =
-								await ctx.context.internalAdapter.consumeVerificationValue(
-									code.toString(),
-								);
+							const consumed = await consumeInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: "oidc-authorization-code",
+									subject: client_id.toString(),
+									identifier: code.toString(),
+								},
+							);
 							if (
 								!consumed ||
 								!constantTimeEqual(consumed.value, verificationValue.value)
