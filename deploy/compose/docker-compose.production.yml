@@ -82,7 +82,7 @@ services:
     profiles: !reset []
     build: !reset null
     image: "${CLEARANCE_IMAGE_REPOSITORY:?set CLEARANCE_IMAGE_REPOSITORY}@${CLEARANCE_IMAGE_DIGEST:?set immutable CLEARANCE_IMAGE_DIGEST}"
-    command: ["node", "packages/delivery-worker/dist/cli.mjs"]
+    command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/delivery-worker/dist/cli.mjs"]
     environment:
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to a full postgres URL with percent-encoded password}
