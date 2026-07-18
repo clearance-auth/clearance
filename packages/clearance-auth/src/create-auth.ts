@@ -70,6 +70,11 @@ import type {
 	ClearanceAuthorizationAssignment,
 	ClearanceAuthorizationReadResult,
 	ClearanceAuthorizationRole,
+	ClearanceAuthorizationServiceAccount,
+	ClearanceAuthorizationServiceAccountAuthentication,
+	ClearanceAuthorizationServiceAccountCredential,
+	ClearanceAuthorizationServiceAccountCredentialMutation,
+	ClearanceAuthorizationServiceAccountMutation,
 	ClearanceAuthorizationSubject,
 	ClearanceAuthenticationAssuranceLevel,
 	ClearanceAuthenticationPolicy,
@@ -403,6 +408,11 @@ export type {
 	ClearanceAuthorizationAssignment,
 	ClearanceAuthorizationReadResult,
 	ClearanceAuthorizationRole,
+	ClearanceAuthorizationServiceAccount,
+	ClearanceAuthorizationServiceAccountAuthentication,
+	ClearanceAuthorizationServiceAccountCredential,
+	ClearanceAuthorizationServiceAccountCredentialMutation,
+	ClearanceAuthorizationServiceAccountMutation,
 	ClearanceAuthorizationSubject,
 	ClearanceAuthenticationAssuranceLevel,
 	ClearanceAuthenticationPolicy,
@@ -3002,6 +3012,20 @@ export function createClearanceAuth<
 						authorizationAuthority.listRoles.bind(authorizationAuthority),
 					listSubjectAssignments:
 						authorizationAuthority.listSubjectAssignments.bind(authorizationAuthority),
+					createServiceAccount:
+						authorizationAuthority.createServiceAccount.bind(authorizationAuthority),
+					listServiceAccounts:
+						authorizationAuthority.listServiceAccounts.bind(authorizationAuthority),
+					setServiceAccountStatus:
+						authorizationAuthority.setServiceAccountStatus.bind(authorizationAuthority),
+					createServiceAccountCredential:
+						authorizationAuthority.createServiceAccountCredential.bind(authorizationAuthority),
+					rotateServiceAccountCredential:
+						authorizationAuthority.rotateServiceAccountCredential.bind(authorizationAuthority),
+					revokeServiceAccountCredential:
+						authorizationAuthority.revokeServiceAccountCredential.bind(authorizationAuthority),
+					authenticateServiceAccountCredential:
+						authorizationAuthority.authenticateServiceAccountCredential.bind(authorizationAuthority),
 				})
 			: undefined;
 	const passwordSetupFacade = Object.freeze({
