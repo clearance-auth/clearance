@@ -811,7 +811,7 @@ export interface ManagementOperationTypes {
 			  };
 	};
 	"service-accounts.disable": {
-		input: { organizationId: string; accountId: string; status: "disabled"; dryRun?: boolean; confirm?: boolean };
+		input: { organizationId: string; accountId: string; status: "disabled"; dryRun?: boolean };
 		output:
 			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
 			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
@@ -829,7 +829,7 @@ export interface ManagementOperationTypes {
 			| { dryRun: true; organizationId: string; serviceAccountId: string; expiresAt: string | null; secretGenerated: false; scope: ResourceScope };
 	};
 	"service-accounts.credentials.rotate": {
-		input: { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: boolean; confirm?: boolean };
+		input: { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: boolean };
 		output:
 			| {
 					credential: ServiceAccountCredentialView;
@@ -849,7 +849,7 @@ export interface ManagementOperationTypes {
 			  };
 	};
 	"service-accounts.credentials.revoke": {
-		input: { organizationId: string; accountId: string; credentialId: string; dryRun?: boolean; confirm?: boolean };
+		input: { organizationId: string; accountId: string; credentialId: string; dryRun?: boolean };
 		output:
 			| {
 					organizationId: string;
