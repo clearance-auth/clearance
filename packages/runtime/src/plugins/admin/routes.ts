@@ -5,7 +5,7 @@ import {
 import type { Session } from "@clearance/core/db";
 import type { DBAdapter, Where } from "@clearance/core/db/adapter";
 import { whereOperators } from "@clearance/core/db/adapter";
-import { runWithTransaction } from "@clearance/core/context";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getAuthoritativeSessionFromCtx, getSessionFromCtx } from "../../api";
@@ -15,9 +15,8 @@ import {
 	setSessionCookie,
 } from "../../cookies";
 import { parseSessionOutput, parseUserOutput } from "../../db/schema";
-import {
-	createInternalSessionIssuanceContext,
-} from "../../internal/session-issuance-context";
+import { lockAndReadUser } from "../../db/user-authority";
+import { captureInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getDate } from "../../utils/date";
 import type { AccessControl, ArrayElement } from "../access";
 import type { defaultStatements } from "./access";
@@ -1247,82 +1246,100 @@ export const impersonateUser = (opts: AdminOptions) =>
 			},
 		},
 		async (ctx) => {
-			const canImpersonateUser = hasPermission({
-				userId: ctx.context.session.user.id,
-				role: ctx.context.session.user.role,
-				options: opts,
-				permissions: {
-					user: ["impersonate"],
-				},
-			});
-			if (!canImpersonateUser) {
-				throw APIError.from(
-					"FORBIDDEN",
-					ADMIN_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS,
+			const issued = await runWithTransaction(ctx.context.adapter, async () => {
+				const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+				const actorId = ctx.context.session.user.id;
+				const lockedUsers = new Map<string, UserWithRole>();
+				for (const userId of [...new Set([actorId, ctx.body.userId])].sort()) {
+					const locked = await lockAndReadUser(transactionAdapter, userId);
+					if (locked) lockedUsers.set(userId, locked as UserWithRole);
+				}
+				const actor = lockedUsers.get(actorId);
+				if (!actor || actor.banned === true) {
+					throw APIError.fromStatus("UNAUTHORIZED");
+				}
+				const targetUser = lockedUsers.get(ctx.body.userId);
+				if (!targetUser || targetUser.banned === true) {
+					throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
+				}
+				const source = await ctx.context.internalAdapter.findSessionById(
+					ctx.context.session.session.id,
 				);
-			}
-
-			const targetUser = (await ctx.context.internalAdapter.findUserById(
-				ctx.body.userId,
-			)) as UserWithRole | null;
-
-			if (!targetUser) {
-				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
-			}
-
-			const adminRoles = (
-				Array.isArray(opts.adminRoles)
-					? opts.adminRoles
-					: opts.adminRoles?.split(",") || []
-			).map((role) => role.trim());
-			const targetUserRole = (
-				targetUser.role ||
-				opts.defaultRole ||
-				"user"
-			).split(",");
-			const isTargetAdmin =
-				targetUserRole.some((role) => adminRoles.includes(role)) ||
-				!!opts.adminUserIds?.includes(targetUser.id);
-			if (isTargetAdmin) {
-				const canImpersonateAdmins =
-					opts.allowImpersonatingAdmins === true ||
-					hasPermission({
-						userId: ctx.context.session.user.id,
-						role: ctx.context.session.user.role,
+				if (
+					!source ||
+					source.session.id !== ctx.context.session.session.id ||
+					source.user.id !== actor.id
+				) {
+					throw APIError.fromStatus("UNAUTHORIZED");
+				}
+				const canImpersonateUser = hasPermission({
+					userId: actor.id,
+					role: actor.role,
+					options: opts,
+					permissions: { user: ["impersonate"] },
+				});
+				if (!canImpersonateUser) {
+					throw APIError.from(
+						"FORBIDDEN",
+						ADMIN_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS,
+					);
+				}
+				const adminRoles = (
+					Array.isArray(opts.adminRoles)
+						? opts.adminRoles
+						: opts.adminRoles?.split(",") || []
+				).map((role) => role.trim());
+				const targetUserRole = (
+					targetUser.role || opts.defaultRole || "user"
+				).split(",");
+				const isTargetAdmin =
+					targetUserRole.some((role) => adminRoles.includes(role)) ||
+					Boolean(opts.adminUserIds?.includes(targetUser.id));
+				if (
+					isTargetAdmin &&
+					opts.allowImpersonatingAdmins !== true &&
+					!hasPermission({
+						userId: actor.id,
+						role: actor.role,
 						options: opts,
-						permissions: {
-							user: ["impersonate-admins"],
-						},
-					});
-				if (!canImpersonateAdmins) {
+						permissions: { user: ["impersonate-admins"] },
+					})
+				) {
 					throw APIError.from(
 						"FORBIDDEN",
 						ADMIN_ERROR_CODES.YOU_CANNOT_IMPERSONATE_ADMINS,
 					);
 				}
-			}
-
-			const session = await ctx.context.internalAdapter.createSession(
-				targetUser.id,
-				true,
-				{
-					impersonatedBy: ctx.context.session.user.id,
-					expiresAt: opts?.impersonationSessionDuration
-						? getDate(opts.impersonationSessionDuration, "sec")
-						: getDate(60 * 60, "sec"), // 1 hour
-				},
-				true,
-				createInternalSessionIssuanceContext({
-					purpose: "impersonation",
-					subjectId: targetUser.id,
-					evidence: [
-						{
-							kind: "primary",
-							primaryMethod: "admin_impersonation",
-						},
-					],
-				}),
-			);
+				const issuanceContext = await captureInternalSessionIssuanceContext(
+					ctx.context.internalAdapter,
+					{
+						purpose: "impersonation",
+						subjectId: targetUser.id,
+						evidence: [
+							{
+								kind: "primary",
+								primaryMethod: "admin_impersonation",
+							},
+						],
+						sourceSessionToken: source.session.token,
+						targetOrganizationId: null,
+					},
+				);
+				const session = await ctx.context.internalAdapter.createSession(
+					targetUser.id,
+					true,
+					{
+						impersonatedBy: actor.id,
+						expiresAt: opts?.impersonationSessionDuration
+							? getDate(opts.impersonationSessionDuration, "sec")
+							: getDate(60 * 60, "sec"),
+					},
+					true,
+					issuanceContext,
+				);
+				return { session, targetUser };
+			});
+			const session = issued.session;
 			if (!session) {
 				throw APIError.from(
 					"INTERNAL_SERVER_ERROR",
@@ -1346,13 +1363,13 @@ export const impersonateUser = (opts: AdminOptions) =>
 				ctx,
 				{
 					session: session,
-					user: targetUser,
+					user: issued.targetUser,
 				},
 				true,
 			);
 			return ctx.json({
 				session: parseSessionOutput(ctx.context.options, session),
-				user: parseUserOutput(ctx.context.options, targetUser) as UserWithRole,
+				user: parseUserOutput(ctx.context.options, issued.targetUser) as UserWithRole,
 			});
 		},
 	);
