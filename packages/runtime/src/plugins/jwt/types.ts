@@ -30,6 +30,16 @@ export interface JwtOptions {
 				 */
 				disablePrivateKeyEncryption?: boolean | undefined;
 				/**
+				 * Protect private JWK material before it is persisted.
+				 *
+				 * The exact serialized public JWK is supplied as immutable context for
+				 * both operations. Implementations must bind the protected value to that
+				 * context and reject a different public key during decryption.
+				 *
+				 * This cannot be combined with `disablePrivateKeyEncryption`.
+				 */
+				privateKeyStorage?: JwtPrivateKeyStorage | undefined;
+				/**
 				 * The key rotation interval in seconds.
 				 *
 				 * @default undefined (disabled)
@@ -164,6 +174,14 @@ export interface JwtOptions {
 			ctx: GenericEndpointContext,
 		) => Promise<Jwk>;
 	};
+}
+
+export interface JwtPrivateKeyStorage {
+	encrypt: (privateKey: string, publicKey: string) => Awaitable<string>;
+	decrypt: (
+		encryptedPrivateKey: string,
+		publicKey: string,
+	) => Awaitable<string>;
 }
 
 /**
