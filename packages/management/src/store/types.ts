@@ -279,6 +279,10 @@ export interface ManagementCoordinatedMutationContext {
 	data: DataStoreSnapshot;
 	/** Present only when normalized principals are authoritative. */
 	principals?: StoreV2PrincipalRepository;
+	/** Present only when projects, environments, and organizations are relational-authoritative. */
+	topology?: StoreV2TopologyRepository;
+	/** Append a redacted audit event in this same transaction. */
+	appendAudit(input: AuditEventInput): AuditEvent;
 	/** Opaque same-transaction outbox capability when delivery is configured. */
 	enqueueDelivery?: (
 		input: EnqueueDeliveryInput,
