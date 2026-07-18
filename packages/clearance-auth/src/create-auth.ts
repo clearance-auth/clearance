@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, hkdfSync, randomUUID } from "node:crypto";
 import {
 	clearance,
 	APIError,
@@ -9,6 +9,12 @@ import {
 	enqueueDeliveryInExistingTransaction,
 	migrateDeliverySchema,
 } from "@clearance/delivery";
+import {
+	createKeyProviderRegistry,
+	createLocalKeyProvider,
+	type KeyProviderRegistry,
+	type KeyPurpose,
+} from "@clearance/key-management";
 import {
 	symmetricDecrypt,
 	symmetricEncrypt,
@@ -72,6 +78,103 @@ export const RUNTIME_BASELINE = {
 	package: "@clearance/runtime",
 	version: "1.6.23",
 } as const;
+
+const DEVELOPMENT_KEY_MANAGEMENT_SALT = Buffer.from(
+	"clearance-development-key-management-v1",
+	"utf8",
+);
+const SCIM_TOKEN_ENVELOPE_PREFIX = "clr-scim:v1:";
+const RETIRED_JWK_PRIVATE_KEY = "clr-jwk:retired:v1";
+
+function credentialResourceId(
+	purpose: KeyPurpose,
+	identity: Readonly<Record<string, string | null>>,
+): string {
+	const canonicalIdentity = JSON.stringify(
+		Object.fromEntries(
+			Object.entries(identity).sort(([left], [right]) =>
+				left.localeCompare(right),
+			),
+		),
+	);
+	return `${purpose}:${createHash("sha256").update(canonicalIdentity).digest("hex")}`;
+}
+
+function developmentKeyManagementRegistry(secret: string): KeyProviderRegistry {
+	const purposes = [
+		"oidc-client-secret",
+		"scim-bearer-token",
+		"access-token-signing-key",
+	] as const satisfies readonly KeyPurpose[];
+	return createKeyProviderRegistry(
+		Object.fromEntries(
+			purposes.map((purpose) => [
+				purpose,
+				createLocalKeyProvider({
+					providerId: `development-${purpose}`,
+					purpose,
+					currentKeyId: "development-v1",
+					keys: {
+						"development-v1": Buffer.from(
+							hkdfSync(
+								"sha256",
+								Buffer.from(secret, "utf8"),
+								DEVELOPMENT_KEY_MANAGEMENT_SALT,
+								Buffer.from(purpose, "utf8"),
+								32,
+							),
+						),
+					},
+				}),
+			]),
+		) as Record<KeyPurpose, ReturnType<typeof createLocalKeyProvider>>,
+	);
+}
+
+function resolveProductKeyManagement<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined,
+	Passkeys extends ClearancePasskeyOptions | false | undefined,
+>(
+	options: CreateClearanceAuthOptions<Security, Passkeys>,
+	strict: boolean,
+): Readonly<{
+	projectId: string;
+	environmentId: string;
+	registry: KeyProviderRegistry;
+}> {
+	const explicit = options.keyManagement;
+	if (strict && !explicit) {
+		throw new Error(
+			"Production requires explicit purpose-separated keyManagement providers",
+		);
+	}
+	const inferredScope = options.authenticationPolicy ?? options.durableDelivery;
+	const projectId = explicit?.projectId ?? inferredScope?.projectId ?? "development";
+	const environmentId =
+		explicit?.environmentId ?? inferredScope?.environmentId ?? "development";
+	if (!projectId.trim() || !environmentId.trim()) {
+		throw new Error("keyManagement projectId and environmentId are required");
+	}
+	for (const scoped of [options.authenticationPolicy, options.durableDelivery]) {
+		if (
+			scoped &&
+			(scoped.projectId !== projectId || scoped.environmentId !== environmentId)
+		) {
+			throw new Error(
+				"keyManagement scope must match authentication policy and durable delivery scope",
+			);
+		}
+	}
+	const registry = explicit?.registry ?? developmentKeyManagementRegistry(options.secret);
+	if (
+		!registry ||
+		typeof registry.providerFor !== "function" ||
+		typeof registry.readiness !== "function"
+	) {
+		throw new Error("keyManagement registry is invalid");
+	}
+	return Object.freeze({ projectId, environmentId, registry });
+}
 
 export type {
 	ClearanceAuthBundle,
@@ -551,6 +654,50 @@ export function createClearanceAuth<
 	if (options.durableDelivery) {
 		validateDurableDeliveryUrl(options.baseURL, "baseURL", strict);
 	}
+	const keyManagement = resolveProductKeyManagement(options, strict);
+	const keyManagementFacade = Object.freeze({
+		scope: Object.freeze({
+			projectId: keyManagement.projectId,
+			environmentId: keyManagement.environmentId,
+		}),
+		resourceId: credentialResourceId,
+		async sealText(
+			purpose: KeyPurpose,
+			resourceId: string,
+			plaintext: string,
+		): Promise<string> {
+			return keyManagement.registry.providerFor(purpose).seal(
+				Buffer.from(plaintext, "utf8"),
+				{
+					projectId: keyManagement.projectId,
+					environmentId: keyManagement.environmentId,
+					resourceId,
+				},
+			);
+		},
+		async openText(
+			purpose: KeyPurpose,
+			resourceId: string,
+			envelope: string,
+		): Promise<string> {
+			return Buffer.from(
+				await keyManagement.registry.providerFor(purpose).open(envelope, {
+					projectId: keyManagement.projectId,
+					environmentId: keyManagement.environmentId,
+					resourceId,
+				}),
+			).toString("utf8");
+		},
+		readiness: () => keyManagement.registry.readiness(),
+	});
+	const openManagedOrLegacyText = async (
+		purpose: KeyPurpose,
+		resourceId: string,
+		ciphertext: string,
+	): Promise<string> =>
+		ciphertext.startsWith("clrkm$v1$")
+			? keyManagementFacade.openText(purpose, resourceId, ciphertext)
+			: decryptRuntimeCredential(ciphertext, options.secret);
 	const authenticationSecurity = resolveAuthenticationSecurity(options, strict);
 	const passkeyOptions: PasskeyOptions | undefined =
 		options.passkeys === false ? undefined : options.passkeys;
@@ -725,6 +872,38 @@ export function createClearanceAuth<
 						adapter: jwksAdapter,
 						jwks: {
 							keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+							privateKeyStorage: {
+								encrypt: (privateKey, publicKey) =>
+									keyManagementFacade.sealText(
+										"access-token-signing-key",
+										credentialResourceId("access-token-signing-key", {
+											publicKey,
+										}),
+										privateKey,
+									),
+								decrypt: (storedPrivateKey, publicKey) => {
+									let ciphertext = storedPrivateKey;
+									if (!ciphertext.startsWith("clrkm$v1$")) {
+										let parsed: unknown;
+										try {
+											parsed = JSON.parse(ciphertext);
+										} catch {
+											parsed = ciphertext;
+										}
+										if (typeof parsed !== "string" || !parsed) {
+											throw new Error("Stored JWT private key is invalid");
+										}
+										ciphertext = parsed;
+									}
+									return openManagedOrLegacyText(
+										"access-token-signing-key",
+										credentialResourceId("access-token-signing-key", {
+											publicKey,
+										}),
+										ciphertext,
+									);
+								},
+							},
 							rotationInterval:
 								authenticationSecurity.asymmetricAccessTokens
 									.rotationIntervalSeconds,
@@ -751,10 +930,22 @@ export function createClearanceAuth<
 									requireTimestamps: true,
 								},
 								storeOIDCClientSecret: {
-									encrypt: (secret: string) =>
-										encryptRuntimeCredential(secret, options.secret),
-									decrypt: (ciphertext: string) =>
-										decryptRuntimeCredential(ciphertext, options.secret),
+									encrypt: (secret: string, providerId: string) =>
+										keyManagementFacade.sealText(
+											"oidc-client-secret",
+											keyManagementFacade.resourceId("oidc-client-secret", {
+												providerId,
+											}),
+											secret,
+										),
+									decrypt: (ciphertext: string, providerId: string) =>
+										openManagedOrLegacyText(
+											"oidc-client-secret",
+											keyManagementFacade.resourceId("oidc-client-secret", {
+												providerId,
+											}),
+											ciphertext,
+										),
 								},
 							},
 							createInternalVerificationChallengeAuthority(),
@@ -772,10 +963,40 @@ export function createClearanceAuth<
 						providerOwnership: { enabled: true },
 						requiredRole: ["admin", "owner"],
 						storeSCIMToken: {
-							encrypt: (token) =>
-								encryptRuntimeCredential(token, options.secret),
-							decrypt: (token) =>
-								decryptRuntimeCredential(token, options.secret),
+							encrypt: async (token, context) =>
+								`${SCIM_TOKEN_ENVELOPE_PREFIX}${await keyManagementFacade.sealText(
+									"scim-bearer-token",
+									keyManagementFacade.resourceId("scim-bearer-token", {
+										providerId: context.providerId,
+										organizationId: context.organizationId ?? null,
+									}),
+									token,
+								)}`,
+							decrypt: async (stored, context) => {
+								const resourceId = keyManagementFacade.resourceId(
+									"scim-bearer-token",
+									{
+										providerId: context.providerId,
+										organizationId: context.organizationId ?? null,
+									},
+								);
+								if (stored.startsWith(SCIM_TOKEN_ENVELOPE_PREFIX)) {
+									const envelope = stored.slice(SCIM_TOKEN_ENVELOPE_PREFIX.length);
+									if (!envelope.startsWith("clrkm$v1$")) {
+										throw new Error("Stored SCIM token envelope is invalid");
+									}
+									return await keyManagementFacade.openText(
+										"scim-bearer-token",
+										resourceId,
+										envelope,
+									);
+								}
+								return await openManagedOrLegacyText(
+									"scim-bearer-token",
+									resourceId,
+									stored,
+								);
+							},
 						},
 					}),
 				]
@@ -1463,31 +1684,322 @@ export function createClearanceAuth<
 		await pool.query(
 			`ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "banReason" text`,
 		);
-		if (options.enableSso !== false) {
-			const providers = await pool.query<{
-				id: string;
-				oidcConfig: string | null;
-			}>(
-				`select id, "oidcConfig" from "ssoProvider" where "oidcConfig" is not null`,
+	}
+
+	async function ensurePurposeSeparatedCredentialCompatibility(): Promise<void> {
+		const readiness = await keyManagementFacade.readiness();
+		if (!readiness.ready) {
+			throw new Error("Purpose-separated key providers are not ready");
+		}
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query(
+				`SELECT pg_advisory_xact_lock(
+					hashtext(current_database()),
+					hashtext(current_schema() || ':clearance:key-management-migration:v1')
+				)`,
 			);
-			for (const provider of providers.rows) {
-				const config = JSON.parse(provider.oidcConfig ?? "null") as {
-					clientSecret?: string;
-				} | null;
-				if (
-					config?.clientSecret &&
-					!config.clientSecret.startsWith("clr-sso:v1:")
-				) {
-					config.clientSecret = `clr-sso:v1:${await encryptRuntimeCredential(
-						config.clientSecret,
-						options.secret,
+			const credentialTables = await client.query<{
+				ssoProvider: string | null;
+				scimProvider: string | null;
+				jwks: string | null;
+			}>(`SELECT
+				to_regclass(format('%I.%I', current_schema(), 'ssoProvider'))::text AS "ssoProvider",
+				to_regclass(format('%I.%I', current_schema(), 'scimProvider'))::text AS "scimProvider",
+				to_regclass(format('%I.%I', current_schema(), 'jwks'))::text AS jwks`);
+			const tables = credentialTables.rows[0]!;
+			if (tables.ssoProvider) {
+				await client.query(`LOCK TABLE "ssoProvider" IN SHARE ROW EXCLUSIVE MODE`);
+			}
+			if (tables.scimProvider) {
+				await client.query(`LOCK TABLE "scimProvider" IN SHARE ROW EXCLUSIVE MODE`);
+			}
+			if (tables.jwks) {
+				await client.query(`LOCK TABLE jwks IN SHARE ROW EXCLUSIVE MODE`);
+			}
+			if (tables.ssoProvider) {
+				const providers = await client.query<{
+					id: string;
+					providerId: string;
+					oidcConfig: string;
+				}>(`SELECT id, "providerId", "oidcConfig" FROM "ssoProvider"
+					WHERE "oidcConfig" IS NOT NULL FOR UPDATE`);
+				for (const provider of providers.rows) {
+					let config: { clientSecret?: unknown };
+					try {
+						config = JSON.parse(provider.oidcConfig) as typeof config;
+					} catch {
+						throw new Error(
+							`Cannot migrate invalid OIDC configuration for provider ${provider.id}`,
+						);
+					}
+					if (typeof config?.clientSecret !== "string" || !config.clientSecret) {
+						continue;
+					}
+					const resourceId = keyManagementFacade.resourceId("oidc-client-secret", {
+						providerId: provider.providerId,
+					});
+					const wrapped = config.clientSecret.startsWith("clr-sso:v1:");
+					const stored = wrapped
+						? config.clientSecret.slice("clr-sso:v1:".length)
+						: config.clientSecret;
+					if (stored.startsWith("clrkm$v1$")) {
+						await keyManagementFacade.openText(
+							"oidc-client-secret",
+							resourceId,
+							stored,
+						);
+						continue;
+					}
+					const plaintext = wrapped
+						? await decryptRuntimeCredential(stored, options.secret)
+						: stored;
+					config.clientSecret = `clr-sso:v1:${await keyManagementFacade.sealText(
+						"oidc-client-secret",
+						resourceId,
+						plaintext,
 					)}`;
-					await pool.query(
-						`update "ssoProvider" set "oidcConfig" = $1 where id = $2`,
-						[JSON.stringify(config), provider.id],
+					const updated = await client.query(
+						`UPDATE "ssoProvider" SET "oidcConfig"=$2
+						 WHERE id=$1 AND "oidcConfig"=$3`,
+						[provider.id, JSON.stringify(config), provider.oidcConfig],
+					);
+					if (updated.rowCount !== 1) {
+						throw new Error(
+							`OIDC configuration changed during key migration for provider ${provider.id}`,
+						);
+					}
+				}
+			}
+			if (tables.scimProvider) {
+				const providers = await client.query<{
+					id: string;
+					providerId: string;
+					organizationId: string | null;
+					scimToken: string;
+				}>(`SELECT id, "providerId", "organizationId", "scimToken"
+					FROM "scimProvider" FOR UPDATE`);
+				for (const provider of providers.rows) {
+					const resourceId = keyManagementFacade.resourceId("scim-bearer-token", {
+						providerId: provider.providerId,
+						organizationId: provider.organizationId,
+					});
+					const wrapped = provider.scimToken.startsWith(
+						SCIM_TOKEN_ENVELOPE_PREFIX,
+					);
+					const stored = wrapped
+						? provider.scimToken.slice(SCIM_TOKEN_ENVELOPE_PREFIX.length)
+						: provider.scimToken;
+					if (wrapped && !stored.startsWith("clrkm$v1$")) {
+						throw new Error(
+							`Cannot migrate invalid SCIM token envelope for provider ${provider.id}`,
+						);
+					}
+					if (wrapped && stored.startsWith("clrkm$v1$")) {
+						await keyManagementFacade.openText(
+							"scim-bearer-token",
+							resourceId,
+							stored,
+						);
+						continue;
+					}
+					if (stored.startsWith("clrkm$v1$")) {
+						await keyManagementFacade.openText(
+							"scim-bearer-token",
+							resourceId,
+							stored,
+						);
+						const normalized = `${SCIM_TOKEN_ENVELOPE_PREFIX}${stored}`;
+						const updated = await client.query(
+							`UPDATE "scimProvider" SET "scimToken"=$2
+							 WHERE id=$1 AND "scimToken"=$3`,
+							[provider.id, normalized, provider.scimToken],
+						);
+						if (updated.rowCount !== 1) {
+							throw new Error(
+								`SCIM token changed during key migration for provider ${provider.id}`,
+							);
+						}
+						continue;
+					}
+					const plaintext = await decryptRuntimeCredential(stored, options.secret);
+					const migrated = `${SCIM_TOKEN_ENVELOPE_PREFIX}${await keyManagementFacade.sealText(
+						"scim-bearer-token",
+						resourceId,
+						plaintext,
+					)}`;
+					const updated = await client.query(
+						`UPDATE "scimProvider" SET "scimToken"=$2
+						 WHERE id=$1 AND "scimToken"=$3`,
+						[provider.id, migrated, provider.scimToken],
+					);
+					if (updated.rowCount !== 1) {
+						throw new Error(
+							`SCIM token changed during key migration for provider ${provider.id}`,
+						);
+					}
+				}
+			}
+			await client.query(
+				`SELECT pg_advisory_xact_lock(
+					hashtext(current_database()),
+					hashtext(current_schema() || ':clearance:jwks-rotation')
+				)`,
+			);
+			const signingKeys: { rows: Array<{
+				id: string;
+				publicKey: string;
+				privateKey: string;
+				expiresAt: Date | null;
+			}> } = tables.jwks
+				? await client.query(`SELECT id, "publicKey", "privateKey", "expiresAt"
+					FROM jwks FOR UPDATE`)
+				: { rows: [] };
+			for (const signingKey of signingKeys.rows) {
+				if (
+					signingKey.privateKey === RETIRED_JWK_PRIVATE_KEY ||
+					(signingKey.expiresAt !== null &&
+						signingKey.expiresAt.getTime() <= Date.now())
+				) {
+					if (signingKey.privateKey !== RETIRED_JWK_PRIVATE_KEY) {
+						const retired = await client.query(
+							`UPDATE jwks SET "privateKey"=$2
+							 WHERE id=$1 AND "privateKey"=$3`,
+							[signingKey.id, RETIRED_JWK_PRIVATE_KEY, signingKey.privateKey],
+						);
+						if (retired.rowCount !== 1) {
+							throw new Error(
+								`JWT private key changed during retirement for key ${signingKey.id}`,
+							);
+						}
+					}
+					continue;
+				}
+				const resourceId = keyManagementFacade.resourceId(
+					"access-token-signing-key",
+					{ publicKey: signingKey.publicKey },
+				);
+				if (signingKey.privateKey.startsWith("clrkm$v1$")) {
+					await keyManagementFacade.openText(
+						"access-token-signing-key",
+						resourceId,
+						signingKey.privateKey,
+					);
+					continue;
+				}
+				let legacyCiphertext: unknown;
+				try {
+					legacyCiphertext = JSON.parse(signingKey.privateKey);
+				} catch {
+					throw new Error(
+						`Cannot migrate invalid JWT private-key storage for key ${signingKey.id}`,
+					);
+				}
+				if (typeof legacyCiphertext !== "string" || !legacyCiphertext) {
+					throw new Error(
+						`Cannot migrate invalid JWT private-key storage for key ${signingKey.id}`,
+					);
+				}
+				const privateKey = await decryptRuntimeCredential(
+					legacyCiphertext,
+					options.secret,
+				);
+				const migrated = await keyManagementFacade.sealText(
+					"access-token-signing-key",
+					resourceId,
+					privateKey,
+				);
+				const updated = await client.query(
+					`UPDATE jwks SET "privateKey"=$2
+					 WHERE id=$1 AND "privateKey"=$3 AND "publicKey"=$4`,
+					[
+						signingKey.id,
+						migrated,
+						signingKey.privateKey,
+						signingKey.publicKey,
+					],
+				);
+				if (updated.rowCount !== 1) {
+					throw new Error(
+						`JWT private key changed during key migration for key ${signingKey.id}`,
 					);
 				}
 			}
+			if (tables.ssoProvider) {
+				await client.query(`
+					CREATE OR REPLACE FUNCTION clearance_require_oidc_key_v1()
+					RETURNS trigger LANGUAGE plpgsql AS $function$
+					DECLARE client_secret text;
+					BEGIN
+						IF NEW."oidcConfig" IS NULL THEN RETURN NEW; END IF;
+						BEGIN
+							client_secret := (NEW."oidcConfig"::jsonb)->>'clientSecret';
+						EXCEPTION WHEN others THEN
+							RAISE EXCEPTION 'OIDC configuration must be valid managed JSON'
+								USING ERRCODE = '23514';
+						END;
+						IF client_secret IS NOT NULL AND client_secret <> '' AND
+						   left(client_secret, length('clr-sso:v1:clrkm$v1$')) <>
+						   'clr-sso:v1:clrkm$v1$' THEN
+							RAISE EXCEPTION 'OIDC client secret must use purpose-separated storage'
+								USING ERRCODE = '23514';
+						END IF;
+						RETURN NEW;
+					END
+					$function$;
+					DROP TRIGGER IF EXISTS clearance_require_oidc_key_v1
+						ON "ssoProvider";
+					CREATE TRIGGER clearance_require_oidc_key_v1
+						BEFORE INSERT OR UPDATE OF "oidcConfig" ON "ssoProvider"
+						FOR EACH ROW EXECUTE FUNCTION clearance_require_oidc_key_v1();
+				`);
+			}
+			if (tables.scimProvider) {
+				await client.query(`
+					CREATE OR REPLACE FUNCTION clearance_require_scim_key_v1()
+					RETURNS trigger LANGUAGE plpgsql AS $function$
+					BEGIN
+						IF left(NEW."scimToken", length('clr-scim:v1:clrkm$v1$')) <>
+						   'clr-scim:v1:clrkm$v1$' THEN
+							RAISE EXCEPTION 'SCIM token must use purpose-separated storage'
+								USING ERRCODE = '23514';
+						END IF;
+						RETURN NEW;
+					END
+					$function$;
+					DROP TRIGGER IF EXISTS clearance_require_scim_key_v1
+						ON "scimProvider";
+					CREATE TRIGGER clearance_require_scim_key_v1
+						BEFORE INSERT OR UPDATE OF "scimToken" ON "scimProvider"
+						FOR EACH ROW EXECUTE FUNCTION clearance_require_scim_key_v1();
+				`);
+			}
+			if (tables.jwks) {
+				await client.query(`
+					CREATE OR REPLACE FUNCTION clearance_require_jwt_key_v1()
+					RETURNS trigger LANGUAGE plpgsql AS $function$
+					BEGIN
+						IF NEW."privateKey" <> 'clr-jwk:retired:v1' AND
+						   left(NEW."privateKey", length('clrkm$v1$')) <> 'clrkm$v1$' THEN
+							RAISE EXCEPTION 'JWT private key must use purpose-separated storage'
+								USING ERRCODE = '23514';
+						END IF;
+						RETURN NEW;
+					END
+					$function$;
+					DROP TRIGGER IF EXISTS clearance_require_jwt_key_v1 ON jwks;
+					CREATE TRIGGER clearance_require_jwt_key_v1
+						BEFORE INSERT OR UPDATE OF "privateKey" ON jwks
+						FOR EACH ROW EXECUTE FUNCTION clearance_require_jwt_key_v1();
+				`);
+			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
 		}
 	}
 
@@ -1700,6 +2212,7 @@ export function createClearanceAuth<
 		pool,
 		db,
 		credentialAuthority: credentialAuthorityFacade,
+		keyManagement: keyManagementFacade,
 		...(authenticationPolicyFacade
 			? { authenticationPolicy: authenticationPolicyFacade }
 			: {}),
@@ -1729,6 +2242,7 @@ export function createClearanceAuth<
 				await runtimePlan.apply();
 				await ensureAuthenticationSecurityCompatibility();
 				await ensureLifecycleCompatibility();
+				await ensurePurposeSeparatedCredentialCompatibility();
 				if (options.durableDelivery) {
 					await migrateDeliverySchema(pool, {
 						schema: options.durableDelivery.schema,
@@ -1788,6 +2302,7 @@ export function createClearanceAuth<
 							await leasePlan.apply();
 							await ensureAuthenticationSecurityCompatibility();
 							await ensureLifecycleCompatibility();
+							await ensurePurposeSeparatedCredentialCompatibility();
 							if (options.durableDelivery) {
 								await migrateDeliverySchema(pool, {
 									schema: options.durableDelivery.schema,
