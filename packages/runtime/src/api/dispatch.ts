@@ -1,7 +1,7 @@
 import type { AuthContext, HookEndpointContext } from "@clearance/core";
 import type { AuthMiddleware } from "@clearance/core/api";
 import {
-	getCurrentDBAdapterAsyncLocalStorage,
+	getActiveTransactionAdapter,
 	isTransactionActive,
 	runWithEndpointContext,
 	runWithTransaction,
@@ -36,17 +36,6 @@ const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
 const rejectActiveTransactionSymbol = Symbol.for(
 	"clearance.endpoint.reject-active-transaction",
 );
-
-type ActiveTransactionStore = {
-	rootAdapter?: object | undefined;
-	adapter?: AuthContext["adapter"] | undefined;
-	activeTransactions?: ReadonlyMap<object, ActiveTransactionStore> | undefined;
-	isTransactionActive?: boolean | undefined;
-};
-type ActiveDispatchTransaction = ActiveTransactionStore & {
-	adapter: AuthContext["adapter"];
-	isTransactionActive: true;
-};
 
 type ActiveTransactionRejection = () => APIError;
 
@@ -99,16 +88,10 @@ function normalizePreflightAPIError(
 
 async function activeDispatchTransaction(
 	context: AuthContext,
-): Promise<ActiveDispatchTransaction | null> {
-	const store = (
-		await getCurrentDBAdapterAsyncLocalStorage()
-	).getStore() as ActiveTransactionStore | undefined;
-	const owner =
-		store?.activeTransactions?.get(context.adapter) ??
-		(store?.rootAdapter === context.adapter ? store : undefined);
-	return owner?.isTransactionActive && owner.adapter
-		? (owner as ActiveDispatchTransaction)
-		: null;
+): Promise<AuthContext["adapter"] | null> {
+	return (await getActiveTransactionAdapter(
+		context.adapter,
+	)) as AuthContext["adapter"] | null;
 }
 
 async function assertDispatchCredentialAuthority(context: AuthContext) {
@@ -463,7 +446,7 @@ export async function dispatchAuthEndpoint(
 			// Direct auth.api calls may enter with a wrapper around the root
 			// adapter. Reuse the owning transaction adapter so every nested
 			// authority read, mutation, and after-commit hook joins that owner.
-			adapter: activeTransaction?.adapter ?? input.context.adapter,
+			adapter: activeTransaction ?? input.context.adapter,
 			returned: undefined,
 			responseHeaders: undefined,
 			// A fresh dispatch (shared context) has no session; a resumed dispatch
@@ -511,7 +494,7 @@ export async function dispatchAuthEndpoint(
 					if (activeTransaction) {
 						// Hook context overrides may not escape the transaction that owns this
 						// direct API dispatch.
-						internalContext.context.adapter = activeTransaction.adapter;
+						internalContext.context.adapter = activeTransaction;
 					}
 				} else if (before) {
 					// A before hook short-circuited. Serialize the response headers it
