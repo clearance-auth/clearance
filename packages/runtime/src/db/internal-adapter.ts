@@ -98,6 +98,7 @@ import {
 	classifyRuntimeInteractiveAuthenticationRoute,
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
 } from "../internal/runtime-audit";
 import {
 	ManagedVerificationChallengeError,
@@ -137,6 +138,69 @@ const runtimeAuditAuthenticationMethods = new Set<string>([
 	"magic_link",
 	"sso",
 ]);
+
+/**
+ * Append only from a database transaction that already owns the terminal
+ * credential mutation.  The runtime audit authority is intentionally absent
+ * for secondary-authoritative paths, so those paths remain event-free.
+ */
+async function appendRuntimeAuditIfBound(
+	transaction: DBTransactionAdapter,
+	adapter: DBAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+): Promise<void> {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(adapter) ??
+		(adapter.options ? readInternalRuntimeAudit(adapter.options) : undefined);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request =
+		(await getRuntimeAuditRequestContext()) ??
+		Object.freeze({
+			correlationId: `rt_${generateId(24)}`,
+			operationId: "internal.session-credential",
+			route: "/internal/session-credential",
+			method: "INTERNAL",
+			clientIp: null,
+			userAgent: null,
+		});
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
+}
+
+async function runtimeAuditActor(): Promise<string> {
+	const current = await getCurrentAuthContext().catch(() => null);
+	const actor = (current as { session?: { user?: { id?: unknown } } } | null)
+		?.session?.user?.id;
+	return typeof actor === "string" && actor.length > 0 ? actor : "system";
+}
+
+async function sessionRevocationAuditContext(): Promise<{
+	actor: string;
+	cause: string;
+}> {
+	const request = await getRuntimeAuditRequestContext();
+	const route = request?.route;
+	const cause =
+		route === "/sign-out"
+			? "sign_out"
+			: route?.startsWith("/admin/")
+				? "administrator"
+				: route === "/passkey/delete" || route === "/two-factor/disable"
+					? "factor_change"
+					: route?.includes("reset-password")
+						? "password_reset"
+						: route?.includes("ban-user") || route?.includes("remove-user")
+							? "account_deactivation"
+							: "security_operation";
+	return { actor: await runtimeAuditActor(), cause };
+}
+
+function sessionAuditOrganizationId(session: Session): string | null {
+	const organizationId = (session as unknown as Record<string, unknown>)
+		.activeOrganizationId;
+	return typeof organizationId === "string" ? organizationId : null;
+}
 
 export const createInternalAdapter = (
 	adapter: DBAdapter<ClearanceOptions>,
@@ -2141,6 +2205,31 @@ export const createInternalAdapter = (
 					userId,
 					expectedCredentialKeys: captured.keys,
 				};
+				const audit = await sessionRevocationAuditContext();
+				await appendRuntimeAuditIfBound(currentAdapter, adapter, {
+					actor: audit.actor,
+					action: "auth.session.revoked",
+					subjectType: "session",
+					subjectId: locked.session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: sessionAuditOrganizationId(locked.session),
+					message: "Session revoked",
+					metadata: { cause: reuseDetectedAt ? "refresh_reuse" : audit.cause },
+				});
+				if (reuseDetectedAt) {
+					await appendRuntimeAuditIfBound(currentAdapter, adapter, {
+						actor: audit.actor,
+						action: "auth.session.reuse_detected",
+						subjectType: "session",
+						subjectId: locked.session.id,
+						outcome: "failure",
+						source: "system",
+						organizationId: sessionAuditOrganizationId(locked.session),
+						message: "Refresh credential reuse detected",
+						metadata: { cause: "refresh_reuse" },
+					});
+				}
 				await queueDatabaseSessionRevocationCleanup(outcome);
 				return outcome;
 			}
@@ -2186,6 +2275,35 @@ export const createInternalAdapter = (
 							model: "session",
 							where: [{ field: "id", value: locked.session.id }],
 						}));
+						if (mutationCompleted) {
+							const audit = await sessionRevocationAuditContext();
+							await appendRuntimeAuditIfBound(transactionAdapter, adapter, {
+								actor: audit.actor,
+								action: "auth.session.revoked",
+								subjectType: "session",
+								subjectId: locked.session.id,
+								outcome: "success",
+								source: "system",
+								organizationId: sessionAuditOrganizationId(locked.session),
+								message: "Session revoked",
+								metadata: {
+									cause: reuseDetectedAt ? "refresh_reuse" : audit.cause,
+								},
+							});
+							if (reuseDetectedAt) {
+								await appendRuntimeAuditIfBound(transactionAdapter, adapter, {
+									actor: audit.actor,
+									action: "auth.session.reuse_detected",
+									subjectType: "session",
+									subjectId: locked.session.id,
+									outcome: "failure",
+									source: "system",
+									organizationId: sessionAuditOrganizationId(locked.session),
+									message: "Refresh credential reuse detected",
+									metadata: { cause: "refresh_reuse" },
+								});
+							}
+						}
 						return mutationCompleted ? reconfirmed.session : null;
 					},
 				},
@@ -4063,6 +4181,17 @@ export const createInternalAdapter = (
 				);
 				if (recovery && recovery !== recoveryCredentialRejected) {
 					await queueManagedRotationPublication(recovery);
+					await appendRuntimeAuditIfBound(currentAdapter, adapter, {
+						actor: recovery.user.id,
+						action: "auth.session.refresh_recovered",
+						subjectType: "session",
+						subjectId: recovery.session.id,
+						outcome: "success",
+						source: "system",
+						organizationId: sessionAuditOrganizationId(recovery.session),
+						message: "Refresh credential rotation recovered",
+						metadata: { rotationCounter: recovery.rotationCounter },
+					});
 				}
 					return recovery;
 				});
@@ -4145,6 +4274,17 @@ export const createInternalAdapter = (
 					if (recovered === recoveryCredentialRejected) return null;
 					if (recovered) {
 						await queueManagedRotationPublication(recovered);
+						await appendRuntimeAuditIfBound(currentAdapter, adapter, {
+							actor: recovered.user.id,
+							action: "auth.session.refresh_recovered",
+							subjectType: "session",
+							subjectId: recovered.session.id,
+							outcome: "success",
+							source: "system",
+							organizationId: sessionAuditOrganizationId(recovered.session),
+							message: "Refresh credential rotation recovered",
+							metadata: { rotationCounter: recovered.rotationCounter },
+						});
 						return recovered;
 					}
 					await revokeAndDeleteSessionById(
@@ -4330,6 +4470,17 @@ export const createInternalAdapter = (
 					successorCredential: persistedSuccessor,
 				};
 				await queueManagedRotationPublication(result);
+				await appendRuntimeAuditIfBound(currentAdapter, adapter, {
+					actor: committedAuthority.user.id,
+					action: "auth.session.refresh_rotated",
+					subjectType: "session",
+					subjectId: committedAuthority.session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: sessionAuditOrganizationId(committedAuthority.session),
+					message: "Refresh credential rotated",
+					metadata: { rotationCounter: persistedSuccessor.rotationCounter },
+				});
 				return result;
 				});
 			} catch (error) {
