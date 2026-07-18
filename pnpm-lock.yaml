@@ -140,6 +140,9 @@ importers:
       '@clearance/delivery':
         specifier: workspace:*
         version: link:../delivery
+      '@clearance/key-management':
+        specifier: workspace:*
+        version: link:../key-management
       kysely:
         specifier: 'catalog:'
         version: 0.29.3
@@ -381,6 +384,9 @@ importers:
       '@clearance/delivery':
         specifier: workspace:*
         version: link:../delivery
+      '@clearance/key-management':
+        specifier: workspace:*
+        version: link:../key-management
       pg:
         specifier: ^8.14.1
         version: 8.22.0
