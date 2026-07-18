@@ -17,6 +17,12 @@ import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db";
 import type { Session, User } from "../../../types";
 import { getDate } from "../../../utils/date";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../../../internal/runtime-audit";
 import { defaultRoles } from "../access/statement";
 import {
 	assertManagedOrganizationTransitionSupported,
@@ -46,6 +52,43 @@ const ORGANIZATION_LIFECYCLE_NESTED_TRANSACTION = {
 	message:
 		"Cookie-bearing organization lifecycle routes cannot run inside an existing transaction",
 } as const;
+
+async function appendInvitationAudit(
+	context: Parameters<typeof getOrgAdapter>[0],
+	transaction: object,
+	input: {
+		action:
+			| "organization.invitation.created"
+			| "organization.invitation.resent"
+			| "organization.invitation.accepted"
+			| "organization.invitation.rejected"
+			| "organization.invitation.canceled";
+		actorId: string;
+		invitationId: string;
+		organizationId: string;
+		role: string;
+	},
+) {
+	const binding =
+		readInternalRuntimeAudit(context.options) ??
+		readInternalRuntimeAudit(context.adapter);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	await appendInternalRuntimeAudit(transaction, {
+		actor: input.actorId,
+		action: input.action,
+		subjectType: "invitation",
+		subjectId: input.invitationId,
+		outcome: "success",
+		source: "system",
+		organizationId: input.organizationId,
+		message: "Organization invitation lifecycle completed",
+		metadata: { role: canonicalizeInvitationRole(input.role) },
+		request,
+	});
+}
 
 async function requireOrganizationLifecycleTransaction(
 	context: Parameters<typeof getOrgAdapter>[0],
@@ -989,6 +1032,13 @@ export const createInvitation = <O extends OrganizationOptions>(option: O) => {
 							semanticExpiresAt: expiresAt,
 						});
 					}
+					await appendInvitationAudit(ctx.context, transaction, {
+						action: "organization.invitation.resent",
+						actorId: actor.id,
+						invitationId: updatedInvitation.id,
+						organizationId,
+						role: updatedInvitation.role,
+					});
 					await queueLegacyInvitationEmail(updatedInvitation, liveMember as Member, lockedOrganization);
 					return { invitation: updatedInvitation, member: liveMember, resent: true as const };
 				}
@@ -1069,6 +1119,14 @@ export const createInvitation = <O extends OrganizationOptions>(option: O) => {
 						semanticExpiresAt: invitation.expiresAt,
 					});
 				}
+				const auditTransaction = await getCurrentAdapter(ctx.context.adapter);
+				await appendInvitationAudit(ctx.context, auditTransaction, {
+					action: "organization.invitation.created",
+					actorId: actor.id,
+					invitationId: invitation.id,
+					organizationId: invitation.organizationId,
+					role: invitation.role,
+				});
 				await queueLegacyInvitationEmail(invitation, liveMember as Member, lockedOrganization);
 				return { invitation, member: liveMember, actor: liveActor.user, organization: lockedOrganization, resent: false as const };
 			};
@@ -1431,6 +1489,14 @@ export const acceptInvitation = <O extends OrganizationOptions>(options: O) =>
 							role: acceptedRole,
 							createdAt: new Date(),
 						});
+						const transaction = await getCurrentAdapter(ctx.context.adapter);
+						await appendInvitationAudit(ctx.context, transaction, {
+							action: "organization.invitation.accepted",
+							actorId: currentActor.user.id,
+							invitationId: acceptedInvitation.id,
+							organizationId: acceptedInvitation.organizationId,
+							role: acceptedRole,
+						});
 						acceptance = {
 							invitation: acceptedInvitation as AcceptedInvitation,
 							member: acceptedMember as AcceptedMember,
@@ -1684,6 +1750,13 @@ export const rejectInvitation = <O extends OrganizationOptions>(options: O) =>
 						ORGANIZATION_ERROR_CODES.INVITATION_NOT_FOUND,
 					);
 				}
+				await appendInvitationAudit(ctx.context, transaction, {
+					action: "organization.invitation.rejected",
+					actorId: liveActor.user.id,
+					invitationId: rejectedInvitation.id,
+					organizationId: rejectedInvitation.organizationId,
+					role: rejectedInvitation.role,
+				});
 				if (options?.organizationHooks?.afterRejectInvitation) {
 					await queueAfterTransactionHook(
 						() =>
@@ -1852,6 +1925,13 @@ export const cancelInvitation = <O extends OrganizationOptions>(options: O) =>
 						ORGANIZATION_ERROR_CODES.INVITATION_NOT_FOUND,
 					);
 				}
+				await appendInvitationAudit(ctx.context, transaction, {
+					action: "organization.invitation.canceled",
+					actorId: liveActor.user.id,
+					invitationId: canceledInvitation.id,
+					organizationId: canceledInvitation.organizationId,
+					role: canceledInvitation.role,
+				});
 				if (options?.organizationHooks?.afterCancelInvitation) {
 					await queueAfterTransactionHook(
 						() =>
