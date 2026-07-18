@@ -185,6 +185,16 @@ export const schema = {
 				type: "date",
 				required: false,
 			},
+			sessionDerivativeAuthority: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
+			organizationId: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
 			clientId: {
 				type: "string",
 				references: {
