@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createAuthClient } from "../../../client";
 import { createAccessControl } from "../../access";
 import { getTestInstance } from "../../../test-utils/test-instance";
+import { attachInternalAuthorizationAuthority } from "../../../internal/authorization-authority";
 import { defaultStatements } from "../access";
 import { organizationClient } from "../client";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
@@ -475,6 +476,91 @@ describe("get-full-organization", async () => {
 });
 
 describe("organization hooks", async () => {
+	it("finalizes authorization ownership in the organization-create transaction", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization()],
+		});
+		const context = await auth.$context;
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		Object.assign(context.adapter, {
+			transaction: async (callback: any) =>
+				transaction(async (activeTransaction) =>
+					callback(
+						Object.assign(activeTransaction, {
+							rawTransactionQuery: vi.fn(),
+						}),
+					),
+				),
+		});
+		const finalize = vi.fn(async () => {});
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: "1",
+					actions: [],
+				};
+			},
+			initializeOrganizationOwner: finalize,
+		});
+		const { headers, user } = await signInWithTestUser();
+		const createdOrganization = await auth.api.createOrganization({
+			body: { name: "authorized", slug: "authorized" },
+			headers,
+		});
+		expect(finalize).toHaveBeenCalledOnce();
+		expect(finalize).toHaveBeenCalledWith(
+			expect.objectContaining({
+				organizationId: createdOrganization.id,
+				ownerPrincipalId: user.id,
+				transaction: expect.objectContaining({
+					rawTransactionQuery: expect.any(Function),
+				}),
+			}),
+		);
+	});
+
+	it("rolls back organization creation when authorization finalization fails", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization()],
+		});
+		const context = await auth.$context;
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		Object.assign(context.adapter, {
+			transaction: async (callback: any) =>
+				transaction(async (activeTransaction) =>
+					callback(
+						Object.assign(activeTransaction, {
+							rawTransactionQuery: vi.fn(),
+						}),
+					),
+				),
+		});
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: "1",
+					actions: [],
+				};
+			},
+			async initializeOrganizationOwner() {
+				throw new Error("authorization finalization failed");
+			},
+		});
+		const { headers } = await signInWithTestUser();
+		await expect(
+			auth.api.createOrganization({
+				body: { name: "rollback authorization", slug: "rollback-authorization" },
+				headers,
+			}),
+		).rejects.toThrow("Authorization authority is unavailable");
+		expect(await context.adapter.count({ model: "organization" })).toBe(0);
+		expect(await context.adapter.count({ model: "member" })).toBe(0);
+	});
+
 	it("serializes concurrent numeric organization-limit admission", async () => {
 		const { client, signInWithTestUser } = await getTestInstance(
 			{ plugins: [organization({ organizationLimit: 1 })] },
