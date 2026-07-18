@@ -22,11 +22,12 @@ describe("OIDC client secret storage", () => {
 			ciphertext.replace(/^encrypted:/, ""),
 		);
 		const options = { storeOIDCClientSecret: { encrypt, decrypt } };
+		const plaintextSecret = "clr-sso:v1:legitimate-plaintext-secret";
 		const config: OIDCConfig = {
 			issuer: "https://issuer.example.com",
 			pkce: true,
 			clientId: "client",
-			clientSecret: "secret",
+			clientSecret: plaintextSecret,
 			discoveryEndpoint:
 				"https://issuer.example.com/.well-known/openid-configuration",
 		};
@@ -34,8 +35,11 @@ describe("OIDC client secret storage", () => {
 		const encrypted = await encryptOIDCConfig(config, "provider-stable", options);
 		await decryptOIDCConfig(encrypted, "provider-stable", options);
 
-		expect(encrypt).toHaveBeenCalledWith("secret", "provider-stable");
-		expect(decrypt).toHaveBeenCalledWith("encrypted:secret", "provider-stable");
+		expect(encrypt).toHaveBeenCalledWith(plaintextSecret, "provider-stable");
+		expect(decrypt).toHaveBeenCalledWith(
+			`encrypted:${plaintextSecret}`,
+			"provider-stable",
+		);
 	});
 });
 
