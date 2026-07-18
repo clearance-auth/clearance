@@ -297,6 +297,16 @@ export type CreateClearanceAuthOptions<Security extends ClearanceAuthenticationS
         /** ES256 software or cloud signer used for five-minute access tokens. */
         signingProvider: KeySigningProvider;
     };
+    /**
+     * Append-only PostgreSQL security audit outbox. When omitted, a scope is
+     * derived only from one unambiguous managed product scope.
+     */
+    runtimeAudit?: false | {
+        projectId: string;
+        environmentId: string;
+        schema?: string;
+        prefix?: string;
+    };
     /** Enabled by default. Set to `false` to omit the passkey server surface. */
     passkeys?: Passkeys;
     credentialAuthority?: {
