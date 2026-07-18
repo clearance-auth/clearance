@@ -14,6 +14,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import pg from "pg";
+import { reconcileAuthorizationTerminalizationAtManagementStartup } from "../auth-bridge.js";
 import {
 	cancelDeliveryInExistingTransaction,
 	createRuntimeAuditTable,
@@ -172,6 +173,7 @@ export class PgStore implements ManagementStore {
 	readonly runtimeAuditEvents: PgRuntimeAuditEventReader;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
 	readonly storeV2Topology?: StoreV2TopologyReader;
+	readonly storeV2OrganizationAuthority?: Readonly<{ schema: string; table: string }>;
 	readonly deliveryControl?: ManagementDeliveryControlReader;
 	readonly webhookEndpoints?: ManagementWebhookEndpointCapability;
 	private data: DataStoreSnapshot;
@@ -197,6 +199,7 @@ export class PgStore implements ManagementStore {
 	private writeError: unknown = null;
 	private readonly activePrincipalTransactions = new Set<Promise<unknown>>();
 	private readonly activeTopologyTransactions = new Set<Promise<unknown>>();
+	private authorizationTerminalizationStartup: Promise<void> | undefined;
 	private initialized = false;
 
 	constructor(
@@ -440,6 +443,10 @@ export class PgStore implements ManagementStore {
 				this.table,
 				normalizedPrefix,
 			);
+			this.storeV2OrganizationAuthority = Object.freeze({
+				schema: "public",
+				table: this.storeV2Shadow.tables.organizations,
+			});
 			this.storeV2 = {
 				plan: async () => {
 					await this.ready();
@@ -451,7 +458,10 @@ export class PgStore implements ManagementStore {
 				},
 				apply: async () => {
 					await this.ready();
-					return this.storeV2Shadow!.apply();
+					const applied = await this.storeV2Shadow!.apply();
+					const loaded = await this.storeV2Shadow!.loadSnapshot();
+					await this.#reconcileAuthorizationTerminalizationAtStartup(loaded);
+					return applied;
 				},
 				verify: async () => {
 					await this.ready();
@@ -489,6 +499,9 @@ export class PgStore implements ManagementStore {
 					await this.ready();
 					const status = await this.storeV2Shadow!.cutoverTopology();
 					await this.refresh();
+					await this.#reconcileAuthorizationTerminalizationAtStartup(
+						await this.storeV2Shadow!.loadSnapshot(),
+					);
 					return status;
 				},
 				rollbackTopology: async () => {
@@ -539,12 +552,26 @@ export class PgStore implements ManagementStore {
 				},
 				getProjectById: (id: string) =>
 					topologyRepository.capability.getProjectById(id),
+				findProjectConflict: (
+					input: Parameters<StoreV2TopologyReader["findProjectConflict"]>[0],
+				) => topologyRepository.capability.findProjectConflict(input),
 				getEnvironment: (
 					input: Parameters<StoreV2TopologyReader["getEnvironment"]>[0],
 				) => topologyRepository.capability.getEnvironment(input),
+				findEnvironmentByKey: (
+					input: Parameters<StoreV2TopologyReader["findEnvironmentByKey"]>[0],
+				) => topologyRepository.capability.findEnvironmentByKey(input),
 				getOrganization: (
 					input: Parameters<StoreV2TopologyReader["getOrganization"]>[0],
 				) => topologyRepository.capability.getOrganization(input),
+				organizationIdExists: (id: string) =>
+					topologyRepository.capability.organizationIdExists(id),
+				getOrganizationBySlug: (
+					input: Parameters<StoreV2TopologyReader["getOrganizationBySlug"]>[0],
+				) => topologyRepository.capability.getOrganizationBySlug(input),
+				getOrganizationByExternalId: (
+					input: Parameters<StoreV2TopologyReader["getOrganizationByExternalId"]>[0],
+				) => topologyRepository.capability.getOrganizationByExternalId(input),
 				countOrganizations: (
 					input: Parameters<StoreV2TopologyReader["countOrganizations"]>[0],
 				) => topologyRepository.capability.countOrganizations(input),
@@ -653,9 +680,35 @@ export class PgStore implements ManagementStore {
 			await this.publishStoreV2Publication(() => {
 				this.publishStoreV2Snapshot(loaded);
 			});
+			// The reconciliation may append its durable migration audit through the
+			// coordinated executor, which requires an initialized store.
+			this.initialized = true;
+			await this.#reconcileAuthorizationTerminalizationAtStartup(loaded);
 		}
 		this.initialized = true;
 		return this;
+	}
+
+	async #reconcileAuthorizationTerminalizationAtStartup(loaded: {
+		authoritativeCollections: readonly StoreV2Collection[];
+	}): Promise<void> {
+		const topologyAuthoritative = ["projects", "environments", "organizations"].every(
+			(collection) => loaded.authoritativeCollections.includes(collection as StoreV2Collection),
+		);
+		// Management-only and legacy startup must never force runtime auth setup.
+		if (!topologyAuthoritative || !process.env.DATABASE_URL || !process.env.CLEARANCE_SECRET) return;
+		if (this.authorizationTerminalizationStartup) {
+			return this.authorizationTerminalizationStartup;
+		}
+		const run = reconcileAuthorizationTerminalizationAtManagementStartup(this);
+		this.authorizationTerminalizationStartup = run;
+		try {
+			await run;
+		} finally {
+			if (this.authorizationTerminalizationStartup === run) {
+				this.authorizationTerminalizationStartup = undefined;
+			}
+		}
 	}
 
 	load(): DataStoreSnapshot {
