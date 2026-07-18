@@ -21,7 +21,7 @@ describe("GCP KMS ES256 signing provider", () => {
 		});
 		const pem = publicKey.export({ type: "spki", format: "pem" }).toString();
 		let input = Buffer.alloc(0);
-		let failure: "name" | "crc" | "signature" | undefined;
+		let failure: "name" | "missing-name" | "crc" | "signature" | undefined;
 		const client = {
 			async asymmetricSign(request: {
 				name: string;
@@ -36,6 +36,17 @@ describe("GCP KMS ES256 signing provider", () => {
 					const signature = Buffer.from([1]);
 					return [{
 						name: retained,
+						signature,
+						signatureCrc32c: { value: crc32c(signature) },
+						verifiedDigestCrc32c: true,
+					}];
+				}
+				if (failure === "missing-name") {
+					const signature = signWithPrivateKey("sha256", input, {
+						key: privateKey,
+						dsaEncoding: "der",
+					});
+					return [{
 						signature,
 						signatureCrc32c: { value: crc32c(signature) },
 						verifiedDigestCrc32c: true,
@@ -103,6 +114,8 @@ describe("GCP KMS ES256 signing provider", () => {
 		expect(JSON.stringify(keys)).not.toContain(retained);
 
 		failure = "name";
+		await expect(provider.sign(input)).rejects.toMatchObject({ code: "KEY_OPERATION_FAILED" });
+		failure = "missing-name";
 		await expect(provider.sign(input)).rejects.toMatchObject({ code: "KEY_OPERATION_FAILED" });
 		failure = "crc";
 		await expect(provider.sign(input)).rejects.toMatchObject({ code: "KEY_OPERATION_FAILED" });
