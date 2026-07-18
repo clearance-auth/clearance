@@ -50,6 +50,16 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		});
 		const now = "2026-07-18T00:00:00.000Z";
 		await store.mutateDurable((data) => {
+			data.principals.push({
+				id: "principal_imported",
+				projectId: initialized.project.id,
+				environmentId: initialized.environment.id,
+				email: "imported@example.com",
+				name: "Imported Principal",
+				status: "active",
+				createdAt: now,
+				updatedAt: now,
+			});
 			data.organizations.push({
 				id: "org_imported",
 				projectId: initialized.project.id,
@@ -135,12 +145,143 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		).toMatchObject({
 			environments: [expect.objectContaining({ id: initialized.environment.id })],
 		});
-
 		const scope = {
 			projectId: initialized.project.id,
 			environmentId: initialized.environment.id,
 		};
-		const insertedTopology = await store.mutateStoreV2Topology!(async (topology) => ({
+		const authorityShadow = (
+			store as unknown as {
+				storeV2Shadow: {
+					loadSnapshot: (...args: never[]) => Promise<unknown>;
+				};
+			}
+		).storeV2Shadow;
+		const originalAuthorityLoadSnapshot = authorityShadow.loadSnapshot;
+		const authorityLoadSnapshot = originalAuthorityLoadSnapshot.bind(authorityShadow);
+		let signalStaleAuthorityRead!: () => void;
+		let releaseStaleAuthorityRead!: () => void;
+		const staleAuthorityRead = new Promise<void>((resolve) => {
+			signalStaleAuthorityRead = resolve;
+		});
+		const staleAuthorityReadReleased = new Promise<void>((resolve) => {
+			releaseStaleAuthorityRead = resolve;
+		});
+		let holdStaleAuthorityRead = true;
+		authorityShadow.loadSnapshot = async (...args) => {
+			const loaded = await authorityLoadSnapshot(...args);
+			if (!holdStaleAuthorityRead) return loaded;
+			holdStaleAuthorityRead = false;
+			signalStaleAuthorityRead();
+			await staleAuthorityReadReleased;
+			return loaded;
+		};
+		try {
+			const staleAuthorityRefresh = store.refresh();
+			await staleAuthorityRead;
+			await store.storeV2!.cutoverPrincipals();
+			const principalAuthorityRevision = store.currentRevision;
+			expect(store.snapshot.principals).toEqual([]);
+			expect(store.resourceCounts()).toMatchObject({ principals: 1 });
+			releaseStaleAuthorityRead();
+			await staleAuthorityRefresh;
+			expect(store.storeV2Principals?.authoritative).toBe(true);
+			expect(store.currentRevision).toBe(principalAuthorityRevision);
+			expect(store.snapshot.principals).toEqual([]);
+			expect(store.resourceCounts()).toMatchObject({ principals: 1 });
+
+			const originalPrincipalLoadSnapshot = authorityShadow.loadSnapshot;
+			const principalLoadSnapshot = originalPrincipalLoadSnapshot.bind(authorityShadow);
+			let signalStalePrincipalRead!: () => void;
+			let releaseStalePrincipalRead!: () => void;
+			const stalePrincipalRead = new Promise<void>((resolve) => {
+				signalStalePrincipalRead = resolve;
+			});
+			const stalePrincipalReadReleased = new Promise<void>((resolve) => {
+				releaseStalePrincipalRead = resolve;
+			});
+			authorityShadow.loadSnapshot = async (...args) => {
+				const loaded = await principalLoadSnapshot(...args);
+				signalStalePrincipalRead();
+				await stalePrincipalReadReleased;
+				return loaded;
+			};
+			try {
+				const stalePrincipalRefresh = store.refresh();
+				await stalePrincipalRead;
+				let principalRefreshRaceAuditId = "";
+				await store.mutateStoreV2Identity!(async ({ principals, appendAudit }) => {
+					principalRefreshRaceAuditId = appendAudit({
+						actor: "cli",
+						action: "principal.created",
+						projectId: scope.projectId,
+						environmentId: scope.environmentId,
+						subjectType: "principal",
+						subjectId: "principal_refresh_race",
+						outcome: "success",
+						source: "cli",
+						message: "Created principal during stale refresh",
+					}).id;
+					return principals.insert({
+						id: "principal_refresh_race",
+						projectId: scope.projectId,
+						environmentId: scope.environmentId,
+						email: "refresh-race@example.com",
+						name: "Refresh Race Principal",
+						status: "active",
+						createdAt: now,
+						updatedAt: now,
+					});
+				});
+				releaseStalePrincipalRead();
+				await stalePrincipalRefresh;
+				expect(store.currentRevision).toBe(principalAuthorityRevision);
+				expect(store.snapshot.principals).toEqual([]);
+				expect(store.resourceCounts()).toMatchObject({ principals: 2 });
+				expect(
+					(
+						await store.storeV2Events!.listPage({ scope, limit: 100 })
+					).events.map((event) => event.id),
+				).toContain(principalRefreshRaceAuditId);
+				expect(
+					await store.storeV2Principals!.getById({
+						scope,
+						id: "principal_refresh_race",
+					}),
+				).toMatchObject({ id: "principal_refresh_race" });
+			} finally {
+				releaseStalePrincipalRead();
+				authorityShadow.loadSnapshot = originalPrincipalLoadSnapshot;
+			}
+			await store.storeV2!.rollbackPrincipals();
+			expect(store.storeV2Principals?.authoritative).toBe(false);
+		} finally {
+			releaseStaleAuthorityRead();
+			authorityShadow.loadSnapshot = originalAuthorityLoadSnapshot;
+		}
+
+		const topologyAudit = (subjectType: string, subjectId: string) => ({
+			actor: "cli",
+			action: "topology.updated",
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			subjectType,
+			subjectId,
+			outcome: "success" as const,
+			source: "cli" as const,
+			message: `Updated ${subjectType} ${subjectId}`,
+		});
+		const observer = await createPgStore(DATABASE_URL, {
+			tableName: TABLE,
+			normalizedPrefix: PREFIX,
+		});
+		stores.push(observer);
+		const observerSnapshotRevision = observer.currentRevision;
+		const observerTopologyRevision =
+			(await observer.storeV2!.status()).topologyRevision;
+		const insertedTopology = await store.mutateStoreV2Topology!(async ({
+			topology,
+			appendAudit,
+		}) => ({
 			project: await topology.upsertProject({
 				id: "project_direct",
 				name: "Direct Project",
@@ -157,7 +298,32 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				createdAt: now,
 				updatedAt: now,
 			}),
+			audit: appendAudit(topologyAudit("project", "project_direct")),
 		}));
+		expect(
+			(
+				await store.storeV2Events!.listPage({
+					scope,
+					limit: 100,
+				})
+			).events.map((event) => event.id),
+		).toContain(insertedTopology.audit.id);
+		expect(store.resourceCounts()).toMatchObject({
+			projects: 2,
+			environments: 2,
+			organizations: shadowCountBefore + 1,
+		});
+		await observer.refresh();
+		expect(observer.currentRevision).toBe(observerSnapshotRevision);
+		expect(observer.resourceCounts()).toMatchObject({
+			projects: 2,
+			environments: 2,
+			organizations: shadowCountBefore + 1,
+		});
+		expect((await observer.storeV2!.status()).topologyRevision).toBe(
+			observerTopologyRevision! + 1,
+		);
+		expect(observer.snapshot.projects).toEqual([]);
 		const directTopologyState = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			const result = await directTopologyState.query<{
@@ -190,8 +356,9 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		try {
 			await lockClient.query("BEGIN");
 			await lockClient.query(`SELECT id FROM ${TABLE} WHERE id = 1 FOR UPDATE`);
-			const writeOne = store.mutateStoreV2Topology!((topology) =>
-				topology.upsertOrganization({
+			const writeOne = store.mutateStoreV2Topology!(({ topology, appendAudit }) => {
+				appendAudit(topologyAudit("organization", "org_live_one"));
+				return topology.upsertOrganization({
 					id: "org_live_one",
 					projectId: scope.projectId,
 					environmentId: scope.environmentId,
@@ -200,10 +367,11 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 					status: "active",
 					createdAt: now,
 					updatedAt: now,
-				}),
-			);
-			const writeTwo = store.mutateStoreV2Topology!((topology) =>
-				topology.upsertOrganization({
+				});
+			});
+			const writeTwo = store.mutateStoreV2Topology!(({ topology, appendAudit }) => {
+				appendAudit(topologyAudit("organization", "org_live_two"));
+				return topology.upsertOrganization({
 					id: "org_live_two",
 					projectId: scope.projectId,
 					environmentId: scope.environmentId,
@@ -212,8 +380,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 					status: "active",
 					createdAt: now,
 					updatedAt: now,
-				}),
-			);
+				});
+			});
 			await expect(
 				Promise.race([
 					Promise.all([writeOne, writeTwo]).then(() => true),
@@ -258,6 +426,55 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				})
 			).organizations.map((organization) => organization.id),
 		).toEqual(["org_live_one", "org_live_two", "org_shadow"]);
+
+		const shadow = (
+			store as unknown as {
+				storeV2Shadow: {
+					loadSnapshot: (...args: never[]) => Promise<unknown>;
+				};
+			}
+		).storeV2Shadow;
+		const originalLoadSnapshot = shadow.loadSnapshot;
+		const loadSnapshot = originalLoadSnapshot.bind(shadow);
+		let signalStaleRead!: () => void;
+		let releaseStaleRead!: () => void;
+		const staleRead = new Promise<void>((resolve) => {
+			signalStaleRead = resolve;
+		});
+		const staleReadReleased = new Promise<void>((resolve) => {
+			releaseStaleRead = resolve;
+		});
+		shadow.loadSnapshot = async (...args) => {
+			const loaded = await loadSnapshot(...args);
+			signalStaleRead();
+			await staleReadReleased;
+			return loaded;
+		};
+		try {
+			const staleRefresh = store.refresh();
+			await staleRead;
+			await store.mutateStoreV2Topology!(({ topology, appendAudit }) => {
+				appendAudit(topologyAudit("organization", "org_refresh_race"));
+				return topology.upsertOrganization({
+					id: "org_refresh_race",
+					projectId: scope.projectId,
+					environmentId: scope.environmentId,
+					name: "Refresh Race",
+					slug: "refresh-race",
+					status: "active",
+					createdAt: now,
+					updatedAt: now,
+				});
+			});
+			releaseStaleRead();
+			await staleRefresh;
+		} finally {
+			releaseStaleRead();
+			shadow.loadSnapshot = originalLoadSnapshot;
+		}
+		expect(store.resourceCounts()).toMatchObject({
+			organizations: shadowCountBefore + 4,
+		});
 
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
@@ -336,7 +553,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				`SELECT (value->>'revision')::integer AS revision
 				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
 			);
-			await store.mutateStoreV2Topology!(async (topology) => {
+			await store.mutateStoreV2Topology!(async ({ topology }) => {
 				await topology.upsertProject(microsecondProject!);
 				await topology.upsertEnvironment(microsecondEnvironment!);
 				await topology.upsertOrganization(microsecondMapped!);
@@ -348,8 +565,106 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				),
 			).toMatchObject({ rows: beforeNoOp.rows });
 
+			const beforeAuditRequired = await pool.query<{ revision: number }>(
+				`SELECT (value->>'revision')::integer AS revision
+				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+			);
 			await expect(
-				store.mutateStoreV2Topology!(async (topology) => {
+				store.mutateStoreV2Topology!(async ({ topology }) => {
+					await topology.upsertProject({
+						id: "project_missing_audit",
+						name: "Missing Audit",
+						slug: "missing-audit",
+						createdAt: now,
+						updatedAt: now,
+					});
+				}),
+			).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_AUDIT_REQUIRED" });
+			expect(await store.storeV2Topology!.getProjectById("project_missing_audit")).toBeNull();
+			expect(
+				await pool.query(
+					`SELECT (value->>'revision')::integer AS revision
+					 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+				),
+			).toMatchObject({ rows: beforeAuditRequired.rows });
+
+			const beforeCallbackRollback = await pool.query<{ revision: number }>(
+				`SELECT (value->>'revision')::integer AS revision
+				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+			);
+			await expect(
+				store.mutateStoreV2Topology!(async ({ topology, appendAudit }) => {
+					appendAudit(topologyAudit("organization", "org_callback_rolled_back"));
+					await topology.upsertOrganization({
+						id: "org_callback_rolled_back",
+						projectId: scope.projectId,
+						environmentId: scope.environmentId,
+						name: "Callback Rolled Back",
+						slug: "callback-rolled-back",
+						status: "active",
+						createdAt: now,
+						updatedAt: now,
+					});
+					throw new Error("callback failure");
+				}),
+			).rejects.toThrow("callback failure");
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: "org_callback_rolled_back",
+				}),
+			).toBeNull();
+			expect(
+				(await store.storeV2Events!.listPage({ scope, limit: 100 })).events.some(
+					(event) => event.subjectId === "org_callback_rolled_back",
+				),
+			).toBe(false);
+			expect(
+				await pool.query(
+					`SELECT (value->>'revision')::integer AS revision
+					 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+				),
+			).toMatchObject({ rows: beforeCallbackRollback.rows });
+
+			const beforeIssuedRollback = await pool.query<{ revision: number }>(
+				`SELECT (value->>'revision')::integer AS revision
+				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+			);
+			await expect(
+				store.mutateStoreV2Topology!(({ topology, appendAudit }) => {
+					appendAudit(topologyAudit("environment", "env_issued_rolled_back"));
+					void topology.upsertEnvironment({
+						id: "env_issued_rolled_back",
+						projectId: "project_missing",
+						name: "Issued Rolled Back",
+						slug: "issued-rolled-back",
+						kind: "development",
+						createdAt: now,
+						updatedAt: now,
+					});
+				}),
+			).rejects.toMatchObject({ code: "23503" });
+			expect(
+				(await store.storeV2Events!.listPage({ scope, limit: 100 })).events.some(
+					(event) => event.subjectId === "env_issued_rolled_back",
+				),
+			).toBe(false);
+			expect(
+				await store.storeV2Topology!.getEnvironment({
+					projectId: "project_missing",
+					id: "env_issued_rolled_back",
+				}),
+			).toBeNull();
+			expect(
+				await pool.query(
+					`SELECT (value->>'revision')::integer AS revision
+					 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
+				),
+			).toMatchObject({ rows: beforeIssuedRollback.rows });
+
+			await expect(
+				store.mutateStoreV2Topology!(async ({ topology, appendAudit }) => {
+					appendAudit(topologyAudit("organization", "org_rolled_back"));
 					await topology.upsertOrganization({
 						id: "org_rolled_back",
 						projectId: scope.projectId,
@@ -407,7 +722,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
 			);
 			expect(result.rows).toEqual([
-				{ projects: 2, environments: 2, organizations: shadowCountBefore + 3 },
+				{ projects: 2, environments: 2, organizations: shadowCountBefore + 4 },
 			]);
 		} finally {
 			await rollbackStatePool.end();
@@ -427,6 +742,12 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			store.snapshot.organizations
 				.map((organization) => organization.id)
 				.sort(),
-		).toEqual(["org_imported", "org_live_one", "org_live_two", "org_shadow"]);
+		).toEqual([
+			"org_imported",
+			"org_live_one",
+			"org_live_two",
+			"org_refresh_race",
+			"org_shadow",
+		]);
 	});
 });
