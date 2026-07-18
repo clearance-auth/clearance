@@ -14,7 +14,12 @@ import {
 import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getJwksAdapter } from "./adapter";
 import type { JwtOptions } from "./types";
-import { createJwk, toExpJWT } from "./utils";
+import {
+	createJwk,
+	decryptPrivateJwk,
+	getPrivateKeyStorage,
+	toExpJWT,
+} from "./utils";
 
 type JWTPayloadWithOptional = {
 	/**
@@ -190,8 +195,14 @@ export async function signJWT(
 	}
 	const privateKeyEncryptionEnabled =
 		!options?.jwks?.disablePrivateKeyEncryption;
-
-	const privateWebKey = privateKeyEncryptionEnabled
+	const privateKeyStorage = getPrivateKeyStorage(options);
+	const privateWebKey = privateKeyStorage
+		? await decryptPrivateJwk(
+					privateKeyStorage,
+					key.privateKey,
+					key.publicKey,
+				)
+		: privateKeyEncryptionEnabled
 		? await symmetricDecrypt({
 				key: ctx.context.secretConfig,
 				data: JSON.parse(key.privateKey),
