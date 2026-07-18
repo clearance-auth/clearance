@@ -17,6 +17,11 @@ import {
 	type InternalRuntimeAuthenticationPolicyBinding,
 } from "../internal/authentication-policy";
 import {
+	attachCapturedInternalAuthorizationAuthority,
+	readInternalAuthorizationAuthority,
+	type InternalAuthorizationAuthority,
+} from "../internal/authorization-authority";
+import {
 	attachCapturedInternalRuntimeAudit,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditBinding,
@@ -59,6 +64,35 @@ function preserveAuthenticationPolicyBinding(
 	attachCapturedInternalAuthenticationPolicy(target, binding);
 }
 
+function assertCompatibleAuthorizationAuthorityBinding(
+	target: object,
+	binding: InternalAuthorizationAuthority | undefined,
+): void {
+	const existing = readInternalAuthorizationAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced authorization authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options authorization authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveAuthorizationAuthorityBinding(
+	target: object,
+	binding: InternalAuthorizationAuthority | undefined,
+): void {
+	assertCompatibleAuthorizationAuthorityBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalAuthorizationAuthority(target, binding);
+}
+
 function assertCompatibleRuntimeAuditBinding(
 	target: object,
 	binding: InternalRuntimeAuditBinding | undefined,
@@ -91,6 +125,7 @@ function preserveRuntimeAuditBinding(
 export async function runPluginInit(context: AuthContext) {
 	let options = context.options;
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const authorizationAuthority = readInternalAuthorizationAuthority(options);
 	const runtimeAudit = readInternalRuntimeAudit(options);
 	const plugins = options.plugins || [];
 	const pluginTrustedOrigins: NonNullable<
@@ -116,6 +151,10 @@ export async function runPluginInit(context: AuthContext) {
 						result.options,
 						authenticationPolicy,
 					);
+					assertCompatibleAuthorizationAuthorityBinding(
+						result.options,
+						authorizationAuthority,
+					);
 					assertCompatibleRuntimeAuditBinding(result.options, runtimeAudit);
 					const { databaseHooks, trustedOrigins, ...restOpts } = result.options;
 					if (databaseHooks) {
@@ -131,6 +170,10 @@ export async function runPluginInit(context: AuthContext) {
 					preserveAuthenticationPolicyBinding(
 						normalizedOptions,
 						authenticationPolicy,
+					);
+					preserveAuthorizationAuthorityBinding(
+						normalizedOptions,
+						authorizationAuthority,
 					);
 					preserveRuntimeAuditBinding(normalizedOptions, runtimeAudit);
 					options = normalizedOptions;
@@ -174,6 +217,7 @@ export async function runPluginInit(context: AuthContext) {
 		});
 	}
 	preserveAuthenticationPolicyBinding(options, authenticationPolicy);
+	preserveAuthorizationAuthorityBinding(options, authorizationAuthority);
 	preserveRuntimeAuditBinding(options, runtimeAudit);
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {
