@@ -220,7 +220,7 @@ export async function applyKeyManagementForManagement(
 	try {
 		assertApplyInput(input, stage);
 		const authority = facade(store, context, stage);
-		if (input.dryRun === true || input.confirm !== true) {
+		if (input.dryRun !== false || input.confirm !== true) {
 			return { dryRun: true, result: await authority.planMigration() };
 		}
 		const result = await mutateCoordinatedWithRuntimeSql(
