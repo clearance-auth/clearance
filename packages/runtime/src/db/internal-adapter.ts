@@ -82,6 +82,10 @@ import {
 	requireInternalSessionIssuanceContext,
 } from "../internal/session-issuance-context";
 import {
+	attachInternalSessionDerivativeAuthority,
+	ManagedSessionDerivativeAuthorityError,
+} from "../internal/session-derivative-authority";
+import {
 	attachStagedAuthenticationContinuation,
 	digestStagedAuthenticationPolicy,
 	requireStagedSessionIssuanceAuthority,
@@ -979,6 +983,20 @@ export const createInternalAdapter = (
 			}
 		}
 		return lineage ? { ...authority, lineage } : null;
+	}
+
+	async function loadStrictManagedSessionAuthorityById(
+		sessionId: string,
+	): Promise<StrictManagedSessionAuthority | null> {
+		if (legacyCredentialAuthority) return null;
+		const credentials = await (
+			await getCurrentAdapter(adapter)
+		).findMany<SessionCredential>({
+			model: SESSION_CREDENTIAL_MODEL,
+			where: [{ field: "sessionId", value: sessionId }],
+		});
+		if (credentials.length === 0) return null;
+		return loadStrictManagedSessionAuthority(sessionId, credentials);
 	}
 
 	async function publishManagedSessionAfterCommit(
@@ -5848,6 +5866,116 @@ export const createInternalAdapter = (
 		refreshUserSessions,
 	};
 	if (authenticationPolicy) {
+		const derivativeAuthorityFromSource = (
+			source: AssuredValidatedSessionAuthority,
+		) => {
+			const sourceAssurance = source.assurance;
+			const sourceExpiresAt = source.session.expiresAt;
+			if (
+				!sourceAssurance ||
+				!(sourceExpiresAt instanceof Date) ||
+				!Number.isFinite(sourceExpiresAt.getTime()) ||
+				sourceExpiresAt <= new Date()
+			) {
+				throw new ManagedSessionDerivativeAuthorityError("authority_stale");
+			}
+			return Object.freeze({
+				sourceSessionId: source.session.id,
+				sourceSubjectId: source.user.id,
+				sourceOrganizationId:
+					sourceAssurance.authenticationPolicyOrganizationId,
+				sourceExpiresAt: sourceExpiresAt.getTime(),
+				policyProjectId: sourceAssurance.authenticationPolicyProjectId,
+				policyEnvironmentId: sourceAssurance.authenticationPolicyEnvironmentId,
+				policyRevision: sourceAssurance.authenticationPolicyRevision,
+			});
+		};
+		const requireDerivativeAuthorityTransaction = async () => {
+			if (!(await isTransactionActive(adapter))) {
+				throw new ManagedSessionDerivativeAuthorityError("authority_invalid");
+			}
+			const transactionAdapter = await getCurrentAdapter(adapter);
+			if (transactionAdapter === adapter) {
+				throw new ManagedSessionDerivativeAuthorityError("authority_invalid");
+			}
+			return transactionAdapter;
+		};
+		const derivativeAuthorityHmac = createHMAC(
+			"SHA-256",
+			"base64urlnopad",
+		);
+		const derivativeAuthoritySignatureInput = (payload: string) =>
+			`clearance:session-derivative-authority:v1:${payload}`;
+		const derivativeAuthorityCurrentVersion = () => {
+			if (typeof ctx.secretConfig === "string") {
+				return -1;
+			}
+			const secret = ctx.secretConfig.keys.get(
+				ctx.secretConfig.currentVersion,
+			);
+			if (!secret) {
+				throw new ManagedSessionDerivativeAuthorityError("authority_invalid");
+			}
+			return ctx.secretConfig.currentVersion;
+		};
+		const derivativeAuthorityVerificationKey = (version: number) => {
+			if (typeof ctx.secretConfig === "string") {
+				return version === -1 ? ctx.secretConfig : undefined;
+			}
+			if (version === -1) return ctx.secretConfig.legacySecret;
+			return ctx.secretConfig.keys.get(version);
+		};
+		attachInternalSessionDerivativeAuthority(internalAdapter, {
+			capture: async (input) => {
+				await requireDerivativeAuthorityTransaction();
+				if ("sourceSessionToken" in input) {
+					const source = await resolveManagedSessionUpdateAuthority(
+						input.sourceSessionToken,
+					);
+					if (!source || !source.assurance || !source.credential) {
+						throw new ManagedSessionDerivativeAuthorityError("authority_stale");
+					}
+					return derivativeAuthorityFromSource(source);
+				}
+				const source = await loadStrictManagedSessionAuthorityById(
+					input.sourceSessionId,
+				);
+				if (!source) {
+					throw new ManagedSessionDerivativeAuthorityError("authority_stale");
+				}
+				return derivativeAuthorityFromSource(source);
+			},
+			validate: async (sourceSessionId) => {
+				await requireDerivativeAuthorityTransaction();
+				const source = await loadStrictManagedSessionAuthorityById(sourceSessionId);
+				if (!source) {
+					throw new ManagedSessionDerivativeAuthorityError("authority_stale");
+				}
+				return derivativeAuthorityFromSource(source);
+			},
+			signatureVersion: derivativeAuthorityCurrentVersion,
+			sign: async (payload, version) => {
+				const secret = derivativeAuthorityVerificationKey(version);
+				if (!secret) {
+					throw new ManagedSessionDerivativeAuthorityError("authority_invalid");
+				}
+				return derivativeAuthorityHmac.sign(
+					secret,
+					derivativeAuthoritySignatureInput(payload),
+				);
+			},
+			verify: async (payload, version, signature) => {
+				const secret = derivativeAuthorityVerificationKey(version);
+				return secret
+					? derivativeAuthorityHmac.verify(
+							secret,
+							derivativeAuthoritySignatureInput(payload),
+							signature,
+						)
+					: false;
+			},
+		});
+
 		// A single transaction can derive at most one organization successor from
 		// a source authority. Source resolution locks the user for cross-
 		// transaction contenders; this closes duplicate capture in one owner.
