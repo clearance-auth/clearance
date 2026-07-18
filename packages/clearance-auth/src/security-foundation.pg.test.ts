@@ -668,6 +668,210 @@ describe.sequential.skipIf(!available)(
 );
 
 describe.sequential.skipIf(!available)(
+	"purpose-separated credential migration on Postgres",
+	() => {
+		it("re-encrypts legacy OIDC, SCIM, and JWT material under exact resource authority", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `key_migration_${suffix}`;
+			const secret = "purpose-separated-migration-proof-secret!!";
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret,
+					databaseUrl,
+					rateLimitEnabled: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: {
+							rotationIntervalSeconds: 300,
+							gracePeriodSeconds: 600,
+						},
+					},
+				});
+				await bundle.migrate();
+				const signup = await bundle.auth.api.signUpEmail({
+					body: {
+						email: `key-migration-${suffix}@example.test`,
+						password: "correct-horse-battery-staple",
+						name: "Key Migration Proof",
+					},
+				});
+
+				const oidcProviderId = `oidc-${suffix}`;
+				const scimProviderId = `scim-${suffix}`;
+				const organizationId = `org-${suffix}`;
+				const publicKey = JSON.stringify({
+					kty: "OKP",
+					crv: "Ed25519",
+					x: Buffer.alloc(32, 7).toString("base64url"),
+				});
+				const privateKey = JSON.stringify({
+					kty: "OKP",
+					crv: "Ed25519",
+					x: Buffer.alloc(32, 7).toString("base64url"),
+					d: Buffer.alloc(32, 8).toString("base64url"),
+				});
+				const legacyOidc = await encryptRuntimeCredential("oidc-secret", secret);
+				const legacyScim = await encryptRuntimeCredential("scim-base", secret);
+				const legacyJwk = JSON.stringify(
+					await encryptRuntimeCredential(privateKey, secret),
+				);
+				const legacyOidcConfig = JSON.stringify({
+					clientId: "client",
+					clientSecret: `clr-sso:v1:${legacyOidc}`,
+				});
+				await scopedPool.query(
+					`INSERT INTO "ssoProvider"
+					 (id, issuer, "oidcConfig", "samlConfig", "userId", "providerId", "organizationId", domain)
+					 VALUES ($1,$2,$3,NULL,$4,$5,NULL,$6)`,
+					[
+						`row-${oidcProviderId}`,
+						"https://issuer.example.test",
+						legacyOidcConfig,
+						signup.user.id,
+						oidcProviderId,
+						"example.test",
+					],
+				);
+				await scopedPool.query(
+					`INSERT INTO "scimProvider" (id, "providerId", "scimToken", "organizationId")
+					 VALUES ($1,$2,$3,$4)`,
+					[`row-${scimProviderId}`, scimProviderId, legacyScim, organizationId],
+				);
+				await scopedPool.query(
+					`INSERT INTO jwks
+					 (id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv)
+					 VALUES ($1,$2,$3,now(),now() + interval '1 hour','EdDSA','Ed25519')`,
+					[`jwk-${suffix}`, publicKey, "invalid-legacy-private-key"],
+				);
+
+				await expect(bundle.migrate()).rejects.toThrow(
+					`Cannot migrate invalid JWT private-key storage for key jwk-${suffix}`,
+				);
+				const rolledBack = (
+					await scopedPool.query<{
+						oidcConfig: string;
+						scimToken: string;
+						privateKey: string;
+					}>(
+						`SELECT sso."oidcConfig", scim."scimToken", jwks."privateKey"
+						 FROM "ssoProvider" sso, "scimProvider" scim, jwks
+						 WHERE sso."providerId"=$1 AND scim."providerId"=$2 AND jwks.id=$3`,
+						[oidcProviderId, scimProviderId, `jwk-${suffix}`],
+					)
+				).rows[0]!;
+				expect(rolledBack).toEqual({
+					oidcConfig: legacyOidcConfig,
+					scimToken: legacyScim,
+					privateKey: "invalid-legacy-private-key",
+				});
+				await scopedPool.query(`UPDATE jwks SET "privateKey"=$2 WHERE id=$1`, [
+					`jwk-${suffix}`,
+					legacyJwk,
+				]);
+				await bundle.migrate();
+
+				const oidc = (
+					await scopedPool.query<{ oidcConfig: string }>(
+						`SELECT "oidcConfig" FROM "ssoProvider" WHERE "providerId"=$1`,
+						[oidcProviderId],
+					)
+				).rows[0]!;
+				const scim = (
+					await scopedPool.query<{ scimToken: string }>(
+						`SELECT "scimToken" FROM "scimProvider" WHERE "providerId"=$1`,
+						[scimProviderId],
+					)
+				).rows[0]!;
+				const jwk = (
+					await scopedPool.query<{ privateKey: string }>(
+						`SELECT "privateKey" FROM jwks WHERE id=$1`,
+						[`jwk-${suffix}`],
+					)
+				).rows[0]!;
+				const oidcStored = (
+					JSON.parse(oidc.oidcConfig) as { clientSecret: string }
+				).clientSecret.slice("clr-sso:v1:".length);
+				const scimStored = scim.scimToken.slice("clr-scim:v1:".length);
+				expect(oidcStored).toMatch(/^clrkm\$v1\$/);
+				expect(scimStored).toMatch(/^clrkm\$v1\$/);
+				expect(jwk.privateKey).toMatch(/^clrkm\$v1\$/);
+				expect(
+					await bundle.keyManagement.openText(
+						"oidc-client-secret",
+						bundle.keyManagement.resourceId("oidc-client-secret", {
+							providerId: oidcProviderId,
+						}),
+						oidcStored,
+					),
+				).toBe("oidc-secret");
+				expect(
+					await bundle.keyManagement.openText(
+						"scim-bearer-token",
+						bundle.keyManagement.resourceId("scim-bearer-token", {
+							providerId: scimProviderId,
+							organizationId,
+						}),
+						scimStored,
+					),
+				).toBe("scim-base");
+				expect(
+					await bundle.keyManagement.openText(
+						"access-token-signing-key",
+						bundle.keyManagement.resourceId("access-token-signing-key", {
+							publicKey,
+						}),
+						jwk.privateKey,
+					),
+				).toBe(privateKey);
+				await expect(
+					bundle.keyManagement.openText(
+						"scim-bearer-token",
+						bundle.keyManagement.resourceId("scim-bearer-token", {
+							providerId: scimProviderId,
+							organizationId: "wrong-organization",
+						}),
+						scimStored,
+					),
+				).rejects.toThrow();
+
+				await bundle.migrate();
+				const repeated = (
+					await scopedPool.query<{
+						oidcConfig: string;
+						scimToken: string;
+						privateKey: string;
+					}>(
+						`SELECT sso."oidcConfig", scim."scimToken", jwks."privateKey"
+						 FROM "ssoProvider" sso, "scimProvider" scim, jwks
+						 WHERE sso."providerId"=$1 AND scim."providerId"=$2 AND jwks.id=$3`,
+						[oidcProviderId, scimProviderId, `jwk-${suffix}`],
+					)
+				).rows[0]!;
+				expect(repeated).toEqual({
+					oidcConfig: oidc.oidcConfig,
+					scimToken: scim.scimToken,
+					privateKey: jwk.privateKey,
+				});
+			} finally {
+				await bundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+	},
+);
+
+describe.sequential.skipIf(!available)(
 	"authentication security schema upgrade",
 	() => {
 		it("rolls back signup when the durable identity bridge fails once", async () => {
