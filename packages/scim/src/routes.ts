@@ -5,7 +5,14 @@ import type {
 	GenericEndpointContext,
 	User,
 } from "@clearance/runtime";
-import { HIDE_METADATA } from "@clearance/runtime";
+import {
+	HIDE_METADATA,
+} from "@clearance/runtime";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	runWithTransaction,
+} from "@clearance/core/context";
 import {
 	APIError,
 	createAuthEndpoint,
@@ -37,10 +44,87 @@ import {
 	SCIMUserResourceType,
 } from "./user-schemas";
 import { getResourceURL } from "./utils";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../../runtime/src/internal/runtime-audit";
 
 const supportedSCIMSchemas = [SCIMUserResourceSchema];
 const supportedSCIMResourceTypes = [SCIMUserResourceType];
 const supportedMediaTypes = ["application/json", "application/scim+json"];
+
+function runtimeAuditBinding(ctx: GenericEndpointContext) {
+	return (
+		readInternalRuntimeAudit(ctx.context.options) ??
+		readInternalRuntimeAudit(ctx.context.adapter)
+	);
+}
+
+function scimConnectionActor(ctx: GenericEndpointContext): string {
+	const provider = ctx.context.scimProvider as { id?: unknown } | undefined;
+	return typeof provider?.id === "string" && provider.id.length > 0
+		? `scim_connection:${provider.id}`
+		: "scim_connection:configured";
+}
+
+async function runSCIMAuditTransaction<T>(
+	ctx: GenericEndpointContext,
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (!runtimeAuditBinding(ctx) || (await isTransactionActive(ctx.context.adapter))) {
+		return fn();
+	}
+	return runWithTransaction(ctx.context.adapter, fn);
+}
+
+async function runSCIMMutationTransaction<T>(
+	ctx: GenericEndpointContext,
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (runtimeAuditBinding(ctx)) {
+		return runWithTransaction(ctx.context.adapter, fn);
+	}
+	return ctx.context.adapter.transaction(fn);
+}
+
+async function appendSCIMAudit(
+	ctx: GenericEndpointContext,
+	input: {
+		action:
+			| "scim.connection.created"
+			| "scim.connection.rotated"
+			| "scim.connection.deleted"
+			| "scim.user.created"
+			| "scim.user.updated"
+			| "scim.user.deactivated"
+			| "scim.user.deprovisioned";
+		actorId: string;
+		subjectType: "scim_connection" | "user";
+		subjectId: string;
+		organizationId: string | null;
+	},
+) {
+	const binding = runtimeAuditBinding(ctx);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	const transaction = await getCurrentAdapter(ctx.context.adapter);
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	await appendInternalRuntimeAudit(transaction, {
+		actor: input.actorId,
+		action: input.action,
+		subjectType: input.subjectType,
+		subjectId: input.subjectId,
+		outcome: "success",
+		source: "scim",
+		organizationId: input.organizationId,
+		message: "SCIM protocol lifecycle completed",
+		metadata: {},
+		request,
+	});
+}
 
 const generateSCIMTokenBodySchema = z.object({
 	providerId: z.string().meta({ description: "Unique provider identifier" }),
@@ -486,10 +570,6 @@ export const generateSCIMToken = (opts: SCIMOptions) =>
 					scimProvider,
 					requiredRole,
 				);
-				await ctx.context.adapter.delete<SCIMProvider>({
-					model: "scimProvider",
-					where: [{ field: "id", value: scimProvider.id }],
-				});
 			}
 
 			const baseToken = generateRandomString(24);
@@ -505,20 +585,36 @@ export const generateSCIMToken = (opts: SCIMOptions) =>
 				});
 			}
 
-			const newSCIMProvider = await ctx.context.adapter.create<SCIMProvider>({
-				model: "scimProvider",
-				data: {
-					providerId,
-					organizationId,
-					scimToken: await storeSCIMToken(ctx, opts, baseToken, {
+			const newSCIMProvider = await runSCIMAuditTransaction(ctx, async () => {
+				if (scimProvider) {
+					await ctx.context.adapter.delete<SCIMProvider>({
+						model: "scimProvider",
+						where: [{ field: "id", value: scimProvider.id }],
+					});
+				}
+				const created = await ctx.context.adapter.create<SCIMProvider>({
+					model: "scimProvider",
+					data: {
 						providerId,
 						organizationId,
-					}),
-					...(isSCIMKeyManagementWriter(opts.storeSCIMToken)
-						? { keyManagementVersion: 1, keyManagementRevision: 1 }
-						: {}),
-					...(isProviderOwnershipEnabled(opts) ? { userId: user.id } : {}),
-				},
+						scimToken: await storeSCIMToken(ctx, opts, baseToken, {
+							providerId,
+							organizationId,
+						}),
+						...(isSCIMKeyManagementWriter(opts.storeSCIMToken)
+							? { keyManagementVersion: 1, keyManagementRevision: 1 }
+							: {}),
+						...(isProviderOwnershipEnabled(opts) ? { userId: user.id } : {}),
+					},
+				});
+				await appendSCIMAudit(ctx, {
+					action: scimProvider ? "scim.connection.rotated" : "scim.connection.created",
+					actorId: user.id,
+					subjectType: "scim_connection",
+					subjectId: created.id,
+					organizationId: created.organizationId ?? null,
+				});
+				return created;
 			});
 
 			if (opts.afterSCIMTokenGenerated) {
@@ -712,11 +808,24 @@ export const deleteSCIMProviderConnection = (opts: SCIMOptions) =>
 			const userId = ctx.context.session.user.id;
 			const requiredRole = resolveRequiredRoles(ctx, opts);
 
-			await checkSCIMProviderAccess(ctx, userId, providerId, requiredRole);
-
-			await ctx.context.adapter.delete<SCIMProvider>({
-				model: "scimProvider",
-				where: [{ field: "providerId", value: providerId }],
+			const provider = await checkSCIMProviderAccess(
+				ctx,
+				userId,
+				providerId,
+				requiredRole,
+			);
+			await runSCIMAuditTransaction(ctx, async () => {
+				await ctx.context.adapter.delete<SCIMProvider>({
+					model: "scimProvider",
+					where: [{ field: "id", value: provider.id }],
+				});
+				await appendSCIMAudit(ctx, {
+					action: "scim.connection.deleted",
+					actorId: userId,
+					subjectType: "scim_connection",
+					subjectId: provider.id,
+					organizationId: provider.organizationId ?? null,
+				});
 			});
 
 			return ctx.json({ success: true });
@@ -852,23 +961,36 @@ export const createSCIMUser = (
 					});
 				}
 				user = existingUser;
-				account = await ctx.context.adapter.transaction<Account>(async () => {
+				account = await runSCIMMutationTransaction(ctx, async () => {
 					const account = await createAccount(user.id);
 					await createOrgMembership(user.id);
+					await appendSCIMAudit(ctx, {
+						action: "scim.user.created",
+						actorId: scimConnectionActor(ctx),
+						subjectType: "user",
+						subjectId: user.id,
+						organizationId: ctx.context.scimProvider.organizationId ?? null,
+					});
 					return account;
 				});
 			} else {
-				[user, account] = await ctx.context.adapter.transaction<
-					[User, Account]
-				>(async () => {
+				[user, account] = await runSCIMMutationTransaction(ctx, async () => {
 					const user = await createUser();
 					const account = await createAccount(user.id);
 					await createOrgMembership(user.id);
-					return [user, account];
+					await appendSCIMAudit(ctx, {
+						action: "scim.user.created",
+						actorId: scimConnectionActor(ctx),
+						subjectType: "user",
+						subjectId: user.id,
+						organizationId: ctx.context.scimProvider.organizationId ?? null,
+					});
+					return [user, account] as [User, Account];
 				});
 			}
 
 			if (body.active === false) {
+				await runSCIMAuditTransaction(ctx, async () => {
 				const deactivation: Record<string, unknown> = { banned: true };
 				resolveSCIMActiveDeactivation(ctx, deactivation);
 				const banned = await ctx.context.internalAdapter.updateUser(
@@ -879,6 +1001,14 @@ export const createSCIMUser = (
 					user = banned;
 				}
 				await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				await appendSCIMAudit(ctx, {
+					action: "scim.user.deactivated",
+					actorId: scimConnectionActor(ctx),
+					subjectType: "user",
+					subjectId: user.id,
+					organizationId: ctx.context.scimProvider.organizationId ?? null,
+				});
+				});
 			}
 
 			const userResource = createUserResource(
@@ -965,7 +1095,8 @@ export const updateSCIMUser = (authMiddleware: AuthMiddleware) =>
 			const deactivating = resolveSCIMActiveDeactivation(ctx, userUpdate);
 
 			const [updatedUser, updatedAccount] =
-				await ctx.context.adapter.transaction<[User | null, Account | null]>(
+				await runSCIMMutationTransaction(
+					ctx,
 					async () => {
 						const updatedUser = await ctx.context.internalAdapter.updateUser(
 							userId,
@@ -977,14 +1108,25 @@ export const updateSCIMUser = (authMiddleware: AuthMiddleware) =>
 								accountId,
 								updatedAt: new Date(),
 							});
+						if (deactivating) {
+							await ctx.context.internalAdapter.deleteUserSessions(userId);
+						}
+						await appendSCIMAudit(ctx, {
+							action: deactivating
+								? "scim.user.deactivated"
+								: "scim.user.updated",
+							actorId: scimConnectionActor(ctx),
+							subjectType: "user",
+							subjectId: userId,
+							organizationId: organizationId ?? null,
+						});
 
-						return [updatedUser, updatedAccount];
+						return [updatedUser, updatedAccount] as [
+							User | null,
+							Account | null,
+						];
 					},
 				);
-
-			if (deactivating) {
-				await ctx.context.internalAdapter.deleteUserSessions(userId);
-			}
 
 			const userResource = createUserResource(
 				ctx.context.baseURL,
@@ -1243,24 +1385,33 @@ export const patchSCIMUser = (authMiddleware: AuthMiddleware) =>
 
 			const deactivating = resolveSCIMActiveDeactivation(ctx, userPatch);
 
-			await Promise.all([
-				Object.keys(userPatch).length > 0
-					? ctx.context.internalAdapter.updateUser(userId, {
-							...userPatch,
-							updatedAt: new Date(),
-						})
-					: Promise.resolve(),
-				Object.keys(accountPatch).length > 0
-					? ctx.context.internalAdapter.updateAccount(account.id, {
-							...accountPatch,
-							updatedAt: new Date(),
-						})
-					: Promise.resolve(),
-			]);
+			await runSCIMAuditTransaction(ctx, async () => {
+				await Promise.all([
+					Object.keys(userPatch).length > 0
+						? ctx.context.internalAdapter.updateUser(userId, {
+								...userPatch,
+								updatedAt: new Date(),
+							})
+						: Promise.resolve(),
+					Object.keys(accountPatch).length > 0
+						? ctx.context.internalAdapter.updateAccount(account.id, {
+								...accountPatch,
+								updatedAt: new Date(),
+							})
+						: Promise.resolve(),
+				]);
 
-			if (deactivating) {
-				await ctx.context.internalAdapter.deleteUserSessions(userId);
-			}
+				if (deactivating) {
+					await ctx.context.internalAdapter.deleteUserSessions(userId);
+				}
+				await appendSCIMAudit(ctx, {
+					action: deactivating ? "scim.user.deactivated" : "scim.user.updated",
+					actorId: scimConnectionActor(ctx),
+					subjectType: "user",
+					subjectId: userId,
+					organizationId: organizationId ?? null,
+				});
+			});
 
 			ctx.setStatus(204);
 			return;
@@ -1338,7 +1489,8 @@ export const deleteSCIMUser = (authMiddleware: AuthMiddleware) =>
 					});
 				}
 
-				await ctx.context.adapter.transaction(async (trx) => {
+				await runWithTransaction(ctx.context.adapter, async () => {
+					const trx = await getCurrentAdapter(ctx.context.adapter);
 					if (member) {
 						await trx.delete({
 							model: "member",
@@ -1370,6 +1522,13 @@ export const deleteSCIMUser = (authMiddleware: AuthMiddleware) =>
 							where: [{ field: "id", value: account.id }],
 						});
 					}
+					await appendSCIMAudit(ctx, {
+						action: "scim.user.deprovisioned",
+						actorId: scimConnectionActor(ctx),
+						subjectType: "user",
+						subjectId: userId,
+						organizationId,
+					});
 				});
 
 				if (member && organization) {
@@ -1392,13 +1551,31 @@ export const deleteSCIMUser = (authMiddleware: AuthMiddleware) =>
 			const hasOtherAccounts = accounts.some((a) => a.id !== account.id);
 
 			if (hasOtherAccounts) {
-				await ctx.context.internalAdapter.deleteAccount(account.id);
+				await runSCIMAuditTransaction(ctx, async () => {
+					await ctx.context.internalAdapter.deleteAccount(account.id);
+					await appendSCIMAudit(ctx, {
+						action: "scim.user.deprovisioned",
+						actorId: scimConnectionActor(ctx),
+						subjectType: "user",
+						subjectId: userId,
+						organizationId: null,
+					});
+				});
 				ctx.setStatus(204);
 				return;
 			}
 
-			await ctx.context.internalAdapter.deleteUserSessions(userId);
-			await ctx.context.internalAdapter.deleteUser(userId);
+			await runSCIMAuditTransaction(ctx, async () => {
+				await ctx.context.internalAdapter.deleteUserSessions(userId);
+				await ctx.context.internalAdapter.deleteUser(userId);
+				await appendSCIMAudit(ctx, {
+					action: "scim.user.deprovisioned",
+					actorId: scimConnectionActor(ctx),
+					subjectType: "user",
+					subjectId: userId,
+					organizationId: null,
+				});
+			});
 
 			ctx.setStatus(204);
 			return;
