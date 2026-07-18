@@ -276,6 +276,7 @@ export async function listStoreV2EventsPage(
 		cursor?: PageCursorKey;
 		action?: string;
 		organizationId?: string;
+		before?: string;
 	},
 ): Promise<{ events: AuditEvent[]; hasMore: boolean }> {
 	const params: unknown[] = [input.scope.projectId, input.scope.environmentId];
@@ -291,6 +292,10 @@ export async function listStoreV2EventsPage(
 	if (input.organizationId) {
 		params.push(input.organizationId);
 		where.push(`organization_id = $${params.length}`);
+	}
+	if (input.before) {
+		params.push(input.before);
+		where.push(`created_at < $${params.length}::timestamptz`);
 	}
 	if (input.cursor) {
 		params.push(input.cursor.createdAt, input.cursor.id);
