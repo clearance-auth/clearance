@@ -35,6 +35,85 @@ afterAll(async () => {
 });
 
 describe("runtime audit outbox", () => {
+	it("accepts only the exact enabled rollback fence alongside its append-only triggers", async () => {
+		if (!available) return;
+		const prefix = `rf_${randomUUID().slice(0, 8)}`;
+		const outbox = createRuntimeAuditOutbox(pool, {
+			projectId: "project_rollback_fence",
+			environmentId: "environment_rollback_fence",
+			schema,
+			prefix,
+		});
+		const table = `"${schema}".${prefix}_runtime_audit_events`;
+		await outbox.applyMigration();
+		const installRollbackFenceFunction = async () => {
+			await pool.query(`CREATE OR REPLACE FUNCTION "public"."clearance_import_rollback_guard_v1"()
+				RETURNS trigger
+				LANGUAGE plpgsql
+				AS $rollback_fence$
+				DECLARE
+					argument_index integer := 0;
+					fence_kind text;
+					reference_column text;
+					condition_column text;
+					condition_value text;
+					reference_id text;
+					row_data jsonb := to_jsonb(NEW);
+				BEGIN
+					WHILE argument_index < TG_NARGS LOOP
+						fence_kind := TG_ARGV[argument_index];
+						reference_column := TG_ARGV[argument_index + 1];
+						condition_column := TG_ARGV[argument_index + 2];
+						condition_value := TG_ARGV[argument_index + 3];
+						reference_id := row_data ->> reference_column;
+						IF reference_id IS NOT NULL AND (
+							condition_column = '' OR row_data ->> condition_column = condition_value
+						) THEN
+							PERFORM pg_advisory_xact_lock(hashtextextended(
+								'clearance-import-rollback:v1:' || fence_kind || ':' || reference_id,
+								0
+							));
+							IF EXISTS (
+								SELECT 1 FROM "public"."clearance_import_rollback_tombstones"
+								WHERE kind = fence_kind AND resource_id = reference_id
+							) THEN
+								RAISE EXCEPTION 'Clearance rollback-fenced resource cannot be referenced'
+									USING ERRCODE = '23503';
+							END IF;
+						END IF;
+						argument_index := argument_index + 4;
+					END LOOP;
+					RETURN NEW;
+				END
+				$rollback_fence$`);
+		};
+		await installRollbackFenceFunction();
+		await pool.query(`CREATE TRIGGER clearance_import_rollback_guard_v1
+			BEFORE INSERT OR UPDATE ON ${table}
+			FOR EACH ROW EXECUTE FUNCTION "public"."clearance_import_rollback_guard_v1"(
+				'organization', 'organization_id', '', ''
+			)`);
+		expect((await outbox.planMigration()).pendingSecurityMigrations).toEqual([]);
+
+		await pool.query(`ALTER TABLE ${table} DISABLE TRIGGER clearance_import_rollback_guard_v1`);
+		expect((await outbox.planMigration()).pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
+		await pool.query(`ALTER TABLE ${table} ENABLE TRIGGER clearance_import_rollback_guard_v1`);
+
+		await pool.query(`CREATE TRIGGER clearance_import_rollback_guard_duplicate
+			BEFORE INSERT OR UPDATE ON ${table}
+			FOR EACH ROW EXECUTE FUNCTION "public"."clearance_import_rollback_guard_v1"(
+				'organization', 'organization_id', '', ''
+			)`);
+		expect((await outbox.planMigration()).pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
+		await pool.query(`DROP TRIGGER clearance_import_rollback_guard_duplicate ON ${table}`);
+
+		await pool.query(`CREATE OR REPLACE FUNCTION "public"."clearance_import_rollback_guard_v1"()
+			RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`);
+		expect((await outbox.planMigration()).pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
+		await installRollbackFenceFunction();
+		expect((await outbox.planMigration()).pendingSecurityMigrations).toEqual([]);
+	});
+
 	it("commits only with its owner transaction and rejects alteration", async () => {
 		if (!available) return;
 		const outbox = createRuntimeAuditOutbox(pool, {
