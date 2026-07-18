@@ -9,6 +9,18 @@ export interface SCIMProvider {
 	userId?: string;
 }
 
+/**
+ * The stable identity of the SCIM provider that owns a stored token.
+ *
+ * Custom encrypted token storage receives this value for both encryption and
+ * decryption. Providers can use it as authenticated context, so a token for
+ * one organization cannot be opened as though it belonged to another.
+ */
+export type SCIMTokenStorageContext = Readonly<{
+	providerId: string;
+	organizationId?: string;
+}>;
+
 export type SCIMName = {
 	formatted?: string;
 	givenName?: string;
@@ -121,8 +133,14 @@ export type SCIMOptions = {
 				| "encrypted"
 				| { hash: (scimToken: string) => Promise<string> }
 				| {
-						encrypt: (scimToken: string) => Promise<string>;
-						decrypt: (scimToken: string) => Promise<string>;
+						encrypt: (
+							scimToken: string,
+							context: SCIMTokenStorageContext,
+						) => Promise<string>;
+						decrypt: (
+							scimToken: string,
+							context: SCIMTokenStorageContext,
+						) => Promise<string>;
 				  }
 		  )
 		| undefined;
