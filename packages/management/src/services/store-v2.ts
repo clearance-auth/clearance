@@ -19,7 +19,9 @@ export interface StoreV2CommandEnvelope {
 		| "schema.store-v2.events.cutover"
 		| "schema.store-v2.events.rollback"
 		| "schema.store-v2.principals.cutover"
-		| "schema.store-v2.principals.rollback";
+		| "schema.store-v2.principals.rollback"
+		| "schema.store-v2.topology.cutover"
+		| "schema.store-v2.topology.rollback";
 	storeBackend: "postgres";
 	dryRun: boolean;
 	status?: StoreV2Status;
@@ -63,7 +65,9 @@ function requireConfirmation(
 		| "schema.store-v2.events.cutover"
 		| "schema.store-v2.events.rollback"
 		| "schema.store-v2.principals.cutover"
-		| "schema.store-v2.principals.rollback",
+		| "schema.store-v2.principals.rollback"
+		| "schema.store-v2.topology.cutover"
+		| "schema.store-v2.topology.rollback",
 ): void {
 	if (confirm === true) return;
 	const applying = stage === "schema.store-v2.apply";
@@ -71,6 +75,8 @@ function requireConfirmation(
 	const rollingBackEvents = stage === "schema.store-v2.events.rollback";
 	const cuttingOverPrincipals = stage === "schema.store-v2.principals.cutover";
 	const rollingBackPrincipals = stage === "schema.store-v2.principals.rollback";
+	const cuttingOverTopology = stage === "schema.store-v2.topology.cutover";
+	const rollingBackTopology = stage === "schema.store-v2.topology.rollback";
 	throw new ClearanceError({
 		code: applying
 			? "STORE_V2_APPLY_CONFIRMATION_REQUIRED"
@@ -82,6 +88,10 @@ function requireConfirmation(
 						? "STORE_V2_PRINCIPALS_CUTOVER_CONFIRMATION_REQUIRED"
 						: rollingBackPrincipals
 							? "STORE_V2_PRINCIPALS_ROLLBACK_CONFIRMATION_REQUIRED"
+							: cuttingOverTopology
+								? "STORE_V2_TOPOLOGY_CUTOVER_CONFIRMATION_REQUIRED"
+								: rollingBackTopology
+									? "STORE_V2_TOPOLOGY_ROLLBACK_CONFIRMATION_REQUIRED"
 					: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED",
 		message: applying
 			? "Store-v2 apply requires explicit confirmation."
@@ -93,6 +103,10 @@ function requireConfirmation(
 						? "Store-v2 principal cutover requires explicit confirmation."
 						: rollingBackPrincipals
 							? "Store-v2 principal rollback requires explicit confirmation."
+							: cuttingOverTopology
+								? "Store-v2 topology cutover requires explicit confirmation."
+								: rollingBackTopology
+									? "Store-v2 topology rollback requires explicit confirmation."
 					: "Store-v2 rollback requires explicit confirmation.",
 		stage,
 		status: 400,
@@ -106,6 +120,10 @@ function requireConfirmation(
 						? "Run schema store-v2 verify, then retry schema store-v2 principals cutover with --yes."
 						: rollingBackPrincipals
 							? "Review schema store-v2 status, then retry schema store-v2 principals rollback with --yes."
+							: cuttingOverTopology
+								? "Run schema store-v2 verify, then retry schema store-v2 topology cutover with --yes."
+								: rollingBackTopology
+									? "Review schema store-v2 status, then retry schema store-v2 topology rollback with --yes."
 					: "Review schema store-v2 status, then retry rollback with --yes.",
 	});
 }
@@ -299,6 +317,40 @@ export async function rollbackStoreV2Principals(
 		return envelope(operation, {
 			dryRun: false,
 			status: await control.rollbackPrincipals(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function cutoverStoreV2Topology(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.topology.cutover" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.cutoverTopology(),
+		});
+	} catch (error) {
+		return translateStoreError(error, operation);
+	}
+}
+
+export async function rollbackStoreV2Topology(
+	store: ManagementStore,
+	opts: { confirm?: boolean },
+): Promise<StoreV2CommandEnvelope> {
+	const operation = "schema.store-v2.topology.rollback" as const;
+	try {
+		const control = requireStoreV2(store, operation);
+		requireConfirmation(opts.confirm, operation);
+		return envelope(operation, {
+			dryRun: false,
+			status: await control.rollbackTopology(),
 		});
 	} catch (error) {
 		return translateStoreError(error, operation);
