@@ -33,6 +33,7 @@
   },
   "dependencies": {
     "@clearance/delivery": "workspace:*",
+    "@clearance/key-management": "workspace:*",
     "kysely": "catalog:",
     "pg": "^8.14.1"
   },
