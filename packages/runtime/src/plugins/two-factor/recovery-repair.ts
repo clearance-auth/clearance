@@ -5,6 +5,7 @@ import {
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { APIError } from "@clearance/core/error";
 import * as z from "zod";
 import {
@@ -13,6 +14,13 @@ import {
 	preloadRecoveryFactorRepairCapability,
 	startRecoveryFactorRepair,
 } from "../../internal/recovery-factor-repair-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../internal/runtime-audit";
 import {
 	STAGED_AUTHENTICATION_COOKIE,
 	consumePreloadedStagedAuthenticationCapability,
@@ -29,6 +37,22 @@ const recoveryRepairBodySchema = z
 		recoveryCode: z.string().min(1).max(256),
 	})
 	.strict();
+
+async function appendRuntimeAuditIfBound(
+	ctx: GenericEndpointContext,
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
+}
 
 function recoveryRepairInvalid(): never {
 	throw APIError.from(
@@ -167,13 +191,36 @@ export const createRecoveryFactorRepairEndpoint = (
 						ctx.body.recoveryCode,
 					);
 					if (proof.kind === "invalid") return proof;
+					const result = await startRecoveryFactorRepair(ctx, {
+						stagedRecoveryBridge: bridge,
+						recoveryProofAuthority: proof.authority,
+						repairFactor: ctx.body.repairFactor,
+					});
+					await appendRuntimeAuditIfBound(ctx, adapter, {
+						actor: subjectId,
+						action: "auth.recovery.code_used",
+						subjectType: "user",
+						subjectId,
+						outcome: "success",
+						source: "system",
+						organizationId: null,
+						message: "Recovery code used",
+						metadata: { purpose: "factor_repair" },
+					});
+					await appendRuntimeAuditIfBound(ctx, adapter, {
+						actor: subjectId,
+						action: "auth.recovery.proof_used",
+						subjectType: "user",
+						subjectId,
+						outcome: "success",
+						source: "system",
+						organizationId: null,
+						message: "Recovery proof used",
+						metadata: { repairFactor: ctx.body.repairFactor },
+					});
 					return {
 						kind: "authorized" as const,
-						result: await startRecoveryFactorRepair(ctx, {
-							stagedRecoveryBridge: bridge,
-							recoveryProofAuthority: proof.authority,
-							repairFactor: ctx.body.repairFactor,
-						}),
+						result,
 					};
 				});
 				if (result.kind === "invalid") {
