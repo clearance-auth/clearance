@@ -4,11 +4,10 @@ import {
 	ORGANIZATION_OPERATIONS,
 	executeMemberImportPlan,
 	inspectMembership,
-	inspectOrganization,
+	inspectOrganizationAuthoritative,
 	inspectUserAuthoritative,
 	listMembers,
-	listOrganizations,
-	listOrganizationsPage,
+	listOrganizationsPageAuthoritative,
 	planMemberImportAuthoritative,
 	type MemberImportFormat,
 } from "@clearance/management";
@@ -28,30 +27,22 @@ export function registerOrganizationRoutes({
 }: OrganizationRouteDependencies) {
 	const routes = new Hono();
 
-	/**
-	 * List organizations. Legacy unpaginated without params; keyset-paginated
-	 * (createdAt+id asc) with ?limit=/?cursor=, returning nextCursor.
-	 */
 	routes.get(ORGANIZATION_OPERATIONS.list.http.path, async (c) => {
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const limitRaw = c.req.query("limit");
 			const cursor = c.req.query("cursor");
-			if (limitRaw !== undefined || cursor !== undefined) {
-				const page = listOrganizationsPage(store, {
-					scope,
-					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
-					...(cursor !== undefined ? { cursor } : {}),
-				});
-				return c.json({
-					organizations: page.organizations,
-					nextCursor: page.nextCursor,
-					scope,
-				});
-			}
+			const page = await listOrganizationsPageAuthoritative(store, {
+				scope,
+				...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
+				...(cursor !== undefined ? { cursor } : {}),
+			});
+			const includeNextCursor =
+				limitRaw !== undefined || cursor !== undefined || page.nextCursor !== null;
 			return c.json({
-				organizations: listOrganizations(store, { scope }),
+				organizations: page.organizations,
+				...(includeNextCursor ? { nextCursor: page.nextCursor } : {}),
 				scope,
 			});
 		} catch (e) {
@@ -63,7 +54,11 @@ export function registerOrganizationRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const organization = inspectOrganization(store, c.req.param("id"), scope);
+			const organization = await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
 			return c.json({ organization, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -139,7 +134,11 @@ export function registerOrganizationRoutes({
 				});
 			}
 			if (body.dryRun === true) {
-				inspectOrganization(store, c.req.param("id"), scope);
+				await inspectOrganizationAuthoritative(
+					store,
+					c.req.param("id"),
+					scope,
+				);
 				return c.json({ dryRun: true, id: c.req.param("id"), name, slug, scope });
 			}
 			const organization = await applicationFor(store).organizations.update(
@@ -237,7 +236,11 @@ export function registerOrganizationRoutes({
 			const principalId = body.principalId.trim();
 			const role = body.role !== undefined ? body.role : "member";
 			if (body.dryRun === true) {
-				inspectOrganization(store, c.req.param("id"), scope);
+				await inspectOrganizationAuthoritative(
+					store,
+					c.req.param("id"),
+					scope,
+				);
 				await inspectUserAuthoritative(store, principalId, scope);
 				return c.json({ dryRun: true, organizationId: c.req.param("id"), principalId, role, scope });
 			}
@@ -313,7 +316,7 @@ export function registerOrganizationRoutes({
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
 			// Ensure org is in scope (cross-scope ids indistinguishable from missing)
-			inspectOrganization(store, orgId, scope);
+			await inspectOrganizationAuthoritative(store, orgId, scope);
 			const existing = inspectMembership(store, memberId, scope);
 			if (existing.organizationId !== orgId) {
 				// Treat as missing — do not leak cross-org membership existence
@@ -353,7 +356,7 @@ export function registerOrganizationRoutes({
 			const scope = scopeForRequest(store, c);
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
-			inspectOrganization(store, orgId, scope);
+			await inspectOrganizationAuthoritative(store, orgId, scope);
 			const existing = inspectMembership(store, memberId, scope);
 			if (existing.organizationId !== orgId) {
 				throw new ClearanceError({
