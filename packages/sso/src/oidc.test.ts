@@ -7,8 +7,37 @@ import { OAuth2Server } from "oauth2-mock-server";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sso } from ".";
 import { ssoClient } from "./client";
+import {
+	decryptOIDCConfig,
+	encryptOIDCConfig,
+} from "./oidc-secret-storage";
+import type { OIDCConfig } from "./types";
 
 const server = new OAuth2Server();
+
+describe("OIDC client secret storage", () => {
+	it("passes the stable providerId to encryption and decryption", async () => {
+		const encrypt = vi.fn(async (secret: string) => `encrypted:${secret}`);
+		const decrypt = vi.fn(async (ciphertext: string) =>
+			ciphertext.replace(/^encrypted:/, ""),
+		);
+		const options = { storeOIDCClientSecret: { encrypt, decrypt } };
+		const config: OIDCConfig = {
+			issuer: "https://issuer.example.com",
+			pkce: true,
+			clientId: "client",
+			clientSecret: "secret",
+			discoveryEndpoint:
+				"https://issuer.example.com/.well-known/openid-configuration",
+		};
+
+		const encrypted = await encryptOIDCConfig(config, "provider-stable", options);
+		await decryptOIDCConfig(encrypted, "provider-stable", options);
+
+		expect(encrypt).toHaveBeenCalledWith("secret", "provider-stable");
+		expect(decrypt).toHaveBeenCalledWith("encrypted:secret", "provider-stable");
+	});
+});
 
 describe("SSO", async () => {
 	const { auth, signInWithTestUser, customFetchImpl, cookieSetter } =
