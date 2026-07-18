@@ -323,10 +323,37 @@ export function registerEnterpriseRoutes({
 			}
 			await inspectOrganizationAuthoritative(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			const scenario = body.scenario ?? "users";
+			if (scenario !== "users" && scenario !== "group-lifecycle") {
+				return c.json(
+					{
+						error: {
+							code: "SCIM_SCENARIO_INVALID",
+							message: "SCIM scenario must be users or group-lifecycle",
+							stage: "scim.test",
+						},
+					},
+					400,
+				);
+			}
+			if (scenario === "group-lifecycle" && body.live === true) {
+				return c.json({ error: { code: "SCIM_SCENARIO_LIVE_CONFLICT", message: "group-lifecycle runs only against the bundled runtime", stage: "scim.test" } }, 400);
+			}
+			if (scenario === "group-lifecycle" && !runtimeDatabaseConfigured()) {
+				return c.json({ error: { code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED", message: "group-lifecycle requires the bundled PostgreSQL runtime", stage: "sync.apply" } }, 409);
+			}
+			const users = body.users;
+			if (scenario === "group-lifecycle" && users !== undefined) {
+				return c.json({ error: { code: "SCIM_SCENARIO_USERS_FORBIDDEN", message: "group-lifecycle owns its SCIM users", stage: "scim.test" } }, 400);
+			}
+			if (scenario === "users" && users !== undefined && (!Array.isArray(users) || users.some((user) => !user || typeof user !== "object" || typeof user.userName !== "string" || (user.displayName !== undefined && typeof user.displayName !== "string") || (user.active !== undefined && typeof user.active !== "boolean")))) {
+				return c.json({ error: { code: "SCIM_USERS_INVALID", message: "SCIM users must contain userName with optional displayName and active", stage: "scim.test" } }, 400);
+			}
 			const testInput = {
 				dryRun: body.dryRun === true,
 				fixture: body.fixture,
-				users: body.users,
+				scenario,
+				...(scenario === "users" ? { users } : {}),
 				actor: requestActor(c),
 				source: "api" as const,
 				scope,
