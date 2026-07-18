@@ -391,11 +391,97 @@ export type ClearanceAuthenticationPolicyOverride = Readonly<{
 	assuranceMaxAgeSeconds?: number | null;
 }>;
 
-export type ClearanceAuthenticationPolicyTransaction = Readonly<{
+/**
+ * A caller-owned PostgreSQL transaction. Management facades use this narrow
+ * structural shape so they can share an already-open transaction without
+ * exposing a pool client or connection details.
+ */
+export type ClearanceTransactionQuery = Readonly<{
 	rawTransactionQuery<Row extends Record<string, unknown> = Record<string, unknown>>(
 		text: string,
 		values?: readonly unknown[],
 	): Promise<{ rows: Row[]; rowCount: number | null }>;
+}>;
+
+export type ClearanceAuthenticationPolicyTransaction = ClearanceTransactionQuery;
+
+export type ClearanceKeyManagementMigrationCounts = Readonly<{
+	oidcClientSecrets: number;
+	scimTokens: number;
+	jwks: number;
+	total: number;
+}>;
+
+export type ClearanceKeyManagementStatus = Readonly<{
+	schemaVersion: "v1";
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	ready: boolean;
+	encryption: Readonly<{
+		ready: boolean;
+		purposes: Readonly<Record<KeyPurpose, KeyProviderReadiness>>;
+	}>;
+	signing: Readonly<{
+		ready: boolean;
+		readiness: KeyProviderReadiness;
+		algorithm: "ES256";
+		currentIdentity: string;
+		retainedIdentities: readonly string[];
+		gracePeriodSeconds: number;
+	}>;
+	schema: Readonly<{ setup: "ready" | "pending" }>;
+	migration: Readonly<{
+		complete: boolean;
+		pending: ClearanceKeyManagementMigrationCounts;
+		migrated: ClearanceKeyManagementMigrationCounts;
+	}>;
+}>;
+
+export type ClearanceKeyManagementMigrationPlan = Readonly<{
+	schemaVersion: "v1";
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	phase: "setup" | "batch" | "complete";
+	maxBatchSize: Readonly<{ perDomain: 5; total: 15 }>;
+	pending: ClearanceKeyManagementMigrationCounts;
+	nextBatch: ClearanceKeyManagementMigrationCounts;
+	planId: string;
+}>;
+
+export type ClearanceKeyManagementMigrationResult = Readonly<{
+	applied: ClearanceKeyManagementMigrationCounts;
+	changed: number;
+	previousPlanId: string;
+	nextPlanId: string;
+	remainingPlan: ClearanceKeyManagementMigrationPlan;
+	status: ClearanceKeyManagementStatus;
+	complete: boolean;
+}>;
+
+export type ClearanceKeyManagementFacade = Readonly<{
+	readonly scope: Readonly<{ projectId: string; environmentId: string }>;
+	resourceId(
+		purpose: KeyPurpose,
+		identity: Readonly<Record<string, string | null>>,
+	): string;
+	sealText(
+		purpose: KeyPurpose,
+		resourceId: string,
+		plaintext: string,
+	): Promise<string>;
+	openText(
+		purpose: KeyPurpose,
+		resourceId: string,
+		envelope: string,
+	): Promise<string>;
+	readiness(): Promise<Readonly<{
+		ready: boolean;
+		purposes: Readonly<Record<KeyPurpose, KeyProviderReadiness>>;
+	}>>;
+	status(): Promise<ClearanceKeyManagementStatus>;
+	planMigration(): Promise<ClearanceKeyManagementMigrationPlan>;
+	applyMigration(input: {
+		expectedPlanId: string;
+		transaction: ClearanceTransactionQuery;
+	}): Promise<ClearanceKeyManagementMigrationResult>;
 }>;
 
 export type ClearanceAuthenticationPolicyGetResult = Readonly<{
@@ -756,27 +842,7 @@ export type ClearanceAuthBundle<
 	};
 	/** Present only when createClearanceAuth received authenticationPolicy scope. */
 	authenticationPolicy?: ClearanceAuthenticationPolicyFacade;
-	keyManagement: {
-		readonly scope: Readonly<{ projectId: string; environmentId: string }>;
-		resourceId(
-			purpose: KeyPurpose,
-			identity: Readonly<Record<string, string | null>>,
-		): string;
-		sealText(
-			purpose: KeyPurpose,
-			resourceId: string,
-			plaintext: string,
-		): Promise<string>;
-		openText(
-			purpose: KeyPurpose,
-			resourceId: string,
-			envelope: string,
-		): Promise<string>;
-		readiness(): Promise<Readonly<{
-			ready: boolean;
-			purposes: Readonly<Record<KeyPurpose, KeyProviderReadiness>>;
-		}>>;
-	};
+	keyManagement: ClearanceKeyManagementFacade;
 	prepareCredentialAuthorityRuntime(): Promise<void>;
 	planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
 	migrate(input?: { drainId?: string }): Promise<ClearanceRuntimeMigrationResult>;
