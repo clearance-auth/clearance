@@ -549,6 +549,7 @@ async function main() {
 		.argument("<id>")
 		.option("--apply", "Apply instead of dry-run", false)
 		.option("--fixture <name>", "ok|malformed|unauthorized")
+		.option("--scenario <name>", "users|group-lifecycle", "users")
 		.option(
 			"--live",
 			"Probe the REAL configured SCIM endpoint (read-only GETs). Requires --yes, HTTPS, non-loopback.",
