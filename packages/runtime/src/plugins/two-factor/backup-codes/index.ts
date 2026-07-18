@@ -32,7 +32,7 @@ import {
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditDraft,
-} from "../../../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import {
