@@ -178,8 +178,31 @@ export interface StoreV2PrincipalRepository extends StoreV2PrincipalReader {
 export interface StoreV2TopologyReader {
 	readonly authoritative: boolean;
 	getProjectById(id: string): Promise<Project | null>;
+	findProjectConflict(input: {
+		name: string;
+		slug: string;
+		excludeId?: string;
+	}): Promise<Project | null>;
 	getEnvironment(input: { projectId: string; id: string }): Promise<Environment | null>;
+	/**
+	 * Indexed, project-scoped exact lookup for user-facing environment selectors.
+	 * This deliberately preserves the legacy id/name/slug selector contract
+	 * without materializing a project environment list after topology cutover.
+	 */
+	findEnvironmentByKey(input: {
+		projectId: string;
+		key: string;
+	}): Promise<Environment | null>;
 	getOrganization(input: { scope: ResourceScope; id: string }): Promise<Organization | null>;
+	organizationIdExists(id: string): Promise<boolean>;
+	getOrganizationBySlug(input: {
+		scope: ResourceScope;
+		slug: string;
+	}): Promise<Organization | null>;
+	getOrganizationByExternalId(input: {
+		scope: ResourceScope;
+		externalId: string;
+	}): Promise<Organization | null>;
 	countOrganizations(input: {
 		scope: ResourceScope;
 		includeArchived?: boolean;
@@ -200,6 +223,23 @@ export interface StoreV2TopologyReader {
 
 /** Physical topology deletion is intentionally not a public capability. */
 export interface StoreV2TopologyRepository extends StoreV2TopologyReader {
+	/**
+	 * Transaction-only topology lock order: project, then environment, then
+	 * organization before dependent snapshot, runtime, or authorization writes.
+	 */
+	lockProject(input: { id: string }): Promise<Project | null>;
+	lockEnvironment(input: {
+		projectId: string;
+		id: string;
+	}): Promise<Environment | null>;
+	/**
+	 * Transaction-only organization lock. Acquire project and environment locks
+	 * first, then this row before dependent writes.
+	 */
+	lockOrganization(input: {
+		scope: ResourceScope;
+		id: string;
+	}): Promise<Organization | null>;
 	upsertProject(project: Project): Promise<Project>;
 	upsertEnvironment(environment: Environment): Promise<Environment>;
 	upsertOrganization(organization: Organization): Promise<Organization>;
@@ -209,6 +249,8 @@ export interface StoreV2TopologyRepository extends StoreV2TopologyReader {
 export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
+	/** Exact server-owned normalized organization table identity, when configured. */
+	readonly storeV2OrganizationAuthority?: Readonly<{ schema: string; table: string }>;
 	readonly storeV2Topology?: StoreV2TopologyReader;
 }
 
