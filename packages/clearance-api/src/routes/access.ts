@@ -3,15 +3,18 @@ import {
 	ClearanceError,
 	ROLE_OPERATIONS,
 	SESSION_OPERATIONS,
+	createRoleInAuth,
 	createApiKey,
 	createRole,
 	inspectApiKey,
 	listApiKeys,
+	listRolesFromAuth,
 	listRoles,
 	normalizeAndValidateApiKeyScopes,
 	publicConfig,
 	revokeApiKey,
 	rotateApiKey,
+	updateRoleInAuth,
 	updateRole,
 	validateApiKeyName,
 	validateRole,
@@ -187,7 +190,9 @@ export function registerAccessRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const roles = listRoles(store, { scope });
+			const roles = store.backend === "postgres"
+				? await listRolesFromAuth(store, { scope })
+				: listRoles(store, { scope });
 			return c.json({ roles, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -219,15 +224,18 @@ export function registerAccessRoutes({
 			if (body.dryRun === true) {
 				return c.json({ dryRun: true, validation: validateRole(store, { name: body.name, slug: body.slug, permissions: body.permissions, scope }), scope });
 			}
-			const role = await createRole(store, {
+			const input = {
 				name: body.name,
 				slug: body.slug,
 				description: body.description,
 				permissions: body.permissions,
 				scope,
 				actor: requestActor(c),
-				source: "api",
-			});
+				source: "api" as const,
+			};
+			const role = store.backend === "postgres"
+				? await createRoleInAuth(store, input)
+				: await createRole(store, input);
 			await store.ready();
 			return c.json({ role, scope }, 201);
 		} catch (e) {
@@ -243,14 +251,17 @@ export function registerAccessRoutes({
 			if (body.dryRun === true) {
 				return c.json({ dryRun: true, id: c.req.param("id"), validation: validateRole(store, { name: body.name, permissions: body.permissions, scope }), scope });
 			}
-			const role = await updateRole(store, c.req.param("id"), {
+			const input = {
 				name: body.name,
 				description: body.description,
 				permissions: body.permissions,
 				scope,
 				actor: requestActor(c),
-				source: "api",
-			});
+				source: "api" as const,
+			};
+			const role = store.backend === "postgres"
+				? await updateRoleInAuth(store, c.req.param("id"), input)
+				: await updateRole(store, c.req.param("id"), input);
 			await store.ready();
 			return c.json({ role, scope });
 		} catch (e) {
