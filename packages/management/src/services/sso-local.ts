@@ -15,6 +15,8 @@ import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
 import { recordEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
+import { resolveOperatorScopeAuthoritative, type ResourceScope } from "./scope.js";
+import { resolveEnterpriseConnectionAuthoritative } from "./enterprise-connection-lifecycle.js";
 
 export const SSO_LOCAL_PROTOCOL_MODE = "simulation" as const;
 export const SSO_LOCAL_EVIDENCE_LABEL =
@@ -296,6 +298,7 @@ export async function verifySsoOidcLocalProtocol(
 		clientId?: string;
 		redirectUri?: string;
 		fetchImpl?: typeof fetch;
+		scope?: ResourceScope;
 	} = {},
 ): Promise<{
 	pass: boolean;
@@ -306,17 +309,14 @@ export async function verifySsoOidcLocalProtocol(
 	authorizationUrl: string;
 	certifiedExternalTenant: false;
 }> {
-	const conn = store.snapshot.identityConnections.find(
-		(c) => c.id === connectionId,
-	);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SSO_NOT_FOUND",
-			message: `SSO connection ${connectionId} not found`,
-			stage: "sso.local-protocol",
-			status: 404,
-		});
-	}
+	const conn = await resolveEnterpriseConnectionAuthoritative(store, connectionId, {
+		connections: store.snapshot.identityConnections,
+		scope: opts.scope,
+		stage: "sso.local-protocol",
+		label: "SSO",
+		idRequiredCode: "SSO_ID_REQUIRED",
+		notFoundCode: "SSO_NOT_FOUND",
+	});
 
 	const corr = `corr_sso_local_${newId("t").slice(4)}`;
 	const base = {
@@ -503,6 +503,25 @@ export async function verifySsoOidcLocalProtocol(
 				certifiedExternalTenant: false,
 			},
 		};
+
+		if (store.storeV2Topology?.authoritative) {
+			if (!store.mutateCoordinated) {
+				throw new ClearanceError({ code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED", message: "Relational topology authority requires a coordinated transaction", stage: "sso.local-protocol", status: 500 });
+			}
+			const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
+			const connection = await store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+				const index = data.identityConnections.findIndex((candidate) => candidate.id === connectionId);
+				const current = index >= 0 ? data.identityConnections[index] : undefined;
+				const organization = current && topology ? await topology.lockOrganization({ scope, id: current.organizationId }) : null;
+				if (!current || !organization || organization.status === "archived") throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${connectionId} not found`, stage: "sso.local-protocol", status: 404 });
+				data.traces.unshift(trace);
+				const updated = { ...current, status: "testing" as const, updatedAt: nowIso() };
+				data.identityConnections[index] = updated;
+				appendAudit({ actor: "system", action: "sso.local-protocol", subjectType: "identity_connection", subjectId: connectionId, outcome: "success", source: "sso", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, correlationId: corr, message: SSO_LOCAL_EVIDENCE_LABEL, metadata: { mode: SSO_LOCAL_PROTOCOL_MODE, evidence: SSO_LOCAL_EVIDENCE_LABEL, certifiedExternalTenant: false } });
+				return updated;
+			});
+			return { pass: true, trace, connection, mode: SSO_LOCAL_PROTOCOL_MODE, evidence: SSO_LOCAL_EVIDENCE_LABEL, authorizationUrl, certifiedExternalTenant: false };
+		}
 
 		store.mutate((data) => {
 			data.traces.unshift(trace);
