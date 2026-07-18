@@ -16,6 +16,14 @@ export const schema = {
 				type: "string",
 				required: false,
 			},
+			organizationId: {
+				type: "string",
+				required: false,
+			},
+			sessionDerivativeAuthority: {
+				type: "string",
+				required: false,
+			},
 			expiresAt: {
 				type: "date",
 				required: true,
@@ -49,6 +57,8 @@ const deviceCode = z.object({
 	deviceCode: z.string(),
 	userCode: z.string(),
 	userId: z.string().optional(),
+	organizationId: z.string().nullish(),
+	sessionDerivativeAuthority: z.string().nullish(),
 	expiresAt: z.date(),
 	status: z.string(),
 	lastPolledAt: z.date().optional(),
