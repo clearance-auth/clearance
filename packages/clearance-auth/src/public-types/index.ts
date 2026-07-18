@@ -333,6 +333,152 @@ export type ClearanceRuntimeMigrationResult = {
 	appliedFields: number;
 };
 
+export type ClearanceAuthenticationAssuranceLevel =
+	| "single_factor"
+	| "multi_factor"
+	| "phishing_resistant";
+
+export type ClearanceAuthenticationPolicy = Readonly<{
+	passwordLockout: Readonly<{
+		enabled: boolean;
+		maxFailedAttempts: number;
+		durationSeconds: number;
+	}>;
+	factorLockout: Readonly<{
+		enabled: boolean;
+		maxFailedAttempts: number;
+		durationSeconds: number;
+	}>;
+	minimumAssurance: ClearanceAuthenticationAssuranceLevel;
+	allowedFactors: Readonly<{ totp: boolean; passkey: boolean }>;
+	trustedDevice: Readonly<{ enabled: boolean; maxAgeSeconds: number }>;
+	assuranceMaxAgeSeconds: number | null;
+}>;
+
+export type ClearanceAuthenticationPolicyOverride = Readonly<{
+	passwordLockout?: Readonly<{
+		enabled?: boolean;
+		maxFailedAttempts?: number;
+		durationSeconds?: number;
+	}>;
+	factorLockout?: Readonly<{
+		enabled?: boolean;
+		maxFailedAttempts?: number;
+		durationSeconds?: number;
+	}>;
+	minimumAssurance?: ClearanceAuthenticationAssuranceLevel;
+	allowedFactors?: Readonly<{ totp?: boolean; passkey?: boolean }>;
+	trustedDevice?: Readonly<{ enabled?: boolean; maxAgeSeconds?: number }>;
+	assuranceMaxAgeSeconds?: number | null;
+}>;
+
+export type ClearanceAuthenticationPolicyTransaction = Readonly<{
+	rawTransactionQuery<Row extends Record<string, unknown> = Record<string, unknown>>(
+		text: string,
+		values?: readonly unknown[],
+	): Promise<{ rows: Row[]; rowCount: number | null }>;
+}>;
+
+export type ClearanceAuthenticationPolicyGetResult = Readonly<{
+	schemaVersion: "v1";
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	revision: string;
+	environment: ClearanceAuthenticationPolicy;
+	organizationOverride: Readonly<{
+		organizationId: string;
+		revision: string;
+		policy: ClearanceAuthenticationPolicyOverride;
+	}> | null;
+	effective: ClearanceAuthenticationPolicy;
+}>;
+
+export type ClearanceAuthenticationPolicyPlanResult = Readonly<{
+	schemaVersion: "v1";
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	target:
+		| Readonly<{ kind: "environment" }>
+		| Readonly<{ kind: "organization"; organizationId: string }>;
+	expectedRevision: string;
+	candidateRevision: string;
+	wouldChange: boolean;
+	current: Readonly<{
+		revision: string;
+		policy: ClearanceAuthenticationPolicy | ClearanceAuthenticationPolicyOverride | null;
+		effective: ClearanceAuthenticationPolicy;
+	}>;
+	candidate: Readonly<{
+		revision: string;
+		policy: ClearanceAuthenticationPolicy | ClearanceAuthenticationPolicyOverride | null;
+		effective: ClearanceAuthenticationPolicy;
+	}>;
+}>;
+
+export type ClearanceAuthenticationPolicyApplyResult =
+	ClearanceAuthenticationPolicyPlanResult &
+		Readonly<{
+			changed: boolean;
+			previousRevision: string;
+			revision: string;
+		}>;
+
+export type ClearanceAuthenticationUnlockKind = "password" | "factor" | "all";
+
+export type ClearanceAuthenticationUnlockAuthorityCounts = Readonly<{
+	matchedRows: number;
+	failedAttemptRows: number;
+	reservationRows: number;
+	lockedRows: number;
+	wouldChangeRows: number;
+}>;
+
+export type ClearanceAuthenticationUnlockPreview = Readonly<{
+	schemaVersion: "v1";
+	userId: string;
+	kind: ClearanceAuthenticationUnlockKind;
+	password: ClearanceAuthenticationUnlockAuthorityCounts;
+	factor: ClearanceAuthenticationUnlockAuthorityCounts;
+	wouldChange: boolean;
+}>;
+
+export type ClearanceAuthenticationUnlockResult =
+	ClearanceAuthenticationUnlockPreview & Readonly<{ changed: boolean }>;
+
+export type ClearanceAuthenticationPolicyFacade = Readonly<{
+	/** Immutable authority scope for fail-fast management scope comparison. */
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	get(input?: {
+		organizationId?: string;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationPolicyGetResult>;
+	plan(input: ClearanceAuthenticationPolicyCandidateInput & {
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationPolicyPlanResult>;
+	apply(input: ClearanceAuthenticationPolicyCandidateInput & {
+		expectedRevision: string;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationPolicyApplyResult>;
+	planUnlock(input: {
+		userId: string;
+		kind: ClearanceAuthenticationUnlockKind;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationUnlockPreview>;
+	unlock(input: {
+		userId: string;
+		kind: ClearanceAuthenticationUnlockKind;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationUnlockResult>;
+}>;
+
+export type ClearanceAuthenticationPolicyCandidateInput =
+	| Readonly<{
+			organizationId?: never;
+			policy: ClearanceAuthenticationPolicy;
+	  }>
+	| Readonly<{
+			organizationId: string;
+			policy: ClearanceAuthenticationPolicyOverride | null;
+	  }>;
+
 export interface ClearanceAuthRuntime {
 	handler(request: Request): Promise<Response>;
 	readonly api: Readonly<Record<string, (...args: any[]) => Promise<any>>>;
@@ -589,6 +735,8 @@ export type ClearanceAuthBundle<
 			expiresAt: Date;
 		}): Promise<void>;
 	};
+	/** Present only when createClearanceAuth received authenticationPolicy scope. */
+	authenticationPolicy?: ClearanceAuthenticationPolicyFacade;
 	prepareCredentialAuthorityRuntime(): Promise<void>;
 	planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
 	migrate(input?: { drainId?: string }): Promise<ClearanceRuntimeMigrationResult>;
