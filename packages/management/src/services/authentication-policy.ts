@@ -7,6 +7,7 @@ import type {
 	ManagementStore,
 } from "../store/types.js";
 import { appendAuditEvent } from "./audit.js";
+import { inspectOrganizationAuthoritative } from "./core.js";
 import { ClearanceError } from "./errors.js";
 import { assertResourceInScope } from "./scope.js";
 
@@ -171,33 +172,123 @@ async function facade(
 	return candidate;
 }
 
-function assertOrganizationTarget(
-	store: Pick<ManagementStore, "snapshot">,
+async function assertOrganizationTarget(
+	store: ManagementStore,
 	context: OperationContext,
 	organizationId: string | undefined,
 	stage: string,
-): void {
+): Promise<void> {
 	if (organizationId === undefined) return;
+	try {
+		await inspectOrganizationAuthoritative(store, organizationId, context.scope);
+	} catch (error) {
+		if (error instanceof ClearanceError && error.code === "ORG_NOT_FOUND") {
+			throw policyError(
+				"AUTHENTICATION_POLICY_ORGANIZATION_NOT_FOUND",
+				"Authentication policy target not found.",
+				stage,
+				404,
+			);
+		}
+		throw error;
+	}
+}
+
+async function assertOrganizationTargetInCoordinatedContext(
+	context: InternalManagementCoordinatedMutationContext,
+	operation: OperationContext,
+	organizationId: string | undefined,
+	stage: string,
+): Promise<void> {
+	if (organizationId === undefined) return;
+	if (!context.topology) {
+		assertResourceInScope(
+			context.data.organizations.find(
+				(organization) => organization.id === organizationId,
+			),
+			operation.scope,
+			{
+				code: "AUTHENTICATION_POLICY_ORGANIZATION_NOT_FOUND",
+				stage,
+				label: "Organization",
+			},
+		);
+		return;
+	}
+	const organization = await context.topology.lockOrganization({
+		scope: operation.scope,
+		id: organizationId,
+	});
+	if (!organization || organization.status === "archived") {
+		throw policyError(
+			"AUTHENTICATION_POLICY_ORGANIZATION_NOT_FOUND",
+			"Authentication policy target not found.",
+			stage,
+			404,
+		);
+	}
+}
+
+async function assertUserTarget(
+	store: Pick<ManagementStore, "snapshot" | "storeV2Principals">,
+	context: OperationContext,
+	userId: string,
+	stage: string,
+): Promise<void> {
+	if (store.storeV2Principals?.authoritative) {
+		const principal = await store.storeV2Principals.getById({
+			scope: context.scope,
+			id: userId,
+		});
+		if (!principal) {
+			throw policyError(
+				"AUTHENTICATION_POLICY_USER_NOT_FOUND",
+				"Authentication policy target not found.",
+				stage,
+				404,
+			);
+		}
+		return;
+	}
 	assertResourceInScope(
-		store.snapshot.organizations.find((organization) => organization.id === organizationId),
+		store.snapshot.principals.find(
+			(principal) => principal.id === userId && principal.status !== "deleted",
+		),
 		context.scope,
 		{
-			code: "AUTHENTICATION_POLICY_ORGANIZATION_NOT_FOUND",
+			code: "AUTHENTICATION_POLICY_USER_NOT_FOUND",
 			stage,
-			label: "Organization",
+			label: "User",
 		},
 	);
 }
 
-function assertUserTarget(
-	store: Pick<ManagementStore, "snapshot">,
-	context: OperationContext,
+async function assertUserTargetInCoordinatedContext(
+	context: InternalManagementCoordinatedMutationContext,
+	operation: OperationContext,
 	userId: string,
 	stage: string,
-): void {
+): Promise<void> {
+	if (context.principals?.authoritative) {
+		const principal = await context.principals.getById({
+			scope: operation.scope,
+			id: userId,
+		});
+		if (!principal) {
+			throw policyError(
+				"AUTHENTICATION_POLICY_USER_NOT_FOUND",
+				"Authentication policy target not found.",
+				stage,
+				404,
+			);
+		}
+		return;
+	}
 	assertResourceInScope(
-		store.snapshot.principals.find((principal) => principal.id === userId),
-		context.scope,
+		context.data.principals.find(
+			(principal) => principal.id === userId && principal.status !== "deleted",
+		),
+		operation.scope,
 		{
 			code: "AUTHENTICATION_POLICY_USER_NOT_FOUND",
 			stage,
@@ -264,7 +355,7 @@ export async function getAuthenticationPolicyForManagement(
 ): Promise<AuthenticationPolicyGetResult> {
 	const stage = "authentication_policy.get";
 	try {
-		assertOrganizationTarget(store, context, input.organizationId, stage);
+		await assertOrganizationTarget(store, context, input.organizationId, stage);
 		const authority = await facade(store, context, stage);
 		return await authority.get(input);
 	} catch (error) {
@@ -279,7 +370,7 @@ export async function planAuthenticationPolicyForManagement(
 ): Promise<AuthenticationPolicyPlanResult> {
 	const stage = "authentication_policy.plan";
 	try {
-		assertOrganizationTarget(store, context, input.organizationId, stage);
+		await assertOrganizationTarget(store, context, input.organizationId, stage);
 		const authority = await facade(store, context, stage);
 		return await authority.plan(policyPlanInput(input));
 	} catch (error) {
@@ -294,7 +385,7 @@ export async function applyAuthenticationPolicyForManagement(
 ): Promise<AuthenticationPolicyApplyControlResult> {
 	const stage = "authentication_policy.apply";
 	try {
-		assertOrganizationTarget(store, context, input.organizationId, stage);
+		await assertOrganizationTarget(store, context, input.organizationId, stage);
 		const authority = await facade(store, context, stage);
 		if (input.dryRun === true || input.confirm !== true) {
 			return {
@@ -305,8 +396,8 @@ export async function applyAuthenticationPolicyForManagement(
 		const result = await mutateCoordinatedWithRuntimeSql(
 			store,
 			async (coordinated) => {
-				assertOrganizationTarget(
-					{ snapshot: coordinated.data },
+				await assertOrganizationTargetInCoordinatedContext(
+					coordinated,
 					context,
 					input.organizationId,
 					stage,
@@ -353,7 +444,7 @@ export async function unlockAuthenticationForManagement(
 ): Promise<AuthenticationUnlockControlResult> {
 	const stage = "authentication_policy.unlock";
 	try {
-		assertUserTarget(store, context, input.userId, stage);
+		await assertUserTarget(store, context, input.userId, stage);
 		const authority = await facade(store, context, stage);
 		if (input.dryRun === true || input.confirm !== true) {
 			return {
@@ -367,8 +458,8 @@ export async function unlockAuthenticationForManagement(
 		const result = await mutateCoordinatedWithRuntimeSql(
 			store,
 			async (coordinated) => {
-				assertUserTarget(
-					{ snapshot: coordinated.data },
+				await assertUserTargetInCoordinatedContext(
+					coordinated,
 					context,
 					input.userId,
 					stage,
