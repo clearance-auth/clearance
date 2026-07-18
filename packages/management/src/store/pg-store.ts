@@ -16,6 +16,7 @@ import { resolve } from "node:path";
 import pg from "pg";
 import {
 	cancelDeliveryInExistingTransaction,
+	createRuntimeAuditTable,
 	createWebhookEndpointInExistingTransaction,
 	createDeliveryKeyring,
 	DEFAULT_DELIVERY_QUOTA_POLICY,
@@ -77,6 +78,10 @@ import {
 	appendStoreV2Events,
 	applyStoreV2EventDelta,
 } from "./store-v2-events.js";
+import {
+	PgRuntimeAuditEventReader,
+	type RuntimeAuditStoreOptions,
+} from "./runtime-audit-events.js";
 import { PgStoreV2PrincipalRepository } from "./store-v2-principals.js";
 import { registerInternalCoordinatedExecutor } from "./coordinated-internal.js";
 import {
@@ -154,6 +159,7 @@ export class PgStore implements ManagementStore {
 	readonly path: string;
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	readonly runtimeAuditEvents: PgRuntimeAuditEventReader;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
 	readonly deliveryControl?: ManagementDeliveryControlReader;
 	readonly webhookEndpoints?: ManagementWebhookEndpointCapability;
@@ -185,6 +191,7 @@ export class PgStore implements ManagementStore {
 			tableName?: string;
 			normalizedPrefix?: string;
 			delivery?: PgStoreDeliveryOptions;
+			runtimeAudit?: RuntimeAuditStoreOptions;
 		},
 	) {
 		const normalizedDelivery = opts?.delivery
@@ -196,6 +203,18 @@ export class PgStore implements ManagementStore {
 					options: {
 						...(opts.delivery.schema ? { schema: opts.delivery.schema } : {}),
 						...(opts.delivery.prefix ? { prefix: opts.delivery.prefix } : {}),
+						...(opts.runtimeAudit === undefined
+							? {}
+							: {
+									runtimeAudit: createRuntimeAuditTable({
+										...(opts.runtimeAudit.schema
+											? { schema: opts.runtimeAudit.schema }
+											: {}),
+										table: opts.runtimeAudit.prefix
+											? `${opts.runtimeAudit.prefix}_runtime_audit_events`
+											: "clearance_runtime_audit_events",
+									}),
+								}),
 						...(opts.delivery.legacyFingerprintKeyId
 							? { legacyFingerprintKeyId: opts.delivery.legacyFingerprintKeyId }
 							: {}),
@@ -208,6 +227,10 @@ export class PgStore implements ManagementStore {
 		}
 		this.path = resolve(opts?.backupDir ?? process.cwd(), ".clearance", "pg");
 		this.pool = new pg.Pool({ connectionString: databaseUrl });
+		this.runtimeAuditEvents = new PgRuntimeAuditEventReader(
+			this.pool,
+			opts?.runtimeAudit,
+		);
 		this.table = safeTableName(opts?.tableName ?? SNAPSHOT_TABLE);
 		// Companion uniqueness tables share the snapshot table prefix for test isolation
 		this.emailUniqueTable = safeTableName(`${this.table}_principal_email`);
@@ -1614,6 +1637,7 @@ export async function createPgStore(
 		tableName?: string;
 		normalizedPrefix?: string;
 		delivery?: PgStoreDeliveryOptions;
+		runtimeAudit?: RuntimeAuditStoreOptions;
 	},
 ): Promise<PgStore> {
 	const store = new PgStore(databaseUrl, opts);
