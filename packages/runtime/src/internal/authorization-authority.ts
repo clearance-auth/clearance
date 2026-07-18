@@ -1,4 +1,6 @@
+import { isTransactionActive } from "@clearance/core/context";
 import type { InternalAdapter } from "@clearance/core";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 const MAX_ACTIONS = 256;
@@ -22,10 +24,30 @@ export type InternalEffectiveAuthorization = Readonly<{
 	actions: readonly string[];
 }>;
 
+declare const activeRawTransaction: unique symbol;
+
+/** An active runtime transaction which can be shared with the product authority. */
+export type InternalAuthorizationActiveRawTransaction =
+	DBTransactionAdapter & {
+		readonly rawTransactionQuery: NonNullable<
+			DBTransactionAdapter["rawTransactionQuery"]
+		>;
+		readonly [activeRawTransaction]: true;
+	};
+
+export type InternalAuthorizationOrganizationOwnerInput = Readonly<{
+	organizationId: string;
+	ownerPrincipalId: string;
+	transaction: InternalAuthorizationActiveRawTransaction;
+}>;
+
 export type InternalAuthorizationAuthority = Readonly<{
 	readEffectiveAuthorization(
 		input: InternalAuthorizationReadInput,
 	): Promise<InternalEffectiveAuthorization>;
+	initializeOrganizationOwner(
+		input: InternalAuthorizationOrganizationOwnerInput,
+	): Promise<void>;
 }>;
 
 export class InvalidInternalAuthorizationAuthorityError extends Error {
@@ -175,9 +197,15 @@ export function attachInternalAuthorizationAuthority<Target extends object>(
 ): Target {
 	if (authorities.has(internalAdapter)) invalid();
 	const readEffectiveAuthorization = authority?.readEffectiveAuthorization;
-	if (typeof readEffectiveAuthorization !== "function") invalid();
+	const initializeOrganizationOwner = authority?.initializeOrganizationOwner;
+	if (
+		typeof readEffectiveAuthorization !== "function" ||
+		typeof initializeOrganizationOwner !== "function"
+	) invalid();
 	const captured = Object.freeze({
 		readEffectiveAuthorization: readEffectiveAuthorization.bind(authority),
+		initializeOrganizationOwner:
+			initializeOrganizationOwner.bind(authority),
 	});
 	capturedAuthorities.add(captured);
 	authorities.set(internalAdapter, captured);
@@ -227,6 +255,47 @@ export async function readInternalEffectiveAuthorization(
 		invalid();
 	}
 	return normalizedResult;
+}
+
+/**
+ * Initializes the organization authorization revision and creator ownership in
+ * the caller's active transaction. The opaque transaction type prevents a
+ * private binding from being invoked with a pool-shaped object instead.
+ */
+export async function initializeInternalOrganizationOwner(
+	internalAdapter: InternalAdapter,
+	input: Readonly<{
+		organizationId: string;
+		ownerPrincipalId: string;
+		transaction: DBTransactionAdapter;
+	}>,
+): Promise<boolean> {
+	const authority = authorities.get(internalAdapter);
+	if (!authority) return false;
+	const organizationId = identifier(input.organizationId);
+	const ownerPrincipalId = identifier(input.ownerPrincipalId);
+	const transaction = input.transaction;
+	if (
+		!transaction ||
+		typeof transaction.rawTransactionQuery !== "function" ||
+		!(await isTransactionActive(transaction))
+	) {
+		throw new InternalAuthorizationAuthorityUnavailableError(
+			new Error("Organization authorization finalization requires an active transaction"),
+		);
+	}
+	try {
+		await authority.initializeOrganizationOwner(
+			Object.freeze({
+				organizationId,
+				ownerPrincipalId,
+				transaction: transaction as InternalAuthorizationActiveRawTransaction,
+			}),
+		);
+	} catch (error) {
+		throw new InternalAuthorizationAuthorityUnavailableError(error);
+	}
+	return true;
 }
 
 /** Returns the attached reader so runtime-owned clones can preserve it. */
