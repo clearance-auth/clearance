@@ -9,7 +9,7 @@ import {
 	attachCapturedInternalRuntimeAudit,
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
-} from "../../runtime/src/internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import type { AuthMiddleware } from "./middlewares";
 import { SCIMAPIError, SCIMErrorOpenAPISchemas } from "./scim-error";
 import { APIGroupSchema, GroupPatchSchema, SCIMGroupResourceSchema, type APIGroup } from "./group-schemas";
