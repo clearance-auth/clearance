@@ -45,6 +45,16 @@ describe("delivery worker boundaries", () => {
 		expect(config.smtp!.requireTls).toBe(true);
 		expect(config.emailTransport).toBe("smtp");
 		expect(config.allowHttpLinks).toBe(false);
+		expect(config.runtimeAudit).toMatchObject({ table: "clearance_runtime_audit_events" });
+		expect(parseWorkerConfig({
+			...env(),
+			CLEARANCE_RUNTIME_AUDIT_SCHEMA: "audit_schema",
+			CLEARANCE_RUNTIME_AUDIT_PREFIX: "tenant",
+		}).runtimeAudit).toMatchObject({
+			schema: "audit_schema",
+			table: "tenant_runtime_audit_events",
+		});
+		expect(parseWorkerConfig({ ...env(), CLEARANCE_RUNTIME_AUDIT: "false" }).runtimeAudit).toBeUndefined();
 		expect(parseWorkerConfig({
 			...env(), CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: "fingerprint.previous-1",
 		}).legacyFingerprintKeyId).toBe("fingerprint.previous-1");
