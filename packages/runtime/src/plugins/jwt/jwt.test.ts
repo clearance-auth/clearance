@@ -1195,6 +1195,85 @@ describe("jwt - custom adapter", async () => {
 	});
 });
 
+describe("jwt private key storage", () => {
+	it("binds protection to the persisted public key and fails closed", async () => {
+		const storage: Jwk[] = [];
+		const contexts: Array<{
+			operation: "encrypt" | "decrypt";
+			publicKey: string;
+		}> = [];
+		let rejectDecryption = false;
+		const { auth } = await getTestInstance({
+			plugins: [
+				jwt({
+					jwks: {
+						privateKeyStorage: {
+							async encrypt(privateKey, publicKey) {
+								contexts.push({ operation: "encrypt", publicKey });
+								return JSON.stringify({ privateKey, publicKey });
+							},
+							async decrypt(encryptedPrivateKey, publicKey) {
+								contexts.push({ operation: "decrypt", publicKey });
+								if (rejectDecryption) throw new Error("protector unavailable");
+								const stored = JSON.parse(encryptedPrivateKey) as {
+									privateKey: string;
+									publicKey: string;
+								};
+								if (stored.publicKey !== publicKey) {
+									throw new Error("wrong public key context");
+								}
+								return stored.privateKey;
+							},
+						},
+					},
+					adapter: {
+						getJwks: async () => storage,
+						createJwk: async (data) => {
+							const key = {
+								...data,
+								id: crypto.randomUUID(),
+								createdAt: new Date(),
+							};
+							storage.push(key);
+							return key;
+						},
+					},
+				}),
+			],
+		});
+
+		await auth.api.signJWT({ body: { payload: { sub: "subject" } } });
+		expect(contexts).toEqual([
+			expect.objectContaining({ operation: "encrypt" }),
+			expect.objectContaining({ operation: "decrypt" }),
+		]);
+		expect(contexts[0]?.publicKey).toBe(storage[0]?.publicKey);
+		expect(contexts[1]?.publicKey).toBe(storage[0]?.publicKey);
+
+		const originalPublicKey = storage[0]!.publicKey;
+		storage[0] = {
+			...storage[0]!,
+			publicKey: JSON.stringify({
+				...JSON.parse(originalPublicKey),
+				kid: "wrong-context",
+			}),
+		};
+		await expect(
+			auth.api.signJWT({ body: { payload: { sub: "subject" } } }),
+		).rejects.toThrow(
+			"Failed to decrypt private key with configured private key storage",
+		);
+
+		storage[0] = { ...storage[0]!, publicKey: originalPublicKey };
+		rejectDecryption = true;
+		await expect(
+			auth.api.signJWT({ body: { payload: { sub: "subject" } } }),
+		).rejects.toThrow(
+			"Failed to decrypt private key with configured private key storage",
+		);
+	});
+});
+
 describe("jwt - custom jwksPath", async () => {
 	it("should use custom jwksPath when specified", async () => {
 		const { auth } = await getTestInstance({
