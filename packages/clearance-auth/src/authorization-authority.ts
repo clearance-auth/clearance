@@ -131,7 +131,7 @@ export type AuthorizationAuthorityReplaceSubjectRolesResult = Readonly<{
 }>;
 
 export type AuthorizationAuthorityListRolesInput = Readonly<{
-	organizationId: string;
+	organizationId?: string;
 	transaction?: AuthorizationAuthorityTransaction;
 }>;
 
@@ -726,6 +726,7 @@ export class PostgresAuthorizationAuthority {
 					const alreadyInstalled = await inspectCatalog(client, this.schema, this.#names);
 					if (!alreadyInstalled) await client.query(createSql(this.schema, this.#names));
 					await inspectCatalog(client, this.schema, this.#names);
+					await this.#seedBuiltInRoles(client);
 					await client.query("COMMIT");
 				} catch (cause) {
 					try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
@@ -964,10 +965,12 @@ export class PostgresAuthorizationAuthority {
 	}
 
 	async listRoles(input: AuthorizationAuthorityListRolesInput): Promise<readonly AuthorizationAuthorityRole[]> {
-		const organizationId = scopeString(input.organizationId, "organizationId");
+		const organizationId = input.organizationId === undefined
+			? undefined
+			: scopeString(input.organizationId, "organizationId");
 		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
 		const roles = this.#table(this.#names.roles);
-		const rows = await queryable.query<RoleListRow>(`SELECT r."roleId" AS role_id, r."organizationId" AS organization_id, r.slug, r.name, r.description, r."builtIn" AS built_in, r.status, COALESCE(array_agg(a."actionName" ORDER BY a."actionName") FILTER (WHERE a."actionName" IS NOT NULL), ARRAY[]::text[]) AS actions FROM ${roles} r LEFT JOIN ${this.#table(this.#names.roleActions)} ra ON ra."projectId" = r."projectId" AND ra."environmentId" = r."environmentId" AND ra."roleId" = r."roleId" LEFT JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE r."projectId" = $1 AND r."environmentId" = $2 AND (r."organizationId" IS NULL OR r."organizationId" = $3) GROUP BY r."projectId", r."environmentId", r."roleId", r."organizationId", r.slug, r.name, r.description, r."builtIn", r.status ORDER BY r.slug, r."roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		const rows = await queryable.query<RoleListRow>(`SELECT r."roleId" AS role_id, r."organizationId" AS organization_id, r.slug, r.name, r.description, r."builtIn" AS built_in, r.status, COALESCE(array_agg(a."actionName" ORDER BY a."actionName") FILTER (WHERE a."actionName" IS NOT NULL), ARRAY[]::text[]) AS actions FROM ${roles} r LEFT JOIN ${this.#table(this.#names.roleActions)} ra ON ra."projectId" = r."projectId" AND ra."environmentId" = r."environmentId" AND ra."roleId" = r."roleId" LEFT JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE r."projectId" = $1 AND r."environmentId" = $2 AND ($3::text IS NULL OR r."organizationId" IS NULL OR r."organizationId" = $3) GROUP BY r."projectId", r."environmentId", r."roleId", r."organizationId", r.slug, r.name, r.description, r."builtIn", r.status ORDER BY r.slug, r."roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId ?? null]);
 		return Object.freeze(rows.rows.map((row) => authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, decodeSortedStrings(row.actions, "role actions").map((action) => canonicalActionName(action, "stored action")), "stored role")));
 	}
 
