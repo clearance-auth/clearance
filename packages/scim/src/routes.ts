@@ -13,6 +13,8 @@ import {
 	isTransactionActive,
 	runWithTransaction,
 } from "@clearance/core/context";
+import { getWithHooks } from "../../runtime/src/db/with-hooks";
+import type { DatabaseHooksEntry } from "../../runtime/src/db/with-hooks";
 import {
 	APIError,
 	createAuthEndpoint,
@@ -50,7 +52,7 @@ import {
 	attachCapturedInternalRuntimeAudit,
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
-} from "../../runtime/src/internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 
 const supportedSCIMSchemas = [SCIMUserResourceSchema];
 const supportedSCIMResourceTypes = [SCIMUserResourceType];
@@ -107,6 +109,22 @@ async function runSCIMMutationTransaction<T>(
 		return runWithTransaction(ctx.context.adapter, fn);
 	}
 	return ctx.context.adapter.transaction(fn);
+}
+
+/**
+ * User and account writes must share the endpoint's root transaction so the
+ * account, organization member, and runtime audit record all commit or roll
+ * back together. Reuse the runtime hook writer rather than constructing a
+ * second internal-adapter root around the transaction adapter.
+ */
+function scimMutationWriter(ctx: GenericEndpointContext) {
+	return getWithHooks(ctx.context.adapter, {
+		options: ctx.context.options,
+		logger: ctx.context.logger,
+		hooks: ctx.context.options.databaseHooks
+			? [{ source: "user", hooks: ctx.context.options.databaseHooks, failureMode: ctx.context.options.databaseHookFailureMode }] satisfies DatabaseHooksEntry[]
+			: [],
+	});
 }
 
 async function appendSCIMAudit(
@@ -920,26 +938,31 @@ export const createSCIMUser = (
 				where: [{ field: "email", value: email }],
 			});
 
-			const createAccount = (userId: string) =>
-				ctx.context.internalAdapter.createAccount({
+			const createAccount = async (userId: string) =>
+				(await scimMutationWriter(ctx).createWithHooks({
+					createdAt: new Date(),
+					updatedAt: new Date(),
 					userId: userId,
 					providerId: providerId,
 					accountId: accountId,
 					accessToken: "",
 					refreshToken: "",
-				});
+				}, "account")) as Account;
 
-			const createUser = () =>
-				ctx.context.internalAdapter.createUser({
+			const createUser = async () =>
+				(await scimMutationWriter(ctx).createWithHooks({
+					createdAt: new Date(),
+					updatedAt: new Date(),
 					email,
 					name,
-				});
+				}, "user")) as User;
 
 			const createOrgMembership = async (userId: string) => {
 				const organizationId = ctx.context.scimProvider.organizationId;
 
 				if (organizationId) {
-					const isOrgMember = await ctx.context.adapter.findOne({
+					const adapter = await getCurrentAdapter(ctx.context.adapter);
+					const isOrgMember = await adapter.findOne({
 						model: "member",
 						where: [
 							{ field: "organizationId", value: organizationId },
@@ -948,7 +971,7 @@ export const createSCIMUser = (
 					});
 
 					if (!isOrgMember) {
-						return await ctx.context.adapter.create<Member>({
+						return await adapter.create<Member>({
 							model: "member",
 							data: {
 								userId: userId,
