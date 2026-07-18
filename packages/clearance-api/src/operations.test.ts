@@ -59,6 +59,18 @@ describe("authenticated operational API contracts", () => {
 			["POST", "/v1/schema/credential-authority/drain", { confirm: true }],
 			["GET", "/v1/schema/store-v2", undefined],
 			["POST", "/v1/migrations/plan", { source: "legacy", fixture: {} }],
+			["GET", "/v1/organizations/org_test/authorization/effective/principal/user_test", undefined],
+			["GET", "/v1/organizations/org_test/authorization/assignments", undefined],
+			["PATCH", "/v1/organizations/org_test/authorization/assignments/principal/user_test", { roleIds: [] }],
+			["POST", "/v1/organizations/org_test/authorization/reconcile", { confirm: true }],
+			["GET", "/v1/organizations/org_test/service-accounts", undefined],
+			["GET", "/v1/organizations/org_test/service-accounts/svc_test", undefined],
+			["POST", "/v1/organizations/org_test/service-accounts", { name: "Automation", roleIds: [] }],
+			["PATCH", "/v1/organizations/org_test/service-accounts/svc_test/status", { status: "disabled" }],
+			["PATCH", "/v1/organizations/org_test/service-accounts/svc_test/status", { status: "active" }],
+			["POST", "/v1/organizations/org_test/service-accounts/svc_test/credentials", {}],
+			["POST", "/v1/organizations/org_test/service-accounts/svc_test/credentials/cred_test/rotate", {}],
+			["POST", "/v1/organizations/org_test/service-accounts/svc_test/credentials/cred_test/revoke", {}],
 		] as const) {
 			const response = await app.request(path, {
 				method,
@@ -69,6 +81,53 @@ describe("authenticated operational API contracts", () => {
 			});
 			expect(response.status, `${method} ${path}`).toBe(401);
 		}
+	});
+
+	it("rejects normalized authorization on the JSON backend before authority access", async () => {
+		for (const path of [
+			"/v1/organizations/org_test/authorization/assignments?subjectKind=principal",
+			"/v1/organizations/org_test/authorization/assignments?subjectId=user_test",
+		]) {
+			const response = await app.request(path, { headers });
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "AUTHORIZATION_POSTGRES_REQUIRED", stage: "authorization.api" },
+			});
+		}
+	});
+
+	it("rejects invalid authorization mutation input before the backend gate", async () => {
+		const response = await app.request(
+			"/v1/organizations/org_test/service-accounts/svc_test/credentials",
+			{
+				method: "POST",
+				headers,
+				body: "{not-json",
+			},
+		);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({
+			error: {
+				code: "AUTHORIZATION_INPUT_INVALID",
+				stage: "authorization.credentials.create",
+			},
+		});
+
+		const missingRoleIds = await app.request(
+			"/v1/organizations/org_test/service-accounts",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify({ name: "Automation" }),
+			},
+		);
+		expect(missingRoleIds.status).toBe(400);
+		expect(await missingRoleIds.json()).toMatchObject({
+			error: {
+				code: "AUTHORIZATION_INPUT_INVALID",
+				stage: "authorization.service_accounts.create",
+			},
+		});
 	});
 
 	it("rejects invalid key-management bodies before the PostgreSQL backend gate", async () => {
