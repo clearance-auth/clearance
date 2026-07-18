@@ -12,6 +12,7 @@ import * as z from "zod";
 import { getSessionFromCtx, requestOnlySessionMiddleware } from "../../../api";
 import { rejectActiveTransactionEndpoint } from "../../../api/dispatch";
 import { deleteSessionCookie, setSessionCookie } from "../../../cookies";
+import { initializeInternalOrganizationOwner } from "../../../internal/authorization-authority";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db";
 import type { Session } from "../../../types";
@@ -435,6 +436,14 @@ export const createOrganization = <O extends OrganizationOptions>(
 						}
 					}
 					member = await adapter.createMember(data);
+					await initializeInternalOrganizationOwner(
+						ctx.context.internalAdapter,
+						{
+							organizationId: organization.id,
+							ownerPrincipalId: user.id,
+							transaction: await getCurrentAdapter(ctx.context.adapter),
+						},
+					);
 					let defaultTeam: InferTeam<O> | undefined;
 					if (options?.teams?.enabled && options.teams.defaultTeam?.enabled !== false) {
 						let teamData = {
