@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { DeliveryKeyring } from "@clearance/delivery";
-import { resolveDeliveryKeyring } from "@clearance/delivery";
+import type { DeliveryKeyring, RuntimeAuditTable } from "@clearance/delivery";
+import { createRuntimeAuditTable, resolveDeliveryKeyring } from "@clearance/delivery";
 
 export type WorkerMode = "run" | "once" | "ready";
 export type EmailTransport = "smtp" | "ses";
@@ -12,6 +12,8 @@ export type WorkerConfig = {
 	schema: string;
 	prefix: string;
 	legacyFingerprintKeyId?: string;
+	/** Product-owned append-only audit authority; omitted preserves legacy delivery behavior. */
+	runtimeAudit?: RuntimeAuditTable;
 	/** Omitted by older programmatic callers; SMTP remains the compatibility default. */
 	emailTransport?: EmailTransport;
 	emailFrom?: string;
@@ -138,6 +140,26 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 	const emailFrom = mailbox(required(env, "CLEARANCE_EMAIL_FROM"), "CLEARANCE_EMAIL_FROM");
 	const workerId = (env.CLEARANCE_DELIVERY_WORKER_ID?.trim() || `delivery-${randomUUID()}`);
 	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) throw new Error("CLEARANCE_DELIVERY_WORKER_ID is invalid");
+	const runtimeAuditEnabled = boolean(env, "CLEARANCE_RUNTIME_AUDIT", true);
+	const runtimeAuditSchema = env.CLEARANCE_RUNTIME_AUDIT_SCHEMA?.trim();
+	const runtimeAuditPrefix = env.CLEARANCE_RUNTIME_AUDIT_PREFIX?.trim();
+	if (
+		runtimeAuditPrefix &&
+		(!/^[a-z_][a-z0-9_]*$/.test(runtimeAuditPrefix) ||
+			runtimeAuditPrefix.length > 30)
+	) {
+		throw new Error(
+			"CLEARANCE_RUNTIME_AUDIT_PREFIX must be a safe PostgreSQL prefix of at most 30 characters",
+		);
+	}
+	const runtimeAudit = runtimeAuditEnabled
+		? createRuntimeAuditTable({
+			...(runtimeAuditSchema ? { schema: runtimeAuditSchema } : {}),
+			table: runtimeAuditPrefix
+				? `${runtimeAuditPrefix}_runtime_audit_events`
+				: "clearance_runtime_audit_events",
+		})
+		: undefined;
 	let smtp: WorkerConfig["smtp"];
 	let ses: WorkerConfig["ses"];
 	if (emailTransport === "smtp") {
@@ -198,6 +220,7 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 				),
 			}
 			: {}),
+		...(runtimeAudit ? { runtimeAudit } : {}),
 		emailTransport,
 		emailFrom,
 		...(smtp ? { smtp } : {}),
