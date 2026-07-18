@@ -3,16 +3,16 @@ import {
 	ENVIRONMENT_OPERATIONS,
 	PROJECT_OPERATIONS,
 	SYSTEM_OPERATIONS,
-	createEnvironment,
-	createProject,
-	initProject,
+	createEnvironmentAuthoritative,
+	createProjectAuthoritative,
+	initProjectAuthoritative,
 	inspectEnvironmentAuthoritative,
 	inspectProjectAuthoritative,
 	listEnvironmentsPageAuthoritative,
 	overviewStatsAuthoritative,
-	planEnvironmentCreate,
-	planProjectCreate,
-	promoteEnvironment,
+	planEnvironmentCreateAuthoritative,
+	planProjectCreateAuthoritative,
+	promoteEnvironmentAuthoritative,
 	runDoctor,
 	type ManagementStore,
 	type ResourceScope,
@@ -69,7 +69,7 @@ export function registerPlatformRoutes({
 		.post(SYSTEM_OPERATIONS.init.http.path, async (c) => {
 			const store = await storeForRequest();
 			const body = await c.req.json().catch(() => ({}));
-			const result = initProject(store, {
+			const result = await initProjectAuthoritative(store, {
 				name: (body as { name?: string }).name ?? "clearance-app",
 				environment: (body as { environment?: string }).environment,
 				source: "api",
@@ -125,10 +125,10 @@ export function registerPlatformRoutes({
 				if (body.dryRun === true) {
 					return c.json({
 						dryRun: true,
-						project: planProjectCreate({ name: body.name }, store.snapshot.projects),
+						project: await planProjectCreateAuthoritative(store, { name: body.name }),
 					});
 				}
-				const project = createProject(store, { name: body.name, actor: requestActor(c), source: "api" });
+				const project = await createProjectAuthoritative(store, { name: body.name, actor: requestActor(c), source: "api" });
 				await store.ready();
 				return c.json({ project }, 201);
 			} catch (error) {
@@ -183,7 +183,7 @@ export function registerPlatformRoutes({
 				if (body.dryRun === true) {
 					return c.json({
 						dryRun: true,
-						environment: planEnvironmentCreate(store, {
+						environment: await planEnvironmentCreateAuthoritative(store, {
 							projectId,
 							name: body.name,
 							kind: body.kind,
@@ -191,11 +191,12 @@ export function registerPlatformRoutes({
 						scope,
 					});
 				}
-				const environment = createEnvironment(store, {
+				const environment = await createEnvironmentAuthoritative(store, {
 					projectId,
 					name: body.name,
 					kind: body.kind,
 					actor: requestActor(c),
+					source: "api",
 				});
 				await store.ready();
 				return c.json({ environment, scope }, 201);
@@ -252,7 +253,7 @@ export function registerPlatformRoutes({
 						status: 400,
 					});
 				}
-				const result = promoteEnvironment(store, {
+				const result = await promoteEnvironmentAuthoritative(store, {
 					to,
 					...(from ? { from } : {}),
 					...(dryRun !== undefined ? { dryRun } : {}),
