@@ -1,9 +1,25 @@
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
+import { runWithTransaction } from "@clearance/core/context";
 import { listen } from "listhen";
-import { createLocalJWKSet, decodeProtectedHeader, jwtVerify } from "jose";
+import {
+	createLocalJWKSet,
+	decodeJwt,
+	decodeProtectedHeader,
+	jwtVerify,
+} from "jose";
 import { afterAll, describe, expect, it } from "vitest";
 import { createAuthClient } from "../../client";
+import { makeSignature } from "../../crypto";
 import { OAUTH_TOKEN_MIGRATION_ID } from "../../db/session-credential-migration";
 import { toNodeHandler } from "../../integrations/node";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import { captureInternalSessionDerivativeAuthority } from "../../internal/session-derivative-authority";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { genericOAuth } from "../generic-oauth";
@@ -1698,5 +1714,278 @@ describe("mcp session freshness (security)", () => {
 		expect(response.status).toBe(401);
 		expect(body?.error).toBe("invalid_grant");
 		expect(body?.access_token).toBeUndefined();
+	});
+});
+
+const managedMcpIdentity = {
+	projectId: "managed-mcp-project",
+	environmentId: "managed-mcp-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedMcpPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+describe("managed MCP session derivative authority", () => {
+	it("binds the exact live source across exchange, access, and refresh", async () => {
+		let revision = "1";
+		const organizationId = "managed-mcp-organization";
+		const client: Client = {
+			clientId: "managed-mcp-client",
+			clientSecret: "managed-mcp-client-secret-value",
+			redirectUrls: ["http://localhost/managed-mcp-callback"],
+			metadata: {},
+			type: "web",
+			disabled: false,
+			name: "Managed MCP client",
+		};
+		const options = {
+			baseURL: "http://localhost:3000",
+			secret: "managed-mcp-runtime-secret-value",
+			session: {
+				expiresIn: 120,
+				storeSessionInDatabase: true,
+				additionalFields: {
+					activeOrganizationId: { type: "string", required: false },
+				},
+			},
+			plugins: [
+				mcp({
+					loginPage: "/login",
+					oidcConfig: { loginPage: "/login", requirePKCE: false },
+				}),
+			],
+			logger: { level: "error" },
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(options, {
+			identity: managedMcpIdentity,
+			reader: {
+				async readForSubject(input) {
+					return {
+						scope: managedMcpIdentity,
+						subjectId: input.subjectId,
+						revision,
+						environment: managedMcpPolicy,
+						organizationMembership:
+							input.organizationId === organizationId
+								? {
+										subjectId: input.subjectId,
+										organizationId,
+									}
+								: null,
+						organizationOverride: null,
+						effective: managedMcpPolicy,
+					};
+				},
+			},
+		});
+		const runtime = await getTestInstance(options, { disableTestUser: true });
+		const context = await runtime.auth.$context;
+		await runtime.db.create({
+			model: "oauthApplication",
+			data: {
+				clientId: client.clientId,
+				clientSecret: client.clientSecret,
+				type: client.type,
+				name: client.name,
+				redirectUrls: client.redirectUrls.join(","),
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const user = await context.internalAdapter.createUser({
+			email: "managed-mcp@example.test",
+			name: "Managed MCP User",
+		});
+		const source = await context.internalAdapter.createSession(
+			user.id,
+			false,
+			{ activeOrganizationId: organizationId },
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: organizationId,
+			}),
+		);
+		const sessionHeaders = new Headers({
+			cookie: `clearance.session_token=${source.token}.${await makeSignature(source.token, context.secret)}`,
+		});
+		const authorize = async () => {
+			const url = new URL("http://localhost:3000/api/auth/mcp/authorize");
+			url.searchParams.set("client_id", client.clientId);
+			url.searchParams.set("redirect_uri", client.redirectUrls[0]!);
+			url.searchParams.set("response_type", "code");
+			url.searchParams.set("scope", "openid profile email offline_access");
+			const response = await runtime.auth.handler(
+				new Request(url, { headers: sessionHeaders }),
+			);
+			return new URL(response.headers.get("location")!).searchParams.get("code")!;
+		};
+		const exchange = (code: string) =>
+			runtime.auth.handler(
+				new Request("http://localhost:3000/api/auth/mcp/token", {
+					method: "POST",
+					headers: { "Content-Type": "application/x-www-form-urlencoded" },
+					body: new URLSearchParams({
+						grant_type: "authorization_code",
+						client_id: client.clientId,
+						client_secret: client.clientSecret!,
+						code,
+						redirect_uri: client.redirectUrls[0]!,
+					}).toString(),
+				}),
+			);
+
+		const adversarialBase = {
+			clientId: client.clientId,
+			redirectURI: client.redirectUrls[0],
+			scope: ["openid", "offline_access"],
+			userId: user.id,
+			authTime: Date.now(),
+			requireConsent: false,
+			state: null,
+			organizationId,
+		};
+		await runWithTransaction(context.adapter, async () => {
+			const oidcAuthority = await captureInternalSessionDerivativeAuthority(
+				context.internalAdapter,
+				{ purpose: "oidc", sourceSessionId: source.id },
+			);
+			for (const [identifier, sessionDerivativeAuthority] of [
+				["managed-mcp-missing-authority", undefined],
+				["managed-mcp-oidc-authority", oidcAuthority],
+			] as const) {
+				await createInternalVerificationChallenge(
+					context.internalAdapter,
+					{ purpose: "mcp-authorization-code", subject: client.clientId },
+					{
+						identifier,
+						value: JSON.stringify({
+							...adversarialBase,
+							...(sessionDerivativeAuthority
+								? { sessionDerivativeAuthority }
+								: {}),
+						}),
+						expiresAt: new Date(Date.now() + 60_000),
+					},
+				);
+			}
+		});
+		for (const code of [
+			"managed-mcp-missing-authority",
+			"managed-mcp-oidc-authority",
+		]) {
+			const rejected = await exchange(code);
+			expect(rejected.status, code).toBe(401);
+			expect(await rejected.json()).toMatchObject({ error: "invalid_grant" });
+		}
+		expect(await runtime.db.count({ model: "oauthAccessToken" })).toBe(0);
+
+		const issuedResponse = await exchange(await authorize());
+		expect(issuedResponse.status).toBe(200);
+		const issued = await issuedResponse.json();
+		const [row] = await runtime.db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(row).toMatchObject({
+			organizationId,
+			sessionDerivativeAuthority: expect.any(String),
+			refreshStatus: "active",
+		});
+		expect(row!.accessTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			source.expiresAt.getTime(),
+		);
+		expect(row!.refreshTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			source.expiresAt.getTime(),
+		);
+		expect(decodeJwt(issued.id_token).exp! * 1000).toBeLessThanOrEqual(
+			source.expiresAt.getTime(),
+		);
+		const getSessionOnlyResponse = await exchange(await authorize());
+		expect(getSessionOnlyResponse.status).toBe(200);
+		const getSessionOnly = await getSessionOnlyResponse.json();
+		const refreshOnlyResponse = await exchange(await authorize());
+		expect(refreshOnlyResponse.status).toBe(200);
+		const refreshOnly = await refreshOnlyResponse.json();
+
+		const rotatedSource = await context.internalAdapter.rotateSessionCredential(
+			source.token,
+			generateCredentialOperationKey(),
+		);
+		expect(rotatedSource?.session.id).toBe(source.id);
+		const refreshResponse = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					grant_type: "refresh_token",
+					client_id: client.clientId,
+					client_secret: client.clientSecret!,
+					refresh_token: issued.refresh_token,
+				}).toString(),
+			}),
+		);
+		expect(refreshResponse.status).toBe(200);
+		const refreshed = await refreshResponse.json();
+		const [, successor] = await runtime.db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+			sortBy: { field: "rotationCounter", direction: "asc" },
+		});
+		expect(successor).toMatchObject({
+			organizationId,
+			sessionDerivativeAuthority: row!.sessionDerivativeAuthority,
+			refreshStatus: "active",
+		});
+		expect(successor!.accessTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			source.expiresAt.getTime(),
+		);
+		expect(successor!.refreshTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			source.expiresAt.getTime(),
+		);
+
+		revision = "2";
+		const staleRefresh = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					grant_type: "refresh_token",
+					client_id: client.clientId,
+					client_secret: client.clientSecret!,
+					refresh_token: refreshOnly.refresh_token,
+				}).toString(),
+			}),
+		);
+		expect(staleRefresh.status).toBe(401);
+		const getSession = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/get-session", {
+				headers: {
+					authorization: `Bearer ${getSessionOnly.access_token}`,
+				},
+			}),
+		);
+		expect(getSession.status).toBe(401);
+		const userInfo = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/mcp/userinfo", {
+				headers: { authorization: `Bearer ${refreshed.access_token}` },
+			}),
+		);
+		expect(userInfo.status).toBe(401);
+		expect(
+			(await runtime.db.findMany<Record<string, any>>({
+				model: "oauthAccessToken",
+			})).every((token) => token.refreshStatus === "revoked"),
+		).toBe(true);
 	});
 });
