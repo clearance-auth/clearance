@@ -2,6 +2,10 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Context, Next } from "hono";
 import {
+	startObservability,
+	type ObservabilityHandle,
+} from "@clearance/observability-node";
+import {
 	assertClientScopeHeaders,
 	assertProductionCredentialKey,
 	assertProductionSecret,
@@ -1183,42 +1187,84 @@ function installGracefulShutdown(
 	server: Server,
 	store: ManagementStore,
 	options: { registerSignals?: boolean; timeoutMs?: number } = {},
+	observability?: ObservabilityHandle,
 ) {
 	let shutdownPromise: Promise<void> | null = null;
 	const shutdown = (signal: string): Promise<void> => {
 		if (shutdownPromise) return shutdownPromise;
 		draining = true;
 		console.log(JSON.stringify({ event: "shutdown_started", service: "clearance-api", signal }));
-		shutdownPromise = new Promise((resolve) => {
-			const timeout = setTimeout(() => {
-				console.error(JSON.stringify({ event: "shutdown_timeout", service: "clearance-api" }));
-				server.closeAllConnections?.();
-				process.exitCode = 1;
-				resolve();
-			}, options.timeoutMs ?? Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000));
-			timeout.unref();
-			server.close(async (error) => {
+		shutdownPromise = (async () => {
+			let firstError: unknown;
+			let cleanup: Promise<void> | undefined;
+			let timeout: NodeJS.Timeout | undefined;
+			let timedOut = false;
+			const recordError = (error: unknown) => {
+				firstError ??= error;
+			};
+			const startCleanup = () => {
+				cleanup ??= (async () => {
+					try {
+						await store.ready();
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						await closeAuthBundle();
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						const destroy = (store as ManagementStore & { destroy?: () => Promise<void> }).destroy;
+						if (destroy) await destroy.call(store);
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						await observability?.shutdown();
+					} catch (error) {
+						recordError(error);
+					}
+				})();
+				return cleanup;
+			};
+			const serverStopped = new Promise<void>((resolve) => {
 				try {
-					if (error) throw error;
-					await store.ready();
-					await closeAuthBundle();
-					const destroy = (store as ManagementStore & { destroy?: () => Promise<void> }).destroy;
-					if (destroy) await destroy.call(store);
-					console.log(JSON.stringify({ event: "shutdown_completed", service: "clearance-api" }));
-				} catch (shutdownError) {
-					console.error(JSON.stringify({
-						event: "shutdown_failed",
-						service: "clearance-api",
-						message: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
-					}));
-					process.exitCode = 1;
-				} finally {
-					clearTimeout(timeout);
+					server.close((error) => {
+						if (error) recordError(error);
+						resolve();
+					});
+					server.closeIdleConnections?.();
+				} catch (error) {
+					recordError(error);
 					resolve();
 				}
 			});
-			server.closeIdleConnections?.();
-		});
+			const complete = serverStopped.then(startCleanup);
+			const deadline = new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(() => {
+					timedOut = true;
+					server.closeAllConnections?.();
+					void startCleanup();
+					reject(new Error("Clearance API shutdown timed out"));
+				}, options.timeoutMs ?? Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000));
+				timeout.unref();
+			});
+			try {
+				await Promise.race([complete, deadline]);
+				if (firstError) throw firstError;
+				console.log(JSON.stringify({ event: "shutdown_completed", service: "clearance-api" }));
+			} catch (error) {
+				console.error(JSON.stringify({
+					event: timedOut ? "shutdown_timeout" : "shutdown_failed",
+					service: "clearance-api",
+					message: timedOut ? undefined : error instanceof Error ? error.message : String(error),
+				}));
+				process.exitCode = 1;
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		})();
 		return shutdownPromise;
 	};
 	if (options.registerSignals !== false) {
@@ -1229,6 +1275,7 @@ function installGracefulShutdown(
 }
 
 async function start() {
+	const observability = await startObservability();
 	// Eager store init so postgres schema exists before traffic
 	const store = await getStore();
 	await store.ready();
@@ -1243,7 +1290,7 @@ async function start() {
 			`clearance-api listening on http://localhost:${port} (store=${store.backend}, cors=${corsOrigins.join(",")})`,
 		);
 	});
-	installGracefulShutdown(server, store);
+	installGracefulShutdown(server, store, undefined, observability);
 	return server;
 }
 
