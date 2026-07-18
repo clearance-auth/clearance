@@ -545,6 +545,9 @@ export class PgStore implements ManagementStore {
 				getOrganization: (
 					input: Parameters<StoreV2TopologyReader["getOrganization"]>[0],
 				) => topologyRepository.capability.getOrganization(input),
+				countOrganizations: (
+					input: Parameters<StoreV2TopologyReader["countOrganizations"]>[0],
+				) => topologyRepository.capability.countOrganizations(input),
 				listProjectsPage: (
 					input: Parameters<StoreV2TopologyReader["listProjectsPage"]>[0],
 				) => topologyRepository.capability.listProjectsPage(input),
