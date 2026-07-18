@@ -23,7 +23,9 @@ import {
 import type { LegacyExportFixture } from "../services/migration.js";
 import {
 	cutoverStoreV2Principals,
+	cutoverStoreV2Topology,
 	rollbackStoreV2Principals,
+	rollbackStoreV2Topology,
 } from "../services/store-v2.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { PgStoreV2Shadow } from "../store/store-v2-shadow.js";
@@ -41,6 +43,8 @@ const DATABASE_URL =
 	"postgres://clearance:clearance@localhost:5434/clearance";
 const TEST_TABLE = `clearance_store_v2_principals_${process.pid}`;
 const PREFIX = `${TEST_TABLE}_n_`;
+const RUNTIME_AUDIT_PREFIX = `rollback_audit_${process.pid}`;
+const RUNTIME_AUDIT_TABLE = `${RUNTIME_AUDIT_PREFIX}_runtime_audit_events`;
 
 const available = await gatePostgresSuite(
 	DATABASE_URL,
@@ -51,10 +55,14 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 	const stores: PgStore[] = [];
 	const previousRuntimeDatabaseUrl = process.env.DATABASE_URL;
 	const previousRuntimeSecret = process.env.CLEARANCE_SECRET;
+	const previousRuntimeAuditPrefix = process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX;
+	const previousRuntimeAuditSchema = process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA;
 
 	beforeAll(() => {
 		process.env.DATABASE_URL = DATABASE_URL;
 		process.env.CLEARANCE_SECRET = "principal-authority-runtime-test-secret";
+		process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX = RUNTIME_AUDIT_PREFIX;
+		process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA = "public";
 	});
 
 	afterAll(async () => {
@@ -63,6 +71,10 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 		else process.env.DATABASE_URL = previousRuntimeDatabaseUrl;
 		if (previousRuntimeSecret === undefined) delete process.env.CLEARANCE_SECRET;
 		else process.env.CLEARANCE_SECRET = previousRuntimeSecret;
+		if (previousRuntimeAuditPrefix === undefined) delete process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX;
+		else process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX = previousRuntimeAuditPrefix;
+		if (previousRuntimeAuditSchema === undefined) delete process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA;
+		else process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA = previousRuntimeAuditSchema;
 		for (const store of stores) await store.destroy().catch(() => undefined);
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
@@ -76,6 +88,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 				`${TEST_TABLE}_principal_email`,
 				`${TEST_TABLE}_organization_slug`,
 				`${TEST_TABLE}_idempotency`,
+				RUNTIME_AUDIT_TABLE,
 				TEST_TABLE,
 			]) {
 				await pool.query(`DROP TABLE IF EXISTS ${table}`);
@@ -625,22 +638,38 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			expect(await pool.query(
 				`SELECT md5(data::text) digest FROM ${TEST_TABLE} WHERE id=1`,
 			)).toMatchObject({ rows: snapshotBeforeFailedScim.rows });
+			const topologyCutover = (await cutoverStoreV2Topology(store, {
+				confirm: true,
+			})).status!;
+			expect(topologyCutover.authoritativeCollections).toEqual([
+				"events",
+				"principals",
+				"projects",
+				"environments",
+				"organizations",
+			]);
+			expect(store.snapshot.projects).toEqual([]);
+			expect(store.snapshot.environments).toEqual([]);
+			expect(store.snapshot.organizations).toEqual([]);
+			expect(store.storeV2Topology?.authoritative).toBe(true);
 
+			const migrationUserSourceId = `legacy-principal-proof-${process.pid}`;
+			const migrationOrganizationSourceId = `legacy-organization-proof-${process.pid}`;
 			const migrationFixture: LegacyExportFixture = {
 				source: "legacy",
 				users: [{
-					id: "legacy-principal-proof",
-					email: "legacy-principal-proof@example.test",
+					id: migrationUserSourceId,
+					email: `${migrationUserSourceId}@example.test`,
 					name: "Legacy Principal Proof",
 				}],
 				organizations: [{
-					id: "legacy-organization-proof",
+					id: migrationOrganizationSourceId,
 					name: "Legacy Organization Proof",
-					slug: "legacy-organization-proof",
+					slug: migrationOrganizationSourceId,
 				}],
 				members: [{
-					userId: "legacy-principal-proof",
-					organizationId: "legacy-organization-proof",
+					userId: migrationUserSourceId,
+					organizationId: migrationOrganizationSourceId,
 					role: "member",
 				}],
 			};
@@ -653,7 +682,161 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			);
 			await verifyMigrationDurable(store, firstMigration.id, migrationFixture);
 			const importedPrincipalId = firstMigration.createdResourceIds!.users[0]!;
-			await rollbackMigrationDurable(store, firstMigration.id, migrationFixture);
+			expect(firstMigration.createdRuntimeResourceIds?.users).toEqual([
+				importedPrincipalId,
+			]);
+			const importedOrganizationId = firstMigration.createdResourceIds!.organizations[0]!;
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: importedOrganizationId,
+				}),
+			).toMatchObject({ id: importedOrganizationId });
+			expect(store.snapshot.organizations).toEqual([]);
+			await store.mutateDurable((data) => data.readinessReports.push({
+				id: "rollback-dependent-readiness",
+				organizationId: importedOrganizationId,
+				generatedAt: "2026-07-18T00:00:00.000Z",
+				checks: [],
+				overall: "ready",
+				conformance: {
+					mode: "simulation",
+					liveCertified: false,
+					note: "rollback dependency proof",
+				},
+				remainingCustomerActions: [],
+				signature: "rollback-dependent-readiness",
+			}));
+			await expect(
+				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
+			).rejects.toMatchObject({
+				code: "CLEARANCE_IMPORT_ROLLBACK_ORGANIZATION_CHANGED",
+			});
+			await store.mutateDurable((data) => {
+				data.readinessReports = data.readinessReports.filter((report) =>
+					report.id !== "rollback-dependent-readiness");
+			});
+			await pool.query(
+				`INSERT INTO clearance_authz_revisions ("projectId", "environmentId", "organizationId", revision)
+				 VALUES ($1, $2, $3, 1)`,
+				[scope.projectId, scope.environmentId, importedOrganizationId],
+			);
+			await expect(
+				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
+			).rejects.toMatchObject({
+				code: "CLEARANCE_IMPORT_ROLLBACK_ORGANIZATION_CHANGED",
+			});
+			await pool.query(
+				`DELETE FROM clearance_authz_revisions
+				 WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3`,
+				[scope.projectId, scope.environmentId, importedOrganizationId],
+			);
+			const rollbackDependentSessionId = `rollback-dependent-session-${process.pid}`;
+			await pool.query(
+				`INSERT INTO session (id, token, "userId", "activeOrganizationId", "expiresAt", "updatedAt")
+				 VALUES ($1, $2, $3, $4, now() + interval '1 hour', now())`,
+				[
+					rollbackDependentSessionId,
+					`clr_sid_rollback-dependent-${process.pid}`,
+					importedPrincipalId,
+					importedOrganizationId,
+				],
+			);
+			await expect(
+				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
+			).rejects.toMatchObject({
+				code: "CLEARANCE_IMPORT_ROLLBACK_ORGANIZATION_CHANGED",
+			});
+			await pool.query(`DELETE FROM session WHERE id = $1`, [rollbackDependentSessionId]);
+			const rollbackDependentPasskeyId = `rollback-dependent-passkey-${process.pid}`;
+			await pool.query(
+				`INSERT INTO passkey (
+					id, "userId", "credentialID", "publicKey", "userHandle", counter,
+					"deviceType", "backedUp", "createdAt", "updatedAt"
+				 ) VALUES ($1, $2, $3, 'public-key', 'user-handle', 0, 'singleDevice', false, now(), now())`,
+				[
+					rollbackDependentPasskeyId,
+					importedPrincipalId,
+					`credential-${process.pid}`,
+				],
+			);
+			await expect(
+				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
+			).rejects.toMatchObject({
+				code: "CLEARANCE_IMPORT_ROLLBACK_USER_CHANGED",
+			});
+			await pool.query(`DELETE FROM passkey WHERE id = $1`, [rollbackDependentPasskeyId]);
+			const originalCreatedUserIds = [...firstMigration.createdResourceIds!.users];
+			await store.mutateDurable((data) => {
+				const migration = data.migrations.find((candidate) => candidate.id === firstMigration.id)!;
+				migration.createdResourceIds = {
+					...migration.createdResourceIds!,
+					users: [...originalCreatedUserIds, originalCreatedUserIds[0]!],
+				};
+			});
+			await expect(
+				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
+			).rejects.toMatchObject({
+				code: "CLEARANCE_IMPORT_ROLLBACK_UNSAFE",
+			});
+			await store.mutateDurable((data) => {
+				const migration = data.migrations.find((candidate) => candidate.id === firstMigration.id)!;
+				migration.createdResourceIds = {
+					...migration.createdResourceIds!,
+					users: originalCreatedUserIds,
+				};
+			});
+			const parentLock = await pool.connect();
+			const concurrentInvitationId = `rollback-concurrent-invitation-${process.pid}`;
+			let parentLockOpen = false;
+			try {
+				await parentLock.query("BEGIN");
+				parentLockOpen = true;
+				await parentLock.query(
+					`SELECT id FROM organization WHERE id = $1 FOR UPDATE`,
+					[importedOrganizationId],
+				);
+				const rollback = rollbackMigrationDurable(
+					store,
+					firstMigration.id,
+					migrationFixture,
+				);
+				let rollbackWaiting = false;
+				for (let attempt = 0; attempt < 100; attempt += 1) {
+					const waiting = await pool.query(
+						`SELECT 1 FROM pg_stat_activity
+						 WHERE datname = current_database()
+						   AND wait_event_type = 'Lock'
+						   AND query LIKE $1
+						 LIMIT 1`,
+						["select id from organization where id = $1 for update%"],
+					);
+					if (waiting.rowCount === 1) {
+						rollbackWaiting = true;
+						break;
+					}
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				expect(rollbackWaiting).toBe(true);
+				const concurrentInvitation = pool.query(
+					`INSERT INTO invitation (id, "organizationId", email, status, "expiresAt", "inviterId")
+					 VALUES ($1, $2, 'concurrent@example.test', 'pending', now() + interval '1 hour', $3)`,
+					[concurrentInvitationId, importedOrganizationId, importedPrincipalId],
+				).then(
+					() => ({ ok: true as const }),
+					(error: unknown) => ({ ok: false as const, error }),
+				);
+				await parentLock.query("COMMIT");
+				parentLockOpen = false;
+				await expect(rollback).resolves.toMatchObject({ status: "rolled_back" });
+				await expect(concurrentInvitation).resolves.toMatchObject({
+					ok: false,
+					error: { code: "23503" },
+				});
+			} finally {
+				if (parentLockOpen) await parentLock.query("ROLLBACK").catch(() => undefined);
+				parentLock.release();
+			}
 			expect(await store.storeV2Principals!.getById({
 				scope,
 				id: importedPrincipalId,
@@ -663,6 +846,38 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 				`SELECT 1 FROM "user" WHERE id=$1`,
 				[importedPrincipalId],
 			)).rowCount).toBe(0);
+			await expect(pool.query(
+				`INSERT INTO "passkeyChallenge" (
+					id, "digestId", ceremony, "rpID", origin, "stagedSubjectId",
+					"expiresAt", "createdAt", "updatedAt"
+				 ) VALUES ($1, $2, 'authentication', 'localhost', 'http://localhost', $3,
+					now() + interval '1 hour', now(), now())`,
+				[
+					`rollback-fenced-challenge-${process.pid}`,
+					`rollback-fenced-digest-${process.pid}`,
+					importedPrincipalId,
+				],
+			)).rejects.toMatchObject({ code: "23503" });
+			await expect(pool.query(
+				`INSERT INTO ${RUNTIME_AUDIT_TABLE} (
+					id, correlation_id, project_id, environment_id, organization_id,
+					actor, action, outcome, source, message, created_at
+				) VALUES ($1, $2, $3, $4, $5, 'runtime', 'auth.login.succeeded', 'success', 'system', 'rollback fence probe', now())`,
+				[
+					`rollback-fenced-audit-${process.pid}`,
+					`rollback-fenced-audit-correlation-${process.pid}`,
+					scope.projectId,
+					scope.environmentId,
+					importedOrganizationId,
+				],
+			)).rejects.toMatchObject({ code: "23503" });
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: importedOrganizationId,
+				}),
+			).toBeNull();
+			expect(store.snapshot.organizations).toEqual([]);
 			const secondMigrationPlan = await planMigrationDurable(store, migrationFixture);
 			await store.ready();
 			const secondMigration = await runMigrationDurable(
@@ -672,6 +887,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			);
 			expect(secondMigration.createdResourceIds?.users).toHaveLength(1);
 			await rollbackMigrationDurable(store, secondMigration.id, migrationFixture);
+			await rollbackStoreV2Topology(store, { confirm: true });
 
 			const second = await createPgStore(DATABASE_URL, {
 				tableName: TEST_TABLE,
