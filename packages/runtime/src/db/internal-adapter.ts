@@ -93,6 +93,13 @@ import {
 	STAGED_AUTHENTICATION_TTL_SECONDS,
 } from "../internal/staged-authentication-context";
 import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	classifyRuntimeInteractiveAuthenticationRoute,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../internal/runtime-audit";
+import {
 	ManagedVerificationChallengeError,
 	requireInternalVerificationChallengeContext,
 	requireInternalVerificationConsumptionContext,
@@ -113,6 +120,23 @@ function getTTLSeconds(expiresAt: Date | number, now = Date.now()): number {
 		typeof expiresAt === "number" ? expiresAt : expiresAt.getTime();
 	return Math.max(Math.floor((expiresMs - now) / 1000), 0);
 }
+
+const runtimeAuditAuthenticationMethods = new Set<string>([
+	"password",
+	"password_enrollment",
+	"federated",
+	"email_link",
+	"email_otp",
+	"phone_otp",
+	"wallet_signature",
+	"passkey",
+	"anonymous",
+	"totp",
+	"otp",
+	"recovery_code",
+	"magic_link",
+	"sso",
+]);
 
 export const createInternalAdapter = (
 	adapter: DBAdapter<ClearanceOptions>,
@@ -3626,6 +3650,135 @@ export const createInternalAdapter = (
 					await queueAfterTransactionHook(async () => {
 						await persistSecondarySession(res as Record<string, any>);
 					}, adapter);
+				}
+				// Runtime audit is a product-bound, database-transaction-only authority.
+				// Secondary-authoritative sessions have no equivalent atomic outbox, so they
+				// deliberately remain outside this audit path.
+				if (storesSessionsInDatabase) {
+					const transactionAdapter = await getCurrentAdapter(adapter);
+					const runtimeAudit =
+						readInternalRuntimeAudit(transactionAdapter) ??
+						readInternalRuntimeAudit(adapter) ??
+						(adapter.options
+							? readInternalRuntimeAudit(adapter.options)
+							: undefined);
+					if (runtimeAudit) {
+						attachCapturedInternalRuntimeAudit(
+							transactionAdapter,
+							runtimeAudit,
+						);
+						const persistedSession = await transactionAdapter.findOne<
+							Session & Record<string, unknown>
+						>({
+							model: "session",
+							where: [{ field: "id", value: String((res as Session).id) }],
+						});
+						if (!persistedSession || !(persistedSession.expiresAt instanceof Date)) {
+							throw new Error("Could not read the persisted session for audit");
+						}
+
+						const issuancePurpose = stagedIssuanceAuthority
+							? "interactive"
+							: (managedIssuanceContext?.purpose ?? "direct");
+						const actor =
+							capturedIssuanceAuthority?.sourceSubjectId ??
+							(managedIssuanceContext?.purpose === "interactive" ||
+							managedIssuanceContext?.purpose === "impersonation"
+								? managedIssuanceContext.subjectId
+								: undefined) ??
+							stagedIssuanceAuthority?.subjectId ??
+							userId;
+						const primaryMethod = persistedSession.authenticationPrimaryMethod;
+						const factorMethod = persistedSession.authenticationFactorMethod;
+						const assuranceLevel =
+							typeof primaryMethod !== "string"
+								? null
+								: primaryMethod === "passkey" || factorMethod === "passkey"
+									? "phishing_resistant"
+									: factorMethod === null || factorMethod === undefined
+										? "single_factor"
+										: "multi_factor";
+						const request =
+							(await getRuntimeAuditRequestContext()) ??
+							Object.freeze({
+								correlationId: `rt_${generateId(24)}`,
+								operationId: "internal.createSession",
+								route: "/internal/session",
+								method: "INTERNAL",
+								clientIp: null,
+								userAgent: null,
+							});
+						const managedInteractive =
+							stagedIssuanceAuthority !== null ||
+							managedIssuanceContext?.purpose === "interactive";
+						const unmanagedMethod =
+							stagedIssuanceAuthority || managedIssuanceContext
+								? null
+									: classifyRuntimeInteractiveAuthenticationRoute(request.route);
+						const managedMethods = stagedIssuanceAuthority
+							? [
+									stagedIssuanceAuthority.primaryMethod,
+									stagedIssuanceAuthority.factorMethod,
+								]
+							: managedIssuanceContext?.purpose === "interactive"
+								? managedIssuanceContext.evidence.map((evidence) =>
+										evidence.kind === "primary"
+											? evidence.primaryMethod
+											: evidence.factorMethod,
+									)
+								: [];
+						const methods: string[] = Array.from(
+							new Set(
+								managedMethods.filter((method) =>
+									runtimeAuditAuthenticationMethods.has(method),
+								),
+							),
+						);
+						if (unmanagedMethod) methods.push(unmanagedMethod);
+						const metadata = {
+							issuancePurpose,
+							targetUserId: userId,
+							expiresAt: persistedSession.expiresAt.toISOString(),
+							assuranceLevel,
+							primaryMethod: typeof primaryMethod === "string" ? primaryMethod : null,
+							factorMethod: typeof factorMethod === "string" ? factorMethod : null,
+							...(typeof persistedSession.impersonatedBy === "string"
+								? { impersonatedBy: persistedSession.impersonatedBy }
+								: {}),
+						};
+						await appendInternalRuntimeAudit(transactionAdapter, {
+							actor,
+							action: "auth.session.created",
+							subjectType: "session",
+							subjectId: persistedSession.id,
+							outcome: "success",
+							source: "system",
+							organizationId:
+								typeof persistedSession.activeOrganizationId === "string"
+									? persistedSession.activeOrganizationId
+									: null,
+							message: "Session created",
+							metadata,
+							request,
+						});
+						if (managedInteractive || unmanagedMethod !== null) {
+							await appendInternalRuntimeAudit(transactionAdapter, {
+								actor,
+								action: "auth.login.succeeded",
+								subjectType: "session",
+								subjectId: persistedSession.id,
+								outcome: "success",
+								source: "system",
+								organizationId:
+									typeof persistedSession.activeOrganizationId === "string"
+										? persistedSession.activeOrganizationId
+										: null,
+								message: "Interactive authentication succeeded",
+								metadata: { ...metadata, methods },
+								request,
+							});
+						}
+					}
 				}
 				return {
 					...(res as Session),
