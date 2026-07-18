@@ -1,3 +1,4 @@
+import type { GenericEndpointContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
 import {
 	AfterTransactionHookError,
@@ -5,6 +6,7 @@ import {
 	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { createHash } from "@clearance/utils/hash";
 import { createOTP } from "@clearance/utils/otp";
@@ -22,6 +24,13 @@ import {
 	captureInternalSessionIssuanceContext,
 	ManagedSessionIssuanceError,
 } from "../../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../../internal/runtime-audit";
 import {
 	consumePreloadedStagedAuthenticationCapability,
 	createStagedAuthenticationBinding,
@@ -94,6 +103,22 @@ const generateTOTPBodySchema = z.object({
 		description: "The secret to generate the TOTP code",
 	}),
 });
+
+async function appendRuntimeAuditIfBound(
+	ctx: GenericEndpointContext,
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
+}
 
 const verifyTOTPBodySchema = z.object({
 	code: z.string().meta({
@@ -712,6 +737,19 @@ export const totp2fa = (
 						false,
 						issuanceContext,
 					);
+					await appendRuntimeAuditIfBound(ctx, adapter, {
+						actor: user.id,
+						action: gate.enrollment
+							? "auth.factor.enrolled"
+							: "auth.factor.used",
+						subjectType: "user",
+						subjectId: user.id,
+						outcome: "success",
+						source: "system",
+						organizationId: null,
+						message: gate.enrollment ? "TOTP factor enrolled" : "TOTP factor used",
+						metadata: { factor: "totp" },
+					});
 					await resetTwoFactorFailures(ctx, twoFactorTable, factor, adapter);
 					await queueAfterTransactionHook(
 						() => setSessionCookie(ctx, { session, user: updatedUser }),
@@ -1032,6 +1070,17 @@ export const totp2fa = (
 							false,
 							replacementIssuanceContext,
 						);
+						await appendRuntimeAuditIfBound(ctx, adapter, {
+							actor: user.id,
+							action: "auth.factor.enrolled",
+							subjectType: "user",
+							subjectId: user.id,
+							outcome: "success",
+							source: "system",
+							organizationId: null,
+							message: "TOTP factor enrolled",
+							metadata: { factor: "totp" },
+						});
 						return { newSession, updatedUser };
 					},
 				);
