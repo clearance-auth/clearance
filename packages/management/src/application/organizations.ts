@@ -1,7 +1,10 @@
 import {
 	archiveOrganization,
+	archiveOrganizationAuthoritative,
 	createOrganization,
+	createOrganizationAuthoritative,
 	updateOrganization,
+	updateOrganizationAuthoritative,
 	type ArchiveOrganizationResult,
 } from "../services/core.js";
 import type { ManagementStore } from "../store/types.js";
@@ -39,6 +42,16 @@ export async function createOrganizationUseCase(
 			ownerUserId,
 		});
 	}
+	if (store.storeV2Topology?.authoritative) {
+		return createOrganizationAuthoritative(store, {
+			name: input.name,
+			...(input.slug !== undefined ? { slug: input.slug } : {}),
+			projectId: context.scope.projectId,
+			environmentId: context.scope.environmentId,
+			actor: context.actor,
+			source: context.source,
+		});
+	}
 	return await withManagementUnitOfWork(store, (unitOfWork) =>
 		createOrganization(unitOfWork, {
 			name: input.name,
@@ -58,10 +71,17 @@ export async function updateOrganizationUseCase(
 	id: string,
 	input: { name?: string; slug?: string },
 ): Promise<Organization> {
-	return authRuntime
-		? await authRuntime.organizations.updateCoordinated(context, id, input)
-		: await withManagementUnitOfWork(store, (unitOfWork) =>
-				updateOrganization(unitOfWork, id, {
+	if (authRuntime) return await authRuntime.organizations.updateCoordinated(context, id, input);
+	if (store.storeV2Topology?.authoritative) {
+		return updateOrganizationAuthoritative(store, id, {
+			...input,
+			actor: context.actor,
+			source: context.source,
+			scope: context.scope,
+		});
+	}
+	return await withManagementUnitOfWork(store, (unitOfWork) =>
+		updateOrganization(unitOfWork, id, {
 					...input,
 					actor: context.actor,
 					source: context.source,
@@ -87,7 +107,13 @@ export async function archiveOrganizationUseCase(
 		scope: context.scope,
 	};
 	if (input.dryRun === true || input.confirm !== true) {
+		if (store.storeV2Topology?.authoritative) {
+			return archiveOrganizationAuthoritative(store, id, archiveInput);
+		}
 		return archiveOrganization(store, id, archiveInput);
+	}
+	if (store.storeV2Topology?.authoritative) {
+		return archiveOrganizationAuthoritative(store, id, archiveInput);
 	}
 	return withManagementUnitOfWork(store, (unitOfWork) =>
 		archiveOrganization(unitOfWork, id, archiveInput)
