@@ -136,6 +136,89 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 		await expect(pool.query(`UPDATE ${n("roles")} SET "organizationId" = $1 WHERE "projectId" = $2 AND "environmentId" = $3 AND "roleId" = $4`, ["org_7a", identity.projectId, identity.environmentId, "role.scope-change"])).rejects.toMatchObject({ code: "23514" });
 	});
 
+	it("owns role mutations with exact affected revisions and immutable built-in seeds", async () => {
+		const organizationId = "org_mutation";
+		await expect(authority.initializeOrganization({ organizationId })).resolves.toEqual({ organizationId, revision: "1", initialized: true });
+		await expect(authority.initializeOrganization({ organizationId })).resolves.toEqual({ organizationId, revision: "1", initialized: false });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.mutation", organizationId, slug: "mutation", name: "Mutation", description: null, builtIn: false, status: "active" },
+			actions: ["a:a", "a.a", "thing:read"],
+		})).resolves.toEqual({ changed: true, affectedOrganizations: [{ organizationId, previousRevision: "1", revision: "2" }] });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.mutation", organizationId, slug: "mutation", name: "Mutation", description: "updated", builtIn: false, status: "active" },
+			actions: ["a:a", "a.a", "thing:read", "thing:write"],
+		})).resolves.toEqual({ changed: true, affectedOrganizations: [{ organizationId, previousRevision: "2", revision: "3" }] });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.arbitrary-built-in", organizationId, slug: "arbitrary-built-in", name: "Arbitrary", description: null, builtIn: true, status: "active" },
+			actions: ["thing:admin"],
+		})).rejects.toMatchObject({ code: "AUTHORIZATION_ROLE_IMMUTABLE" });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.too-many-actions", organizationId, slug: "too-many-actions", name: "Too many", description: null, builtIn: false, status: "active" },
+			actions: Array.from({ length: 257 }, (_, index) => `limit:${index}`),
+		})).rejects.toMatchObject({ code: "AUTHORIZATION_ACTION_LIMIT_EXCEEDED" });
+		await expect(authority.listRoles({ organizationId })).resolves.toEqual(expect.arrayContaining([
+			expect.objectContaining({ roleId: "role.mutation", actions: ["a.a", "a:a", "thing:read", "thing:write"] }),
+			expect.objectContaining({
+				roleId: "role_builtin_owner",
+				organizationId: null,
+				slug: "owner",
+				name: "Owner",
+				description: "Full organization control including delete and access-control management",
+				builtIn: true,
+				status: "active",
+				actions: ["ac:create", "ac:delete", "ac:read", "ac:update", "invitation:cancel", "invitation:create", "member:create", "member:delete", "member:update", "organization:delete", "organization:update", "team:create", "team:delete", "team:update"],
+			}),
+		]));
+		const sharedOrganizationId = "org_shared_role_mutation";
+		await authority.initializeOrganization({ organizationId: sharedOrganizationId });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.shared.mutation", organizationId: null, slug: "shared-mutation", name: "Shared mutation", description: null, builtIn: false, status: "active" },
+			actions: ["thing:read"],
+		})).resolves.toEqual({ changed: true, affectedOrganizations: [] });
+		await authority.replaceSubjectRoles({ organizationId: sharedOrganizationId, subject: { kind: "principal", id: "principal_shared_mutation" }, roleIds: ["role.shared.mutation"] });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.shared.mutation", organizationId: null, slug: "shared-mutation", name: "Shared mutation", description: null, builtIn: false, status: "active" },
+			actions: ["thing:read", "thing:write"],
+		})).resolves.toEqual({ changed: true, affectedOrganizations: [{ organizationId: sharedOrganizationId, previousRevision: "2", revision: "3" }] });
+	});
+
+	it("atomically replaces assignments with CAS, owner protection, and caller rollback", async () => {
+		const organizationId = "org_mutation";
+		const subject = { kind: "principal" as const, id: "principal_mutation" };
+		await expect(authority.replaceSubjectRoles({ organizationId, subject, roleIds: ["role_builtin_owner", "role.mutation"], expectedRevision: "3" })).resolves.toEqual({
+			changed: true,
+			previousRevision: "3",
+			revision: "4",
+			roleIds: ["role.mutation", "role_builtin_owner"],
+		});
+		await expect(authority.readEffective({ organizationId, subject })).resolves.toMatchObject({
+			roleIds: ["role.mutation", "role_builtin_owner"],
+			actions: expect.arrayContaining(["ac:create", "organization:delete", "thing:read", "thing:write"]),
+			revision: "4",
+		});
+		await expect(authority.replaceSubjectRoles({ organizationId, subject, roleIds: ["role.mutation", "role_builtin_owner"], expectedRevision: "4" })).resolves.toEqual({
+			changed: false,
+			previousRevision: "4",
+			revision: "4",
+			roleIds: ["role.mutation", "role_builtin_owner"],
+		});
+		await expect(authority.replaceSubjectRoles({ organizationId, subject, roleIds: ["role.mutation"], expectedRevision: "3" })).rejects.toMatchObject({ code: "AUTHORIZATION_REVISION_STALE" });
+		await expect(authority.replaceSubjectRoles({ organizationId, subject, roleIds: [], expectedRevision: "4" })).rejects.toMatchObject({ code: "AUTHORIZATION_LAST_OWNER_PROTECTED" });
+		const otherOrganizationId = "org_mutation_other";
+		await authority.initializeOrganization({ organizationId: otherOrganizationId });
+		await expect(authority.replaceSubjectRoles({ organizationId: otherOrganizationId, subject: { kind: "principal", id: "principal_other" }, roleIds: ["role.mutation"] })).rejects.toMatchObject({ code: "AUTHORIZATION_ROLE_SCOPE_MISMATCH" });
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await authority.replaceSubjectRoles({ organizationId, subject: { kind: "principal", id: "principal_rollback" }, roleIds: ["role.mutation"], transaction: { rawTransactionQuery: client.query.bind(client) } });
+			await client.query("ROLLBACK");
+		} finally {
+			client.release();
+		}
+		await expect(authority.listSubjectAssignments({ organizationId, subject: { kind: "principal", id: "principal_rollback" } })).resolves.toEqual([]);
+		await expect(authority.readEffective({ organizationId, subject })).resolves.toMatchObject({ revision: "4", roleIds: ["role.mutation", "role_builtin_owner"] });
+	});
+
 	it("supports a safe custom schema and prefix and rejects an incompatible partial installation", async () => {
 		const customSchema = `authorization_custom_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
 		const partialSchema = `authorization_partial_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
