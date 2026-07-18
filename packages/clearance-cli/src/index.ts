@@ -721,6 +721,9 @@ async function main() {
 	const storeV2Principals = storeV2.command("principals").description("Relational principal authority");
 	storeV2Principals.command("cutover").description("Make normalized principals authoritative").action(remoteCommandAction);
 	storeV2Principals.command("rollback").description("Reverse-materialize principals into the snapshot").action(remoteCommandAction);
+	const storeV2Topology = storeV2.command("topology").description("Relational topology authority");
+	storeV2Topology.command("cutover").description("Make normalized topology authoritative").action(remoteCommandAction);
+	storeV2Topology.command("rollback").description("Reverse-materialize topology into the snapshot").action(remoteCommandAction);
 
 	// config
 	const config = program.command("config").description("Config");
