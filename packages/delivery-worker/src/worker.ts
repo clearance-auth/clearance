@@ -1,6 +1,11 @@
 import http, { type Server } from "node:http";
 import pg from "pg";
 import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleDeliveryLeaseError } from "@clearance/delivery";
+import {
+	startObservability,
+	type ObservabilityHandle,
+	withDeliveryProcessingSpan,
+} from "@clearance/observability-node";
 import type { WorkerConfig } from "./config.js";
 import { classifyEmailError, configuredEmailTransport, createEmailSender } from "./email.js";
 import { createJsonLogger, type WorkerLogger } from "./logger.js";
@@ -28,6 +33,45 @@ export class DeliveryDrainTimeoutError extends Error {
 		super(`Delivery worker drain timed out with ${inFlight} job(s) still in flight`);
 		this.name = "DeliveryDrainTimeoutError";
 	}
+}
+
+class DeliveryStopTimeoutError extends Error {
+	constructor() {
+		super("Delivery worker shutdown timed out");
+		this.name = "DeliveryStopTimeoutError";
+	}
+}
+
+function settleBeforeDeadline<T>(
+	operation: () => T | Promise<T>,
+	deadline: number,
+): Promise<T> {
+	const pending = Promise.resolve().then(operation);
+	// The deadline race owns the outcome; retain the late rejection so a hung
+	// cleanup stage cannot produce an unhandled rejection after shutdown ends.
+	void pending.catch(() => undefined);
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const timeout = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			reject(new DeliveryStopTimeoutError());
+		}, Math.max(0, deadline - Date.now()));
+		pending.then(
+			(value) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				resolve(value);
+			},
+			(error: unknown) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				reject(error);
+			},
+		);
+	});
 }
 
 export type WorkerReadiness = {
@@ -65,6 +109,8 @@ export class DeliveryWorker {
 	private heartbeatTimer?: NodeJS.Timeout;
 	private maintenanceTimer?: NodeJS.Timeout;
 	private maintenanceRunning = false;
+	private observability?: ObservabilityHandle;
+	private stopPromise?: Promise<void>;
 
 	constructor(config: WorkerConfig, dependencies: {
 		pool?: pg.Pool;
@@ -91,6 +137,7 @@ export class DeliveryWorker {
 	}
 
 	async initialize(options: { verifyEmail?: boolean; verifySmtp?: boolean } = {}): Promise<void> {
+		this.observability = await startObservability();
 		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state: "starting" }).catch(() => undefined);
 		const result = await this.store.migrate();
 		await this.store.assertRuntimeAuditTableReady();
@@ -189,91 +236,100 @@ export class DeliveryWorker {
 		if (this.draining || this.stopping) return false;
 		const leased = await this.store.claimNext({ workerId: this.config.workerId, leaseMs: this.config.leaseMs });
 		if (!leased) return false;
-		const claimedAt = performance.now();
-		let metricOutcome: DeliveryMetricOutcome = "finish_failed";
-		this.metrics.recordClaim(leased.channel);
-		this.logger.log("info", "delivery.claimed", { jobId: leased.id, eventId: leased.eventId, kind: leased.kind, attempt: leased.attemptCount });
-		try {
-			if (leased.channel !== "email" && leased.channel !== "webhook") {
-				await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: "transport.unsupported" });
-				metricOutcome = "dead";
-				return true;
-			}
-			const payload = await this.store.readLeasedPayload<unknown>({ jobId: leased.id, leaseToken: leased.leaseToken, keyring: this.config.keyring });
-			const email = leased.channel === "email"
-				? renderEmailPayload(payload, this.config)
-				: undefined;
-			const destination = email?.to ??
-				webhookDestination(payload);
-			await this.store.assertLeasedDestination({
-				jobId: leased.id,
-				leaseToken: leased.leaseToken,
-				destination,
-				keyring: this.config.keyring,
-			});
-			const result = await this.sendWithLeaseRenewal(
-				leased,
-				email
-					? () => this.sender.send(email, {
+		return withDeliveryProcessingSpan(
+			{
+				carrier: leased.traceCarrier,
+				channel: leased.channel,
+				transport: "postgres",
+			},
+			async () => {
+				const claimedAt = performance.now();
+				let metricOutcome: DeliveryMetricOutcome = "finish_failed";
+				this.metrics.recordClaim(leased.channel);
+				this.logger.log("info", "delivery.claimed", { jobId: leased.id, eventId: leased.eventId, kind: leased.kind, attempt: leased.attemptCount });
+				try {
+					if (leased.channel !== "email" && leased.channel !== "webhook") {
+						await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: "transport.unsupported" });
+						metricOutcome = "dead";
+						return true;
+					}
+					const payload = await this.store.readLeasedPayload<unknown>({ jobId: leased.id, leaseToken: leased.leaseToken, keyring: this.config.keyring });
+					const email = leased.channel === "email"
+						? renderEmailPayload(payload, this.config)
+						: undefined;
+					const destination = email?.to ??
+						webhookDestination(payload);
+					await this.store.assertLeasedDestination({
+						jobId: leased.id,
+						leaseToken: leased.leaseToken,
+						destination,
+						keyring: this.config.keyring,
+					});
+					const result = await this.sendWithLeaseRenewal(
+						leased,
+						email
+							? () => this.sender.send(email, {
+									jobId: leased.id,
+									eventId: leased.eventId,
+								})
+							: () => this.webhookSender.send(payload, {
+									jobId: leased.id,
+									eventId: leased.eventId,
+								}),
+					);
+					if (leased.channel === "email") this.emailHealthy = true;
+					try {
+						await this.store.markProviderAccepted({
+							jobId: leased.id,
+							leaseToken: leased.leaseToken,
+							workerId: this.config.workerId,
+							providerStatus: result.status,
+							providerRequestId: result.requestId,
+						});
+						await this.store.complete({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, providerStatus: result.status, providerRequestId: result.requestId });
+					} catch (error) {
+						throw new ProviderAcceptedUnconfirmedError(error);
+					}
+					this.logger.log("info", "delivery.delivered", { jobId: leased.id, eventId: leased.eventId, providerStatus: result.status });
+					metricOutcome = "delivered";
+				} catch (error) {
+					if (error instanceof ProviderAcceptedUnconfirmedError) {
+						metricOutcome = "accepted_unconfirmed";
+						this.logger.log("error", "delivery.provider_accepted_unconfirmed", {
 							jobId: leased.id,
 							eventId: leased.eventId,
-						})
-					: () => this.webhookSender.send(payload, {
-							jobId: leased.id,
-							eventId: leased.eventId,
-						}),
-			);
-			if (leased.channel === "email") this.emailHealthy = true;
-			try {
-				await this.store.markProviderAccepted({
-					jobId: leased.id,
-					leaseToken: leased.leaseToken,
-					workerId: this.config.workerId,
-					providerStatus: result.status,
-					providerRequestId: result.requestId,
-				});
-				await this.store.complete({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, providerStatus: result.status, providerRequestId: result.requestId });
-			} catch (error) {
-				throw new ProviderAcceptedUnconfirmedError(error);
-			}
-			this.logger.log("info", "delivery.delivered", { jobId: leased.id, eventId: leased.eventId, providerStatus: result.status });
-			metricOutcome = "delivered";
-		} catch (error) {
-			if (error instanceof ProviderAcceptedUnconfirmedError) {
-				metricOutcome = "accepted_unconfirmed";
-				this.logger.log("error", "delivery.provider_accepted_unconfirmed", {
-					jobId: leased.id,
-					eventId: leased.eventId,
-					error: error.cause,
-				});
+							error: error.cause,
+						});
+						return true;
+					}
+					if (error instanceof StaleDeliveryLeaseError) {
+						metricOutcome = "stale_lease";
+						this.logger.log("warn", "delivery.stale_lease", { jobId: leased.id, eventId: leased.eventId });
+						return true;
+					}
+					const classified = leased.channel === "webhook"
+						? classifyWebhookError(error)
+						: classifyEmailError(this.config, error);
+					if (leased.channel === "email" && /^(?:smtp|ses)\.(?:transport|timeout)$/.test(classified.errorClass)) {
+						this.emailHealthy = false;
+					}
+					try {
+						const result = classified.retryable
+							? await this.store.retry({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus })
+							: await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
+						this.logger.log(classified.retryable ? "warn" : "error", `delivery.${result.state}`, { jobId: leased.id, eventId: leased.eventId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
+						metricOutcome = result.state === "retry" ? "retry"
+							: result.state === "cancelled" ? "cancelled"
+							: "dead";
+					} catch (finishError) {
+						this.logger.log("error", "delivery.finish_failed", { jobId: leased.id, error: finishError });
+					}
+				} finally {
+					this.metrics.recordOutcome(leased.channel, metricOutcome, performance.now() - claimedAt);
+				}
 				return true;
-			}
-			if (error instanceof StaleDeliveryLeaseError) {
-				metricOutcome = "stale_lease";
-				this.logger.log("warn", "delivery.stale_lease", { jobId: leased.id, eventId: leased.eventId });
-				return true;
-			}
-			const classified = leased.channel === "webhook"
-				? classifyWebhookError(error)
-				: classifyEmailError(this.config, error);
-			if (leased.channel === "email" && /^(?:smtp|ses)\.(?:transport|timeout)$/.test(classified.errorClass)) {
-				this.emailHealthy = false;
-			}
-			try {
-				const result = classified.retryable
-					? await this.store.retry({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus })
-					: await this.store.dead({ jobId: leased.id, leaseToken: leased.leaseToken, workerId: this.config.workerId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
-				this.logger.log(classified.retryable ? "warn" : "error", `delivery.${result.state}`, { jobId: leased.id, eventId: leased.eventId, errorClass: classified.errorClass, providerStatus: classified.providerStatus });
-				metricOutcome = result.state === "retry" ? "retry"
-					: result.state === "cancelled" ? "cancelled"
-					: "dead";
-			} catch (finishError) {
-				this.logger.log("error", "delivery.finish_failed", { jobId: leased.id, error: finishError });
-			}
-		} finally {
-			this.metrics.recordOutcome(leased.channel, metricOutcome, performance.now() - claimedAt);
-		}
-		return true;
+			},
+		);
 	}
 
 	private async sendWithLeaseRenewal(
@@ -425,13 +481,12 @@ export class DeliveryWorker {
 		}
 	}
 
-	async drain(): Promise<void> {
+	async drain(deadline = Date.now() + this.config.drainTimeoutMs): Promise<void> {
 		if (!this.draining) {
 			this.draining = true;
 			this.logger.log("info", "worker.draining", { workerId: this.config.workerId, inFlight: this.inFlight.size });
 			await this.writeHeartbeat("draining").catch(() => undefined);
 		}
-		const deadline = Date.now() + this.config.drainTimeoutMs;
 		while (this.inFlight.size && Date.now() < deadline) await Promise.race([Promise.allSettled([...this.inFlight]), sleep(25)]);
 		if (this.inFlight.size) {
 			this.logger.log("error", "worker.drain_timeout", { inFlight: this.inFlight.size });
@@ -441,21 +496,46 @@ export class DeliveryWorker {
 
 	async stop(): Promise<void> {
 		if (this.stopped) return;
-		let drainError: unknown;
+		if (this.stopPromise) return this.stopPromise;
+		this.stopPromise = this.stopWithinDeadline();
+		return this.stopPromise;
+	}
+
+	private async stopWithinDeadline(): Promise<void> {
+		const deadline = Date.now() + this.config.drainTimeoutMs;
+		let firstError: unknown;
+		const recordError = (error: unknown) => {
+			firstError ??= error;
+		};
+		const runCleanup = async (operation: () => unknown | Promise<unknown>) => {
+			try {
+				await settleBeforeDeadline(operation, deadline);
+			} catch (error) {
+				recordError(error);
+			}
+		};
 		try {
-			await this.drain();
+			await settleBeforeDeadline(() => this.drain(deadline), deadline);
 		} catch (error) {
-			drainError = error;
+			recordError(error);
 		}
 		this.stopping = true;
 		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
 		if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
-		await this.writeHeartbeat("stopped").catch(() => undefined);
-		if (this.healthServer) await new Promise<void>((resolve) => this.healthServer!.close(() => resolve()));
-		this.sender.close();
-		await this.pool.end();
+		await runCleanup(() => this.writeHeartbeat("stopped"));
+		try {
+			if (this.healthServer) {
+				await runCleanup(
+					() => new Promise<void>((resolve) => this.healthServer!.close(() => resolve())),
+				);
+			}
+			await runCleanup(() => this.sender.close());
+			await runCleanup(() => this.pool.end());
+		} finally {
+			await runCleanup(() => this.observability?.shutdown());
+		}
 		this.stopped = true;
 		this.logger.log("info", "worker.stopped", { workerId: this.config.workerId });
-		if (drainError) throw drainError;
+		if (firstError) throw firstError;
 	}
 }
