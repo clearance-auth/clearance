@@ -1,4 +1,9 @@
 import { isAPIError } from "@clearance/core/utils/is-api-error";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	runWithTransaction,
+} from "@clearance/core/context";
 import type { User } from "@clearance/runtime";
 import { APIError } from "@clearance/runtime/api";
 import { setSessionCookie } from "@clearance/runtime/cookies";
@@ -38,6 +43,58 @@ import {
 	validateEmailDomain,
 } from "../utils";
 import { createIdP, createSP, findSAMLProvider } from "./helpers";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../../../runtime/src/internal/runtime-audit";
+
+function runtimeAuditBinding(ctx: { context: { options: object; adapter: object } }) {
+	return (
+		readInternalRuntimeAudit(ctx.context.options) ??
+		readInternalRuntimeAudit(ctx.context.adapter)
+	);
+}
+
+async function runSAMLTerminalTransaction<T>(ctx: any, fn: () => Promise<T>) {
+	if (!runtimeAuditBinding(ctx) || (await isTransactionActive(ctx.context.adapter))) {
+		return fn();
+	}
+	return runWithTransaction(ctx.context.adapter, fn);
+}
+
+async function appendSAMLAudit(
+	ctx: any,
+	input: {
+		action: "sso.login.succeeded" | "sso.provisioned";
+		userId: string;
+		isRegistration: boolean;
+		organizationId: string | null;
+	},
+) {
+	const binding = runtimeAuditBinding(ctx);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	const transaction = await getCurrentAdapter(ctx.context.adapter);
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	await appendInternalRuntimeAudit(transaction, {
+		actor: input.userId,
+		action: input.action,
+		subjectType: "user",
+		subjectId: input.userId,
+		outcome: "success",
+		source: "sso",
+		organizationId: input.organizationId,
+		message: "SSO protocol lifecycle completed",
+		metadata: {
+			protocol: "saml",
+			isRegistration: input.isRegistration,
+		},
+		request,
+	});
+}
 
 type RelayState = Awaited<ReturnType<typeof parseRelayState>>;
 
@@ -567,6 +624,7 @@ export async function processSAMLResponse(
 		ctx.context.baseURL;
 	const errorUrl = relayState?.errorURL || samlRedirectUrl;
 
+	return runSAMLTerminalTransaction(ctx, async () => {
 	let result: Awaited<ReturnType<typeof handleOAuthUserInfo>>;
 	try {
 		result = await handleOAuthUserInfo(ctx, {
@@ -619,6 +677,14 @@ export async function processSAMLResponse(
 			userInfo,
 			provider,
 		});
+		if (result.isRegister) {
+			await appendSAMLAudit(ctx, {
+				action: "sso.provisioned",
+				userId: user.id,
+				isRegistration: true,
+				organizationId: provider.organizationId ?? null,
+			});
+		}
 	}
 
 	// 17. Organization assignment
@@ -634,6 +700,12 @@ export async function processSAMLResponse(
 		},
 		provider,
 		provisioningOptions: options?.organizationProvisioning,
+	});
+	await appendSAMLAudit(ctx, {
+		action: "sso.login.succeeded",
+		userId: user.id,
+		isRegistration: Boolean(result.isRegister),
+		organizationId: provider.organizationId ?? null,
 	});
 
 	// 18. Set session cookie
@@ -690,4 +762,5 @@ export async function processSAMLResponse(
 		(url: string, settings?: { allowRelativePaths: boolean }) =>
 			ctx.context.isTrustedOrigin(url, settings),
 	);
+	});
 }
