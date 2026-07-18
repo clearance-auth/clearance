@@ -14,6 +14,7 @@ import {
 	createLocalScimFixtureServer,
 	createOrganization,
 	createScimConnection,
+	createEnvironment,
 	commitSetupLink,
 	createSetupLink,
 	createSsoConnection,
@@ -32,6 +33,10 @@ import {
 	rotateCredential,
 	rotateScimCredential,
 	rotateSsoCredential,
+	testScimConnection,
+	testScimConnectionReal,
+	testSsoConnection,
+	testSsoConnectionReal,
 	verifySsoOidcLocalProtocol,
 } from "../index.js";
 
@@ -479,6 +484,66 @@ describe("SCIM local HTTP protocol verification", () => {
 });
 
 describe("SSO local OIDC protocol verification", () => {
+	it("fails foreign-scope fixture, real, and local entrypoints before transport or mutation", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "Scope fence" });
+		const environmentB = createEnvironment(store, { projectId: initialized.project.id, name: "preview", kind: "preview" });
+		const foreign = createOrganization(store, { name: "Foreign", projectId: initialized.project.id, environmentId: environmentB.id });
+		const sso = createSsoConnection(store, { organizationId: foreign.id, protocol: "oidc", provider: "scope-test", issuer: "https://idp.example.test" });
+		const scim = createScimConnection(store, { organizationId: foreign.id, provider: "scope-test", endpoint: "https://directory.example.test", bearerToken: "must-not-send" });
+		const scope = { projectId: initialized.project.id, environmentId: initialized.environment.id };
+		const before = { traces: store.snapshot.traces.length, events: store.snapshot.events.length, sso: store.snapshot.identityConnections[0]!.status, scim: store.snapshot.directoryConnections[0]!.status };
+		let fetches = 0;
+		const fetchImpl: typeof fetch = async () => {
+			fetches += 1;
+			return new Response("unexpected", { status: 500 });
+		};
+		expect(() => testSsoConnection(store, sso.id, { scope })).toThrow(/not found/i);
+		expect(() => testScimConnection(store, scim.id, { scope })).toThrow(/not found/i);
+		await expect(testSsoConnectionReal(store, sso.id, { scope })).rejects.toMatchObject({ code: "SSO_NOT_FOUND" });
+		await expect(verifySsoOidcLocalProtocol(store, sso.id, { scope, fetchImpl })).rejects.toMatchObject({ code: "SSO_NOT_FOUND" });
+		await expect(testScimConnectionReal(store, scim.id, { scope, fetchImpl })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
+		expect(fetches).toBe(0);
+		expect({ traces: store.snapshot.traces.length, events: store.snapshot.events.length, sso: store.snapshot.identityConnections[0]!.status, scim: store.snapshot.directoryConnections[0]!.status }).toEqual(before);
+	});
+
+	it("refuses real SCIM apply on JsonStore before any user or control-plane mutation", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "SCIM atomic backend" });
+		const organization = createOrganization(store, { name: "Customer" });
+		const connection = createScimConnection(store, {
+			organizationId: organization.id,
+			provider: "fixture",
+			bearerToken: "scim-test-token",
+		});
+		const before = {
+			traces: store.snapshot.traces.length,
+			events: listEvents(store, { limit: 100 }).length,
+			memberships: store.snapshot.memberships.length,
+			status: store.snapshot.directoryConnections.find((row) => row.id === connection.id)!.status,
+		};
+		await expect(
+			testScimConnectionReal(store, connection.id, {
+				dryRun: false,
+				bearerToken: "scim-test-token",
+				scope: {
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+				},
+				users: [
+					{ userName: "first@example.test" },
+					{ userName: "second@example.test" },
+				],
+			}),
+		).rejects.toMatchObject({ code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED" });
+		expect({
+			traces: store.snapshot.traces.length,
+			events: listEvents(store, { limit: 100 }).length,
+			memberships: store.snapshot.memberships.length,
+			status: store.snapshot.directoryConnections.find((row) => row.id === connection.id)!.status,
+		}).toEqual(before);
+	});
+
 	it("exercises authorize URL state/nonce/PKCE and callback validation", async () => {
 		const store = tempStore();
 		initProject(store, { name: "OidcLocal" });
