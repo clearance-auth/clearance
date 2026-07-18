@@ -42,6 +42,7 @@ export * from "./services/scim-real.js";
 export * from "./services/live-conformance.js";
 export {
 	createSetupLink,
+	createSetupLinkAuthoritative,
 	redeemSetupLink,
 	reserveSetupLink,
 	commitSetupLink,
