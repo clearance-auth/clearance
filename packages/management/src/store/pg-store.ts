@@ -1615,9 +1615,24 @@ export class PgStore implements ManagementStore {
 				? new PgStoreV2PrincipalRepository(client, this.storeV2Shadow!.tables)
 				: undefined;
 			const principals = principalTransaction?.capability;
+			const topologyTransaction = [
+				"projects",
+				"environments",
+				"organizations",
+			].every((collection) =>
+				authoritativeCollections.includes(collection as StoreV2Collection),
+			)
+				? new PgStoreV2TopologyRepository(client, this.storeV2Shadow!.tables)
+				: undefined;
+			const topology = topologyTransaction?.capability;
 			const before = cloneSnapshot(base);
 			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			const revision = previousRevision + 1;
+			let auditActive = true;
+			const appendAudit = (input: AuditEventInput): AuditEvent => {
+				if (!auditActive) throw new TransactionCapabilityRevokedError();
+				return structuredClone(appendAuditEvent(base, structuredClone(input)));
+			};
 
 			let queryActive = true;
 			const pendingQueries = new Set<Promise<{
@@ -1837,6 +1852,8 @@ export class PgStore implements ManagementStore {
 				value = await fn({
 					data: base,
 					...(principals ? { principals } : {}),
+					...(topology ? { topology } : {}),
+					appendAudit,
 					query,
 					...(enqueueDelivery ? { enqueueDelivery } : {}),
 					...(controlDelivery ? { controlDelivery } : {}),
@@ -1848,15 +1865,18 @@ export class PgStore implements ManagementStore {
 			}
 			queryActive = false;
 			principalTransaction?.revoke();
+			topologyTransaction?.revoke();
+			auditActive = false;
 			// A caller cannot accidentally commit product state before an issued
 			// outbox/control write settles by forgetting to await the returned
 			// promise. Settle issued work even when the callback throws so no query or
 			// rejection can escape after this transaction starts rolling back.
 			const issued = await Promise.allSettled([
 				...pendingDeliveryEnqueues,
-					...pendingDeliveryControls,
-					...pendingWebhookFanouts,
+				...pendingDeliveryControls,
+				...pendingWebhookFanouts,
 				...(principalTransaction ? [principalTransaction.settleIssued()] : []),
+				...(topologyTransaction ? [topologyTransaction.settleIssued()] : []),
 			]);
 			issued.push(...await settleIssuedQueries());
 			if (callbackFailed) throw callbackError;
@@ -1869,6 +1889,16 @@ export class PgStore implements ManagementStore {
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
 				: undefined;
+			if (
+				topologyTransaction?.hasMutations() &&
+				(appendedEvents?.length ?? base.events.length - before.events.length) === 0
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_AUDIT_REQUIRED",
+					"Changed relational topology transactions must append an audit event.",
+				);
+			}
+			await topologyTransaction?.finalizeState();
 
 			const sync = await this.storeV2Shadow?.syncTransaction(
 				client,
@@ -1977,10 +2007,19 @@ export class PgStore implements ManagementStore {
 		authoritativeCollections: readonly StoreV2Collection[] = [],
 	): Promise<void> {
 		const principalsAuthoritative = authoritativeCollections.includes("principals");
+		const topologyAuthoritative = [
+			"projects",
+			"environments",
+			"organizations",
+		].every((collection) =>
+			authoritativeCollections.includes(collection as StoreV2Collection),
+		);
 		if (!principalsAuthoritative) {
 			await client.query(`DELETE FROM ${this.emailUniqueTable}`);
 		}
-		await client.query(`DELETE FROM ${this.slugUniqueTable}`);
+		if (!topologyAuthoritative) {
+			await client.query(`DELETE FROM ${this.slugUniqueTable}`);
+		}
 
 		if (!principalsAuthoritative) {
 			for (const p of snapshot.principals) {
@@ -1999,14 +2038,16 @@ export class PgStore implements ManagementStore {
 			}
 		}
 
-		for (const o of snapshot.organizations) {
-			if (o.status === "archived") continue;
-			await client.query(
-				`INSERT INTO ${this.slugUniqueTable}
+		if (!topologyAuthoritative) {
+			for (const o of snapshot.organizations) {
+				if (o.status === "archived") continue;
+				await client.query(
+					`INSERT INTO ${this.slugUniqueTable}
          (project_id, environment_id, slug, organization_id)
          VALUES ($1, $2, $3, $4)`,
-				[o.projectId, o.environmentId, o.slug, o.id],
-			);
+					[o.projectId, o.environmentId, o.slug, o.id],
+				);
+			}
 		}
 	}
 
