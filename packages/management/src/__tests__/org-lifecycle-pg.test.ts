@@ -34,15 +34,23 @@ import {
 	createUserInAuth,
 	ensureAuthMigrated,
 	getAuthBundle,
+	provisionOrganizationInAuth,
 	resetAuthBundle,
 	updateOrganizationInAuth,
 } from "../auth-bridge.js";
+import {
+	createScimConnectionReal,
+	testScimConnectionReal,
+} from "../services/scim-real.js";
+import { createSetupLink } from "../services/setup-links.js";
+import { createSsoConnectionReal } from "../services/sso-real.js";
 import {
 	initProject,
 	listEvents,
 	resolveOperatorScope,
 	syncRuntimeOrganizationToManagementDurable,
-} from "../index.js";
+	} from "../index.js";
+import { PostgresAuthorizationAuthority } from "../../../clearance-auth/src/authorization-authority.js";
 
 const DATABASE_URL =
 	process.env.CLEARANCE_ORG_TEST_DATABASE_URL ??
@@ -56,6 +64,10 @@ if (DATABASE_URL.includes(":5434")) {
 }
 
 const TEST_TABLE = `clearance_mgmt_org_lc_${process.pid}`;
+const TOPOLOGY_TABLE = `${TEST_TABLE}_topology`;
+const TOPOLOGY_PREFIX = `${TOPOLOGY_TABLE}_n_`;
+const STARTUP_ABSENT_TABLE = `${TEST_TABLE}_startup_absent`;
+const STARTUP_ABSENT_PREFIX = `${STARTUP_ABSENT_TABLE}_n_`;
 const DELIVERY_PREFIX = `org_lc_delivery_${process.pid}_`;
 const deliveryOptions = { prefix: DELIVERY_PREFIX } as const;
 const deliveryKeyInput = {
@@ -199,6 +211,7 @@ describe.skipIf(!available)(
 			NODE_ENV: process.env.NODE_ENV,
 			CLEARANCE_PROJECT_ID: process.env.CLEARANCE_PROJECT_ID,
 			CLEARANCE_ENV_ID: process.env.CLEARANCE_ENV_ID,
+			CLEARANCE_AUTHORIZATION_PREFIX: process.env.CLEARANCE_AUTHORIZATION_PREFIX,
 		};
 
 		process.env.DATABASE_URL = DATABASE_URL;
@@ -206,8 +219,24 @@ describe.skipIf(!available)(
 		process.env.CLEARANCE_BASE_URL = "http://localhost:3300";
 		process.env.NODE_ENV = "development";
 
+		async function resetTopologyFixture(): Promise<void> {
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				for (const table of [
+					`${TOPOLOGY_PREFIX}events`, `${TOPOLOGY_PREFIX}principals`,
+					`${TOPOLOGY_PREFIX}organizations`, `${TOPOLOGY_PREFIX}environments`,
+					`${TOPOLOGY_PREFIX}projects`, `${TOPOLOGY_PREFIX}meta`,
+					`${TOPOLOGY_TABLE}_principal_email`, `${TOPOLOGY_TABLE}_organization_slug`,
+					`${TOPOLOGY_TABLE}_idempotency`, TOPOLOGY_TABLE,
+				]) await pool.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+			} finally {
+				await pool.end();
+			}
+		}
+
 		afterEach(async () => {
 			await cleanupTracked().catch(() => undefined);
+			await resetTopologyFixture().catch(() => undefined);
 			createdRuntimeUserIds.clear();
 			createdRuntimeOrgIds.clear();
 			createdRuntimeMemberIds.clear();
@@ -242,6 +271,30 @@ describe.skipIf(!available)(
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_principal_email`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_organization_slug`);
+				for (const table of [
+					`${STARTUP_ABSENT_PREFIX}events`,
+					`${STARTUP_ABSENT_PREFIX}principals`,
+					`${STARTUP_ABSENT_PREFIX}organizations`,
+					`${STARTUP_ABSENT_PREFIX}environments`,
+					`${STARTUP_ABSENT_PREFIX}projects`,
+					`${STARTUP_ABSENT_PREFIX}meta`,
+					`${STARTUP_ABSENT_TABLE}_principal_email`,
+					`${STARTUP_ABSENT_TABLE}_organization_slug`,
+					`${STARTUP_ABSENT_TABLE}_idempotency`,
+					STARTUP_ABSENT_TABLE,
+					`${TOPOLOGY_PREFIX}events`,
+					`${TOPOLOGY_PREFIX}principals`,
+					`${TOPOLOGY_PREFIX}organizations`,
+					`${TOPOLOGY_PREFIX}environments`,
+					`${TOPOLOGY_PREFIX}projects`,
+					`${TOPOLOGY_PREFIX}meta`,
+					`${TOPOLOGY_TABLE}_principal_email`,
+					`${TOPOLOGY_TABLE}_organization_slug`,
+					`${TOPOLOGY_TABLE}_idempotency`,
+					TOPOLOGY_TABLE,
+				]) {
+					await pool.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+				}
 			} finally {
 				await pool.end().catch(() => undefined);
 			}
@@ -268,6 +321,146 @@ describe.skipIf(!available)(
 			await ensureAuthMigrated();
 			return store;
 		}
+
+		async function freshTopologyStore(): Promise<{
+			store: PgStore;
+			scope: { projectId: string; environmentId: string };
+		}> {
+			const store = await createPgStore(DATABASE_URL, {
+				tableName: TOPOLOGY_TABLE,
+				normalizedPrefix: TOPOLOGY_PREFIX,
+			});
+			stores.push(store);
+			const initialized = initProject(store, {
+				name: "Org Lifecycle Topology PG",
+				source: "cli",
+			});
+			await store.ready();
+			const scope = {
+				projectId: initialized.project.id,
+				environmentId: initialized.environment.id,
+			};
+			process.env.CLEARANCE_PROJECT_ID = scope.projectId;
+			process.env.CLEARANCE_ENV_ID = scope.environmentId;
+			await ensureAuthMigrated();
+			return { store, scope };
+		}
+
+		it("reconciles pending authz-v2 once on normal startup after topology authority is already cut over", async () => {
+			const startupTable = `${TEST_TABLE}_start`;
+			const startupPrefix = `${startupTable}_n_`;
+			const previousAuthorizationPrefix = process.env.CLEARANCE_AUTHORIZATION_PREFIX;
+			const previousProjectId = process.env.CLEARANCE_PROJECT_ID;
+			const previousEnvironmentId = process.env.CLEARANCE_ENV_ID;
+			const previousSecret = process.env.CLEARANCE_SECRET;
+			const prefix = `startupauthz${process.pid}`;
+			let store: PgStore | undefined;
+			let restarted: PgStore | undefined;
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				store = await createPgStore(DATABASE_URL, {
+					tableName: startupTable,
+					normalizedPrefix: startupPrefix,
+				});
+				const initialized = initProject(store, {
+					name: "Startup Reconciliation PG",
+					source: "cli",
+				});
+				await store.ready();
+				const scope = {
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+				};
+				process.env.CLEARANCE_PROJECT_ID = scope.projectId;
+				process.env.CLEARANCE_ENV_ID = scope.environmentId;
+				process.env.CLEARANCE_AUTHORIZATION_PREFIX = prefix;
+				resetAuthBundle();
+				await store.storeV2!.apply();
+				const activeOrganizationId = `org_startup_active_${process.pid}`;
+				const absentOrganizationId = `org_startup_absent_${process.pid}`;
+				const now = "2026-07-18T00:00:00.000Z";
+				await store.mutateDurable((data) => {
+				data.organizations.push({
+					id: activeOrganizationId,
+					projectId: scope.projectId,
+					environmentId: scope.environmentId,
+					name: "Startup authority",
+					slug: `startup-authority-${process.pid}`,
+					status: "active",
+					createdAt: now,
+					updatedAt: now,
+				});
+				});
+				// Authz-v2 is fully migrated while topology is still shadow. Its
+				// terminal reconciliation must wait for the later authoritative
+				// management identity, then run at normal startup.
+				await ensureAuthMigrated();
+				const legacy = new PostgresAuthorizationAuthority(pool, { ...scope, prefix });
+				await legacy.initializeOrganization({ organizationId: activeOrganizationId });
+				await legacy.initializeOrganization({ organizationId: absentOrganizationId });
+				// Keep the cutover itself free of the runtime bridge so the following
+				// fresh process, rather than cutover, proves the startup seam.
+				delete process.env.CLEARANCE_SECRET;
+				resetAuthBundle();
+				await store.storeV2!.cutoverEvents();
+				await store.storeV2!.cutoverTopology();
+				if (previousSecret === undefined) delete process.env.CLEARANCE_SECRET;
+				else process.env.CLEARANCE_SECRET = previousSecret;
+				resetAuthBundle();
+
+				restarted = await createPgStore(DATABASE_URL, {
+					tableName: startupTable,
+					normalizedPrefix: startupPrefix,
+				});
+				await expect(legacy.initializeOrganization({ organizationId: activeOrganizationId })).resolves.toMatchObject({ initialized: false });
+				await expect(legacy.initializeOrganization({ organizationId: absentOrganizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+				const audit = await pool.query<{ action: string; source: string; metadata: { terminalizedOrganizations?: number; terminalizedOrganizationIds?: string[] } }>(
+					`select action, source, metadata from ${startupPrefix}events where action = 'authorization.organizations.reconcile'`,
+				);
+				expect(audit.rows).toHaveLength(1);
+				expect(audit.rows[0]).toMatchObject({
+					action: "authorization.organizations.reconcile",
+					source: "migration",
+					metadata: { terminalizedOrganizations: 1, terminalizedOrganizationIds: [absentOrganizationId] },
+				});
+				const secondStartup = await createPgStore(DATABASE_URL, {
+					tableName: startupTable,
+					normalizedPrefix: startupPrefix,
+				});
+				await secondStartup.destroy();
+				const repeatedAudit = await pool.query(
+					`select 1 from ${startupPrefix}events where action = 'authorization.organizations.reconcile'`,
+				);
+				expect(repeatedAudit.rows).toHaveLength(1);
+				await expect(legacy.initializeOrganization({ organizationId: activeOrganizationId })).resolves.toMatchObject({ initialized: false });
+			} finally {
+				await restarted?.destroy().catch(() => undefined);
+				await store?.destroy().catch(() => undefined);
+				await pool.query(`DROP TABLE IF EXISTS "${prefix}_authz_actions", "${prefix}_authz_role_actions", "${prefix}_authz_roles", "${prefix}_authz_subject_role_assignments", "${prefix}_authz_service_accounts", "${prefix}_authz_service_account_credentials", "${prefix}_authz_revisions" CASCADE`).catch(() => undefined);
+				for (const table of [
+					`${startupPrefix}events`, `${startupPrefix}principals`, `${startupPrefix}organizations`,
+					`${startupPrefix}environments`, `${startupPrefix}projects`, `${startupPrefix}meta`,
+					`${startupTable}_principal_email`, `${startupTable}_organization_slug`,
+					`${startupTable}_idempotency`, startupTable,
+				]) await pool.query(`DROP TABLE IF EXISTS ${table} CASCADE`).catch(() => undefined);
+				await pool.end();
+				if (previousAuthorizationPrefix === undefined) delete process.env.CLEARANCE_AUTHORIZATION_PREFIX;
+				else process.env.CLEARANCE_AUTHORIZATION_PREFIX = previousAuthorizationPrefix;
+				if (previousProjectId === undefined) delete process.env.CLEARANCE_PROJECT_ID;
+				else process.env.CLEARANCE_PROJECT_ID = previousProjectId;
+				if (previousEnvironmentId === undefined) delete process.env.CLEARANCE_ENV_ID;
+				else process.env.CLEARANCE_ENV_ID = previousEnvironmentId;
+				if (previousSecret === undefined) delete process.env.CLEARANCE_SECRET;
+				else process.env.CLEARANCE_SECRET = previousSecret;
+				resetAuthBundle();
+			}
+		});
+
+		it("skips authorization reconciliation when the configured StoreV2 schema is absent", async () => {
+			const store = await createPgStore(DATABASE_URL, { tableName: STARTUP_ABSENT_TABLE, normalizedPrefix: STARTUP_ABSENT_PREFIX });
+			stores.push(store);
+			await expect(store.storeV2!.status()).resolves.toMatchObject({ phase: "absent" });
+		});
 
 		async function seedOwnerAndOrg(store: PgStore) {
 			const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -322,6 +515,27 @@ describe.skipIf(!available)(
 				[organizationId],
 			);
 			return Number(r.rows[0]?.c ?? 0);
+		}
+
+		async function runtimeEnterpriseProviderCounts(organizationId: string): Promise<{
+			sso: number;
+			scim: number;
+		}> {
+			const b = getAuthBundle();
+			const [sso, scim] = await Promise.all([
+				b.pool.query(
+					`select count(*)::int as count from "ssoProvider" where "organizationId" = $1`,
+					[organizationId],
+				),
+				b.pool.query(
+					`select count(*)::int as count from "scimProvider" where "organizationId" = $1`,
+					[organizationId],
+				),
+			]);
+			return {
+				sso: Number(sso.rows[0]?.count ?? 0),
+				scim: Number(scim.rows[0]?.count ?? 0),
+			};
 		}
 
 		it("update parity: same id/name/slug in runtime and management, one audit", async () => {
@@ -820,6 +1034,19 @@ describe.skipIf(!available)(
 				actor: "test",
 			});
 			trackMember(membership.id);
+			const authorization = getAuthBundle().authorization;
+			if (!authorization) throw new Error("authorization authority unavailable");
+			await authorization.createServiceAccount({
+				organizationId: organization.id,
+				serviceAccountId: `svc-archive-${stamp}`,
+				name: "Archive machine",
+				roleIds: ["role_builtin_member"],
+			});
+			const machineCredential = await authorization.createServiceAccountCredential({
+				organizationId: organization.id,
+				serviceAccountId: `svc-archive-${stamp}`,
+				credentialId: `cred-archive-${stamp}`,
+			});
 
 			expect(await runtimeMemberCount(organization.id)).toBeGreaterThanOrEqual(2);
 
@@ -845,6 +1072,17 @@ describe.skipIf(!available)(
 			expect(archived.wouldChange).toBe(true);
 			expect(archived.organization.id).toBe(organization.id);
 			expect(archived.organization.status).toBe("archived");
+			await expect(
+				authorization.readEffective({
+					organizationId: organization.id,
+					subject: { kind: "principal", id: owner.id },
+				}),
+			).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+			await expect(
+				authorization.authenticateServiceAccountCredential({
+					secret: machineCredential.secret,
+				}),
+			).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
 
 			// Runtime gone
 			expect(await runtimeOrgRow(organization.id)).toBeUndefined();
@@ -871,6 +1109,31 @@ describe.skipIf(!available)(
 				(e) => e.action === "orgs.archive" && e.subjectId === organization.id,
 			);
 			expect(audits).toHaveLength(1);
+			const authorizationPrefix =
+				process.env.CLEARANCE_AUTHORIZATION_PREFIX?.trim() || "clearance";
+			await getAuthBundle().pool.query(
+				`update ${authorizationPrefix}_authz_service_accounts set status = 'active'
+				 where "projectId" = $1 and "environmentId" = $2 and "organizationId" = $3`,
+				[authorization.scope.projectId, authorization.scope.environmentId, organization.id],
+			);
+			await getAuthBundle().pool.query(
+				`update ${authorizationPrefix}_authz_service_account_credentials
+				 set status = 'active', "revokedAt" = null
+				 where "projectId" = $1 and "environmentId" = $2 and "organizationId" = $3`,
+				[authorization.scope.projectId, authorization.scope.environmentId, organization.id],
+			);
+			const healed = await archiveOrganizationInAuth(store, organization.id, {
+				confirm: true,
+				actor: "test",
+				source: "cli",
+			});
+			expect(healed).toMatchObject({ idempotent: false, wouldChange: true });
+			await expect(
+				authorization.authenticateServiceAccountCredential({ secret: machineCredential.secret }),
+			).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+			expect(listEvents(store, { limit: 200 }).filter(
+				(e) => e.action === "orgs.archive.reconcile" && e.subjectId === organization.id,
+			)).toHaveLength(1);
 		});
 
 		it("re-archive is idempotent with no duplicate audit", async () => {
@@ -892,6 +1155,106 @@ describe.skipIf(!available)(
 					(e) => e.action === "orgs.archive" && e.subjectId === organization.id,
 				),
 			).toHaveLength(1);
+		});
+
+		it("settles enterprise create and archive atomically with no archived-org residue", async () => {
+			const store = await freshStore();
+			const { organization } = await seedOwnerAndOrg(store);
+			const beforeEvents = listEvents(store, { limit: 500 }).length;
+
+			// A failure after the runtime insert rolls back its provider row, the
+			// management connection, and the create audit as one transaction.
+			const restore = injectSqlFailureAfter(store, (sql) =>
+				sql.includes('insert into "ssoprovider"'),
+			);
+			try {
+				await expect(
+					createSsoConnectionReal(store, {
+						organizationId: organization.id,
+						provider: "okta",
+						protocol: "oidc",
+						issuer: "https://dev-example.okta.com/oauth2/default",
+						domain: `rollback-${organization.slug}.example`,
+						clientId: "rollback-client",
+						clientSecret: "rollback-client-secret",
+					}),
+				).rejects.toBeTruthy();
+			} finally {
+				restore();
+			}
+			await store.refresh();
+			expect(await runtimeEnterpriseProviderCounts(organization.id)).toEqual({
+				sso: 0,
+				scim: 0,
+			});
+			expect(
+				store.snapshot.identityConnections.some(
+					(connection) => connection.organizationId === organization.id,
+				),
+			).toBe(false);
+			expect(listEvents(store, { limit: 500 })).toHaveLength(beforeEvents);
+
+			await createSsoConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				protocol: "oidc",
+				issuer: "https://dev-example.okta.com/oauth2/default",
+				domain: `settle-${organization.slug}.example`,
+				clientId: "settle-client",
+				clientSecret: "settle-client-secret",
+			});
+			await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+			});
+			const ssoCapability = createSetupLink(store, {
+				organizationId: organization.id,
+				kind: "sso",
+			});
+			const scimCapability = createSetupLink(store, {
+				organizationId: organization.id,
+				kind: "scim",
+			});
+			void ssoCapability;
+			void scimCapability;
+			expect(await runtimeEnterpriseProviderCounts(organization.id)).toEqual({
+				sso: 1,
+				scim: 1,
+			});
+
+			await archiveOrganizationInAuth(store, organization.id, {
+				confirm: true,
+				actor: "test",
+			});
+			expect(await runtimeEnterpriseProviderCounts(organization.id)).toEqual({
+				sso: 0,
+				scim: 0,
+			});
+			expect(
+				store.snapshot.identityConnections.some(
+					(connection) => connection.organizationId === organization.id,
+				),
+			).toBe(false);
+			expect(
+				store.snapshot.directoryConnections.some(
+					(connection) => connection.organizationId === organization.id,
+				),
+			).toBe(false);
+			const capabilities = (store.snapshot.setupLinks ?? []).filter(
+				(capability) => capability.organizationId === organization.id,
+			);
+			expect(capabilities).toHaveLength(2);
+			expect(capabilities.every((capability) => capability.revokedAt)).toBe(true);
+			const archiveAudit = listEvents(store, { limit: 500 }).find(
+				(event) => event.action === "orgs.archive" && event.subjectId === organization.id,
+			);
+			expect(archiveAudit?.metadata.enterpriseSettlement).toMatchObject({
+				runtimeSsoProvidersDeleted: 1,
+				runtimeScimProvidersDeleted: 1,
+				identityConnectionsRemoved: 1,
+				directoryConnectionsRemoved: 1,
+				setupCapabilitiesRevoked: 2,
+			});
 		});
 
 		it("cross-scope archive fails closed with no write", async () => {
@@ -955,7 +1318,20 @@ describe.skipIf(!available)(
 
 		it("injected SQL failure rolls back archive (runtime + management + audit)", async () => {
 			const store = await freshStore();
-			const { organization } = await seedOwnerAndOrg(store);
+			const { owner, organization } = await seedOwnerAndOrg(store);
+			const authorization = getAuthBundle().authorization;
+			if (!authorization) throw new Error("authorization authority unavailable");
+			await authorization.createServiceAccount({
+				organizationId: organization.id,
+				serviceAccountId: `svc-rollback-${organization.id}`,
+				name: "Rollback machine",
+				roleIds: ["role_builtin_member"],
+			});
+			const machineCredential = await authorization.createServiceAccountCredential({
+				organizationId: organization.id,
+				serviceAccountId: `svc-rollback-${organization.id}`,
+				credentialId: `cred-rollback-${organization.id}`,
+			});
 			const beforeMembers = await runtimeMemberCount(organization.id);
 			const beforeEvents = listEvents(store, { limit: 500 }).length;
 
@@ -990,6 +1366,17 @@ describe.skipIf(!available)(
 				).length,
 			).toBeGreaterThanOrEqual(1);
 			expect(listEvents(store, { limit: 500 }).length).toBe(beforeEvents);
+			await expect(
+				authorization.readEffective({
+					organizationId: organization.id,
+					subject: { kind: "principal", id: owner.id },
+				}),
+			).resolves.toMatchObject({ organizationId: organization.id });
+			await expect(
+				authorization.authenticateServiceAccountCredential({
+					secret: machineCredential.secret,
+				}),
+			).resolves.toMatchObject({ organizationId: organization.id });
 		});
 
 		it("stable organization id is preserved across update and archive tombstone", async () => {
@@ -1013,6 +1400,251 @@ describe.skipIf(!available)(
 				store.snapshot.organizations.find((o) => o.id === stableId)?.status,
 			).toBe("archived");
 			expect(await runtimeOrgRow(stableId)).toBeUndefined();
+		});
+
+		it("uses relational-authoritative organizations after topology cutover", async () => {
+			const { store, scope } = await freshTopologyStore();
+			const { owner, organization } = await seedOwnerAndOrg(store);
+			await store.storeV2!.apply();
+			await store.storeV2!.cutoverEvents();
+			await store.storeV2!.cutoverTopology();
+
+			expect(store.storeV2Topology?.authoritative).toBe(true);
+			expect(store.snapshot.organizations).toEqual([]);
+
+			const provisioned = await provisionOrganizationInAuth(store, {
+				name: "Relational Provisioned Org",
+				slug: `relational-${organization.slug.slice(-12)}`,
+				ownerUserId: owner.id,
+				scope,
+				actor: "test",
+			});
+			trackOrg(provisioned);
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: provisioned.id,
+				}),
+			).toMatchObject({ id: provisioned.id, status: "active" });
+
+			const updated = await updateOrganizationInAuth(store, organization.id, {
+				name: "Relational Authority Org",
+				scope,
+				actor: "test",
+			});
+			expect(updated.name).toBe("Relational Authority Org");
+			expect((await runtimeOrgRow(organization.id))?.name).toBe(updated.name);
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: organization.id,
+				}),
+			).toMatchObject({ name: updated.name, status: "active" });
+
+			const dryRun = await archiveOrganizationInAuth(store, organization.id, {
+				dryRun: true,
+				scope,
+				actor: "test",
+			});
+			expect(dryRun).toMatchObject({ dryRun: true, wouldChange: true });
+
+			const archived = await archiveOrganizationInAuth(store, organization.id, {
+				confirm: true,
+				scope,
+				actor: "test",
+			});
+			expect(archived.organization).toMatchObject({
+				id: organization.id,
+				status: "archived",
+			});
+			expect(await runtimeOrgRow(organization.id)).toBeUndefined();
+			expect(await runtimeMemberCount(organization.id)).toBe(0);
+			expect(
+				await store.storeV2Topology!.getOrganization({
+					scope,
+					id: organization.id,
+				}),
+			).toMatchObject({ status: "archived" });
+			expect(
+				store.snapshot.memberships.filter(
+					(member) => member.organizationId === organization.id,
+				).every((member) => member.status === "removed"),
+			).toBe(true);
+
+			const events = await getAuthBundle().pool.query<{
+				action: string;
+				subject_id: string;
+			}>(
+				`select action, subject_id from ${TOPOLOGY_PREFIX}events
+				 where subject_id = $1 and action in ('orgs.update', 'orgs.archive')`,
+				[organization.id],
+			);
+			expect(events.rows).toEqual(expect.arrayContaining([
+				{ action: "orgs.update", subject_id: organization.id },
+				{ action: "orgs.archive", subject_id: organization.id },
+			]));
+		});
+
+		it("applies SCIM users atomically and rolls every plane back on a late failure", async () => {
+			const { store, scope } = await freshTopologyStore();
+			const { organization } = await seedOwnerAndOrg(store);
+			await store.storeV2!.apply();
+			await store.storeV2!.cutoverEvents();
+			await store.storeV2!.cutoverPrincipals();
+			await store.storeV2!.cutoverTopology();
+
+			const connection = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				scope,
+			});
+			const successEmail = `scim-success-${Date.now()}@org-lc.test`;
+			const success = await testScimConnectionReal(store, connection.id, {
+				dryRun: false,
+				bearerToken: connection.bearerTokenOnce,
+				scope,
+				users: [{ userName: successEmail, displayName: "SCIM Success" }],
+			});
+			expect(success.pass).toBe(true);
+			const runtime = await getAuthBundle().pool.query(
+				`select id from "user" where lower(email) = lower($1)`,
+				[successEmail],
+			);
+			expect(runtime.rows).toHaveLength(1);
+			expect(
+				await store.storeV2Principals!.getById({
+					scope,
+					id: String(runtime.rows[0]!.id),
+				}),
+			).toMatchObject({ email: successEmail });
+
+			const rollbackEmail = `scim-rollback-${Date.now()}@org-lc.test`;
+			const tracesBefore = store.snapshot.traces.length;
+			const eventsBefore = listEvents(store, { limit: 500 }).length;
+			const restore = injectSqlFailureAfter(store, (sql) =>
+				sql.includes("insert into account"),
+			);
+			try {
+				await expect(
+					testScimConnectionReal(store, connection.id, {
+						dryRun: false,
+						bearerToken: connection.bearerTokenOnce,
+						scope,
+						users: [{ userName: rollbackEmail, displayName: "SCIM Rollback" }],
+					}),
+				).rejects.toBeTruthy();
+			} finally {
+				restore();
+			}
+			await store.refresh();
+			const rolledBackRuntime = await getAuthBundle().pool.query(
+				`select id from "user" where lower(email) = lower($1)`,
+				[rollbackEmail],
+			);
+			expect(rolledBackRuntime.rows).toHaveLength(0);
+			expect(
+				await store.storeV2Principals!.findActiveByEmail({
+					scope,
+					email: rollbackEmail,
+				}),
+			).toBeNull();
+			expect(store.snapshot.traces).toHaveLength(tracesBefore);
+			expect(listEvents(store, { limit: 500 })).toHaveLength(eventsBefore);
+		});
+
+		it("reconciles a locked runtime owner membership into normalized authorization without partial writes", async () => {
+			delete process.env.CLEARANCE_PROJECT_ID;
+			delete process.env.CLEARANCE_ENV_ID;
+			const store = await freshStore();
+			const scope = resolveOperatorScope(store);
+			const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const owner = await createUserInAuth({
+				email: `reconcile-owner-${stamp}@org-lc.test`,
+				name: "Reconcile Owner",
+				password: "OrgLifecycle1!",
+				managementStore: store,
+			});
+			trackUser(owner);
+			const wrongOwner = await createUserInAuth({
+				email: `reconcile-wrong-${stamp}@org-lc.test`,
+				name: "Wrong Owner",
+				password: "OrgLifecycle1!",
+				managementStore: store,
+			});
+			trackUser(wrongOwner);
+			const runtimeOrg = await createOrgInAuth({
+				name: `Reconcile ${stamp}`,
+				slug: `reconcile-${stamp}`,
+				userId: owner.id,
+			});
+			trackOrg(runtimeOrg);
+			if (!runtimeOrg.ownerMembershipId) throw new Error("runtime owner membership missing");
+			trackMember(runtimeOrg.ownerMembershipId);
+
+			await expect(
+				syncRuntimeOrganizationToManagementDurable(store, runtimeOrg, wrongOwner.id, {
+					scope,
+					actor: "test",
+				}),
+			).rejects.toMatchObject({ code: "RUNTIME_OWNER_MEMBERSHIP_MISMATCH" });
+			expect(store.snapshot.organizations.some((organization) => organization.id === runtimeOrg.id)).toBe(false);
+			expect(store.snapshot.memberships.some((membership) => membership.organizationId === runtimeOrg.id)).toBe(false);
+
+			const reconciled = await syncRuntimeOrganizationToManagementDurable(store, runtimeOrg, owner.id, {
+				scope,
+				actor: "test",
+			});
+			expect(reconciled).toMatchObject({ id: runtimeOrg.id, slug: runtimeOrg.slug });
+			expect(store.snapshot.memberships.find((membership) => membership.organizationId === runtimeOrg.id && membership.principalId === owner.id)).toMatchObject({
+			id: runtimeOrg.ownerMembershipId,
+			role: "owner",
+			status: "active",
+		});
+			const authorization = getAuthBundle().authorization;
+			if (!authorization) throw new Error("authorization authority unavailable");
+			expect((await authorization.readEffective({
+				organizationId: runtimeOrg.id,
+				subject: { kind: "principal", id: owner.id },
+			})).roleIds).toEqual(["role_builtin_owner"]);
+			await getAuthBundle().pool.query(
+				`delete from clearance_authz_subject_role_assignments
+				 where "projectId" = $1 and "environmentId" = $2
+				 and "organizationId" = $3 and "subjectKind" = 'principal'
+				 and "subjectId" = $4 and "roleId" = 'role_builtin_owner'`,
+				[scope.projectId, scope.environmentId, runtimeOrg.id, owner.id],
+			);
+			const authorizationAuditCount = listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === runtimeOrg.id && event.action === "authorization.owner.reconcile",
+			).length;
+			await syncRuntimeOrganizationToManagementDurable(store, runtimeOrg, owner.id, {
+				scope,
+				actor: "test",
+			});
+			expect((await authorization.readEffective({
+				organizationId: runtimeOrg.id,
+				subject: { kind: "principal", id: owner.id },
+			})).roleIds).toEqual(["role_builtin_owner"]);
+			expect(listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === runtimeOrg.id && event.action === "authorization.owner.reconcile",
+			).length).toBe(authorizationAuditCount + 1);
+			await syncRuntimeOrganizationToManagementDurable(store, runtimeOrg, owner.id, {
+				scope,
+				actor: "test",
+			});
+			expect(listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === runtimeOrg.id && event.action === "authorization.owner.reconcile",
+			).length).toBe(authorizationAuditCount + 1);
+
+			const auditCount = listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === runtimeOrg.id && event.action.startsWith("orgs."),
+			).length;
+			await syncRuntimeOrganizationToManagementDurable(store, runtimeOrg, owner.id, {
+				scope,
+				actor: "test",
+			});
+			expect(listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === runtimeOrg.id && event.action.startsWith("orgs."),
+			).length).toBe(auditCount);
 		});
 	},
 );
