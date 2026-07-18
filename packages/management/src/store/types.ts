@@ -5,6 +5,7 @@ import type {
 } from "../types/resources.js";
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
+import type { RuntimeAuditEventReader } from "./runtime-audit-events.js";
 import type {
 	DeliveryControlPreview,
 	DeliveryJobPage,
@@ -88,6 +89,8 @@ export interface StoreV2EventReader {
 		cursor?: PageCursorKey;
 		action?: string;
 		organizationId?: string;
+		/** Strict archival upper bound for bounded exports. */
+		before?: string;
 	}): Promise<{ events: AuditEvent[]; hasMore: boolean }>;
 }
 
@@ -278,6 +281,8 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Postgres-only, explicitly activated normalized shadow-store migration. */
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
+	/** PostgreSQL runtime audit authority; absent on the local JSON backend. */
+	readonly runtimeAuditEvents?: RuntimeAuditEventReader;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
 	/** Direct normalized transaction, available only after principal authority. */
 	mutateStoreV2Principals?<T>(
