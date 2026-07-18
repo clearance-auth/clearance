@@ -12,6 +12,18 @@ import {
 	normalizeRuntimeAuthenticationPolicyOverride,
 } from "../../runtime/src/internal/authentication-policy.js";
 import pg from "pg";
+import type {
+	ClearanceAuthenticationPolicyApplyResult,
+	ClearanceAuthenticationPolicy,
+	ClearanceAuthenticationPolicyGetResult,
+	ClearanceAuthenticationPolicyOverride,
+	ClearanceAuthenticationPolicyPlanResult,
+	ClearanceAuthenticationPolicyTransaction,
+	ClearanceAuthenticationUnlockAuthorityCounts,
+	ClearanceAuthenticationUnlockKind,
+	ClearanceAuthenticationUnlockPreview,
+	ClearanceAuthenticationUnlockResult,
+} from "./public-types/index.js";
 
 const POLICY_TABLE = "authenticationPolicy";
 const OVERRIDE_TABLE = "authenticationPolicyOrganizationOverride";
@@ -39,9 +51,12 @@ export type AuthenticationPolicyAuthorityMigrationPlan = {
 };
 
 export class PostgresAuthenticationPolicyAuthorityError extends Error {
-	constructor(message: string, options?: ErrorOptions) {
+	readonly code: string;
+
+	constructor(message: string, options?: ErrorOptions & { code?: string }) {
 		super(message, options);
 		this.name = "PostgresAuthenticationPolicyAuthorityError";
+		this.code = options?.code ?? "AUTHENTICATION_POLICY_AUTHORITY_UNAVAILABLE";
 	}
 }
 
@@ -354,11 +369,7 @@ type PolicyRow = {
 	assuranceMaxAgeSeconds: unknown;
 };
 
-type ReaderRow = PolicyRow & {
-	projectId: unknown;
-	environmentId: unknown;
-	subjectId: unknown;
-	organizationId: unknown;
+type OverrideRow = {
 	overrideRevision: unknown;
 	overridePasswordLockoutEnabled: unknown;
 	overridePasswordLockoutMaxFailedAttempts: unknown;
@@ -375,8 +386,22 @@ type ReaderRow = PolicyRow & {
 	overrideAssuranceMaxAgeSeconds: unknown;
 };
 
-function authorityError(message: string, cause?: unknown): PostgresAuthenticationPolicyAuthorityError {
-	return new PostgresAuthenticationPolicyAuthorityError(message, cause === undefined ? undefined : { cause });
+type ReaderRow = PolicyRow & OverrideRow & {
+	projectId: unknown;
+	environmentId: unknown;
+	subjectId: unknown;
+	organizationId: unknown;
+};
+
+function authorityError(
+	message: string,
+	cause?: unknown,
+	code?: string,
+): PostgresAuthenticationPolicyAuthorityError {
+	return new PostgresAuthenticationPolicyAuthorityError(message, {
+		...(cause === undefined ? {} : { cause }),
+		...(code === undefined ? {} : { code }),
+	});
 }
 
 function identifier(value: unknown, label: string): string {
@@ -498,7 +523,7 @@ function setIfPresent(
 	if (value !== null && value !== undefined) target[key] = value;
 }
 
-function decodeOverride(row: ReaderRow): RuntimeAuthenticationPolicyOverride | null {
+function decodeOverride(row: OverrideRow): RuntimeAuthenticationPolicyOverride | null {
 	if (row.overrideRevision === null || row.overrideRevision === undefined) return null;
 	const passwordLockout: Record<string, unknown> = {};
 	setIfPresent(passwordLockout, "enabled", row.overridePasswordLockoutEnabled);
@@ -635,6 +660,294 @@ async function inspectCatalog(
 		scopeRevision: canonicalRevision(row.revision),
 		scopePolicy: decodeEnvironmentPolicy(row),
 	};
+}
+
+type LoadedPolicyState = Readonly<{
+	revision: string;
+	environment: RuntimeAuthenticationPolicy;
+	organizationOverride: Readonly<{
+		revision: string;
+		policy: RuntimeAuthenticationPolicyOverride;
+	}> | null;
+	effective: RuntimeAuthenticationPolicy;
+}>;
+
+type LockoutRow = {
+	id: unknown;
+	failedCount: unknown;
+	reservations: unknown;
+	lockedUntil: unknown;
+};
+
+const POLICY_SELECT = `SELECT revision::text AS revision,
+	"passwordLockoutEnabled", "passwordLockoutMaxFailedAttempts", "passwordLockoutDurationSeconds",
+	"factorLockoutEnabled", "factorLockoutMaxFailedAttempts", "factorLockoutDurationSeconds",
+	"minimumAssurance", "allowedFactorTotp", "allowedFactorPasskey",
+	"trustedDeviceEnabled", "trustedDeviceMaxAgeSeconds", "assuranceMaxAgeSeconds"
+FROM "${POLICY_TABLE}"
+WHERE "projectId" = $1 AND "environmentId" = $2`;
+
+const OVERRIDE_SELECT = `SELECT revision::text AS "overrideRevision",
+	"passwordLockoutEnabled" AS "overridePasswordLockoutEnabled",
+	"passwordLockoutMaxFailedAttempts" AS "overridePasswordLockoutMaxFailedAttempts",
+	"passwordLockoutDurationSeconds" AS "overridePasswordLockoutDurationSeconds",
+	"factorLockoutEnabled" AS "overrideFactorLockoutEnabled",
+	"factorLockoutMaxFailedAttempts" AS "overrideFactorLockoutMaxFailedAttempts",
+	"factorLockoutDurationSeconds" AS "overrideFactorLockoutDurationSeconds",
+	"minimumAssurance" AS "overrideMinimumAssurance",
+	"allowedFactorTotp" AS "overrideAllowedFactorTotp",
+	"allowedFactorPasskey" AS "overrideAllowedFactorPasskey",
+	"trustedDeviceEnabled" AS "overrideTrustedDeviceEnabled",
+	"trustedDeviceMaxAgeSeconds" AS "overrideTrustedDeviceMaxAgeSeconds",
+	"assuranceMaxAgeSecondsSet" AS "overrideAssuranceMaxAgeSecondsSet",
+	"assuranceMaxAgeSeconds" AS "overrideAssuranceMaxAgeSeconds"
+FROM "${OVERRIDE_TABLE}"
+WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3`;
+
+function transactionQueryable(
+	transaction: ClearanceAuthenticationPolicyTransaction,
+): Queryable {
+	if (typeof transaction.rawTransactionQuery !== "function") {
+		throw authorityError(
+			"Authentication policy transaction is invalid",
+			undefined,
+			"AUTHENTICATION_POLICY_INPUT_INVALID",
+		);
+	}
+	return {
+		query: transaction.rawTransactionQuery.bind(transaction),
+	};
+}
+
+function invalidPolicyInput(cause: unknown): never {
+	if (cause instanceof PostgresAuthenticationPolicyAuthorityError) throw cause;
+	throw authorityError(
+		"Authentication policy input is invalid",
+		cause,
+		"AUTHENTICATION_POLICY_INPUT_INVALID",
+	);
+}
+
+function normalizedEnvironmentInput(value: unknown): RuntimeAuthenticationPolicy {
+	try {
+		return normalizeRuntimeAuthenticationPolicy(value);
+	} catch (error) {
+		return invalidPolicyInput(error);
+	}
+}
+
+function normalizedOverrideInput(value: unknown): RuntimeAuthenticationPolicyOverride {
+	try {
+		return normalizeRuntimeAuthenticationPolicyOverride(value);
+	} catch (error) {
+		return invalidPolicyInput(error);
+	}
+}
+
+function effectivePolicy(
+	environment: RuntimeAuthenticationPolicy,
+	override: RuntimeAuthenticationPolicyOverride | null,
+): RuntimeAuthenticationPolicy {
+	try {
+		return applyRuntimeAuthenticationPolicyOverride(environment, override ?? {});
+	} catch (error) {
+		return invalidPolicyInput(error);
+	}
+}
+
+function incrementRevision(value: string): string {
+	const revision = BigInt(value);
+	if (revision >= POSTGRES_BIGINT_MAX) {
+		throw authorityError(
+			"Authentication policy revision cannot be incremented",
+			undefined,
+			"AUTHENTICATION_POLICY_REVISION_OVERFLOW",
+		);
+	}
+	return (revision + 1n).toString();
+}
+
+async function assertInstalledCatalog(
+	queryable: Queryable,
+	identity: RuntimeAuthenticationPolicyIdentity,
+): Promise<void> {
+	const state = await inspectCatalog(queryable, identity);
+	if (!state.policyExists || !state.overrideExists || !state.scopeExists) {
+		throw authorityError(
+			"PostgreSQL authentication-policy authority scope is unavailable",
+			undefined,
+			"AUTHENTICATION_POLICY_SCOPE_NOT_FOUND",
+		);
+	}
+}
+
+async function loadPolicyState(
+	queryable: Queryable,
+	identity: RuntimeAuthenticationPolicyIdentity,
+	organizationId: string | undefined,
+	lock: boolean,
+): Promise<LoadedPolicyState> {
+	await assertInstalledCatalog(queryable, identity);
+	const policy = await queryable.query<PolicyRow>(
+		`${POLICY_SELECT}${lock ? " FOR UPDATE" : ""}`,
+		[identity.projectId, identity.environmentId],
+	);
+	if (policy.rows.length !== 1) {
+		throw authorityError(
+			"PostgreSQL authentication-policy authority scope is unavailable",
+			undefined,
+			"AUTHENTICATION_POLICY_SCOPE_NOT_FOUND",
+		);
+	}
+	const policyRow = policy.rows[0]!;
+	const revision = canonicalRevision(policyRow.revision);
+	const environment = decodeEnvironmentPolicy(policyRow);
+	let organizationOverride: LoadedPolicyState["organizationOverride"] = null;
+	if (organizationId !== undefined) {
+		const organization = await queryable.query<{ id: unknown }>(
+			`SELECT id FROM organization WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
+			[organizationId],
+		);
+		if (organization.rows.length !== 1 || organization.rows[0]?.id !== organizationId) {
+			throw authorityError(
+				"Authentication policy organization was not found",
+				undefined,
+				"AUTHENTICATION_POLICY_ORGANIZATION_NOT_FOUND",
+			);
+		}
+		const override = await queryable.query<OverrideRow>(
+			`${OVERRIDE_SELECT}${lock ? " FOR UPDATE" : ""}`,
+			[identity.projectId, identity.environmentId, organizationId],
+		);
+		if (override.rows.length > 1) {
+			throw authorityError("PostgreSQL authentication-policy override scope is not unique");
+		}
+		const overrideRow = override.rows[0];
+		if (overrideRow) {
+			const overrideRevision = canonicalRevision(overrideRow.overrideRevision);
+			if (BigInt(overrideRevision) > BigInt(revision)) {
+				throw authorityError("Authentication policy override revision exceeds environment revision");
+			}
+			organizationOverride = Object.freeze({
+				revision: overrideRevision,
+				policy: decodeOverride(overrideRow)!,
+			});
+		}
+	}
+	return Object.freeze({
+		revision,
+		environment,
+		organizationOverride,
+		effective: effectivePolicy(environment, organizationOverride?.policy ?? null),
+	});
+}
+
+function policyParameters(policy: RuntimeAuthenticationPolicy): readonly unknown[] {
+	return [
+		policy.passwordLockout.enabled,
+		policy.passwordLockout.maxFailedAttempts,
+		policy.passwordLockout.durationSeconds,
+		policy.factorLockout.enabled,
+		policy.factorLockout.maxFailedAttempts,
+		policy.factorLockout.durationSeconds,
+		policy.minimumAssurance,
+		policy.allowedFactors.totp,
+		policy.allowedFactors.passkey,
+		policy.trustedDevice.enabled,
+		policy.trustedDevice.maxAgeSeconds,
+		policy.assuranceMaxAgeSeconds,
+	];
+}
+
+function hasOwn(value: object, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function overrideParameters(
+	policy: RuntimeAuthenticationPolicyOverride,
+): readonly unknown[] {
+	return [
+		policy.passwordLockout?.enabled ?? null,
+		policy.passwordLockout?.maxFailedAttempts ?? null,
+		policy.passwordLockout?.durationSeconds ?? null,
+		policy.factorLockout?.enabled ?? null,
+		policy.factorLockout?.maxFailedAttempts ?? null,
+		policy.factorLockout?.durationSeconds ?? null,
+		policy.minimumAssurance ?? null,
+		policy.allowedFactors?.totp ?? null,
+		policy.allowedFactors?.passkey ?? null,
+		policy.trustedDevice?.enabled ?? null,
+		policy.trustedDevice?.maxAgeSeconds ?? null,
+		hasOwn(policy, "assuranceMaxAgeSeconds"),
+		policy.assuranceMaxAgeSeconds ?? null,
+	];
+}
+
+function unlockKind(value: unknown): ClearanceAuthenticationUnlockKind {
+	if (value !== "password" && value !== "factor" && value !== "all") {
+		throw authorityError(
+			"Authentication unlock kind is invalid",
+			undefined,
+			"AUTHENTICATION_POLICY_INPUT_INVALID",
+		);
+	}
+	return value;
+}
+
+function unlockCounts(rows: readonly LockoutRow[]): ClearanceAuthenticationUnlockAuthorityCounts {
+	let failedAttemptRows = 0;
+	let reservationRows = 0;
+	let lockedRows = 0;
+	let wouldChangeRows = 0;
+	for (const row of rows) {
+		if (typeof row.id !== "string" || row.id.length === 0) {
+			throw authorityError("Authentication lockout authority returned an invalid row");
+		}
+		if (
+			(row.failedCount !== null &&
+				(typeof row.failedCount !== "number" || !Number.isSafeInteger(row.failedCount))) ||
+			(row.reservations !== null && typeof row.reservations !== "string")
+		) {
+			throw authorityError("Authentication lockout authority returned an invalid row");
+		}
+		if (typeof row.failedCount === "number" && row.failedCount !== 0) failedAttemptRows++;
+		if (typeof row.reservations === "string" && row.reservations !== "[]") reservationRows++;
+		if (row.lockedUntil !== null) lockedRows++;
+		if (
+			row.failedCount !== 0 ||
+			row.reservations !== "[]" ||
+			row.lockedUntil !== null
+		) {
+			wouldChangeRows++;
+		}
+	}
+	return Object.freeze({
+		matchedRows: rows.length,
+		failedAttemptRows,
+		reservationRows,
+		lockedRows,
+		wouldChangeRows,
+	});
+}
+
+function unlockPreview(
+	userId: string,
+	kind: ClearanceAuthenticationUnlockKind,
+	passwordRows: readonly LockoutRow[],
+	factorRows: readonly LockoutRow[],
+): ClearanceAuthenticationUnlockPreview {
+	const password = unlockCounts(passwordRows);
+	const factor = unlockCounts(factorRows);
+	return Object.freeze({
+		schemaVersion: "v1",
+		userId,
+		kind,
+		password,
+		factor,
+		wouldChange:
+			(kind !== "factor" && password.wouldChangeRows > 0) ||
+			(kind !== "password" && factor.wouldChangeRows > 0),
+	});
 }
 
 const READ_SQL = `WITH catalog_tables AS (
@@ -779,7 +1092,7 @@ export class PostgresAuthenticationPolicyAuthority implements RuntimeAuthenticat
 		this.initialPolicy = normalizeRuntimeAuthenticationPolicy(seed);
 	}
 
-	async plan(): Promise<AuthenticationPolicyAuthorityMigrationPlan> {
+	async planMigration(): Promise<AuthenticationPolicyAuthorityMigrationPlan> {
 		const state = await inspectCatalog(this.pool, this.identity);
 		const pendingTables = Number(!state.policyExists) + Number(!state.overrideExists);
 		const pendingFields =
@@ -833,6 +1146,425 @@ export class PostgresAuthenticationPolicyAuthority implements RuntimeAuthenticat
 		} finally {
 			client.release();
 		}
+	}
+
+	private async runRead<T>(
+		transaction: ClearanceAuthenticationPolicyTransaction | undefined,
+		operation: (queryable: Queryable) => Promise<T>,
+	): Promise<T> {
+		try {
+			return await operation(
+				transaction === undefined
+					? this.pool
+					: transactionQueryable(transaction),
+			);
+		} catch (error) {
+			if (error instanceof PostgresAuthenticationPolicyAuthorityError) throw error;
+			throw authorityError("PostgreSQL authentication-policy authority operation failed", error);
+		}
+	}
+
+	private async runMutation<T>(
+		transaction: ClearanceAuthenticationPolicyTransaction | undefined,
+		operation: (queryable: Queryable) => Promise<T>,
+	): Promise<T> {
+		if (transaction !== undefined) {
+			return this.runRead(transaction, operation);
+		}
+		let client: pg.PoolClient;
+		try {
+			client = await this.pool.connect();
+		} catch (error) {
+			throw authorityError(
+				"PostgreSQL authentication-policy authority mutation failed",
+				error,
+			);
+		}
+		try {
+			await client.query("BEGIN");
+			const result = await operation(client);
+			await client.query("COMMIT");
+			return result;
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			if (error instanceof PostgresAuthenticationPolicyAuthorityError) throw error;
+			throw authorityError("PostgreSQL authentication-policy authority mutation failed", error);
+		} finally {
+			client.release();
+		}
+	}
+
+	private async planWithQuery(
+		queryable: Queryable,
+		input: {
+			organizationId?: string;
+			policy: ClearanceAuthenticationPolicy | ClearanceAuthenticationPolicyOverride | null;
+		},
+		lock: boolean,
+	): Promise<ClearanceAuthenticationPolicyPlanResult> {
+		const organizationId = input.organizationId === undefined
+			? undefined
+			: identifier(input.organizationId, "Authentication policy organizationId");
+		const state = await loadPolicyState(
+			queryable,
+			this.identity,
+			organizationId,
+			lock,
+		);
+		const currentPolicy = organizationId === undefined
+			? state.environment
+			: state.organizationOverride?.policy ?? null;
+		let candidatePolicy:
+			| RuntimeAuthenticationPolicy
+			| RuntimeAuthenticationPolicyOverride
+			| null;
+		let candidateEffective: RuntimeAuthenticationPolicy;
+		if (organizationId === undefined) {
+			if (input.policy === null) invalidPolicyInput(input.policy);
+			const normalized = normalizedEnvironmentInput(input.policy);
+			candidatePolicy = normalized;
+			candidateEffective = normalized;
+		} else {
+			candidatePolicy = input.policy === null
+				? null
+				: normalizedOverrideInput(input.policy);
+			candidateEffective = effectivePolicy(state.environment, candidatePolicy);
+		}
+		const wouldChange = JSON.stringify(currentPolicy) !== JSON.stringify(candidatePolicy);
+		const candidateRevision = wouldChange
+			? incrementRevision(state.revision)
+			: state.revision;
+		return Object.freeze({
+			schemaVersion: "v1",
+			scope: this.identity,
+			target: organizationId === undefined
+				? Object.freeze({ kind: "environment" as const })
+				: Object.freeze({ kind: "organization" as const, organizationId }),
+			expectedRevision: state.revision,
+			candidateRevision,
+			wouldChange,
+			current: Object.freeze({
+				revision: state.revision,
+				policy: currentPolicy,
+				effective: state.effective,
+			}),
+			candidate: Object.freeze({
+				revision: candidateRevision,
+				policy: candidatePolicy,
+				effective: candidateEffective,
+			}),
+		});
+	}
+
+	async get(input: {
+		organizationId?: string;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	} = {}): Promise<ClearanceAuthenticationPolicyGetResult> {
+		const organizationId = input.organizationId === undefined
+			? undefined
+			: identifier(input.organizationId, "Authentication policy organizationId");
+		return this.runRead(input.transaction, async (queryable) => {
+			const state = await loadPolicyState(
+				queryable,
+				this.identity,
+				organizationId,
+				false,
+			);
+			return Object.freeze({
+				schemaVersion: "v1",
+				scope: this.identity,
+				revision: state.revision,
+				environment: state.environment,
+				organizationOverride:
+					organizationId && state.organizationOverride
+						? Object.freeze({
+								organizationId,
+								revision: state.organizationOverride.revision,
+								policy: state.organizationOverride.policy,
+							})
+						: null,
+				effective: state.effective,
+			});
+		});
+	}
+
+	async plan(input: {
+		organizationId?: string;
+		policy: ClearanceAuthenticationPolicy | ClearanceAuthenticationPolicyOverride | null;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationPolicyPlanResult> {
+		return this.runRead(input.transaction, (queryable) =>
+			this.planWithQuery(queryable, input, false));
+	}
+
+	async apply(input: {
+		organizationId?: string;
+		policy: ClearanceAuthenticationPolicy | ClearanceAuthenticationPolicyOverride | null;
+		expectedRevision: string;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationPolicyApplyResult> {
+		let expectedRevision: string;
+		try {
+			expectedRevision = canonicalRevision(input.expectedRevision);
+		} catch (error) {
+			throw authorityError(
+				"Authentication policy expectedRevision is invalid",
+				error,
+				"AUTHENTICATION_POLICY_INPUT_INVALID",
+			);
+		}
+		return this.runMutation(input.transaction, async (queryable) => {
+			const plan = await this.planWithQuery(queryable, input, true);
+			if (plan.expectedRevision !== expectedRevision) {
+				throw authorityError(
+					"Authentication policy revision conflict",
+					undefined,
+					"AUTHENTICATION_POLICY_REVISION_CONFLICT",
+				);
+			}
+			if (!plan.wouldChange) {
+				return Object.freeze({
+					...plan,
+					changed: false,
+					previousRevision: plan.expectedRevision,
+					revision: plan.expectedRevision,
+				});
+			}
+
+			let updated: { rowCount: number | null };
+			if (plan.target.kind === "environment") {
+				const candidate = plan.candidate.policy as RuntimeAuthenticationPolicy;
+				updated = await queryable.query(
+					`UPDATE "${POLICY_TABLE}" SET
+						revision = $3::bigint,
+						"passwordLockoutEnabled" = $4,
+						"passwordLockoutMaxFailedAttempts" = $5,
+						"passwordLockoutDurationSeconds" = $6,
+						"factorLockoutEnabled" = $7,
+						"factorLockoutMaxFailedAttempts" = $8,
+						"factorLockoutDurationSeconds" = $9,
+						"minimumAssurance" = $10,
+						"allowedFactorTotp" = $11,
+						"allowedFactorPasskey" = $12,
+						"trustedDeviceEnabled" = $13,
+						"trustedDeviceMaxAgeSeconds" = $14,
+						"assuranceMaxAgeSeconds" = $15,
+						"updatedAt" = now()
+					 WHERE "projectId" = $1 AND "environmentId" = $2
+						AND revision = $16::bigint`,
+					[
+						this.identity.projectId,
+						this.identity.environmentId,
+						plan.candidateRevision,
+						...policyParameters(candidate),
+						expectedRevision,
+					],
+				);
+			} else {
+				updated = await queryable.query(
+					`UPDATE "${POLICY_TABLE}"
+					 SET revision = $3::bigint, "updatedAt" = now()
+					 WHERE "projectId" = $1 AND "environmentId" = $2
+						AND revision = $4::bigint`,
+					[
+						this.identity.projectId,
+						this.identity.environmentId,
+						plan.candidateRevision,
+						expectedRevision,
+					],
+				);
+			}
+			if (updated.rowCount !== 1) {
+				throw authorityError(
+					"Authentication policy revision conflict",
+					undefined,
+					"AUTHENTICATION_POLICY_REVISION_CONFLICT",
+				);
+			}
+
+			if (plan.target.kind === "organization") {
+				const organizationId = plan.target.organizationId;
+				const candidate = plan.candidate.policy as RuntimeAuthenticationPolicyOverride | null;
+				if (candidate === null) {
+					await queryable.query(
+						`DELETE FROM "${OVERRIDE_TABLE}"
+						 WHERE "projectId" = $1 AND "environmentId" = $2
+							AND "organizationId" = $3`,
+						[this.identity.projectId, this.identity.environmentId, organizationId],
+					);
+				} else {
+					await queryable.query(
+						`INSERT INTO "${OVERRIDE_TABLE}" (
+							"projectId", "environmentId", "organizationId", revision,
+							"passwordLockoutEnabled", "passwordLockoutMaxFailedAttempts", "passwordLockoutDurationSeconds",
+							"factorLockoutEnabled", "factorLockoutMaxFailedAttempts", "factorLockoutDurationSeconds",
+							"minimumAssurance", "allowedFactorTotp", "allowedFactorPasskey",
+							"trustedDeviceEnabled", "trustedDeviceMaxAgeSeconds",
+							"assuranceMaxAgeSecondsSet", "assuranceMaxAgeSeconds"
+						 ) VALUES ($1, $2, $3, $4::bigint, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+						 ON CONFLICT ("projectId", "environmentId", "organizationId") DO UPDATE SET
+							revision = EXCLUDED.revision,
+							"passwordLockoutEnabled" = EXCLUDED."passwordLockoutEnabled",
+							"passwordLockoutMaxFailedAttempts" = EXCLUDED."passwordLockoutMaxFailedAttempts",
+							"passwordLockoutDurationSeconds" = EXCLUDED."passwordLockoutDurationSeconds",
+							"factorLockoutEnabled" = EXCLUDED."factorLockoutEnabled",
+							"factorLockoutMaxFailedAttempts" = EXCLUDED."factorLockoutMaxFailedAttempts",
+							"factorLockoutDurationSeconds" = EXCLUDED."factorLockoutDurationSeconds",
+							"minimumAssurance" = EXCLUDED."minimumAssurance",
+							"allowedFactorTotp" = EXCLUDED."allowedFactorTotp",
+							"allowedFactorPasskey" = EXCLUDED."allowedFactorPasskey",
+							"trustedDeviceEnabled" = EXCLUDED."trustedDeviceEnabled",
+							"trustedDeviceMaxAgeSeconds" = EXCLUDED."trustedDeviceMaxAgeSeconds",
+							"assuranceMaxAgeSecondsSet" = EXCLUDED."assuranceMaxAgeSecondsSet",
+							"assuranceMaxAgeSeconds" = EXCLUDED."assuranceMaxAgeSeconds",
+							"updatedAt" = now()`,
+						[
+							this.identity.projectId,
+							this.identity.environmentId,
+							organizationId,
+							plan.candidateRevision,
+							...overrideParameters(candidate),
+						],
+					);
+				}
+			}
+
+			return Object.freeze({
+				...plan,
+				changed: true,
+				previousRevision: plan.expectedRevision,
+				revision: plan.candidateRevision,
+			});
+		});
+	}
+
+	private async unlockRows(
+		queryable: Queryable,
+		userId: string,
+		lock: boolean,
+	): Promise<{
+		passwordRows: LockoutRow[];
+		factorRows: LockoutRow[];
+	}> {
+		await assertInstalledCatalog(queryable, this.identity);
+		const user = await queryable.query<{ id: unknown }>(
+			`SELECT id FROM "user" WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
+			[userId],
+		);
+		if (user.rows.length !== 1 || user.rows[0]?.id !== userId) {
+			throw authorityError(
+				"Authentication unlock user was not found",
+				undefined,
+				"AUTHENTICATION_POLICY_USER_NOT_FOUND",
+			);
+		}
+		const password = await queryable.query<LockoutRow>(
+			`SELECT id,
+				"failedPasswordAttempts" AS "failedCount",
+				"activePasswordAttemptReservations" AS reservations,
+				"passwordLockedUntil" AS "lockedUntil"
+			 FROM account
+			 WHERE "userId" = $1 AND "providerId" = 'credential'
+			 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+			[userId],
+		);
+		const factorRelation = await queryable.query<{
+			relkind: unknown;
+			persistence: unknown;
+		}>(
+			`SELECT relation.relkind::text AS relkind,
+			        relation.relpersistence::text AS persistence
+			 FROM pg_class relation
+			 JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+			 WHERE namespace.nspname = current_schema()
+			   AND relation.relname = 'twoFactor'`,
+		);
+		if (factorRelation.rows.length > 1) {
+			throw authorityError("Two-factor lockout authority is ambiguous");
+		}
+		const factorCatalog = factorRelation.rows[0];
+		if (
+			factorCatalog &&
+			(factorCatalog.relkind !== "r" || factorCatalog.persistence !== "p")
+		) {
+			throw authorityError("Two-factor lockout authority is incompatible");
+		}
+		const factorRows = factorCatalog
+			? (await queryable.query<LockoutRow>(
+					`SELECT id,
+						"failedVerificationCount" AS "failedCount",
+						"activeVerificationReservations" AS reservations,
+						"lockedUntil" AS "lockedUntil"
+					 FROM "twoFactor"
+					 WHERE "userId" = $1
+					 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+					[userId],
+				)).rows
+			: [];
+		return { passwordRows: password.rows, factorRows };
+	}
+
+	async planUnlock(input: {
+		userId: string;
+		kind: ClearanceAuthenticationUnlockKind;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationUnlockPreview> {
+		const userId = identifier(input.userId, "Authentication unlock userId");
+		const kind = unlockKind(input.kind);
+		return this.runRead(input.transaction, async (queryable) => {
+			const rows = await this.unlockRows(queryable, userId, false);
+			return unlockPreview(userId, kind, rows.passwordRows, rows.factorRows);
+		});
+	}
+
+	async unlock(input: {
+		userId: string;
+		kind: ClearanceAuthenticationUnlockKind;
+		transaction?: ClearanceAuthenticationPolicyTransaction;
+	}): Promise<ClearanceAuthenticationUnlockResult> {
+		const userId = identifier(input.userId, "Authentication unlock userId");
+		const kind = unlockKind(input.kind);
+		return this.runMutation(input.transaction, async (queryable) => {
+			const rows = await this.unlockRows(queryable, userId, true);
+			const preview = unlockPreview(userId, kind, rows.passwordRows, rows.factorRows);
+			if (kind !== "factor" && preview.password.wouldChangeRows > 0) {
+				const updated = await queryable.query(
+					`UPDATE account SET
+						"failedPasswordAttempts" = 0,
+						"activePasswordAttemptReservations" = '[]',
+						"passwordLockedUntil" = NULL
+					 WHERE "userId" = $1 AND "providerId" = 'credential'
+						AND (
+							"failedPasswordAttempts" IS DISTINCT FROM 0 OR
+							"activePasswordAttemptReservations" IS DISTINCT FROM '[]' OR
+							"passwordLockedUntil" IS NOT NULL
+						)`,
+					[userId],
+				);
+				if (updated.rowCount !== preview.password.wouldChangeRows) {
+					throw authorityError("Password lockout authority changed during unlock");
+				}
+			}
+			if (kind !== "password" && preview.factor.wouldChangeRows > 0) {
+				const updated = await queryable.query(
+					`UPDATE "twoFactor" SET
+						"failedVerificationCount" = 0,
+						"activeVerificationReservations" = '[]',
+						"lockedUntil" = NULL
+					 WHERE "userId" = $1
+						AND (
+							"failedVerificationCount" IS DISTINCT FROM 0 OR
+							"activeVerificationReservations" IS DISTINCT FROM '[]' OR
+							"lockedUntil" IS NOT NULL
+						)`,
+					[userId],
+				);
+				if (updated.rowCount !== preview.factor.wouldChangeRows) {
+					throw authorityError("Factor lockout authority changed during unlock");
+				}
+			}
+			return Object.freeze({ ...preview, changed: preview.wouldChange });
+		});
 	}
 
 	async readForSubject(
