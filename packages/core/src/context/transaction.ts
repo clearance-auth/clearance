@@ -6,15 +6,23 @@ import { __getClearanceGlobal } from "./global";
 
 type StoredAdapter = DBTransactionAdapter<ClearanceOptions>;
 
+type TransactionLifecycle = {
+	active: boolean;
+};
+
 type HookContext = {
 	rootAdapter: object;
 	adapter: StoredAdapter;
 	activeTransactions: ReadonlyMap<object, HookContext>;
 	pendingBeforeCommitHooks: Array<() => Promise<void>>;
 	pendingHooks: Array<() => Promise<void>>;
-	isTransactionActive: boolean;
+	transactionLifecycle: TransactionLifecycle | null;
 	parent?: HookContext | undefined;
 };
+
+function contextHasActiveTransaction(store: HookContext): boolean {
+	return store.transactionLifecycle?.active === true;
+}
 
 function ownsAdapter(store: HookContext, adapter: object): boolean {
 	return store.rootAdapter === adapter || store.adapter === adapter;
@@ -25,9 +33,15 @@ function findAdapterContext(
 	adapter: object,
 ): HookContext | undefined {
 	const active = store?.activeTransactions.get(adapter);
-	if (active?.isTransactionActive) return active;
+	if (active && contextHasActiveTransaction(active)) return active;
 	for (let current = store; current; current = current.parent) {
-		if (ownsAdapter(current, adapter)) return current;
+		if (!ownsAdapter(current, adapter)) continue;
+		if (
+			current.transactionLifecycle === null ||
+			contextHasActiveTransaction(current)
+		) {
+			return current;
+		}
 	}
 	return undefined;
 }
@@ -39,7 +53,7 @@ function ownerView(owner: HookContext, current: HookContext): HookContext {
 		activeTransactions: current.activeTransactions,
 		pendingBeforeCommitHooks: owner.pendingBeforeCommitHooks,
 		pendingHooks: owner.pendingHooks,
-		isTransactionActive: owner.isTransactionActive,
+		transactionLifecycle: owner.transactionLifecycle,
 		parent: current,
 	};
 }
@@ -59,9 +73,9 @@ function findActiveTransactionContext(
 	adapter: object,
 ): HookContext | undefined {
 	const registered = store?.activeTransactions.get(adapter);
-	if (registered?.isTransactionActive) return registered;
+	if (registered && contextHasActiveTransaction(registered)) return registered;
 	for (let current = store; current; current = current.parent) {
-		if (current.isTransactionActive && ownsAdapter(current, adapter)) {
+		if (contextHasActiveTransaction(current) && ownsAdapter(current, adapter)) {
 			return current;
 		}
 	}
@@ -124,7 +138,7 @@ export const isTransactionActive = async (
 		const store = (await ensureAsyncStorage()).getStore();
 		return adapter
 			? findActiveTransactionContext(store, adapter) !== undefined
-			: store?.isTransactionActive === true;
+			: store ? contextHasActiveTransaction(store) : false;
 	} catch {
 		return false;
 	}
@@ -186,7 +200,7 @@ export const runWithAdapter = async <
 						activeTransactions,
 						pendingBeforeCommitHooks: [],
 						pendingHooks,
-						isTransactionActive: false,
+						transactionLifecycle: null,
 						parent: activeStore,
 					},
 					fn,
@@ -247,6 +261,7 @@ export const runWithTransaction = async <
 				result = await adapter.transaction(async (trx) => {
 					const pendingBeforeCommitHooks: Array<() => Promise<void>> = [];
 					const pendingHooks: Array<() => Promise<void>> = [];
+					const transactionLifecycle: TransactionLifecycle = { active: true };
 					const activeTransactions = new Map(
 						store?.activeTransactions ?? [],
 					);
@@ -256,20 +271,29 @@ export const runWithTransaction = async <
 						activeTransactions,
 						pendingBeforeCommitHooks,
 						pendingHooks,
-						isTransactionActive: true,
+						transactionLifecycle,
 						parent: store,
 					};
 					activeTransactions.set(adapter, transactionContext);
 					activeTransactions.set(trx, transactionContext);
-					const transactionResult = await als.run(transactionContext, async () => {
-						const transactionResult = await fn();
-						for (const hook of pendingBeforeCommitHooks) {
-							await hook();
-						}
+					try {
+						const transactionResult = await als.run(
+							transactionContext,
+							async () => {
+								const transactionResult = await fn();
+								for (const hook of pendingBeforeCommitHooks) {
+									await hook();
+								}
+								return transactionResult;
+							},
+						);
+						committedPendingHooks = pendingHooks;
 						return transactionResult;
-					});
-					committedPendingHooks = pendingHooks;
-					return transactionResult;
+					} finally {
+						transactionLifecycle.active = false;
+						activeTransactions.delete(adapter);
+						activeTransactions.delete(trx);
+					}
 				});
 			} catch (e) {
 				hasError = true;
@@ -312,7 +336,7 @@ export const queueBeforeTransactionCommitHook = async (
 	const store = als.getStore();
 	const owner = adapter
 		? findActiveTransactionContext(store, adapter)
-		: store?.isTransactionActive
+		: store && contextHasActiveTransaction(store)
 			? store
 			: undefined;
 	if (owner) {
