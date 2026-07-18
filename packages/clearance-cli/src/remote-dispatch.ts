@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import {
 	API_KEY_OPERATIONS,
+	AUTHORIZATION_OPERATIONS,
 	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
@@ -20,6 +21,7 @@ import {
 	STORE_V2_OPERATIONS,
 	SCIM_OPERATIONS,
 	SESSION_OPERATIONS,
+	SERVICE_ACCOUNT_OPERATIONS,
 	SSO_OPERATIONS,
 	SYSTEM_OPERATIONS,
 	UPGRADE_OPERATIONS,
@@ -148,6 +150,18 @@ export async function dispatchRemoteCommand(
 		case ROLE_OPERATIONS.validate.cliPath:
 		case ROLE_OPERATIONS.create.cliPath:
 		case ROLE_OPERATIONS.update.cliPath:
+		case AUTHORIZATION_OPERATIONS.effectiveInspect.cliPath:
+		case AUTHORIZATION_OPERATIONS.assignmentsList.cliPath:
+		case AUTHORIZATION_OPERATIONS.assignmentsReplace.cliPath:
+		case AUTHORIZATION_OPERATIONS.reconcile.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.list.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.inspect.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.create.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.disable.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.enable.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialCreate.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialRotate.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.cliPath:
 			return dispatchAccessCommand({ session, path, args, opts, global });
 		case SSO_OPERATIONS.create.cliPath:
 		case SSO_OPERATIONS.configure.cliPath:
