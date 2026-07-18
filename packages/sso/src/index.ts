@@ -271,6 +271,16 @@ export function sso<O extends SSOOptions>(
 						required: false,
 						fieldName: options?.fields?.oidcConfig ?? "oidcConfig",
 					},
+					keyManagementVersion: {
+						type: "number",
+						required: false,
+						returned: false,
+					},
+					keyManagementRevision: {
+						type: "number",
+						required: false,
+						returned: false,
+					},
 					samlConfig: {
 						type: "string",
 						required: false,
