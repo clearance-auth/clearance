@@ -83,6 +83,7 @@ import {
 	type RuntimeAuditStoreOptions,
 } from "./runtime-audit-events.js";
 import { PgStoreV2PrincipalRepository } from "./store-v2-principals.js";
+import { PgStoreV2TopologyRepository } from "./store-v2-topology.js";
 import { registerInternalCoordinatedExecutor } from "./coordinated-internal.js";
 import {
 	appendAuditEvent,
@@ -105,6 +106,8 @@ import type {
 	StoreV2Phase,
 	StoreV2PrincipalReader,
 	StoreV2PrincipalRepository,
+	StoreV2TopologyReader,
+	StoreV2TopologyRepository,
 	StoreV2Collection,
 } from "./types.js";
 
@@ -161,6 +164,7 @@ export class PgStore implements ManagementStore {
 	readonly storeV2Events?: StoreV2EventReader;
 	readonly runtimeAuditEvents: PgRuntimeAuditEventReader;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
+	readonly storeV2Topology?: StoreV2TopologyReader;
 	readonly deliveryControl?: ManagementDeliveryControlReader;
 	readonly webhookEndpoints?: ManagementWebhookEndpointCapability;
 	private data: DataStoreSnapshot;
@@ -182,6 +186,7 @@ export class PgStore implements ManagementStore {
 	/** Set when a queued write fails; rethrown from ready() so the chain never rejects. */
 	private writeError: unknown = null;
 	private readonly activePrincipalTransactions = new Set<Promise<unknown>>();
+	private readonly activeTopologyTransactions = new Set<Promise<unknown>>();
 	private initialized = false;
 
 	constructor(
@@ -452,25 +457,37 @@ export class PgStore implements ManagementStore {
 					await this.refresh();
 					return status;
 				},
-					rollbackEvents: async () => {
+				rollbackEvents: async () => {
 					await this.ready();
 					const status = await this.storeV2Shadow!.rollbackEvents();
 					await this.refresh();
-						return status;
-					},
-					cutoverPrincipals: async () => {
-						await this.ready();
-						const status = await this.storeV2Shadow!.cutoverPrincipals();
-						await this.refresh();
-						return status;
-					},
-					rollbackPrincipals: async () => {
-						await this.ready();
-						const status = await this.storeV2Shadow!.rollbackPrincipals();
-						await this.refresh();
-						return status;
-					},
-				};
+					return status;
+				},
+				cutoverPrincipals: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.cutoverPrincipals();
+					await this.refresh();
+					return status;
+				},
+				rollbackPrincipals: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.rollbackPrincipals();
+					await this.refresh();
+					return status;
+				},
+				cutoverTopology: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.cutoverTopology();
+					await this.refresh();
+					return status;
+				},
+				rollbackTopology: async () => {
+					await this.ready();
+					const status = await this.storeV2Shadow!.rollbackTopology();
+					await this.refresh();
+					return status;
+				},
+			};
 			const owner = this;
 			this.storeV2Events = {
 				get authoritative() {
@@ -497,6 +514,37 @@ export class PgStore implements ManagementStore {
 				countActiveSessions: (input) =>
 					this.storeV2Shadow!.countActivePrincipalSessions(input),
 			};
+			const topologyRepository = new PgStoreV2TopologyRepository(
+				this.pool as unknown as pg.PoolClient,
+				this.storeV2Shadow.tables,
+				false,
+			);
+			this.storeV2Topology = Object.freeze({
+				get authoritative() {
+					return ["projects", "environments", "organizations"].every(
+						(collection) => owner.storeV2AuthoritativeCollections.includes(
+							collection as StoreV2Collection,
+						),
+					);
+				},
+				getProjectById: (id: string) =>
+					topologyRepository.capability.getProjectById(id),
+				getEnvironment: (
+					input: Parameters<StoreV2TopologyReader["getEnvironment"]>[0],
+				) => topologyRepository.capability.getEnvironment(input),
+				getOrganization: (
+					input: Parameters<StoreV2TopologyReader["getOrganization"]>[0],
+				) => topologyRepository.capability.getOrganization(input),
+				listProjectsPage: (
+					input: Parameters<StoreV2TopologyReader["listProjectsPage"]>[0],
+				) => topologyRepository.capability.listProjectsPage(input),
+				listEnvironmentsPage: (
+					input: Parameters<StoreV2TopologyReader["listEnvironmentsPage"]>[0],
+				) => topologyRepository.capability.listEnvironmentsPage(input),
+				listOrganizationsPage: (
+					input: Parameters<StoreV2TopologyReader["listOrganizationsPage"]>[0],
+				) => topologyRepository.capability.listOrganizationsPage(input),
+			});
 		}
 		this.data = emptySnapshot();
 		registerInternalCoordinatedExecutor(this, (fn) =>
@@ -622,6 +670,7 @@ export class PgStore implements ManagementStore {
 		while (this.activePrincipalTransactions.size > 0) {
 			await Promise.allSettled([...this.activePrincipalTransactions]);
 		}
+		while (this.activeTopologyTransactions.size > 0) await Promise.allSettled([...this.activeTopologyTransactions]);
 		if (this.writeError) {
 			const err = this.writeError;
 			this.writeError = null;
@@ -706,6 +755,13 @@ export class PgStore implements ManagementStore {
 		}) => Promise<T> | T,
 	): Promise<T> {
 		return this.trackPrincipalTransaction(this.transactStoreV2Identity(fn));
+	}
+
+	mutateStoreV2Topology<T>(fn: (topology: StoreV2TopologyRepository) => Promise<T> | T): Promise<T> {
+		const transaction = this.transactStoreV2Topology(fn);
+		this.activeTopologyTransactions.add(transaction);
+		transaction.finally(() => this.activeTopologyTransactions.delete(transaction)).catch(() => undefined);
+		return transaction;
 	}
 
 	private trackPrincipalTransaction<T>(transaction: Promise<T>): Promise<T> {
@@ -1131,6 +1187,57 @@ export class PgStore implements ManagementStore {
 			}
 			this.storeV2PrincipalCount = principalState.count;
 			this.storeV2PrincipalRevision = principalState.revision;
+			return value;
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	private async transactStoreV2Topology<T>(
+		fn: (topology: StoreV2TopologyRepository) => Promise<T> | T,
+	): Promise<T> {
+		if (!this.storeV2Shadow) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_TOPOLOGY_UNAVAILABLE",
+				"Normalized topology storage is not configured for this store.",
+			);
+		}
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
+			const authority =
+				await this.storeV2Shadow.transactionAuthoritativeCollections(client);
+			if (
+				!["projects", "environments", "organizations"].every((collection) =>
+					authority.includes(collection as StoreV2Collection),
+				)
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_NOT_AUTHORITATIVE",
+					"Direct topology mutation requires relational topology authority.",
+				);
+			}
+			const repository = new PgStoreV2TopologyRepository(
+				client,
+				this.storeV2Shadow.tables,
+			);
+			let value!: T;
+			let callbackError: unknown;
+			try {
+				value = await fn(repository.capability);
+			} catch (error) {
+				callbackError = error;
+			}
+			repository.revoke();
+			await repository.settleIssued();
+			if (callbackError !== undefined) throw callbackError;
+			await repository.finalizeState();
+			await client.query("COMMIT");
+			this.storeV2AuthoritativeCollections = authority;
 			return value;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -1574,6 +1681,18 @@ export class PgStore implements ManagementStore {
 		}
 		if (sync.authoritativeCollections.includes("principals")) {
 			materialized = { ...materialized, principals: [] };
+		}
+		if (
+			["projects", "environments", "organizations"].every((collection) =>
+				sync.authoritativeCollections.includes(collection as StoreV2Collection),
+			)
+		) {
+			materialized = {
+				...materialized,
+				projects: [],
+				environments: [],
+				organizations: [],
+			};
 		}
 		return materialized;
 	}
