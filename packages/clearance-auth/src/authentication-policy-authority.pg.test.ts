@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RuntimeAuthenticationPolicy } from "../../core/src/types/authentication-policy.js";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	PostgresAuthenticationPolicyAuthority,
 	PostgresAuthenticationPolicyAuthorityError,
@@ -88,6 +88,10 @@ describe.sequential.skipIf(!available)(
 			authority = new PostgresAuthenticationPolicyAuthority(pool, identity, seed);
 		});
 
+		afterEach(async () => {
+			await pool?.query(`DROP TABLE IF EXISTS "twoFactor", account`);
+		});
+
 		afterAll(async () => {
 			await pool?.end();
 			await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
@@ -95,7 +99,7 @@ describe.sequential.skipIf(!available)(
 		});
 
 		it("plans, applies, verifies, and idempotently preserves the first seed", async () => {
-			const plan = await authority.plan();
+			const plan = await authority.planMigration();
 			expect(plan).toMatchObject({
 				pendingTables: 2,
 				pendingFields: 36,
@@ -110,7 +114,7 @@ describe.sequential.skipIf(!available)(
 			await pool.query(`BEGIN; ${sql} ROLLBACK;`);
 
 			await plan.apply();
-			const installed = await authority.plan();
+			const installed = await authority.planMigration();
 			expect(installed).toMatchObject({
 				pendingTables: 0,
 				pendingFields: 0,
@@ -151,7 +155,7 @@ describe.sequential.skipIf(!available)(
 				identity,
 				differentSeed,
 			);
-			await (await replica.plan()).apply();
+			await (await replica.planMigration()).apply();
 			const persisted = await pool.query<{
 				revision: string;
 				maxFailedAttempts: number;
@@ -265,6 +269,210 @@ describe.sequential.skipIf(!available)(
 			poolQuery.mockRestore();
 		});
 
+		it("manages revisioned policy and redacted password/factor unlock authority", async () => {
+			const initial = await authority.get();
+			expect(initial).toMatchObject({
+				schemaVersion: "v1",
+				scope: identity,
+				revision: "2",
+				organizationOverride: null,
+			});
+			const noOpPlan = await authority.plan({ policy: initial.environment });
+			expect(noOpPlan).toMatchObject({
+				expectedRevision: "2",
+				candidateRevision: "2",
+				wouldChange: false,
+			});
+			await expect(
+				authority.apply({
+					policy: initial.environment,
+					expectedRevision: "2",
+				}),
+			).resolves.toMatchObject({ changed: false, revision: "2" });
+
+			const environmentCandidate: RuntimeAuthenticationPolicy = {
+				...initial.environment,
+				passwordLockout: {
+					...initial.environment.passwordLockout,
+					maxFailedAttempts: 8,
+				},
+			};
+			const environmentPlan = await authority.plan({ policy: environmentCandidate });
+			expect(environmentPlan).toMatchObject({
+				expectedRevision: "2",
+				candidateRevision: "3",
+				wouldChange: true,
+			});
+			const concurrentApplies = await Promise.allSettled([
+				authority.apply({
+					policy: environmentCandidate,
+					expectedRevision: "2",
+				}),
+				authority.apply({
+					policy: environmentCandidate,
+					expectedRevision: "2",
+				}),
+			]);
+			expect(concurrentApplies.filter((result) => result.status === "fulfilled"))
+				.toHaveLength(1);
+			const rejectedApply = concurrentApplies.find(
+				(result) => result.status === "rejected",
+			);
+			expect(rejectedApply).toMatchObject({
+				status: "rejected",
+				reason: { code: "AUTHENTICATION_POLICY_REVISION_CONFLICT" },
+			});
+			await expect(authority.get()).resolves.toMatchObject({
+				revision: "3",
+				environment: environmentCandidate,
+			});
+
+			const organizationPolicy = {
+				minimumAssurance: "multi_factor" as const,
+				allowedFactors: { totp: true },
+			};
+			const organizationPlan = await authority.plan({
+				organizationId: "org_policy",
+				policy: organizationPolicy,
+			});
+			expect(organizationPlan).toMatchObject({
+				expectedRevision: "3",
+				candidateRevision: "4",
+				wouldChange: true,
+				candidate: { effective: { minimumAssurance: "multi_factor" } },
+			});
+			await authority.apply({
+				organizationId: "org_policy",
+				policy: organizationPolicy,
+				expectedRevision: "3",
+			});
+			await expect(
+				authority.get({ organizationId: "org_policy" }),
+			).resolves.toMatchObject({
+				revision: "4",
+				organizationOverride: {
+					organizationId: "org_policy",
+					revision: "4",
+					policy: organizationPolicy,
+				},
+				effective: { minimumAssurance: "multi_factor" },
+			});
+			const deletePlan = await authority.plan({
+				organizationId: "org_policy",
+				policy: null,
+			});
+			expect(deletePlan).toMatchObject({
+				expectedRevision: "4",
+				candidateRevision: "5",
+				wouldChange: true,
+			});
+			await authority.apply({
+				organizationId: "org_policy",
+				policy: null,
+				expectedRevision: "4",
+			});
+			await expect(
+				authority.get({ organizationId: "org_policy" }),
+			).resolves.toMatchObject({
+				revision: "5",
+				organizationOverride: null,
+				effective: environmentCandidate,
+			});
+
+			await pool.query(`
+				CREATE TABLE account (
+					id text PRIMARY KEY,
+					"userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+					"providerId" text NOT NULL,
+					password text,
+					"failedPasswordAttempts" integer,
+					"activePasswordAttemptReservations" text,
+					"passwordLockedUntil" timestamptz,
+					"refreshToken" text
+				);
+				CREATE TABLE "twoFactor" (
+					id text PRIMARY KEY,
+					"userId" text NOT NULL UNIQUE REFERENCES "user"(id) ON DELETE CASCADE,
+					secret text NOT NULL,
+					"failedVerificationCount" integer,
+					"activeVerificationReservations" text,
+					"lockedUntil" timestamptz,
+					"lastUsedTotpCounter" integer,
+					"trustDeviceGeneration" text
+				);
+				INSERT INTO account (
+					id, "userId", "providerId", password,
+					"failedPasswordAttempts", "activePasswordAttemptReservations",
+					"passwordLockedUntil", "refreshToken"
+				) VALUES (
+					'account_policy', 'user_policy', 'credential', 'password-digest',
+					4, '[{"id":"password-reservation"}]', now() + interval '10 minutes',
+					'refresh-preserved'
+				);
+				INSERT INTO "twoFactor" (
+					id, "userId", secret, "failedVerificationCount",
+					"activeVerificationReservations", "lockedUntil",
+					"lastUsedTotpCounter", "trustDeviceGeneration"
+				) VALUES (
+					'factor_policy', 'user_policy', 'factor-secret-preserved', 3,
+					'[{"id":"factor-reservation"}]', now() + interval '10 minutes',
+					42, 'trust-generation-preserved'
+				);
+			`);
+			const unlockPlan = await authority.planUnlock({
+				userId: "user_policy",
+				kind: "all",
+			});
+			expect(unlockPlan).toEqual({
+				schemaVersion: "v1",
+				userId: "user_policy",
+				kind: "all",
+				password: {
+					matchedRows: 1,
+					failedAttemptRows: 1,
+					reservationRows: 1,
+					lockedRows: 1,
+					wouldChangeRows: 1,
+				},
+				factor: {
+					matchedRows: 1,
+					failedAttemptRows: 1,
+					reservationRows: 1,
+					lockedRows: 1,
+					wouldChangeRows: 1,
+				},
+				wouldChange: true,
+			});
+			await expect(
+				authority.unlock({ userId: "user_policy", kind: "all" }),
+			).resolves.toMatchObject({ changed: true, wouldChange: true });
+			const passwordState = await pool.query(
+				`SELECT password, "refreshToken", "failedPasswordAttempts",
+				        "activePasswordAttemptReservations", "passwordLockedUntil"
+				 FROM account WHERE id = 'account_policy'`,
+			);
+			expect(passwordState.rows[0]).toEqual({
+				password: "password-digest",
+				refreshToken: "refresh-preserved",
+				failedPasswordAttempts: 0,
+				activePasswordAttemptReservations: "[]",
+				passwordLockedUntil: null,
+			});
+			const factorState = await pool.query(
+				`SELECT secret, "lastUsedTotpCounter", "trustDeviceGeneration",
+				        "failedVerificationCount", "activeVerificationReservations", "lockedUntil"
+				 FROM "twoFactor" WHERE id = 'factor_policy'`,
+			);
+			expect(factorState.rows[0]).toEqual({
+				secret: "factor-secret-preserved",
+				lastUsedTotpCounter: 42,
+				trustDeviceGeneration: "trust-generation-preserved",
+				failedVerificationCount: 0,
+				activeVerificationReservations: "[]",
+				lockedUntil: null,
+			});
+		});
+
 		it("rejects incompatible authority and rolls back failed fresh installation", async () => {
 			const incompatibleSchema = `auth_policy_bad_${randomUUID().replaceAll("-", "").slice(0, 10)}`;
 			const rollbackSchema = `auth_policy_rb_${randomUUID().replaceAll("-", "").slice(0, 10)}`;
@@ -285,7 +493,7 @@ describe.sequential.skipIf(!available)(
 					identity,
 					seed,
 				);
-				await expect(incompatible.plan()).rejects.toBeInstanceOf(
+				await expect(incompatible.planMigration()).rejects.toBeInstanceOf(
 					PostgresAuthenticationPolicyAuthorityError,
 				);
 				const untouched = await incompatiblePool.query<{ columns: string }>(
@@ -303,7 +511,7 @@ describe.sequential.skipIf(!available)(
 					seed,
 				);
 				await expect(
-					(await rollbackAuthority.plan()).apply(),
+					(await rollbackAuthority.planMigration()).apply(),
 				).rejects.toThrow("migration failed");
 				const rolledBack = await rollbackPool.query<{
 					policy: string | null;
@@ -438,6 +646,15 @@ describe.sequential.skipIf(!available)(
 					"SELECT pg_advisory_unlock(hashtextextended(current_schema() || ':clearance:authentication-policy-authority:v1', 0))",
 				);
 				await migration;
+				expect(bundle.authenticationPolicy).toBeDefined();
+				await expect(bundle.authenticationPolicy!.get()).resolves.toMatchObject({
+					schemaVersion: "v1",
+					scope: {
+						projectId: `project_${suffix}`,
+						environmentId: `environment_${suffix}`,
+					},
+					revision: "1",
+				});
 				const signup = await bundle.auth.api.signUpEmail({
 					body: {
 						email: `managed-policy-${suffix}@example.test`,
