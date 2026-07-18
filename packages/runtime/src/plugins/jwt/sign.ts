@@ -7,6 +7,7 @@ import { ClearanceError } from "@clearance/core/error";
 import type { JWTPayload } from "jose";
 import { decodeJwt, importJWK, SignJWT } from "jose";
 import { symmetricDecrypt } from "../../crypto";
+import { readInternalEffectiveAuthorization } from "../../internal/authorization-authority";
 import {
 	captureInternalSessionDerivativeAuthority,
 	validateInternalSessionDerivativeAuthority,
@@ -81,6 +82,17 @@ export const JWT_SESSION_SOURCE_SUBJECT_CLAIM =
 	"urn:clearance:claims:session-source-subject";
 export const JWT_SESSION_SOURCE_ORGANIZATION_CLAIM =
 	"urn:clearance:claims:session-source-organization";
+export const JWT_AUTHORIZATION_ACTIONS_CLAIM = "actions";
+export const JWT_AUTHORIZATION_REVISION_CLAIM = "authz_revision";
+
+function equalStringArrays(left: unknown, right: unknown): boolean {
+	return (
+		Array.isArray(left) &&
+		Array.isArray(right) &&
+		left.length === right.length &&
+		left.every((value, index) => value === right[index])
+	);
+}
 
 export async function signJWT(
 	ctx: GenericEndpointContext,
@@ -150,6 +162,10 @@ export async function signJWT(
 					"Custom JWT signer returned an invalid session-bound token",
 				);
 			}
+			const hasAuthorizationActions =
+				jwtPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM] !== undefined;
+			const hasAuthorizationRevision =
+				jwtPayload[JWT_AUTHORIZATION_REVISION_CLAIM] !== undefined;
 			if (
 				!Object.hasOwn(
 					returnedPayload,
@@ -169,6 +185,19 @@ export async function signJWT(
 				!Number.isFinite(returnedPayload.exp) ||
 				!Number.isInteger(returnedPayload.exp) ||
 				returnedPayload.exp! > exp
+				||
+				hasAuthorizationActions !==
+					Object.hasOwn(returnedPayload, JWT_AUTHORIZATION_ACTIONS_CLAIM) ||
+				hasAuthorizationRevision !==
+					Object.hasOwn(returnedPayload, JWT_AUTHORIZATION_REVISION_CLAIM) ||
+				(hasAuthorizationActions &&
+					!equalStringArrays(
+						returnedPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM],
+						jwtPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM],
+					)) ||
+				(hasAuthorizationRevision &&
+					returnedPayload[JWT_AUTHORIZATION_REVISION_CLAIM] !==
+						jwtPayload[JWT_AUTHORIZATION_REVISION_CLAIM])
 			) {
 				throw new ClearanceError(
 					"Custom JWT signer changed session-bound authority",
@@ -296,6 +325,13 @@ export async function getJwtToken(
 		const payload = !options?.jwt?.definePayload
 			? live.user
 			: await options.jwt.definePayload(liveSession);
+		const authorization =
+			authority?.sourceOrganizationId === null || authority === undefined
+				? undefined
+				: await readInternalEffectiveAuthorization(ctx.context.internalAdapter, {
+						organizationId: authority.sourceOrganizationId,
+						subject: { kind: "principal", id: authority.sourceSubjectId },
+					});
 		const reservedClaims = binding
 			? {
 					[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: binding,
@@ -308,6 +344,17 @@ export async function getJwtToken(
 					[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: undefined,
 					[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: undefined,
 				};
+		const authorizationClaims = authorization
+			? {
+					[JWT_AUTHORIZATION_ACTIONS_CLAIM]: Object.freeze([
+						...authorization.actions,
+					]),
+					[JWT_AUTHORIZATION_REVISION_CLAIM]: authorization.revision,
+				}
+			: {
+					[JWT_AUTHORIZATION_ACTIONS_CLAIM]: undefined,
+					[JWT_AUTHORIZATION_REVISION_CLAIM]: undefined,
+				};
 
 		return signJWT(ctx, {
 			options,
@@ -316,10 +363,11 @@ export async function getJwtToken(
 				iat: Math.floor(Date.now() / 1000),
 				...payload,
 				...sessionClaims,
-				sub:
-					(await options?.jwt?.getSubject?.(liveSession)) ?? live.user.id,
-				...reservedClaims,
-			},
+					sub:
+						(await options?.jwt?.getSubject?.(liveSession)) ?? live.user.id,
+					...reservedClaims,
+					...authorizationClaims,
+				},
 		});
 	});
 }
