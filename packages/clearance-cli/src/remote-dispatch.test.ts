@@ -16,7 +16,9 @@ vi.mock("@clearance/management", async (importOriginal) => {
 		STORE_V2_OPERATIONS: source.STORE_V2_OPERATIONS,
 		SCHEMA_OPERATIONS: source.SCHEMA_OPERATIONS,
 		AUTHENTICATION_POLICY_OPERATIONS: source.AUTHENTICATION_POLICY_OPERATIONS,
+		AUTHORIZATION_OPERATIONS: source.AUTHORIZATION_OPERATIONS,
 		MANAGEMENT_OPERATIONS: source.MANAGEMENT_OPERATIONS,
+		SERVICE_ACCOUNT_OPERATIONS: source.SERVICE_ACCOUNT_OPERATIONS,
 	};
 });
 import {
@@ -112,6 +114,50 @@ describe("CLI transport parity", () => {
 			scopes: ["users:read"],
 			expiresAt: "2030-01-01T00:00:00Z",
 		});
+	});
+
+	it("dispatches normalized authorization and service-account lifecycle operations exactly", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}));
+
+		await dispatchRemoteCommand(session, "orgs authorization effective", [], {
+			org: "org_1", subject: "user_1", subjectKind: "principal",
+		}, {});
+		await dispatchRemoteCommand(session, "orgs authorization assignments replace", [], {
+			org: "org_1", subject: "user_1", subjectKind: "principal", role: ["role_b", "role_a", "role_b"], expectedRevision: "7",
+		}, { yes: true, dryRun: false });
+		await expect(dispatchRemoteCommand(session, "orgs authorization assignments replace", [], {
+			org: "org_1", subject: "user_1", subjectKind: "principal", role: [], expectedRevision: "07",
+		}, { dryRun: false })).rejects.toMatchObject({ code: "AUTHORIZATION_OPTION_INVALID" });
+		await expect(dispatchRemoteCommand(session, "orgs service-accounts disable", ["svc_1"], { org: "org_1" }, {}))
+			.rejects.toMatchObject({ code: "SERVICE_ACCOUNT_DISABLE_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(session, "orgs service-accounts disable", ["svc_1"], { org: "org_1" }, { yes: true, dryRun: false });
+		await dispatchRemoteCommand(session, "orgs service-accounts credentials create", ["svc_1"], {
+			org: "org_1", expiresAt: "2030-01-01T00:00:00Z",
+		}, { dryRun: false });
+		await dispatchRemoteCommand(session, "orgs service-accounts credentials rotate", ["svc_1", "cred_1"], {
+			org: "org_1", expiresAt: "2031-01-01T00:00:00Z",
+		}, { yes: true, dryRun: false });
+		await dispatchRemoteCommand(session, "orgs service-accounts credentials revoke", ["svc_1", "cred_1"], { org: "org_1" }, { dryRun: true });
+
+		expect(calls.map(([url]) => url)).toEqual([
+			"https://api.clearance.test/v1/organizations/org_1/authorization/effective/principal/user_1",
+			"https://api.clearance.test/v1/organizations/org_1/authorization/assignments/principal/user_1",
+			"https://api.clearance.test/v1/organizations/org_1/service-accounts/svc_1/status",
+			"https://api.clearance.test/v1/organizations/org_1/service-accounts/svc_1/credentials",
+			"https://api.clearance.test/v1/organizations/org_1/service-accounts/svc_1/credentials/cred_1/rotate",
+			"https://api.clearance.test/v1/organizations/org_1/service-accounts/svc_1/credentials/cred_1/revoke",
+		]);
+		expect(JSON.parse(String(calls[1]?.[1].body))).toEqual({
+			roleIds: ["role_a", "role_b"], expectedRevision: "7", dryRun: false, confirm: true,
+		});
+		expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({ status: "disabled", dryRun: false });
+		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ expiresAt: "2030-01-01T00:00:00Z", dryRun: false });
+		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({ expiresAt: "2031-01-01T00:00:00Z", dryRun: false });
+		expect(JSON.parse(String(calls[5]?.[1].body))).toEqual({ dryRun: true });
 	});
 
 	it("routes store-v2 reads and gates apply, rollback, event, and principal authority", async () => {
