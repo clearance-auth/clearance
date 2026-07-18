@@ -47,6 +47,7 @@ import { createSsoConnectionReal } from "../services/sso-real.js";
 import {
 	initProject,
 	listEvents,
+	listEventsPageOperational,
 	resolveOperatorScope,
 	syncRuntimeOrganizationToManagementDurable,
 	} from "../index.js";
@@ -1550,6 +1551,60 @@ describe.skipIf(!available)(
 			).toBeNull();
 			expect(store.snapshot.traces).toHaveLength(tracesBefore);
 			expect(listEvents(store, { limit: 500 })).toHaveLength(eventsBefore);
+		});
+
+		it("executes and cleans the scoped SCIM Group lifecycle with merged runtime audits", async () => {
+			const { store, scope } = await freshTopologyStore();
+			const { organization } = await seedOwnerAndOrg(store);
+			await store.storeV2!.apply();
+			await store.storeV2!.cutoverEvents();
+			await store.storeV2!.cutoverPrincipals();
+			await store.storeV2!.cutoverTopology();
+			const connection = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "group-lifecycle-primary",
+				scope,
+			});
+			const other = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "group-lifecycle-other",
+				scope,
+			});
+			await expect(testScimConnectionReal(store, other.id, {
+				dryRun: false,
+				scenario: "group-lifecycle",
+				bearerToken: connection.bearerTokenOnce,
+				scope,
+			})).rejects.toMatchObject({ code: "SCIM_UNAUTHORIZED" });
+			const result = await testScimConnectionReal(store, connection.id, {
+				dryRun: false,
+				scenario: "group-lifecycle",
+				bearerToken: connection.bearerTokenOnce,
+				scope,
+			});
+			expect(result.groupLifecycle).toMatchObject({
+				group: { status: "deleted" },
+				counts: { usersCreated: 2, membersCreated: 1, membersAfterPatch: 2 },
+				actions: { create: 201, patch: 200, get: 200, list: 200, delete: 204 },
+			});
+			const merged = await listEventsPageOperational(store, {
+				scope,
+				organizationId: organization.id,
+				limit: 100,
+			});
+			const lifecycle = merged.events.filter((event) => ["scim.group.created", "scim.group.updated", "scim.group.deleted"].includes(event.action));
+			expect(lifecycle.map((event) => event.action).sort()).toEqual([
+				"scim.group.created", "scim.group.deleted", "scim.group.updated",
+			]);
+			for (const event of lifecycle) {
+				expect(event).toMatchObject({ projectId: scope.projectId, environmentId: scope.environmentId, organizationId: organization.id, source: "scim" });
+			}
+			expect(merged.events.filter((event) => event.action === "scim.test" && event.subjectId === connection.id)).toHaveLength(1);
+			const serialized = JSON.stringify(merged.events);
+			expect(serialized).not.toContain(connection.bearerTokenOnce!);
+			expect(serialized).not.toContain("@example.invalid");
+			const generated = await getAuthBundle().pool.query(`select count(*)::int as count from "user" where email like 'scim-group-%@example.invalid'`);
+			expect(Number(generated.rows[0]?.count ?? 0)).toBe(0);
 		});
 
 		it("reconciles a locked runtime owner membership into normalized authorization without partial writes", async () => {
