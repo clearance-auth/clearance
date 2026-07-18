@@ -465,6 +465,17 @@ export type ClearanceAuthorizationAffectedRevision = Readonly<{
 	revision: string;
 }>;
 
+/** Redacted audit result from irreversible authorization terminalization. */
+export type ClearanceAuthorizationArchiveOrganizationResult = Readonly<{
+	organizationId: string;
+	previousRevision: string;
+	revision: string;
+	archived: boolean;
+	removedAssignments: number;
+	disabledServiceAccounts: number;
+	revokedCredentials: number;
+}>;
+
 export type ClearanceAuthorizationServiceAccount = Readonly<{
 	organizationId: string;
 	serviceAccountId: string;
@@ -508,6 +519,17 @@ export type ClearanceAuthorizationServiceAccountAuthentication = Readonly<{
 
 export type ClearanceAuthorizationFacade = Readonly<{
 	readonly scope: Readonly<{ projectId: string; environmentId: string }>;
+	/** Package-internal startup reconciliation; callers supply only server-owned table identities. */
+	reconcileRuntimeOrganizations(input: Readonly<{
+		management: Readonly<{ schema: string; table: string }>;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<Readonly<{
+		terminalizedOrganizations: number;
+		terminalizedOrganizationIds: readonly string[];
+		removedAssignments: number;
+		disabledServiceAccounts: number;
+		revokedCredentials: number;
+	}>>;
 	readEffective(input: Readonly<{
 		organizationId: string;
 		subject: ClearanceAuthorizationSubject;
@@ -521,6 +543,10 @@ export type ClearanceAuthorizationFacade = Readonly<{
 		revision: string;
 		initialized: boolean;
 	}>>;
+	archiveOrganization(input: Readonly<{
+		organizationId: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationArchiveOrganizationResult>;
 	upsertRole(input: Readonly<{
 		role: Omit<ClearanceAuthorizationRole, "actions">;
 		actions: readonly string[];
