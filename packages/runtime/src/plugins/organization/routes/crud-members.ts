@@ -18,7 +18,11 @@ import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db/to-zod";
 import { readInternalAuthenticationPolicy } from "../../../internal/authentication-policy";
 import { defaultRoles } from "../access/statement";
-import { getOrgAdapter, resolveMaximumMembersPerTeam } from "../adapter";
+import {
+	assertManagedOrganizationTransitionSupported,
+	getOrgAdapter,
+	resolveMaximumMembersPerTeam,
+} from "../adapter";
 import { orgMiddleware, orgSessionMiddleware } from "../call";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
 import { hasPermission } from "../has-permission";
@@ -646,6 +650,7 @@ export const removeMember = <O extends OrganizationOptions>(options: O) =>
 					toBeRemovedMember.organizationId;
 			if (removesCurrentActiveMembership) {
 				await rejectNestedCookieLifecycleTransaction(ctx.context);
+				assertManagedOrganizationTransitionSupported(ctx.context);
 			}
 			requireOrganizationLifecycleTransaction(ctx.context);
 			const secondaryOnlySessions = usesSecondaryOnlySessions(ctx.context);
@@ -1333,9 +1338,8 @@ export const leaveOrganization = <O extends OrganizationOptions>(options: O) =>
 		},
 		async (ctx) => {
 			const session = ctx.context.session;
-			if (session.session.activeOrganizationId === ctx.body.organizationId) {
-				await rejectNestedCookieLifecycleTransaction(ctx.context);
-			}
+			const leavesActiveOrganization =
+				session.session.activeOrganizationId === ctx.body.organizationId;
 			const adapter = getOrgAdapter<O>(ctx.context, options);
 			const member = await adapter.findMemberByOrgId({
 				userId: session.user.id,
@@ -1350,13 +1354,6 @@ export const leaveOrganization = <O extends OrganizationOptions>(options: O) =>
 			}
 			const creatorRole = ctx.context.orgOptions?.creatorRole || "owner";
 			const isOwnerLeaving = canonicalizeRoles(member.role).includes(creatorRole);
-			requireOrganizationLifecycleTransaction(ctx.context);
-			const leavesActiveOrganization =
-				session.session.activeOrganizationId === ctx.body.organizationId;
-			const secondaryOnlySessions = usesSecondaryOnlySessions(ctx.context);
-			const sourceSessionId = leavesActiveOrganization
-				? session.session.id
-				: undefined;
 			if (isOwnerLeaving) {
 				const members = await ctx.context.adapter.findMany<Member>({
 					model: "member",
@@ -1377,6 +1374,15 @@ export const leaveOrganization = <O extends OrganizationOptions>(options: O) =>
 					);
 				}
 			}
+			if (leavesActiveOrganization) {
+				await rejectNestedCookieLifecycleTransaction(ctx.context);
+				assertManagedOrganizationTransitionSupported(ctx.context);
+			}
+			requireOrganizationLifecycleTransaction(ctx.context);
+			const secondaryOnlySessions = usesSecondaryOnlySessions(ctx.context);
+			const sourceSessionId = leavesActiveOrganization
+				? session.session.id
+				: undefined;
 			const acquireOrganizationLock = async () => {
 				const transaction = await getCurrentAdapter(ctx.context.adapter);
 				const lockedOrganization = await transaction.update({
