@@ -180,6 +180,10 @@ export interface StoreV2TopologyReader {
 	getProjectById(id: string): Promise<Project | null>;
 	getEnvironment(input: { projectId: string; id: string }): Promise<Environment | null>;
 	getOrganization(input: { scope: ResourceScope; id: string }): Promise<Organization | null>;
+	countOrganizations(input: {
+		scope: ResourceScope;
+		includeArchived?: boolean;
+	}): Promise<number>;
 	listProjectsPage(input: { limit: number; cursor?: PageCursorKey }): Promise<{ projects: Project[]; hasMore: boolean }>;
 	listEnvironmentsPage(input: {
 		projectId: string;
