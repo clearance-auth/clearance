@@ -45,6 +45,7 @@ const mainOptions = { prefix: `delivery_${suffix}` } satisfies DeliverySchemaOpt
 const collisionOptions = { prefix: `delivery_collision_${suffix}` } satisfies DeliverySchemaOptions;
 const futureOptions = { prefix: `delivery_future_${suffix}` } satisfies DeliverySchemaOptions;
 const driftOptions = { prefix: `delivery_drift_${suffix}` } satisfies DeliverySchemaOptions;
+const traceParentDriftOptions = { prefix: `delivery_trace_${suffix}` } satisfies DeliverySchemaOptions;
 const endpointConstraintDriftOptions = { prefix: `delivery_epc_${suffix}` } satisfies DeliverySchemaOptions;
 const endpointFkDriftOptions = { prefix: `delivery_epfk_${suffix}` } satisfies DeliverySchemaOptions;
 const endpointIndexDriftOptions = { prefix: `delivery_epi_${suffix}` } satisfies DeliverySchemaOptions;
@@ -113,6 +114,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 	afterAll(async () => {
 		for (const options of [
 			mainOptions, collisionOptions, futureOptions, driftOptions, endpointConstraintDriftOptions,
+			traceParentDriftOptions,
 			endpointFkDriftOptions,
 			endpointIndexDriftOptions, endpointKeyOptions, rollbackIndexOptions, migrationOptions,
 			historyTriggerDriftOptions,
@@ -138,7 +140,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await migrateDeliverySchema(pool, futureOptions);
 		const future = qualifiedDeliveryTables(futureOptions);
 		await pool.query(
-			`UPDATE ${future.meta} SET value='5'::jsonb WHERE key='schema_version'`,
+			`UPDATE ${future.meta} SET value='6'::jsonb WHERE key='schema_version'`,
 		);
 		await expect(migrateDeliverySchema(pool, futureOptions)).rejects.toMatchObject({
 			code: "DELIVERY_SCHEMA_VERSION_FUTURE",
@@ -150,6 +152,29 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await expect(migrateDeliverySchema(pool, driftOptions)).rejects.toMatchObject({
 			code: "DELIVERY_SCHEMA_DRIFT",
 		});
+
+		await migrateDeliverySchema(pool, traceParentDriftOptions);
+		const traceParentTables = qualifiedDeliveryTables(traceParentDriftOptions);
+		await expect(pool.query(
+			`INSERT INTO ${traceParentTables.event}
+			 (id, kind, source_fingerprint, source_fingerprint_key_id, source_dedupe_fingerprint,
+			  source_dedupe_version, project_id, environment_id, destination_fingerprint,
+			  destination_fingerprint_key_id, created_at, semantic_expires_at, trace_parent)
+			 VALUES ('invalid-trace-parent','password.reset',$1,'fingerprint-current',$2,2,
+			 'project-1','env-1',$3,'fingerprint-current',$4,$5,$6)`,
+			[
+				"a".repeat(64), "b".repeat(64), "c".repeat(64), start, expiry,
+				"00-00000000000000000000000000000000-1234567890abcdef-01",
+			],
+		)).rejects.toThrow();
+		await pool.query(
+			`ALTER TABLE ${traceParentTables.event}
+			 DROP CONSTRAINT ${quoteIdentifier(`${traceParentTables.names.event}_trace_parent_check`)},
+			 ADD CONSTRAINT ${quoteIdentifier(`${traceParentTables.names.event}_trace_parent_check`)}
+			 CHECK (trace_parent IS NULL OR trace_parent ~ '^00-')`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, traceParentDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
 	});
 
 	it("fails closed when endpoint privacy constraints or URL uniqueness drift", async () => {
@@ -225,7 +250,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			 FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}()`,
 		);
 		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
-			.resolves.toMatchObject({ version: 4 });
+			.resolves.toMatchObject({ version: 5 });
 		await pool.query(
 			`ALTER TABLE ${tables.event} ENABLE REPLICA TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}`,
 		);
@@ -261,12 +286,27 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			`DROP FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(shadowFunction)}()`,
 		);
 		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
-			.resolves.toMatchObject({ version: 4 });
+			.resolves.toMatchObject({ version: 5 });
 	});
 
-	it("transactionally upgrades owned v1 storage through v4 without losing rows", async () => {
+	it("transactionally upgrades owned v4 storage with the nullable private trace carrier", async () => {
 		await migrateDeliverySchema(pool, migrationOptions);
 		const tables = qualifiedDeliveryTables(migrationOptions);
+		await pool.query(`ALTER TABLE ${tables.event} DROP COLUMN trace_parent`);
+		for (const name of [
+			tables.names.meta, tables.names.webhookEndpoint, tables.names.event, tables.names.payload,
+			tables.names.job, tables.names.attempt, tables.names.worker,
+		]) {
+			await pool.query(`COMMENT ON TABLE ${quoteIdentifier(tables.schema)}.${quoteIdentifier(name)} IS 'clearance.delivery:v4'`);
+		}
+		await pool.query(`COMMENT ON FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}() IS 'clearance.delivery:v4'`);
+		await pool.query(`UPDATE ${tables.meta} SET value='4'::jsonb WHERE key='schema_version'`);
+		const v5 = await migrateDeliverySchema(pool, migrationOptions);
+		expect(v5.version).toBe(5);
+		expect((await pool.query(`SELECT trace_parent FROM ${tables.event}`)).rows).toEqual([]);
+
+		// Continue from a deliberately reconstructed owned v1 schema to ensure all
+		// historical forward paths still finish at the same v5 authority.
 		await pool.query(
 			`ALTER TABLE ${tables.job}
 			 DROP CONSTRAINT ${quoteIdentifier(`${tables.names.job}_provider_check`)},
@@ -279,6 +319,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await pool.query(
 			`ALTER TABLE ${tables.event}
 			 DROP COLUMN webhook_endpoint_id,
+			 DROP COLUMN trace_parent,
 			 DROP COLUMN source_fingerprint_key_id,
 			 DROP COLUMN source_dedupe_fingerprint CASCADE,
 			 DROP COLUMN source_dedupe_version,
@@ -310,10 +351,10 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			code: "DELIVERY_FINGERPRINT_MIGRATION_KEY_ID_REQUIRED",
 		});
 		const migrated = await migrateDeliverySchema(pool, migrationOptions);
-		expect(migrated.version).toBe(4);
+		expect(migrated.version).toBe(5);
 		expect((await pool.query(
 			`SELECT j.id, j.state, j.provider_accepted_at, j.destination_fingerprint_key_id,
-			 e.source_fingerprint_key_id, e.source_dedupe_version
+			 e.source_fingerprint_key_id, e.source_dedupe_version, e.trace_parent
 			 FROM ${tables.job} j JOIN ${tables.event} e ON e.id=j.event_id WHERE j.id='v1-job'`,
 		)).rows).toEqual([
 			{
@@ -323,9 +364,35 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 				destination_fingerprint_key_id: "fingerprint-v2",
 				source_fingerprint_key_id: "fingerprint-v2",
 				source_dedupe_version: 1,
+				trace_parent: null,
 			},
 		]);
-		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(4);
+		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(5);
+
+		const carrierNow = new Date(start.getTime() - 1_000);
+		const carrierStore = new DeliveryStore(pool, migrationOptions);
+		await pool.query(
+			`INSERT INTO ${tables.event}
+			 (id, kind, source_fingerprint, source_fingerprint_key_id, source_dedupe_fingerprint,
+			  source_dedupe_version, project_id, environment_id, destination_fingerprint,
+			  destination_fingerprint_key_id, created_at, semantic_expires_at, trace_parent)
+			 VALUES ('trace-event','password.reset',$1,'fingerprint-v2',$2,2,'project-1','env-1',$3,
+			 'fingerprint-v2',$4,$5,$6)`,
+			["c".repeat(64), "d".repeat(64), "e".repeat(64), carrierNow, expiry,
+				"00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"],
+		);
+		await pool.query(
+			`INSERT INTO ${tables.job}
+			 (id, event_id, channel, destination_fingerprint, destination_fingerprint_key_id, state,
+			  available_at, semantic_expires_at, max_attempts, created_at, updated_at)
+			 VALUES ('trace-job','trace-event','email',$1,'fingerprint-v2','queued',$2,$3,3,$2,$2)`,
+			["e".repeat(64), carrierNow, expiry],
+		);
+		const lease = await carrierStore.claimNext({ workerId: "trace-worker", now: carrierNow });
+		expect(lease?.traceCarrier?.traceparent)
+			.toBe("00-1234567890abcdef1234567890abcdef-1234567890abcdef-01");
+		expect(JSON.stringify(await carrierStore.inspectJob("trace-job")))
+			.not.toContain("1234567890abcdef1234567890abcdef");
 	});
 
 	it("recreates rollback lookup indexes with their exact catalog definitions", async () => {
@@ -362,7 +429,7 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		await pool.query(
 			`DROP INDEX ${quoteIdentifier(mainTables.schema)}.${quoteIdentifier(`${mainTables.names.event}_scope_created_idx`)}`,
 		);
-		expect((await store.migrate()).version).toBe(4);
+		expect((await store.migrate()).version).toBe(5);
 		expect((await pool.query<{ indexdef: string }>(
 			`SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname=$2`,
 			[mainTables.schema, `${mainTables.names.event}_scope_created_idx`],
