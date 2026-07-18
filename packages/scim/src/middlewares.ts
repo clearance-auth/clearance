@@ -78,6 +78,10 @@ export const authMiddlewareFactory = (opts: SCIMOptions) =>
 			opts,
 			scimProvider.scimToken,
 			scimToken,
+			{
+				providerId: scimProvider.providerId,
+				organizationId: scimProvider.organizationId,
+			},
 		);
 
 		if (!isValidToken) {
