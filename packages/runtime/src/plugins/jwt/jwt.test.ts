@@ -1,13 +1,76 @@
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import type { JSONWebKeySet } from "jose";
-import { createLocalJWKSet, jwtVerify } from "jose";
+import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 import { describe, expect, it } from "vitest";
 import { createAuthClient } from "../../client";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { jwt } from ".";
 import { jwtClient } from "./client";
+import {
+	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+} from "./sign";
 import type { JWKOptions, Jwk, JwtOptions } from "./types";
 import { generateExportedKeyPair, toExpJWT } from "./utils";
+
+const managedJwtIdentity = {
+	projectId: "jwt-project",
+	environmentId: "jwt-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedJwtPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+function managedJwtOptions(override: JwtOptions = {}) {
+	const options = {
+		plugins: [
+			jwt({
+				...override,
+				disableSettingJwtHeader: true,
+				jwt: {
+					getSubject: async () => "application-subject",
+					definePayload: async () => ({
+						[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: "forged",
+						[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: "forged",
+						[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: "forged",
+					}),
+					...override.jwt,
+				},
+			}),
+		],
+		logger: { level: "error" },
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity: managedJwtIdentity,
+		reader: {
+			async readForSubject(input) {
+				return {
+					scope: managedJwtIdentity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: managedJwtPolicy,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective: managedJwtPolicy,
+				};
+			},
+		},
+	});
+	return options;
+}
 
 describe("jwt compatibility", async () => {
 	const { auth, signInWithTestUser } = await getTestInstance({
@@ -114,6 +177,97 @@ describe("jwt compatibility", async () => {
 				tokenMode: null,
 			},
 		]);
+	});
+});
+
+describe("jwt session derivative authority", async () => {
+	it("binds live managed sessions, rejects stale sources, and preserves generic tokens", async () => {
+		const local = await getTestInstance(managedJwtOptions());
+		const signedIn = await local.signInWithTestUser();
+		const currentSession = await local.client.getSession({
+			fetchOptions: { headers: signedIn.headers },
+		});
+		const response = await local.auth.handler(
+			new Request("http://localhost:3000/api/auth/token", {
+				method: "GET",
+				headers: signedIn.headers,
+			}),
+		);
+		const { token } = (await response.json()) as { token: string };
+		const payload = decodeJwt(token);
+
+		expect(payload).toMatchObject({
+			sub: "application-subject",
+			[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: expect.any(String),
+			[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: signedIn.user.id,
+			[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: null,
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toMatchObject({ sub: "application-subject" });
+
+		await local.client.revokeSession({
+			id: currentSession.data!.session.id,
+			fetchOptions: { headers: signedIn.headers },
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toBeNull();
+
+		const generic = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+				},
+			},
+		});
+		expect(
+			(
+				await local.auth.api.verifyJWT({
+					body: { token: generic.token },
+				})
+			).payload,
+		).toMatchObject({ sub: "generic-subject" });
+	});
+
+	it("rejects a remote signer that strips managed session authority", async () => {
+		let signingCalls = 0;
+		const local = await getTestInstance(
+			managedJwtOptions({
+				jwks: {
+					remoteUrl: "https://example.com/.well-known/jwks.json",
+					keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+				},
+				jwt: {
+					async sign(payload) {
+						signingCalls += 1;
+						const stripped = { ...payload };
+						delete stripped[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM];
+						delete stripped[JWT_SESSION_SOURCE_SUBJECT_CLAIM];
+						delete stripped[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM];
+						const encode = (value: unknown) =>
+							Buffer.from(JSON.stringify(value)).toString("base64url");
+						return `${encode({ alg: "EdDSA", typ: "JWT" })}.${encode(stripped)}.signature`;
+					},
+				},
+			}),
+		);
+		const signedIn = await local.signInWithTestUser();
+		const refresh = async () => {
+			const headers = new Headers(signedIn.headers);
+			headers.set("idempotency-key", generateCredentialOperationKey());
+			return local.auth.handler(
+				new Request("http://localhost:3000/api/auth/token", {
+					method: "POST",
+					headers,
+				}),
+			);
+		};
+
+		expect((await refresh()).status).toBe(500);
+		expect((await refresh()).status).toBe(500);
+		expect(signingCalls).toBe(2);
 	});
 });
 
