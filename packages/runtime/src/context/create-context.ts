@@ -46,6 +46,11 @@ import {
 	readInternalAuthenticationPolicy,
 	type InternalRuntimeAuthenticationPolicyBinding,
 } from "../internal/authentication-policy";
+import {
+	attachCapturedInternalRuntimeAudit,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditBinding,
+} from "../internal/runtime-audit";
 
 function sameAuthenticationPolicyBinding(
 	left: InternalRuntimeAuthenticationPolicyBinding,
@@ -70,6 +75,33 @@ function assertCompatibleAuthenticationPolicyTarget(
 	if (existing && !sameAuthenticationPolicyBinding(existing, binding)) {
 		throw new ClearanceError(
 			"Authentication policy authority does not match the runtime options binding",
+		);
+	}
+}
+
+function sameRuntimeAuditBinding(
+	left: InternalRuntimeAuditBinding,
+	right: InternalRuntimeAuditBinding,
+): boolean {
+	return left === right;
+}
+
+function assertCompatibleRuntimeAuditTarget(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	const existing = readInternalRuntimeAudit(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Runtime audit authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && !sameRuntimeAuditBinding(existing, binding)) {
+		throw new ClearanceError(
+			"Runtime audit authority does not match the runtime options binding",
 		);
 	}
 }
@@ -134,12 +166,14 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 ): Promise<AuthContext<Options>> {
 	const credentialAuthority = readInternalCredentialAuthority(options);
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const runtimeAudit = readInternalRuntimeAudit(options);
 	const initialPolicyTargets = [
 		adapter,
 		...(adapter.options ? [adapter.options] : []),
 	];
 	for (const target of new Set(initialPolicyTargets)) {
 		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
 	}
 	if (authenticationPolicy) {
 		if (!options.database) {
@@ -281,10 +315,16 @@ Most of the features of Clearance will not work correctly.`,
 	]);
 	for (const target of authenticationPolicyTargets) {
 		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
 	}
 	if (authenticationPolicy) {
 		for (const target of authenticationPolicyTargets) {
 			attachCapturedInternalAuthenticationPolicy(target, authenticationPolicy);
+		}
+	}
+	if (runtimeAudit) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalRuntimeAudit(target, runtimeAudit);
 		}
 	}
 
