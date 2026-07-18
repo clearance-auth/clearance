@@ -20,11 +20,14 @@ import {
 } from "./pagination.js";
 import {
 	inspectScimTrace,
+	inspectScimTraceAuthoritative,
 	replayScimTrace,
+	replayScimTraceAuthoritative,
 	type ScimActorSource,
 } from "./scim.js";
 import {
 	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
 	type ResourceScope,
 } from "./scope.js";
 
@@ -670,6 +673,121 @@ function findExistingScimReplay(
 	}
 }
 
+async function findExistingScimReplayAuthoritative(
+	store: ManagementStore,
+	originalId: string,
+	scope: ResourceScope,
+): Promise<DiagnosticTrace | undefined> {
+	const audit = store.snapshot.events.find(
+		(event) =>
+			(event.action === "scim.replay" || event.action === "events.replay") &&
+			eventInScope(event, scope) &&
+			event.metadata &&
+			(event.metadata as { originalId?: string }).originalId === originalId &&
+			typeof event.subjectId === "string",
+	);
+	if (!audit?.subjectId) return undefined;
+	try {
+		return await inspectScimTraceAuthoritative(store, audit.subjectId, { scope });
+	} catch {
+		return undefined;
+	}
+}
+
+function traceNotFound(id: string, stage: string): ClearanceError {
+	return new ClearanceError({
+		code: "TRACE_NOT_FOUND",
+		message: "Diagnostic trace not found",
+		stage,
+		status: 404,
+		remediation:
+			"Pass a SCIM diagnostic trace id from scim test (not an audit event id)",
+	});
+}
+
+async function recordIdempotentReplayAuditAuthoritative(
+	store: ManagementStore,
+	input: {
+		original: DiagnosticTrace;
+		existing: DiagnosticTrace;
+		scope: ResourceScope;
+		opts: ReplayDiagnosticOptions;
+	},
+): Promise<void> {
+	if (!store.storeV2Topology?.authoritative) {
+		store.mutate((data) => {
+			appendAuditEvent(data, replayIdempotentAuditInput(input));
+		});
+		return;
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+			message: "Relational topology authority requires a coordinated transaction",
+			stage: "events.replay",
+			status: 500,
+		});
+	}
+	await store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const original = data.traces.find((trace) => trace.id === input.original.id);
+		const existing = data.traces.find((trace) => trace.id === input.existing.id);
+		if (!original || original.subsystem !== "scim" || !existing) {
+			throw traceNotFound(input.original.id, "events.replay");
+		}
+		if (original.connectionId) {
+			const connection = data.directoryConnections.find(
+				(candidate) => candidate.id === original.connectionId,
+			);
+			const organization = connection && topology ? await topology.lockOrganization({
+				scope: input.scope,
+				id: connection.organizationId,
+			}) : null;
+			if (!organization || organization.status === "archived") {
+				throw traceNotFound(input.original.id, "events.replay");
+			}
+		} else if (original.organizationId) {
+			const organization = topology ? await topology.lockOrganization({
+				scope: input.scope,
+				id: original.organizationId,
+			}) : null;
+			if (!organization || organization.status === "archived") {
+				throw traceNotFound(input.original.id, "events.replay");
+			}
+		} else if (
+			original.projectId !== input.scope.projectId ||
+			original.environmentId !== input.scope.environmentId
+		) {
+			throw traceNotFound(input.original.id, "events.replay");
+		}
+		appendAudit(replayIdempotentAuditInput(input));
+	});
+}
+
+function replayIdempotentAuditInput(input: {
+	original: DiagnosticTrace;
+	existing: DiagnosticTrace;
+	scope: ResourceScope;
+	opts: ReplayDiagnosticOptions;
+}) {
+	return {
+		actor: input.opts.actor ?? "operator",
+		action: "events.replay" as const,
+		subjectType: "diagnostic_trace",
+		subjectId: input.existing.id,
+		outcome: "success" as const,
+		source: input.opts.source ?? "cli",
+		projectId: input.scope.projectId,
+		environmentId: input.scope.environmentId,
+		organizationId: input.original.organizationId,
+		message: `Replay already recorded for diagnostic trace ${input.original.id}`,
+		metadata: {
+			originalId: input.original.id,
+			idempotent: true,
+			subsystem: "scim",
+		},
+	};
+}
+
 /**
  * Inspect an audit event and/or diagnostic trace by id / correlation id.
  * Fail closed for wrong-scope resources (same as missing).
@@ -885,6 +1003,106 @@ export function replayDiagnosticTrace(
 		replayable: true,
 		original: scimOriginal,
 		trace: replay,
+		scope,
+		auditAction: "scim.replay",
+	};
+}
+
+/**
+ * Production replay path. It retains the synchronous JSON fallback, while
+ * Postgres topology cutover resolves every SCIM organization boundary through
+ * bounded normalized reads and rechecks that boundary in the write unit.
+ */
+export async function replayDiagnosticTraceOperational(
+	store: ManagementStore,
+	id: string,
+	opts: ReplayDiagnosticOptions = {},
+): Promise<ReplayDiagnosticResult> {
+	if (!store.storeV2Topology?.authoritative) {
+		return replayDiagnosticTrace(store, id, opts);
+	}
+	const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
+	const dryRun = opts.dryRun === true || opts.confirm !== true;
+	const stage = "events.replay";
+	const rawTrace = findTrace(store, id);
+	if (!rawTrace) throw traceNotFound(id, stage);
+	if (rawTrace.subsystem !== "scim") {
+		if (!traceInScope(rawTrace, scope)) throw traceNotFound(id, stage);
+		throw new ClearanceError({
+			code: "EVENT_NOT_REPLAYABLE",
+			message: rawTrace.stage.endsWith(".replay")
+				? "Trace is already a replay artifact; pass the original diagnostic trace id"
+				: `Subsystem "${rawTrace.subsystem}" is not replayable (only scim diagnostic re-record)`,
+			stage,
+			status: 400,
+			remediation:
+				"Only original SCIM diagnostic traces can be re-recorded; audit mutations and other subsystems cannot be replayed",
+		});
+	}
+	const original = await inspectScimTraceAuthoritative(store, rawTrace.id, { scope });
+	if (original.stage.endsWith(".replay")) {
+		throw new ClearanceError({
+			code: "EVENT_NOT_REPLAYABLE",
+			message: "Trace is already a replay artifact; pass the original diagnostic trace id",
+			stage,
+			status: 400,
+			remediation:
+				"Only original SCIM diagnostic traces can be re-recorded; audit mutations and other subsystems cannot be replayed",
+		});
+	}
+
+	const existing = await findExistingScimReplayAuthoritative(store, original.id, scope);
+	if (existing) {
+		if (!dryRun) {
+			await recordIdempotentReplayAuditAuthoritative(store, {
+				original,
+				existing,
+				scope,
+				opts,
+			});
+		}
+		return {
+			dryRun,
+			idempotent: true,
+			wouldChange: false,
+			replayable: true,
+			original,
+			trace: existing,
+			scope,
+			...(dryRun ? {} : { auditAction: "events.replay" as const }),
+		};
+	}
+
+	if (dryRun) {
+		return {
+			dryRun: true,
+			idempotent: false,
+			wouldChange: true,
+			replayable: true,
+			original,
+			trace: {
+				...original,
+				id: "tr_preview",
+				correlationId: "corr_replay_preview",
+				createdAt: nowIso(),
+				stage: `${original.stage.replace(/\.replay$/, "")}.replay`,
+			},
+			scope,
+		};
+	}
+
+	const trace = await replayScimTraceAuthoritative(store, original.id, {
+		actor: opts.actor ?? "operator",
+		source: (opts.source ?? "cli") as ScimActorSource,
+		scope,
+	});
+	return {
+		dryRun: false,
+		idempotent: false,
+		wouldChange: true,
+		replayable: true,
+		original,
+		trace,
 		scope,
 		auditAction: "scim.replay",
 	};
