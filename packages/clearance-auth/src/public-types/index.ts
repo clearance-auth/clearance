@@ -1,3 +1,9 @@
+import type {
+	KeyProviderReadiness,
+	KeyProviderRegistry,
+	KeyPurpose,
+} from "@clearance/key-management";
+
 export type SocialProviderConfig = {
 	clientId: string;
 	clientSecret: string;
@@ -286,6 +292,15 @@ export type CreateClearanceAuthOptions<
 	authenticationPolicy?: {
 		projectId: string;
 		environmentId: string;
+	};
+	/**
+	 * Purpose-separated credential and signing-key protection. Required in
+	 * production/strict mode. Development derives three isolated local keys.
+	 */
+	keyManagement?: {
+		projectId: string;
+		environmentId: string;
+		registry: KeyProviderRegistry;
 	};
 	/** Enabled by default. Set to `false` to omit the passkey server surface. */
 	passkeys?: Passkeys;
@@ -737,6 +752,27 @@ export type ClearanceAuthBundle<
 	};
 	/** Present only when createClearanceAuth received authenticationPolicy scope. */
 	authenticationPolicy?: ClearanceAuthenticationPolicyFacade;
+	keyManagement: {
+		readonly scope: Readonly<{ projectId: string; environmentId: string }>;
+		resourceId(
+			purpose: KeyPurpose,
+			identity: Readonly<Record<string, string | null>>,
+		): string;
+		sealText(
+			purpose: KeyPurpose,
+			resourceId: string,
+			plaintext: string,
+		): Promise<string>;
+		openText(
+			purpose: KeyPurpose,
+			resourceId: string,
+			envelope: string,
+		): Promise<string>;
+		readiness(): Promise<Readonly<{
+			ready: boolean;
+			purposes: Readonly<Record<KeyPurpose, KeyProviderReadiness>>;
+		}>>;
+	};
 	prepareCredentialAuthorityRuntime(): Promise<void>;
 	planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
 	migrate(input?: { drainId?: string }): Promise<ClearanceRuntimeMigrationResult>;
