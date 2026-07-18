@@ -72,6 +72,7 @@ import type { AuditEvent, DataStoreSnapshot } from "../types/resources.js";
 import {
 	PgStoreV2Shadow,
 	StoreV2MigrationError,
+	type StoreV2LoadResult,
 	type StoreV2SyncResult,
 } from "./store-v2-shadow.js";
 import {
@@ -83,7 +84,11 @@ import {
 	type RuntimeAuditStoreOptions,
 } from "./runtime-audit-events.js";
 import { PgStoreV2PrincipalRepository } from "./store-v2-principals.js";
-import { PgStoreV2TopologyRepository } from "./store-v2-topology.js";
+import {
+	PgStoreV2TopologyRepository,
+	readStoreV2TopologyState,
+	type StoreV2TopologyState,
+} from "./store-v2-topology.js";
 import { registerInternalCoordinatedExecutor } from "./coordinated-internal.js";
 import {
 	appendAuditEvent,
@@ -112,6 +117,8 @@ import type {
 } from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
+
+type StoreV2SnapshotPublication = Omit<StoreV2LoadResult, "storedSnapshot">;
 
 class TransactionCapabilityRevokedError extends Error {
 	readonly code = "TRANSACTION_CAPABILITY_REVOKED";
@@ -182,6 +189,9 @@ export class PgStore implements ManagementStore {
 	private storeV2AuthoritativeCollections: StoreV2Collection[] = [];
 	private storeV2PrincipalRevision: number | null = null;
 	private storeV2PrincipalCount = 0;
+	private storeV2TopologyState: StoreV2TopologyState | null = null;
+	private storeV2TopologySnapshotRevision = -1;
+	private storeV2Publication: Promise<void> = Promise.resolve();
 	private pending: Promise<void> = Promise.resolve();
 	/** Set when a queued write fails; rethrown from ready() so the chain never rejects. */
 	private writeError: unknown = null;
@@ -637,12 +647,9 @@ export class PgStore implements ManagementStore {
 		}
 		if (this.storeV2Shadow) {
 			const loaded = await this.storeV2Shadow.loadSnapshot();
-			this.data = loaded.snapshot;
-			this.storeV2PrincipalCount = loaded.principalCount;
-			this.revision = loaded.revision;
-			this.storeV2Phase = loaded.phase;
-			this.storeV2AuthoritativeCollections = loaded.authoritativeCollections;
-			this.storeV2PrincipalRevision = loaded.principalRevision;
+			await this.publishStoreV2Publication(() => {
+				this.publishStoreV2Snapshot(loaded);
+			});
 		}
 		this.initialized = true;
 		return this;
@@ -689,12 +696,9 @@ export class PgStore implements ManagementStore {
 				principalRevision: this.storeV2PrincipalRevision,
 				principalCount: this.storeV2PrincipalCount,
 			});
-			this.data = loaded.snapshot;
-			this.storeV2PrincipalCount = loaded.principalCount;
-			this.revision = loaded.revision;
-			this.storeV2Phase = loaded.phase;
-			this.storeV2AuthoritativeCollections = loaded.authoritativeCollections;
-			this.storeV2PrincipalRevision = loaded.principalRevision;
+			await this.publishStoreV2Publication(() => {
+				this.publishStoreV2Snapshot(loaded);
+			});
 			if (process.env.CLEARANCE_STORE_V2_VERIFY === "1") {
 				const status = await this.storeV2Shadow.verify();
 				if ((status.phase === "shadow" || status.phase === "hybrid") && !status.consistent) {
@@ -757,7 +761,12 @@ export class PgStore implements ManagementStore {
 		return this.trackPrincipalTransaction(this.transactStoreV2Identity(fn));
 	}
 
-	mutateStoreV2Topology<T>(fn: (topology: StoreV2TopologyRepository) => Promise<T> | T): Promise<T> {
+	mutateStoreV2Topology<T>(
+		fn: (context: {
+			topology: StoreV2TopologyRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T> {
 		const transaction = this.transactStoreV2Topology(fn);
 		this.activeTopologyTransactions.add(transaction);
 		transaction.finally(() => this.activeTopologyTransactions.delete(transaction)).catch(() => undefined);
@@ -817,7 +826,198 @@ export class PgStore implements ManagementStore {
 		if (this.storeV2AuthoritativeCollections.includes("principals")) {
 			counts.principals = this.storeV2PrincipalCount;
 		}
+		if (
+			["projects", "environments", "organizations"].every((collection) =>
+				this.storeV2AuthoritativeCollections.includes(
+					collection as StoreV2Collection,
+				),
+			)
+		) {
+			if (!this.storeV2TopologyState) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_STATE_INVALID",
+					"Store-v2 topology state metadata is missing or invalid.",
+				);
+			}
+			counts.projects = this.storeV2TopologyState.projectCount;
+			counts.environments = this.storeV2TopologyState.environmentCount;
+			counts.organizations = this.storeV2TopologyState.organizationCount;
+		}
 		return counts;
+	}
+
+	/**
+	 * A refresh reads snapshot, authority, principals, and topology from one
+	 * database view. Publish that view all at once only when it cannot regress
+	 * the snapshot or topology views already observed by this process.
+	 */
+	private publishStoreV2Snapshot(loaded: StoreV2SnapshotPublication): boolean {
+		if (
+			!this.canPublishStoreV2SnapshotTopology(loaded) ||
+			!this.canPublishStoreV2PrincipalCache(loaded)
+		) {
+			this.publishStoreV2TopologyState({
+				phase: loaded.phase,
+				authoritativeCollections: loaded.authoritativeCollections,
+				topologyState: loaded.topologyState,
+				snapshotRevision: loaded.revision,
+			});
+			return false;
+		}
+		this.data = loaded.snapshot;
+		this.revision = loaded.revision;
+		this.storeV2PrincipalCount = loaded.principalCount;
+		this.storeV2PrincipalRevision = loaded.principalRevision;
+		this.publishStoreV2TopologyState({
+			phase: loaded.phase,
+			authoritativeCollections: loaded.authoritativeCollections,
+			topologyState: loaded.topologyState,
+			snapshotRevision: loaded.revision,
+		});
+		return true;
+	}
+
+	/**
+	 * A committed snapshot candidate may lose a local publication race to a
+	 * direct relational transaction. Reload directly after commit until one
+	 * coherent view publishes, retaining the newer safe view if writers remain
+	 * continuously active.
+	 */
+	private async publishCommittedStoreV2Snapshot(
+		candidate: StoreV2SnapshotPublication,
+	): Promise<void> {
+		await this.publishStoreV2Publication(async () => {
+			if (this.publishStoreV2Snapshot(candidate) || !this.storeV2Shadow) return;
+			try {
+				const loaded = await this.storeV2Shadow.loadSnapshot({
+					principalRevision: this.storeV2PrincipalRevision,
+					principalCount: this.storeV2PrincipalCount,
+				});
+				this.publishStoreV2Snapshot(loaded);
+			} catch {
+				// The database commit is durable. Retain the newer coherent local view;
+				// the next ordinary refresh can retry convergence.
+			}
+		});
+	}
+
+	private publishStoreV2Publication<T>(
+		fn: () => Promise<T> | T,
+	): Promise<T> {
+		const publication = this.storeV2Publication.then(fn, fn);
+		this.storeV2Publication = publication.then(
+			() => undefined,
+			() => undefined,
+		);
+		return publication;
+	}
+
+	private canPublishStoreV2SnapshotTopology(
+		loaded: StoreV2SnapshotPublication,
+	): boolean {
+		if (loaded.revision < this.revision) return false;
+		const currentTopologyRevision = this.storeV2TopologyState?.revision;
+		const incomingTopologyRevision = loaded.topologyState?.revision;
+		if (
+			currentTopologyRevision !== undefined &&
+			(incomingTopologyRevision === undefined ||
+				incomingTopologyRevision < currentTopologyRevision)
+		) return false;
+		if (
+			currentTopologyRevision !== undefined &&
+			incomingTopologyRevision === currentTopologyRevision &&
+			loaded.revision < this.storeV2TopologySnapshotRevision
+		) return false;
+		return true;
+	}
+
+	private canPublishStoreV2PrincipalCache(
+		loaded: StoreV2SnapshotPublication,
+	): boolean {
+		const incomingPrincipalsAuthoritative =
+			loaded.authoritativeCollections.includes("principals");
+		if (incomingPrincipalsAuthoritative && loaded.principalRevision === null) {
+			return false;
+		}
+		if (
+			this.storeV2PrincipalRevision !== null &&
+			(loaded.principalRevision === null ||
+				loaded.principalRevision < this.storeV2PrincipalRevision)
+		) return false;
+		return true;
+	}
+
+	private publishStoreV2PrincipalState(revision: number, count: number): void {
+		if (
+			this.storeV2PrincipalRevision !== null &&
+			revision < this.storeV2PrincipalRevision
+		) return;
+		this.storeV2PrincipalRevision = revision;
+		this.storeV2PrincipalCount = count;
+	}
+
+	/**
+	 * Publish the topology authority view as one monotonic cache update. Direct
+	 * topology writers do not advance the snapshot revision, so an older refresh
+	 * may return after their commit; its older topology state must not win.
+	 */
+	private publishStoreV2TopologyState(input: {
+		phase: StoreV2Phase;
+		authoritativeCollections: readonly StoreV2Collection[];
+		topologyState: StoreV2TopologyState | null;
+		snapshotRevision: number;
+	}): void {
+		const authoritativeCollections = [...input.authoritativeCollections];
+		const nextTopologyAuthoritative = [
+			"projects",
+			"environments",
+			"organizations",
+		].every((collection) =>
+			authoritativeCollections.includes(collection as StoreV2Collection),
+		);
+		const currentTopologyAuthoritative = [
+			"projects",
+			"environments",
+			"organizations",
+		].every((collection) =>
+			this.storeV2AuthoritativeCollections.includes(
+				collection as StoreV2Collection,
+			),
+		);
+		if (input.topologyState) {
+			const currentTopologyRevision = this.storeV2TopologyState?.revision;
+			if (
+				currentTopologyRevision !== undefined &&
+				input.topologyState.revision < currentTopologyRevision
+			) return;
+			if (
+				input.topologyState.revision === currentTopologyRevision &&
+				input.snapshotRevision < this.storeV2TopologySnapshotRevision
+			) return;
+			if (
+				currentTopologyRevision === undefined &&
+				input.snapshotRevision < this.storeV2TopologySnapshotRevision
+			) return;
+			this.storeV2TopologyState = input.topologyState;
+			if (input.snapshotRevision < this.storeV2TopologySnapshotRevision) return;
+			this.storeV2Phase = input.phase;
+			this.storeV2AuthoritativeCollections = authoritativeCollections;
+			this.storeV2TopologySnapshotRevision = input.snapshotRevision;
+			return;
+		}
+		if (input.phase !== "absent" && nextTopologyAuthoritative) return;
+		if (
+			input.snapshotRevision < this.storeV2TopologySnapshotRevision ||
+			(this.storeV2TopologyState &&
+				currentTopologyAuthoritative &&
+				input.snapshotRevision === this.storeV2TopologySnapshotRevision)
+		) {
+			return;
+		}
+		this.storeV2Phase = input.phase;
+		this.storeV2AuthoritativeCollections = authoritativeCollections;
+		this.storeV2TopologyState = null;
+		this.storeV2TopologySnapshotRevision = input.snapshotRevision;
 	}
 
 	async destroy(): Promise<void> {
@@ -920,6 +1120,14 @@ export class PgStore implements ManagementStore {
 		replacing = false,
 	): Promise<void> {
 		const client = await this.pool.connect();
+		let committed = false;
+		let released = false;
+		const release = () => {
+			if (!released) {
+				released = true;
+				client.release();
+			}
+		};
 		try {
 			await client.query("BEGIN");
 			if (this.storeV2Shadow) {
@@ -1004,22 +1212,23 @@ export class PgStore implements ManagementStore {
 				[JSON.stringify(persisted), newRevision],
 			);
 			await client.query("COMMIT");
-			this.data = materialized;
-			this.revision = newRevision;
-			this.storeV2Phase = sync?.phase ?? phase;
-			this.storeV2AuthoritativeCollections =
-				sync?.authoritativeCollections ?? [];
-			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
-			this.storeV2PrincipalCount = principalCount;
+			committed = true;
+			release();
+			await this.publishCommittedStoreV2Snapshot({
+				snapshot: materialized,
+				principalCount,
+				revision: newRevision,
+				phase: sync?.phase ?? phase,
+				authoritativeCollections: sync?.authoritativeCollections ?? [],
+				principalRevision: sync?.principalRevision ?? null,
+				topologyState: sync?.topologyState ?? null,
+			}).catch(() => undefined);
 		} catch (e) {
-			try {
-				await client.query("ROLLBACK");
-			} catch {
-				/* ignore rollback errors */
-			}
+			if (committed) return;
+			await client.query("ROLLBACK").catch(() => undefined);
 			throw e;
 		} finally {
-			client.release();
+			release();
 		}
 	}
 
@@ -1027,6 +1236,15 @@ export class PgStore implements ManagementStore {
 		fn: (data: DataStoreSnapshot) => T,
 	): Promise<T> {
 		const client = await this.pool.connect();
+		let committed = false;
+		let released = false;
+		const release = () => {
+			if (!released) {
+				released = true;
+				client.release();
+			}
+		};
+		let committedValue!: T;
 		try {
 			await client.query("BEGIN");
 			if (this.storeV2Shadow) {
@@ -1046,7 +1264,7 @@ export class PgStore implements ManagementStore {
 			const before = cloneSnapshot(base);
 			if (phase === "hybrid") deferAuditRetentionForDraft(base);
 			const revision = previousRevision + 1;
-			const value = fn(base);
+			const value = committedValue = fn(base);
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
 				: undefined;
@@ -1083,19 +1301,24 @@ export class PgStore implements ManagementStore {
 				[JSON.stringify(persisted), revision],
 			);
 			await client.query("COMMIT");
-			this.data = materialized;
-			this.revision = revision;
-			this.storeV2Phase = sync?.phase ?? phase;
-			this.storeV2AuthoritativeCollections =
-				sync?.authoritativeCollections ?? [];
-			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
-			this.storeV2PrincipalCount = principalCount;
+			committed = true;
+			release();
+			await this.publishCommittedStoreV2Snapshot({
+				snapshot: materialized,
+				principalCount,
+				revision,
+				phase: sync?.phase ?? phase,
+				authoritativeCollections: sync?.authoritativeCollections ?? [],
+				principalRevision: sync?.principalRevision ?? null,
+				topologyState: sync?.topologyState ?? null,
+			}).catch(() => undefined);
 			return value;
 		} catch (error) {
+			if (committed) return committedValue;
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
 		} finally {
-			client.release();
+			release();
 		}
 	}
 
@@ -1117,12 +1340,23 @@ export class PgStore implements ManagementStore {
 				"Normalized principal storage is not configured for this store.",
 			);
 		}
+		const snapshotRevision = this.revision;
 		const client = await this.pool.connect();
+		let committed = false;
+		let released = false;
+		const release = () => {
+			if (!released) {
+				released = true;
+				client.release();
+			}
+		};
+		let committedValue!: T;
 		try {
 			await client.query("BEGIN");
 			await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
 			const authoritativeCollections =
 				await this.storeV2Shadow.transactionAuthoritativeCollections(client);
+			const phase = await this.storeV2Shadow.transactionPhase(client);
 			if (!authoritativeCollections.includes("principals")) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
@@ -1168,7 +1402,12 @@ export class PgStore implements ManagementStore {
 			}
 			if (callbackFailed) throw callbackError;
 			if (issuedError !== undefined) throw issuedError;
+			committedValue = value;
 			const principalState = await repository.finalizeState();
+			const topologyState = await readStoreV2TopologyState(
+				client,
+				this.storeV2Shadow.tables,
+			);
 			const eventDelta = audits.length > 0
 				? await appendStoreV2Events(
 						client,
@@ -1178,26 +1417,41 @@ export class PgStore implements ManagementStore {
 					)
 				: undefined;
 			await client.query("COMMIT");
-			this.storeV2AuthoritativeCollections = authoritativeCollections;
-			if (eventDelta) {
-				this.data = {
-					...this.data,
-					events: applyStoreV2EventDelta(this.data.events, eventDelta),
-				};
-			}
-			this.storeV2PrincipalCount = principalState.count;
-			this.storeV2PrincipalRevision = principalState.revision;
+			committed = true;
+			release();
+			await this.publishStoreV2Publication(() => {
+				this.publishStoreV2TopologyState({
+					phase,
+					authoritativeCollections,
+					topologyState,
+					snapshotRevision,
+				});
+				if (eventDelta) {
+					this.data = {
+						...this.data,
+						events: applyStoreV2EventDelta(this.data.events, eventDelta),
+					};
+				}
+				this.publishStoreV2PrincipalState(
+					principalState.revision,
+					principalState.count,
+				);
+			}).catch(() => undefined);
 			return value;
 		} catch (error) {
+			if (committed) return committedValue;
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
 		} finally {
-			client.release();
+			release();
 		}
 	}
 
 	private async transactStoreV2Topology<T>(
-		fn: (topology: StoreV2TopologyRepository) => Promise<T> | T,
+		fn: (context: {
+			topology: StoreV2TopologyRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
 	): Promise<T> {
 		if (!this.storeV2Shadow) {
 			throw new StoreV2MigrationError(
@@ -1205,12 +1459,23 @@ export class PgStore implements ManagementStore {
 				"Normalized topology storage is not configured for this store.",
 			);
 		}
+		const snapshotRevision = this.revision;
 		const client = await this.pool.connect();
+		let committed = false;
+		let released = false;
+		const release = () => {
+			if (!released) {
+				released = true;
+				client.release();
+			}
+		};
+		let committedValue!: T;
 		try {
 			await client.query("BEGIN");
 			await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
 			const authority =
 				await this.storeV2Shadow.transactionAuthoritativeCollections(client);
+			const phase = await this.storeV2Shadow.transactionPhase(client);
 			if (
 				!["projects", "environments", "organizations"].every((collection) =>
 					authority.includes(collection as StoreV2Collection),
@@ -1221,29 +1486,91 @@ export class PgStore implements ManagementStore {
 					"Direct topology mutation requires relational topology authority.",
 				);
 			}
+			if (!authority.includes("events")) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_EVENTS_NOT_AUTHORITATIVE",
+					"Relational topology transactions require append-only event authority.",
+				);
+			}
 			const repository = new PgStoreV2TopologyRepository(
 				client,
 				this.storeV2Shadow.tables,
 			);
+			const audits: AuditEvent[] = [];
+			let auditActive = true;
+			const appendAudit = (input: AuditEventInput): AuditEvent => {
+				if (!auditActive) throw new TransactionCapabilityRevokedError();
+				const event = buildAuditEvent(structuredClone(input));
+				audits.push(event);
+				return structuredClone(event);
+			};
 			let value!: T;
 			let callbackError: unknown;
+			let callbackFailed = false;
 			try {
-				value = await fn(repository.capability);
+				value = await fn(
+					Object.freeze({ topology: repository.capability, appendAudit }),
+				);
 			} catch (error) {
+				callbackFailed = true;
 				callbackError = error;
 			}
 			repository.revoke();
-			await repository.settleIssued();
-			if (callbackError !== undefined) throw callbackError;
-			await repository.finalizeState();
+			auditActive = false;
+			let issuedError: unknown;
+			try {
+				await repository.settleIssued();
+			} catch (error) {
+				issuedError = error;
+			}
+			if (callbackFailed) throw callbackError;
+			if (issuedError !== undefined) throw issuedError;
+			committedValue = value;
+			if (repository.hasMutations() && audits.length === 0) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_AUDIT_REQUIRED",
+					"Changed relational topology transactions must append an audit event.",
+				);
+			}
+			const topologyState = await repository.finalizeState();
+			if (!topologyState) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_STATE_INVALID",
+					"Store-v2 topology state metadata is missing or invalid.",
+				);
+			}
+			const eventDelta = audits.length > 0
+				? await appendStoreV2Events(
+						client,
+						this.storeV2Shadow.tables,
+						audits,
+						topologyState.revision,
+					)
+				: undefined;
 			await client.query("COMMIT");
-			this.storeV2AuthoritativeCollections = authority;
+			committed = true;
+			release();
+			await this.publishStoreV2Publication(() => {
+				this.publishStoreV2TopologyState({
+					phase,
+					authoritativeCollections: authority,
+					topologyState,
+					snapshotRevision,
+				});
+				if (eventDelta) {
+					this.data = {
+						...this.data,
+						events: applyStoreV2EventDelta(this.data.events, eventDelta),
+					};
+				}
+			}).catch(() => undefined);
 			return value;
 		} catch (error) {
+			if (committed) return committedValue;
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
 		} finally {
-			client.release();
+			release();
 		}
 	}
 
@@ -1253,6 +1580,15 @@ export class PgStore implements ManagementStore {
 		) => Promise<T> | T,
 	): Promise<T> {
 		const client = await this.pool.connect();
+		let committed = false;
+		let released = false;
+		const release = () => {
+			if (!released) {
+				released = true;
+				client.release();
+			}
+		};
+		let committedValue!: T;
 		try {
 			await client.query("BEGIN");
 			if (this.storeV2Shadow) {
@@ -1525,6 +1861,7 @@ export class PgStore implements ManagementStore {
 				(result): result is PromiseRejectedResult => result.status === "rejected",
 			);
 			if (failed) throw failed.reason;
+			committedValue = value;
 			await principalTransaction?.finalizeState();
 			const appendedEvents = phase === "hybrid"
 				? consumeDeferredAuditEvents(base)
@@ -1563,19 +1900,24 @@ export class PgStore implements ManagementStore {
 				[JSON.stringify(persisted), revision],
 			);
 			await client.query("COMMIT");
-			this.data = materialized;
-			this.revision = revision;
-			this.storeV2Phase = sync?.phase ?? phase;
-			this.storeV2AuthoritativeCollections =
-				sync?.authoritativeCollections ?? [];
-			this.storeV2PrincipalRevision = sync?.principalRevision ?? null;
-			this.storeV2PrincipalCount = principalCount;
+			committed = true;
+			release();
+			await this.publishCommittedStoreV2Snapshot({
+				snapshot: materialized,
+				principalCount,
+				revision,
+				phase: sync?.phase ?? phase,
+				authoritativeCollections: sync?.authoritativeCollections ?? [],
+				principalRevision: sync?.principalRevision ?? null,
+				topologyState: sync?.topologyState ?? null,
+			}).catch(() => undefined);
 			return value;
 		} catch (error) {
+			if (committed) return committedValue;
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
 		} finally {
-			client.release();
+			release();
 		}
 	}
 
