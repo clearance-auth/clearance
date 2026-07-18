@@ -137,8 +137,8 @@ export type SSOProvider<O extends SSOOptions> =
 export interface SSOOptions {
 	/** Transparent at-rest protection for OIDC client secrets. */
 	storeOIDCClientSecret?: {
-		encrypt: (secret: string) => Awaitable<string>;
-		decrypt: (ciphertext: string) => Awaitable<string>;
+		encrypt: (secret: string, providerId: string) => Awaitable<string>;
+		decrypt: (ciphertext: string, providerId: string) => Awaitable<string>;
 	};
 	/**
 	 * custom function to provision a user when they sign in with an SSO provider.
