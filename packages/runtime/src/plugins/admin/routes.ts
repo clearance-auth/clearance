@@ -3,7 +3,7 @@ import {
 	createAuthMiddleware,
 } from "@clearance/core/api";
 import type { Session } from "@clearance/core/db";
-import type { DBAdapter, Where } from "@clearance/core/db/adapter";
+import type { DBAdapter, DBTransactionAdapter, Where } from "@clearance/core/db/adapter";
 import { whereOperators } from "@clearance/core/db/adapter";
 import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
@@ -17,6 +17,13 @@ import {
 import { parseSessionOutput, parseUserOutput } from "../../db/schema";
 import { lockAndReadUser } from "../../db/user-authority";
 import { captureInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../internal/runtime-audit";
 import { getDate } from "../../utils/date";
 import type { AccessControl, ArrayElement } from "../access";
 import type { defaultStatements } from "./access";
@@ -59,6 +66,22 @@ function requireAtomicCredentialMutation(adapter: Pick<DBAdapter, "options">) {
 				"Administrative credential revocation requires rollback-capable database transactions",
 		});
 	}
+}
+
+async function appendRuntimeAuditIfBound(
+	ctx: { context: { adapter: DBAdapter; options: object } },
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
 }
 
 const setRoleBodySchema = z.object({
@@ -1337,6 +1360,17 @@ export const impersonateUser = (opts: AdminOptions) =>
 					true,
 					issuanceContext,
 				);
+				await appendRuntimeAuditIfBound(ctx, transactionAdapter, {
+					actor: actor.id,
+					action: "auth.impersonation.started",
+					subjectType: "session",
+					subjectId: session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: null,
+					message: "Impersonation started",
+					metadata: { targetUserId: targetUser.id },
+				});
 				return { session, targetUser };
 			});
 			const session = issued.session;
@@ -1440,7 +1474,21 @@ export const stopImpersonating = () =>
 					message: "Failed to find admin session",
 				});
 			}
-			await ctx.context.internalAdapter.deleteSessionById(session.session.id);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+				await ctx.context.internalAdapter.deleteSessionById(session.session.id);
+				await appendRuntimeAuditIfBound(ctx, transactionAdapter, {
+					actor: session.session.impersonatedBy,
+					action: "auth.impersonation.stopped",
+					subjectType: "session",
+					subjectId: session.session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: null,
+					message: "Impersonation stopped",
+					metadata: { targetUserId: session.user.id },
+				});
+			});
 			await setSessionCookie(ctx, adminSession, !!dontRememberMeCookie);
 			expireCookie(ctx, adminSessionCookie);
 			return ctx.json({
