@@ -2,6 +2,7 @@ import type {
 	KeyProviderReadiness,
 	KeyProviderRegistry,
 	KeyPurpose,
+	KeySigningProvider,
 } from "@clearance/key-management";
 
 export type SocialProviderConfig = {
@@ -295,12 +296,15 @@ export type CreateClearanceAuthOptions<
 	};
 	/**
 	 * Purpose-separated credential and signing-key protection. Required in
-	 * production/strict mode. Development derives three isolated local keys.
+	 * production/strict mode. Development derives isolated encryption and
+	 * signing keys.
 	 */
 	keyManagement?: {
 		projectId: string;
 		environmentId: string;
 		registry: KeyProviderRegistry;
+		/** ES256 software or cloud signer used for five-minute access tokens. */
+		signingProvider: KeySigningProvider;
 	};
 	/** Enabled by default. Set to `false` to omit the passkey server surface. */
 	passkeys?: Passkeys;
