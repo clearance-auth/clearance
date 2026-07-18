@@ -8,6 +8,7 @@ import {
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
+	KEY_MANAGEMENT_OPERATIONS,
 	MANAGEMENT_OPERATIONS,
 	MEMBER_OPERATIONS,
 	MIGRATION_OPERATIONS,
@@ -32,6 +33,7 @@ import { dispatchCoreCommand } from "./dispatch/core.js";
 import { dispatchDeliveryCommand } from "./dispatch/delivery.js";
 import { dispatchEnterpriseCommand } from "./dispatch/enterprise.js";
 import { dispatchEventCommand } from "./dispatch/events.js";
+import { dispatchKeyManagementCommand } from "./dispatch/key-management.js";
 import { dispatchMigrationCommand } from "./dispatch/migrations.js";
 import { dispatchOperationsCommand } from "./dispatch/operations.js";
 import { dispatchOrganizationCommand } from "./dispatch/organizations.js";
@@ -132,6 +134,10 @@ export async function dispatchRemoteCommand(
 		case AUTHENTICATION_POLICY_OPERATIONS.apply.cliPath:
 		case AUTHENTICATION_POLICY_OPERATIONS.unlock.cliPath:
 			return dispatchAuthenticationPolicyCommand({ session, path, args, opts, global });
+		case KEY_MANAGEMENT_OPERATIONS.status.cliPath:
+		case KEY_MANAGEMENT_OPERATIONS.plan.cliPath:
+		case KEY_MANAGEMENT_OPERATIONS.apply.cliPath:
+			return dispatchKeyManagementCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
 		case API_KEY_OPERATIONS.rotate.cliPath:
