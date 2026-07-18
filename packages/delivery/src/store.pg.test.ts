@@ -49,6 +49,8 @@ const endpointConstraintDriftOptions = { prefix: `delivery_epc_${suffix}` } sati
 const endpointFkDriftOptions = { prefix: `delivery_epfk_${suffix}` } satisfies DeliverySchemaOptions;
 const endpointIndexDriftOptions = { prefix: `delivery_epi_${suffix}` } satisfies DeliverySchemaOptions;
 const endpointKeyOptions = { prefix: `delivery_endpoint_keys_${suffix}` } satisfies DeliverySchemaOptions;
+const rollbackIndexOptions = { prefix: `delivery_rbi_${suffix}` } satisfies DeliverySchemaOptions;
+const historyTriggerDriftOptions = { prefix: `delivery_htr_${suffix}` } satisfies DeliverySchemaOptions;
 const migrationOptions = {
 	prefix: `delivery_migration_${suffix}`,
 	legacyFingerprintKeyId: "fingerprint-v2",
@@ -112,7 +114,9 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 		for (const options of [
 			mainOptions, collisionOptions, futureOptions, driftOptions, endpointConstraintDriftOptions,
 			endpointFkDriftOptions,
-			endpointIndexDriftOptions, endpointKeyOptions, migrationOptions, rotationOptions,
+			endpointIndexDriftOptions, endpointKeyOptions, rollbackIndexOptions, migrationOptions,
+			historyTriggerDriftOptions,
+			rotationOptions,
 		]) {
 			await dropSchemaAssets(pool, options).catch(() => undefined);
 		}
@@ -201,6 +205,65 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
 	});
 
+	it("requires the exact immutable-history trigger and permits separately named rollback fences", async () => {
+		await migrateDeliverySchema(pool, historyTriggerDriftOptions);
+		const tables = qualifiedDeliveryTables(historyTriggerDriftOptions);
+		await pool.query(
+			`DROP TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)} ON ${tables.event}`,
+		);
+		await pool.query(
+			`CREATE TRIGGER ${quoteIdentifier("clearance_import_rollback_guard_v1")}
+			 BEFORE UPDATE OR DELETE ON ${tables.event}
+			 FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}()`,
+		);
+
+		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+		await pool.query(
+			`CREATE TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}
+			 BEFORE UPDATE OR DELETE ON ${tables.event}
+			 FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}()`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
+			.resolves.toMatchObject({ version: 4 });
+		await pool.query(
+			`ALTER TABLE ${tables.event} ENABLE REPLICA TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+		await pool.query(
+			`ALTER TABLE ${tables.event} ENABLE TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}`,
+		);
+		const shadowFunction = `${tables.names.rejectMutationFunction}_shadow`;
+		await pool.query(
+			`CREATE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(shadowFunction)}() RETURNS trigger
+			 LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		);
+		await pool.query(
+			`DROP TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)} ON ${tables.event}`,
+		);
+		await pool.query(
+			`CREATE TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}
+			 BEFORE UPDATE OR DELETE ON ${tables.event}
+			 FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(shadowFunction)}()`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
+			.rejects.toMatchObject({ code: "DELIVERY_SCHEMA_DRIFT" });
+		await pool.query(
+			`DROP TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)} ON ${tables.event}`,
+		);
+		await pool.query(
+			`CREATE TRIGGER ${quoteIdentifier(`${tables.names.event}_immutable`)}
+			 BEFORE UPDATE OR DELETE ON ${tables.event}
+			 FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(tables.names.rejectMutationFunction)}()`,
+		);
+		await pool.query(
+			`DROP FUNCTION ${quoteIdentifier(tables.schema)}.${quoteIdentifier(shadowFunction)}()`,
+		);
+		await expect(assertDeliverySchemaCurrent(pool, historyTriggerDriftOptions))
+			.resolves.toMatchObject({ version: 4 });
+	});
+
 	it("transactionally upgrades owned v1 storage through v4 without losing rows", async () => {
 		await migrateDeliverySchema(pool, migrationOptions);
 		const tables = qualifiedDeliveryTables(migrationOptions);
@@ -263,6 +326,34 @@ describe.skipIf(!available)("delivery Postgres storage", () => {
 			},
 		]);
 		expect((await pool.query(`SELECT value FROM ${tables.meta} WHERE key='schema_version'`)).rows[0].value).toBe(4);
+	});
+
+	it("recreates rollback lookup indexes with their exact catalog definitions", async () => {
+		await migrateDeliverySchema(pool, rollbackIndexOptions);
+		const tables = qualifiedDeliveryTables(rollbackIndexOptions);
+		const indexDefinitions = await pool.query<{ indexname: string; indexdef: string }>(
+			`SELECT indexname, indexdef FROM pg_indexes
+			 WHERE schemaname=$1 AND tablename=$2
+			   AND (
+				indexdef LIKE '%(project_id, environment_id, organization_id)%'
+				OR indexdef LIKE '%(project_id, environment_id, actor_id)%'
+			   )`,
+			[tables.schema, tables.names.event],
+		);
+		expect(indexDefinitions.rows).toHaveLength(2);
+		for (const { indexname } of indexDefinitions.rows) {
+			await pool.query(`DROP INDEX ${quoteIdentifier(tables.schema)}.${quoteIdentifier(indexname)}`);
+		}
+
+		await migrateDeliverySchema(pool, rollbackIndexOptions);
+		const repaired = await pool.query<{ indexdef: string }>(
+			`SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2`,
+			[tables.schema, tables.names.event],
+		);
+		expect(repaired.rows.map((row) => row.indexdef)).toEqual(expect.arrayContaining([
+			expect.stringContaining("(project_id, environment_id, organization_id)"),
+			expect.stringContaining("(project_id, environment_id, actor_id)"),
+		]));
 	});
 
 	it("rolls enqueue back atomically and stores no plaintext", async () => {
