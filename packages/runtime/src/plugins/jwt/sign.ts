@@ -1,8 +1,17 @@
 import type { GenericEndpointContext } from "@clearance/core";
+import {
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { ClearanceError } from "@clearance/core/error";
 import type { JWTPayload } from "jose";
-import { importJWK, SignJWT } from "jose";
+import { decodeJwt, importJWK, SignJWT } from "jose";
 import { symmetricDecrypt } from "../../crypto";
+import {
+	captureInternalSessionDerivativeAuthority,
+	validateInternalSessionDerivativeAuthority,
+} from "../../internal/session-derivative-authority";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getJwksAdapter } from "./adapter";
 import type { JwtOptions } from "./types";
 import { createJwk, toExpJWT } from "./utils";
@@ -61,6 +70,13 @@ type JWTPayloadWithOptional = {
 	[propName: string]: unknown | undefined;
 };
 
+export const JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM =
+	"urn:clearance:claims:session-derivative-authority";
+export const JWT_SESSION_SOURCE_SUBJECT_CLAIM =
+	"urn:clearance:claims:session-source-subject";
+export const JWT_SESSION_SOURCE_ORGANIZATION_CLAIM =
+	"urn:clearance:claims:session-source-organization";
+
 export async function signJWT(
 	ctx: GenericEndpointContext,
 	config: {
@@ -111,7 +127,7 @@ export async function signJWT(
 
 	// Custom/remote signing function
 	if (options?.jwt?.sign) {
-		const jwtPayload = {
+		const jwtPayload: JWTPayload = {
 			...payload,
 			iat,
 			exp,
@@ -119,13 +135,58 @@ export async function signJWT(
 			iss: iss ?? defaultIss,
 			aud: aud ?? defaultAud,
 		};
-		return options.jwt.sign(jwtPayload);
+		const token = await options.jwt.sign(jwtPayload);
+		if (jwtPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] !== undefined) {
+			let returnedPayload: JWTPayload;
+			try {
+				returnedPayload = decodeJwt(token);
+			} catch {
+				throw new ClearanceError(
+					"Custom JWT signer returned an invalid session-bound token",
+				);
+			}
+			if (
+				!Object.hasOwn(
+					returnedPayload,
+					JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+				) ||
+				!Object.hasOwn(returnedPayload, JWT_SESSION_SOURCE_SUBJECT_CLAIM) ||
+				!Object.hasOwn(
+					returnedPayload,
+					JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+				) ||
+				returnedPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] !==
+					jwtPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] ||
+				returnedPayload[JWT_SESSION_SOURCE_SUBJECT_CLAIM] !==
+					jwtPayload[JWT_SESSION_SOURCE_SUBJECT_CLAIM] ||
+				returnedPayload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM] !==
+					jwtPayload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM] ||
+				!Number.isFinite(returnedPayload.exp) ||
+				!Number.isInteger(returnedPayload.exp) ||
+				returnedPayload.exp! > exp
+			) {
+				throw new ClearanceError(
+					"Custom JWT signer changed session-bound authority",
+				);
+			}
+		}
+		return token;
 	}
 
-	const adapter = getJwksAdapter(ctx.context.adapter, options);
-	let key = await adapter.getLatestKey(ctx);
+	const currentAdapter = await getCurrentAdapter(ctx.context.adapter);
+	const currentCtx =
+		currentAdapter === ctx.context.adapter
+			? ctx
+			: (Object.assign(Object.create(ctx), {
+					context: { ...ctx.context, adapter: currentAdapter },
+				}) as GenericEndpointContext);
+	const adapter = getJwksAdapter(
+		currentAdapter as typeof ctx.context.adapter,
+		options,
+	);
+	let key = await adapter.getLatestKey(currentCtx);
 	if (!key || (key.expiresAt && key.expiresAt < new Date())) {
-		key = await createJwk(ctx, options);
+		key = await createJwk(currentCtx, options);
 	}
 	const privateKeyEncryptionEnabled =
 		!options?.jwks?.disablePrivateKeyEncryption;
@@ -169,20 +230,85 @@ export async function getJwtToken(
 		  }
 		| undefined,
 ) {
-	const payload = !options?.jwt?.definePayload
-		? ctx.context.session!.user
-		: await options.jwt.definePayload(ctx.context.session!);
+	const currentSession = ctx.context.session ?? ctx.context.newSession;
+	if (!currentSession?.session.id) {
+		throw new ClearanceError("Cannot issue an access token without a session");
+	}
+	const sourceSessionId = currentSession.session.id;
 
-	return await signJWT(ctx, {
-		options,
-		maxExpiresAt: ctx.context.session!.session.expiresAt,
-		payload: {
-			iat: Math.floor(Date.now() / 1000),
-			...payload,
-			...sessionClaims,
-			sub:
-				(await options?.jwt?.getSubject?.(ctx.context.session!)) ??
-				ctx.context.session!.user.id,
-		},
+	return runWithTransaction(ctx.context.adapter, async () => {
+		const live = await ctx.context.internalAdapter.findSessionById(sourceSessionId);
+		if (!live || live.session.id !== sourceSessionId) {
+			throw new ClearanceError(
+				"Cannot issue an access token for an inactive session",
+			);
+		}
+		const sourceExpiresAt = live.session.expiresAt;
+		if (
+			!(sourceExpiresAt instanceof Date) ||
+			!Number.isFinite(sourceExpiresAt.getTime())
+		) {
+			throw new ClearanceError(
+				"Cannot issue an access token for an invalid session",
+			);
+		}
+
+		const binding = await captureInternalSessionDerivativeAuthority(
+			ctx.context.internalAdapter,
+			{ purpose: "jwt", sourceSessionId },
+		);
+		if (!binding && readInternalAuthenticationPolicy(ctx.context.options)) {
+			throw new ClearanceError(
+				"Cannot issue an access token without session derivative authority",
+			);
+		}
+		const authority = binding
+			? await validateInternalSessionDerivativeAuthority(
+					ctx.context.internalAdapter,
+					binding,
+					{ purpose: "jwt", subjectId: live.user.id },
+				)
+			: undefined;
+		if (
+			binding &&
+			(!authority ||
+				authority.sourceSessionId !== sourceSessionId ||
+				authority.sourceSubjectId !== live.user.id ||
+				authority.sourceExpiresAt !== sourceExpiresAt.getTime())
+		) {
+			throw new ClearanceError(
+				"Cannot issue an access token from stale session authority",
+			);
+		}
+
+		const liveSession = { session: live.session, user: live.user };
+		const payload = !options?.jwt?.definePayload
+			? live.user
+			: await options.jwt.definePayload(liveSession);
+		const reservedClaims = binding
+			? {
+					[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: binding,
+					[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: authority!.sourceSubjectId,
+					[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]:
+						authority!.sourceOrganizationId,
+				}
+			: {
+					[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: undefined,
+					[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: undefined,
+					[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: undefined,
+				};
+
+		return signJWT(ctx, {
+			options,
+			maxExpiresAt: sourceExpiresAt,
+			payload: {
+				iat: Math.floor(Date.now() / 1000),
+				...payload,
+				...sessionClaims,
+				sub:
+					(await options?.jwt?.getSubject?.(liveSession)) ?? live.user.id,
+				...reservedClaims,
+			},
+		});
 	});
 }
