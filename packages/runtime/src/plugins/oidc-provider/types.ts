@@ -4,6 +4,8 @@ import type { OAuthApplication, schema } from "./schema";
 export interface OIDCOptions {
 	/** @internal */
 	__skipDeprecationWarning?: boolean | undefined;
+	/** @internal Protocol identity used by the shared MCP consent endpoint. */
+	__sessionDerivativePurpose?: "oidc" | "mcp" | undefined;
 	/**
 	 * The amount of time in seconds that the access token is valid for.
 	 *
@@ -380,6 +382,10 @@ export interface CodeVerificationValue {
 	 * Nonce
 	 */
 	nonce?: string | undefined;
+	/** Live managed-session authority for this authorization code. */
+	sessionDerivativeAuthority?: string | undefined;
+	/** Exact source-session organization at authorization time. */
+	organizationId?: string | null | undefined;
 }
 
 export interface OAuthAccessToken {
@@ -414,6 +420,8 @@ export interface OAuthAccessToken {
 	 * The time that the refresh token expires
 	 */
 	refreshTokenExpiresAt?: Date | null;
+	sessionDerivativeAuthority?: string | null;
+	organizationId?: string | null;
 	/**
 	 * The client ID
 	 */
