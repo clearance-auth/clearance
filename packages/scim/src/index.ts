@@ -74,6 +74,16 @@ export const scim = (options?: SCIMOptions) => {
 						required: true,
 						unique: true,
 					},
+					keyManagementVersion: {
+						type: "number",
+						required: false,
+						returned: false,
+					},
+					keyManagementRevision: {
+						type: "number",
+						required: false,
+						returned: false,
+					},
 					organizationId: {
 						type: "string",
 						required: false,
