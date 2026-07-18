@@ -64,6 +64,7 @@ import {
 	readStoreV2TopologyState,
 	storeV2TopologyIsAuthoritative,
 	writeStoreV2TopologyState,
+	type StoreV2TopologyState,
 } from "./store-v2-topology.js";
 
 const MAX_DIFFERING_IDS = 20;
@@ -83,8 +84,19 @@ export interface StoreV2SyncResult {
 	persistedSnapshot: DataStoreSnapshot;
 	authoritativeCollections: StoreV2Collection[];
 	principalRevision: number | null;
-	topologyRevision?: number | null;
+	topologyState?: StoreV2TopologyState | null;
 	eventDelta?: StoreV2EventDelta;
+}
+
+export interface StoreV2LoadResult {
+	snapshot: DataStoreSnapshot;
+	storedSnapshot: DataStoreSnapshot;
+	principalCount: number;
+	revision: number;
+	phase: StoreV2Phase;
+	authoritativeCollections: StoreV2Collection[];
+	principalRevision: number | null;
+	topologyState: StoreV2TopologyState | null;
 }
 
 interface SnapshotRow {
@@ -1068,15 +1080,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 	async loadSnapshot(_cache?: {
 		principalRevision: number | null;
 		principalCount: number;
-	}): Promise<{
-		snapshot: DataStoreSnapshot;
-		storedSnapshot: DataStoreSnapshot;
-		principalCount: number;
-		revision: number;
-		phase: StoreV2Phase;
-		authoritativeCollections: StoreV2Collection[];
-		principalRevision: number | null;
-	}> {
+	}): Promise<StoreV2LoadResult> {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -1104,6 +1108,15 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPAL_REVISION_INVALID",
 					"Store-v2 principal revision metadata is missing or invalid.",
+				);
+			}
+			const topologyState = phase === "absent"
+				? null
+				: await readStoreV2TopologyState(client, this.tables);
+			if (phase !== "absent" && !topologyState) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_STATE_INVALID",
+					"Store-v2 topology state metadata is missing or invalid.",
 				);
 			}
 			let snapshot = storedSnapshot;
@@ -1141,6 +1154,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				phase,
 				authoritativeCollections,
 				principalRevision,
+				topologyState,
 			};
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
@@ -2168,6 +2182,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				persistedSnapshot: after,
 				authoritativeCollections,
 				principalRevision: principalState?.revision ?? null,
+				topologyState,
 			};
 		}
 		if (
@@ -2331,7 +2346,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			persistedSnapshot,
 			authoritativeCollections,
 			principalRevision: principalState.revision,
-			topologyRevision: topologyState.revision,
+			topologyState,
 			...(eventDelta ? { eventDelta } : {}),
 		};
 	}
