@@ -16,6 +16,7 @@ import type { Member } from "@clearance/runtime/plugins";
 import { getOrgAdapter } from "@clearance/runtime/plugins";
 import * as z from "zod";
 import { getAccountId, getUserFullName, getUserPrimaryEmail } from "./mappings";
+import { isSCIMKeyManagementWriter } from "./internal/key-management-writer";
 import type { AuthMiddleware } from "./middlewares";
 import { buildUserPatch } from "./patch-operations";
 import { SCIMAPIError, SCIMErrorOpenAPISchemas } from "./scim-error";
@@ -513,6 +514,9 @@ export const generateSCIMToken = (opts: SCIMOptions) =>
 						providerId,
 						organizationId,
 					}),
+					...(isSCIMKeyManagementWriter(opts.storeSCIMToken)
+						? { keyManagementVersion: 1, keyManagementRevision: 1 }
+						: {}),
 					...(isProviderOwnershipEnabled(opts) ? { userId: user.id } : {}),
 				},
 			});
