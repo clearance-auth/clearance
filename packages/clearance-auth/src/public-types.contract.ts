@@ -35,6 +35,14 @@ const managedPolicyOptions: import("./public-types/index.js").CreateClearanceAut
 	},
 };
 const readonlyQueryValues = ["active", 10] as const;
+const publicPolicy: import("./public-types/index.js").ClearanceAuthenticationPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 5, durationSeconds: 600 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: null,
+};
 
 async function assertPublicCompatibility(): Promise<void> {
 	await bundle.auth.api.signInEmail({});
@@ -52,6 +60,30 @@ async function assertPublicCompatibility(): Promise<void> {
 	);
 	void rows;
 	void rowCount;
+
+	if (bundle.authenticationPolicy) {
+		void bundle.authenticationPolicy.scope.projectId;
+		void bundle.authenticationPolicy.scope.environmentId;
+		const current = await bundle.authenticationPolicy.get();
+		const plan = await bundle.authenticationPolicy.plan({ policy: publicPolicy });
+		await bundle.authenticationPolicy.apply({
+			policy: plan.candidate.policy as import("./public-types/index.js").ClearanceAuthenticationPolicy,
+			expectedRevision: current.revision,
+		});
+		await bundle.authenticationPolicy.plan({
+			organizationId: "organization_public_contract",
+			policy: { minimumAssurance: "multi_factor" },
+		});
+		await bundle.authenticationPolicy.plan({
+			organizationId: "organization_public_contract",
+			policy: null,
+		});
+		const unlock = await bundle.authenticationPolicy.planUnlock({
+			userId: "user_public_contract",
+			kind: "all",
+		});
+		void unlock.password.matchedRows;
+	}
 }
 
 void rootContract;
