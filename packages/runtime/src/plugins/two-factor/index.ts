@@ -5,6 +5,7 @@ import {
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { createHMAC } from "@clearance/utils/hmac";
 import { createOTP } from "@clearance/utils/otp";
@@ -35,6 +36,13 @@ import { runManagedAuthenticationTransaction } from "../../internal/managed-auth
 import {
 	captureInternalSessionIssuanceContext,
 } from "../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../internal/runtime-audit";
 import {
 	consumeInternalVerificationChallenge,
 	createInternalVerificationChallenge,
@@ -98,6 +106,22 @@ function twoFactorLastFactorProtected(): never {
 
 function twoFactorLifecycleConflict(): never {
 	throw APIError.from("CONFLICT", TWO_FACTOR_ERROR_CODES.LIFECYCLE_CONFLICT);
+}
+
+async function appendRuntimeAuditIfBound(
+	ctx: GenericEndpointContext,
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
 }
 
 function logTwoFactorLifecycleFailure(
@@ -944,6 +968,17 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 									) {
 										twoFactorLifecycleConflict();
 									}
+									await appendRuntimeAuditIfBound(ctx, adapter, {
+										actor: user.id,
+										action: "auth.factor.removed",
+										subjectType: "user",
+										subjectId: user.id,
+										outcome: "success",
+										source: "system",
+										organizationId: null,
+										message: "TOTP factor removed",
+										metadata: { factor: "totp" },
+									});
 									committedLifecycle = {
 										kind: "success" as const,
 										replacementSession,
