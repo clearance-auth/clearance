@@ -1,10 +1,19 @@
 import type { GenericEndpointContext } from "@clearance/core";
-import { getCurrentAuthContext } from "@clearance/core/context";
+import {
+	getCurrentAuthContext,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { base64 } from "@clearance/utils/base64";
 import type { JWTPayload } from "jose";
 import { importJWK, jwtVerify } from "jose";
+import { validateInternalSessionDerivativeAuthority } from "../../internal/session-derivative-authority";
 import { getJwksAdapter } from "./adapter";
 import { DEFAULT_JWKS_GRACE_PERIOD_SECONDS } from "./constant";
+import {
+	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+} from "./sign";
 import type { JwtOptions } from "./types";
 
 /**
@@ -71,6 +80,59 @@ export async function verifyJWT<T extends JWTPayload = JWTPayload>(
 
 		if (!payload.sub || !payload.aud) {
 			return null;
+		}
+
+		const hasAuthority = Object.hasOwn(
+			payload,
+			JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+		);
+		const hasSourceSubject = Object.hasOwn(
+			payload,
+			JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+		);
+		const hasSourceOrganization = Object.hasOwn(
+			payload,
+			JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+		);
+		if (hasAuthority || hasSourceSubject || hasSourceOrganization) {
+			const binding = payload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM];
+			const sourceSubject = payload[JWT_SESSION_SOURCE_SUBJECT_CLAIM];
+			const sourceOrganization =
+				payload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM];
+			if (
+				!hasAuthority ||
+				!hasSourceSubject ||
+				!hasSourceOrganization ||
+				typeof binding !== "string" ||
+				binding.length === 0 ||
+				typeof sourceSubject !== "string" ||
+				sourceSubject.length === 0 ||
+				(sourceOrganization !== null &&
+					typeof sourceOrganization !== "string")
+			) {
+				return null;
+			}
+			const authority = await runWithTransaction(
+				ctx.context.adapter,
+				async () =>
+					validateInternalSessionDerivativeAuthority(
+						ctx.context.internalAdapter,
+						binding,
+						{
+							purpose: "jwt",
+							subjectId: sourceSubject,
+							organizationId: sourceOrganization,
+						},
+					),
+			);
+			if (
+				!authority ||
+				!Number.isFinite(payload.exp) ||
+				!Number.isInteger(payload.exp) ||
+				payload.exp! > Math.floor(authority.sourceExpiresAt / 1000)
+			) {
+				return null;
+			}
 		}
 
 		return payload as T & Required<Pick<JWTPayload, "sub" | "aud">>;
