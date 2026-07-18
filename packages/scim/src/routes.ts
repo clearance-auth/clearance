@@ -35,6 +35,7 @@ import {
 	ServiceProviderOpenAPISchema,
 } from "./scim-metadata";
 import { createUserResource } from "./scim-resources";
+import { SCIMGroupResourceSchema, SCIMGroupResourceType } from "./group-schemas";
 import { storeSCIMToken } from "./scim-tokens";
 import type { SCIMOptions, SCIMProvider } from "./types";
 import {
@@ -54,6 +55,25 @@ import {
 const supportedSCIMSchemas = [SCIMUserResourceSchema];
 const supportedSCIMResourceTypes = [SCIMUserResourceType];
 const supportedMediaTypes = ["application/json", "application/scim+json"];
+
+function supportsSCIMGroups(ctx: GenericEndpointContext): boolean {
+	const organization = ctx.context.getPlugin("organization")?.options as
+		| { teams?: { enabled?: boolean } }
+		| undefined;
+	return organization?.teams?.enabled === true;
+}
+
+function schemasFor(ctx: GenericEndpointContext) {
+	return supportsSCIMGroups(ctx)
+		? [...supportedSCIMSchemas, SCIMGroupResourceSchema]
+		: supportedSCIMSchemas;
+}
+
+function resourceTypesFor(ctx: GenericEndpointContext) {
+	return supportsSCIMGroups(ctx)
+		? [...supportedSCIMResourceTypes, SCIMGroupResourceType]
+		: supportedSCIMResourceTypes;
+}
 
 function runtimeAuditBinding(ctx: GenericEndpointContext) {
 	return (
@@ -1662,12 +1682,13 @@ export const getSCIMSchemas = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
+		const schemas = schemasFor(ctx);
 		return ctx.json({
-			totalResults: supportedSCIMSchemas.length,
-			itemsPerPage: supportedSCIMSchemas.length,
+			totalResults: schemas.length,
+			itemsPerPage: schemas.length,
 			startIndex: 1,
 			schemas: ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
-			Resources: supportedSCIMSchemas.map((s) => {
+			Resources: schemas.map((s) => {
 				return {
 					...s,
 					meta: {
@@ -1706,7 +1727,7 @@ export const getSCIMSchema = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		const schema = supportedSCIMSchemas.find(
+		const schema = schemasFor(ctx).find(
 			(s) => s.id === ctx.params.schemaId,
 		);
 
@@ -1763,12 +1784,13 @@ export const getSCIMResourceTypes = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
+		const resourceTypes = resourceTypesFor(ctx);
 		return ctx.json({
-			totalResults: supportedSCIMResourceTypes.length,
-			itemsPerPage: supportedSCIMResourceTypes.length,
+			totalResults: resourceTypes.length,
+			itemsPerPage: resourceTypes.length,
 			startIndex: 1,
 			schemas: ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
-			Resources: supportedSCIMResourceTypes.map((s) => {
+			Resources: resourceTypes.map((s) => {
 				return {
 					...s,
 					meta: {
@@ -1807,7 +1829,7 @@ export const getSCIMResourceType = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		const resourceType = supportedSCIMResourceTypes.find(
+		const resourceType = resourceTypesFor(ctx).find(
 			(s) => s.id === ctx.params.resourceTypeId,
 		);
 
