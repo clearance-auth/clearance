@@ -294,6 +294,11 @@ export class PgStoreV2TopologyRepository {
 			: readStoreV2TopologyState(this.client, this.tables);
 	}
 
+	/** Whether this capability executed a row-changing topology upsert. */
+	hasMutations(): boolean {
+		return this.mutated;
+	}
+
 	private issue<T>(fn: () => Promise<T>): Promise<T> {
 		if (!this.active) {
 			return Promise.reject(
