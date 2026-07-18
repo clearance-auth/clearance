@@ -302,6 +302,91 @@ async function main() {
 		.option("--member <id>", "Membership id")
 		.action(remoteCommandAction);
 
+	const authorization = orgs
+		.command("authorization")
+		.description("Normalized organization authorization");
+	const authorizationEffective = authorization
+		.command("effective")
+		.description("Inspect a subject's effective organization authorization");
+	authorizationEffective
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--subject <id>", "Principal or service-account id")
+		.requiredOption("--subject-kind <kind>", "principal|service_account")
+		.action(remoteCommandAction);
+	const authorizationAssignments = authorization
+		.command("assignments")
+		.description("Inspect or replace normalized role assignments");
+	authorizationAssignments
+		.command("list")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--subject <id>", "Optional principal or service-account id")
+		.option("--subject-kind <kind>", "principal|service_account; requires --subject")
+		.action(remoteCommandAction);
+	authorizationAssignments
+		.command("replace")
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--subject <id>", "Principal or service-account id")
+		.requiredOption("--subject-kind <kind>", "principal|service_account")
+		.option("--role <id>", "Role id; repeat for each assigned role", (value, previous: string[] = []) => [...previous, value], [])
+		.option("--expected-revision <revision>", "Require this current authorization revision")
+		.action(remoteCommandAction);
+	authorization
+		.command("reconcile")
+		.description("Preview organization authorization reconciliation; pass --yes to apply")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+
+	const serviceAccounts = orgs
+		.command("service-accounts")
+		.description("Organization service accounts and credentials");
+	serviceAccounts
+		.command("list")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("inspect")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("create")
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--name <name>", "Human-readable service-account name")
+		.option("--role <id>", "Role id; repeat for each assignment", (value, previous: string[] = []) => [...previous, value], [])
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("disable")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("enable")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	const serviceAccountCredentials = serviceAccounts
+		.command("credentials")
+		.description("Service-account credential lifecycle");
+	serviceAccountCredentials
+		.command("create")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.action(remoteCommandAction);
+	serviceAccountCredentials
+		.command("rotate")
+		.argument("<accountId>", "Service-account id")
+		.argument("<credentialId>", "Credential id")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.action(remoteCommandAction);
+	serviceAccountCredentials
+		.command("revoke")
+		.argument("<accountId>", "Service-account id")
+		.argument("<credentialId>", "Credential id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+
 	// events — list / tail / inspect / export / replay (shared management services)
 	const events = program.command("events").description("Audit events");
 	events
