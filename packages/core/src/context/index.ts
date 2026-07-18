@@ -17,8 +17,10 @@ export {
 export {
 	AfterOperationHookError,
 	AfterTransactionHookError,
+	getActiveTransactionAdapter,
 	getCurrentAdapter,
 	getCurrentDBAdapterAsyncLocalStorage,
+	isRollbackCapableTransactionActive,
 	isTransactionActive,
 	queueAfterTransactionHook,
 	queueBeforeTransactionCommitHook,
