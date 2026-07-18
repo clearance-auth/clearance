@@ -7,11 +7,11 @@ import {
 import type {
 	InternalRuntimeAuditBinding,
 	InternalRuntimeAuditDraft,
-} from "../../runtime/src/internal/runtime-audit.js";
+} from "@clearance/runtime/internal/runtime-audit";
 import {
 	attachInternalRuntimeAudit,
 	readInternalRuntimeAudit,
-} from "../../runtime/src/internal/runtime-audit.js";
+} from "@clearance/runtime/internal/runtime-audit";
 import type { ClearanceTransactionQuery } from "./public-types/index.js";
 
 const MIGRATION_ID = "runtime-audit-outbox-v2";
