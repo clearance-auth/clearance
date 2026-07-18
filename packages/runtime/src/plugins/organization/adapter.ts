@@ -1,8 +1,8 @@
 import type { AuthContext, GenericEndpointContext } from "@clearance/core";
 import {
 	AfterTransactionHookError,
-	getCurrentDBAdapterAsyncLocalStorage,
 	getCurrentAdapter,
+	isRollbackCapableTransactionActive,
 	runWithTransaction,
 } from "@clearance/core/context";
 import type {
@@ -150,37 +150,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 		if (typeof baseAdapter.options?.adapterConfig.transaction === "function") {
 			return true;
 		}
-		// A transaction adapter can omit the root's options. Locate *its* active
-		// owner rather than trusting the current ALS root: an unrelated nested
-		// transaction may be current while this adapter is owned by a parent.
-		type TransactionOwner = {
-			rootAdapter: DBTransactionAdapter;
-			adapter: DBTransactionAdapter;
-			activeTransactions?: ReadonlyMap<object, TransactionOwner>;
-			isTransactionActive: boolean;
-			parent?: TransactionOwner;
-		};
-		const store = (await getCurrentDBAdapterAsyncLocalStorage()).getStore() as
-			| TransactionOwner
-			| undefined;
-		const findOwner = (current: TransactionOwner | undefined): TransactionOwner | undefined => {
-			for (let owner = current; owner; owner = owner.parent) {
-				const registered = owner.activeTransactions?.get(baseAdapter);
-				if (registered?.isTransactionActive) return registered;
-				if (
-					owner.isTransactionActive &&
-					(owner.rootAdapter === baseAdapter || owner.adapter === baseAdapter)
-				) {
-					return owner;
-				}
-			}
-			return undefined;
-		};
-		const owner = findOwner(store);
-		return (
-			typeof owner?.rootAdapter.options?.adapterConfig.transaction ===
-			"function"
-		);
+		return isRollbackCapableTransactionActive(baseAdapter);
 	};
 	const filterOrganizationOutput = <
 		T extends Record<string, unknown> | null,
