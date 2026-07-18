@@ -18,7 +18,7 @@ import {
 	JWT_ROTATION_UNAVAILABLE_CODE,
 } from "./constant";
 import { schema } from "./schema";
-import { getJwtToken, signJWT } from "./sign";
+import { getJwtToken, issueServiceAccountJWT, signJWT } from "./sign";
 import type { JwtOptions } from "./types";
 import { createJwk } from "./utils";
 import { verifyJWT as verifyJWTHelper } from "./verify";
@@ -44,6 +44,10 @@ const signJWTBodySchema = z.object({
 const verifyJWTBodySchema = z.object({
 	token: z.string(),
 	issuer: z.string().optional(),
+});
+
+const issueServiceAccountJWTBodySchema = z.object({
+	secret: z.string().min(1).max(16_384),
 });
 
 const NO_STORE_TOKEN_RESPONSE_HEADERS = {
@@ -98,6 +102,24 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 		version: PACKAGE_VERSION,
 		options: options as NoInfer<O>,
 		endpoints: {
+			issueServiceAccountJWT: createAuthEndpoint.serverOnly(
+				{
+					method: "POST",
+					metadata: {
+						$Infer: {
+							body: {} as { secret: string },
+							response: {} as { token: string },
+						},
+					},
+					body: issueServiceAccountJWTBodySchema,
+				},
+				async (ctx) =>
+					ctx.json({
+						token: await issueServiceAccountJWT(ctx, options, {
+							secret: ctx.body.secret,
+						}),
+					}),
+			),
 			getJwks: createAuthEndpoint(
 				jwksPath,
 				{
