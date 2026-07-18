@@ -13,6 +13,12 @@ import { ClearanceError } from "./errors.js";
 import { writeExportArtifact } from "./export-artifact.js";
 import { redactRecord } from "./redact.js";
 import {
+	decodePageCursor,
+	encodePageCursor,
+	normalizePageLimit,
+	type PageCursorKey,
+} from "./pagination.js";
+import {
 	inspectScimTrace,
 	replayScimTrace,
 	type ScimActorSource,
@@ -26,6 +32,8 @@ export const EVENTS_EXPORT_DEFAULT_LIMIT = 100;
 export const EVENTS_EXPORT_MAX_LIMIT = 1000;
 export const EVENTS_TAIL_DEFAULT_LIMIT = 20;
 export const EVENTS_TAIL_MAX_LIMIT = 1000;
+const EVENTS_LIST_DEFAULT_PAGE_LIMIT = 50;
+const EVENTS_LIST_MAX_PAGE_LIMIT = 1000;
 export const EVENTS_EXPORT_FORMATS = ["json", "jsonl"] as const;
 export type EventsExportFormat = (typeof EVENTS_EXPORT_FORMATS)[number];
 
@@ -253,6 +261,144 @@ export function selectEventsForExport(
 	};
 }
 
+type OperationalEventsFilter = {
+	limit?: number;
+	organizationId?: string;
+	action?: string;
+	scope?: ResourceScope;
+	cursor?: string;
+	before?: string;
+};
+
+type EventSourcePage = { events: AuditEvent[]; hasMore: boolean };
+
+function eventSortDescending(left: AuditEvent, right: AuditEvent): number {
+	if (left.createdAt !== right.createdAt) {
+		return left.createdAt < right.createdAt ? 1 : -1;
+	}
+	return left.id === right.id ? 0 : left.id < right.id ? 1 : -1;
+}
+
+function mergeEventPages(
+	pages: readonly EventSourcePage[],
+	limit: number,
+): EventSourcePage {
+	const ids = new Set<string>();
+	const merged = pages
+		.flatMap((page) => page.events)
+		.sort(eventSortDescending)
+		.filter((event) => {
+			if (ids.has(event.id)) return false;
+			ids.add(event.id);
+			return true;
+		});
+	return {
+		events: merged.slice(0, limit).map(sanitizeAuditEvent),
+		hasMore: merged.length > limit || pages.some((page) => page.hasMore),
+	};
+}
+
+function snapshotEventPage(
+	store: ManagementStore,
+	input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		action?: string;
+		organizationId?: string;
+		before?: string;
+	},
+): EventSourcePage {
+	let events = store.snapshot.events.filter(
+		(event) =>
+			(!event.projectId || event.projectId === input.scope.projectId) &&
+			(!event.environmentId || event.environmentId === input.scope.environmentId),
+	);
+	if (input.organizationId) {
+		events = events.filter((event) => event.organizationId === input.organizationId);
+	}
+	if (input.action) events = events.filter((event) => event.action === input.action);
+	if (input.before) events = events.filter((event) => event.createdAt < input.before!);
+	if (input.cursor) {
+		events = events.filter(
+			(event) =>
+				event.createdAt < input.cursor!.createdAt ||
+				(event.createdAt === input.cursor!.createdAt && event.id < input.cursor!.id),
+		);
+	}
+	const ordered = events.sort(eventSortDescending);
+	return {
+		events: ordered.slice(0, input.limit),
+		hasMore: ordered.length > input.limit,
+	};
+}
+
+async function managementEventPage(
+	store: ManagementStore,
+	input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		action?: string;
+		organizationId?: string;
+		before?: string;
+	},
+): Promise<EventSourcePage> {
+	if (store.storeV2Events?.authoritative) {
+		return store.storeV2Events.listPage(input);
+	}
+	return snapshotEventPage(store, input);
+}
+
+async function operationalEventPage(
+	store: ManagementStore,
+	input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		action?: string;
+		organizationId?: string;
+		before?: string;
+	},
+): Promise<EventSourcePage> {
+	const management = managementEventPage(store, input);
+	const runtime = store.runtimeAuditEvents
+		? store.runtimeAuditEvents.listPage(input)
+		: Promise.resolve<EventSourcePage>({ events: [], hasMore: false });
+	return mergeEventPages(await Promise.all([management, runtime]), input.limit);
+}
+
+/**
+ * Database-aware list reader for operational transports. The legacy sync
+ * reader remains available to local JSON callers; Postgres callers merge two
+ * independently bounded sources and retain the existing opaque cursor.
+ */
+export async function listEventsPageOperational(
+	store: ManagementStore,
+	filter: OperationalEventsFilter = {},
+): Promise<{ events: AuditEvent[]; nextCursor: string | null }> {
+	const limit = normalizePageLimit(filter.limit, {
+		stage: "events.list",
+		code: "EVENTS_LIST_OPTION_INVALID",
+		defaultValue: EVENTS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: EVENTS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(filter.cursor, "events", "events.list");
+	const scope = filter.scope ?? resolveOperatorScope(store);
+	const page = await operationalEventPage(store, {
+		scope,
+		limit,
+		...(cursor ? { cursor } : {}),
+		...(filter.action ? { action: filter.action } : {}),
+		...(filter.organizationId ? { organizationId: filter.organizationId } : {}),
+	});
+	const last = page.events[page.events.length - 1];
+	return {
+		events: page.events,
+		nextCursor: page.hasMore && last ? encodePageCursor("events", last) : null,
+	};
+}
+
 function selectTailCandidates(
 	store: ManagementStore,
 	filter: Required<Pick<EventsTailFilter, "scope">> & EventsTailFilter,
@@ -406,6 +552,82 @@ export function exportEvents(
 	return envelope;
 }
 
+/**
+ * Database-aware export. It reads at most limit + 1 rows from each authority
+ * so truncation is accurate without materializing a runtime audit history.
+ */
+export async function exportEventsOperational(
+	store: ManagementStore,
+	opts: EventsExportOptions = {},
+): Promise<EventsExportEnvelope> {
+	const scope = opts.scope ?? resolveOperatorScope(store);
+	const limit = normalizeEventsExportLimit(opts.limit);
+	const format = normalizeEventsExportFormat(opts.format);
+	const before = normalizeEventsExportBefore(opts.before);
+	const corr = correlationId();
+	const page = await operationalEventPage(store, {
+		scope,
+		limit,
+		...(opts.organizationId ? { organizationId: opts.organizationId } : {}),
+		...(opts.action ? { action: opts.action } : {}),
+		...(before ? { before } : {}),
+	});
+
+	const envelope: EventsExportEnvelope = {
+		schemaVersion: 1,
+		kind: "events.export",
+		exportedAt: nowIso(),
+		format,
+		scope,
+		limit,
+		count: page.events.length,
+		truncated: page.hasMore,
+		filters: {
+			...(opts.organizationId ? { organizationId: opts.organizationId } : {}),
+			...(opts.action ? { action: opts.action } : {}),
+			...(before ? { before } : {}),
+		},
+		events: page.events,
+		correlationId: corr,
+	};
+
+	if (opts.outputPath) {
+		const body = serializeExportBody(envelope, format);
+		const written = writeExportArtifact(
+			opts.outputPath,
+			body,
+			Boolean(opts.force),
+		);
+		envelope.outputPath = written;
+	}
+
+	if (!opts.skipAudit) {
+		store.mutate((data) => {
+			appendAuditEvent(data, {
+				actor: opts.actor ?? "operator",
+				action: "events.export",
+				subjectType: "audit_export",
+				outcome: "success",
+				source: opts.source ?? "cli",
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				correlationId: corr,
+				message: `Exported ${page.events.length} audit event(s)`,
+				metadata: {
+					count: page.events.length,
+					limit,
+					truncated: page.hasMore,
+					format,
+					wroteFile: Boolean(envelope.outputPath),
+					filters: envelope.filters,
+				},
+			});
+		});
+	}
+
+	return envelope;
+}
+
 export function isReplayableTraceSubsystem(
 	subsystem: DiagnosticTrace["subsystem"],
 ): subsystem is ReplayableTraceSubsystem {
@@ -520,6 +742,33 @@ export function inspectEvent(
 	}
 
 	return { event, trace, scope, replayable, replayBlocker };
+}
+
+/**
+ * Inspect runtime-owned events before falling back to the legacy audit/trace
+ * reader. Runtime audit rows are never replayable; traces retain their
+ * existing replay behavior and error contract.
+ */
+export async function inspectEventOperational(
+	store: ManagementStore,
+	id: string,
+	opts?: { scope?: ResourceScope },
+): Promise<EventInspectResult> {
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const key = id.trim();
+	const runtime = key
+		? await store.runtimeAuditEvents?.getById({ scope, id: key })
+		: undefined;
+	if (runtime) {
+		return {
+			event: sanitizeAuditEvent(runtime),
+			scope,
+			replayable: false,
+			replayBlocker:
+				"Audit events are not replayable; only SCIM diagnostic traces can be re-recorded",
+		};
+	}
+	return inspectEvent(store, id, { scope });
 }
 
 /**
