@@ -284,6 +284,20 @@ describe("@clearance/auth runtime wrapper", () => {
 		).toThrow(
 			"authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds must not exceed 2592000 when authenticationPolicy is enabled",
 		);
+		expect(() =>
+			createClearanceAuth({
+				...common,
+				authorization: {
+					projectId: common.authenticationPolicy.projectId,
+					environmentId: common.authenticationPolicy.environmentId,
+				},
+				authenticationSecurity: {
+					asymmetricAccessTokens: { enabled: false },
+				},
+			}),
+		).toThrow(
+			"authorization requires asymmetric access tokens for revision-bound action claims",
+		);
 		const boundary = createClearanceAuth({
 			...common,
 			authenticationSecurity: {
