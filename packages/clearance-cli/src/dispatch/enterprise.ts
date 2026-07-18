@@ -121,11 +121,17 @@ export async function dispatchEnterpriseCommand({
 			if (opts.live && opts.fixture) {
 				throw error("SCIM_TEST_MODE_CONFLICT", "--live and --fixture are mutually exclusive.", "Use one SCIM test mode.");
 			}
+			if (opts.scenario !== undefined && opts.scenario !== "users" && opts.scenario !== "group-lifecycle") {
+				throw error("SCIM_SCENARIO_INVALID", "--scenario must be users or group-lifecycle.", "Use --scenario users|group-lifecycle.");
+			}
+			if (opts.live && opts.scenario === "group-lifecycle") {
+				throw error("SCIM_SCENARIO_LIVE_CONFLICT", "--scenario group-lifecycle cannot use --live.", "Remove --live to exercise the bundled runtime.");
+			}
 			if (opts.live) requireLiveTestMode(global, "SCIM_LIVE_CONFIRM_REQUIRED", "Live SCIM conformance");
 			return requestManagementApi(session, {
 				method: SCIM_OPERATIONS.test.http.method,
 				path: resolveOperationPath(SCIM_OPERATIONS.test, { id: rawId }),
-				body: body({ fixture: opts.fixture, live: opts.live, dryRun: global.dryRun || !opts.apply }),
+				body: body({ fixture: opts.fixture, live: opts.live, dryRun: global.dryRun || !opts.apply, scenario: opts.scenario ?? "users" }),
 			});
 		case SCIM_OPERATIONS.list.cliPath:
 			return requestManagementApi(session, {
