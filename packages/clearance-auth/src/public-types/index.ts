@@ -318,6 +318,16 @@ export type CreateClearanceAuthOptions<
 				schema?: string;
 				prefix?: string;
 		  };
+	/**
+	 * Normalized PostgreSQL roles, actions, subject assignments, service accounts,
+	 * credentials, and organization authorization revisions.
+	 */
+	authorization?: {
+		projectId: string;
+		environmentId: string;
+		schema?: string;
+		prefix?: string;
+	};
 	/** Enabled by default. Set to `false` to omit the passkey server surface. */
 	passkeys?: Passkeys;
 	credentialAuthority?: {
@@ -416,6 +426,172 @@ export type ClearanceTransactionQuery = Readonly<{
 }>;
 
 export type ClearanceAuthenticationPolicyTransaction = ClearanceTransactionQuery;
+
+export type ClearanceAuthorizationSubject = Readonly<{
+	kind: "principal" | "service_account";
+	id: string;
+}>;
+
+export type ClearanceAuthorizationReadResult = Readonly<{
+	projectId: string;
+	environmentId: string;
+	organizationId: string;
+	subject: ClearanceAuthorizationSubject;
+	roleIds: readonly string[];
+	actions: readonly string[];
+	revision: string;
+}>;
+
+export type ClearanceAuthorizationRole = Readonly<{
+	roleId: string;
+	organizationId: string | null;
+	slug: string;
+	name: string;
+	description: string | null;
+	builtIn: boolean;
+	status: "active" | "disabled" | "archived";
+	actions: readonly string[];
+}>;
+
+export type ClearanceAuthorizationAssignment = Readonly<{
+	organizationId: string;
+	subject: ClearanceAuthorizationSubject;
+	roleId: string;
+}>;
+
+export type ClearanceAuthorizationAffectedRevision = Readonly<{
+	organizationId: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type ClearanceAuthorizationServiceAccount = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}>;
+
+export type ClearanceAuthorizationServiceAccountMutation = Readonly<{
+	serviceAccount: ClearanceAuthorizationServiceAccount;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type ClearanceAuthorizationServiceAccountCredential = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	credentialPrefix: string;
+	credentialFingerprint: string;
+	expiresAt: Date | null;
+	version: number;
+}>;
+
+export type ClearanceAuthorizationServiceAccountCredentialMutation = Readonly<{
+	credential: ClearanceAuthorizationServiceAccountCredential;
+	secret: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type ClearanceAuthorizationServiceAccountAuthentication = Readonly<{
+	projectId: string;
+	environmentId: string;
+	organizationId: string;
+	subject: Readonly<{ kind: "service_account"; id: string }>;
+	credential: ClearanceAuthorizationServiceAccountCredential;
+	roleIds: readonly string[];
+	actions: readonly string[];
+	revision: string;
+}>;
+
+export type ClearanceAuthorizationFacade = Readonly<{
+	readonly scope: Readonly<{ projectId: string; environmentId: string }>;
+	readEffective(input: Readonly<{
+		organizationId: string;
+		subject: ClearanceAuthorizationSubject;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationReadResult>;
+	initializeOrganization(input: Readonly<{
+		organizationId: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<Readonly<{
+		organizationId: string;
+		revision: string;
+		initialized: boolean;
+	}>>;
+	upsertRole(input: Readonly<{
+		role: Omit<ClearanceAuthorizationRole, "actions">;
+		actions: readonly string[];
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<Readonly<{
+		changed: boolean;
+		affectedOrganizations: readonly ClearanceAuthorizationAffectedRevision[];
+	}>>;
+	replaceSubjectRoles(input: Readonly<{
+		organizationId: string;
+		subject: ClearanceAuthorizationSubject;
+		roleIds: readonly string[];
+		expectedRevision?: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<Readonly<{
+		changed: boolean;
+		previousRevision: string;
+		revision: string;
+		roleIds: readonly string[];
+	}>>;
+	listRoles(input: Readonly<{
+		organizationId?: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<readonly ClearanceAuthorizationRole[]>;
+	listSubjectAssignments(input: Readonly<{
+		organizationId: string;
+		subject?: ClearanceAuthorizationSubject;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<readonly ClearanceAuthorizationAssignment[]>;
+	createServiceAccount(input: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		name: string;
+		roleIds: readonly string[];
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationServiceAccountMutation>;
+	listServiceAccounts(input: Readonly<{
+		organizationId: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<readonly ClearanceAuthorizationServiceAccount[]>;
+	setServiceAccountStatus(input: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		status: "active" | "disabled";
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationServiceAccountMutation>;
+	createServiceAccountCredential(input: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId?: string;
+		expiresAt?: Date;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationServiceAccountCredentialMutation>;
+	rotateServiceAccountCredential(input: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		expiresAt?: Date;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationServiceAccountCredentialMutation>;
+	revokeServiceAccountCredential(input: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationAffectedRevision>;
+	authenticateServiceAccountCredential(input: Readonly<{
+		secret: string;
+		transaction?: ClearanceTransactionQuery;
+	}>): Promise<ClearanceAuthorizationServiceAccountAuthentication>;
+}>;
 
 export type ClearanceKeyManagementMigrationCounts = Readonly<{
 	oidcClientSecrets: number;
@@ -854,6 +1030,8 @@ export type ClearanceAuthBundle<
 	};
 	/** Present only when createClearanceAuth received authenticationPolicy scope. */
 	authenticationPolicy?: ClearanceAuthenticationPolicyFacade;
+	/** Present only when createClearanceAuth received authorization scope. */
+	authorization?: ClearanceAuthorizationFacade;
 	keyManagement: ClearanceKeyManagementFacade;
 	prepareCredentialAuthorityRuntime(): Promise<void>;
 	planMigrations(): Promise<ClearanceRuntimeMigrationPlan>;
