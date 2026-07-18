@@ -5,6 +5,7 @@ import {
 	type PgStore,
 	type PgStoreDeliveryOptions,
 } from "./pg-store.js";
+import type { RuntimeAuditStoreOptions } from "./runtime-audit-events.js";
 import type { ManagementStore } from "./types.js";
 import {
 	DEFAULT_DELIVERY_QUOTA_POLICY,
@@ -22,6 +23,8 @@ export type CreateStoreOptions = {
 	databaseUrl?: string;
 	/** Optional encrypted outbox capability for coordinated Postgres mutations. */
 	delivery?: PgStoreDeliveryOptions;
+	/** Runtime audit source; defaults to clearance_runtime_audit_events. */
+	runtimeAudit?: RuntimeAuditStoreOptions;
 };
 
 const DELIVERY_KEY_ENV = [
@@ -133,6 +136,9 @@ export async function createManagementStore(
 		}
 		return createPgStore(databaseUrl, {
 			...(opts.delivery ? { delivery: opts.delivery } : {}),
+			...(opts.runtimeAudit
+				? { runtimeAudit: opts.runtimeAudit }
+				: runtimeAuditStoreOptionsFromEnvironment()),
 		});
 	}
 
@@ -142,6 +148,18 @@ export async function createManagementStore(
 			? resolve(process.env.CLEARANCE_DATA_PATH)
 			: defaultDataPath();
 	return new JsonStore(path);
+}
+
+function runtimeAuditStoreOptionsFromEnvironment():
+	{ runtimeAudit: RuntimeAuditStoreOptions } {
+	const schema = process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA?.trim();
+	const prefix = process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX?.trim();
+	return {
+		runtimeAudit: {
+			...(schema ? { schema } : {}),
+			...(prefix ? { prefix } : {}),
+		},
+	};
 }
 
 export type { PgStore };
