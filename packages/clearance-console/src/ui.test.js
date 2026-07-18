@@ -27,7 +27,7 @@ const CSRF = "csrf-token-for-tests";
 
 /** Stateful mock of the console server's /api surface. */
 function createMockServer() {
-	const state = { loggedIn: false, requests: [] };
+	const state = { loggedIn: false, requests: [], deferAssignments: false, assignmentResolvers: [] };
 	async function fetchImpl(input, init = {}) {
 		const url = String(input);
 		const method = (init.method || "GET").toUpperCase();
@@ -117,6 +117,35 @@ function createMockServer() {
 				activeSessions: 1,
 				recentEvents: [],
 			});
+		}
+		if (url === "/api/v1/organizations") {
+			return respond(200, {
+				organizations: [{ id: "org_1", name: "Acme", slug: "acme", status: "active" }],
+			});
+		}
+		if (url === "/api/v1/roles") {
+			return respond(200, {
+				roles: [{ id: "role_builtin_member", name: "Member", slug: "member", kind: "built_in", permissions: ["projects:read"] }],
+			});
+		}
+		if (url === "/api/v1/organizations/org_1/authorization/assignments") {
+			if (state.deferAssignments) {
+				return new Promise((resolve) => {
+					state.assignmentResolvers.push(() => resolve(respond(200, { assignments: [] })));
+				});
+			}
+			return respond(200, { assignments: [] });
+		}
+		if (url === "/api/v1/organizations/org_1/authorization/assignments/principal/user_1" && method === "PATCH") {
+			return respond(200, {
+				dryRun: true,
+				wouldChange: true,
+				currentRevision: "1",
+				assignment: { roleIds: ["role_builtin_member"] },
+			});
+		}
+		if (url === "/api/v1/organizations/org_1/service-accounts") {
+			return respond(200, { serviceAccounts: [] });
 		}
 		if (url.startsWith("/api/v1/users")) {
 			return respond(200, { users: [] });
@@ -310,5 +339,42 @@ describe("console SPA login flow (DOM)", () => {
 			/Session expired/,
 		);
 		assert.equal(document.querySelector(".app").hidden, true);
+	});
+
+	it("authorization route previews a revisioned replacement through the CSRF BFF", async () => {
+		const { document, window, server } = ctx;
+		await until(() => document.getElementById("login-host").hidden === false, "login view visible");
+		submitLogin(document, window, GOOD.username, GOOD.password);
+		await until(() => document.querySelector(".app").hidden === false, "app visible after login");
+		document.querySelector('[data-route="authorization"]').dispatchEvent(new window.Event("click", { bubbles: true }));
+		await until(() => document.getElementById("az-replace-id"), "authorization screen rendered");
+		document.getElementById("az-replace-id").value = "user_1";
+		document.getElementById("az-role-ids").value = "role_builtin_member";
+		document.getElementById("az-preview").dispatchEvent(new window.Event("click", { bubbles: true }));
+		await until(
+			() => server.state.requests.some((request) => request.url === "/api/v1/organizations/org_1/authorization/assignments/principal/user_1"),
+			"authorization preview request",
+		);
+		const preview = server.state.requests.find((request) => request.url === "/api/v1/organizations/org_1/authorization/assignments/principal/user_1");
+		assert.equal(preview.method, "PATCH");
+		assert.equal(preview.headers["x-csrf-token"], CSRF);
+		assert.deepEqual(JSON.parse(preview.body), { roleIds: ["role_builtin_member"], dryRun: true });
+		await until(() => document.getElementById("az-apply").disabled === false, "apply enabled after preview");
+	});
+
+	it("ignores delayed authorization work after navigation to service accounts", async () => {
+		const { document, window, server } = ctx;
+		await until(() => document.getElementById("login-host").hidden === false, "login view visible");
+		submitLogin(document, window, GOOD.username, GOOD.password);
+		await until(() => document.querySelector(".app").hidden === false, "app visible after login");
+		server.state.deferAssignments = true;
+		document.querySelector('[data-route="authorization"]').dispatchEvent(new window.Event("click", { bubbles: true }));
+		await until(() => document.getElementById("az-assignments"), "authorization shell rendered");
+		document.querySelector('[data-route="service-accounts"]').dispatchEvent(new window.Event("click", { bubbles: true }));
+		await until(() => document.getElementById("sa-create-form"), "service-account screen rendered");
+		for (const resolve of server.state.assignmentResolvers.splice(0)) resolve();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(document.getElementById("sa-create-form"), "new route remains visible");
+		assert.equal(document.getElementById("az-assignments"), null, "old authorization result cannot overwrite the new route");
 	});
 });
