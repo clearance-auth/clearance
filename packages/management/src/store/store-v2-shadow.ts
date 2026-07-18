@@ -56,6 +56,15 @@ import {
 	writeStoreV2PrincipalState,
 	type StoreV2PrincipalRow,
 } from "./store-v2-principals.js";
+import {
+	STORE_V2_TOPOLOGY_AUTHORITY_VERSION,
+	STORE_V2_TOPOLOGY_AUTHORITY_VERSION_META_KEY,
+	STORE_V2_TOPOLOGY_STATE_META_KEY,
+	advanceStoreV2TopologyState,
+	readStoreV2TopologyState,
+	storeV2TopologyIsAuthoritative,
+	writeStoreV2TopologyState,
+} from "./store-v2-topology.js";
 
 const MAX_DIFFERING_IDS = 20;
 const META_SCHEMA_VERSION = "store_v2_schema_version";
@@ -74,6 +83,7 @@ export interface StoreV2SyncResult {
 	persistedSnapshot: DataStoreSnapshot;
 	authoritativeCollections: StoreV2Collection[];
 	principalRevision: number | null;
+	topologyRevision?: number | null;
 	eventDelta?: StoreV2EventDelta;
 }
 
@@ -589,6 +599,14 @@ async function buildStatus(
 			...(authoritativeCollections.includes("principals")
 				? { principals: relational.principals as Principal[] }
 				: {}),
+				...(( ["projects", "environments", "organizations"] as StoreV2Collection[])
+					.every((collection) => authoritativeCollections.includes(collection))
+					? {
+						projects: relational.projects as Project[],
+						environments: relational.environments as Environment[],
+						organizations: relational.organizations as Organization[],
+					}
+					: {}),
 		};
 	}
 	const selected = selectedCollections(materialized);
@@ -610,6 +628,18 @@ async function buildStatus(
 		? null
 		: await readStoreV2PrincipalState(queryable, tables);
 	const principalRevision = principalState?.revision ?? null;
+	const topologyState = phase === "absent"
+		? null
+		: await readStoreV2TopologyState(queryable, tables);
+	const topologyRevision = topologyState?.revision ?? null;
+	const topologyStateConsistent =
+		phase === "absent" ||
+		(topologyState !== null &&
+			topologyState.projectCount === (relational?.projects.length ?? 0) &&
+			topologyState.environmentCount ===
+				(relational?.environments.length ?? 0) &&
+			topologyState.organizationCount ===
+				(relational?.organizations.length ?? 0));
 	const principalStateConsistent =
 		phase === "absent" ||
 		(principalState !== null &&
@@ -617,7 +647,10 @@ async function buildStatus(
 	const authoritativeProjectionsEmpty = authoritativeCollections.every(
 		(collection) =>
 			(collection !== "events" || snapshot.events.length === 0) &&
-			(collection !== "principals" || snapshot.principals.length === 0),
+			(collection !== "principals" || snapshot.principals.length === 0) &&
+			(collection !== "projects" || snapshot.projects.length === 0) &&
+			(collection !== "environments" || snapshot.environments.length === 0) &&
+			(collection !== "organizations" || snapshot.organizations.length === 0),
 	);
 
 	return {
@@ -626,12 +659,14 @@ async function buildStatus(
 		snapshotRevision: revision,
 		relationalRevision,
 		principalRevision,
+		topologyRevision,
 		consistent:
 			phase !== "absent" &&
 			schemaVersion === STORE_V2_SCHEMA_VERSION &&
 			relationalRevision === revision &&
 			principalRevision !== null &&
 			principalStateConsistent &&
+			topologyStateConsistent &&
 			STORE_V2_COLLECTIONS.every(
 				(collection) => collections[collection].consistent,
 			) && authoritativeProjectionsEmpty,
@@ -834,6 +869,13 @@ async function syncDiff(
 	authoritativeCollections: readonly StoreV2Collection[] = [],
 ): Promise<void> {
 	const principalsAuthoritative = authoritativeCollections.includes("principals");
+	const topologyAuthoritative = [
+		"projects",
+		"environments",
+		"organizations",
+	].every((collection) =>
+		authoritativeCollections.includes(collection as StoreV2Collection),
+	);
 	const projects = changedResources(before.projects, after.projects);
 	const environments = changedResources(before.environments, after.environments);
 	const principals = changedResources(before.principals, after.principals);
@@ -883,9 +925,9 @@ async function syncDiff(
 	if (!principalsAuthoritative) {
 		await deleteIds(client, tables.principals, principals.deletedIds);
 	}
-	await deleteIds(client, tables.organizations, organizations.deletedIds);
+	if (!topologyAuthoritative) await deleteIds(client, tables.organizations, organizations.deletedIds);
 	await neutralizeUniqueValues(client, tables, {
-		projectIds: [
+		projectIds: topologyAuthoritative ? [] : [
 			...new Set([
 				...projects.upserted.map((project) => project.id),
 				...projects.deletedIds,
@@ -894,12 +936,12 @@ async function syncDiff(
 		principalIds: principalsAuthoritative
 			? []
 			: principals.upserted.map((principal) => principal.id),
-		organizationIds: organizations.upserted.map(
+		organizationIds: topologyAuthoritative ? [] : organizations.upserted.map(
 			(organization) => organization.id,
 		),
 	});
 
-	for (const project of projects.upserted) {
+	if (!topologyAuthoritative) for (const project of projects.upserted) {
 		await client.query(
 			`INSERT INTO ${tables.projects} (id, name, slug, created_at, updated_at)
 			 VALUES ($1, $2, $3, $4, $5)
@@ -909,7 +951,7 @@ async function syncDiff(
 			[project.id, project.name, project.slug, project.createdAt, project.updatedAt],
 		);
 	}
-	for (const environment of environments.upserted) {
+	if (!topologyAuthoritative) for (const environment of environments.upserted) {
 		await client.query(
 			`INSERT INTO ${tables.environments}
 			 (id, project_id, name, slug, kind, created_at, updated_at)
@@ -956,7 +998,7 @@ async function syncDiff(
 			);
 		}
 	}
-	for (const organization of organizations.upserted) {
+	if (!topologyAuthoritative) for (const organization of organizations.upserted) {
 		await client.query(
 			`INSERT INTO ${tables.organizations}
 			 (id, project_id, environment_id, name, slug, status, external_id,
@@ -982,8 +1024,10 @@ async function syncDiff(
 		);
 	}
 
-	await deleteIds(client, tables.environments, environments.deletedIds);
-	await deleteIds(client, tables.projects, projects.deletedIds);
+	if (!topologyAuthoritative) {
+		await deleteIds(client, tables.environments, environments.deletedIds);
+		await deleteIds(client, tables.projects, projects.deletedIds);
+	}
 }
 
 export class PgStoreV2Shadow implements StoreV2MigrationControl {
@@ -1074,15 +1118,19 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 					}
 					principalCount = principalState.count;
 				}
-				snapshot = {
-					...cloneSnapshot(storedSnapshot),
+					snapshot = {
+						...cloneSnapshot(storedSnapshot),
 					...(authoritativeCollections.includes("events")
 						? { events: await readStoreV2Events(client, this.tables) }
 						: {}),
-					...(authoritativeCollections.includes("principals")
-						? { principals: [] }
-						: {}),
-				};
+						...(authoritativeCollections.includes("principals")
+							? { principals: [] }
+							: {}),
+						...(( ["projects", "environments", "organizations"] as StoreV2Collection[])
+							.every((collection) => authoritativeCollections.includes(collection))
+							? { projects: [], environments: [], organizations: [] }
+							: {}),
+					};
 			}
 			await client.query("COMMIT");
 			return {
@@ -1113,6 +1161,11 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		const phase = phaseFromMeta(meta);
 		return authoritativeCollectionsFromMeta(meta, phase).includes("principals");
 	}
+
+	async topologyIsAuthoritative(): Promise<boolean> {
+		return storeV2TopologyIsAuthoritative(this.pool, this.tables);
+	}
+
 
 	async transactionPhase(queryable: Queryable): Promise<StoreV2Phase> {
 		return phaseFromMeta(await readMeta(queryable, this.tables));
@@ -1541,6 +1594,12 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				STORE_V2_PRINCIPAL_AUTHORITY_VERSION_META_KEY,
 				STORE_V2_PRINCIPAL_AUTHORITY_VERSION,
 			);
+			await writeMeta(
+				client,
+				this.tables,
+				STORE_V2_TOPOLOGY_AUTHORITY_VERSION_META_KEY,
+				STORE_V2_TOPOLOGY_AUTHORITY_VERSION,
+			);
 			const existingAuthorities = existingPhase === "hybrid"
 				? authoritativeCollectionsFromMeta(existingMeta, existingPhase)
 				: [];
@@ -1571,6 +1630,19 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 						count: parsedCount,
 					});
 				}
+				if (!(await readStoreV2TopologyState(client, this.tables))) {
+					const counts = await client.query<{ projects: string; environments: string; organizations: string }>(
+						`SELECT (SELECT count(*)::text FROM ${this.tables.projects}) projects,
+						        (SELECT count(*)::text FROM ${this.tables.environments}) environments,
+						        (SELECT count(*)::text FROM ${this.tables.organizations}) organizations`,
+					);
+					await writeStoreV2TopologyState(client, this.tables, {
+						revision,
+						projectCount: Number(counts.rows[0]?.projects),
+						environmentCount: Number(counts.rows[0]?.environments),
+						organizationCount: Number(counts.rows[0]?.organizations),
+					});
+				}
 				const status = await buildStatus(client, this.tables, this.snapshotTable);
 				await client.query("COMMIT");
 				return status;
@@ -1581,6 +1653,12 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 					numberFromMeta(existingMeta.get(STORE_V2_PRINCIPAL_REVISION_META_KEY)) ??
 					revision,
 				count: snapshot.principals.length,
+			});
+			await writeStoreV2TopologyState(client, this.tables, {
+				revision,
+				projectCount: snapshot.projects.length,
+				environmentCount: snapshot.environments.length,
+				organizationCount: snapshot.organizations.length,
 			});
 			await writeMeta(client, this.tables, META_PHASE, "shadow");
 			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, revision);
@@ -1894,6 +1972,180 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		return this.readStatus();
 	}
 
+	/** Move the complete project -> environment -> organization chain to SQL authority. */
+	async cutoverTopology(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			const phase = phaseFromMeta(meta);
+			const authority = authoritativeCollectionsFromMeta(meta, phase);
+			if (
+				phase !== "hybrid" ||
+				!authority.includes("events") ||
+				["projects", "environments", "organizations"].some((collection) =>
+					authority.includes(collection as StoreV2Collection),
+				)
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_CUTOVER_PHASE_INVALID",
+					"Topology cutover requires relational-authoritative events and snapshot-authoritative topology.",
+				);
+			}
+			if (
+				numberFromMeta(meta.get(STORE_V2_TOPOLOGY_AUTHORITY_VERSION_META_KEY)) !==
+				STORE_V2_TOPOLOGY_AUTHORITY_VERSION
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_AUTHORITY_VERSION_INVALID",
+					"Topology authority capability metadata is missing or invalid.",
+				);
+			}
+			const status = await buildStatus(client, this.tables, this.snapshotTable);
+			if (
+				!status.consistent ||
+				!["projects", "environments", "organizations"].every((collection) =>
+					status.collections[collection as StoreV2Collection].consistent,
+				)
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_DIVERGENCE",
+					"Store-v2 topology diverged before cutover.",
+				);
+			}
+			const nextRevision = incrementStoreV2Revision(revision);
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[
+					JSON.stringify({
+						...snapshot,
+						projects: [],
+						environments: [],
+						organizations: [],
+					}),
+					nextRevision,
+				],
+			);
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				canonicalStoreV2AuthoritySet([
+					...authority,
+					"projects",
+					"environments",
+					"organizations",
+				]),
+			);
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await advanceStoreV2TopologyState(client, this.tables, {
+				projectCount: 0,
+				environmentCount: 0,
+				organizationCount: 0,
+			});
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
+	/** Reverse-materialize the relational topology before returning authority. */
+	async rollbackTopology(): Promise<StoreV2Status> {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await this.lockPrincipalAuthority(client);
+			const { snapshot, revision } = await readSnapshot(
+				client,
+				this.snapshotTable,
+				true,
+			);
+			const meta = await readMeta(client, this.tables);
+			const phase = phaseFromMeta(meta);
+			const authority = authoritativeCollectionsFromMeta(meta, phase);
+			if (
+				phase !== "hybrid" ||
+				!["projects", "environments", "organizations"].every((collection) =>
+					authority.includes(collection as StoreV2Collection),
+				)
+			) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_ROLLBACK_PHASE_INVALID",
+					"Topology rollback requires relational topology authority.",
+				);
+			}
+			const status = await buildStatus(client, this.tables, this.snapshotTable);
+			if (!status.consistent) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_DIVERGENCE",
+					"Store-v2 topology diverged before rollback.",
+				);
+			}
+			const nextRevision = incrementStoreV2Revision(revision);
+			const topology = await relationalCollections(client, this.tables);
+			if (!topology) {
+				throw new StoreV2MigrationError(
+					"STORE_V2_TOPOLOGY_MISSING",
+					"Normalized topology rows are unavailable for rollback.",
+				);
+			}
+			await client.query(
+				`UPDATE ${this.snapshotTable}
+				 SET data = $1::jsonb, revision = $2, updated_at = now()
+				 WHERE id = 1`,
+				[
+					JSON.stringify({
+						...snapshot,
+						projects: topology.projects,
+						environments: topology.environments,
+						organizations: topology.organizations,
+					}),
+					nextRevision,
+				],
+			);
+			await client.query(
+				"SELECT set_config('clearance.topology_authority_rollback', $1, true)",
+				[String(STORE_V2_TOPOLOGY_AUTHORITY_VERSION)],
+			);
+			await writeMeta(
+				client,
+				this.tables,
+				META_AUTHORITATIVE_COLLECTIONS,
+				canonicalStoreV2AuthoritySet(
+					authority.filter(
+						(collection) =>
+							!["projects", "environments", "organizations"].includes(collection),
+					),
+				),
+			);
+			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
+			await advanceStoreV2TopologyState(client, this.tables, {
+				projectCount: 0,
+				environmentCount: 0,
+				organizationCount: 0,
+			});
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		return this.readStatus();
+	}
+
 	async syncTransaction(
 		client: pg.PoolClient,
 		before: DataStoreSnapshot,
@@ -1907,6 +2159,9 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		let principalState = phase === "absent"
 			? null
 			: await readStoreV2PrincipalState(client, this.tables);
+		let topologyState = phase === "absent"
+			? null
+			: await readStoreV2TopologyState(client, this.tables);
 		if (phase !== "shadow" && phase !== "hybrid") {
 			return {
 				phase,
@@ -1939,6 +2194,23 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 				"Generic snapshot mutation cannot change relational-authoritative principals.",
 			);
 		}
+		const topologyAuthoritative = [
+			"projects",
+			"environments",
+			"organizations",
+		].every((collection) =>
+			authoritativeCollections.includes(collection as StoreV2Collection),
+		);
+		const topologyChanged =
+			stableJson(before.projects) !== stableJson(after.projects) ||
+			stableJson(before.environments) !== stableJson(after.environments) ||
+			stableJson(before.organizations) !== stableJson(after.organizations);
+		if (topologyAuthoritative && topologyChanged) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_TOPOLOGY_TYPED_MUTATION_REQUIRED",
+				"Generic snapshot mutation cannot change relational-authoritative topology.",
+			);
+		}
 		await syncDiff(
 			client,
 			this.tables,
@@ -1962,6 +2234,23 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPAL_STATE_INVALID",
 				"Principal authority state metadata is missing or invalid.",
+			);
+		}
+		if (!topologyAuthoritative && topologyChanged) {
+			topologyState = await advanceStoreV2TopologyState(client, this.tables, {
+				projectCount: after.projects.length - before.projects.length,
+				environmentCount:
+					after.environments.length - before.environments.length,
+				organizationCount:
+					after.organizations.length - before.organizations.length,
+			});
+		} else {
+			topologyState = await readStoreV2TopologyState(client, this.tables);
+		}
+		if (!topologyState) {
+			throw new StoreV2MigrationError(
+				"STORE_V2_TOPOLOGY_STATE_INVALID",
+				"Topology authority state metadata is missing or invalid.",
 			);
 		}
 		let eventDelta: StoreV2EventDelta | undefined;
@@ -2028,12 +2317,21 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		if (authoritativeCollections.includes("principals")) {
 			persistedSnapshot = { ...persistedSnapshot, principals: [] };
 		}
+		if (topologyAuthoritative) {
+			persistedSnapshot = {
+				...persistedSnapshot,
+				projects: [],
+				environments: [],
+				organizations: [],
+			};
+		}
 		await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, revision);
 		return {
 			phase,
 			persistedSnapshot,
 			authoritativeCollections,
 			principalRevision: principalState.revision,
+			topologyRevision: topologyState.revision,
 			...(eventDelta ? { eventDelta } : {}),
 		};
 	}
