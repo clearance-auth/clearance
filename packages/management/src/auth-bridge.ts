@@ -149,6 +149,26 @@ function credentialAuthorityRuntimeOptions(): NonNullable<
 	};
 }
 
+function authenticationPolicyRuntimeOptions(
+	generation: "legacy-v1" | "digest-v1",
+): Pick<
+	Parameters<typeof createClearanceAuth>[0],
+	"authenticationPolicy"
+> {
+	if (generation === "legacy-v1") return {};
+	const projectId = process.env.CLEARANCE_PROJECT_ID?.trim();
+	const environmentId = process.env.CLEARANCE_ENV_ID?.trim();
+	if (Boolean(projectId) !== Boolean(environmentId)) {
+		throw new Error(
+			"CLEARANCE_PROJECT_ID and CLEARANCE_ENV_ID must both be set for managed authentication policy",
+		);
+	}
+	if (projectId && environmentId) {
+		return { authenticationPolicy: { projectId, environmentId } };
+	}
+	return {};
+}
+
 export function getAuthBundle(): ClearanceAuthBundle {
 	if (bundle) return bundle;
 	const databaseUrl = process.env.DATABASE_URL;
@@ -171,13 +191,15 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		throw new Error("Refusing default CLEARANCE_SECRET for auth runtime");
 	}
 	const baseURL = process.env.CLEARANCE_BASE_URL ?? "http://localhost:3300";
+	const credentialAuthority = credentialAuthorityRuntimeOptions();
 	bundle = createClearanceAuth({
 		baseURL,
 		secret,
 		databaseUrl,
 		enableSso: true,
 		enableScim: true,
-		credentialAuthority: credentialAuthorityRuntimeOptions(),
+		credentialAuthority,
+		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
 	});
 	return bundle;
 }
