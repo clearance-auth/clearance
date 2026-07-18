@@ -1,10 +1,77 @@
-import { describe, expect, it } from "vitest";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
+import { describe, expect, it, vi } from "vitest";
 import type { AuthQueryAtom } from "../../../client";
 import { createAuthClient } from "../../../client";
+import { parseSetCookieHeader } from "../../../cookies";
+import { attachInternalAuthenticationPolicy } from "../../../internal/authentication-policy";
 import { getTestInstance } from "../../../test-utils/test-instance";
+import * as cookies from "../../../cookies";
 import { organizationClient } from "../client";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
 import { organization } from "../organization";
+import type { OrganizationOptions } from "../types";
+
+const managedIdentity = {
+	projectId: "crud-members-project",
+	environmentId: "crud-members-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+function managedOrganizationOptions(
+	organizationHooks?: OrganizationOptions["organizationHooks"],
+) {
+	const options = {
+		plugins: [organization({ organizationHooks })],
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity: managedIdentity,
+		reader: {
+			async readForSubject(input) {
+				const membership =
+					input.organizationId && input.transaction
+						? await input.transaction.findOne<{
+							userId: string;
+							organizationId: string;
+						}>({
+								model: "member",
+								where: [
+									{ field: "userId", value: input.subjectId },
+									{ field: "organizationId", value: input.organizationId },
+								],
+							})
+						: null;
+				return {
+					scope: managedIdentity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: managedPolicy,
+					organizationMembership:
+						input.organizationId && membership
+							? {
+									subjectId: input.subjectId,
+									organizationId: input.organizationId,
+								}
+							: null,
+					organizationOverride: null,
+					effective: managedPolicy,
+				};
+			},
+		},
+	});
+	return options;
+}
 
 describe("listMembers", async () => {
 	const { auth, signInWithTestUser, cookieSetter } = await getTestInstance({
@@ -566,6 +633,429 @@ describe("updateMemberRole", async () => {
 			);
 			expect(updated.error?.status).toBe(400);
 		}
+	});
+
+	it("revalidates hook-produced owner roles before preserving the last owner", async () => {
+		const { auth: hookedAuth, signInWithTestUser: signIn } =
+			await getTestInstance({
+				plugins: [
+					organization({
+						organizationHooks: {
+							beforeUpdateMemberRole: async () => ({
+								data: { role: " member " },
+							}),
+						},
+					}),
+				],
+			});
+		const { headers } = await signIn();
+		const hookedClient = createAuthClient({
+			plugins: [organizationClient()],
+			baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: {
+				customFetchImpl: async (url, init) =>
+					hookedAuth.handler(new Request(url, init)),
+			},
+		});
+		const org = await hookedClient.organization.create({
+			name: "hook-owner",
+			slug: `hook-owner-${crypto.randomUUID()}`,
+			fetchOptions: { headers },
+		});
+		const owner = await hookedAuth.api.getActiveMember({ headers });
+		const result = await hookedClient.organization.updateMemberRole(
+			{
+				organizationId: org.data?.id,
+				memberId: owner?.id as string,
+				role: "admin",
+			},
+			{ headers },
+		);
+		expect(result.error?.status).toBe(400);
+		const persisted = await (await hookedAuth.$context).adapter.findOne<{ role: string }>({
+			model: "member",
+			where: [{ field: "id", value: owner?.id as string }],
+		});
+			expect(persisted?.role).toBe("owner");
+		});
+
+	it("rejects an update when the target changes during beforeUpdateMemberRole", async () => {
+		let release!: () => void;
+		let entered!: () => void;
+		const barrier = new Promise<void>((resolve) => { release = resolve; });
+		const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+		const afterUpdateMemberRole = vi.fn();
+		const { auth: hookedAuth, signInWithTestUser: signIn, customFetchImpl: fetch } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { beforeUpdateMemberRole: async () => { entered(); await barrier; }, afterUpdateMemberRole } })],
+		});
+		const { headers } = await signIn();
+		const hookedClient = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl: fetch } });
+		const org = await hookedClient.organization.create({ name: "update-barrier", slug: `update-barrier-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await hookedAuth.api.signUpEmail({ body: { email: `update-barrier-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await hookedAuth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const update = hookedClient.organization.updateMemberRole({ organizationId: org.data?.id, memberId: membership?.id as string, role: "member" }, { headers });
+		await enteredBarrier;
+		const context = await hookedAuth.$context;
+		await context.adapter.update({ model: "member", where: [{ field: "id", value: membership?.id as string }], update: { role: "admin" } });
+		release();
+		const result = await update;
+		expect(result.error?.status).toBe(400);
+		expect((await context.adapter.findOne<{ role: string }>({ model: "member", where: [{ field: "id", value: membership?.id as string }] }))?.role).toBe("admin");
+		expect(afterUpdateMemberRole).not.toHaveBeenCalled();
+	});
+
+	it("uses the locked live target role as previousRole when it changes before transaction entry", async () => {
+		const afterUpdateMemberRole = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterUpdateMemberRole } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "locked-update-role", slug: `locked-update-role-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `locked-update-role-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const context = await auth.$context;
+		let release!: () => void;
+		let entered!: () => void;
+		const barrier = new Promise<void>((resolve) => { release = resolve; });
+		const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		const transactionSpy = vi.spyOn(context.adapter, "transaction").mockImplementation(async (callback) => {
+			entered();
+			await barrier;
+			return transaction(callback);
+		});
+		const update = client.organization.updateMemberRole({ organizationId: org.data?.id, memberId: membership?.id as string, role: "member" }, { headers });
+		await enteredBarrier;
+		await context.adapter.update({ model: "member", where: [{ field: "id", value: membership?.id as string }], update: { role: "admin" } });
+		release();
+		const result = await update;
+		transactionSpy.mockRestore();
+		expect(result.error).toBeNull();
+		expect(afterUpdateMemberRole).toHaveBeenCalledTimes(1);
+		expect(afterUpdateMemberRole.mock.calls[0]?.[0]).toMatchObject({ previousRole: "admin", member: { role: "member" } });
+		expect((await context.adapter.findOne<{ role: string }>({ model: "member", where: [{ field: "id", value: membership?.id as string }] }))?.role).toBe("member");
+	});
+});
+
+describe("member removal session authority", () => {
+	it("rejects removal when the target changes during beforeRemoveMember", async () => {
+		let release!: () => void;
+		let entered!: () => void;
+		const barrier = new Promise<void>((resolve) => { release = resolve; });
+		const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { beforeRemoveMember: async () => { entered(); await barrier; }, afterRemoveMember } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "remove-barrier", slug: `remove-barrier-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `remove-barrier-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const remove = auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers, asResponse: true });
+		await enteredBarrier;
+		const context = await auth.$context;
+		await context.adapter.update({ model: "member", where: [{ field: "id", value: membership?.id as string }], update: { role: "admin" } });
+		release();
+		const response = await remove;
+		expect(response.status).toBe(400);
+		expect((await context.adapter.findOne<{ role: string }>({ model: "member", where: [{ field: "id", value: membership?.id as string }] }))?.role).toBe("admin");
+		expect(afterRemoveMember).not.toHaveBeenCalled();
+	});
+
+	it("uses the locked live target role when it changes before transaction entry", async () => {
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "locked-remove-role", slug: `locked-remove-role-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `locked-remove-role-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const context = await auth.$context;
+		let release!: () => void;
+		let entered!: () => void;
+		const barrier = new Promise<void>((resolve) => { release = resolve; });
+		const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		const transactionSpy = vi.spyOn(context.adapter, "transaction").mockImplementation(async (callback) => {
+			entered();
+			await barrier;
+			return transaction(callback);
+		});
+		const removal = auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers });
+		await enteredBarrier;
+		await context.adapter.update({ model: "member", where: [{ field: "id", value: membership?.id as string }], update: { role: "admin" } });
+		release();
+		await removal;
+		transactionSpy.mockRestore();
+		expect(afterRemoveMember).toHaveBeenCalledTimes(1);
+		expect(afterRemoveMember.mock.calls[0]?.[0]).toMatchObject({ member: { id: membership?.id, role: "admin" } });
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: membership?.id as string }] })).toBeNull();
+	});
+
+	it("revokes every database session scoped to the removed organization by id", async () => {
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization()],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({
+			plugins: [organizationClient()],
+			baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: { customFetchImpl },
+		});
+		const orgResponse = await client.organization.create({
+			name: "session-authority",
+			slug: `session-authority-${crypto.randomUUID()}`,
+			fetchOptions: { headers },
+		});
+		const target = await auth.api.signUpEmail({
+			body: {
+				email: `session-authority-${crypto.randomUUID()}@test.com`,
+				name: "target",
+				password: "password",
+			},
+		});
+		const membership = await auth.api.addMember({
+			body: {
+				organizationId: orgResponse.data?.id as string,
+				userId: target.user.id,
+				role: "member",
+			},
+		});
+		const context = await auth.$context;
+		const scopedOne = await context.internalAdapter.createSession(target.user.id, false, {
+			activeOrganizationId: orgResponse.data?.id,
+		});
+		const scopedTwo = await context.internalAdapter.createSession(target.user.id, false, {
+			activeOrganizationId: orgResponse.data?.id,
+		});
+		const unrelated = await context.internalAdapter.createSession(target.user.id, false, {
+			activeOrganizationId: "another-organization",
+		});
+
+		await auth.api.removeMember({
+			body: {
+				organizationId: orgResponse.data?.id,
+				memberIdOrEmail: membership?.id as string,
+			},
+			headers,
+		});
+
+		expect(await context.internalAdapter.findSession(scopedOne.token)).toBeNull();
+		expect(await context.internalAdapter.findSession(scopedTwo.token)).toBeNull();
+		expect(await context.internalAdapter.findSession(unrelated.token)).not.toBeNull();
+	});
+
+	it("revokes secondary-only scoped sessions before deletion and preserves unrelated sessions", async () => {
+		const secondary = new Map<string, string>();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			session: { storeSessionInDatabase: false },
+			secondaryStorage: {
+				get: (key) => secondary.get(key) ?? null,
+				set: (key, value) => void secondary.set(key, value),
+				delete: (key) => void secondary.delete(key),
+			},
+			plugins: [organization()],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({
+			plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: { customFetchImpl },
+		});
+		const org = await client.organization.create({ name: "secondary-session", slug: `secondary-session-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `secondary-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const context = await auth.$context;
+		const scoped = await context.internalAdapter.createSession(target.user.id, false, { activeOrganizationId: org.data?.id });
+		const unrelated = await context.internalAdapter.createSession(target.user.id, false, { activeOrganizationId: "other-org" });
+		const deleted = vi.spyOn(context.internalAdapter, "deleteSessionById");
+		await auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers });
+		expect(deleted).toHaveBeenCalledWith(scoped.id);
+		expect(deleted).not.toHaveBeenCalledWith(unrelated.id);
+		expect(await context.internalAdapter.findSession(unrelated.token)).not.toBeNull();
+	});
+
+	it("aborts secondary-only removal when durable session deletion fails", async () => {
+		const secondary = new Map<string, string>();
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			session: { storeSessionInDatabase: false },
+			secondaryStorage: { get: (key) => secondary.get(key) ?? null, set: (key, value) => void secondary.set(key, value), delete: (key) => void secondary.delete(key) },
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "secondary-failure", slug: `secondary-failure-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `secondary-failure-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const context = await auth.$context;
+		await context.internalAdapter.createSession(target.user.id, false, { activeOrganizationId: org.data?.id });
+		vi.spyOn(context.internalAdapter, "deleteSessionById").mockRejectedValueOnce(new Error("secondary unavailable"));
+		await expect(auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers })).rejects.toThrow("secondary unavailable");
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: membership?.id as string }] })).not.toBeNull();
+		expect(afterRemoveMember).not.toHaveBeenCalled();
+	});
+
+	it("does not revoke secondary sessions when locked sole-owner validation rejects removal", async () => {
+		const secondary = new Map<string, string>();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			session: { storeSessionInDatabase: false },
+			secondaryStorage: { get: (key) => secondary.get(key) ?? null, set: (key, value) => void secondary.set(key, value), delete: (key) => void secondary.delete(key) },
+			plugins: [organization()],
+		});
+		const { headers, user } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "secondary-rejected", slug: `secondary-rejected-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const context = await auth.$context;
+		const ownerMember = await context.adapter.findOne<{ id: string }>({ model: "member", where: [{ field: "organizationId", value: org.data?.id as string }, { field: "userId", value: user.id }] });
+		if (!ownerMember) throw new Error("Owner membership missing");
+		const scoped = await context.internalAdapter.createSession(user.id, false, { activeOrganizationId: org.data?.id });
+		const deleted = vi.spyOn(context.internalAdapter, "deleteSessionById");
+		await expect(auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: ownerMember.id }, headers })).rejects.toThrow(ORGANIZATION_ERROR_CODES.YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER.message);
+		expect(deleted).not.toHaveBeenCalledWith(scoped.id);
+		expect(await context.internalAdapter.findSession(scoped.token)).not.toBeNull();
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: ownerMember.id }] })).not.toBeNull();
+	});
+
+	it("runs afterRemoveMember once after the member deletion commits", async () => {
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "after-remove", slug: `after-remove-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `after-remove-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		await auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers });
+		expect(afterRemoveMember).toHaveBeenCalledTimes(1);
+		expect(await (await auth.$context).adapter.findOne({ model: "member", where: [{ field: "id", value: membership?.id as string }] })).toBeNull();
+	});
+
+	it("keeps committed self-removal and its after hook when cookie publication fails", async () => {
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers, user } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "cookie-failure", slug: `cookie-failure-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const secondOwner = await auth.api.signUpEmail({ body: { email: `second-owner-${crypto.randomUUID()}@test.com`, name: "owner", password: "password" } });
+		await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: secondOwner.user.id, role: "owner" } });
+		const context = await auth.$context;
+		const ownerMember = await context.adapter.findOne<{ id: string }>({ model: "member", where: [{ field: "organizationId", value: org.data?.id as string }, { field: "userId", value: user.id }] });
+		if (!ownerMember) throw new Error("Owner membership missing");
+		vi.spyOn(cookies, "setSessionCookie").mockRejectedValueOnce(new Error("cookie publication failed"));
+		await expect(auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: ownerMember.id }, headers })).rejects.toThrow("cookie publication failed");
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: ownerMember.id }] })).toBeNull();
+		expect(afterRemoveMember).toHaveBeenCalledTimes(1);
+	});
+
+	it("publishes the committed successor then returns AFTER_TRANSACTION_HOOK_FAILED for active self-removal", async () => {
+		const afterRemoveMember = vi.fn(async () => {
+			throw new Error("after remove failed");
+		});
+		const { auth, client, cookieSetter, signInWithTestUser } =
+			await getTestInstance(
+				managedOrganizationOptions({ afterRemoveMember }),
+				{ clientOptions: { plugins: [organizationClient()] } },
+			);
+		const { headers, user } = await signInWithTestUser();
+		const org = await client.organization.create({
+			name: "after-hook-failure",
+			slug: `after-hook-failure-${crypto.randomUUID()}`,
+			fetchOptions: { headers, onSuccess: cookieSetter(headers) },
+		});
+		expect(org.error).toBeNull();
+		const source = await auth.api.getSession({ headers });
+		if (!source) throw new Error("Managed source session missing");
+		const secondOwner = await auth.api.signUpEmail({ body: { email: `after-hook-owner-${crypto.randomUUID()}@test.com`, name: "owner", password: "password" } });
+		await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: secondOwner.user.id, role: "owner" } });
+		const context = await auth.$context;
+		const ownerMember = await context.adapter.findOne<{ id: string }>({ model: "member", where: [{ field: "organizationId", value: org.data?.id as string }, { field: "userId", value: user.id }] });
+		if (!ownerMember) throw new Error("Owner membership missing");
+		const response = await auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: ownerMember.id }, headers, asResponse: true });
+		expect(response.status).toBe(500);
+		const publishedCookie = response.headers.get("set-cookie") || "";
+		expect(publishedCookie).toContain("clearance.session_token=");
+		const successorToken = parseSetCookieHeader(publishedCookie)
+			.get("clearance.session_token")
+			?.value;
+		expect(successorToken).toBeTruthy();
+		expect(await response.clone().json()).toMatchObject({ code: "AFTER_TRANSACTION_HOOK_FAILED" });
+		expect(await context.internalAdapter.findSession(source.session.token)).toBeNull();
+		const successor = await auth.api.getSession({
+			headers: new Headers({
+				cookie: `clearance.session_token=${successorToken}`,
+			}),
+		});
+		expect(successor?.session.id).not.toBe(source.session.id);
+		expect(successor?.user.id).toBe(user.id);
+		expect(successor?.session.activeOrganizationId).toBeNull();
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: ownerMember.id }] })).toBeNull();
+		expect(afterRemoveMember).toHaveBeenCalledTimes(1);
+	});
+
+	it("recovers only the exact presenting legacy session after an active self-removal hook failure", async () => {
+		const afterRemoveMember = vi.fn(async () => {
+			throw new Error("after remove failed");
+		});
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers, user } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "legacy-after-hook-failure", slug: `legacy-after-hook-failure-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const source = await auth.api.getSession({ headers });
+		if (!source) throw new Error("Legacy source session missing");
+		const secondOwner = await auth.api.signUpEmail({ body: { email: `legacy-after-hook-owner-${crypto.randomUUID()}@test.com`, name: "owner", password: "password" } });
+		await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: secondOwner.user.id, role: "owner" } });
+		const context = await auth.$context;
+		const ownerMember = await context.adapter.findOne<{ id: string }>({ model: "member", where: [{ field: "organizationId", value: org.data?.id as string }, { field: "userId", value: user.id }] });
+		if (!ownerMember) throw new Error("Owner membership missing");
+		const response = await auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: ownerMember.id }, headers, asResponse: true });
+		expect(response.status).toBe(500);
+		const successorToken = parseSetCookieHeader(response.headers.get("set-cookie") || "")
+			.get("clearance.session_token")
+			?.value;
+		expect(successorToken).toBeTruthy();
+		expect(await response.clone().json()).toMatchObject({ code: "AFTER_TRANSACTION_HOOK_FAILED" });
+		const presentingSession = await auth.api.getSession({
+			headers: new Headers({
+				cookie: `clearance.session_token=${successorToken}`,
+			}),
+		});
+		expect(presentingSession?.session.id).toBe(source.session.id);
+		expect(presentingSession?.user.id).toBe(user.id);
+		expect(presentingSession?.session.activeOrganizationId).toBeNull();
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: ownerMember.id }] })).toBeNull();
+		expect(afterRemoveMember).toHaveBeenCalledTimes(1);
+	});
+
+	it("suppresses afterRemoveMember when a post-delete transaction failure rolls back", async () => {
+		const afterRemoveMember = vi.fn();
+		const { auth, signInWithTestUser, customFetchImpl } = await getTestInstance({
+			plugins: [organization({ organizationHooks: { afterRemoveMember } })],
+		});
+		const { headers } = await signInWithTestUser();
+		const client = createAuthClient({ plugins: [organizationClient()], baseURL: "http://localhost:3000/api/auth", fetchOptions: { customFetchImpl } });
+		const org = await client.organization.create({ name: "rollback-after-delete", slug: `rollback-after-delete-${crypto.randomUUID()}`, fetchOptions: { headers } });
+		const target = await auth.api.signUpEmail({ body: { email: `rollback-after-delete-${crypto.randomUUID()}@test.com`, name: "target", password: "password" } });
+		const membership = await auth.api.addMember({ body: { organizationId: org.data?.id as string, userId: target.user.id, role: "member" } });
+		const context = await auth.$context;
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		vi.spyOn(context.adapter, "transaction").mockImplementation(async (callback) =>
+			transaction(async (trx) => {
+				await callback(trx);
+				throw new Error("forced rollback after member deletion");
+			}),
+		);
+		await expect(auth.api.removeMember({ body: { organizationId: org.data?.id, memberIdOrEmail: membership?.id as string }, headers })).rejects.toThrow("forced rollback after member deletion");
+		expect(await context.adapter.findOne({ model: "member", where: [{ field: "id", value: membership?.id as string }] })).not.toBeNull();
+		expect(afterRemoveMember).not.toHaveBeenCalled();
 	});
 });
 
