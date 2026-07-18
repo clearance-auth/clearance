@@ -1,8 +1,32 @@
 import pg from "pg";
 
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
+const MAX_EFFECTIVE_ACTIONS = 256;
 const MIGRATION_ID = "authorization-authority-v1";
 const DEFAULT_PREFIX = "clearance";
+const BUILT_IN_ROLE_DEFINITIONS = Object.freeze([
+	Object.freeze({
+		roleId: "role_builtin_owner",
+		slug: "owner",
+		name: "Owner",
+		description: "Full organization control including delete and access-control management",
+		actions: Object.freeze(["ac:create", "ac:delete", "ac:read", "ac:update", "invitation:cancel", "invitation:create", "member:create", "member:delete", "member:update", "organization:delete", "organization:update", "team:create", "team:delete", "team:update"]),
+	}),
+	Object.freeze({
+		roleId: "role_builtin_admin",
+		slug: "admin",
+		name: "Admin",
+		description: "Manage members, invitations, teams, and access control (no organization delete)",
+		actions: Object.freeze(["ac:create", "ac:delete", "ac:read", "ac:update", "invitation:cancel", "invitation:create", "member:create", "member:delete", "member:update", "organization:update", "team:create", "team:delete", "team:update"]),
+	}),
+	Object.freeze({
+		roleId: "role_builtin_member",
+		slug: "member",
+		name: "Member",
+		description: "Baseline organization membership with read access to roles",
+		actions: Object.freeze(["ac:read"]),
+	}),
+]);
 
 type QueryResult<Row extends Record<string, unknown>> = Promise<{
 	rows: Row[];
@@ -42,7 +66,7 @@ export type AuthorizationSubject = Readonly<{
 export type AuthorizationAuthorityReadInput = Readonly<{
 	organizationId: string;
 	subject: AuthorizationSubject;
-	transaction?: AuthorizationAuthorityTransaction | Queryable;
+	transaction?: AuthorizationAuthorityTransaction;
 }>;
 
 export type AuthorizationAuthorityReadResult = Readonly<{
@@ -53,6 +77,74 @@ export type AuthorizationAuthorityReadResult = Readonly<{
 	roleIds: readonly string[];
 	actions: readonly string[];
 	revision: string;
+}>;
+
+export type AuthorizationAuthorityRole = Readonly<{
+	roleId: string;
+	organizationId: string | null;
+	slug: string;
+	name: string;
+	description: string | null;
+	builtIn: boolean;
+	status: "active" | "disabled" | "archived";
+	actions: readonly string[];
+}>;
+
+export type AuthorizationAuthorityRoleInput = Omit<AuthorizationAuthorityRole, "actions">;
+
+export type AuthorizationAuthorityRevision = Readonly<{
+	organizationId: string;
+	revision: string;
+	initialized: boolean;
+}>;
+
+export type AuthorizationAuthorityAffectedRevision = Readonly<{
+	organizationId: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationAuthorityUpsertRoleInput = Readonly<{
+	role: AuthorizationAuthorityRoleInput;
+	actions: readonly string[];
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthorityUpsertRoleResult = Readonly<{
+	changed: boolean;
+	affectedOrganizations: readonly AuthorizationAuthorityAffectedRevision[];
+}>;
+
+export type AuthorizationAuthorityReplaceSubjectRolesInput = Readonly<{
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleIds: readonly string[];
+	expectedRevision?: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthorityReplaceSubjectRolesResult = Readonly<{
+	changed: boolean;
+	previousRevision: string;
+	revision: string;
+	roleIds: readonly string[];
+}>;
+
+export type AuthorizationAuthorityListRolesInput = Readonly<{
+	organizationId: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthorityAssignment = Readonly<{
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleId: string;
+}>;
+
+export type AuthorizationAuthorityListSubjectAssignmentsInput = Readonly<{
+	organizationId: string;
+	subject?: AuthorizationSubject;
+	transaction?: AuthorizationAuthorityTransaction;
 }>;
 
 export type AuthorizationAuthorityMigrationPlan = Readonly<{
@@ -175,6 +267,10 @@ function normalize(value: string): string {
 	return value.replaceAll('"', "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function canonicalStringCompare(left: string, right: string): number {
+	return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function columns(): Readonly<Record<keyof Names, readonly ExpectedColumn[]>> {
 	const scope = [
 		{ name: "projectId", dataType: "text", nullable: false },
@@ -274,12 +370,12 @@ function authorizationTriggers(names: Names): readonly ExpectedTrigger[] {
 		{
 			table: "assignments",
 			name: c("assignments_role_scope_trg"),
-			definitionIncludes: ["constraint trigger", "after insert or update", names.assignments, `.${guard}()`],
+			definitionIncludes: ["constraint trigger", "after insert or update", names.assignments, `${guard}()`],
 		},
 		{
 			table: "roles",
 			name: c("roles_scope_change_trg"),
-			definitionIncludes: ["constraint trigger", "after update of", "organizationid", names.roles, `.${guard}()`],
+			definitionIncludes: ["constraint trigger", "after update of", "organizationid", names.roles, `${guard}()`],
 		},
 	];
 }
@@ -493,9 +589,8 @@ async function inspectCatalog(queryable: Queryable, schema: string, names: Names
 	return true;
 }
 
-function transactionQueryable(value: AuthorizationAuthorityTransaction | Queryable): Queryable {
-	if ("rawTransactionQuery" in value) return { query: value.rawTransactionQuery.bind(value) };
-	if (typeof value.query === "function") return value;
+function transactionQueryable(value: AuthorizationAuthorityTransaction): Queryable {
+	if (value && typeof value.rawTransactionQuery === "function") return { query: value.rawTransactionQuery.bind(value) };
 	throw error("Authorization transaction is invalid", undefined, "AUTHORIZATION_INPUT_INVALID");
 }
 
@@ -503,10 +598,100 @@ type ReadRow = { revision: unknown; subject_valid: unknown; role_ids: unknown; a
 
 function decodeSortedStrings(value: unknown, field: string): readonly string[] {
 	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) throw error(`Authorization ${field} is invalid`);
-	const sorted = [...value].sort((left, right) => left.localeCompare(right));
+	const sorted = [...value].sort(canonicalStringCompare);
 	if (sorted.some((value, index) => index > 0 && value === sorted[index - 1])) throw error(`Authorization ${field} is invalid`);
 	return Object.freeze(sorted);
 }
+
+function sortedUnique(values: readonly unknown[], label: string, validate: (value: unknown, label: string) => string): readonly string[] {
+	if (!Array.isArray(values)) throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	const result = values.map((value) => validate(value, label)).sort(canonicalStringCompare);
+	if (result.some((value, index) => index > 0 && value === result[index - 1])) throw error(`${label} contains duplicates`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return Object.freeze(result);
+}
+
+function sortedDistinct(values: readonly unknown[], label: string, validate: (value: unknown, label: string) => string): readonly string[] {
+	return Object.freeze([...new Set(values.map((value) => validate(value, label)))].sort(canonicalStringCompare));
+}
+
+function canonicalActionName(value: unknown, label: string): string {
+	const action = scopeString(value, label);
+	if (!/^[a-z][a-z0-9._:-]{0,127}$/.test(action)) throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return action;
+}
+
+function roleId(value: unknown, label: string): string {
+	return scopeString(value, label);
+}
+
+function roleSlug(value: unknown, label: string): string {
+	const slug = scopeString(value, label);
+	if (!/^[a-z][a-z0-9_-]{0,127}$/.test(slug)) throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return slug;
+}
+
+function roleName(value: unknown, label: string): string {
+	const name = scopeString(value, label);
+	if (name.length > 255) throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return name;
+}
+
+function roleDescription(value: unknown, label: string): string | null {
+	if (value === null) return null;
+	const description = scopeString(value, label);
+	if (description.length > 4_096) throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return description;
+}
+
+function roleStatus(value: unknown, label: string): AuthorizationAuthorityRole["status"] {
+	if (value === "active" || value === "disabled" || value === "archived") return value;
+	throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+}
+
+function authorizationSubject(value: unknown, label: string): AuthorizationSubject {
+	if (!value || typeof value !== "object") throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	const candidate = value as { kind?: unknown; id?: unknown };
+	if (candidate.kind !== "principal" && candidate.kind !== "service_account") throw error(`${label}.kind is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return Object.freeze({ kind: candidate.kind, id: scopeString(candidate.id, `${label}.id`) });
+}
+
+function authorizationRole(value: unknown, actions: readonly string[], label: string): AuthorizationAuthorityRole {
+	if (!value || typeof value !== "object") throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	const candidate = value as Record<string, unknown>;
+	const organizationId = candidate.organizationId === null ? null : scopeString(candidate.organizationId, `${label}.organizationId`);
+	if (typeof candidate.builtIn !== "boolean") throw error(`${label}.builtIn is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return Object.freeze({
+		roleId: roleId(candidate.roleId, `${label}.roleId`),
+		organizationId,
+		slug: roleSlug(candidate.slug, `${label}.slug`),
+		name: roleName(candidate.name, `${label}.name`),
+		description: roleDescription(candidate.description, `${label}.description`),
+		builtIn: candidate.builtIn,
+		status: roleStatus(candidate.status, `${label}.status`),
+		actions,
+	});
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isReservedBuiltInRole(role: AuthorizationAuthorityRole): boolean {
+	return BUILT_IN_ROLE_DEFINITIONS.some((definition) => definition.roleId === role.roleId || definition.slug === role.slug);
+}
+
+type RevisionRow = { revision: unknown };
+type RoleRow = {
+	role_id: unknown;
+	organization_id: unknown;
+	slug: unknown;
+	name: unknown;
+	description: unknown;
+	built_in: unknown;
+	status: unknown;
+};
+type RoleListRow = RoleRow & { actions: unknown };
+type AssignmentRow = { organization_id: unknown; subject_kind: unknown; subject_id: unknown; role_id: unknown };
 
 export class PostgresAuthorizationAuthority {
 	readonly identity: AuthorizationAuthorityIdentity;
@@ -548,6 +733,250 @@ export class PostgresAuthorizationAuthority {
 				} finally { client.release(); }
 			},
 		});
+	}
+
+	#table(name: string): string {
+		return qualified(this.schema, name);
+	}
+
+	async #withMutation<T>(transaction: AuthorizationAuthorityTransaction | undefined, operation: (queryable: Queryable) => Promise<T>): Promise<T> {
+		const lock = async (queryable: Queryable): Promise<void> => {
+			await queryable.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${this.schema}:${this.prefix}:authorization-mutation-v1`]);
+		};
+		if (transaction) {
+			const queryable = transactionQueryable(transaction);
+			await lock(queryable);
+			return operation(queryable);
+		}
+		const client = await this.#database.connect();
+		try {
+			await client.query("BEGIN");
+			await lock(client);
+			const result = await operation(client);
+			await client.query("COMMIT");
+			return result;
+		} catch (cause) {
+			try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
+			throw cause;
+		} finally {
+			client.release();
+		}
+	}
+
+	async #ensureRevision(queryable: Queryable, organizationId: string): Promise<AuthorizationAuthorityRevision> {
+		const table = this.#table(this.#names.revisions);
+		const inserted = await queryable.query<RevisionRow>(`INSERT INTO ${table} ("projectId", "environmentId", "organizationId", revision) VALUES ($1, $2, $3, 1) ON CONFLICT ("projectId", "environmentId", "organizationId") DO NOTHING RETURNING revision::text AS revision`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		if (inserted.rows.length === 1) return Object.freeze({ organizationId, revision: canonicalRevision(inserted.rows[0]!.revision), initialized: true });
+		const existing = await queryable.query<RevisionRow>(`SELECT revision::text AS revision FROM ${table} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		if (existing.rows.length !== 1) throw error("Authorization revision is unavailable");
+		return Object.freeze({ organizationId, revision: canonicalRevision(existing.rows[0]!.revision), initialized: false });
+	}
+
+	async #requireRevision(queryable: Queryable, organizationId: string): Promise<string> {
+		const rows = await queryable.query<RevisionRow>(`SELECT revision::text AS revision FROM ${this.#table(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		if (rows.rows.length !== 1) throw error("Authorization revision was not found", undefined, "AUTHORIZATION_REVISION_NOT_FOUND");
+		return canonicalRevision(rows.rows[0]!.revision);
+	}
+
+	async #advanceAffectedRevisions(queryable: Queryable, organizationIds: readonly string[]): Promise<readonly AuthorizationAuthorityAffectedRevision[]> {
+		const affected: AuthorizationAuthorityAffectedRevision[] = [];
+		for (const organizationId of organizationIds) {
+			const revision = await this.#ensureRevision(queryable, organizationId);
+			if (revision.initialized) {
+				affected.push(Object.freeze({ organizationId, previousRevision: "0", revision: revision.revision }));
+				continue;
+			}
+			if (BigInt(revision.revision) >= POSTGRES_BIGINT_MAX) throw error("Authorization revision overflow", undefined, "AUTHORIZATION_REVISION_OVERFLOW");
+			const updated = await queryable.query<RevisionRow>(`UPDATE ${this.#table(this.#names.revisions)} SET revision = revision + 1, "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 RETURNING revision::text AS revision`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+			if (updated.rows.length !== 1) throw error("Authorization revision is unavailable");
+			affected.push(Object.freeze({ organizationId, previousRevision: revision.revision, revision: canonicalRevision(updated.rows[0]!.revision) }));
+		}
+		return Object.freeze(affected);
+	}
+
+	async #seedBuiltInRoles(queryable: Queryable): Promise<boolean> {
+		const roles = this.#table(this.#names.roles);
+		const actions = this.#table(this.#names.actions);
+		const roleActions = this.#table(this.#names.roleActions);
+		const roleIds = BUILT_IN_ROLE_DEFINITIONS.map((definition) => definition.roleId);
+		const slugs = BUILT_IN_ROLE_DEFINITIONS.map((definition) => definition.slug);
+		const actionNames = Object.freeze([...new Set(BUILT_IN_ROLE_DEFINITIONS.flatMap((definition) => definition.actions))].sort(canonicalStringCompare));
+		const roleRows = await queryable.query<RoleRow>(`SELECT "roleId" AS role_id, "organizationId" AS organization_id, slug, name, description, "builtIn" AS built_in, status FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = ANY($3::text[]) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, roleIds]);
+		const slugRows = await queryable.query<{ role_id: unknown; slug: unknown }>(`SELECT "roleId" AS role_id, slug FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" IS NULL AND slug = ANY($3::text[]) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, slugs]);
+		const actionRows = await queryable.query<{ action_id: unknown; action_name: unknown }>(`SELECT "actionId" AS action_id, "actionName" AS action_name FROM ${actions} WHERE "projectId" = $1 AND "environmentId" = $2 AND "actionName" = ANY($3::text[]) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, actionNames]);
+		for (const row of actionRows.rows) {
+			const actionName = canonicalActionName(row.action_name, "stored built-in action");
+			if (roleId(row.action_id, "stored built-in actionId") !== actionName) throw error("Built-in action catalog drift was detected", undefined, "AUTHORIZATION_BUILT_IN_ROLE_DRIFT");
+		}
+		const rolesById = new Map(roleRows.rows.map((row) => [roleId(row.role_id, "stored built-in roleId"), row]));
+		for (const row of slugRows.rows) {
+			const slug = roleSlug(row.slug, "stored built-in role slug");
+			const definition = BUILT_IN_ROLE_DEFINITIONS.find((candidate) => candidate.slug === slug);
+			if (!definition || roleId(row.role_id, "stored built-in roleId") !== definition.roleId) throw error("Built-in role collision was detected", undefined, "AUTHORIZATION_BUILT_IN_ROLE_DRIFT");
+		}
+		const missing: typeof BUILT_IN_ROLE_DEFINITIONS[number][] = [];
+		for (const definition of BUILT_IN_ROLE_DEFINITIONS) {
+			const row = rolesById.get(definition.roleId);
+			if (!row) {
+				missing.push(definition);
+				continue;
+			}
+			const storedActions = await queryable.query<{ actions: unknown }>(`SELECT COALESCE(array_agg(a."actionName" ORDER BY a."actionName"), ARRAY[]::text[]) AS actions FROM ${roleActions} ra JOIN ${actions} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE ra."projectId" = $1 AND ra."environmentId" = $2 AND ra."roleId" = $3`, [this.identity.projectId, this.identity.environmentId, definition.roleId]);
+			const stored = authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, decodeSortedStrings(storedActions.rows[0]?.actions, "stored built-in actions").map((action) => canonicalActionName(action, "stored built-in action")), "stored built-in role");
+			const expected = authorizationRole({ ...definition, organizationId: null, builtIn: true, status: "active" }, definition.actions, "canonical built-in role");
+			if (stored.roleId !== expected.roleId || stored.organizationId !== expected.organizationId || stored.slug !== expected.slug || stored.name !== expected.name || stored.description !== expected.description || stored.builtIn !== expected.builtIn || stored.status !== expected.status || !sameStrings(stored.actions, expected.actions)) {
+				throw error("Built-in role drift was detected", undefined, "AUTHORIZATION_BUILT_IN_ROLE_DRIFT");
+			}
+		}
+		if (missing.length === 0) return false;
+		await queryable.query(`INSERT INTO ${actions} ("projectId", "environmentId", "actionId", "actionName") SELECT $1, $2, action_name, action_name FROM unnest($3::text[]) AS requested(action_name) ON CONFLICT ("projectId", "environmentId", "actionName") DO NOTHING`, [this.identity.projectId, this.identity.environmentId, actionNames]);
+		for (const definition of missing) {
+			await queryable.query(`INSERT INTO ${roles} ("projectId", "environmentId", "roleId", "organizationId", slug, name, description, "builtIn", status) VALUES ($1, $2, $3, NULL, $4, $5, $6, true, 'active')`, [this.identity.projectId, this.identity.environmentId, definition.roleId, definition.slug, definition.name, definition.description]);
+			await queryable.query(`INSERT INTO ${roleActions} ("projectId", "environmentId", "roleId", "actionId") SELECT $1, $2, $3, a."actionId" FROM ${actions} a WHERE a."projectId" = $1 AND a."environmentId" = $2 AND a."actionName" = ANY($4::text[])`, [this.identity.projectId, this.identity.environmentId, definition.roleId, definition.actions]);
+		}
+		return true;
+	}
+
+	async initializeOrganization(input: Readonly<{ organizationId: string; transaction?: AuthorizationAuthorityTransaction }>): Promise<AuthorizationAuthorityRevision> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#seedBuiltInRoles(queryable);
+			return this.#ensureRevision(queryable, organizationId);
+		});
+	}
+
+	async #assertAssignedSubjectActionLimit(queryable: Queryable, role: AuthorizationAuthorityRole, assignments: readonly AssignmentRow[]): Promise<void> {
+		if (role.status !== "active" || assignments.length === 0) return;
+		const roles = this.#table(this.#names.roles);
+		const roleActions = this.#table(this.#names.roleActions);
+		const actions = this.#table(this.#names.actions);
+		const assignmentsTable = this.#table(this.#names.assignments);
+		for (const assignment of assignments) {
+			const organizationId = scopeString(assignment.organization_id, "stored assignment organizationId");
+			const subject = authorizationSubject({ kind: assignment.subject_kind, id: assignment.subject_id }, "stored assignment subject");
+			const otherActions = await queryable.query<{ action_name: unknown }>(`SELECT DISTINCT ac."actionName" AS action_name FROM ${assignmentsTable} a JOIN ${roles} r ON r."projectId" = a."projectId" AND r."environmentId" = a."environmentId" AND r."roleId" = a."roleId" JOIN ${roleActions} ra ON ra."projectId" = r."projectId" AND ra."environmentId" = r."environmentId" AND ra."roleId" = r."roleId" JOIN ${actions} ac ON ac."projectId" = ra."projectId" AND ac."environmentId" = ra."environmentId" AND ac."actionId" = ra."actionId" WHERE a."projectId" = $1 AND a."environmentId" = $2 AND a."organizationId" = $3 AND a."subjectKind" = $4 AND a."subjectId" = $5 AND a."roleId" <> $6 AND r.status = 'active' AND (r."organizationId" IS NULL OR r."organizationId" = a."organizationId")`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.kind, subject.id, role.roleId]);
+			const effectiveActions = new Set(role.actions);
+			for (const row of otherActions.rows) effectiveActions.add(canonicalActionName(row.action_name, "stored action"));
+			if (effectiveActions.size > MAX_EFFECTIVE_ACTIONS) throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+		}
+	}
+
+	async upsertRole(input: AuthorizationAuthorityUpsertRoleInput): Promise<AuthorizationAuthorityUpsertRoleResult> {
+		const actions = sortedUnique(input.actions, "actions", canonicalActionName);
+		const role = authorizationRole(input.role, actions, "role");
+		if (role.builtIn || isReservedBuiltInRole(role)) throw error("Built-in roles are initialized by the authorization authority", undefined, "AUTHORIZATION_ROLE_IMMUTABLE");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			if (actions.length > MAX_EFFECTIVE_ACTIONS) throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+			const roles = this.#table(this.#names.roles);
+			const roleActions = this.#table(this.#names.roleActions);
+			const actionsTable = this.#table(this.#names.actions);
+			const assignments = this.#table(this.#names.assignments);
+			const currentRows = await queryable.query<RoleRow>(`SELECT "roleId" AS role_id, "organizationId" AS organization_id, slug, name, description, "builtIn" AS built_in, status FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, role.roleId]);
+			if (currentRows.rows.length > 1) throw error("Authorization role is unavailable");
+			const currentActions = currentRows.rows.length === 0
+				? Object.freeze([]) as readonly string[]
+				: decodeSortedStrings((await queryable.query<{ actions: unknown }>(`SELECT COALESCE(array_agg(a."actionName" ORDER BY a."actionName"), ARRAY[]::text[]) AS actions FROM ${roleActions} ra JOIN ${actionsTable} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE ra."projectId" = $1 AND ra."environmentId" = $2 AND ra."roleId" = $3`, [this.identity.projectId, this.identity.environmentId, role.roleId])).rows[0]?.actions, "role actions").map((action) => canonicalActionName(action, "role action"));
+			const current = currentRows.rows.length === 0 ? undefined : authorizationRole({
+				roleId: currentRows.rows[0]!.role_id,
+				organizationId: currentRows.rows[0]!.organization_id,
+				slug: currentRows.rows[0]!.slug,
+				name: currentRows.rows[0]!.name,
+				description: currentRows.rows[0]!.description,
+				builtIn: currentRows.rows[0]!.built_in,
+				status: currentRows.rows[0]!.status,
+			}, currentActions, "stored role");
+			const unchanged = current !== undefined && current.roleId === role.roleId && current.organizationId === role.organizationId && current.slug === role.slug && current.name === role.name && current.description === role.description && current.builtIn === role.builtIn && current.status === role.status && sameStrings(current.actions, role.actions);
+			if (current && (current.builtIn !== role.builtIn || current.builtIn) && !unchanged) {
+				throw error("Built-in roles are immutable", undefined, "AUTHORIZATION_ROLE_IMMUTABLE");
+			}
+			if (unchanged) return Object.freeze({ changed: false, affectedOrganizations: Object.freeze([]) });
+			const collision = await queryable.query<{ role_id: unknown }>(`SELECT "roleId" AS role_id FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" IS NOT DISTINCT FROM $3 AND slug = $4 AND "roleId" <> $5 LIMIT 1`, [this.identity.projectId, this.identity.environmentId, role.organizationId, role.slug, role.roleId]);
+			if (collision.rows.length !== 0) throw error("Authorization role slug already exists", undefined, "AUTHORIZATION_ROLE_COLLISION");
+			const assignmentRows = await queryable.query<AssignmentRow>(`SELECT DISTINCT "organizationId" AS organization_id, "subjectKind" AS subject_kind, "subjectId" AS subject_id FROM ${assignments} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = $3 ORDER BY "organizationId", "subjectKind", "subjectId"`, [this.identity.projectId, this.identity.environmentId, role.roleId]);
+			await this.#assertAssignedSubjectActionLimit(queryable, role, assignmentRows.rows);
+			const affectedOrganizations = sortedDistinct([
+				...assignmentRows.rows.map((row) => row.organization_id),
+				...(current?.organizationId === null || current === undefined ? [] : [current.organizationId]),
+				...(role.organizationId === null ? [] : [role.organizationId]),
+			], "affected organizationId", scopeString);
+			if (current) {
+				await queryable.query(`UPDATE ${roles} SET "organizationId" = $4, slug = $5, name = $6, description = $7, "builtIn" = $8, status = $9, "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = $3`, [this.identity.projectId, this.identity.environmentId, role.roleId, role.organizationId, role.slug, role.name, role.description, role.builtIn, role.status]);
+			} else {
+				await queryable.query(`INSERT INTO ${roles} ("projectId", "environmentId", "roleId", "organizationId", slug, name, description, "builtIn", status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [this.identity.projectId, this.identity.environmentId, role.roleId, role.organizationId, role.slug, role.name, role.description, role.builtIn, role.status]);
+			}
+			if (role.actions.length > 0) {
+				await queryable.query(`INSERT INTO ${actionsTable} ("projectId", "environmentId", "actionId", "actionName") SELECT $1, $2, action_name, action_name FROM unnest($3::text[]) AS requested(action_name) ON CONFLICT ("projectId", "environmentId", "actionName") DO NOTHING`, [this.identity.projectId, this.identity.environmentId, role.actions]);
+			}
+			await queryable.query(`DELETE FROM ${roleActions} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = $3`, [this.identity.projectId, this.identity.environmentId, role.roleId]);
+			if (role.actions.length > 0) {
+				await queryable.query(`INSERT INTO ${roleActions} ("projectId", "environmentId", "roleId", "actionId") SELECT $1, $2, $3, a."actionId" FROM ${actionsTable} a WHERE a."projectId" = $1 AND a."environmentId" = $2 AND a."actionName" = ANY($4::text[])`, [this.identity.projectId, this.identity.environmentId, role.roleId, role.actions]);
+			}
+			return Object.freeze({ changed: true, affectedOrganizations: await this.#advanceAffectedRevisions(queryable, affectedOrganizations) });
+		});
+	}
+
+	async replaceSubjectRoles(input: AuthorizationAuthorityReplaceSubjectRolesInput): Promise<AuthorizationAuthorityReplaceSubjectRolesResult> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const subject = authorizationSubject(input.subject, "subject");
+		const roleIds = sortedUnique(input.roleIds, "roleIds", roleId);
+		const expectedRevision = input.expectedRevision === undefined ? undefined : canonicalRevision(input.expectedRevision);
+		return this.#withMutation(input.transaction, async (queryable) => {
+			const revision = await this.#requireRevision(queryable, organizationId);
+			if (expectedRevision !== undefined && expectedRevision !== revision) throw error("Authorization revision is stale", undefined, "AUTHORIZATION_REVISION_STALE");
+			const roles = this.#table(this.#names.roles);
+			const assignments = this.#table(this.#names.assignments);
+			if (subject.kind === "service_account") {
+				const account = await queryable.query<{ service_account_id: unknown }>(`SELECT "serviceAccountId" AS service_account_id FROM ${this.#table(this.#names.serviceAccounts)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 AND status = 'active'`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.id]);
+				if (account.rows.length !== 1) throw error("Authorization subject was not found", undefined, "AUTHORIZATION_SUBJECT_NOT_FOUND");
+			}
+			if (roleIds.length > 0) {
+				const requestedRoles = await queryable.query<RoleRow>(`SELECT "roleId" AS role_id, "organizationId" AS organization_id, slug, name, description, "builtIn" AS built_in, status FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = ANY($3::text[]) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, roleIds]);
+				if (requestedRoles.rows.length !== roleIds.length) throw error("Authorization role was not found", undefined, "AUTHORIZATION_ROLE_NOT_FOUND");
+				for (const row of requestedRoles.rows) {
+					const role = authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, Object.freeze([]), "stored role");
+					if (role.status !== "active") throw error("Authorization role is inactive", undefined, "AUTHORIZATION_ROLE_INACTIVE");
+					if (role.organizationId !== null && role.organizationId !== organizationId) throw error("Authorization role scope mismatch", undefined, "AUTHORIZATION_ROLE_SCOPE_MISMATCH");
+				}
+				const requestedActions = await queryable.query<{ action_name: unknown }>(`SELECT DISTINCT a."actionName" AS action_name FROM ${this.#table(this.#names.roleActions)} ra JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE ra."projectId" = $1 AND ra."environmentId" = $2 AND ra."roleId" = ANY($3::text[])`, [this.identity.projectId, this.identity.environmentId, roleIds]);
+				const effectiveActions = new Set(requestedActions.rows.map((row) => canonicalActionName(row.action_name, "stored requested action")));
+				if (effectiveActions.size > MAX_EFFECTIVE_ACTIONS) throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+			}
+			const currentRows = await queryable.query<{ role_id: unknown }>(`SELECT "roleId" AS role_id FROM ${assignments} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "subjectKind" = $4 AND "subjectId" = $5 ORDER BY "roleId" FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.kind, subject.id]);
+			const currentRoleIds = Object.freeze(currentRows.rows.map((row) => roleId(row.role_id, "stored assignment roleId")).sort(canonicalStringCompare));
+			if (subject.kind === "principal") {
+				const owners = await queryable.query<{ subject_id: unknown; role_id: unknown }>(`SELECT a."subjectId" AS subject_id, a."roleId" AS role_id FROM ${assignments} a JOIN ${roles} r ON r."projectId" = a."projectId" AND r."environmentId" = a."environmentId" AND r."roleId" = a."roleId" WHERE a."projectId" = $1 AND a."environmentId" = $2 AND a."organizationId" = $3 AND a."subjectKind" = 'principal' AND r."builtIn" = true AND r.slug = 'owner' AND r.status = 'active' AND (r."organizationId" IS NULL OR r."organizationId" = a."organizationId") FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+				if (owners.rows.length > 0) {
+					const currentOwnerCountOutsideSubject = owners.rows.filter((row) => scopeString(row.subject_id, "stored owner subjectId") !== subject.id).length;
+					const ownerRoleIds = new Set(owners.rows.map((row) => roleId(row.role_id, "stored owner roleId")));
+					const replacementOwnerCount = roleIds.filter((roleId) => ownerRoleIds.has(roleId)).length;
+					if (currentOwnerCountOutsideSubject + replacementOwnerCount === 0) throw error("The final active owner assignment is protected", undefined, "AUTHORIZATION_LAST_OWNER_PROTECTED");
+				}
+			}
+			if (sameStrings(currentRoleIds, roleIds)) return Object.freeze({ changed: false, previousRevision: revision, revision, roleIds });
+			await queryable.query(`DELETE FROM ${assignments} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "subjectKind" = $4 AND "subjectId" = $5`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.kind, subject.id]);
+			if (roleIds.length > 0) {
+				await queryable.query(`INSERT INTO ${assignments} ("projectId", "environmentId", "organizationId", "subjectKind", "subjectId", "roleId") SELECT $1, $2, $3, $4, $5, role_id FROM unnest($6::text[]) AS requested(role_id)`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.kind, subject.id, roleIds]);
+			}
+			const affected = await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId]));
+			const advanced = affected[0]!;
+			return Object.freeze({ changed: true, previousRevision: advanced.previousRevision, revision: advanced.revision, roleIds });
+		});
+	}
+
+	async listRoles(input: AuthorizationAuthorityListRolesInput): Promise<readonly AuthorizationAuthorityRole[]> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		const roles = this.#table(this.#names.roles);
+		const rows = await queryable.query<RoleListRow>(`SELECT r."roleId" AS role_id, r."organizationId" AS organization_id, r.slug, r.name, r.description, r."builtIn" AS built_in, r.status, COALESCE(array_agg(a."actionName" ORDER BY a."actionName") FILTER (WHERE a."actionName" IS NOT NULL), ARRAY[]::text[]) AS actions FROM ${roles} r LEFT JOIN ${this.#table(this.#names.roleActions)} ra ON ra."projectId" = r."projectId" AND ra."environmentId" = r."environmentId" AND ra."roleId" = r."roleId" LEFT JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE r."projectId" = $1 AND r."environmentId" = $2 AND (r."organizationId" IS NULL OR r."organizationId" = $3) GROUP BY r."projectId", r."environmentId", r."roleId", r."organizationId", r.slug, r.name, r.description, r."builtIn", r.status ORDER BY r.slug, r."roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		return Object.freeze(rows.rows.map((row) => authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, decodeSortedStrings(row.actions, "role actions").map((action) => canonicalActionName(action, "stored action")), "stored role")));
+	}
+
+	async listSubjectAssignments(input: AuthorizationAuthorityListSubjectAssignmentsInput): Promise<readonly AuthorizationAuthorityAssignment[]> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const subject = input.subject === undefined ? undefined : authorizationSubject(input.subject, "subject");
+		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		const rows = await queryable.query<AssignmentRow>(`SELECT "organizationId" AS organization_id, "subjectKind" AS subject_kind, "subjectId" AS subject_id, "roleId" AS role_id FROM ${this.#table(this.#names.assignments)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND ($4::text IS NULL OR ("subjectKind" = $4 AND "subjectId" = $5)) ORDER BY "subjectKind", "subjectId", "roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId, subject?.kind ?? null, subject?.id ?? null]);
+		return Object.freeze(rows.rows.map((row) => Object.freeze({ organizationId: scopeString(row.organization_id, "stored assignment organizationId"), subject: authorizationSubject({ kind: row.subject_kind, id: row.subject_id }, "stored assignment subject"), roleId: roleId(row.role_id, "stored assignment roleId") })));
 	}
 
 	async readEffective(input: AuthorizationAuthorityReadInput): Promise<AuthorizationAuthorityReadResult> {
