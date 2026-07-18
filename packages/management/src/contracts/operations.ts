@@ -98,6 +98,12 @@ import type {
 	AuthenticationUnlockInput,
 } from "../services/authentication-policy.js";
 import type {
+	KeyManagementApplyControlResult,
+	KeyManagementApplyInput,
+	KeyManagementPlanResult,
+	KeyManagementStatusResult,
+} from "../services/key-management.js";
+import type {
 	DeliveryJobState,
 	DeliveryQuotaStatus,
 	DeliveryReadinessSummary,
@@ -542,6 +548,18 @@ export interface ManagementOperationTypes {
 	"schema.credential-authority.drain": {
 		input: { deploymentId: string; drainId: string; confirm?: boolean };
 		output: Awaited<ReturnType<typeof drainCredentialAuthority>>;
+	};
+	"key_management.status": {
+		input: Record<string, never>;
+		output: KeyManagementStatusResult;
+	};
+	"key_management.plan": {
+		input: Record<string, never>;
+		output: KeyManagementPlanResult;
+	};
+	"key_management.apply": {
+		input: KeyManagementApplyInput & { dryRun?: boolean; confirm?: boolean };
+		output: KeyManagementApplyControlResult;
 	};
 	"schema.store-v2.status": {
 		input: Record<string, never>;
@@ -1500,6 +1518,33 @@ export const STORE_V2_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const KEY_MANAGEMENT_OPERATIONS = Object.freeze({
+	status: defineOperation({
+		id: "key_management.status",
+		cliPath: "key-management status",
+		http: { method: "GET", path: "/v1/key-management/status" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "key_management.plan",
+		cliPath: "key-management plan",
+		http: { method: "POST", path: "/v1/key-management/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "key_management.apply",
+		cliPath: "key-management apply",
+		http: { method: "POST", path: "/v1/key-management/apply" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const USER_OPERATIONS = Object.freeze({
 	list: defineOperation({
 		id: "users.list",
@@ -1666,6 +1711,7 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(UPGRADE_OPERATIONS),
 	...Object.values(SCHEMA_OPERATIONS),
 	...Object.values(STORE_V2_OPERATIONS),
+	...Object.values(KEY_MANAGEMENT_OPERATIONS),
 	...Object.values(USER_OPERATIONS),
 	...Object.values(ORGANIZATION_OPERATIONS),
 	...Object.values(MEMBER_OPERATIONS),
