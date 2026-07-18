@@ -12,6 +12,21 @@
 - **Completion rule:** Every row below must be `Proven ahead`, with direct source, CLI, live-product, operational, or release evidence recorded in this file. A feature without an API and CLI workflow is incomplete. Completion includes a review-ready pull request followed by the signed `0.3.0` release and public-registry verification.
 - **Ledger rule:** Update status, evidence, decisions, dependencies, and next actions after each completed implementation unit. Current code and observed behavior remain the source of truth.
 
+### Engineering-first execution policy
+
+This policy governs every remaining implementation round so progress concentrates on product and engineering outcomes instead of process volume.
+
+- Start each round by identifying the highest-leverage dependency that makes a plan requirement materially more true. Prefer central authority, storage, protocol, API, or workflow primitives that close several call sites over route-specific patches.
+- Before assigning work, identify one or more optimization paths that reduce duplicated implementation, repeated context loading, redundant verification, serial dependencies, or review churn. Adopt the safest useful optimization immediately and record material changes in the execution log.
+- Keep one cohesive implementation lane per dependent unit. Run truly disjoint units concurrently after their shared contract is stable; never create parallel lanes that edit the same files or invent competing architecture.
+- Give delegated workers bounded engineering contracts, exact invariants, file ownership, and targeted verification. The manager owns architecture, integration, source inspection, commits, and final acceptance.
+- Add tests only for an explicit acceptance invariant, a reproduced failure, or a regression that existing proof cannot detect. Prefer one strong deterministic case over several overlapping mock, adapter, and endpoint variants.
+- During implementation, run only the narrow suite and typecheck needed to shorten the feedback loop. At unit completion, run one integrated affected-surface gate, one typecheck, and diff hygiene. Do not rerun unchanged proof or broad builds without an invalidating source, schema, release-path, runtime, or dependency change.
+- Use one adversarial review for the cohesive integrated unit. Batch its actionable findings into one repair pass, then rereview only the changed authority boundary. Avoid reviewer fan-out that covers the same invariant repeatedly.
+- Update this ledger once per meaningful completed unit with source evidence, the minimal sufficient verification, dependencies cleared, remaining risk, and the next highest-leverage action. Test counts and review volume are evidence, never progress units by themselves.
+- At the end of each round, perform a brief optimization check: what consumed time without changing the product, what can be centralized or deleted, what work can safely run in parallel next, and which proof can be reused because its authority was not invalidated.
+- Reserve package builds, broad CI matrices, release rehearsals, deployment proof, and publication checks for the gates that actually require them, especially the frozen `0.3.0` candidate.
+
 ### Status legend
 
 - `In progress`: active implementation work.
