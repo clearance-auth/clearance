@@ -3,10 +3,46 @@ import pg from "pg";
 
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 const MAX_EFFECTIVE_ACTIONS = 256;
-const MIGRATION_ID = "authorization-authority-v1";
+const MIGRATION_ID = "authorization-authority-v2";
 const DEFAULT_PREFIX = "clearance";
 const SERVICE_ACCOUNT_CREDENTIAL_PREFIX = "clr_sac_v1";
 const SERVICE_ACCOUNT_CREDENTIAL_SECRET_BYTES = 32;
+const ROLLBACK_FENCE_FUNCTION_SOURCE = `
+	DECLARE
+		argument_index integer := 0;
+		fence_kind text;
+		reference_column text;
+		condition_column text;
+		condition_value text;
+		reference_id text;
+		row_data jsonb := to_jsonb(NEW);
+	BEGIN
+		WHILE argument_index < TG_NARGS LOOP
+			fence_kind := TG_ARGV[argument_index];
+			reference_column := TG_ARGV[argument_index + 1];
+			condition_column := TG_ARGV[argument_index + 2];
+			condition_value := TG_ARGV[argument_index + 3];
+			reference_id := row_data ->> reference_column;
+			IF reference_id IS NOT NULL AND (
+				condition_column = '' OR row_data ->> condition_column = condition_value
+			) THEN
+				PERFORM pg_advisory_xact_lock(hashtextextended(
+					'clearance-import-rollback:v1:' || fence_kind || ':' || reference_id,
+					0
+				));
+				IF EXISTS (
+					SELECT 1 FROM "public"."clearance_import_rollback_tombstones"
+					WHERE kind = fence_kind AND resource_id = reference_id
+				) THEN
+					RAISE EXCEPTION 'Clearance rollback-fenced resource cannot be referenced'
+						USING ERRCODE = '23503';
+				END IF;
+			END IF;
+			argument_index := argument_index + 4;
+		END LOOP;
+		RETURN NEW;
+	END
+`;
 const SERVICE_ACCOUNT_CREDENTIAL_DIGEST_DOMAIN = "clearance:service-account-credential:v1:";
 const BUILT_IN_ROLE_DEFINITIONS = Object.freeze([
 	Object.freeze({
@@ -62,6 +98,26 @@ export type PostgresAuthorizationAuthorityOptions = AuthorizationAuthorityIdenti
 		prefix?: string;
 	}>;
 
+/**
+ * Server-owned identity for the runtime organization authority. This is kept
+ * out of product configuration: callers either inject the exact table they
+ * own or reconciliation is unavailable.
+ */
+export type AuthorizationRuntimeOrganizationAuthority = Readonly<{
+	schema: string;
+	table: string;
+	/**
+	 * Optional exact normalized-management organization authority. When present,
+	 * an active row protects its authorization state even if the runtime product
+	 * organization row does not exist. This identity is server-owned and never
+	 * comes from product configuration.
+	 */
+	management?: Readonly<{
+		schema: string;
+		table: string;
+	}>;
+}>;
+
 export type AuthorizationSubject = Readonly<{
 	kind: "principal" | "service_account";
 	id: string;
@@ -106,6 +162,31 @@ export type AuthorizationAuthorityAffectedRevision = Readonly<{
 	organizationId: string;
 	previousRevision: string;
 	revision: string;
+}>;
+
+/** Redacted result of terminalizing an organization's authorization authority. */
+export type AuthorizationAuthorityArchiveOrganizationResult = Readonly<{
+	organizationId: string;
+	previousRevision: string;
+	revision: string;
+	archived: boolean;
+	removedAssignments: number;
+	disabledServiceAccounts: number;
+	revokedCredentials: number;
+}>;
+
+export type AuthorizationAuthorityArchiveOrganizationInput = Readonly<{
+	organizationId: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthorityReconciliationResult = Readonly<{
+	terminalizedOrganizations: number;
+	/** Bounded redacted identifiers for durable migration/audit evidence. */
+	terminalizedOrganizationIds: readonly string[];
+	removedAssignments: number;
+	disabledServiceAccounts: number;
+	revokedCredentials: number;
 }>;
 
 export type AuthorizationAuthorityUpsertRoleInput = Readonly<{
@@ -299,7 +380,29 @@ type ConstraintRow = {
 	definition: string;
 };
 type IndexRow = { table_name: string; index_name: string; definition: string };
-type TriggerRow = { table_name: string; trigger_name: string; definition: string };
+type TriggerRow = {
+	table_name: string;
+	trigger_name: string;
+	definition: string;
+	enabled: boolean;
+	function_schema: string;
+	function_name: string;
+	function_identity: string;
+	function_source: string;
+	function_language: string;
+	function_return_type: string;
+	function_argument_count: number;
+	function_security_definer: boolean;
+};
+type RollbackFenceTableRow = {
+	relkind: string;
+	persistence: string;
+	column_count: number;
+	has_kind: boolean;
+	has_resource_id: boolean;
+	has_tombstoned_at: boolean;
+	has_primary_key: boolean;
+};
 type FunctionRow = { function_name: string; definition: string };
 
 function error(message: string, cause?: unknown, code?: string): PostgresAuthorizationAuthorityError {
@@ -382,7 +485,7 @@ function columns(): Readonly<Record<keyof Names, readonly ExpectedColumn[]>> {
 		assignments: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "subjectKind", dataType: "text", nullable: false }, { name: "subjectId", dataType: "text", nullable: false }, { name: "roleId", dataType: "text", nullable: false }, created],
 		serviceAccounts: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "serviceAccountId", dataType: "text", nullable: false }, { name: "name", dataType: "text", nullable: false }, { name: "status", dataType: "text", nullable: false }, created, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
 		credentials: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "credentialId", dataType: "text", nullable: false }, { name: "serviceAccountId", dataType: "text", nullable: false }, { name: "credentialDigest", dataType: "text", nullable: false }, { name: "credentialPrefix", dataType: "text", nullable: false }, { name: "credentialFingerprint", dataType: "text", nullable: false }, { name: "status", dataType: "text", nullable: false }, { name: "expiresAt", dataType: "timestamp with time zone", nullable: true }, { name: "replacedCredentialId", dataType: "text", nullable: true }, { name: "version", dataType: "integer", nullable: false }, created, { name: "revokedAt", dataType: "timestamp with time zone", nullable: true }, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
-		revisions: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "revision", dataType: "bigint", nullable: false }, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
+		revisions: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "revision", dataType: "bigint", nullable: false }, { name: "terminal", dataType: "boolean", nullable: false, default: "false" }, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
 	};
 }
 
@@ -436,7 +539,10 @@ function indexes(names: Names): Readonly<Record<keyof Names, readonly ExpectedIn
 		actions: [],
 		roles: [{ name: c("roles_scope_org_slug_uq"), definitionIncludes: ["unique index", "projectid", "environmentid", "coalesce", "organizationid", "slug"] }],
 		roleActions: [],
-		assignments: [{ name: c("assignments_subject_idx"), definitionIncludes: ["projectid", "environmentid", "organizationid", "subjectkind", "subjectid"] }],
+		assignments: [
+			{ name: c("assignments_subject_idx"), definitionIncludes: ["projectid", "environmentid", "organizationid", "subjectkind", "subjectid"] },
+			{ name: c("assignments_principal_subject_idx"), definitionIncludes: ["projectid", "environmentid", "subjectkind", "subjectid"] },
+		],
 		serviceAccounts: [{ name: c("service_accounts_scope_name_uq"), definitionIncludes: ["unique index", "projectid", "environmentid", "organizationid", "name"] }],
 		credentials: [
 			{ name: c("credentials_account_idx"), definitionIncludes: ["projectid", "environmentid", "organizationid", "serviceaccountid"] },
@@ -548,12 +654,13 @@ function createSql(schema: string, names: Names): string {
 		)`,
 		`CREATE TABLE IF NOT EXISTS ${t(names.revisions)} (
 			"projectId" text NOT NULL, "environmentId" text NOT NULL, "organizationId" text NOT NULL,
-			revision bigint NOT NULL, "updatedAt" timestamptz NOT NULL DEFAULT now(),
+			revision bigint NOT NULL, terminal boolean NOT NULL DEFAULT false, "updatedAt" timestamptz NOT NULL DEFAULT now(),
 			CONSTRAINT ${c("revisions_pk")} PRIMARY KEY ("projectId", "environmentId", "organizationId"),
 			CONSTRAINT ${c("revisions_positive_ck")} CHECK (revision > 0)
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${c("roles_scope_org_slug_uq")} ON ${t(names.roles)} ("projectId", "environmentId", COALESCE("organizationId", ''), slug)`,
 		`CREATE INDEX IF NOT EXISTS ${c("assignments_subject_idx")} ON ${t(names.assignments)} ("projectId", "environmentId", "organizationId", "subjectKind", "subjectId")`,
+		`CREATE INDEX IF NOT EXISTS ${c("assignments_principal_subject_idx")} ON ${t(names.assignments)} ("projectId", "environmentId", "subjectKind", "subjectId")`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${c("service_accounts_scope_name_uq")} ON ${t(names.serviceAccounts)} ("projectId", "environmentId", "organizationId", name)`,
 		`CREATE INDEX IF NOT EXISTS ${c("credentials_account_idx")} ON ${t(names.credentials)} ("projectId", "environmentId", "organizationId", "serviceAccountId")`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${c("credentials_account_version_uq")} ON ${t(names.credentials)} ("projectId", "environmentId", "organizationId", "serviceAccountId", version)`,
@@ -594,6 +701,14 @@ function createSql(schema: string, names: Names): string {
 		DEFERRABLE INITIALLY IMMEDIATE
 		FOR EACH ROW EXECUTE FUNCTION ${f(authorizationGuardFunctionName(names))}()`,
 	].join(";\n");
+}
+
+function terminalizationMigrationSql(schema: string, names: Names): string {
+	return `ALTER TABLE ${qualified(schema, names.revisions)} ADD COLUMN IF NOT EXISTS terminal boolean NOT NULL DEFAULT false`;
+}
+
+function principalSubjectIndexMigrationSql(schema: string, names: Names): string {
+	return `CREATE INDEX IF NOT EXISTS ${quoted(shortName(names, "assignments_principal_subject_idx"))} ON ${qualified(schema, names.assignments)} ("projectId", "environmentId", "subjectKind", "subjectId")`;
 }
 
 function canonicalRevision(value: unknown): string {
@@ -646,9 +761,34 @@ function assertIndexes(table: string, actual: readonly IndexRow[], expected: rea
 }
 
 function assertTriggers(actual: readonly TriggerRow[], names: Names, expected: readonly ExpectedTrigger[]): void {
-	if (actual.length !== expected.length) throw error("Authorization triggers are incompatible");
+	const rollbackFences = actual.filter((row) => row.trigger_name === "clearance_import_rollback_guard_v1");
+	if (rollbackFences.length > 1) throw error("Authorization rollback fence trigger is incompatible");
+	if (rollbackFences.length === 1) {
+		const [rollbackFence] = rollbackFences;
+		const definition = normalize(rollbackFence.definition);
+		const expectedArguments = "('organization', 'organizationId', '', '', 'principal', 'subjectId', 'subjectKind', 'principal')";
+		if (
+			rollbackFence.table_name !== names.assignments ||
+			!rollbackFence.enabled ||
+			rollbackFence.function_schema !== "public" ||
+			rollbackFence.function_name !== "clearance_import_rollback_guard_v1" ||
+			rollbackFence.function_identity !== "public.clearance_import_rollback_guard_v1()" ||
+			rollbackFence.function_language !== "plpgsql" ||
+			rollbackFence.function_return_type !== "trigger" ||
+			rollbackFence.function_argument_count !== 0 ||
+			rollbackFence.function_security_definer !== false ||
+			!definition.includes(normalize("before insert or update")) ||
+			!definition.includes(normalize("for each row")) ||
+			!definition.includes(normalize(expectedArguments)) ||
+			normalize(rollbackFence.function_source) !== normalize(ROLLBACK_FENCE_FUNCTION_SOURCE)
+		) {
+			throw error("Authorization rollback fence trigger is incompatible");
+		}
+	}
+	const authorityTriggers = actual.filter((row) => row.trigger_name !== "clearance_import_rollback_guard_v1");
+	if (authorityTriggers.length !== expected.length) throw error("Authorization triggers are incompatible");
 	for (const trigger of expected) {
-		const found = actual.find((row) => row.table_name === names[trigger.table] && row.trigger_name === trigger.name);
+		const found = authorityTriggers.find((row) => row.table_name === names[trigger.table] && row.trigger_name === trigger.name);
 		if (!found || trigger.definitionIncludes.some((part) => !normalize(found.definition).includes(normalize(part)))) {
 			throw error(`Authorization trigger ${trigger.name} is incompatible`);
 		}
@@ -665,26 +805,58 @@ function assertFunctions(actual: readonly FunctionRow[], expected: readonly Expe
 	}
 }
 
-async function inspectCatalog(queryable: Queryable, schema: string, names: Names): Promise<boolean> {
+type CatalogInspection = Readonly<{
+	installed: boolean;
+	terminalizationPending: boolean;
+	principalSubjectIndexPending: boolean;
+}>;
+
+async function inspectCatalog(queryable: Queryable, schema: string, names: Names): Promise<CatalogInspection> {
 	const tableNames = Object.values(names);
 	const tables = await queryable.query<TableRow>(`SELECT c.relname AS table_name, c.relkind, c.relpersistence AS persistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[])`, [schema, tableNames]);
-	if (tables.rows.length === 0) return false;
+	if (tables.rows.length === 0) return Object.freeze({ installed: false, terminalizationPending: false, principalSubjectIndexPending: false });
 	if (tables.rows.length !== tableNames.length || tables.rows.some((row) => row.relkind !== "r" || row.persistence !== "p")) throw error("PostgreSQL authorization authority is partially installed or incompatible");
 	const actualColumns = await queryable.query<ColumnRow>(`SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = $1 AND table_name = ANY($2::text[]) ORDER BY table_name, ordinal_position`, [schema, tableNames]);
 	const actualConstraints = await queryable.query<ConstraintRow>(`SELECT c.relname AS table_name, con.conname AS constraint_name, con.contype AS constraint_type, con.convalidated AS validated, pg_get_constraintdef(con.oid, true) AS definition FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.contype = ANY(ARRAY['p', 'u', 'f', 'c']::"char"[]) ORDER BY c.relname, con.conname`, [schema, tableNames]);
 	const actualIndexes = await queryable.query<IndexRow>(`SELECT c.relname AS table_name, i.relname AS index_name, pg_get_indexdef(i.oid) AS definition FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_constraint con ON con.conindid = i.oid WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.oid IS NULL ORDER BY c.relname, i.relname`, [schema, tableNames]);
-	const actualTriggers = await queryable.query<TriggerRow>(`SELECT c.relname AS table_name, tg.tgname AS trigger_name, pg_get_triggerdef(tg.oid, true) AS definition FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND NOT tg.tgisinternal ORDER BY c.relname, tg.tgname`, [schema, tableNames]);
+	const actualTriggers = await queryable.query<TriggerRow>(`SELECT c.relname AS table_name, tg.tgname AS trigger_name, pg_get_triggerdef(tg.oid, true) AS definition, tg.tgenabled = 'O' AS enabled, function_namespace.nspname AS function_schema, function_record.proname AS function_name, format('%I.%I(%s)', function_namespace.nspname, function_record.proname, pg_get_function_identity_arguments(function_record.oid)) AS function_identity, function_record.prosrc AS function_source, language_record.lanname AS function_language, return_type.typname AS function_return_type, function_record.pronargs AS function_argument_count, function_record.prosecdef AS function_security_definer FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc function_record ON function_record.oid = tg.tgfoid JOIN pg_namespace function_namespace ON function_namespace.oid = function_record.pronamespace JOIN pg_language language_record ON language_record.oid = function_record.prolang JOIN pg_type return_type ON return_type.oid = function_record.prorettype WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND NOT tg.tgisinternal ORDER BY c.relname, tg.tgname`, [schema, tableNames]);
+	const rollbackFencePresent = actualTriggers.rows.some((row) => row.trigger_name === "clearance_import_rollback_guard_v1");
+	if (rollbackFencePresent) {
+		const rollbackFenceTable = await queryable.query<RollbackFenceTableRow>(`SELECT c.relkind, c.relpersistence AS persistence, (SELECT count(*)::int FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attnum > 0 AND NOT attribute_record.attisdropped) AS column_count, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'kind' AND attribute_record.atttypid = 'text'::regtype AND attribute_record.attnotnull) AS has_kind, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'resource_id' AND attribute_record.atttypid = 'text'::regtype AND attribute_record.attnotnull) AS has_resource_id, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'tombstoned_at' AND attribute_record.atttypid = 'timestamp with time zone'::regtype AND attribute_record.attnotnull) AS has_tombstoned_at, EXISTS (SELECT 1 FROM pg_constraint constraint_record WHERE constraint_record.conrelid = c.oid AND constraint_record.contype = 'p' AND pg_get_constraintdef(constraint_record.oid, true) = 'PRIMARY KEY (kind, resource_id)') AS has_primary_key FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2`, ["public", "clearance_import_rollback_tombstones"]);
+		const tableRecord = rollbackFenceTable.rows[0];
+		if (
+			rollbackFenceTable.rows.length !== 1 ||
+			tableRecord?.relkind !== "r" ||
+			tableRecord.persistence !== "p" ||
+			tableRecord.column_count !== 3 ||
+			!tableRecord.has_kind ||
+			!tableRecord.has_resource_id ||
+			!tableRecord.has_tombstoned_at ||
+			!tableRecord.has_primary_key
+		) {
+			throw error("Authorization rollback fence table is incompatible");
+		}
+	}
 	const guard = authorizationGuardFunctionName(names);
 	const actualFunctions = await queryable.query<FunctionRow>(`SELECT p.proname AS function_name, pg_get_functiondef(p.oid) AS definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1 AND p.proname = $2 AND p.pronargs = 0`, [schema, guard]);
 	const expectedColumns = columns(); const expectedConstraints = constraints(names); const expectedIndexes = indexes(names);
+	const terminalizationPending = !actualColumns.rows.some((row) => row.table_name === names.revisions && row.column_name === "terminal");
+	const principalSubjectIndex = shortName(names, "assignments_principal_subject_idx");
+	const principalSubjectIndexPending = !actualIndexes.rows.some((row) => row.table_name === names.assignments && row.index_name === principalSubjectIndex);
+	const compatibleColumns = terminalizationPending
+		? Object.freeze({ ...expectedColumns, revisions: expectedColumns.revisions.filter((column) => column.name !== "terminal") })
+		: expectedColumns;
+	const compatibleIndexes = principalSubjectIndexPending
+		? Object.freeze({ ...expectedIndexes, assignments: expectedIndexes.assignments.filter((index) => index.name !== principalSubjectIndex) })
+		: expectedIndexes;
 	for (const key of Object.keys(names) as (keyof Names)[]) {
-		assertColumns(names[key], actualColumns.rows, expectedColumns[key]);
+		assertColumns(names[key], actualColumns.rows, compatibleColumns[key]);
 		assertConstraints(names[key], actualConstraints.rows, expectedConstraints[key]);
-		assertIndexes(names[key], actualIndexes.rows, expectedIndexes[key]);
+		assertIndexes(names[key], actualIndexes.rows, compatibleIndexes[key]);
 	}
 	assertTriggers(actualTriggers.rows, names, authorizationTriggers(names));
 	assertFunctions(actualFunctions.rows, authorizationGuardFunctions(names));
-	return true;
+	return Object.freeze({ installed: true, terminalizationPending, principalSubjectIndexPending });
 }
 
 function transactionQueryable(value: AuthorizationAuthorityTransaction): Queryable {
@@ -835,7 +1007,7 @@ function isReservedBuiltInRole(role: AuthorizationAuthorityRole): boolean {
 	return BUILT_IN_ROLE_DEFINITIONS.some((definition) => definition.roleId === role.roleId || definition.slug === role.slug);
 }
 
-type RevisionRow = { revision: unknown };
+type RevisionRow = { revision: unknown; terminal: unknown };
 type RoleRow = {
 	role_id: unknown;
 	organization_id: unknown;
@@ -866,33 +1038,64 @@ export class PostgresAuthorizationAuthority {
 	readonly prefix: string;
 	readonly #database: Pick<pg.Pool, "query" | "connect">;
 	readonly #names: Names;
+	readonly #runtimeOrganizationAuthority: AuthorizationRuntimeOrganizationAuthority | undefined;
 
-	constructor(database: Pick<pg.Pool, "query" | "connect">, options: PostgresAuthorizationAuthorityOptions) {
+	constructor(
+		database: Pick<pg.Pool, "query" | "connect">,
+		options: PostgresAuthorizationAuthorityOptions,
+		runtimeOrganizationAuthority?: AuthorizationRuntimeOrganizationAuthority,
+	) {
 		if (!database || typeof database.query !== "function" || typeof database.connect !== "function") throw error("PostgreSQL authorization database is invalid", undefined, "AUTHORIZATION_INPUT_INVALID");
 		this.identity = Object.freeze({ projectId: scopeString(options.projectId, "projectId"), environmentId: scopeString(options.environmentId, "environmentId") });
 		this.schema = identifier(options.schema ?? "public", "schema", 63);
 		this.prefix = identifier(options.prefix ?? DEFAULT_PREFIX, "prefix", 24);
 		this.#database = database;
 		this.#names = namesFor(this.prefix);
+		this.#runtimeOrganizationAuthority = runtimeOrganizationAuthority === undefined
+			? undefined
+			: Object.freeze({
+				schema: identifier(runtimeOrganizationAuthority.schema, "runtime organization schema", 63),
+				table: identifier(runtimeOrganizationAuthority.table, "runtime organization table", 63),
+				...(runtimeOrganizationAuthority.management === undefined
+					? {}
+					: {
+						management: Object.freeze({
+							schema: identifier(runtimeOrganizationAuthority.management.schema, "management organization schema", 63),
+							table: identifier(runtimeOrganizationAuthority.management.table, "management organization table", 63),
+						}),
+					}),
+			});
 	}
 
 	async planMigration(): Promise<AuthorizationAuthorityMigrationPlan> {
-		const installed = await inspectCatalog(this.#database, this.schema, this.#names);
+		const inspection = await inspectCatalog(this.#database, this.schema, this.#names);
 		const fieldCount = Object.values(columns()).reduce((total, table) => total + table.length, 0);
-		const sql = installed ? "" : createSql(this.schema, this.#names);
+		const sql = !inspection.installed
+			? createSql(this.schema, this.#names)
+			: [
+				...(inspection.terminalizationPending ? [terminalizationMigrationSql(this.schema, this.#names)] : []),
+				...(inspection.principalSubjectIndexPending ? [principalSubjectIndexMigrationSql(this.schema, this.#names)] : []),
+			].join(";\n");
 		return Object.freeze({
-			pendingTables: installed ? 0 : Object.keys(this.#names).length,
-			pendingFields: installed ? 0 : fieldCount,
-			pendingSecurityMigrations: installed ? Object.freeze([]) : Object.freeze([MIGRATION_ID]),
+			pendingTables: inspection.installed ? 0 : Object.keys(this.#names).length,
+			pendingFields: inspection.installed ? (inspection.terminalizationPending ? 1 : 0) : fieldCount,
+			pendingSecurityMigrations: sql === "" ? Object.freeze([]) : Object.freeze([MIGRATION_ID]),
 			compileSql: async () => sql,
 			apply: async () => {
 				const client = await this.#database.connect();
 				try {
 					await client.query("BEGIN");
 					await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${this.schema}:${this.prefix}:${MIGRATION_ID}`]);
-					const alreadyInstalled = await inspectCatalog(client, this.schema, this.#names);
-					if (!alreadyInstalled) await client.query(createSql(this.schema, this.#names));
-					await inspectCatalog(client, this.schema, this.#names);
+					const current = await inspectCatalog(client, this.schema, this.#names);
+					if (!current.installed) await client.query(createSql(this.schema, this.#names));
+					else {
+						if (current.terminalizationPending) await client.query(terminalizationMigrationSql(this.schema, this.#names));
+						if (current.principalSubjectIndexPending) await client.query(principalSubjectIndexMigrationSql(this.schema, this.#names));
+					}
+					const verified = await inspectCatalog(client, this.schema, this.#names);
+					if (!verified.installed || verified.terminalizationPending || verified.principalSubjectIndexPending) {
+						throw error("PostgreSQL authorization authority terminalization migration is incomplete");
+					}
 					await this.#seedBuiltInRoles(client);
 					await client.query("COMMIT");
 				} catch (cause) {
@@ -933,16 +1136,26 @@ export class PostgresAuthorizationAuthority {
 
 	async #ensureRevision(queryable: Queryable, organizationId: string): Promise<AuthorizationAuthorityRevision> {
 		const table = this.#table(this.#names.revisions);
-		const inserted = await queryable.query<RevisionRow>(`INSERT INTO ${table} ("projectId", "environmentId", "organizationId", revision) VALUES ($1, $2, $3, 1) ON CONFLICT ("projectId", "environmentId", "organizationId") DO NOTHING RETURNING revision::text AS revision`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		const inserted = await queryable.query<RevisionRow>(`INSERT INTO ${table} ("projectId", "environmentId", "organizationId", revision) VALUES ($1, $2, $3, 1) ON CONFLICT ("projectId", "environmentId", "organizationId") DO NOTHING RETURNING revision::text AS revision, terminal`, [this.identity.projectId, this.identity.environmentId, organizationId]);
 		if (inserted.rows.length === 1) return Object.freeze({ organizationId, revision: canonicalRevision(inserted.rows[0]!.revision), initialized: true });
-		const existing = await queryable.query<RevisionRow>(`SELECT revision::text AS revision FROM ${table} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		const existing = await queryable.query<RevisionRow>(`SELECT revision::text AS revision, terminal FROM ${table} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
 		if (existing.rows.length !== 1) throw error("Authorization revision is unavailable");
+		if (existing.rows[0]!.terminal !== false) throw error("Organization authorization is archived", undefined, "AUTHORIZATION_ORGANIZATION_ARCHIVED");
 		return Object.freeze({ organizationId, revision: canonicalRevision(existing.rows[0]!.revision), initialized: false });
 	}
 
 	async #requireRevision(queryable: Queryable, organizationId: string): Promise<string> {
-		const rows = await queryable.query<RevisionRow>(`SELECT revision::text AS revision FROM ${this.#table(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		const rows = await queryable.query<RevisionRow>(`SELECT revision::text AS revision, terminal FROM ${this.#table(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
 		if (rows.rows.length !== 1) throw error("Authorization revision was not found", undefined, "AUTHORIZATION_REVISION_NOT_FOUND");
+		return canonicalRevision(rows.rows[0]!.revision);
+	}
+
+	async #requireActiveOrganization(queryable: Queryable, organizationId: string): Promise<string> {
+		const rows = await queryable.query<RevisionRow>(`SELECT revision::text AS revision, terminal FROM ${this.#table(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		if (rows.rows.length !== 1) throw error("Authorization revision was not found", undefined, "AUTHORIZATION_REVISION_NOT_FOUND");
+		if (rows.rows[0]!.terminal !== false) {
+			throw error("Organization authorization is archived", undefined, "AUTHORIZATION_ORGANIZATION_ARCHIVED");
+		}
 		return canonicalRevision(rows.rows[0]!.revision);
 	}
 
@@ -1013,6 +1226,125 @@ export class PostgresAuthorizationAuthority {
 		});
 	}
 
+	/**
+	 * Irreversibly terminalizes this scope's authorization state for an organization.
+	 * It is intentionally transaction-capable so topology archival can share the
+	 * same commit boundary. No restore operation exists in this authority.
+	 */
+	async archiveOrganization(input: AuthorizationAuthorityArchiveOrganizationInput): Promise<AuthorizationAuthorityArchiveOrganizationResult> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			const revisions = this.#table(this.#names.revisions);
+			const inserted = await queryable.query<RevisionRow>(`INSERT INTO ${revisions} ("projectId", "environmentId", "organizationId", revision, terminal) VALUES ($1, $2, $3, 1, true) ON CONFLICT ("projectId", "environmentId", "organizationId") DO NOTHING RETURNING revision::text AS revision, terminal`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+			const current = inserted.rows[0] ?? (await queryable.query<RevisionRow>(`SELECT revision::text AS revision, terminal FROM ${revisions} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId])).rows[0];
+			if (!current) throw error("Authorization terminalization is unavailable");
+			const previousRevision = inserted.rows.length === 1 ? "0" : canonicalRevision(current.revision);
+			let revision = canonicalRevision(current.revision);
+			if (current.terminal === false) {
+				if (BigInt(revision) >= POSTGRES_BIGINT_MAX) throw error("Authorization revision overflow", undefined, "AUTHORIZATION_REVISION_OVERFLOW");
+				const advanced = await queryable.query<RevisionRow>(`UPDATE ${revisions} SET terminal = true, revision = revision + 1, "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND terminal = false RETURNING revision::text AS revision, terminal`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+				if (advanced.rows.length !== 1 || advanced.rows[0]!.terminal !== true) throw error("Authorization terminalization is unavailable");
+				revision = canonicalRevision(advanced.rows[0]!.revision);
+			} else if (current.terminal !== true) {
+				throw error("Authorization terminal state is invalid");
+			}
+			const assignments = await queryable.query(`DELETE FROM ${this.#table(this.#names.assignments)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+			const disabled = await queryable.query(`UPDATE ${this.#table(this.#names.serviceAccounts)} SET status = 'disabled', "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND status = 'active'`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+			const revoked = await queryable.query(`UPDATE ${this.#table(this.#names.credentials)} SET status = 'revoked', "revokedAt" = now(), "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND status = 'active'`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+			return Object.freeze({
+				organizationId,
+				previousRevision,
+				revision,
+				archived: true,
+				removedAssignments: assignments.rowCount ?? 0,
+				disabledServiceAccounts: disabled.rowCount ?? 0,
+				revokedCredentials: revoked.rowCount ?? 0,
+			});
+		});
+	}
+
+	/**
+	 * Terminalizes only live authorization rows that are absent from every exact
+	 * injected organization authority. A runtime product row or a scoped active
+	 * normalized-management row is sufficient to keep an organization live. The
+	 * operation is set-based, idempotent, and deliberately unavailable without
+	 * both server-owned identities: runtime absence alone is never archival proof.
+	 */
+	async reconcileRuntimeOrganizations(input?: Readonly<{
+		management: Readonly<{ schema: string; table: string }>;
+		transaction?: AuthorizationAuthorityTransaction;
+	}>): Promise<AuthorizationAuthorityReconciliationResult> {
+		const runtime = this.#runtimeOrganizationAuthority;
+		const configuredManagement = input?.management ?? runtime?.management;
+		const management = configuredManagement === undefined
+			? undefined
+			: Object.freeze({
+				schema: identifier(configuredManagement.schema, "management organization schema", 63),
+				table: identifier(configuredManagement.table, "management organization table", 63),
+			});
+		if (!runtime || !management) throw error("Organization authorities are not configured", undefined, "AUTHORIZATION_RUNTIME_ORGANIZATION_UNAVAILABLE");
+		return this.#withMutation(input?.transaction, async (queryable) => {
+			const runtimeTable = qualified(runtime.schema, runtime.table);
+			const managementTable = qualified(management.schema, management.table);
+			const catalog = await queryable.query<{ authority: unknown; exists: unknown; id_type: unknown; status_type: unknown; project_type: unknown; environment_type: unknown }>(`SELECT authority, to_regclass(qualified_name) IS NOT NULL AS exists,
+				(SELECT data_type FROM information_schema.columns WHERE table_schema = schema_name AND table_name = table_name_input AND column_name = 'id') AS id_type,
+				(SELECT data_type FROM information_schema.columns WHERE table_schema = schema_name AND table_name = table_name_input AND column_name = 'status') AS status_type,
+				(SELECT data_type FROM information_schema.columns WHERE table_schema = schema_name AND table_name = table_name_input AND column_name = 'project_id') AS project_type,
+				(SELECT data_type FROM information_schema.columns WHERE table_schema = schema_name AND table_name = table_name_input AND column_name = 'environment_id') AS environment_type
+				FROM (VALUES
+					('runtime'::text, $1::text, $2::text, $3::text),
+					('management'::text, $4::text, $5::text, $6::text)
+				) AS authority_rows(authority, qualified_name, schema_name, table_name_input)`, [
+				`${runtime.schema}.${runtime.table}`, runtime.schema, runtime.table,
+				`${management.schema}.${management.table}`, management.schema, management.table,
+			]);
+			const runtimeCatalog = catalog.rows.find((row) => row.authority === "runtime");
+			const managementCatalog = catalog.rows.find((row) => row.authority === "management");
+			if (
+				catalog.rows.length !== 2 ||
+				runtimeCatalog?.exists !== true || runtimeCatalog.id_type !== "text" ||
+				managementCatalog?.exists !== true || managementCatalog.id_type !== "text" ||
+				managementCatalog.status_type !== "text" || managementCatalog.project_type !== "text" || managementCatalog.environment_type !== "text"
+			) {
+				throw error("Organization authorities are unavailable", undefined, "AUTHORIZATION_RUNTIME_ORGANIZATION_UNAVAILABLE");
+			}
+			const revisions = this.#table(this.#names.revisions);
+			const managementActive = `EXISTS (SELECT 1 FROM ${managementTable} management_org WHERE management_org.id = revision."organizationId" AND management_org.project_id = revision."projectId" AND management_org.environment_id = revision."environmentId" AND management_org.status = 'active')`;
+			const managementArchived = `EXISTS (SELECT 1 FROM ${managementTable} management_org WHERE management_org.id = revision."organizationId" AND management_org.project_id = revision."projectId" AND management_org.environment_id = revision."environmentId" AND management_org.status = 'archived')`;
+			// A normalized tombstone is authoritative over stale runtime state. In
+			// its absence, an extant runtime row still protects legacy live orgs.
+			const missingAuthority = `NOT (${managementActive}) AND ((${managementArchived}) OR NOT EXISTS (SELECT 1 FROM ${runtimeTable} runtime_org WHERE runtime_org.id = revision."organizationId"))`;
+			const overflow = await queryable.query<{ organization_id: unknown }>(`SELECT "organizationId" AS organization_id FROM ${revisions} revision WHERE revision."projectId" = $1 AND revision."environmentId" = $2 AND revision.terminal = false AND revision.revision >= $3::bigint AND ${missingAuthority} LIMIT 1 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, POSTGRES_BIGINT_MAX.toString()]);
+			if (overflow.rows.length > 0) throw error("Authorization revision overflow", undefined, "AUTHORIZATION_REVISION_OVERFLOW");
+			const terminalized = await queryable.query<{ count: unknown; organization_ids: unknown }>(`WITH orphaned AS (
+				SELECT revision."organizationId" FROM ${revisions} revision
+				WHERE revision."projectId" = $1 AND revision."environmentId" = $2 AND revision.terminal = false
+				AND ${missingAuthority}
+			), updated AS (
+				UPDATE ${revisions} revision SET terminal = true, revision = revision.revision + 1, "updatedAt" = now()
+				FROM orphaned WHERE revision."projectId" = $1 AND revision."environmentId" = $2
+				AND revision."organizationId" = orphaned."organizationId" AND revision.terminal = false
+				RETURNING revision."organizationId" AS organization_id
+			) SELECT count(*)::int AS count, COALESCE((array_agg(organization_id ORDER BY organization_id))[1:100], ARRAY[]::text[]) AS organization_ids FROM updated`, [this.identity.projectId, this.identity.environmentId]);
+			const assignments = await queryable.query(`DELETE FROM ${this.#table(this.#names.assignments)} assignment
+				USING ${revisions} revision
+				WHERE assignment."projectId" = $1 AND assignment."environmentId" = $2
+				AND revision."projectId" = assignment."projectId" AND revision."environmentId" = assignment."environmentId"
+				AND revision."organizationId" = assignment."organizationId" AND revision.terminal = true`, [this.identity.projectId, this.identity.environmentId]);
+			const disabled = await queryable.query(`UPDATE ${this.#table(this.#names.serviceAccounts)} account SET status = 'disabled', "updatedAt" = now()
+				WHERE account."projectId" = $1 AND account."environmentId" = $2 AND account.status = 'active'
+				AND EXISTS (SELECT 1 FROM ${revisions} revision WHERE revision."projectId" = $1 AND revision."environmentId" = $2 AND revision."organizationId" = account."organizationId" AND revision.terminal = true)`, [this.identity.projectId, this.identity.environmentId]);
+			const revoked = await queryable.query(`UPDATE ${this.#table(this.#names.credentials)} credential SET status = 'revoked', "revokedAt" = now(), "updatedAt" = now()
+				WHERE credential."projectId" = $1 AND credential."environmentId" = $2 AND credential.status = 'active'
+				AND EXISTS (SELECT 1 FROM ${revisions} revision WHERE revision."projectId" = $1 AND revision."environmentId" = $2 AND revision."organizationId" = credential."organizationId" AND revision.terminal = true)`, [this.identity.projectId, this.identity.environmentId]);
+			const terminalizedRow = terminalized.rows[0];
+			const terminalizedIds = Array.isArray(terminalizedRow?.organization_ids)
+				? terminalizedRow.organization_ids.filter((id): id is string => typeof id === "string")
+				: [];
+			return Object.freeze({ terminalizedOrganizations: Number(terminalizedRow?.count ?? 0), terminalizedOrganizationIds: Object.freeze(terminalizedIds), removedAssignments: assignments.rowCount ?? 0, disabledServiceAccounts: disabled.rowCount ?? 0, revokedCredentials: revoked.rowCount ?? 0 });
+		});
+	}
+
 	async #assertAssignedSubjectActionLimit(queryable: Queryable, role: AuthorizationAuthorityRole, assignments: readonly AssignmentRow[]): Promise<void> {
 		if (role.status !== "active" || assignments.length === 0) return;
 		const roles = this.#table(this.#names.roles);
@@ -1056,6 +1388,7 @@ export class PostgresAuthorizationAuthority {
 	}
 
 	async #requireServiceAccount(queryable: Queryable, organizationId: string, serviceAccountId: string, active: boolean): Promise<AuthorizationServiceAccount> {
+		await this.#requireActiveOrganization(queryable, organizationId);
 		const rows = await queryable.query<ServiceAccountRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status FROM ${this.#table(this.#names.serviceAccounts)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId]);
 		if (rows.rows.length !== 1) throw error("Service account was not found", undefined, "AUTHORIZATION_SERVICE_ACCOUNT_NOT_FOUND");
 		const account = this.#serviceAccountFromRow(rows.rows[0]!);
@@ -1101,6 +1434,7 @@ export class PostgresAuthorizationAuthority {
 		if (role.builtIn || isReservedBuiltInRole(role)) throw error("Built-in roles are initialized by the authorization authority", undefined, "AUTHORIZATION_ROLE_IMMUTABLE");
 		return this.#withMutation(input.transaction, async (queryable) => {
 			if (actions.length > MAX_EFFECTIVE_ACTIONS) throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+			if (role.organizationId !== null) await this.#requireActiveOrganization(queryable, role.organizationId);
 			const roles = this.#table(this.#names.roles);
 			const roleActions = this.#table(this.#names.roleActions);
 			const actionsTable = this.#table(this.#names.actions);
@@ -1119,6 +1453,9 @@ export class PostgresAuthorizationAuthority {
 				builtIn: currentRows.rows[0]!.built_in,
 				status: currentRows.rows[0]!.status,
 			}, currentActions, "stored role");
+			if (current?.organizationId !== null && current?.organizationId !== undefined) {
+				await this.#requireActiveOrganization(queryable, current.organizationId);
+			}
 			const unchanged = current !== undefined && current.roleId === role.roleId && current.organizationId === role.organizationId && current.slug === role.slug && current.name === role.name && current.description === role.description && current.builtIn === role.builtIn && current.status === role.status && sameStrings(current.actions, role.actions);
 			if (current && (current.builtIn !== role.builtIn || current.builtIn) && !unchanged) {
 				throw error("Built-in roles are immutable", undefined, "AUTHORIZATION_ROLE_IMMUTABLE");
@@ -1155,7 +1492,7 @@ export class PostgresAuthorizationAuthority {
 		const roleIds = sortedUnique(input.roleIds, "roleIds", roleId);
 		const expectedRevision = input.expectedRevision === undefined ? undefined : canonicalRevision(input.expectedRevision);
 		return this.#withMutation(input.transaction, async (queryable) => {
-			const revision = await this.#requireRevision(queryable, organizationId);
+			const revision = await this.#requireActiveOrganization(queryable, organizationId);
 			if (expectedRevision !== undefined && expectedRevision !== revision) throw error("Authorization revision is stale", undefined, "AUTHORIZATION_REVISION_STALE");
 			const roles = this.#table(this.#names.roles);
 			const assignments = this.#table(this.#names.assignments);
@@ -1203,6 +1540,7 @@ export class PostgresAuthorizationAuthority {
 		const name = roleName(input.name, "name");
 		const roleIds = sortedUnique(input.roleIds, "roleIds", roleId);
 		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#requireActiveOrganization(queryable, organizationId);
 			await this.#validateServiceAccountRoleIds(queryable, organizationId, roleIds);
 			const inserted = await queryable.query<ServiceAccountRow>(`INSERT INTO ${this.#table(this.#names.serviceAccounts)} ("projectId", "environmentId", "organizationId", "serviceAccountId", name, status) VALUES ($1, $2, $3, $4, $5, 'active') RETURNING "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, name]);
 			if (inserted.rows.length !== 1) throw error("Service account is unavailable");
@@ -1217,6 +1555,7 @@ export class PostgresAuthorizationAuthority {
 	async listServiceAccounts(input: AuthorizationListServiceAccountsInput): Promise<readonly AuthorizationServiceAccount[]> {
 		const organizationId = scopeString(input.organizationId, "organizationId");
 		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		await this.#requireActiveOrganization(queryable, organizationId);
 		const rows = await queryable.query<ServiceAccountRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status FROM ${this.#table(this.#names.serviceAccounts)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 ORDER BY name, "serviceAccountId"`, [this.identity.projectId, this.identity.environmentId, organizationId]);
 		return Object.freeze(rows.rows.map((row) => this.#serviceAccountFromRow(row)));
 	}
@@ -1305,7 +1644,7 @@ export class PostgresAuthorizationAuthority {
 		)
 		SELECT c."organizationId" AS organization_id, c."serviceAccountId" AS service_account_id, c."credentialId" AS credential_id, c."credentialDigest" AS credential_digest, c."credentialPrefix" AS credential_prefix, c."credentialFingerprint" AS credential_fingerprint, c."expiresAt" AS expires_at, c.version,
 			r.revision::text AS revision, COALESCE((SELECT array_agg("roleId" ORDER BY "roleId") FROM effective_roles), ARRAY[]::text[]) AS role_ids, COALESCE((SELECT array_agg("actionName" ORDER BY "actionName") FROM effective_actions), ARRAY[]::text[]) AS actions
-		FROM credential c JOIN ${t(this.#names.revisions)} r ON r."projectId" = $2 AND r."environmentId" = $3 AND r."organizationId" = c."organizationId"`, [digest, this.identity.projectId, this.identity.environmentId]);
+		FROM credential c JOIN ${t(this.#names.revisions)} r ON r."projectId" = $2 AND r."environmentId" = $3 AND r."organizationId" = c."organizationId" AND r.terminal = false`, [digest, this.identity.projectId, this.identity.environmentId]);
 		if (rows.rows.length !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
 		const row = rows.rows[0]!;
 		const actions = decodeSortedStrings(row.actions, "actions").map((action) => canonicalActionName(action, "stored action"));
@@ -1319,6 +1658,7 @@ export class PostgresAuthorizationAuthority {
 			? undefined
 			: scopeString(input.organizationId, "organizationId");
 		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		if (organizationId !== undefined) await this.#requireActiveOrganization(queryable, organizationId);
 		const roles = this.#table(this.#names.roles);
 		const rows = await queryable.query<RoleListRow>(`SELECT r."roleId" AS role_id, r."organizationId" AS organization_id, r.slug, r.name, r.description, r."builtIn" AS built_in, r.status, COALESCE(array_agg(a."actionName" ORDER BY a."actionName") FILTER (WHERE a."actionName" IS NOT NULL), ARRAY[]::text[]) AS actions FROM ${roles} r LEFT JOIN ${this.#table(this.#names.roleActions)} ra ON ra."projectId" = r."projectId" AND ra."environmentId" = r."environmentId" AND ra."roleId" = r."roleId" LEFT JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE r."projectId" = $1 AND r."environmentId" = $2 AND ($3::text IS NULL OR r."organizationId" IS NULL OR r."organizationId" = $3) GROUP BY r."projectId", r."environmentId", r."roleId", r."organizationId", r.slug, r.name, r.description, r."builtIn", r.status ORDER BY r.slug, r."roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId ?? null]);
 		return Object.freeze(rows.rows.map((row) => authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, decodeSortedStrings(row.actions, "role actions").map((action) => canonicalActionName(action, "stored action")), "stored role")));
@@ -1328,6 +1668,7 @@ export class PostgresAuthorizationAuthority {
 		const organizationId = scopeString(input.organizationId, "organizationId");
 		const subject = input.subject === undefined ? undefined : authorizationSubject(input.subject, "subject");
 		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		await this.#requireActiveOrganization(queryable, organizationId);
 		const rows = await queryable.query<AssignmentRow>(`SELECT "organizationId" AS organization_id, "subjectKind" AS subject_kind, "subjectId" AS subject_id, "roleId" AS role_id FROM ${this.#table(this.#names.assignments)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND ($4::text IS NULL OR ("subjectKind" = $4 AND "subjectId" = $5)) ORDER BY "subjectKind", "subjectId", "roleId"`, [this.identity.projectId, this.identity.environmentId, organizationId, subject?.kind ?? null, subject?.id ?? null]);
 		return Object.freeze(rows.rows.map((row) => Object.freeze({ organizationId: scopeString(row.organization_id, "stored assignment organizationId"), subject: authorizationSubject({ kind: row.subject_kind, id: row.subject_id }, "stored assignment subject"), roleId: roleId(row.role_id, "stored assignment roleId") })));
 	}
@@ -1338,8 +1679,8 @@ export class PostgresAuthorizationAuthority {
 		const subject = Object.freeze({ kind: input.subject.kind, id: scopeString(input.subject.id, "subject.id") });
 		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
 		const t = (name: string) => qualified(this.schema, name);
-		const row = await queryable.query<ReadRow>(`WITH revision_row AS (
-			SELECT revision::text AS revision FROM ${t(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3
+		const row = await queryable.query<ReadRow & { terminal: unknown }>(`WITH revision_row AS (
+			SELECT revision::text AS revision, terminal FROM ${t(this.#names.revisions)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3
 		), effective_roles AS (
 			SELECT DISTINCT r."roleId" FROM ${t(this.#names.assignments)} a
 			JOIN ${t(this.#names.roles)} r ON r."projectId" = a."projectId" AND r."environmentId" = a."environmentId" AND r."roleId" = a."roleId"
@@ -1349,13 +1690,14 @@ export class PostgresAuthorizationAuthority {
 			SELECT DISTINCT ac."actionName" FROM effective_roles er JOIN ${t(this.#names.roleActions)} ra ON ra."projectId" = $1 AND ra."environmentId" = $2 AND ra."roleId" = er."roleId"
 			JOIN ${t(this.#names.actions)} ac ON ac."projectId" = ra."projectId" AND ac."environmentId" = ra."environmentId" AND ac."actionId" = ra."actionId"
 		)
-		SELECT (SELECT revision FROM revision_row) AS revision,
+		SELECT (SELECT revision FROM revision_row) AS revision, (SELECT terminal FROM revision_row) AS terminal,
 			CASE WHEN $4 = 'principal' THEN true ELSE EXISTS (SELECT 1 FROM ${t(this.#names.serviceAccounts)} sa WHERE sa."projectId" = $1 AND sa."environmentId" = $2 AND sa."organizationId" = $3 AND sa."serviceAccountId" = $5 AND sa.status = 'active') END AS subject_valid,
 			COALESCE((SELECT array_agg("roleId" ORDER BY "roleId") FROM effective_roles), ARRAY[]::text[]) AS role_ids,
 			COALESCE((SELECT array_agg("actionName" ORDER BY "actionName") FROM effective_actions), ARRAY[]::text[]) AS actions`, [this.identity.projectId, this.identity.environmentId, organizationId, subject.kind, subject.id]);
 		if (row.rows.length !== 1) throw error("Authorization read is unavailable");
 		const result = row.rows[0]!;
 		if (result.revision === null || result.revision === undefined) throw error("Authorization revision was not found", undefined, "AUTHORIZATION_REVISION_NOT_FOUND");
+		if (result.terminal !== false) throw error("Organization authorization is archived", undefined, "AUTHORIZATION_ORGANIZATION_ARCHIVED");
 		const revision = canonicalRevision(result.revision);
 		if (result.subject_valid !== true) throw error("Authorization subject was not found", undefined, "AUTHORIZATION_SUBJECT_NOT_FOUND");
 		return Object.freeze({ projectId: this.identity.projectId, environmentId: this.identity.environmentId, organizationId, subject, roleIds: decodeSortedStrings(result.role_ids, "roles"), actions: decodeSortedStrings(result.actions, "actions"), revision });
