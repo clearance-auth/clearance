@@ -991,7 +991,12 @@ export function createClearanceAuth<
 		? createRuntimeAuditOutbox(pool, runtimeAuditScope)
 		: null;
 	const authorizationAuthority = options.authorization
-		? new PostgresAuthorizationAuthority(pool, options.authorization)
+		? new PostgresAuthorizationAuthority(pool, options.authorization, {
+			// createClearanceAuth owns the runtime migration and its exact public
+			// organization authority; this is intentionally not caller-configurable.
+			schema: "public",
+			table: "organization",
+		})
 		: null;
 	const authenticationPolicyAuthority = options.authenticationPolicy
 		? new PostgresAuthenticationPolicyAuthority(
@@ -1644,6 +1649,7 @@ export function createClearanceAuth<
 					origin text NOT NULL,
 					"userId" text,
 					"userHandle" text,
+					"stagedSubjectId" text,
 					"targetPasskeyId" text,
 					"expiresAt" timestamptz NOT NULL,
 					"createdAt" timestamptz NOT NULL,
@@ -1656,6 +1662,7 @@ export function createClearanceAuth<
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS origin text;
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "userId" text;
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "userHandle" text;
+				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "stagedSubjectId" text;
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "targetPasskeyId" text;
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "expiresAt" timestamptz;
 				ALTER TABLE "passkeyChallenge" ADD COLUMN IF NOT EXISTS "createdAt" timestamptz;
@@ -1778,6 +1785,10 @@ export function createClearanceAuth<
 					ON "passkeyChallenge" ("digestId");
 				CREATE INDEX IF NOT EXISTS "passkeyChallenge_expiresAt_idx"
 					ON "passkeyChallenge" ("expiresAt");
+				CREATE INDEX IF NOT EXISTS "passkeyChallenge_userId_idx"
+					ON "passkeyChallenge" ("userId");
+				CREATE INDEX IF NOT EXISTS "passkeyChallenge_stagedSubjectId_idx"
+					ON "passkeyChallenge" ("stagedSubjectId");
 				DO $bridge$
 				BEGIN
 					IF NOT EXISTS (
@@ -1840,6 +1851,7 @@ export function createClearanceAuth<
 					('passkeyChallenge', 'origin', 'text', 'NO'),
 					('passkeyChallenge', 'userId', 'text', 'YES'),
 					('passkeyChallenge', 'userHandle', 'text', 'YES'),
+					('passkeyChallenge', 'stagedSubjectId', 'text', 'YES'),
 					('passkeyChallenge', 'targetPasskeyId', 'text', 'YES'),
 					('passkeyChallenge', 'expiresAt', 'timestamptz', 'NO'),
 					('passkeyChallenge', 'createdAt', 'timestamptz', 'NO'),
@@ -1886,7 +1898,9 @@ export function createClearanceAuth<
 					('passkey_credentialID_uidx', 'passkey', true, 'credentialID'),
 					('passkey_userId_idx', 'passkey', false, 'userId'),
 					('passkeyChallenge_digestId_uidx', 'passkeyChallenge', true, 'digestId'),
-					('passkeyChallenge_expiresAt_idx', 'passkeyChallenge', false, 'expiresAt')
+					('passkeyChallenge_expiresAt_idx', 'passkeyChallenge', false, 'expiresAt'),
+					('passkeyChallenge_userId_idx', 'passkeyChallenge', false, 'userId'),
+					('passkeyChallenge_stagedSubjectId_idx', 'passkeyChallenge', false, 'stagedSubjectId')
 				), actual AS (
 					SELECT index_record.relname AS name,
 					       table_record.relname AS "tableName",
@@ -3016,10 +3030,14 @@ export function createClearanceAuth<
 		authorizationAuthority
 			? Object.freeze({
 					scope: authorizationAuthority.identity,
+					reconcileRuntimeOrganizations:
+						authorizationAuthority.reconcileRuntimeOrganizations.bind(authorizationAuthority),
 					readEffective:
 						authorizationAuthority.readEffective.bind(authorizationAuthority),
 					initializeOrganization:
 						authorizationAuthority.initializeOrganization.bind(authorizationAuthority),
+					archiveOrganization:
+						authorizationAuthority.archiveOrganization.bind(authorizationAuthority),
 					upsertRole:
 						authorizationAuthority.upsertRole.bind(authorizationAuthority),
 					replaceSubjectRoles:
