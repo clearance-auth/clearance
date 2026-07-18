@@ -21,7 +21,6 @@
 import {
 	createClearanceAuth,
 	decryptRuntimeCredential,
-	encryptRuntimeCredential,
 	type ClearanceAuthBundle,
 } from "@clearance/auth";
 import { randomBytes } from "node:crypto";
@@ -87,6 +86,7 @@ import {
 	enqueueOrganizationUpdatedWebhooks,
 	type ValidatedManagementWebhookTarget,
 } from "./application/delivery.js";
+import { keyManagementRuntimeOptions } from "./key-management-env.js";
 
 export type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
 
@@ -200,6 +200,7 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		enableScim: true,
 		credentialAuthority,
 		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
+		...keyManagementRuntimeOptions(),
 	});
 	return bundle;
 }
@@ -583,12 +584,17 @@ async function assertSsoRowScope(
 				status: 409,
 			});
 		}
-		const secret = process.env.CLEARANCE_SECRET;
-		if (!secret) throw new Error("CLEARANCE_SECRET is required to reconcile OIDC secrets");
-		const decrypted = await decryptRuntimeCredential(
-			storedSecret.slice(prefix.length),
-			secret,
-		);
+		const b = getAuthBundle();
+		const ciphertext = storedSecret.slice(prefix.length);
+		const decrypted = ciphertext.startsWith("clrkm$v1$")
+			? await b.keyManagement.openText(
+					"oidc-client-secret",
+					b.keyManagement.resourceId("oidc-client-secret", {
+						providerId: row.providerId,
+					}),
+					ciphertext,
+				)
+			: await decryptRuntimeCredential(ciphertext, process.env.CLEARANCE_SECRET!);
 		if (fingerprint(decrypted) !== fingerprint(input.oidc.clientSecret)) {
 			throw new ClearanceError({
 				code: "SSO_PROVIDER_ID_CONFLICT",
@@ -689,13 +695,14 @@ export async function insertSsoProvider(input: {
 
 	let oidcConfig: string | null = null;
 	if (input.oidc) {
-		const secret = process.env.CLEARANCE_SECRET;
-		if (!secret) throw new Error("CLEARANCE_SECRET is required to encrypt OIDC secrets");
 		oidcConfig = JSON.stringify({
 			clientId: input.oidc.clientId,
-			clientSecret: `clr-sso:v1:${await encryptRuntimeCredential(
+			clientSecret: `clr-sso:v1:${await b.keyManagement.sealText(
+				"oidc-client-secret",
+				b.keyManagement.resourceId("oidc-client-secret", {
+					providerId: input.providerId,
+				}),
 				input.oidc.clientSecret,
-				secret,
 			)}`,
 			discoveryEndpoint: `${input.issuer}/.well-known/openid-configuration`,
 		});
@@ -752,6 +759,46 @@ type ScimProviderRow = {
 	organizationId: string | null;
 };
 
+const SCIM_TOKEN_ENVELOPE_PREFIX = "clr-scim:v1:";
+
+async function openScimBaseToken(
+	b: ClearanceAuthBundle,
+	row: ScimProviderRow,
+): Promise<string> {
+	const wrapped = row.scimToken.startsWith(SCIM_TOKEN_ENVELOPE_PREFIX);
+	const stored = wrapped
+		? row.scimToken.slice(SCIM_TOKEN_ENVELOPE_PREFIX.length)
+		: row.scimToken;
+	if (wrapped && !stored.startsWith("clrkm$v1$")) {
+		throw new Error("Stored SCIM token envelope is invalid");
+	}
+	return stored.startsWith("clrkm$v1$")
+		? b.keyManagement.openText(
+				"scim-bearer-token",
+				b.keyManagement.resourceId("scim-bearer-token", {
+					providerId: row.providerId,
+					organizationId: row.organizationId,
+				}),
+				stored,
+			)
+		: decryptRuntimeCredential(stored, process.env.CLEARANCE_SECRET!);
+}
+
+async function sealScimBaseToken(
+	b: ClearanceAuthBundle,
+	input: { providerId: string; organizationId?: string },
+	baseToken: string,
+): Promise<string> {
+	return `${SCIM_TOKEN_ENVELOPE_PREFIX}${await b.keyManagement.sealText(
+		"scim-bearer-token",
+		b.keyManagement.resourceId("scim-bearer-token", {
+			providerId: input.providerId,
+			organizationId: input.organizationId ?? null,
+		}),
+		baseToken,
+	)}`;
+}
+
 function assertScimRowScope(
 	row: ScimProviderRow,
 	input: { providerId: string; organizationId?: string },
@@ -796,8 +843,6 @@ export async function insertScimProvider(input: {
 }): Promise<{ id: string; token: string; reused?: boolean }> {
 	const b = getAuthBundle();
 	const id = input.id ?? newId("scim").replace(/^scim_/, "scim");
-	const secret = process.env.CLEARANCE_SECRET;
-	if (!secret) throw new Error("CLEARANCE_SECRET is required to encrypt SCIM tokens");
 
 	const loadById = async (lookupId: string): Promise<ScimProviderRow | null> => {
 		const r = await b.pool.query(
@@ -834,7 +879,7 @@ export async function insertScimProvider(input: {
 			}
 			assertScimRowScope(existing, input);
 			// Decrypt only in-memory for one-time handoff reconstruction.
-			const baseToken = await decryptRuntimeCredential(existing.scimToken, secret);
+			const baseToken = await openScimBaseToken(b, existing);
 			const token = await scimBearerFromStoredBase(
 				baseToken,
 				existing.providerId,
@@ -850,7 +895,7 @@ export async function insertScimProvider(input: {
 		input.providerId,
 		input.organizationId,
 	);
-	const storedToken = await encryptRuntimeCredential(baseToken, secret);
+	const storedToken = await sealScimBaseToken(b, input, baseToken);
 
 	try {
 		await b.pool.query(
@@ -864,7 +909,7 @@ export async function insertScimProvider(input: {
 			(await loadById(id)) ?? (await loadByProviderId(input.providerId));
 		if (!raced || raced.id !== id) throw err;
 		assertScimRowScope(raced, input);
-		const base = await decryptRuntimeCredential(raced.scimToken, secret);
+		const base = await openScimBaseToken(b, raced);
 		const recovered = await scimBearerFromStoredBase(
 			base,
 			raced.providerId,
