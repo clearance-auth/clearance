@@ -243,4 +243,94 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 			await admin.query(`DROP SCHEMA IF EXISTS "${customSchema}" CASCADE; DROP SCHEMA IF EXISTS "${partialSchema}" CASCADE`);
 		}
 	});
+
+	it("creates digest-only service-account credentials, rotates them, and derives the exact sorted action union", async () => {
+		const organizationId = "org_service_account";
+		const serviceAccountId = "service_account_7c";
+		await authority.initializeOrganization({ organizationId });
+		await authority.upsertRole({
+			role: { roleId: "role.service.account.one", organizationId, slug: "service-account-one", name: "Service account one", description: null, builtIn: false, status: "active" },
+			actions: ["service:audit", "service:read"],
+		});
+		await authority.upsertRole({
+			role: { roleId: "role.service.account.two", organizationId, slug: "service-account-two", name: "Service account two", description: null, builtIn: false, status: "active" },
+			actions: ["service:read", "service:write"],
+		});
+		await expect(authority.createServiceAccount({ organizationId, serviceAccountId, name: "Release automation", roleIds: ["role.service.account.two", "role.service.account.one"] })).resolves.toMatchObject({
+			serviceAccount: { organizationId, serviceAccountId, name: "Release automation", status: "active" },
+		});
+		const created = await authority.createServiceAccountCredential({ organizationId, serviceAccountId, credentialId: "credential_7c" });
+		expect(created.secret).toMatch(/^clr_sac_v1_[A-Za-z0-9_-]{43}$/);
+		const stored = await pool.query<{ credential_digest: string; credential_prefix: string; credential_fingerprint: string }>(`SELECT "credentialDigest" AS credential_digest, "credentialPrefix" AS credential_prefix, "credentialFingerprint" AS credential_fingerprint FROM ${n("service_account_credentials")} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "credentialId" = $4`, [identity.projectId, identity.environmentId, organizationId, "credential_7c"]);
+		expect(stored.rows).toHaveLength(1);
+		expect(stored.rows[0]).toMatchObject({ credential_digest: expect.stringMatching(/^v1:[a-f0-9]{64}$/), credential_prefix: "clr_sac_v1", credential_fingerprint: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/) });
+		expect(JSON.stringify(stored.rows[0])).not.toContain(created.secret);
+		await expect(authority.authenticateServiceAccountCredential({ secret: created.secret })).resolves.toMatchObject({
+			organizationId,
+			subject: { kind: "service_account", id: serviceAccountId },
+			roleIds: ["role.service.account.one", "role.service.account.two"],
+			actions: ["service:audit", "service:read", "service:write"],
+		});
+		const rotated = await authority.rotateServiceAccountCredential({ organizationId, serviceAccountId, credentialId: "credential_7c" });
+		expect(rotated.credential.version).toBe(2);
+		await expect(authority.authenticateServiceAccountCredential({ secret: created.secret })).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+		await expect(authority.authenticateServiceAccountCredential({ secret: rotated.secret })).resolves.toMatchObject({ credential: { credentialId: rotated.credential.credentialId, version: 2 } });
+		const disabled = await authority.setServiceAccountStatus({ organizationId, serviceAccountId, status: "disabled" });
+		expect(BigInt(disabled.revision)).toBeGreaterThan(BigInt(rotated.revision));
+		await expect(authority.authenticateServiceAccountCredential({ secret: rotated.secret })).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+		await authority.setServiceAccountStatus({ organizationId, serviceAccountId, status: "active" });
+		const revoked = await authority.revokeServiceAccountCredential({ organizationId, serviceAccountId, credentialId: rotated.credential.credentialId });
+		expect(BigInt(revoked.revision)).toBeGreaterThan(BigInt(revoked.previousRevision));
+		await expect(authority.authenticateServiceAccountCredential({ secret: rotated.secret })).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+	});
+
+	it("rejects cross-organization service-account mutations and rolls back callers atomically", async () => {
+		const organizationId = "org_service_account_rollback";
+		const otherOrganizationId = "org_service_account_other";
+		await authority.initializeOrganization({ organizationId });
+		await authority.initializeOrganization({ organizationId: otherOrganizationId });
+		await authority.upsertRole({
+			role: { roleId: "role.service.account.other", organizationId: otherOrganizationId, slug: "service-account-other", name: "Other service role", description: null, builtIn: false, status: "active" },
+			actions: ["service:other"],
+		});
+		await authority.createServiceAccount({ organizationId: otherOrganizationId, serviceAccountId: "service_cross_org", name: "Other organization account", roleIds: ["role.service.account.other"] });
+		await expect(authority.createServiceAccount({ organizationId, serviceAccountId: "service_cross_org", name: "Cross organization", roleIds: ["role.service.account.other"] })).rejects.toMatchObject({ code: "AUTHORIZATION_ROLE_SCOPE_MISMATCH" });
+		await expect(authority.createServiceAccountCredential({ organizationId, serviceAccountId: "service_cross_org" })).rejects.toMatchObject({ code: "AUTHORIZATION_SERVICE_ACCOUNT_NOT_FOUND" });
+		const foreignAuthority = new PostgresAuthorizationAuthority(pool, {
+			projectId: "project_service_account_foreign",
+			environmentId: identity.environmentId,
+			schema,
+		});
+		await foreignAuthority.initializeOrganization({ organizationId });
+		await foreignAuthority.createServiceAccount({
+			organizationId,
+			serviceAccountId: "service_foreign_scope",
+			name: "Foreign scope account",
+			roleIds: ["role_builtin_member"],
+		});
+		const foreignCredential = await foreignAuthority.createServiceAccountCredential({
+			organizationId,
+			serviceAccountId: "service_foreign_scope",
+		});
+		await expect(
+			authority.authenticateServiceAccountCredential({ secret: foreignCredential.secret }),
+		).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+		await expect(
+			foreignAuthority.authenticateServiceAccountCredential({ secret: foreignCredential.secret }),
+		).resolves.toMatchObject({
+			projectId: "project_service_account_foreign",
+			organizationId,
+			actions: ["ac:read"],
+		});
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await authority.createServiceAccount({ organizationId, serviceAccountId: "service_rolled_back", name: "Rolled back", roleIds: [], transaction: { rawTransactionQuery: client.query.bind(client) } });
+			await client.query("ROLLBACK");
+		} finally {
+			client.release();
+		}
+		await expect(authority.listServiceAccounts({ organizationId })).resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ serviceAccountId: "service_rolled_back" })]));
+		await expect(authority.readEffective({ organizationId, subject: { kind: "principal", id: "principal_rollback_check" } })).resolves.toMatchObject({ revision: "1" });
+	});
 });
