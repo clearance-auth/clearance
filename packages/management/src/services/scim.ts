@@ -3,15 +3,22 @@ import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.j
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, DirectoryConnection, Membership, Principal } from "../types/resources.js";
 import { deleteScimProviderById } from "../auth-bridge.js";
-import { appendAuditEvent, recordEvent } from "./audit.js";
+import {
+	appendAuditEvent,
+	recordEvent,
+	type AuditEventInput,
+} from "./audit.js";
 import {
 	decryptCredential,
 	encryptCredential,
 	rotateCredential,
 } from "./credentials.js";
 import { ClearanceError } from "./errors.js";
-import { resolveEnterpriseConnection } from "./enterprise-connection-lifecycle.js";
-import { addMember, createUser, inspectOrganization } from "./core.js";
+import {
+	resolveEnterpriseConnection,
+	resolveEnterpriseConnectionAuthoritative,
+} from "./enterprise-connection-lifecycle.js";
+import { addMember, createUser, inspectOrganization, inspectOrganizationAuthoritative } from "./core.js";
 import {
 	probeOutcomeToError,
 	probeScimEndpoint,
@@ -19,6 +26,7 @@ import {
 import { publicDirectoryConnection } from "./redact.js";
 import {
 	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
 	type ResourceScope,
 } from "./scope.js";
 
@@ -49,6 +57,21 @@ export function resolveScimConnection(
 	});
 }
 
+export async function resolveScimConnectionAuthoritative(
+	store: ManagementStore,
+	id: string,
+	opts?: { scope?: ResourceScope; stage?: string },
+): Promise<DirectoryConnection> {
+	return resolveEnterpriseConnectionAuthoritative(store, id, {
+		connections: store.snapshot.directoryConnections,
+		scope: opts?.scope,
+		stage: opts?.stage ?? "scim.resolve",
+		label: "SCIM",
+		idRequiredCode: "SCIM_ID_REQUIRED",
+		notFoundCode: "SCIM_NOT_FOUND",
+	});
+}
+
 /** Public inspect — never returns encrypted bearer material. */
 export function inspectScimConnection(
 	store: ManagementStore,
@@ -62,19 +85,34 @@ export function inspectScimConnection(
 	return publicDirectoryConnection(conn) as DirectoryConnection;
 }
 
-export function createScimConnection(
+export async function inspectScimConnectionAuthoritative(
 	store: ManagementStore,
-	input: {
-		organizationId: string;
-		provider: string;
-		endpoint?: string;
-		bearerToken?: string;
-		deprovisioningPolicy?: DirectoryConnection["deprovisioningPolicy"];
-		actor?: string;
-		source?: ScimActorSource;
-	},
+	id: string,
+	opts?: { scope?: ResourceScope },
+): Promise<DirectoryConnection> {
+	const conn = await resolveScimConnectionAuthoritative(store, id, {
+		scope: opts?.scope,
+		stage: "scim.inspect",
+	});
+	return publicDirectoryConnection(conn) as DirectoryConnection;
+}
+
+type CreateScimConnectionInput = {
+	organizationId: string;
+	provider: string;
+	endpoint?: string;
+	bearerToken?: string;
+	deprovisioningPolicy?: DirectoryConnection["deprovisioningPolicy"];
+	actor?: string;
+	source?: ScimActorSource;
+	/** Server-derived request scope for relational authority. */
+	scope?: ResourceScope;
+};
+
+function buildScimConnection(
+	input: CreateScimConnectionInput,
+	org: { id: string; projectId: string; environmentId: string },
 ): DirectoryConnection {
-	const org = inspectOrganization(store, input.organizationId);
 	const now = nowIso();
 	const token =
 		input.bearerToken ??
@@ -93,10 +131,15 @@ export function createScimConnection(
 		createdAt: now,
 		updatedAt: now,
 	};
-	store.mutate((data) => {
-		data.directoryConnections.push(conn);
-	});
-	recordEvent(store, {
+	return conn;
+}
+
+function scimCreateAuditInput(
+	conn: DirectoryConnection,
+	input: CreateScimConnectionInput,
+	org: { id: string; projectId: string; environmentId: string },
+): AuditEventInput {
+	return {
 		actor: input.actor ?? "operator",
 		action: "scim.create",
 		subjectType: "directory_connection",
@@ -108,12 +151,57 @@ export function createScimConnection(
 		environmentId: org.environmentId,
 		message: `Created SCIM connection for ${input.provider}`,
 		metadata: {
-			bearerTokenFingerprint: enc.fingerprint,
-			bearerTokenKeyId: enc.keyId,
+			bearerTokenFingerprint: conn.bearerTokenFingerprint,
+			bearerTokenKeyId: conn.bearerTokenKeyId,
 			// never: token
 		},
+	};
+}
+
+export function createScimConnection(
+	store: ManagementStore,
+	input: CreateScimConnectionInput,
+): DirectoryConnection {
+	const organization = inspectOrganization(store, input.organizationId);
+	const connection = buildScimConnection(input, organization);
+	store.mutate((data) => {
+		data.directoryConnections.push(connection);
 	});
-	return publicDirectoryConnection(conn) as DirectoryConnection;
+	recordEvent(store, scimCreateAuditInput(connection, input, organization));
+	return publicDirectoryConnection(connection) as DirectoryConnection;
+}
+
+export async function createScimConnectionAuthoritative(
+	store: ManagementStore,
+	input: CreateScimConnectionInput,
+): Promise<DirectoryConnection> {
+	if (!store.storeV2Topology?.authoritative) return createScimConnection(store, input);
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+			message: "Relational topology authority requires a coordinated transaction",
+			stage: "scim.create",
+			status: 500,
+		});
+	}
+	const scope = input.scope ?? await resolveOperatorScopeAuthoritative(store);
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const organization = topology
+			? await topology.lockOrganization({ scope, id: input.organizationId })
+			: null;
+		if (!organization || organization.status === "archived") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.inspect",
+				status: 404,
+			});
+		}
+		const connection = buildScimConnection(input, organization);
+		data.directoryConnections.push(connection);
+		appendAudit(scimCreateAuditInput(connection, input, organization));
+		return publicDirectoryConnection(connection) as DirectoryConnection;
+	});
 }
 
 export function listScimConnections(
@@ -132,16 +220,13 @@ export function listScimConnections(
  * Plaintext token is preserved; only AEAD envelope / fingerprint metadata change.
  * Never returns encrypted material — fingerprints only.
  */
-export function rotateScimCredential(
+function rotateScimCredentialResolved(
 	store: ManagementStore,
-	id: string,
+	conn: DirectoryConnection,
+	org: { id: string; projectId: string; environmentId: string },
 	opts?: ScimMutationOpts,
 ): DirectoryConnection {
 	const stage = "scim.rotate";
-	const conn = resolveScimConnection(store, id, {
-		scope: opts?.scope,
-		stage,
-	});
 	if (!conn.bearerTokenEncrypted) {
 		throw new ClearanceError({
 			code: "SCIM_NO_TOKEN",
@@ -151,11 +236,6 @@ export function rotateScimCredential(
 			remediation: "Recreate the SCIM connection to mint a bearer token",
 		});
 	}
-	const org = inspectOrganization(
-		store,
-		conn.organizationId,
-		opts?.scope ?? resolveOperatorScope(store),
-	);
 	const rotated = rotateCredential(conn.bearerTokenEncrypted);
 	const now = nowIso();
 	let result: DirectoryConnection | undefined;
@@ -205,6 +285,87 @@ export function rotateScimCredential(
 		});
 	}
 	return result;
+}
+
+export function rotateScimCredential(store: ManagementStore, id: string, opts?: ScimMutationOpts): DirectoryConnection {
+	const connection = resolveScimConnection(store, id, { scope: opts?.scope, stage: "scim.rotate" });
+	const organization = inspectOrganization(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
+	return rotateScimCredentialResolved(store, connection, organization, opts);
+}
+
+export async function rotateScimCredentialAuthoritative(
+	store: ManagementStore,
+	id: string,
+	opts?: ScimMutationOpts,
+): Promise<DirectoryConnection> {
+	if (!store.storeV2Topology?.authoritative) {
+		return rotateScimCredential(store, id, opts);
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+			message: "Relational topology authority requires a coordinated transaction",
+			stage: "scim.rotate",
+			status: 500,
+		});
+	}
+	const connectionId = id?.trim();
+	if (!connectionId) {
+		throw new ClearanceError({
+			code: "SCIM_ID_REQUIRED",
+			message: "SCIM connection id is required",
+			stage: "scim.rotate",
+			status: 400,
+		});
+	}
+	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const index = data.directoryConnections.findIndex((connection) => connection.id === connectionId);
+		const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+		const organization = connection && topology
+			? await topology.lockOrganization({ scope, id: connection.organizationId })
+			: null;
+		if (!connection || !organization || organization.status === "archived") {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${connectionId} not found`,
+				stage: "scim.rotate",
+				status: 404,
+			});
+		}
+		if (!connection.bearerTokenEncrypted) {
+			throw new ClearanceError({
+				code: "SCIM_NO_TOKEN",
+				message: "No encrypted bearer token to rotate",
+				stage: "scim.rotate",
+				status: 400,
+				remediation: "Recreate the SCIM connection to mint a bearer token",
+			});
+		}
+		const rotated = rotateCredential(connection.bearerTokenEncrypted);
+		const updated: DirectoryConnection = {
+			...connection,
+			bearerTokenEncrypted: rotated.ciphertext,
+			bearerTokenKeyId: rotated.keyId,
+			bearerTokenFingerprint: rotated.fingerprint,
+			updatedAt: nowIso(),
+		};
+		data.directoryConnections[index] = updated;
+		appendAudit({
+			actor: opts?.actor ?? "operator",
+			action: "scim.rotate",
+			subjectType: "directory_connection",
+			subjectId: connectionId,
+			outcome: "success",
+			source: opts?.source ?? "cli",
+			organizationId: organization.id,
+			projectId: organization.projectId,
+			environmentId: organization.environmentId,
+			message: `Rotated SCIM credential envelope for ${connectionId}`,
+			metadata: { keyId: rotated.keyId, bearerTokenFingerprint: rotated.fingerprint },
+		});
+		return publicDirectoryConnection(updated) as DirectoryConnection;
+	});
 }
 
 /**
@@ -280,6 +441,32 @@ export function disableScimConnection(
 	return result;
 }
 
+/** Management-only disable that remains topology-authoritative after cutover. */
+export async function disableScimConnectionAuthoritative(
+	store: ManagementStore,
+	id: string,
+	opts?: ScimMutationOpts,
+): Promise<{ connection: DirectoryConnection; idempotent: boolean }> {
+	if (!store.storeV2Topology?.authoritative) return disableScimConnection(store, id, opts);
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({ code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED", message: "Relational topology authority requires a coordinated transaction", stage: "scim.disable", status: 500 });
+	}
+	const connectionId = id.trim();
+	if (!connectionId) throw new ClearanceError({ code: "SCIM_ID_REQUIRED", message: "SCIM connection id is required", stage: "scim.disable", status: 400 });
+	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const index = data.directoryConnections.findIndex((connection) => connection.id === connectionId);
+		const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+		const organization = connection && topology ? await topology.lockOrganization({ scope, id: connection.organizationId }) : null;
+		if (!connection || !organization || organization.status === "archived") throw new ClearanceError({ code: "SCIM_NOT_FOUND", message: `SCIM connection ${connectionId} not found`, stage: "scim.disable", status: 404 });
+		const alreadyDisabled = connection.status === "disabled";
+		const updated = alreadyDisabled ? connection : { ...connection, status: "disabled" as const, updatedAt: nowIso() };
+		data.directoryConnections[index] = updated;
+		appendAudit({ actor: opts?.actor ?? "operator", action: "scim.disable", subjectType: "directory_connection", subjectId: connectionId, outcome: "success", source: opts?.source ?? "cli", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, message: alreadyDisabled ? `SCIM connection ${connectionId} already disabled` : `Disabled SCIM connection ${connectionId}`, metadata: { idempotent: alreadyDisabled, previousStatus: connection.status, runtimeRemoved: false } });
+		return { connection: publicDirectoryConnection(updated) as DirectoryConnection, idempotent: alreadyDisabled };
+	});
+}
+
 /**
  * Disable SCIM connection and remove the matching runtime scimProvider row.
  * Coordinated when Postgres mutateCoordinated is available.
@@ -294,11 +481,84 @@ export async function disableScimConnectionReal(
 	runtimeRemoved: boolean;
 }> {
 	const stage = "scim.disable";
-	const conn = resolveScimConnection(store, id, {
+	if (store.storeV2Topology?.authoritative) {
+		if (!store.mutateCoordinated) {
+			throw new ClearanceError({
+				code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+				message: "Relational topology authority requires a coordinated transaction",
+				stage,
+				status: 500,
+			});
+		}
+		const connectionId = id?.trim();
+		if (!connectionId) {
+			throw new ClearanceError({
+				code: "SCIM_ID_REQUIRED",
+				message: "SCIM connection id is required",
+				stage,
+				status: 400,
+			});
+		}
+		const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
+		return mutateCoordinatedWithRuntimeSql(store, async ({
+			data,
+			query,
+			topology,
+			appendAudit,
+		}) => {
+			const index = data.directoryConnections.findIndex(
+				(connection) => connection.id === connectionId,
+			);
+			const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+			const organization = connection && topology
+				? await topology.lockOrganization({ scope, id: connection.organizationId })
+				: null;
+			if (!connection || !organization || organization.status === "archived") {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: `SCIM connection ${connectionId} not found`,
+					stage,
+					status: 404,
+				});
+			}
+			const deleted = await query(`delete from "scimProvider" where id = $1`, [connectionId]);
+			const runtimeRemoved = (deleted.rowCount ?? 0) > 0;
+			const alreadyDisabled = connection.status === "disabled";
+			const updated = alreadyDisabled
+				? connection
+				: { ...connection, status: "disabled" as const, updatedAt: nowIso() };
+			data.directoryConnections[index] = updated;
+			appendAudit({
+				actor: opts?.actor ?? "operator",
+				action: "scim.disable",
+				subjectType: "directory_connection",
+				subjectId: connectionId,
+				outcome: "success",
+				source: opts?.source ?? "cli",
+				organizationId: organization.id,
+				projectId: organization.projectId,
+				environmentId: organization.environmentId,
+				message: alreadyDisabled
+					? `SCIM connection ${connectionId} already disabled`
+					: `Disabled SCIM connection ${connectionId}`,
+				metadata: {
+					idempotent: alreadyDisabled && !runtimeRemoved,
+					previousStatus: connection.status,
+					runtimeRemoved,
+				},
+			});
+			return {
+				connection: publicDirectoryConnection(updated) as DirectoryConnection,
+				idempotent: alreadyDisabled && !runtimeRemoved,
+				runtimeRemoved,
+			};
+		});
+	}
+	const conn = await resolveScimConnectionAuthoritative(store, id, {
 		scope: opts?.scope,
 		stage,
 	});
-	const org = inspectOrganization(
+	const org = await inspectOrganizationAuthoritative(
 		store,
 		conn.organizationId,
 		opts?.scope ?? resolveOperatorScope(store),
@@ -388,6 +648,7 @@ export async function checkScimConnection(
 		fetchImpl?: typeof fetch;
 		actor?: string;
 		source?: ScimActorSource;
+		scope?: ResourceScope;
 	} = {},
 ): Promise<{
 	pass: boolean;
@@ -397,15 +658,7 @@ export async function checkScimConnection(
 	evidence: typeof SCIM_LOCAL_PROTOCOL_EVIDENCE;
 	externalProviderCertified: false;
 }> {
-	const conn = store.snapshot.directoryConnections.find((c) => c.id === id);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SCIM_NOT_FOUND",
-			message: `SCIM connection ${id} not found`,
-			stage: "scim.check",
-			status: 404,
-		});
-	}
+	const conn = await resolveScimConnectionAuthoritative(store, id, { scope: opts.scope, stage: "scim.check" });
 
 	const corr = `corr_scim_chk_${newId("t").slice(4)}`;
 	let token = opts.bearerToken;
@@ -595,6 +848,7 @@ export function testScimConnection(
 		fixture?: "ok" | "malformed" | "unauthorized";
 		actor?: string;
 		source?: ScimActorSource;
+		scope?: ResourceScope;
 	} = {},
 ): {
 	pass: boolean;
@@ -603,15 +857,7 @@ export function testScimConnection(
 	connection: DirectoryConnection;
 	mode: "simulation";
 } {
-	const conn = store.snapshot.directoryConnections.find((c) => c.id === id);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SCIM_NOT_FOUND",
-			message: `SCIM connection ${id} not found`,
-			stage: "scim.test",
-			status: 404,
-		});
-	}
+	const conn = resolveScimConnection(store, id, { scope: opts.scope, stage: "scim.test" });
 
 	const fixture = opts.fixture ?? "ok";
 	if (!["ok", "malformed", "unauthorized"].includes(fixture)) {
@@ -704,12 +950,15 @@ export function testScimConnection(
 					name: u.displayName ?? u.userName,
 					externalId: u.externalId,
 					source: "scim",
+					projectId: opts.scope?.projectId,
+					environmentId: opts.scope?.environmentId,
 				});
 			addMember(store, {
 				organizationId: conn.organizationId,
 				principalId: principal.id,
 				role: "member",
 				source: "scim",
+				scope: opts.scope,
 			});
 		}
 	}
@@ -780,9 +1029,12 @@ export async function testScimConnectionAuthoritative(
 		fixture?: "ok" | "malformed" | "unauthorized";
 		actor?: string;
 		source?: ScimActorSource;
+		scope?: ResourceScope;
 	} = {},
 ): Promise<ReturnType<typeof testScimConnection>> {
-	if (!store.storeV2Principals?.authoritative || opts.dryRun !== false) {
+	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
+	const principalsAuthoritative = store.storeV2Principals?.authoritative === true;
+	if (!topologyAuthoritative && !principalsAuthoritative) {
 		return testScimConnection(store, id, opts);
 	}
 	if (!store.mutateCoordinated) {
@@ -812,8 +1064,9 @@ export async function testScimConnectionAuthoritative(
 		email: user.userName,
 	}));
 	const corr = `corr_scim_${newId("t").slice(4)}`;
-	const outcome = await store.mutateCoordinated(async ({ data, principals }) => {
-		if (!principals) {
+	const organizationScope = opts.scope ?? resolveOperatorScope(store);
+	const outcome = await store.mutateCoordinated(async ({ data, principals, topology }) => {
+		if (!principals && opts.dryRun === false) {
 			throw new ClearanceError({
 				code: "STORE_V2_PRINCIPAL_TRANSACTION_REQUIRED",
 				message: "Relational principal repository is unavailable",
@@ -830,13 +1083,13 @@ export async function testScimConnectionAuthoritative(
 				status: 404,
 			});
 		}
-		const org = data.organizations.find(
-			(candidate) => candidate.id === conn.organizationId && candidate.status !== "archived",
-		);
-		if (!org) {
+		const org = topology
+			? await topology.lockOrganization({ scope: organizationScope, id: conn.organizationId })
+			: await inspectOrganizationAuthoritative(store, conn.organizationId, organizationScope);
+		if (!org || org.status === "archived") {
 			throw new ClearanceError({
-				code: "ORG_NOT_FOUND",
-				message: "Organization not found",
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${id} not found`,
 				stage: "scim.test",
 				status: 404,
 			});
@@ -887,16 +1140,44 @@ export async function testScimConnectionAuthoritative(
 				remediation: trace.remediation!,
 			};
 		}
-		const scope = { projectId: org.projectId, environmentId: org.environmentId };
+		if (opts.dryRun !== false) {
+			const trace: DiagnosticTrace = {
+				id: newId("tr"), correlationId: corr, organizationId: conn.organizationId, connectionId: conn.id,
+				subsystem: "scim", mode: SCIM_FIXTURE_MODE, stage: "sync.dry_run", outcome: "pass",
+				cause: "Dry-run proposed changes (simulation)", causeConfidence: 1, owner: "application", createdAt: timestamp,
+				checks: [{ name: "auth.bearer", pass: true }, { name: "schema", pass: true }, { name: "map_users", pass: true, detail: `${proposed.length} users` }, { name: "mode", pass: true, detail: "simulation" }],
+				redactedResponse: { proposedCount: proposed.length, dryRun: true },
+			};
+			data.traces.unshift(trace);
+			const connectionIndex = data.directoryConnections.findIndex((candidate) => candidate.id === id);
+			data.directoryConnections[connectionIndex] = { ...conn, status: "testing", updatedAt: timestamp };
+			appendAuditEvent(data, {
+				actor: opts.actor ?? "system", action: "scim.test", subjectType: "directory_connection", subjectId: id,
+				outcome: "success", source: opts.source ?? "scim", projectId: org.projectId, environmentId: org.environmentId,
+				organizationId: conn.organizationId, correlationId: corr,
+				message: "SCIM simulation dry-run passed (not live directory conformance)",
+				metadata: { proposed, mode: SCIM_FIXTURE_MODE, fixture },
+			});
+			return { kind: "success" as const, trace: structuredClone(trace), connection: structuredClone(data.directoryConnections[connectionIndex]!) };
+		}
+		if (!principals) {
+			throw new ClearanceError({
+				code: "STORE_V2_PRINCIPAL_TRANSACTION_REQUIRED",
+				message: "Relational principal repository is unavailable",
+				stage: "scim.test",
+				status: 500,
+			});
+		}
+		const principalScope = { projectId: org.projectId, environmentId: org.environmentId };
 		for (const user of users) {
 			if (user.active === false) continue;
 			const email = user.userName.toLowerCase();
-			let principal = await principals.findActiveByEmail({ scope, email });
+			let principal = await principals.findActiveByEmail({ scope: principalScope, email });
 			if (!principal) {
 				principal = await principals.insert({
 					id: newId("user"),
-					projectId: scope.projectId,
-					environmentId: scope.environmentId,
+					projectId: principalScope.projectId,
+					environmentId: principalScope.environmentId,
 					email,
 					name: user.displayName?.trim() || email,
 					status: "active",
@@ -1058,6 +1339,63 @@ export function inspectScimTrace(
 }
 
 /**
+ * Authority-aware counterpart to inspectScimTrace. Trace and connection
+ * envelopes remain management records; their organization boundary comes from
+ * normalized topology after cutover. JSON callers intentionally retain the
+ * synchronous implementation above.
+ */
+export async function inspectScimTraceAuthoritative(
+	store: ManagementStore,
+	traceId: string,
+	opts?: { scope?: ResourceScope },
+): Promise<DiagnosticTrace> {
+	if (!store.storeV2Topology?.authoritative) {
+		return inspectScimTrace(store, traceId, opts);
+	}
+	const stage = "scim.replay";
+	const id = traceId?.trim();
+	if (!id) {
+		throw new ClearanceError({
+			code: "TRACE_ID_REQUIRED",
+			message: "SCIM trace id is required",
+			stage,
+			status: 400,
+		});
+	}
+	const original = store.snapshot.traces.find((trace) => trace.id === id);
+	if (!original || original.subsystem !== "scim") {
+		throw new ClearanceError({
+			code: "TRACE_NOT_FOUND",
+			message: `SCIM trace ${id} not found`,
+			stage,
+			status: 404,
+		});
+	}
+	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
+	if (original.connectionId) {
+		await resolveScimConnectionAuthoritative(store, original.connectionId, {
+			scope,
+			stage,
+		});
+	} else if (original.organizationId) {
+		await inspectOrganizationAuthoritative(store, original.organizationId, scope);
+	} else if (
+		original.projectId &&
+		original.environmentId &&
+		(original.projectId !== scope.projectId ||
+			original.environmentId !== scope.environmentId)
+	) {
+		throw new ClearanceError({
+			code: "TRACE_NOT_FOUND",
+			message: `SCIM trace ${id} not found`,
+			stage,
+			status: 404,
+		});
+	}
+	return original;
+}
+
+/**
  * Replay a SCIM diagnostic trace under principal-derived scope.
  * Writes a new trace row + audit; never mutates directory connections or tokens.
  */
@@ -1124,4 +1462,103 @@ export function replayScimTrace(
 		});
 	}
 	return replay;
+}
+
+/**
+ * Re-record a trace with normalized-topology authority. The target is checked
+ * once for preview and again from the transaction draft before trace/audit
+ * mutation, so an archived or cross-scope organization cannot race replay.
+ */
+export async function replayScimTraceAuthoritative(
+	store: ManagementStore,
+	traceId: string,
+	opts?: ScimMutationOpts,
+): Promise<DiagnosticTrace> {
+	if (!store.storeV2Topology?.authoritative) {
+		return replayScimTrace(store, traceId, opts);
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+			message: "Relational topology authority requires a coordinated transaction",
+			stage: "scim.replay",
+			status: 500,
+		});
+	}
+	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
+	const original = await inspectScimTraceAuthoritative(store, traceId, { scope });
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const current = data.traces.find((trace) => trace.id === original.id);
+		if (!current || current.subsystem !== "scim") {
+			throw new ClearanceError({
+				code: "TRACE_NOT_FOUND",
+				message: `SCIM trace ${original.id} not found`,
+				stage: "scim.replay",
+				status: 404,
+			});
+		}
+
+		if (current.connectionId) {
+			const connection = data.directoryConnections.find(
+				(candidate) => candidate.id === current.connectionId,
+			);
+			const organization = connection && topology
+				? await topology.lockOrganization({ scope, id: connection.organizationId })
+				: null;
+			if (!organization || organization.status === "archived") {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: `SCIM connection ${current.connectionId} not found`,
+					stage: "scim.replay",
+					status: 404,
+				});
+			}
+		} else if (current.organizationId) {
+			const organization = topology
+				? await topology.lockOrganization({ scope, id: current.organizationId })
+				: null;
+			if (!organization || organization.status === "archived") {
+				throw new ClearanceError({
+					code: "TRACE_NOT_FOUND",
+					message: `SCIM trace ${current.id} not found`,
+					stage: "scim.replay",
+					status: 404,
+				});
+			}
+		} else if (
+			current.projectId !== scope.projectId ||
+			current.environmentId !== scope.environmentId
+		) {
+			throw new ClearanceError({
+				code: "TRACE_NOT_FOUND",
+				message: `SCIM trace ${current.id} not found`,
+				stage: "scim.replay",
+				status: 404,
+			});
+		}
+
+		const next: DiagnosticTrace = {
+			...current,
+			id: newId("tr"),
+			correlationId: `corr_replay_${newId("t").slice(4)}`,
+			createdAt: nowIso(),
+			stage: `${current.stage}.replay`,
+		};
+		data.traces.unshift(next);
+		if (data.traces.length > 2000) data.traces.length = 2000;
+		appendAudit({
+			actor: opts?.actor ?? "operator",
+			action: "scim.replay",
+			subjectType: "diagnostic_trace",
+			subjectId: next.id,
+			outcome: "success",
+			source: opts?.source ?? "cli",
+			organizationId: current.organizationId,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			message: `Replayed SCIM trace ${current.id}`,
+			metadata: { originalId: current.id, connectionId: current.connectionId ?? null },
+		});
+		return next;
+	});
 }
