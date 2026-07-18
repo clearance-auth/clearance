@@ -4,6 +4,7 @@ import { PgInstrumentation } from "@opentelemetry/instrumentation-pg";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { NodeSDK, tracing } from "@opentelemetry/sdk-node";
 import type { EnabledObservabilityConfig } from "./config";
+import { inboundOnlyTraceContextPropagator } from "./propagation";
 import { RedactingSpanExporter } from "./redaction";
 
 export interface RunningObservabilityRuntime {
@@ -47,6 +48,7 @@ export async function createObservabilityRuntime(
 		resource,
 		sampler: samplerFor(config),
 		traceExporter: exporter,
+		textMapPropagator: inboundOnlyTraceContextPropagator,
 		instrumentations: [
 			new HttpInstrumentation({
 				headersToSpanAttributes: {
