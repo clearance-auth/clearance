@@ -25,6 +25,15 @@ const secretPolicyContract: typeof import("./public-types/secret-policy.js") =
 	{} as typeof import("./secret-policy.js");
 
 declare const bundle: import("./public-types/index.js").ClearanceAuthBundle;
+const managedPolicyOptions: import("./public-types/index.js").CreateClearanceAuthOptions = {
+	baseURL: "https://auth.example.test",
+	secret: "public-contract-secret-value!!",
+	databaseUrl: "postgres://example.invalid/clearance",
+	authenticationPolicy: {
+		projectId: "project_public_contract",
+		environmentId: "environment_public_contract",
+	},
+};
 const readonlyQueryValues = ["active", 10] as const;
 
 async function assertPublicCompatibility(): Promise<void> {
@@ -50,4 +59,5 @@ void clearanceContract;
 void clientContract;
 void nodeContract;
 void secretPolicyContract;
+void managedPolicyOptions;
 void assertPublicCompatibility;
