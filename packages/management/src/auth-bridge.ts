@@ -59,7 +59,13 @@ import {
 	type MembershipActorSource,
 	type MembershipSource,
 } from "./services/members.js";
-import { resolveAssignableRole } from "./services/roles.js";
+import {
+	isBuiltInRoleSlug,
+	normalizeAndValidatePermissions,
+	resolveAssignableRole,
+	validateRoleName,
+	validateRoleSlug,
+} from "./services/roles.js";
 import {
 	inspectSession,
 	normalizeSessionLimit,
@@ -163,10 +169,7 @@ function authenticationPolicyRuntimeOptions(
 			"CLEARANCE_PROJECT_ID and CLEARANCE_ENV_ID must both be set for managed authentication policy",
 		);
 	}
-	if (projectId && environmentId) {
-		return { authenticationPolicy: { projectId, environmentId } };
-	}
-	return {};
+	return { authenticationPolicy: projectEnv() };
 }
 
 export function getAuthBundle(): ClearanceAuthBundle {
@@ -200,6 +203,9 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		enableScim: true,
 		credentialAuthority,
 		runtimeAudit: runtimeAuditOptions(),
+		...(credentialAuthority.generation === "digest-v1"
+			? { authorization: authorizationOptions() }
+			: {}),
 		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
 		...keyManagementRuntimeOptions(),
 	});
@@ -230,14 +236,24 @@ export async function ensureAuthMigrated(): Promise<void> {
 
 function projectEnv() {
 	return {
-		projectId: process.env.CLEARANCE_PROJECT_ID ?? "proj_default",
-		environmentId: process.env.CLEARANCE_ENV_ID ?? "env_default",
+		projectId: process.env.CLEARANCE_PROJECT_ID?.trim() || "proj_default",
+		environmentId: process.env.CLEARANCE_ENV_ID?.trim() || "env_default",
 	};
 }
 
 function runtimeAuditOptions() {
 	const schema = process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA?.trim();
 	const prefix = process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX?.trim();
+	return {
+		...projectEnv(),
+		...(schema ? { schema } : {}),
+		...(prefix ? { prefix } : {}),
+	};
+}
+
+function authorizationOptions() {
+	const schema = process.env.CLEARANCE_AUTHORIZATION_SCHEMA?.trim();
+	const prefix = process.env.CLEARANCE_AUTHORIZATION_PREFIX?.trim();
 	return {
 		...projectEnv(),
 		...(schema ? { schema } : {}),
@@ -1467,6 +1483,323 @@ type CoordinatedQuery = (
 	params?: unknown[],
 ) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
 
+type AuthorizationTransaction = {
+	rawTransactionQuery<Row extends Record<string, unknown>>(
+		text: string,
+		values?: readonly unknown[],
+	): Promise<{ rows: Row[]; rowCount: number | null }>;
+};
+
+type NormalizedAuthorizationRole = Readonly<{
+	roleId: string;
+	organizationId: string | null;
+	slug: string;
+	name: string;
+	description: string | null;
+	builtIn: boolean;
+	status: "active" | "disabled" | "archived";
+	actions: readonly string[];
+}>;
+
+type NormalizedAuthorizationFacade = Readonly<{
+	scope: Readonly<{ projectId: string; environmentId: string }>;
+	initializeOrganization(input: {
+		organizationId: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<{ organizationId: string; revision: string; initialized: boolean }>;
+	upsertRole(input: {
+		role: {
+			roleId: string;
+			organizationId: string | null;
+			slug: string;
+			name: string;
+			description: string | null;
+			builtIn: false;
+			status: "active" | "disabled" | "archived";
+		};
+		actions: readonly string[];
+		transaction?: AuthorizationTransaction;
+	}): Promise<{
+		changed: boolean;
+		affectedOrganizations: readonly {
+			organizationId: string;
+			previousRevision: string;
+			revision: string;
+		}[];
+	}>;
+	replaceSubjectRoles(input: {
+		organizationId: string;
+		subject: { kind: "principal"; id: string };
+		roleIds: readonly string[];
+		expectedRevision?: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<{ changed: boolean; previousRevision: string; revision: string; roleIds: readonly string[] }>;
+	listRoles(input: {
+		organizationId?: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<readonly NormalizedAuthorizationRole[]>;
+	listSubjectAssignments(input: {
+		organizationId: string;
+		subject?: { kind: "principal"; id: string };
+		transaction?: AuthorizationTransaction;
+	}): Promise<readonly {
+		organizationId: string;
+		subject: { kind: "principal" | "service_account"; id: string };
+		roleId: string;
+	}[]>;
+}>;
+
+function authorizationTransaction(query: CoordinatedQuery): AuthorizationTransaction {
+	return {
+		rawTransactionQuery: async <Row extends Record<string, unknown>>(
+			text: string,
+			values?: readonly unknown[],
+		) => query(text, values as unknown[]) as Promise<{ rows: Row[]; rowCount: number | null }>,
+	};
+}
+
+function requireAuthorizationFacade(
+	scope: ResourceScope,
+	stage: string,
+): NormalizedAuthorizationFacade {
+	const authorization = getAuthBundle().authorization as unknown as
+		| NormalizedAuthorizationFacade
+		| undefined;
+	if (!authorization) {
+		throw new ClearanceError({
+			code: "AUTHORIZATION_AUTHORITY_REQUIRED",
+			message: "Normalized authorization authority is required for this operation",
+			stage,
+			status: 500,
+			remediation: "Configure the auth runtime with the matching authorization authority scope",
+		});
+	}
+	if (
+		authorization.scope.projectId !== scope.projectId ||
+		authorization.scope.environmentId !== scope.environmentId
+	) {
+		throw new ClearanceError({
+			code: "AUTHORIZATION_AUTHORITY_SCOPE_MISMATCH",
+			message: "Normalized authorization authority scope does not match the management operation",
+			stage,
+			status: 500,
+		});
+	}
+	return authorization;
+}
+
+function customAuthorityRoleFromDraft(
+	data: DataStoreSnapshot,
+	resolved: ReturnType<typeof resolveAssignableRole>,
+	scope: ResourceScope,
+): { role: {
+	roleId: string;
+	organizationId: string | null;
+	slug: string;
+	name: string;
+	description: string | null;
+	builtIn: false;
+	status: "active" | "disabled" | "archived";
+}; actions: readonly string[] } | null {
+	if (resolved.kind === "built_in") return null;
+	const custom = (data.roles ?? []).find(
+		(candidate) =>
+			candidate.id === resolved.roleId &&
+			candidate.kind === "custom" &&
+			candidate.projectId === scope.projectId &&
+			candidate.environmentId === scope.environmentId,
+	);
+	if (!custom) {
+		throw new ClearanceError({
+			code: "ROLE_NOT_FOUND",
+			message: "Role not found",
+			stage: "authorization.role.seed",
+			status: 404,
+		});
+	}
+	return {
+		role: {
+			roleId: custom.id,
+			organizationId: custom.organizationId ?? null,
+			slug: custom.slug,
+			name: custom.name,
+			description: custom.description ?? null,
+			builtIn: false,
+			status: custom.status ?? "active",
+		},
+		actions: custom.permissions,
+	};
+}
+
+async function synchronizePrincipalAuthorization(
+	data: DataStoreSnapshot,
+	query: CoordinatedQuery,
+	input: {
+		organizationId: string;
+		principalId: string;
+		roleSlug: string;
+		scope: ResourceScope;
+		stage: string;
+		remove?: boolean;
+	},
+): Promise<{ changed: boolean; previousRevision: string; revision: string }> {
+	const authorization = requireAuthorizationFacade(input.scope, input.stage);
+	const transaction = authorizationTransaction(query);
+	await authorization.initializeOrganization({
+		organizationId: input.organizationId,
+		transaction,
+	});
+	if (input.remove) {
+		return authorization.replaceSubjectRoles({
+			organizationId: input.organizationId,
+			subject: { kind: "principal", id: input.principalId },
+			roleIds: [],
+			transaction,
+		});
+	}
+	const resolved = resolveAssignableRole({ snapshot: data } as ManagementStore, input.roleSlug, {
+		scope: input.scope,
+		organizationId: input.organizationId,
+		stage: input.stage,
+	});
+	const custom = customAuthorityRoleFromDraft(data, resolved, input.scope);
+	if (custom) await authorization.upsertRole({ ...custom, transaction });
+	return authorization.replaceSubjectRoles({
+		organizationId: input.organizationId,
+		subject: { kind: "principal", id: input.principalId },
+		roleIds: [resolved.roleId],
+		transaction,
+	});
+}
+
+/**
+ * Production organization provisioning. Runtime organization/member rows,
+ * management snapshot rows, audit records, and the normalized owner grant
+ * commit through the same Postgres transaction.
+ */
+export async function provisionOrganizationInAuth(
+	store: ManagementStore,
+	input: {
+		name: string;
+		slug?: string;
+		ownerUserId: string;
+		scope?: ResourceScope;
+		actor?: string;
+	},
+): Promise<Organization> {
+	await ensureAuthMigrated();
+	const stage = "orgs.provision";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const { mutateCoordinated } = requireCoordinatedStore(
+		store,
+		stage,
+		"ORGANIZATION_PROVISION_BACKEND",
+	);
+	const slug =
+		input.slug ??
+		input.name
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-|-$/g, "")
+			.slice(0, 48);
+	const organizationId = newId("org").replace(/^org_/, "org");
+	const ownerMembershipId = newId("mem").replace(/^mem_/, "mem");
+	const now = nowIso();
+
+	return mutateCoordinated(async ({ data, principals, query }) => {
+		const owner = await findPrincipalInScope(
+			data,
+			principals,
+			input.ownerUserId,
+			scope,
+			stage,
+		);
+		await requireRuntimeUser(query, owner.id, stage);
+		if (
+			data.organizations.some(
+				(organization) =>
+					organization.slug === slug &&
+					organization.projectId === scope.projectId &&
+					organization.environmentId === scope.environmentId &&
+					organization.status !== "archived",
+			)
+		) {
+			throw new ClearanceError({
+				code: "ORG_SLUG_EXISTS",
+				message: `Organization slug ${slug} already exists`,
+				stage,
+				status: 409,
+			});
+		}
+
+		await query(
+			`insert into organization (id, name, slug, "createdAt") values ($1, $2, $3, $4)`,
+			[organizationId, input.name, slug, new Date(now)],
+		);
+		await query(
+			`insert into member (id, "organizationId", "userId", role, "createdAt") values ($1, $2, $3, $4, $5)`,
+			[ownerMembershipId, organizationId, owner.id, "owner", new Date(now)],
+		);
+
+		const organization: Organization = {
+			id: organizationId,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			name: input.name,
+			slug,
+			status: "active",
+			createdAt: now,
+			updatedAt: now,
+		};
+		data.organizations.push(organization);
+		data.memberships.push({
+			id: ownerMembershipId,
+			organizationId,
+			principalId: owner.id,
+			role: "owner",
+			status: "active",
+			source: "manual",
+			createdAt: now,
+			updatedAt: now,
+		});
+		appendAuditEvent(data, {
+			actor: input.actor ?? owner.email,
+			action: "orgs.sync_runtime",
+			subjectType: "organization",
+			subjectId: organization.id,
+			outcome: "success",
+			source: "system",
+			organizationId: organization.id,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			message: `Synced runtime organization ${organization.slug}`,
+		});
+		appendAuditEvent(data, {
+			actor: input.actor ?? owner.email,
+			action: "orgs.members.sync_runtime",
+			subjectType: "membership",
+			subjectId: ownerMembershipId,
+			outcome: "success",
+			source: "system",
+			organizationId: organization.id,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			message: `Synced runtime owner ${owner.email}`,
+		});
+
+		const authorization = requireAuthorizationFacade(scope, stage);
+		const transaction = authorizationTransaction(query);
+		await authorization.initializeOrganization({ organizationId, transaction });
+		await authorization.replaceSubjectRoles({
+			organizationId,
+			subject: { kind: "principal", id: owner.id },
+			roleIds: ["role_builtin_owner"],
+			transaction,
+		});
+		return { ...organization };
+	});
+}
+
 type LifecycleSource = AuditEvent["source"] | "import";
 
 function requireCoordinatedStore(
@@ -2178,7 +2511,7 @@ export async function addMemberInAuth(
 	const roleInput = input.role ?? "member";
 
 	// Role validation uses current snapshot (outside TX) then re-checks scope in TX
-	const preResolved = resolveAssignableRole(store, roleInput, {
+	resolveAssignableRole(store, roleInput, {
 		scope,
 		organizationId: input.organizationId,
 		stage,
@@ -2241,6 +2574,13 @@ export async function addMemberInAuth(
 					runtimeMember.id,
 				]);
 			}
+			await synchronizePrincipalAuthorization(data, query, {
+				organizationId: org.id,
+				principalId: principal.id,
+				roleSlug: mgmtActive.role,
+				scope,
+				stage,
+			});
 			return { ...mgmtActive };
 		}
 
@@ -2281,6 +2621,13 @@ export async function addMemberInAuth(
 					reconciled: "runtime_to_management",
 				},
 			});
+			await synchronizePrincipalAuthorization(data, query, {
+				organizationId: org.id,
+				principalId: principal.id,
+				roleSlug: membership.role,
+				scope,
+				stage,
+			});
 			return membership;
 		}
 
@@ -2298,6 +2645,13 @@ export async function addMemberInAuth(
 				],
 			);
 			// No new audit — membership already existed in management
+			await synchronizePrincipalAuthorization(data, query, {
+				organizationId: org.id,
+				principalId: principal.id,
+				roleSlug: mgmtActive.role,
+				scope,
+				stage,
+			});
 			return { ...mgmtActive };
 		}
 
@@ -2337,8 +2691,13 @@ export async function addMemberInAuth(
 				principalId: principal.id,
 			},
 		});
-		// silence unused preResolved when TX re-resolves
-		void preResolved;
+		await synchronizePrincipalAuthorization(data, query, {
+			organizationId: org.id,
+			principalId: principal.id,
+			roleSlug: membership.role,
+			scope,
+			stage,
+		});
 		return membership;
 	});
 }
@@ -2426,6 +2785,13 @@ export async function updateMemberInAuth(
 			if (runtime.id !== row.id) {
 				row.id = runtime.id;
 			}
+			await synchronizePrincipalAuthorization(data, query, {
+				organizationId: org.id,
+				principalId: principal.id,
+				roleSlug: row.role,
+				scope,
+				stage,
+			});
 			return { ...row };
 		}
 
@@ -2481,6 +2847,13 @@ export async function updateMemberInAuth(
 				roleKind: resolved.kind,
 				principalId: principal.id,
 			},
+		});
+		await synchronizePrincipalAuthorization(data, query, {
+			organizationId: org.id,
+			principalId: principal.id,
+			roleSlug: row.role,
+			scope,
+			stage,
 		});
 		return membership;
 	});
@@ -2592,7 +2965,405 @@ export async function removeMemberInAuth(
 				principalId: row.principalId,
 			},
 		});
+		await synchronizePrincipalAuthorization(data, query, {
+			organizationId: org.id,
+			principalId: row.principalId,
+			roleSlug: row.role,
+			scope,
+			stage,
+			remove: true,
+		});
 		return membership;
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Normalized authorization authority bridge
+// ---------------------------------------------------------------------------
+
+const AUTHORIZATION_EPOCH = "1970-01-01T00:00:00.000Z";
+
+function customRoleToAuthorityRole(role: import("./types/resources.js").CustomRole): {
+	role: {
+		roleId: string;
+		organizationId: string | null;
+		slug: string;
+		name: string;
+		description: string | null;
+		builtIn: false;
+		status: "active" | "disabled" | "archived";
+	};
+	actions: readonly string[];
+} {
+	return {
+		role: {
+			roleId: role.id,
+			organizationId: role.organizationId ?? null,
+			slug: role.slug,
+			name: role.name,
+			description: role.description ?? null,
+			builtIn: false,
+			status: role.status ?? "active",
+		},
+		actions: role.permissions,
+	};
+}
+
+/** Read canonical roles directly from the normalized authority, never a role cache. */
+export async function listRolesFromAuth(
+	store: ManagementStore,
+	input: { organizationId?: string; scope?: ResourceScope },
+): Promise<import("./types/resources.js").CustomRole[]> {
+	await ensureAuthMigrated();
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const authorization = requireAuthorizationFacade(scope, "roles.list");
+	if (input.organizationId) {
+		findOrgInScope(store.snapshot, input.organizationId, scope, "roles.list");
+		await authorization.initializeOrganization({ organizationId: input.organizationId });
+	}
+	const shadows = new Map(
+		(store.snapshot.roles ?? []).map((role) => [role.id, role]),
+	);
+	const roles = await authorization.listRoles(
+		input.organizationId ? { organizationId: input.organizationId } : {},
+	);
+	const mapped = roles.map((role) => {
+		const shadow = shadows.get(role.roleId);
+		return {
+			id: role.roleId,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			name: role.name,
+			slug: role.slug,
+			...(role.description ? { description: role.description } : {}),
+			permissions: [...role.actions],
+			kind: role.builtIn ? ("built_in" as const) : ("custom" as const),
+			...(role.organizationId ? { organizationId: role.organizationId } : {}),
+			...(role.status === "active" ? {} : { status: role.status }),
+			createdAt: shadow?.createdAt ?? AUTHORIZATION_EPOCH,
+			updatedAt: shadow?.updatedAt ?? AUTHORIZATION_EPOCH,
+		};
+	});
+	const builtInOrder = new Map([
+		["owner", 0],
+		["admin", 1],
+		["member", 2],
+	]);
+	return mapped.sort((left, right) => {
+		const leftRank = left.kind === "built_in" ? builtInOrder.get(left.slug) ?? 3 : 4;
+		const rightRank = right.kind === "built_in" ? builtInOrder.get(right.slug) ?? 3 : 4;
+		if (leftRank !== rightRank) return leftRank - rightRank;
+		if (left.slug !== right.slug) return left.slug < right.slug ? -1 : 1;
+		return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+	});
+}
+
+export async function createRoleInAuth(
+	store: ManagementStore,
+	input: {
+		name: string;
+		slug?: string;
+		description?: string;
+		permissions: string[];
+		organizationId?: string;
+		projectId?: string;
+		environmentId?: string;
+		actor?: string;
+		source?: "cli" | "console" | "api";
+		scope?: ResourceScope;
+	},
+): Promise<import("./types/resources.js").CustomRole> {
+	await ensureAuthMigrated();
+	const scope = input.scope ?? resolveOperatorScope(store, {
+		projectId: input.projectId,
+		environmentId: input.environmentId,
+	});
+	const stage = "roles.create";
+	const name = validateRoleName(input.name, stage);
+	const slug = validateRoleSlug(input.slug?.trim() ? input.slug : name, stage);
+	const permissions = normalizeAndValidatePermissions(input.permissions, stage);
+	const description = typeof input.description === "string" && input.description.trim()
+		? input.description.trim().slice(0, 256)
+		: undefined;
+	if (input.organizationId) findOrgInScope(store.snapshot, input.organizationId, scope, stage);
+	const { mutateCoordinated } = requireCoordinatedStore(
+		store,
+		stage,
+		"ROLE_LIFECYCLE_BACKEND",
+	);
+	return mutateCoordinated(async ({ data, query }) => {
+		const authorization = requireAuthorizationFacade(scope, stage);
+		if (input.organizationId) findOrgInScope(data, input.organizationId, scope, stage);
+		if (!Array.isArray(data.roles)) data.roles = [];
+		const conflict = data.roles.find(
+			(role) =>
+				role.slug === slug &&
+				role.projectId === scope.projectId &&
+				role.environmentId === scope.environmentId,
+		);
+		if (conflict) {
+			throw new ClearanceError({
+				code: "ROLE_EXISTS",
+				message: `Role slug "${slug}" already exists in this scope`,
+				stage,
+				status: 409,
+			});
+		}
+		const now = nowIso();
+		const role: import("./types/resources.js").CustomRole = {
+			id: newId("role"),
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			name,
+			slug,
+			...(description ? { description } : {}),
+			permissions,
+			kind: "custom",
+			...(input.organizationId ? { organizationId: input.organizationId } : {}),
+			createdAt: now,
+			updatedAt: now,
+		};
+		await authorization.upsertRole({
+			...customRoleToAuthorityRole(role),
+			transaction: authorizationTransaction(query),
+		});
+		data.roles.push(role);
+		appendAuditEvent(data, {
+			actor: input.actor ?? "operator",
+			action: "roles.create",
+			subjectType: "role",
+			subjectId: role.id,
+			outcome: "success",
+			source: input.source ?? "cli",
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			...(input.organizationId ? { organizationId: input.organizationId } : {}),
+			message: `Created role ${role.slug}`,
+			metadata: { slug: role.slug, permissionCount: role.permissions.length, permissions: role.permissions },
+		});
+		return { ...role, permissions: [...role.permissions] };
+	});
+}
+
+export async function updateRoleInAuth(
+	store: ManagementStore,
+	id: string,
+	input: {
+		name?: string;
+		description?: string | null;
+		permissions?: string[];
+		actor?: string;
+		source?: "cli" | "console" | "api";
+		scope?: ResourceScope;
+	},
+): Promise<import("./types/resources.js").CustomRole> {
+	await ensureAuthMigrated();
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const stage = "roles.update";
+	if (id.startsWith("role_builtin_") || isBuiltInRoleSlug(id.replace(/^role_builtin_/, ""))) {
+		throw new ClearanceError({
+			code: "ROLE_BUILT_IN",
+			message: "Built-in roles cannot be updated",
+			stage,
+			status: 403,
+		});
+	}
+	const hasName = input.name !== undefined;
+	const hasDescription = input.description !== undefined;
+	const hasPermissions = input.permissions !== undefined;
+	if (!hasName && !hasDescription && !hasPermissions) {
+		throw new ClearanceError({
+			code: "ROLE_UPDATE_EMPTY",
+			message: "At least one of name, description, or permissions is required",
+			stage,
+			status: 400,
+		});
+	}
+	const name = hasName ? validateRoleName(input.name, stage) : undefined;
+	const permissions = hasPermissions
+		? normalizeAndValidatePermissions(input.permissions, stage)
+		: undefined;
+	const description = hasDescription
+		? input.description === null ||
+			(typeof input.description === "string" && !input.description.trim())
+			? null
+			: String(input.description).trim().slice(0, 256)
+		: undefined;
+	const { mutateCoordinated } = requireCoordinatedStore(
+		store,
+		stage,
+		"ROLE_LIFECYCLE_BACKEND",
+	);
+	return mutateCoordinated(async ({ data, query }) => {
+		const authorization = requireAuthorizationFacade(scope, stage);
+		const role = (data.roles ?? []).find((candidate) => candidate.id === id);
+		if (!role || role.kind === "built_in") {
+			throw new ClearanceError({
+				code: role?.kind === "built_in" ? "ROLE_BUILT_IN" : "ROLE_NOT_FOUND",
+				message: role?.kind === "built_in" ? "Built-in roles cannot be updated" : "Role not found",
+				stage,
+				status: role?.kind === "built_in" ? 403 : 404,
+			});
+		}
+		assertResourceInScope(role, scope, { code: "ROLE_NOT_FOUND", stage, label: "Role" });
+		if (name !== undefined) role.name = name;
+		if (description !== undefined) {
+			if (description === null) delete role.description;
+			else role.description = description;
+		}
+		if (permissions !== undefined) role.permissions = permissions;
+		role.updatedAt = nowIso();
+		await authorization.upsertRole({
+			...customRoleToAuthorityRole(role),
+			transaction: authorizationTransaction(query),
+		});
+		appendAuditEvent(data, {
+			actor: input.actor ?? "operator",
+			action: "roles.update",
+			subjectType: "role",
+			subjectId: role.id,
+			outcome: "success",
+			source: input.source ?? "cli",
+			projectId: role.projectId,
+			environmentId: role.environmentId,
+			...(role.organizationId ? { organizationId: role.organizationId } : {}),
+			message: `Updated role ${role.slug}`,
+			metadata: {
+				slug: role.slug,
+				fields: [
+					...(hasName ? ["name"] : []),
+					...(hasDescription ? ["description"] : []),
+					...(hasPermissions ? ["permissions"] : []),
+				],
+				permissionCount: role.permissions.length,
+				...(hasPermissions ? { permissions: role.permissions } : {}),
+			},
+		});
+		return { ...role, permissions: [...role.permissions] };
+	});
+}
+
+/**
+ * Bounded migration/doctor primitive: reconcile only one organization's active
+ * legacy memberships. It never enumerates principals or other organizations.
+ */
+export async function reconcileAuthorizationOrganizationInAuth(
+	store: ManagementStore,
+	input: {
+		organizationId: string;
+		scope?: ResourceScope;
+		actor?: string;
+		auditSource?: MembershipActorSource;
+	},
+): Promise<{
+	organizationId: string;
+	initialized: boolean;
+	rolesChanged: number;
+	assignmentsChanged: number;
+	revision: string;
+}> {
+	await ensureAuthMigrated();
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const stage = "authorization.reconcile";
+	const { mutateCoordinated } = requireCoordinatedStore(
+		store,
+		stage,
+		"AUTHORIZATION_RECONCILE_BACKEND",
+	);
+	return mutateCoordinated(async ({ data, query }) => {
+		const org = findOrgInScope(data, input.organizationId, scope, stage);
+		const authorization = requireAuthorizationFacade(scope, stage);
+		const transaction = authorizationTransaction(query);
+		const initialized = await authorization.initializeOrganization({
+			organizationId: org.id,
+			transaction,
+		});
+		const memberships = data.memberships
+			.filter((membership) => membership.organizationId === org.id && membership.status === "active")
+			.slice()
+			.sort((left, right) => left.principalId.localeCompare(right.principalId));
+		const membershipRoles = memberships.map((membership) => ({
+			membership,
+			resolved: resolveAssignableRole({ snapshot: data } as ManagementStore, membership.role, {
+				scope,
+				organizationId: org.id,
+				stage,
+			}),
+		}));
+		const rolesById = new Map(
+			membershipRoles.map(({ resolved }) => [resolved.roleId, resolved]),
+		);
+		let rolesChanged = 0;
+		let revision = initialized.revision;
+		for (const resolved of [...rolesById.values()].sort((left, right) => left.roleId.localeCompare(right.roleId))) {
+			const custom = customAuthorityRoleFromDraft(data, resolved, scope);
+			if (!custom) continue;
+			const result = await authorization.upsertRole({ ...custom, transaction });
+			if (result.changed) rolesChanged += 1;
+			const affected = result.affectedOrganizations.find(
+				(candidate) => candidate.organizationId === org.id,
+			);
+			if (affected) revision = affected.revision;
+		}
+		const currentAssignments = await authorization.listSubjectAssignments({
+			organizationId: org.id,
+			transaction,
+		});
+		const activePrincipalIds = new Set(
+			memberships.map((membership) => membership.principalId),
+		);
+		const stalePrincipalIds = new Set(
+			currentAssignments
+				.filter(
+					(assignment) =>
+						assignment.subject.kind === "principal" &&
+						!activePrincipalIds.has(assignment.subject.id),
+				)
+				.map((assignment) => assignment.subject.id),
+		);
+		let assignmentsChanged = 0;
+		for (const { membership, resolved } of membershipRoles) {
+			const result = await authorization.replaceSubjectRoles({
+				organizationId: org.id,
+				subject: { kind: "principal", id: membership.principalId },
+				roleIds: [resolved.roleId],
+				transaction,
+			});
+			if (result.changed) assignmentsChanged += 1;
+			revision = result.revision;
+		}
+		for (const principalId of [...stalePrincipalIds].sort()) {
+			const result = await authorization.replaceSubjectRoles({
+				organizationId: org.id,
+				subject: { kind: "principal", id: principalId },
+				roleIds: [],
+				transaction,
+			});
+			if (result.changed) assignmentsChanged += 1;
+			revision = result.revision;
+		}
+		if (initialized.initialized || rolesChanged > 0 || assignmentsChanged > 0) {
+			appendAuditEvent(data, {
+				actor: input.actor ?? "operator",
+				action: "authorization.reconcile",
+				subjectType: "organization",
+				subjectId: org.id,
+				outcome: "success",
+				source: (input.auditSource as "cli") ?? "cli",
+				organizationId: org.id,
+				projectId: org.projectId,
+				environmentId: org.environmentId,
+				message: `Reconciled normalized authorization for ${org.name}`,
+				metadata: { rolesChanged, assignmentsChanged, revision },
+			});
+		}
+		return {
+			organizationId: org.id,
+			initialized: initialized.initialized,
+			rolesChanged,
+			assignmentsChanged,
+			revision,
+		};
 	});
 }
 
