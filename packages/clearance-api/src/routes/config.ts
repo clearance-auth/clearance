@@ -3,8 +3,8 @@ import {
 	CONFIG_OPERATIONS,
 	diffConfig,
 	publicConfig,
-	setConfig,
-	validateConfig,
+	setConfigAuthoritative,
+	validateConfigAuthoritative,
 } from "@clearance/management";
 import { Hono } from "hono";
 import type { ScopedRouteDependencies } from "./shared.js";
@@ -43,7 +43,7 @@ export function registerConfigRoutes({
 				const key = c.req.param("key");
 				const value = request.value;
 				const candidate = { ...store.snapshot.meta.config, [key]: value };
-				validateConfig(store, candidate);
+				await validateConfigAuthoritative(store, candidate);
 				if (request.dryRun === true) {
 					return c.json({
 						dryRun: true,
@@ -53,7 +53,7 @@ export function registerConfigRoutes({
 						scope,
 					});
 				}
-				const result = setConfig(store, key, value);
+				const result = await setConfigAuthoritative(store, key, value);
 				if (result.changed) await store.ready();
 				return c.json({ ok: true, changed: result.changed, key, ...publicConfig(result.config), scope });
 			} catch (error) {
@@ -66,7 +66,7 @@ export function registerConfigRoutes({
 				const scope = scopeForRequest(store, c);
 				const request = await c.req.json().catch(() => ({}));
 				const candidate = request.config ?? store.snapshot.meta.config;
-				validateConfig(store, candidate);
+				await validateConfigAuthoritative(store, candidate);
 				return c.json({
 					ok: true,
 					source: request.config === undefined ? "current" : "candidate",
@@ -82,7 +82,7 @@ export function registerConfigRoutes({
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
 				const request = await c.req.json();
-				validateConfig(store, request.config);
+				await validateConfigAuthoritative(store, request.config);
 				return c.json({ ...diffConfig(store.snapshot.meta.config, request.config), scope });
 			} catch (error) {
 				return handleError(c, error);
