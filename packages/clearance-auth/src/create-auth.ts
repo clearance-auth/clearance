@@ -70,6 +70,12 @@ import type {
 	ClearanceAuthenticationPolicyOverride,
 	ClearanceAuthenticationPolicyPlanResult,
 	ClearanceAuthenticationPolicyTransaction,
+	ClearanceKeyManagementFacade,
+	ClearanceKeyManagementMigrationCounts,
+	ClearanceKeyManagementMigrationPlan,
+	ClearanceKeyManagementMigrationResult,
+	ClearanceKeyManagementStatus,
+	ClearanceTransactionQuery,
 	ClearanceAuthenticationSecurityOptions,
 	ClearanceAuthenticationUnlockAuthorityCounts,
 	ClearanceAuthenticationUnlockKind,
@@ -97,6 +103,94 @@ const DEVELOPMENT_KEY_MANAGEMENT_SALT = Buffer.from(
 const SCIM_TOKEN_ENVELOPE_PREFIX = "clr-scim:v1:";
 const RETIRED_JWK_PRIVATE_KEY = "clr-jwk:retired:v1";
 const KEY_MANAGEMENT_MIGRATION_BATCH_SIZE = 5;
+type KeyManagementMigrationDomain = "oidcClientSecrets" | "scimTokens" | "jwks";
+type MigrationSnapshot = Readonly<{
+	id: string;
+	version: number | null;
+	revision: number | null;
+	sourceHash: string;
+}>;
+type KeyManagementMigrationBatch = Readonly<{
+	oidcClientSecrets: readonly MigrationSnapshot[];
+	scimTokens: readonly MigrationSnapshot[];
+	jwks: readonly MigrationSnapshot[];
+}>;
+type KeyManagementQuery = Pick<ClearanceTransactionQuery, "rawTransactionQuery">;
+type KeyManagementTriggerDefinition = Readonly<{
+	table: '"ssoProvider"' | '"scimProvider"' | "jwks";
+	column: '"oidcConfig"' | '"scimToken"' | '"privateKey"';
+	triggerName: string;
+	functionName: string;
+	body: string;
+}>;
+const OIDC_KEY_MANAGEMENT_TRIGGER_BODY = `
+DECLARE client_secret text; DECLARE migration_bypass boolean;
+BEGIN
+	IF NEW."oidcConfig" IS NULL THEN RETURN NEW; END IF;
+	migration_bypass := current_setting('clearance.key_management_migration', true) = 'v1';
+	BEGIN client_secret := (NEW."oidcConfig"::jsonb)->>'clientSecret';
+	EXCEPTION WHEN others THEN
+		RAISE EXCEPTION 'OIDC configuration must be valid managed JSON' USING ERRCODE = '23514';
+	END;
+	IF client_secret IS NOT NULL AND client_secret <> '' AND
+		left(client_secret, length('clr-sso:v1:clrkm$v1$')) <> 'clr-sso:v1:clrkm$v1$' THEN
+		RAISE EXCEPTION 'OIDC client secret must use purpose-separated storage' USING ERRCODE = '23514';
+	END IF;
+	IF migration_bypass THEN RETURN NEW; END IF;
+	IF TG_OP = 'INSERT' OR OLD."oidcConfig" IS NULL THEN
+		IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
+			RAISE EXCEPTION 'OIDC key generation is invalid' USING ERRCODE = '23514';
+		END IF;
+	ELSIF NEW."oidcConfig" IS DISTINCT FROM OLD."oidcConfig" AND (
+		OLD."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
+		OLD."keyManagementRevision" IS NULL OR NEW."keyManagementRevision" IS DISTINCT FROM OLD."keyManagementRevision" + 1
+	) THEN RAISE EXCEPTION 'OIDC key revision did not advance' USING ERRCODE = '23514';
+	END IF;
+	RETURN NEW;
+END`.trim();
+const SCIM_KEY_MANAGEMENT_TRIGGER_BODY = `
+DECLARE migration_bypass boolean;
+BEGIN
+	migration_bypass := current_setting('clearance.key_management_migration', true) = 'v1';
+	IF left(NEW."scimToken", length('clr-scim:v1:clrkm$v1$')) <> 'clr-scim:v1:clrkm$v1$' THEN
+		RAISE EXCEPTION 'SCIM token must use purpose-separated storage' USING ERRCODE = '23514';
+	END IF;
+	IF migration_bypass THEN RETURN NEW; END IF;
+	IF TG_OP = 'INSERT' THEN
+		IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
+			RAISE EXCEPTION 'SCIM key generation is invalid' USING ERRCODE = '23514';
+		END IF;
+	ELSIF NEW."scimToken" IS DISTINCT FROM OLD."scimToken" AND (
+		OLD."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
+		OLD."keyManagementRevision" IS NULL OR NEW."keyManagementRevision" IS DISTINCT FROM OLD."keyManagementRevision" + 1
+	) THEN RAISE EXCEPTION 'SCIM key revision did not advance' USING ERRCODE = '23514';
+	END IF;
+	RETURN NEW;
+END`.trim();
+const JWKS_KEY_MANAGEMENT_TRIGGER_BODY = `
+DECLARE migration_bypass boolean;
+BEGIN
+	migration_bypass := current_setting('clearance.key_management_migration', true) = 'v1';
+	IF NEW."privateKey" <> 'clr-jwk:retired:v1' AND left(NEW."privateKey", length('clrkm$v1$')) <> 'clrkm$v1$' THEN
+		RAISE EXCEPTION 'JWT private key must use purpose-separated storage' USING ERRCODE = '23514';
+	END IF;
+	IF migration_bypass THEN RETURN NEW; END IF;
+	IF TG_OP = 'INSERT' THEN
+		IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
+			RAISE EXCEPTION 'JWT key generation is invalid' USING ERRCODE = '23514';
+		END IF;
+	ELSIF NEW."privateKey" IS DISTINCT FROM OLD."privateKey" AND (
+		OLD."keyManagementVersion" IS DISTINCT FROM 1 OR NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
+		OLD."keyManagementRevision" IS NULL OR NEW."keyManagementRevision" IS DISTINCT FROM OLD."keyManagementRevision" + 1
+	) THEN RAISE EXCEPTION 'JWT key revision did not advance' USING ERRCODE = '23514';
+	END IF;
+	RETURN NEW;
+END`.trim();
+const KEY_MANAGEMENT_TRIGGER_DEFINITIONS: readonly KeyManagementTriggerDefinition[] = [
+	{ table: '"ssoProvider"', column: '"oidcConfig"', triggerName: "clearance_require_oidc_key_v1", functionName: "clearance_require_oidc_key_v1", body: OIDC_KEY_MANAGEMENT_TRIGGER_BODY },
+	{ table: '"scimProvider"', column: '"scimToken"', triggerName: "clearance_require_scim_key_v1", functionName: "clearance_require_scim_key_v1", body: SCIM_KEY_MANAGEMENT_TRIGGER_BODY },
+	{ table: "jwks", column: '"privateKey"', triggerName: "clearance_require_jwt_key_v1", functionName: "clearance_require_jwt_key_v1", body: JWKS_KEY_MANAGEMENT_TRIGGER_BODY },
+] as const;
 const P256_ORDER = BigInt(
 	"0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
 );
@@ -262,6 +356,12 @@ export type {
 	ClearanceAuthenticationPolicyOverride,
 	ClearanceAuthenticationPolicyPlanResult,
 	ClearanceAuthenticationPolicyTransaction,
+	ClearanceKeyManagementFacade,
+	ClearanceKeyManagementMigrationCounts,
+	ClearanceKeyManagementMigrationPlan,
+	ClearanceKeyManagementMigrationResult,
+	ClearanceKeyManagementStatus,
+	ClearanceTransactionQuery,
 	ClearanceRuntimeMigrationPlan,
 	ClearanceRuntimeMigrationResult,
 	ClearanceRuntimeUser,
@@ -736,7 +836,7 @@ export function createClearanceAuth<
 		validateDurableDeliveryUrl(options.baseURL, "baseURL", strict);
 	}
 	const keyManagement = resolveProductKeyManagement(options, strict);
-	const keyManagementFacade = Object.freeze({
+	const keyManagementFacade: ClearanceKeyManagementFacade = Object.freeze({
 		scope: Object.freeze({
 			projectId: keyManagement.projectId,
 			environmentId: keyManagement.environmentId,
@@ -770,6 +870,9 @@ export function createClearanceAuth<
 			).toString("utf8");
 		},
 		readiness: () => keyManagement.registry.readiness(),
+		status: () => keyManagementStatus(),
+		planMigration: () => keyManagementMigrationPlan(),
+		applyMigration: (input) => applyKeyManagementMigration(input),
 	});
 	const openManagedOrLegacyText = async (
 		purpose: KeyPurpose,
@@ -1742,13 +1845,35 @@ export function createClearanceAuth<
 		);
 	}
 
+	async function installKeyManagementTrigger(
+		client: { query: ClearanceTransactionQuery["rawTransactionQuery"] },
+		definition: KeyManagementTriggerDefinition,
+	): Promise<void> {
+		await client.query(`
+			CREATE OR REPLACE FUNCTION ${definition.functionName}()
+			RETURNS trigger LANGUAGE plpgsql AS $function$${definition.body}$function$;
+			DROP TRIGGER IF EXISTS ${definition.triggerName} ON ${definition.table};
+			CREATE TRIGGER ${definition.triggerName}
+				BEFORE INSERT OR UPDATE OF ${definition.column} ON ${definition.table}
+				FOR EACH ROW EXECUTE FUNCTION ${definition.functionName}();
+		`);
+	}
+
 	async function migratePurposeSeparatedCredentialBatch(
 		setupOnly: boolean,
-	): Promise<number> {
-		let migratedRows = 0;
-		const client = await pool.connect();
+		transaction?: KeyManagementQuery,
+		approvedBatch?: KeyManagementMigrationBatch,
+	): Promise<ClearanceKeyManagementMigrationCounts> {
+		let migratedOidcClientSecrets = 0;
+		let migratedScimTokens = 0;
+		let migratedJwks = 0;
+		const ownedClient = transaction ? undefined : await pool.connect();
+		const client: { query: ClearanceTransactionQuery["rawTransactionQuery"] } =
+			transaction
+				? { query: transaction.rawTransactionQuery.bind(transaction) }
+				: { query: ownedClient!.query.bind(ownedClient) };
 		try {
-			await client.query("BEGIN");
+			if (ownedClient) await client.query("BEGIN");
 			await client.query(
 				`SELECT pg_advisory_xact_lock(
 					hashtext(current_database()),
@@ -1797,8 +1922,16 @@ export function createClearanceAuth<
 					WHERE "oidcConfig" IS NOT NULL
 					  AND ("keyManagementVersion" IS DISTINCT FROM 1
 					       OR "keyManagementRevision" IS NULL)
-					ORDER BY id LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE}
-					FOR UPDATE SKIP LOCKED`);
+					${approvedBatch ? "AND id = ANY($1::text[])" : ""}
+					ORDER BY id ${approvedBatch ? "FOR UPDATE" : `LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE} FOR UPDATE SKIP LOCKED`}`,
+					approvedBatch
+						? [approvedBatch.oidcClientSecrets.map((snapshot) => snapshot.id)]
+						: undefined);
+				assertApprovedMigrationSnapshots(
+					"oidcClientSecrets",
+					providers.rows,
+					approvedBatch?.oidcClientSecrets,
+				);
 				for (const provider of providers.rows) {
 					let config: { clientSecret?: unknown };
 					try {
@@ -1828,7 +1961,7 @@ export function createClearanceAuth<
 								`OIDC configuration changed during key migration for provider ${provider.id}`,
 							);
 						}
-						migratedRows += 1;
+						migratedOidcClientSecrets += 1;
 						continue;
 					}
 					const resourceId = keyManagementFacade.resourceId("oidc-client-secret", {
@@ -1876,7 +2009,7 @@ export function createClearanceAuth<
 							`OIDC configuration changed during key migration for provider ${provider.id}`,
 						);
 					}
-					migratedRows += 1;
+					migratedOidcClientSecrets += 1;
 				}
 			}
 			if (!setupOnly && tables.scimProvider) {
@@ -1890,10 +2023,18 @@ export function createClearanceAuth<
 				}>(`SELECT id, "providerId", "organizationId", "scimToken",
 					       "keyManagementVersion", "keyManagementRevision"
 					FROM "scimProvider"
-					WHERE "keyManagementVersion" IS DISTINCT FROM 1
-					   OR "keyManagementRevision" IS NULL
-					ORDER BY id LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE}
-					FOR UPDATE SKIP LOCKED`);
+					WHERE ("keyManagementVersion" IS DISTINCT FROM 1
+					   OR "keyManagementRevision" IS NULL)
+					${approvedBatch ? "AND id = ANY($1::text[])" : ""}
+					ORDER BY id ${approvedBatch ? "FOR UPDATE" : `LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE} FOR UPDATE SKIP LOCKED`}`,
+					approvedBatch
+						? [approvedBatch.scimTokens.map((snapshot) => snapshot.id)]
+						: undefined);
+				assertApprovedMigrationSnapshots(
+					"scimTokens",
+					providers.rows,
+					approvedBatch?.scimTokens,
+				);
 				for (const provider of providers.rows) {
 					const resourceId = keyManagementFacade.resourceId("scim-bearer-token", {
 						providerId: provider.providerId,
@@ -1946,7 +2087,7 @@ export function createClearanceAuth<
 							`SCIM token changed during key migration for provider ${provider.id}`,
 						);
 					}
-					migratedRows += 1;
+					migratedScimTokens += 1;
 				}
 			}
 			await client.query(
@@ -1966,11 +2107,19 @@ export function createClearanceAuth<
 				? await client.query(`SELECT id, "publicKey", "privateKey", "expiresAt",
 					       "keyManagementVersion", "keyManagementRevision"
 					FROM jwks
-					WHERE "keyManagementVersion" IS DISTINCT FROM 1
-					   OR "keyManagementRevision" IS NULL
-					ORDER BY id LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE}
-					FOR UPDATE SKIP LOCKED`)
+					WHERE ("keyManagementVersion" IS DISTINCT FROM 1
+					   OR "keyManagementRevision" IS NULL)
+					${approvedBatch ? "AND id = ANY($1::text[])" : ""}
+					ORDER BY id ${approvedBatch ? "FOR UPDATE" : `LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE} FOR UPDATE SKIP LOCKED`}`,
+					approvedBatch
+						? [approvedBatch.jwks.map((snapshot) => snapshot.id)]
+						: undefined)
 				: { rows: [] };
+			assertApprovedMigrationSnapshots(
+				"jwks",
+				signingKeys.rows,
+				approvedBatch?.jwks,
+			);
 			for (const signingKey of signingKeys.rows) {
 				let migratedPrivateKey: string;
 				if (
@@ -2037,156 +2186,496 @@ export function createClearanceAuth<
 						`JWT private key changed during key migration for key ${signingKey.id}`,
 						);
 					}
-				migratedRows += 1;
+				migratedJwks += 1;
 			}
 			if (setupOnly && tables.ssoProvider) {
-				await client.query(`
-					CREATE OR REPLACE FUNCTION clearance_require_oidc_key_v1()
-					RETURNS trigger LANGUAGE plpgsql AS $function$
-					DECLARE client_secret text;
-					DECLARE migration_bypass boolean;
-					BEGIN
-						IF NEW."oidcConfig" IS NULL THEN RETURN NEW; END IF;
-						migration_bypass :=
-							current_setting('clearance.key_management_migration', true) = 'v1';
-						BEGIN
-							client_secret := (NEW."oidcConfig"::jsonb)->>'clientSecret';
-						EXCEPTION WHEN others THEN
-							RAISE EXCEPTION 'OIDC configuration must be valid managed JSON'
-								USING ERRCODE = '23514';
-						END;
-						IF client_secret IS NOT NULL AND client_secret <> '' AND
-						   left(client_secret, length('clr-sso:v1:clrkm$v1$')) <>
-						   'clr-sso:v1:clrkm$v1$' THEN
-							RAISE EXCEPTION 'OIDC client secret must use purpose-separated storage'
-								USING ERRCODE = '23514';
-						END IF;
-						IF migration_bypass THEN RETURN NEW; END IF;
-						IF TG_OP = 'INSERT' OR OLD."oidcConfig" IS NULL THEN
-							IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							   NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
-								RAISE EXCEPTION 'OIDC key generation is invalid'
-									USING ERRCODE = '23514';
-							END IF;
-						ELSIF NEW."oidcConfig" IS DISTINCT FROM OLD."oidcConfig" AND (
-							OLD."keyManagementVersion" IS DISTINCT FROM 1 OR
-							NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							OLD."keyManagementRevision" IS NULL OR
-							NEW."keyManagementRevision" IS DISTINCT FROM
-								OLD."keyManagementRevision" + 1
-						) THEN
-							RAISE EXCEPTION 'OIDC key revision did not advance'
-								USING ERRCODE = '23514';
-						END IF;
-						RETURN NEW;
-					END
-					$function$;
-					DROP TRIGGER IF EXISTS clearance_require_oidc_key_v1
-						ON "ssoProvider";
-					CREATE TRIGGER clearance_require_oidc_key_v1
-						BEFORE INSERT OR UPDATE OF "oidcConfig" ON "ssoProvider"
-						FOR EACH ROW EXECUTE FUNCTION clearance_require_oidc_key_v1();
-				`);
+				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[0]);
 			}
 			if (setupOnly && tables.scimProvider) {
-				await client.query(`
-					CREATE OR REPLACE FUNCTION clearance_require_scim_key_v1()
-					RETURNS trigger LANGUAGE plpgsql AS $function$
-					DECLARE migration_bypass boolean;
-					BEGIN
-						migration_bypass :=
-							current_setting('clearance.key_management_migration', true) = 'v1';
-						IF left(NEW."scimToken", length('clr-scim:v1:clrkm$v1$')) <>
-						   'clr-scim:v1:clrkm$v1$' THEN
-							RAISE EXCEPTION 'SCIM token must use purpose-separated storage'
-								USING ERRCODE = '23514';
-						END IF;
-						IF migration_bypass THEN RETURN NEW; END IF;
-						IF TG_OP = 'INSERT' THEN
-							IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							   NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
-								RAISE EXCEPTION 'SCIM key generation is invalid'
-									USING ERRCODE = '23514';
-							END IF;
-						ELSIF NEW."scimToken" IS DISTINCT FROM OLD."scimToken" AND (
-							OLD."keyManagementVersion" IS DISTINCT FROM 1 OR
-							NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							OLD."keyManagementRevision" IS NULL OR
-							NEW."keyManagementRevision" IS DISTINCT FROM
-								OLD."keyManagementRevision" + 1
-						) THEN
-							RAISE EXCEPTION 'SCIM key revision did not advance'
-								USING ERRCODE = '23514';
-						END IF;
-						RETURN NEW;
-					END
-					$function$;
-					DROP TRIGGER IF EXISTS clearance_require_scim_key_v1
-						ON "scimProvider";
-					CREATE TRIGGER clearance_require_scim_key_v1
-						BEFORE INSERT OR UPDATE OF "scimToken" ON "scimProvider"
-						FOR EACH ROW EXECUTE FUNCTION clearance_require_scim_key_v1();
-				`);
+				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[1]);
 			}
 			if (setupOnly && tables.jwks) {
-				await client.query(`
-					CREATE OR REPLACE FUNCTION clearance_require_jwt_key_v1()
-					RETURNS trigger LANGUAGE plpgsql AS $function$
-					DECLARE migration_bypass boolean;
-					BEGIN
-						migration_bypass :=
-							current_setting('clearance.key_management_migration', true) = 'v1';
-						IF NEW."privateKey" <> 'clr-jwk:retired:v1' AND
-						   left(NEW."privateKey", length('clrkm$v1$')) <> 'clrkm$v1$' THEN
-							RAISE EXCEPTION 'JWT private key must use purpose-separated storage'
-								USING ERRCODE = '23514';
-						END IF;
-						IF migration_bypass THEN RETURN NEW; END IF;
-						IF TG_OP = 'INSERT' THEN
-							IF NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							   NEW."keyManagementRevision" IS DISTINCT FROM 1 THEN
-								RAISE EXCEPTION 'JWT key generation is invalid'
-									USING ERRCODE = '23514';
-							END IF;
-						ELSIF NEW."privateKey" IS DISTINCT FROM OLD."privateKey" AND (
-							OLD."keyManagementVersion" IS DISTINCT FROM 1 OR
-							NEW."keyManagementVersion" IS DISTINCT FROM 1 OR
-							OLD."keyManagementRevision" IS NULL OR
-							NEW."keyManagementRevision" IS DISTINCT FROM
-								OLD."keyManagementRevision" + 1
-						) THEN
-							RAISE EXCEPTION 'JWT key revision did not advance'
-								USING ERRCODE = '23514';
-						END IF;
-						RETURN NEW;
-					END
-					$function$;
-					DROP TRIGGER IF EXISTS clearance_require_jwt_key_v1 ON jwks;
-					CREATE TRIGGER clearance_require_jwt_key_v1
-						BEFORE INSERT OR UPDATE OF "privateKey" ON jwks
-						FOR EACH ROW EXECUTE FUNCTION clearance_require_jwt_key_v1();
-				`);
+				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[2]);
 			}
-			await client.query("COMMIT");
+			if (ownedClient) await client.query("COMMIT");
 		} catch (error) {
-			await client.query("ROLLBACK").catch(() => undefined);
+			if (ownedClient) await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
 		} finally {
-			client.release();
+			ownedClient?.release();
 		}
-		return migratedRows;
+		return keyManagementMigrationCounts(
+			migratedOidcClientSecrets,
+			migratedScimTokens,
+			migratedJwks,
+		);
+	}
+
+	type CredentialTables = Readonly<{
+		ssoProvider: boolean;
+		scimProvider: boolean;
+		jwks: boolean;
+	}>;
+	type KeyManagementMigrationInspection = Readonly<{
+		tables: CredentialTables;
+		setupReady: boolean;
+		pending: ClearanceKeyManagementMigrationCounts;
+		migrated: ClearanceKeyManagementMigrationCounts;
+		batch: KeyManagementMigrationBatch;
+		snapshots: Readonly<Record<KeyManagementMigrationDomain, readonly MigrationSnapshot[]>>;
+	}>;
+
+	const zeroKeyManagementMigrationCounts = (): ClearanceKeyManagementMigrationCounts =>
+		Object.freeze({ oidcClientSecrets: 0, scimTokens: 0, jwks: 0, total: 0 });
+	const keyManagementMigrationCounts = (
+		oidcClientSecrets: number,
+		scimTokens: number,
+		jwks: number,
+	): ClearanceKeyManagementMigrationCounts =>
+		Object.freeze({
+			oidcClientSecrets,
+			scimTokens,
+			jwks,
+			total: oidcClientSecrets + scimTokens + jwks,
+		});
+	const sourceDigest = (value: string): string =>
+		createHash("sha256").update(value, "utf8").digest("hex");
+	function configuredKeyManagementWriteAuthority(): Readonly<{
+		encryption: readonly Readonly<{ purpose: KeyPurpose; identity: string }>[];
+		signing: string;
+	}> {
+		const encryption = ([
+			"oidc-client-secret",
+			"scim-bearer-token",
+			"access-token-signing-key",
+		] as const).map((purpose) => {
+			const provider = keyManagement.registry.providerFor(purpose);
+			return Object.freeze({
+				purpose,
+				identity: sourceDigest(JSON.stringify({
+					kind: provider.kind,
+					providerId: provider.providerId,
+					currentKeyId: provider.currentKeyId,
+				})),
+			});
+		});
+		return Object.freeze({
+			encryption: Object.freeze(encryption),
+			signing: sourceDigest(JSON.stringify({
+				kind: keyManagement.signingProvider.kind,
+				providerId: keyManagement.signingProvider.providerId,
+				currentKeyId: keyManagement.signingProvider.currentKeyId,
+			})),
+		});
+	}
+	const nullableNumber = (value: unknown): number | null =>
+		typeof value === "number" ? value : null;
+	const nullableText = (value: unknown): string | null =>
+		typeof value === "string" ? value : null;
+	const canonicalSnapshot = (
+		domain: KeyManagementMigrationDomain,
+		row: Record<string, unknown>,
+	): MigrationSnapshot => {
+		const id = String(row.id);
+		const version = nullableNumber(row.version ?? row.keyManagementVersion);
+		const revision = nullableNumber(row.revision ?? row.keyManagementRevision);
+		const source = nullableText(row.source) ??
+			(domain === "oidcClientSecrets"
+				? String(row.oidcConfig)
+				: domain === "scimTokens"
+					? String(row.scimToken)
+					: String(row.privateKey));
+		const expiresAt = row.expiresAt instanceof Date
+			? row.expiresAt.toISOString()
+			: row.expiresAt === null || row.expiresAt === undefined
+				? null
+				: new Date(String(row.expiresAt)).toISOString();
+		const binding = domain === "oidcClientSecrets"
+			? { providerId: String(row.providerId), oidcConfig: source }
+			: domain === "scimTokens"
+				? {
+					providerId: String(row.providerId),
+					organizationId: nullableText(row.organizationId),
+					scimToken: source,
+				}
+				: {
+					publicKey: String(row.publicKey),
+					privateKey: source,
+					expiresAt,
+				};
+		return Object.freeze({
+			id,
+			version,
+			revision,
+			sourceHash: sourceDigest(JSON.stringify({ id, version, revision, ...binding })),
+		});
+	};
+	const staleKeyManagementPlan = (): Error =>
+		Object.assign(new Error("Key management migration plan is stale"), {
+			code: "KEY_MANAGEMENT_PLAN_STALE",
+		});
+	const keyManagementTransactionRequired = (): Error =>
+		Object.assign(new Error("Key management migration requires a PostgreSQL transaction"), {
+			code: "KEY_MANAGEMENT_TRANSACTION_REQUIRED",
+		});
+	const keyManagementProviderNotReady = (): Error =>
+		Object.assign(new Error("Purpose-separated key providers are not ready"), {
+			code: "KEY_MANAGEMENT_PROVIDER_NOT_READY",
+		});
+	function assertApprovedMigrationSnapshots(
+		domain: KeyManagementMigrationDomain,
+		rows: readonly Record<string, unknown>[],
+		expected: readonly MigrationSnapshot[] | undefined,
+	): void {
+		if (!expected) return;
+		const actual = rows.map((row) => canonicalSnapshot(domain, row));
+		if (
+			actual.length !== expected.length ||
+			actual.some((snapshot, index) =>
+				snapshot.id !== expected[index]?.id ||
+				snapshot.version !== expected[index]?.version ||
+				snapshot.revision !== expected[index]?.revision ||
+				snapshot.sourceHash !== expected[index]?.sourceHash,
+			)
+		) {
+			throw staleKeyManagementPlan();
+		}
+	}
+
+	function keyManagementQuery(
+		transaction?: KeyManagementQuery,
+	): ClearanceTransactionQuery["rawTransactionQuery"] {
+		return transaction
+			? transaction.rawTransactionQuery.bind(transaction)
+			: pool.query.bind(pool);
+	}
+
+	async function inspectKeyManagementMigration(
+		transaction?: KeyManagementQuery,
+	): Promise<KeyManagementMigrationInspection> {
+		const query = keyManagementQuery(transaction);
+		const tableResult = await query<{
+			ssoProvider: string | null;
+			scimProvider: string | null;
+			jwks: string | null;
+		}>(`SELECT
+			to_regclass(format('%I.%I', current_schema(), 'ssoProvider'))::text AS "ssoProvider",
+			to_regclass(format('%I.%I', current_schema(), 'scimProvider'))::text AS "scimProvider",
+			to_regclass(format('%I.%I', current_schema(), 'jwks'))::text AS jwks`);
+		const tables = Object.freeze({
+			ssoProvider: Boolean(tableResult.rows[0]?.ssoProvider),
+			scimProvider: Boolean(tableResult.rows[0]?.scimProvider),
+			jwks: Boolean(tableResult.rows[0]?.jwks),
+		});
+		const setup = await query<{
+			name: string;
+			columnsReady: boolean;
+			triggerReady: boolean;
+		}>(`WITH expected(name, table_name, column_name, trigger_name, function_name, function_body) AS (
+			VALUES
+				('oidcClientSecrets', 'ssoProvider', 'oidcConfig', 'clearance_require_oidc_key_v1', 'clearance_require_oidc_key_v1', $1::text),
+				('scimTokens', 'scimProvider', 'scimToken', 'clearance_require_scim_key_v1', 'clearance_require_scim_key_v1', $2::text),
+				('jwks', 'jwks', 'privateKey', 'clearance_require_jwt_key_v1', 'clearance_require_jwt_key_v1', $3::text)
+		)
+		SELECT expected.name,
+			CASE WHEN to_regclass(format('%I.%I', current_schema(), expected.table_name)) IS NULL THEN true
+			ELSE (
+				SELECT count(*) = 2 AND bool_and(data_type = 'integer' AND udt_name = 'int4')
+				FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = expected.table_name
+				AND column_name IN ('keyManagementVersion', 'keyManagementRevision')
+			) END AS "columnsReady",
+			CASE WHEN to_regclass(format('%I.%I', current_schema(), expected.table_name)) IS NULL THEN true
+			ELSE EXISTS (
+				SELECT 1 FROM pg_trigger trigger_record
+				JOIN pg_class table_record ON table_record.oid = trigger_record.tgrelid
+				JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+				JOIN pg_proc function_record ON function_record.oid = trigger_record.tgfoid
+				WHERE namespace_record.nspname = current_schema()
+				AND table_record.relname = expected.table_name
+				AND trigger_record.tgname = expected.trigger_name
+				AND NOT trigger_record.tgisinternal
+				AND trigger_record.tgenabled = 'O'
+				AND trigger_record.tgtype = 23::smallint
+				AND array_length(trigger_record.tgattr::smallint[], 1) = 1
+				AND array_to_string(trigger_record.tgattr::smallint[], ',') = (
+					SELECT attribute_record.attnum::text FROM pg_attribute attribute_record
+					WHERE attribute_record.attrelid = table_record.oid
+					AND attribute_record.attname = expected.column_name
+					AND NOT attribute_record.attisdropped
+				)
+				AND function_record.proname = expected.function_name
+				AND function_record.pronargs = 0
+				AND function_record.prorettype = 'trigger'::regtype
+				AND function_record.prosrc = expected.function_body
+			) END AS "triggerReady"
+		FROM expected`, [
+			OIDC_KEY_MANAGEMENT_TRIGGER_BODY,
+			SCIM_KEY_MANAGEMENT_TRIGGER_BODY,
+			JWKS_KEY_MANAGEMENT_TRIGGER_BODY,
+		]);
+		const setupReady = setup.rows.every(
+			(row) => row.columnsReady && row.triggerReady,
+		);
+
+		const readDomain = async (
+			domain: KeyManagementMigrationDomain,
+		): Promise<Readonly<{ pending: number; migrated: number; snapshots: readonly MigrationSnapshot[] }>> => {
+			if (
+				(domain === "oidcClientSecrets" && !tables.ssoProvider) ||
+				(domain === "scimTokens" && !tables.scimProvider) ||
+				(domain === "jwks" && !tables.jwks)
+			) return { pending: 0, migrated: 0, snapshots: [] };
+			const table = domain === "oidcClientSecrets" ? '"ssoProvider"' : domain === "scimTokens" ? '"scimProvider"' : "jwks";
+			const source = domain === "oidcClientSecrets" ? '"oidcConfig"' : domain === "scimTokens" ? '"scimToken"' : '"privateKey"';
+			const eligible = domain === "oidcClientSecrets" ? `WHERE ${source} IS NOT NULL` : "";
+			const markerReady = setup.rows.find((row) => row.name === domain)?.columnsReady === true;
+			const pendingWhere = markerReady
+				? `${eligible ? `${eligible} AND` : "WHERE"} ("keyManagementVersion" IS DISTINCT FROM 1 OR "keyManagementRevision" IS NULL)`
+				: eligible;
+			const migratedWhere = markerReady
+				? `${eligible ? `${eligible} AND` : "WHERE"} "keyManagementVersion" = 1 AND "keyManagementRevision" IS NOT NULL`
+				: "WHERE false";
+			const counts = await query<{ pending: string; migrated: string }>(`SELECT
+				(SELECT count(*)::text FROM ${table} ${pendingWhere}) AS pending,
+				(SELECT count(*)::text FROM ${table} ${migratedWhere}) AS migrated`);
+			const rows = await query<{
+				id: string;
+				version: number | null;
+				revision: number | null;
+				source: string;
+				providerId?: string;
+				organizationId?: string | null;
+				publicKey?: string;
+				expiresAt?: Date | null;
+			}>(`SELECT id, ${markerReady ? '"keyManagementVersion"' : "NULL::integer"} AS version,
+				${markerReady ? '"keyManagementRevision"' : "NULL::integer"} AS revision,
+				${source} AS source,
+				${domain === "oidcClientSecrets" || domain === "scimTokens" ? '"providerId"' : "NULL::text"} AS "providerId",
+				${domain === "scimTokens" ? '"organizationId"' : "NULL::text"} AS "organizationId",
+				${domain === "jwks" ? '"publicKey"' : "NULL::text"} AS "publicKey",
+				${domain === "jwks" ? '"expiresAt"' : "NULL::timestamptz"} AS "expiresAt"
+				FROM ${table} ${pendingWhere} ORDER BY id
+				LIMIT ${KEY_MANAGEMENT_MIGRATION_BATCH_SIZE}`);
+			return Object.freeze({
+				pending: Number(counts.rows[0]?.pending ?? 0),
+				migrated: Number(counts.rows[0]?.migrated ?? 0),
+				snapshots: Object.freeze(rows.rows.map((row) => canonicalSnapshot(domain, row))),
+			});
+		};
+		const oidcClientSecrets = await readDomain("oidcClientSecrets");
+		const scimTokens = await readDomain("scimTokens");
+		const jwks = await readDomain("jwks");
+		return Object.freeze({
+			tables,
+			setupReady,
+			pending: keyManagementMigrationCounts(
+				oidcClientSecrets.pending,
+				scimTokens.pending,
+				jwks.pending,
+			),
+			migrated: keyManagementMigrationCounts(
+				oidcClientSecrets.migrated,
+				scimTokens.migrated,
+				jwks.migrated,
+			),
+			batch: Object.freeze({
+				oidcClientSecrets: oidcClientSecrets.snapshots,
+				scimTokens: scimTokens.snapshots,
+				jwks: jwks.snapshots,
+			}),
+			snapshots: Object.freeze({
+				oidcClientSecrets: oidcClientSecrets.snapshots,
+				scimTokens: scimTokens.snapshots,
+				jwks: jwks.snapshots,
+			}),
+		});
+	}
+
+	function keyManagementMigrationPlanFromInspection(
+		inspection: KeyManagementMigrationInspection,
+	): ClearanceKeyManagementMigrationPlan {
+		const phase = !inspection.setupReady
+			? "setup"
+			: inspection.pending.total > 0
+				? "batch"
+				: "complete";
+		const nextBatch = keyManagementMigrationCounts(
+			inspection.batch.oidcClientSecrets.length,
+			inspection.batch.scimTokens.length,
+			inspection.batch.jwks.length,
+		);
+		const planId = sourceDigest(JSON.stringify({
+			schemaVersion: "v1",
+			scope: keyManagementFacade.scope,
+			setupReady: inspection.setupReady,
+			tables: inspection.tables,
+			pending: inspection.pending,
+			migrated: inspection.migrated,
+			writeAuthority: configuredKeyManagementWriteAuthority(),
+			snapshots: inspection.snapshots,
+		}));
+		return Object.freeze({
+			schemaVersion: "v1",
+			scope: keyManagementFacade.scope,
+			phase,
+			maxBatchSize: Object.freeze({ perDomain: 5, total: 15 }),
+			pending: inspection.pending,
+			nextBatch,
+			planId,
+		});
+	}
+
+	async function keyManagementMigrationPlan(
+		transaction?: KeyManagementQuery,
+	): Promise<ClearanceKeyManagementMigrationPlan> {
+		return keyManagementMigrationPlanFromInspection(
+			await inspectKeyManagementMigration(transaction),
+		);
+	}
+
+	type KeyManagementReadinessEvidence = Readonly<{
+		encryption: Awaited<ReturnType<typeof keyManagementFacade.readiness>>;
+		signing: Awaited<ReturnType<typeof keyManagement.signingProvider.readiness>>;
+	}>;
+	async function keyManagementReadinessEvidence(): Promise<KeyManagementReadinessEvidence> {
+		let encryption: Awaited<ReturnType<typeof keyManagementFacade.readiness>>;
+		let signing: Awaited<ReturnType<typeof keyManagement.signingProvider.readiness>>;
+		try {
+			[encryption, signing] = await Promise.all([
+				keyManagementFacade.readiness(),
+				keyManagement.signingProvider.readiness(),
+			]);
+		} catch {
+			throw keyManagementProviderNotReady();
+		}
+		return Object.freeze({ encryption, signing });
+	}
+	function keyManagementStatusFromInspection(
+		inspection: KeyManagementMigrationInspection,
+		evidence: KeyManagementReadinessEvidence,
+	): ClearanceKeyManagementStatus {
+		const { encryption, signing: signingReadiness } = evidence;
+		const currentIdentity = keyManagement.signingProvider.currentKeyId;
+		const retainedIdentities = Object.freeze(
+			[...keyManagement.signingProvider.retainedKeyIds]
+				.sort(),
+		);
+		return Object.freeze({
+			schemaVersion: "v1",
+			scope: keyManagementFacade.scope,
+			ready:
+				encryption.ready &&
+				signingReadiness.ready &&
+				inspection.setupReady &&
+				inspection.pending.total === 0,
+			encryption: Object.freeze({ ready: encryption.ready, purposes: encryption.purposes }),
+			signing: Object.freeze({
+				ready: signingReadiness.ready,
+				readiness: signingReadiness,
+				algorithm: "ES256",
+				currentIdentity,
+				retainedIdentities,
+				gracePeriodSeconds: authenticationSecurity.asymmetricAccessTokens.gracePeriodSeconds,
+			}),
+			schema: Object.freeze({ setup: inspection.setupReady ? "ready" : "pending" }),
+			migration: Object.freeze({
+				complete: inspection.setupReady && inspection.pending.total === 0,
+				pending: inspection.pending,
+				migrated: inspection.migrated,
+			}),
+		});
+	}
+	async function keyManagementStatus(
+		transaction?: KeyManagementQuery,
+	): Promise<ClearanceKeyManagementStatus> {
+		const [inspection, evidence] = await Promise.all([
+			inspectKeyManagementMigration(transaction),
+			keyManagementReadinessEvidence(),
+		]);
+		return keyManagementStatusFromInspection(inspection, evidence);
+	}
+
+	async function assertKeyManagementMigrationReady(): Promise<KeyManagementReadinessEvidence> {
+		const evidence = await keyManagementReadinessEvidence();
+		if (!evidence.encryption.ready || !evidence.signing.ready) {
+			throw keyManagementProviderNotReady();
+		}
+		return evidence;
+	}
+	async function requireKeyManagementMigrationTransaction(
+		transaction: ClearanceTransactionQuery,
+	): Promise<void> {
+		const before = await transaction.rawTransactionQuery<{ txid: string }>(
+			"SELECT txid_current()::text AS txid",
+		);
+		await transaction.rawTransactionQuery(`SELECT pg_advisory_xact_lock(
+			hashtext(current_database()),
+			hashtext(current_schema() || ':clearance:key-management-migration:v1')
+		)`);
+		const after = await transaction.rawTransactionQuery<{ txid: string }>(
+			"SELECT txid_current()::text AS txid",
+		);
+		if (!before.rows[0]?.txid || before.rows[0].txid !== after.rows[0]?.txid) {
+			throw keyManagementTransactionRequired();
+		}
+	}
+
+	async function applyKeyManagementMigration(input: {
+		expectedPlanId: string;
+		transaction: ClearanceTransactionQuery;
+	}): Promise<ClearanceKeyManagementMigrationResult> {
+		if (!input.expectedPlanId || typeof input.transaction?.rawTransactionQuery !== "function") {
+			throw Object.assign(new Error("Key management migration input is invalid"), {
+				code: "KEY_MANAGEMENT_INPUT_INVALID",
+			});
+		}
+		const readinessEvidence = await assertKeyManagementMigrationReady();
+		const transaction = input.transaction;
+		await requireKeyManagementMigrationTransaction(transaction);
+		const inspection = await inspectKeyManagementMigration(transaction);
+		const previousPlan = keyManagementMigrationPlanFromInspection(inspection);
+		if (previousPlan.planId !== input.expectedPlanId) {
+			throw staleKeyManagementPlan();
+		}
+		let applied = zeroKeyManagementMigrationCounts();
+		if (previousPlan.phase === "setup") {
+			await migratePurposeSeparatedCredentialBatch(true, transaction);
+			if (previousPlan.nextBatch.total > 0) {
+				applied = await migratePurposeSeparatedCredentialBatch(
+					false,
+					transaction,
+					inspection.batch,
+				);
+			}
+		} else if (previousPlan.phase === "batch") {
+			applied = await migratePurposeSeparatedCredentialBatch(
+				false,
+				transaction,
+				inspection.batch,
+			);
+		}
+		const remainingInspection = await inspectKeyManagementMigration(transaction);
+		const remainingPlan = keyManagementMigrationPlanFromInspection(remainingInspection);
+		const status = keyManagementStatusFromInspection(
+			remainingInspection,
+			readinessEvidence,
+		);
+		return Object.freeze({
+			applied,
+			changed: applied.total,
+			previousPlanId: previousPlan.planId,
+			nextPlanId: remainingPlan.planId,
+			remainingPlan,
+			status,
+			complete: remainingPlan.phase === "complete",
+		});
 	}
 
 	async function ensurePurposeSeparatedCredentialCompatibility(): Promise<void> {
-		const [encryptionReadiness, signingReadiness] = await Promise.all([
-			keyManagementFacade.readiness(),
-			keyManagement.signingProvider.readiness(),
-		]);
-		if (!encryptionReadiness.ready || !signingReadiness.ready) {
-			throw new Error("Purpose-separated key providers are not ready");
-		}
+		await assertKeyManagementMigrationReady();
 		await migratePurposeSeparatedCredentialBatch(true);
-		while ((await migratePurposeSeparatedCredentialBatch(false)) > 0) {
+		while ((await migratePurposeSeparatedCredentialBatch(false)).total > 0) {
 			// Each transaction advances at most five rows per credential table.
 		}
 	}
