@@ -8,15 +8,20 @@ import {
 	createScimConnection,
 	createUser,
 	exportEvents,
+	exportEventsOperational,
 	initProject,
 	inspectEvent,
+	inspectEventOperational,
 	listEvents,
+	listEventsPageOperational,
 	replayDiagnosticTrace,
 	testScimConnection,
 	EVENTS_EXPORT_MAX_LIMIT,
 	beginEventsTail,
 	pollEventsTail,
 } from "../index.js";
+import type { AuditEvent } from "../types/resources.js";
+import type { ManagementStore } from "../store/types.js";
 
 const dirs: string[] = [];
 
@@ -33,6 +38,83 @@ afterEach(() => {
 });
 
 describe("events export", () => {
+	it("merges a bounded runtime authority into operational readers without snapshot import", async () => {
+		const store = tempStore();
+		const { project, environment } = initProject(store, { name: "Runtime Event Read" });
+		const scope = { projectId: project.id, environmentId: environment.id };
+		store.mutate((data) => {
+			data.events = [{
+				id: "evt_management", correlationId: "corr_management", ...scope,
+				actor: "operator", action: "users.create", subjectType: "user",
+				outcome: "success", source: "cli", message: "management",
+				createdAt: "2026-01-01T00:00:02.000Z",
+			}];
+		});
+		const runtimeEvents: AuditEvent[] = [{
+			id: "runtime_older", correlationId: "corr_runtime_older", ...scope,
+			actor: "runtime", action: "auth.login.failed", outcome: "failure",
+			source: "system", message: "anonymous failure",
+			metadata: { token: "Bearer eyJ.runtime.secret" },
+			createdAt: "2026-01-01T00:00:01.000Z",
+		}, {
+			id: "runtime_newer", correlationId: "corr_runtime_newer", ...scope,
+			organizationId: "org_runtime", actor: "runtime", action: "auth.login.succeeded",
+			subjectType: "user", subjectId: "user_runtime", outcome: "success",
+			source: "sso", message: "runtime success",
+			createdAt: "2026-01-01T00:00:03.000Z",
+		}];
+		const runtime = {
+			listPage: async (input: {
+				scope: typeof scope; limit: number; cursor?: { createdAt: string; id: string };
+				action?: string; organizationId?: string; before?: string;
+			}) => {
+				const matching = runtimeEvents.filter((event) =>
+					event.projectId === input.scope.projectId &&
+					event.environmentId === input.scope.environmentId &&
+					(!input.action || event.action === input.action) &&
+					(!input.organizationId || event.organizationId === input.organizationId) &&
+					(!input.before || event.createdAt < input.before) &&
+					(!input.cursor || event.createdAt < input.cursor.createdAt ||
+						(event.createdAt === input.cursor.createdAt && event.id < input.cursor.id)),
+				).sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+				return { events: matching.slice(0, input.limit), hasMore: matching.length > input.limit };
+			},
+			getById: async (input: { scope: typeof scope; id: string }) =>
+				input.scope.projectId === scope.projectId && input.scope.environmentId === scope.environmentId
+					? runtimeEvents.find((event) => event.id === input.id) ?? null
+					: null,
+		};
+		Object.assign(store as ManagementStore, { runtimeAuditEvents: runtime });
+
+		const first = await listEventsPageOperational(store, { scope, limit: 2 });
+		expect(first.events.map((event) => event.id)).toEqual([
+			"runtime_newer", "evt_management",
+		]);
+		expect(first.nextCursor).toBeTruthy();
+		const second = await listEventsPageOperational(store, {
+			scope,
+			limit: 2,
+			cursor: first.nextCursor!,
+		});
+		expect(second.events.map((event) => event.id)).toEqual(["runtime_older"]);
+
+		const exported = await exportEventsOperational(store, {
+			scope,
+			skipAudit: true,
+			before: "2026-01-01T00:00:02.000Z",
+		});
+		expect(exported.events.map((event) => event.id)).toEqual(["runtime_older"]);
+		expect(JSON.stringify(exported)).not.toContain("eyJ.runtime.secret");
+		expect(JSON.stringify(exported)).toContain("[redacted]");
+
+		const inspected = await inspectEventOperational(store, "runtime_newer", { scope });
+		expect(inspected).toMatchObject({
+			event: { correlationId: "corr_runtime_newer", source: "sso", subjectId: "user_runtime" },
+			replayable: false,
+		});
+		expect(store.snapshot.events.map((event) => event.id)).toEqual(["evt_management"]);
+	});
+
 	it("exports deterministically, redacts secrets, respects bounds and scope", () => {
 		const store = tempStore();
 		const { project, environment } = initProject(store, { name: "Export App" });
