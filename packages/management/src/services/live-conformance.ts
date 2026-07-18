@@ -23,11 +23,14 @@ import type {
 	DirectoryConnection,
 	IdentityConnection,
 } from "../types/resources.js";
-import { recordEvent } from "./audit.js";
+import { recordEvent, type AuditEventInput } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { decryptCredential } from "./credentials.js";
 import { probeScimEndpoint } from "./scim-probe.js";
 import { publicIdentityConnection, publicDirectoryConnection } from "./redact.js";
+import { resolveOperatorScopeAuthoritative, type ResourceScope } from "./scope.js";
+import { resolveSsoConnectionAuthoritative } from "./sso.js";
+import { resolveScimConnectionAuthoritative } from "./scim.js";
 
 export const LIVE_CONFORMANCE_MODE = "live" as const;
 export const LIVE_EVIDENCE_LABEL =
@@ -146,6 +149,58 @@ export interface LiveProbeResult<C> {
 export interface LiveProbeOptions {
 	fetchImpl?: typeof fetch;
 	timeoutMs?: number;
+	/** Server-derived scope; supplied by the API/CLI boundary. */
+	scope?: ResourceScope;
+}
+
+async function persistLiveTrace(
+	store: ManagementStore,
+	input: {
+		kind: "sso" | "scim";
+		id: string;
+		scope?: ResourceScope;
+		trace: DiagnosticTrace;
+		audit: AuditEventInput;
+		setTesting: boolean;
+	},
+): Promise<IdentityConnection | DirectoryConnection> {
+	if (!store.storeV2Topology?.authoritative) {
+		pushTrace(store, input.trace);
+		if (input.setTesting) {
+			store.mutate((data) => {
+				const connections = input.kind === "sso" ? data.identityConnections : data.directoryConnections;
+				const index = connections.findIndex((connection) => connection.id === input.id);
+				if (index >= 0) connections[index] = { ...connections[index]!, status: "testing", updatedAt: nowIso() };
+			});
+		}
+		recordEvent(store, input.audit);
+		const current = input.kind === "sso"
+			? store.snapshot.identityConnections.find((connection) => connection.id === input.id)
+			: store.snapshot.directoryConnections.find((connection) => connection.id === input.id);
+		if (!current) throw new ClearanceError({ code: input.kind === "sso" ? "SSO_NOT_FOUND" : "SCIM_NOT_FOUND", message: "Connection not found", stage: `${input.kind}.test.live`, status: 404 });
+		return current;
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({ code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED", message: "Relational topology authority requires a coordinated transaction", stage: `${input.kind}.test.live`, status: 500 });
+	}
+	const scope = input.scope ?? await resolveOperatorScopeAuthoritative(store);
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const connections = input.kind === "sso" ? data.identityConnections : data.directoryConnections;
+		const index = connections.findIndex((connection) => connection.id === input.id);
+		const connection = index >= 0 ? connections[index] : undefined;
+		const organization = connection && topology
+			? await topology.lockOrganization({ scope, id: connection.organizationId })
+			: null;
+		if (!connection || !organization || organization.status === "archived") {
+			throw new ClearanceError({ code: input.kind === "sso" ? "SSO_NOT_FOUND" : "SCIM_NOT_FOUND", message: "Connection not found", stage: `${input.kind}.test.live`, status: 404 });
+		}
+		data.traces.unshift(input.trace);
+		if (data.traces.length > 2000) data.traces.length = 2000;
+		const updated = input.setTesting ? { ...connection, status: "testing" as const, updatedAt: nowIso() } : connection;
+		connections[index] = updated;
+		appendAudit({ ...input.audit, organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId });
+		return structuredClone(updated);
+	});
 }
 
 async function fetchWithTimeout(
@@ -178,15 +233,11 @@ export async function testSsoConnectionLive(
 	id: string,
 	opts: LiveProbeOptions = {},
 ): Promise<LiveProbeResult<IdentityConnection>> {
-	const conn = store.snapshot.identityConnections.find((c) => c.id === id);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SSO_NOT_FOUND",
-			message: `SSO connection ${id} not found`,
-			stage: "sso.test.live",
-			status: 404,
-		});
-	}
+	// This authorization read is deliberately before issuer parsing or any
+	// network work. An archive that completed before invocation cannot cause a
+	// probe (or later SCIM bearer access) under a stale route precheck.
+	const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
+	const conn = await resolveSsoConnectionAuthoritative(store, id, { scope, stage: "sso.test.live" });
 	if (conn.protocol === "saml") {
 		throw new ClearanceError({
 			code: "SSO_LIVE_SAML_UNSUPPORTED",
@@ -210,14 +261,14 @@ export async function testSsoConnectionLive(
 		createdAt: nowIso(),
 	};
 
-	const failTrace = (
+	const failTrace = async (
 		stage: string,
 		cause: string,
 		owner: "customer" | "application",
 		remediation: string,
 		checks: Array<{ name: string; pass: boolean; detail?: string }>,
-	): LiveProbeResult<IdentityConnection> => {
-		const trace = pushTrace(store, {
+	): Promise<LiveProbeResult<IdentityConnection>> => {
+		const trace: DiagnosticTrace = {
 			...base,
 			stage,
 			outcome: "fail",
@@ -227,8 +278,14 @@ export async function testSsoConnectionLive(
 			remediation,
 			checks,
 			redactedResponse: { evidence: LIVE_EVIDENCE_LABEL },
-		});
-		recordEvent(store, {
+		};
+		const connection = await persistLiveTrace(store, {
+			kind: "sso",
+			id,
+			scope,
+			trace,
+			setTesting: false,
+			audit: {
 			actor: "operator",
 			action: "sso.test",
 			subjectType: "identity_connection",
@@ -239,11 +296,12 @@ export async function testSsoConnectionLive(
 			correlationId: corr,
 			message: `Live SSO conformance failed at ${stage}: ${cause}`,
 			metadata: { mode: LIVE_CONFORMANCE_MODE, endpoint: issuerUrl.origin },
+			},
 		});
 		return {
 			pass: false,
 			trace,
-			connection: publicIdentityConnection(conn) as IdentityConnection,
+			connection: publicIdentityConnection(connection as IdentityConnection) as IdentityConnection,
 			mode: LIVE_CONFORMANCE_MODE,
 			evidence: LIVE_EVIDENCE_LABEL,
 			endpoint: issuerUrl.origin,
@@ -360,7 +418,7 @@ export async function testSsoConnectionLive(
 		);
 	}
 
-	const trace = pushTrace(store, {
+	const trace: DiagnosticTrace = {
 		...base,
 		stage: "discovery.validate",
 		outcome: "pass",
@@ -374,14 +432,14 @@ export async function testSsoConnectionLive(
 			{ name: "mode", pass: true, detail: "live" },
 		],
 		redactedResponse: { evidence: LIVE_EVIDENCE_LABEL, endpoint: issuerUrl.origin },
-	});
-	store.mutate((data) => {
-		const idx = data.identityConnections.findIndex((c) => c.id === id);
-		if (idx >= 0) {
-			data.identityConnections[idx] = { ...conn, status: "testing", updatedAt: nowIso() };
-		}
-	});
-	recordEvent(store, {
+	};
+	const connection = await persistLiveTrace(store, {
+		kind: "sso",
+		id,
+		scope,
+		trace,
+		setTesting: true,
+		audit: {
 		actor: "operator",
 		action: "sso.test",
 		subjectType: "identity_connection",
@@ -392,13 +450,12 @@ export async function testSsoConnectionLive(
 		correlationId: corr,
 		message: `Live SSO discovery conformance passed for ${issuerUrl.origin} — ${LIVE_EVIDENCE_LABEL}`,
 		metadata: { mode: LIVE_CONFORMANCE_MODE, endpoint: issuerUrl.origin },
+		},
 	});
 	return {
 		pass: true,
 		trace,
-		connection: publicIdentityConnection(
-			store.snapshot.identityConnections.find((c) => c.id === id)!,
-		) as IdentityConnection,
+		connection: publicIdentityConnection(connection as IdentityConnection) as IdentityConnection,
 		mode: LIVE_CONFORMANCE_MODE,
 		evidence: LIVE_EVIDENCE_LABEL,
 		endpoint: issuerUrl.origin,
@@ -415,15 +472,10 @@ export async function testScimConnectionLive(
 	id: string,
 	opts: LiveProbeOptions = {},
 ): Promise<LiveProbeResult<DirectoryConnection>> {
-	const conn = store.snapshot.directoryConnections.find((c) => c.id === id);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SCIM_NOT_FOUND",
-			message: `SCIM connection ${id} not found`,
-			stage: "scim.test.live",
-			status: 404,
-		});
-	}
+	// Resolve authority before reading endpoint/token material. This is the
+	// pre-I/O half of the archive race fence; persistence locks again below.
+	const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
+	const conn = await resolveScimConnectionAuthoritative(store, id, { scope, stage: "scim.test.live" });
 	const endpointUrl = assertLiveEndpoint(conn.endpoint, "scim", "scim.test.live");
 	const bearerToken = conn.bearerTokenEncrypted
 		? decryptCredential(conn.bearerTokenEncrypted)
@@ -439,14 +491,14 @@ export async function testScimConnectionLive(
 		createdAt: nowIso(),
 	};
 
-	const finish = (
+	const finish = async (
 		pass: boolean,
 		stage: string,
 		cause: string,
 		checks: Array<{ name: string; pass: boolean; detail?: string }>,
 		remediation?: string,
-	): LiveProbeResult<DirectoryConnection> => {
-		const trace = pushTrace(store, {
+	): Promise<LiveProbeResult<DirectoryConnection>> => {
+		const trace: DiagnosticTrace = {
 			...base,
 			stage,
 			outcome: pass ? "pass" : "fail",
@@ -456,8 +508,14 @@ export async function testScimConnectionLive(
 			...(remediation ? { remediation } : {}),
 			checks,
 			redactedResponse: { evidence: LIVE_EVIDENCE_LABEL, endpoint: endpointUrl.origin },
-		});
-		recordEvent(store, {
+		};
+		const connection = await persistLiveTrace(store, {
+			kind: "scim",
+			id,
+			scope,
+			trace,
+			setTesting: false,
+			audit: {
 			actor: "operator",
 			action: "scim.test",
 			subjectType: "directory_connection",
@@ -470,11 +528,12 @@ export async function testScimConnectionLive(
 				? `Live SCIM conformance passed for ${endpointUrl.origin} — ${LIVE_EVIDENCE_LABEL}`
 				: `Live SCIM conformance failed at ${stage}: ${cause}`,
 			metadata: { mode: LIVE_CONFORMANCE_MODE, endpoint: endpointUrl.origin },
+			},
 		});
 		return {
 			pass,
 			trace,
-			connection: publicDirectoryConnection(conn) as DirectoryConnection,
+			connection: publicDirectoryConnection(connection as DirectoryConnection) as DirectoryConnection,
 			mode: LIVE_CONFORMANCE_MODE,
 			evidence: LIVE_EVIDENCE_LABEL,
 			endpoint: endpointUrl.origin,
