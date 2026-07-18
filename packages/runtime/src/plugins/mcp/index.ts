@@ -41,14 +41,27 @@ import {
 	findOAuthTokenBySecret,
 	getClient,
 	oidcProvider,
+	parseCodeVerificationValue,
+	revokeOAuthTokenFamily,
 	rotateOAuthRefreshToken,
+	validateOAuthSessionDerivativeAuthority,
+	withOAuthAccessTokenAuthority,
 } from "../oidc-provider";
 import { schema } from "../oidc-provider/schema";
 import {
+	oauthExpiresIn,
 	setNoStoreTokenResponseHeaders,
 } from "../oidc-provider/token-response";
 import { lockAndReadActiveUser } from "../../db/user-authority";
 import { consumeInternalVerificationChallenge } from "../../internal/verification-challenge-context";
+import {
+	ManagedSessionDerivativeAuthorityError,
+	type InternalSessionDerivativeAuthority,
+} from "../../internal/session-derivative-authority";
+import {
+	runManagedAuthenticationTransaction,
+	usesManagedAuthenticationPolicy,
+} from "../../internal/managed-authentication-transaction";
 import {
 	attachInternalCredentialAuthority,
 	readInternalCredentialAuthority,
@@ -246,7 +259,11 @@ export const mcp = (options: MCPOptions) => {
 		},
 	};
 	const signer = jwt(signerOptions);
-	const provider = oidcProvider({ ...opts, __skipDeprecationWarning: true });
+	const provider = oidcProvider({
+		...opts,
+		__skipDeprecationWarning: true,
+		__sessionDerivativePurpose: "mcp",
+	});
 	return {
 		id: "mcp",
 		version: PACKAGE_VERSION,
@@ -327,63 +344,64 @@ export const mcp = (options: MCPOptions) => {
 							error_description: "authorization bearer token not found",
 						});
 					}
-					const accessToken = await findOAuthTokenBySecret(
-						ctx.context.adapter,
+					const claims = await withOAuthAccessTokenAuthority(
+						ctx,
 						modelName.oauthAccessToken,
-						"access",
 						authorization.slice("Bearer ".length),
+						"mcp",
+						async (adapter, accessToken) => {
+							const client = await getClient(
+								accessToken.clientId,
+								opts.trustedClients,
+							);
+							const user = await ctx.context.internalAdapter.findUserById(
+								accessToken.userId,
+							);
+							if (
+								!client ||
+								client.disabled === true ||
+								!user ||
+								(user as Record<string, unknown>).banned === true
+							) {
+								await revokeOAuthTokenFamily(
+									adapter,
+									modelName.oauthAccessToken,
+									accessToken,
+								);
+								return null;
+							}
+							const scopes = accessToken.scopes.split(" ");
+							const canonicalClaims = {
+								sub: user.id,
+								name: scopes.includes("profile") ? user.name : undefined,
+								picture: scopes.includes("profile") ? user.image : undefined,
+								given_name: scopes.includes("profile")
+									? user.name.split(" ")[0]
+									: undefined,
+								family_name: scopes.includes("profile")
+									? user.name.split(" ")[1]
+									: undefined,
+								email: scopes.includes("email") ? user.email : undefined,
+								email_verified: scopes.includes("email")
+									? user.emailVerified
+									: undefined,
+							};
+							const extensionClaims = opts.getAdditionalUserInfoClaim
+								? filterAdditionalUserClaims(
+										await opts.getAdditionalUserInfoClaim(user, scopes, client),
+									)
+								: {};
+							return { ...canonicalClaims, ...extensionClaims };
+						},
 					);
-					if (
-						!accessToken ||
-						accessToken.refreshStatus === "revoked" ||
-						accessToken.accessTokenExpiresAt <= new Date()
-					) {
+					if (!claims) {
 						throw new APIError("UNAUTHORIZED", {
 							error: "invalid_token",
 							error_description: "invalid access token",
 						});
 					}
-					const client = await getClient(
-						accessToken.clientId,
-						opts.trustedClients,
-					);
-					const user = await ctx.context.internalAdapter.findUserById(
-						accessToken.userId,
-					);
-					if (
-						!client ||
-						client.disabled === true ||
-						!user ||
-						(user as Record<string, unknown>).banned === true
-					) {
-						throw new APIError("UNAUTHORIZED", {
-							error: "invalid_token",
-							error_description: "token authority no longer exists",
-						});
-					}
-					const scopes = accessToken.scopes.split(" ");
-					const canonicalClaims = {
-						sub: user.id,
-						name: scopes.includes("profile") ? user.name : undefined,
-						picture: scopes.includes("profile") ? user.image : undefined,
-						given_name: scopes.includes("profile")
-							? user.name.split(" ")[0]
-							: undefined,
-						family_name: scopes.includes("profile")
-							? user.name.split(" ")[1]
-							: undefined,
-						email: scopes.includes("email") ? user.email : undefined,
-						email_verified: scopes.includes("email")
-							? user.emailVerified
-							: undefined,
-					};
-					const extensionClaims = opts.getAdditionalUserInfoClaim
-						? filterAdditionalUserClaims(
-								await opts.getAdditionalUserInfoClaim(user, scopes, client),
-							)
-						: {};
 					setNoStoreTokenResponseHeaders(ctx);
-					return ctx.json({ ...canonicalClaims, ...extensionClaims });
+					return ctx.json(claims);
 				},
 			),
 			oAuthConsent: provider.endpoints.oAuthConsent,
@@ -654,6 +672,11 @@ export const mcp = (options: MCPOptions) => {
 								accessTokenExpiresAt,
 								secretConfig: ctx.context.secretConfig,
 								idempotencyKey,
+								derivativeAuthority: {
+									internalAdapter: ctx.context.internalAdapter,
+									purpose: "mcp",
+									managed: usesManagedAuthenticationPolicy(ctx),
+								},
 							},
 						);
 						if (rotation.kind !== "rotated") {
@@ -666,7 +689,9 @@ export const mcp = (options: MCPOptions) => {
 						return ctx.json({
 							access_token: rotation.successor.accessToken,
 							token_type: "Bearer",
-							expires_in: opts.accessTokenExpiresIn,
+							expires_in: oauthExpiresIn(
+								rotation.successor.row.accessTokenExpiresAt,
+							),
 							refresh_token: rotation.successor.refreshToken,
 							scope: rotation.token.scopes,
 						});
@@ -781,9 +806,13 @@ export const mcp = (options: MCPOptions) => {
 							});
 						}
 					}
-					const value = JSON.parse(
-						verificationValue.value,
-					) as CodeVerificationValue;
+					const value = parseCodeVerificationValue(verificationValue.value);
+					if (!value) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "invalid code",
+							error: "invalid_grant",
+						});
+					}
 					if (value.clientId !== client_id.toString()) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "invalid client_id",
@@ -819,79 +848,6 @@ export const mcp = (options: MCPOptions) => {
 						}
 					}
 
-					const requestedScopes = value.scope;
-					const accessToken = generateRandomString(48, "a-z", "A-Z", "0-9");
-					const issueRefreshToken = requestedScopes.includes("offline_access");
-					const refreshToken = issueRefreshToken
-						? generateRandomString(48, "A-Z", "a-z", "0-9")
-						: undefined;
-					const accessTokenExpiresAt = new Date(
-						Date.now() + opts.accessTokenExpiresIn * 1000,
-					);
-					const refreshTokenExpiresAt = new Date(
-						Date.now() + opts.refreshTokenExpiresIn * 1000,
-					);
-					const user = await ctx.context.internalAdapter.findUserById(
-						value.userId,
-					);
-					if (!user || (user as Record<string, unknown>).banned === true) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "user is unavailable",
-							error: "invalid_grant",
-						});
-					}
-					const profile = {
-						given_name: user.name.split(" ")[0]!,
-						family_name: user.name.split(" ")[1]!,
-						name: user.name,
-						profile: user.image,
-						updated_at: Math.floor(new Date(user.updatedAt).getTime() / 1000),
-					};
-					const email = {
-						email: user.email,
-						email_verified: user.emailVerified,
-					};
-					const userClaims = {
-						...(requestedScopes.includes("profile") ? profile : {}),
-						...(requestedScopes.includes("email") ? email : {}),
-					};
-
-					const additionalUserClaims = opts.getAdditionalUserInfoClaim
-						? await opts.getAdditionalUserInfoClaim(
-								user,
-								requestedScopes,
-								client,
-							)
-						: {};
-					const extensionClaims = filterAdditionalUserClaims(
-						additionalUserClaims,
-					);
-					const issuedAt = Math.floor(Date.now() / 1000);
-					const issuer = getMCPProviderMetadata(ctx, opts).issuer;
-					const idToken = await signJWT(ctx, {
-						options: {
-							...signerOptions,
-							jwt: {
-								issuer,
-								audience: client_id.toString(),
-								expirationTime: Math.floor(
-									accessTokenExpiresAt.getTime() / 1000,
-								),
-							},
-						},
-						maxExpiresAt: accessTokenExpiresAt,
-						payload: {
-							...userClaims,
-							...extensionClaims,
-						sub: user.id,
-						aud: client_id.toString(),
-							iss: issuer,
-							iat: issuedAt,
-							auth_time: Math.floor(value.authTime / 1000),
-						nonce: value.nonce,
-						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
-						},
-					});
 					const issued = await runWithTransaction(
 						ctx.context.adapter,
 						async () => {
@@ -907,16 +863,52 @@ export const mcp = (options: MCPOptions) => {
 								!consumed ||
 								!constantTimeEqual(consumed.value, verificationValue.value)
 							) {
-								return false;
-								}
-								const adapter = await getCurrentAdapter(ctx.context.adapter);
-								const authority = readInternalCredentialAuthority(
-									ctx.context.options,
+								return null;
+							}
+							const adapter = await getCurrentAdapter(ctx.context.adapter);
+							const authority = readInternalCredentialAuthority(
+								ctx.context.options,
+							);
+							if (authority) {
+								attachInternalCredentialAuthority(adapter, authority);
+							}
+							let sourceAuthority: InternalSessionDerivativeAuthority | undefined;
+							try {
+								sourceAuthority = await validateOAuthSessionDerivativeAuthority(
+									ctx.context.internalAdapter,
+									value,
+									"mcp",
+									usesManagedAuthenticationPolicy(ctx),
 								);
-								if (authority) {
-									attachInternalCredentialAuthority(adapter, authority);
+							} catch (error) {
+								if (!(error instanceof ManagedSessionDerivativeAuthorityError)) {
+									throw error;
 								}
-								const activeUser = await lockAndReadActiveUser(
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "invalid code",
+									error: "invalid_grant",
+								});
+							}
+							const issuedAt = Math.floor(Date.now() / 1000);
+							const accessTokenExpiresAt = new Date(
+								Math.min(
+									(issuedAt + opts.accessTokenExpiresIn) * 1000,
+									sourceAuthority?.sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+								),
+							);
+							if (accessTokenExpiresAt.getTime() <= Date.now()) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "source session expired",
+									error: "invalid_grant",
+								});
+							}
+							const refreshTokenExpiresAt = new Date(
+								Math.min(
+									(issuedAt + opts.refreshTokenExpiresIn) * 1000,
+									sourceAuthority?.sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+								),
+							);
+							const activeUser = await lockAndReadActiveUser(
 								adapter,
 								value.userId,
 							);
@@ -926,6 +918,68 @@ export const mcp = (options: MCPOptions) => {
 									error: "invalid_grant",
 								});
 							}
+							const requestedScopes = value.scope;
+							const accessToken = generateRandomString(
+								48,
+								"a-z",
+								"A-Z",
+								"0-9",
+							);
+							const issueRefreshToken = requestedScopes.includes("offline_access");
+							const refreshToken = issueRefreshToken
+								? generateRandomString(48, "A-Z", "a-z", "0-9")
+								: undefined;
+							const profile = {
+								given_name: activeUser.name.split(" ")[0]!,
+								family_name: activeUser.name.split(" ")[1]!,
+								name: activeUser.name,
+								profile: activeUser.image,
+								updated_at: Math.floor(
+									new Date(activeUser.updatedAt).getTime() / 1000,
+								),
+							};
+							const email = {
+								email: activeUser.email,
+								email_verified: activeUser.emailVerified,
+							};
+							const userClaims = {
+								...(requestedScopes.includes("profile") ? profile : {}),
+								...(requestedScopes.includes("email") ? email : {}),
+							};
+							const extensionClaims = filterAdditionalUserClaims(
+								opts.getAdditionalUserInfoClaim
+									? await opts.getAdditionalUserInfoClaim(
+											activeUser,
+											requestedScopes,
+											client,
+										)
+									: {},
+							);
+							const issuer = getMCPProviderMetadata(ctx, opts).issuer;
+							const idToken = await signJWT(ctx, {
+								options: {
+									...signerOptions,
+									jwt: {
+										issuer,
+										audience: client_id.toString(),
+										expirationTime: Math.floor(
+											accessTokenExpiresAt.getTime() / 1000,
+										),
+									},
+								},
+								maxExpiresAt: accessTokenExpiresAt,
+								payload: {
+									...userClaims,
+									...extensionClaims,
+									sub: activeUser.id,
+									aud: client_id.toString(),
+									iss: issuer,
+									iat: issuedAt,
+									auth_time: Math.floor(value.authTime / 1000),
+									nonce: value.nonce,
+									acr: "urn:mace:incommon:iap:silver",
+								},
+							});
 							await createOAuthTokenPair(adapter, modelName.oauthAccessToken, {
 								clientId: client_id.toString(),
 								userId: value.userId,
@@ -937,8 +991,17 @@ export const mcp = (options: MCPOptions) => {
 								issueRefreshToken,
 								accessToken,
 								refreshToken,
+								sessionDerivativeAuthority:
+									value.sessionDerivativeAuthority ?? null,
+								organizationId: value.organizationId ?? null,
 							});
-							return true;
+							return {
+								accessToken,
+								refreshToken,
+								idToken,
+								requestedScopes,
+								accessTokenExpiresAt,
+							};
 						},
 					);
 					if (!issued) {
@@ -949,12 +1012,14 @@ export const mcp = (options: MCPOptions) => {
 					}
 					setNoStoreTokenResponseHeaders(ctx);
 					return ctx.json({
-						access_token: accessToken,
+						access_token: issued.accessToken,
 						token_type: "Bearer",
-						expires_in: opts.accessTokenExpiresIn,
-						refresh_token: refreshToken,
-						scope: requestedScopes.join(" "),
-						id_token: requestedScopes.includes("openid") ? idToken : undefined,
+						expires_in: oauthExpiresIn(issued.accessTokenExpiresAt),
+						refresh_token: issued.refreshToken,
+						scope: issued.requestedScopes.join(" "),
+						id_token: issued.requestedScopes.includes("openid")
+							? issued.idToken
+							: undefined,
 					});
 				},
 			),
@@ -1192,48 +1257,43 @@ export const mcp = (options: MCPOptions) => {
 					if (!accessToken) {
 						return invalidToken();
 					}
-					const accessTokenData = await findOAuthTokenBySecret(
-						c.context.adapter,
+					const session = await withOAuthAccessTokenAuthority(
+						c,
 						modelName.oauthAccessToken,
-						"access",
 						accessToken,
+						"mcp",
+						async (adapter, accessTokenData) => {
+							const tokenClient = await getClient(
+								accessTokenData.clientId,
+								opts.trustedClients,
+							);
+							const tokenUser = await c.context.internalAdapter.findUserById(
+								accessTokenData.userId,
+							);
+							if (
+								!tokenClient ||
+								tokenClient.disabled === true ||
+								!tokenUser ||
+								(tokenUser as Record<string, unknown>).banned === true
+							) {
+								await revokeOAuthTokenFamily(
+									adapter,
+									modelName.oauthAccessToken,
+									accessTokenData,
+								);
+								return null;
+							}
+							return {
+								id: accessTokenData.id,
+								clientId: accessTokenData.clientId,
+								userId: accessTokenData.userId,
+								scopes: accessTokenData.scopes,
+								accessTokenExpiresAt: accessTokenData.accessTokenExpiresAt,
+							} satisfies MCPSession;
+						},
 					);
-					if (!accessTokenData) {
-						return invalidToken();
-					}
-					// An access token authorizes a protected resource only while it is
-					// unexpired. Without this gate an expired bearer token keeps
-					// authorizing handlers until its row is deleted (RFC 6750 §3.1
-					// treats an expired token as `invalid_token`).
-					if (accessTokenData.accessTokenExpiresAt < new Date()) {
-						return invalidToken();
-					}
-					if (accessTokenData.refreshStatus === "revoked") {
-						return invalidToken();
-					}
-					const tokenClient = await getClient(
-						accessTokenData.clientId,
-						opts.trustedClients,
-					);
-					if (!tokenClient || tokenClient.disabled === true) {
-						return invalidToken();
-					}
-					const tokenUser = await c.context.internalAdapter.findUserById(
-						accessTokenData.userId,
-					);
-					if (
-						!tokenUser ||
-						(tokenUser as Record<string, unknown>).banned === true
-					) {
-						return invalidToken();
-					}
-					return c.json({
-						id: accessTokenData.id,
-						clientId: accessTokenData.clientId,
-						userId: accessTokenData.userId,
-						scopes: accessTokenData.scopes,
-						accessTokenExpiresAt: accessTokenData.accessTokenExpiresAt,
-					} satisfies MCPSession);
+					if (!session) return invalidToken();
+					return c.json(session);
 				},
 			),
 		},
