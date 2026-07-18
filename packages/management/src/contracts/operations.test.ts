@@ -3,6 +3,7 @@ import type { ResourceScope } from "../services/scope.js";
 import type { Principal } from "../types/resources.js";
 import {
 	API_KEY_OPERATIONS,
+	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
 	DELIVERY_OPERATIONS,
@@ -56,7 +57,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(103);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(110);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -66,6 +67,28 @@ describe("management operation contracts", () => {
 		});
 		expect(MEMBER_OPERATIONS.remove.confirmation).toBe("client-required");
 		expect(MEMBER_OPERATIONS.import.confirmation).toBe("server-required");
+	});
+
+	it("defines revisioned authentication-policy preview and mutation safety", () => {
+		expect(Object.values(AUTHENTICATION_POLICY_OPERATIONS)).toHaveLength(4);
+		expect(AUTHENTICATION_POLICY_OPERATIONS.get).toMatchObject({
+			id: "authentication_policy.get",
+			cliPath: "auth-policy get",
+			http: { method: "GET", path: "/v1/authentication-policy" },
+			mutation: false,
+			confirmation: "none",
+		});
+		expect(AUTHENTICATION_POLICY_OPERATIONS.plan).toMatchObject({
+			http: { method: "POST", path: "/v1/authentication-policy/plan" },
+			mutation: false,
+		});
+		for (const action of ["apply", "unlock"] as const) {
+			expect(AUTHENTICATION_POLICY_OPERATIONS[action]).toMatchObject({
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
 	});
 
 	it("defines the complete webhook endpoint transport and safety contract", () => {
