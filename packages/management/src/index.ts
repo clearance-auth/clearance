@@ -30,6 +30,7 @@ export * from "./services/identity.js";
 export * from "./services/doctor.js";
 export * from "./services/delivery-control.js";
 export * from "./services/webhook-endpoints.js";
+export * from "./services/authentication-policy.js";
 export * from "./services/store-v2.js";
 export * from "./services/sso.js";
 export * from "./services/scim.js";
