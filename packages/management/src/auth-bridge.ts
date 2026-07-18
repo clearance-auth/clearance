@@ -199,7 +199,7 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		enableSso: true,
 		enableScim: true,
 		credentialAuthority,
-		runtimeAudit: projectEnv(),
+		runtimeAudit: runtimeAuditOptions(),
 		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
 		...keyManagementRuntimeOptions(),
 	});
@@ -232,6 +232,16 @@ function projectEnv() {
 	return {
 		projectId: process.env.CLEARANCE_PROJECT_ID ?? "proj_default",
 		environmentId: process.env.CLEARANCE_ENV_ID ?? "env_default",
+	};
+}
+
+function runtimeAuditOptions() {
+	const schema = process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA?.trim();
+	const prefix = process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX?.trim();
+	return {
+		...projectEnv(),
+		...(schema ? { schema } : {}),
+		...(prefix ? { prefix } : {}),
 	};
 }
 
