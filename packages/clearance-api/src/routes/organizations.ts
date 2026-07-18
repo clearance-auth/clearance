@@ -207,7 +207,12 @@ export function registerOrganizationRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const members = listMembers(store, c.req.param("id"), { scope });
+			const organization = await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
+			const members = listMembers(store, organization.id, { scope, organization });
 			return c.json({ members, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -235,12 +240,12 @@ export function registerOrganizationRoutes({
 			}
 			const principalId = body.principalId.trim();
 			const role = body.role !== undefined ? body.role : "member";
+			await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
 			if (body.dryRun === true) {
-				await inspectOrganizationAuthoritative(
-					store,
-					c.req.param("id"),
-					scope,
-				);
 				await inspectUserAuthoritative(store, principalId, scope);
 				return c.json({ dryRun: true, organizationId: c.req.param("id"), principalId, role, scope });
 			}
@@ -287,6 +292,7 @@ export function registerOrganizationRoutes({
 				organizationId: c.req.param("id"),
 				content: body.content,
 				format,
+				scope,
 			});
 			if (body.dryRun === true || body.confirm !== true) {
 				return c.json({ dryRun: true, ...plan, scope });
@@ -316,8 +322,8 @@ export function registerOrganizationRoutes({
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
 			// Ensure org is in scope (cross-scope ids indistinguishable from missing)
-			await inspectOrganizationAuthoritative(store, orgId, scope);
-			const existing = inspectMembership(store, memberId, scope);
+			const organization = await inspectOrganizationAuthoritative(store, orgId, scope);
+			const existing = inspectMembership(store, memberId, scope, organization);
 			if (existing.organizationId !== orgId) {
 				// Treat as missing — do not leak cross-org membership existence
 				throw new ClearanceError({
@@ -356,8 +362,8 @@ export function registerOrganizationRoutes({
 			const scope = scopeForRequest(store, c);
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
-			await inspectOrganizationAuthoritative(store, orgId, scope);
-			const existing = inspectMembership(store, memberId, scope);
+			const organization = await inspectOrganizationAuthoritative(store, orgId, scope);
+			const existing = inspectMembership(store, memberId, scope, organization);
 			if (existing.organizationId !== orgId) {
 				throw new ClearanceError({
 					code: "MEMBER_NOT_FOUND",
