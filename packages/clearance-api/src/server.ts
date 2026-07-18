@@ -34,6 +34,7 @@ import {
 	type ResourceScope,
 } from "@clearance/management";
 import { registerAccessRoutes } from "./routes/access.js";
+import { registerAuthenticationPolicyRoutes } from "./routes/authentication-policy.js";
 import { registerConfigRoutes } from "./routes/config.js";
 import { registerDeliveryRoutes } from "./routes/delivery.js";
 import { registerWebhookEndpointRoutes } from "./routes/webhook-endpoints.js";
@@ -989,6 +990,11 @@ app.route("/", registerConfigRoutes({ storeForRequest, scopeForRequest, handleEr
 app.route("/", registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }));
 
 app.route("/", registerWebhookEndpointRoutes({ storeForRequest, scopeForRequest, handleError }));
+
+app.route(
+	"/",
+	registerAuthenticationPolicyRoutes({ storeForRequest, scopeForRequest, handleError }),
+);
 
 app.route(
 	"/",
