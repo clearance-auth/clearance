@@ -26,6 +26,13 @@ import { parseUserOutput } from "../../../db/schema";
 import {
 	captureInternalSessionIssuanceContext,
 } from "../../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../../internal/runtime-audit";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import {
@@ -91,6 +98,22 @@ export interface BackupCodeOptions {
 const HASHED_BACKUP_CODES_PREFIX = "clr-recovery:v1:";
 const RECOVERY_CODE_DIGEST_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_RECOVERY_CODES = 100;
+
+async function appendRuntimeAuditIfBound(
+	ctx: GenericEndpointContext,
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
+}
 
 type RecoveryRepairAuthorityRecord = Readonly<{
 	subjectId: string;
@@ -915,23 +938,35 @@ export const backupCode2fa = (
 							TWO_FACTOR_ERROR_CODES.INVALID_BACKUP_CODE,
 						);
 					}
-					const updated = await ctx.context.adapter.incrementOne({
-						model: twoFactorTable,
-						where: [
-							{
-								field: "id",
-								value: twoFactor.id,
-							},
-							{
-								field: "backupCodes",
-								value: twoFactor.backupCodes,
-							},
-						],
-						increment: {},
-						set: {
-							backupCodes: validate.updated,
+					const updated = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							const adapter = await getCurrentAdapter(ctx.context.adapter);
+							const updated = await adapter.incrementOne({
+								model: twoFactorTable,
+								where: [
+									{ field: "id", value: twoFactor.id },
+									{ field: "backupCodes", value: twoFactor.backupCodes },
+								],
+								increment: {},
+								set: { backupCodes: validate.updated },
+							});
+							if (updated) {
+								await appendRuntimeAuditIfBound(ctx, adapter, {
+									actor: user.id,
+									action: "auth.recovery.code_used",
+									subjectType: "user",
+									subjectId: user.id,
+									outcome: "success",
+									source: "system",
+									organizationId: null,
+									message: "Recovery code used",
+									metadata: {},
+								});
+							}
+							return updated;
 						},
-					});
+					);
 					if (!updated) {
 						await attempt?.restore();
 						await accountAttempt?.restore();
@@ -1124,6 +1159,17 @@ export const backupCode2fa = (
 									false,
 									replacementIssuanceContext,
 								);
+							await appendRuntimeAuditIfBound(ctx, adapter, {
+								actor: user.id,
+								action: "auth.recovery.code_regenerated",
+								subjectType: "user",
+								subjectId: user.id,
+								outcome: "success",
+								source: "system",
+								organizationId: null,
+								message: "Recovery codes regenerated",
+								metadata: {},
+							});
 							return { generated, replacementSession, updatedUser };
 						},
 					).catch(async (error) => {
