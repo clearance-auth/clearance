@@ -3,6 +3,7 @@ import type { ResourceScope } from "../services/scope.js";
 import type { Principal } from "../types/resources.js";
 import {
 	API_KEY_OPERATIONS,
+	AUTHORIZATION_OPERATIONS,
 	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
@@ -23,6 +24,7 @@ import {
 	SCHEMA_OPERATIONS,
 	STORE_V2_OPERATIONS,
 	SESSION_OPERATIONS,
+	SERVICE_ACCOUNT_OPERATIONS,
 	SSO_OPERATIONS,
 	USER_OPERATIONS,
 	UPGRADE_OPERATIONS,
@@ -58,7 +60,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(113);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(125);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -68,6 +70,81 @@ describe("management operation contracts", () => {
 		});
 		expect(MEMBER_OPERATIONS.remove.confirmation).toBe("client-required");
 		expect(MEMBER_OPERATIONS.import.confirmation).toBe("server-required");
+	});
+
+	it("defines normalized authorization and service-account transport safety", () => {
+		expect(Object.values(AUTHORIZATION_OPERATIONS)).toHaveLength(4);
+		expect(Object.values(AUTHORIZATION_OPERATIONS).map((operation) => `${operation.http.method} ${operation.http.path}`)).toEqual([
+			"GET /v1/organizations/:id/authorization/effective/:subjectKind/:subjectId",
+			"GET /v1/organizations/:id/authorization/assignments",
+			"PATCH /v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId",
+			"POST /v1/organizations/:id/authorization/reconcile",
+		]);
+		expect(AUTHORIZATION_OPERATIONS.effectiveInspect).toMatchObject({
+			id: "authorization.effective.inspect",
+			cliPath: "orgs authorization effective",
+			http: { method: "GET", path: "/v1/organizations/:id/authorization/effective/:subjectKind/:subjectId" },
+			mutation: false,
+		});
+		for (const operation of [
+			AUTHORIZATION_OPERATIONS.assignmentsReplace,
+			AUTHORIZATION_OPERATIONS.reconcile,
+		]) {
+			expect(operation).toMatchObject({ mutation: true, supportsDryRun: true, confirmation: "server-required" });
+		}
+		expect(AUTHORIZATION_OPERATIONS.assignmentsList.http).toEqual({
+			method: "GET",
+			path: "/v1/organizations/:id/authorization/assignments",
+		});
+		expect(AUTHORIZATION_OPERATIONS.assignmentsReplace.http).toEqual({
+			method: "PATCH",
+			path: "/v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId",
+		});
+		expect(AUTHORIZATION_OPERATIONS.reconcile.http).toEqual({
+			method: "POST",
+			path: "/v1/organizations/:id/authorization/reconcile",
+		});
+		expect(Object.values(SERVICE_ACCOUNT_OPERATIONS)).toHaveLength(8);
+		expect(Object.values(SERVICE_ACCOUNT_OPERATIONS).map((operation) => `${operation.http.method} ${operation.http.path}`)).toEqual([
+			"GET /v1/organizations/:id/service-accounts",
+			"GET /v1/organizations/:id/service-accounts/:accountId",
+			"POST /v1/organizations/:id/service-accounts",
+			"PATCH /v1/organizations/:id/service-accounts/:accountId/status",
+			"PATCH /v1/organizations/:id/service-accounts/:accountId/status",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke",
+		]);
+		expect(SERVICE_ACCOUNT_OPERATIONS.create).toMatchObject({
+			id: "service-accounts.create",
+			http: { method: "POST", path: "/v1/organizations/:id/service-accounts" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "none",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.disable).toMatchObject({
+			http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+			confirmation: "client-required",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.enable.confirmation).toBe("none");
+		expect(SERVICE_ACCOUNT_OPERATIONS.inspect.http).toEqual({
+			method: "GET",
+			path: "/v1/organizations/:id/service-accounts/:accountId",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialCreate.http).toEqual({
+			method: "POST",
+			path: "/v1/organizations/:id/service-accounts/:accountId/credentials",
+		});
+		for (const operation of [
+			SERVICE_ACCOUNT_OPERATIONS.credentialRotate,
+			SERVICE_ACCOUNT_OPERATIONS.credentialRevoke,
+		]) {
+			expect(operation).toMatchObject({ mutation: true, supportsDryRun: true, confirmation: "client-required" });
+		}
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialRotate.http.path)
+			.toBe("/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate");
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.http.path)
+			.toBe("/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke");
 	});
 
 	it("defines revisioned authentication-policy preview and mutation safety", () => {
