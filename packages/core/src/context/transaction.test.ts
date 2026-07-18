@@ -307,6 +307,59 @@ describe("runWithTransaction", () => {
 		expect(hookRuns).toBe(1);
 	});
 
+	it("deactivates detached transaction continuations after commit and rollback", async () => {
+		for (const mode of ["commit", "rollback", "owner-view"] as const) {
+			const first = createTransactionHarness();
+			const second = createTransactionHarness();
+			let release!: () => void;
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let detached!: Promise<{
+				adapter: DBTransactionAdapter;
+				rootActive: boolean;
+				transactionActive: boolean;
+			}>;
+			const scheduleDetachedProbe = () => {
+				detached = (async () => {
+					await released;
+					return {
+						adapter: await getCurrentAdapter(first.adapter),
+						rootActive: await isTransactionActive(first.adapter),
+						transactionActive: await isTransactionActive(
+							first.transactionAdapter,
+						),
+					};
+				})();
+			};
+
+			const transaction = runWithTransaction(first.adapter, async () => {
+				if (mode === "owner-view") {
+					await runWithTransaction(second.adapter, () =>
+						runWithTransaction(first.adapter, async () => {
+							scheduleDetachedProbe();
+						}),
+					);
+				} else {
+					scheduleDetachedProbe();
+				}
+				if (mode === "rollback") throw new Error("force rollback");
+			});
+
+			if (mode === "rollback") {
+				await expect(transaction).rejects.toThrow("force rollback");
+			} else {
+				await transaction;
+			}
+			release();
+			await expect(detached).resolves.toEqual({
+				adapter: first.adapter,
+				rootActive: false,
+				transactionActive: false,
+			});
+		}
+	});
+
 	it("does not retry a failing adapter callback inside an active transaction", async () => {
 		const { adapter, getTransactionCalls } = createTransactionHarness();
 		let callbackCalls = 0;
