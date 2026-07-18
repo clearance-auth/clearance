@@ -849,7 +849,7 @@ describe.for([
 });
 
 describe("jwt - remote signing", async () => {
-	it("should fail if sign is defined and remoteUrl is not", async () => {
+	it("requires verification keys and serves adapter JWKS for custom signing", async () => {
 		expect(() =>
 			getTestInstance({
 				plugins: [
@@ -863,8 +863,69 @@ describe("jwt - remote signing", async () => {
 				],
 			}),
 		).toThrowError(
-			"options.jwks.remoteUrl must be set when using options.jwt.sign",
+			"options.jwt.sign requires options.jwks.remoteUrl or options.adapter.getJwks",
 		);
+
+		const keySets: Jwk[] = [
+			{
+				id: "clearance-es256",
+				publicKey: JSON.stringify({
+					kty: "EC",
+					crv: "P-256",
+					x: "test-public-x",
+					y: "test-public-y",
+				}),
+				privateKey: "not-used-by-custom-signer",
+				createdAt: new Date("2026-01-01T00:00:00.000Z"),
+				alg: "ES256",
+			},
+		];
+		let createJwkCalls = 0;
+		const { auth } = await getTestInstance({
+			plugins: [
+				jwt({
+					jwt: {
+						sign: (payload) => {
+							const header = Buffer.from(
+								JSON.stringify({ alg: "ES256", kid: "clearance-es256" }),
+							).toString("base64url");
+							const body = Buffer.from(JSON.stringify(payload)).toString(
+								"base64url",
+							);
+							return `${header}.${body}.custom-signature`;
+						},
+					},
+					adapter: {
+						getJwks: async () => keySets,
+						createJwk: async () => {
+							createJwkCalls += 1;
+							throw new Error("custom signing must not create a local key");
+						},
+					},
+				}),
+			],
+		});
+
+		const token = await auth.api.signJWT({
+			body: { payload: { sub: "custom-signer-subject" } },
+		});
+		expect(token.token).toContain("custom-signature");
+
+		const jwks = await auth.api.getJwks();
+		expect(jwks.keys).toEqual([
+			expect.objectContaining({
+				kid: "clearance-es256",
+				alg: "ES256",
+				kty: "EC",
+			}),
+		]);
+		expect(createJwkCalls).toBe(0);
+
+		keySets.length = 0;
+		await expect(auth.api.getJwks()).rejects.toThrow(
+			"No public JWKS keys found for options.jwt.sign. Make sure options.adapter.getJwks returns at least one key.",
+		);
+		expect(createJwkCalls).toBe(0);
 	});
 });
 
