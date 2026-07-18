@@ -1,4 +1,9 @@
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import {
+	createHash,
+	createHmac,
+	generateKeyPairSync,
+	randomUUID,
+} from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mcp } from "../../runtime/src/plugins/mcp/index.js";
@@ -517,7 +522,7 @@ describe.sequential.skipIf(!available)(
 			).toBe(false);
 		});
 
-		it("rotates encrypted Ed25519 signing keys with overlap and public-only JWKS", async () => {
+		it("signs ES256 tokens without recovering private material and publishes local JWKS", async () => {
 			const first = await bundle.auth.api.getToken({ headers });
 			const firstHeader = decodeJwtPart<{ alg: string; kid: string }>(
 				first.token,
@@ -529,25 +534,10 @@ describe.sequential.skipIf(!available)(
 				iat: number;
 				exp: number;
 			}>(first.token, 1);
-			expect(firstHeader).toMatchObject({ alg: "EdDSA" });
+			expect(firstHeader).toMatchObject({ alg: "ES256" });
 			expect(firstHeader.kid).toBeTruthy();
 			expect(firstPayload).toMatchObject({ iss: baseURL, aud: baseURL });
 			expect(firstPayload.exp - firstPayload.iat).toBe(300);
-
-			const firstRow = (
-				await scopedPool.query<JwksRow>(
-					`SELECT id, "publicKey", "privateKey", alg, crv FROM jwks WHERE id=$1`,
-					[firstHeader.kid],
-				)
-			).rows[0]!;
-			expect(firstRow).toMatchObject({ alg: "EdDSA", crv: "Ed25519" });
-			expect(firstRow.privateKey).not.toContain('"d"');
-			expect(firstRow.publicKey).not.toContain('"d"');
-
-			await scopedPool.query(
-				`UPDATE jwks SET "expiresAt"=now()-interval '1 second' WHERE id=$1`,
-				[firstHeader.kid],
-			);
 			const concurrent = await Promise.all(
 				Array.from({ length: 8 }, (_, index) =>
 					(index % 2 === 0 ? bundle : peerBundle).auth.api.getToken({
@@ -558,27 +548,34 @@ describe.sequential.skipIf(!available)(
 			const secondHeaders = concurrent.map((entry) =>
 				decodeJwtPart<{ alg: string; kid: string }>(entry.token, 0),
 			);
-			const secondHeader = secondHeaders[0]!;
 			rotatedToken = concurrent[0]!.token;
-			rotatedKid = secondHeader.kid;
-			expect(secondHeader).toMatchObject({ alg: "EdDSA" });
-			expect(secondHeader.kid).not.toBe(firstHeader.kid);
+			rotatedKid = firstHeader.kid;
+			expect(secondHeaders[0]).toMatchObject({
+				alg: "ES256",
+				kid: firstHeader.kid,
+			});
 			expect(new Set(secondHeaders.map((entry) => entry.kid)).size).toBe(1);
 			expect(
 				(
 					await scopedPool.query<{ count: number }>(
-						"SELECT count(*)::int count FROM jwks",
+						"SELECT count(*)::int count FROM jwks WHERE id=$1",
+						[firstHeader.kid],
 					)
 				).rows[0]?.count,
-			).toBe(2);
+			).toBe(0);
 
 			const oldToken = await bundle.auth.api.verifyJWT({
 				body: { token: first.token },
 			});
 			expect(oldToken.payload?.iss).toBe(baseURL);
 			const publicSet = await bundle.auth.api.getJwks();
-			expect(publicSet.keys.map((key) => key.kid).sort()).toEqual(
-				[firstHeader.kid, secondHeader.kid].sort(),
+			expect(publicSet.keys).toContainEqual(
+				expect.objectContaining({
+					kid: firstHeader.kid,
+					alg: "ES256",
+					kty: "EC",
+					crv: "P-256",
+				}),
 			);
 			expect(JSON.stringify(publicSet)).not.toContain('"d"');
 			expect(JSON.stringify(publicSet)).not.toContain("privateKey");
@@ -587,24 +584,33 @@ describe.sequential.skipIf(!available)(
 		it("retires legacy keys on upgrade and fails closed on unknown metadata", async () => {
 			const unknownId = randomUUID();
 			const legacyRsaId = randomUUID();
+			const legacyEdId = randomUUID();
+			const legacyEdPublic = generateKeyPairSync("ed25519").publicKey.export({
+				format: "jwk",
+			});
+			await scopedPool.query(
+				`DROP TRIGGER IF EXISTS clearance_require_jwt_key_v1 ON jwks`,
+			);
 			await scopedPool.query(
 				`INSERT INTO jwks
 				 (id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv)
-				 VALUES ($1, '{}', 'unusable-private-key', now(), now()+interval '1 day', NULL, NULL)`,
+				 VALUES ($1, '{}', 'clr-jwk:retired:v1', now(), now()+interval '1 day', NULL, NULL)`,
 				[unknownId],
 			);
 			await scopedPool.query(
 				`INSERT INTO jwks
 				 (id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv)
-				 VALUES ($1, $2, 'unusable-private-key', now(), now()+interval '1 day', 'RS256', NULL)`,
+				 VALUES ($1, $2, 'clr-jwk:retired:v1', now(), now()+interval '1 day', 'RS256', NULL)`,
 				[
 					legacyRsaId,
 					JSON.stringify({ kty: "RSA", n: "legacy-modulus", e: "AQAB" }),
 				],
 			);
 			await scopedPool.query(
-				`UPDATE jwks SET "expiresAt"=NULL, alg=NULL, crv=NULL WHERE id=$1`,
-				[rotatedKid],
+				`INSERT INTO jwks
+				 (id, "publicKey", "privateKey", "createdAt", "expiresAt", alg, crv)
+				 VALUES ($1, $2, 'clr-jwk:retired:v1', now(), NULL, NULL, NULL)`,
+				[legacyEdId, JSON.stringify(legacyEdPublic)],
 			);
 
 			await bundle.migrate();
@@ -612,7 +618,7 @@ describe.sequential.skipIf(!available)(
 				await scopedPool.query<JwksRow & { expiresAt: Date }>(
 					`SELECT id, "publicKey", "privateKey", "expiresAt", alg, crv
 					 FROM jwks WHERE id=$1`,
-					[rotatedKid],
+					[legacyEdId],
 				)
 			).rows[0]!;
 			expect(upgraded).toMatchObject({ alg: "EdDSA", crv: "Ed25519" });
@@ -654,7 +660,7 @@ describe.sequential.skipIf(!available)(
 				replacement.token,
 				0,
 			);
-			expect(replacementHeader.kid).not.toBe(rotatedKid);
+			expect(replacementHeader.kid).toBe(rotatedKid);
 			expect(replacementHeader.kid).not.toBe(legacyRsaId);
 			expect(
 				(await bundle.auth.api.verifyJWT({ body: { token: rotatedToken } }))
@@ -779,6 +785,9 @@ describe.sequential.skipIf(!available)(
 					scimToken: legacyScim,
 					privateKey: "invalid-legacy-private-key",
 				});
+				await scopedPool.query(
+					`DROP TRIGGER IF EXISTS clearance_require_jwt_key_v1 ON jwks`,
+				);
 				await scopedPool.query(`UPDATE jwks SET "privateKey"=$2 WHERE id=$1`, [
 					`jwk-${suffix}`,
 					legacyJwk,
@@ -803,6 +812,34 @@ describe.sequential.skipIf(!available)(
 						[`jwk-${suffix}`],
 					)
 				).rows[0]!;
+				const generations = (
+					await scopedPool.query<{
+						oidcVersion: number;
+						oidcRevision: number;
+						scimVersion: number;
+						scimRevision: number;
+						jwtVersion: number;
+						jwtRevision: number;
+					}>(
+						`SELECT sso."keyManagementVersion" AS "oidcVersion",
+						        sso."keyManagementRevision" AS "oidcRevision",
+						        scim."keyManagementVersion" AS "scimVersion",
+						        scim."keyManagementRevision" AS "scimRevision",
+						        jwks."keyManagementVersion" AS "jwtVersion",
+						        jwks."keyManagementRevision" AS "jwtRevision"
+						 FROM "ssoProvider" sso, "scimProvider" scim, jwks
+						 WHERE sso."providerId"=$1 AND scim."providerId"=$2 AND jwks.id=$3`,
+						[oidcProviderId, scimProviderId, `jwk-${suffix}`],
+					)
+				).rows[0]!;
+				expect(generations).toEqual({
+					oidcVersion: 1,
+					oidcRevision: 1,
+					scimVersion: 1,
+					scimRevision: 1,
+					jwtVersion: 1,
+					jwtRevision: 1,
+				});
 				const oidcStored = (
 					JSON.parse(oidc.oidcConfig) as { clientSecret: string }
 				).clientSecret.slice("clr-sso:v1:".length);
