@@ -9,7 +9,8 @@ import {
 } from "@clearance/auth";
 import {
 	createManagementStore,
-	initProject,
+	initProjectAuthoritative,
+	provisionOrganizationInAuth,
 	recordEvent,
 	syncRuntimeOrganizationToManagementDurable,
 	syncRuntimeUserToManagementDurable,
@@ -81,10 +82,11 @@ function getManagementStore() {
 		backend: "postgres",
 		databaseUrl,
 	}).then(async (managementStore) => {
-		if (managementStore.snapshot.projects.length === 0) {
-			initProject(managementStore, { name: "sample-b2b", source: "api" });
-			await managementStore.ready();
-		}
+		await initProjectAuthoritative(managementStore, {
+			name: "sample-b2b",
+			source: "api",
+		});
+		await managementStore.ready();
 		return managementStore;
 	});
 	return managementStorePromise;
@@ -492,6 +494,8 @@ async function routeRequest(
 			slug: string;
 			createdAt?: string | Date;
 		}> = [];
+		const managementStore = await getManagementStore();
+		let provisionedOrganizationId: string | undefined;
 		try {
 			const headers = new Headers({
 				cookie: req.headers.cookie ?? "",
@@ -506,16 +510,14 @@ async function routeRequest(
 					createdAt?: string | Date;
 				}>) ?? [];
 			if (orgs.length === 0) {
-				await bundle.auth.api.createOrganization({
-					body: {
-						name: `${user.name}'s Workspace`,
-						slug: `ws-${user.id.slice(0, 8).toLowerCase()}`,
-					},
-					headers,
+				const provisioned = await provisionOrganizationInAuth(managementStore, {
+					name: `${user.name}'s Workspace`,
+					slug: `ws-${user.id.slice(0, 8).toLowerCase()}`,
+					ownerUserId: user.id,
+					actor: user.email,
 				});
-				const again = await bundle.auth.api.listOrganizations({ headers });
-				runtimeOrganizations =
-					(again as typeof runtimeOrganizations) ?? [];
+				provisionedOrganizationId = provisioned.id;
+				runtimeOrganizations = [provisioned];
 			} else {
 				runtimeOrganizations = orgs;
 			}
@@ -524,8 +526,8 @@ async function routeRequest(
 			orgNames = "(org plugin)";
 		}
 
-		const managementStore = await getManagementStore();
 		for (const organization of runtimeOrganizations) {
+			if (organization.id === provisionedOrganizationId) continue;
 			await syncRuntimeOrganizationToManagementDurable(
 				managementStore,
 				organization,
