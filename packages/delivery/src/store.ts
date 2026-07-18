@@ -35,6 +35,10 @@ import {
 	type DeliveryQuotaStatus,
 	type DeliveryScope,
 } from "./quota.js";
+import {
+	appendRuntimeAuditInTransaction,
+	assertRuntimeAuditTableReady,
+} from "./runtime-audit.js";
 
 type JobRow = {
 	id: string;
@@ -43,6 +47,8 @@ type JobRow = {
 	project_id: string;
 	environment_id: string;
 	organization_id: string | null;
+	actor_id: string | null;
+	correlation_id: string | null;
 	webhook_endpoint_id: string | null;
 	channel: "email" | "webhook";
 	state: DeliveryJobState;
@@ -159,6 +165,86 @@ export class DeliveryStore {
 
 	migrate() {
 		return migrateDeliverySchema(this.pool, this.options);
+	}
+
+	/** Verify a configured product-owned audit authority without ever migrating it. */
+	async assertRuntimeAuditTableReady(): Promise<void> {
+		if (!this.options.runtimeAudit) return;
+		await assertRuntimeAuditTableReady({
+			rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+				text: string,
+				values: readonly unknown[] = [],
+			) => {
+				const result = await this.pool.query<Row>(text, [...values]);
+				return { rows: result.rows, rowCount: result.rowCount };
+			},
+		}, this.options.runtimeAudit);
+	}
+
+	private async appendWebhookAudit(
+		client: pg.PoolClient,
+		row: Readonly<{
+			id: string;
+			event_id: string;
+			project_id: string;
+			environment_id: string;
+			organization_id: string | null;
+			actor_id: string | null;
+			correlation_id: string | null;
+			webhook_endpoint_id: string | null;
+			attempt_count: number;
+		}>,
+		action: "delivery.webhook.delivered" | "delivery.webhook.retried" | "delivery.webhook.dead",
+		terminalState: "delivered" | "retry" | "dead",
+		input: Readonly<{
+			providerStatus?: string | null;
+			providerRequestId?: string | null;
+			errorClass?: string | null;
+			now: Date;
+		}>,
+	): Promise<void> {
+		if (!this.options.runtimeAudit) return;
+		const providerStatus = safeProviderValue(input.providerStatus, "status");
+		const providerRequestId = safeProviderValue(input.providerRequestId, "requestId");
+		const errorClass = safeErrorClass(input.errorClass);
+		await appendRuntimeAuditInTransaction({
+			rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+				text: string,
+				values: readonly unknown[] = [],
+			) => {
+				const result = await client.query<Row>(text, [...values]);
+				return { rows: result.rows, rowCount: result.rowCount };
+			},
+		}, this.options.runtimeAudit, {
+			correlationId: row.correlation_id ?? row.event_id,
+			projectId: row.project_id,
+			environmentId: row.environment_id,
+			organizationId: row.organization_id,
+			actor: row.actor_id ?? "system",
+			action,
+			subjectType: "delivery_job",
+			subjectId: row.id,
+			outcome: terminalState === "retry" ? "pending" : terminalState === "delivered" ? "success" : "failure",
+			source: "system",
+			message: terminalState === "retry" ? "Webhook delivery retry scheduled" : terminalState === "delivered" ? "Webhook delivery delivered" : "Webhook delivery dead-lettered",
+			metadata: {
+				eventId: row.event_id,
+				...(row.webhook_endpoint_id === null ? {} : { endpointId: row.webhook_endpoint_id }),
+				attempt: Number(row.attempt_count),
+				terminalState,
+				...(providerStatus === null ? {} : { providerStatus }),
+				...(providerRequestId === null ? {} : { providerRequestId }),
+				...(errorClass === null ? {} : { errorClass }),
+				request: {
+					operationId: "delivery-webhook-transition",
+					route: "/internal/delivery/webhook",
+					method: "POST",
+					clientIp: null,
+					userAgent: null,
+				},
+			},
+			createdAt: input.now,
+		});
 	}
 
 	/**
@@ -446,7 +532,7 @@ export class DeliveryStore {
 		const workerId = validWorkerId(input.workerId);
 		return this.transaction(async (client) => {
 			const locked = await client.query<JobRow & { cancel_requested: boolean }>(
-				`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id
+				`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.actor_id, e.correlation_id, e.webhook_endpoint_id
 				 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
 				 WHERE j.id=$1 AND j.state='leased' AND j.lease_token=$2
 				   AND j.lease_owner=$3 AND j.lease_expires_at > $4 FOR UPDATE OF j`,
@@ -503,6 +589,23 @@ export class DeliveryStore {
 					safeProviderValue(input.providerRequestId, "requestId"), errorClass, now,
 				],
 			);
+			if (row.channel === "webhook") {
+				const audit = state === "delivered"
+					? { action: "delivery.webhook.delivered" as const, terminalState: "delivered" as const }
+					: state === "retry"
+						? { action: "delivery.webhook.retried" as const, terminalState: "retry" as const }
+						: state === "dead"
+							? { action: "delivery.webhook.dead" as const, terminalState: "dead" as const }
+							: null;
+				if (audit) {
+					await this.appendWebhookAudit(client, row, audit.action, audit.terminalState, {
+						providerStatus: input.providerStatus,
+						providerRequestId: input.providerRequestId,
+						errorClass,
+						now,
+					});
+				}
+			}
 			return jobRecord({ ...updated.rows[0]!, kind: row.kind, project_id: row.project_id,
 				environment_id: row.environment_id, organization_id: row.organization_id,
 				webhook_endpoint_id: row.webhook_endpoint_id });
@@ -534,40 +637,60 @@ export class DeliveryStore {
 		validDate(now, "now");
 		boundedInteger(limit, "reclaim limit", 1, 1_000);
 		return this.transaction(async (client) => {
-				const rows = await client.query<{
-					id: string; attempt_count: number; max_attempts: number; semantic_expires_at: Date | string;
-					lease_token: string; lease_owner: string; cancel_requested: boolean;
-					provider_accepted_at: Date | string | null; provider_status: string | null;
-					provider_request_id: string | null;
-				}>(
-					`SELECT id, attempt_count, max_attempts, semantic_expires_at, lease_token, lease_owner,
-					 cancel_requested, provider_accepted_at, provider_status, provider_request_id
-				 FROM ${this.tables.job} WHERE state='leased' AND lease_expires_at <= $1
-				 ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2`,
+			const rows = await client.query<{
+				id: string; event_id: string; channel: "email" | "webhook"; project_id: string;
+				environment_id: string; organization_id: string | null; actor_id: string | null;
+				correlation_id: string | null; webhook_endpoint_id: string | null;
+				attempt_count: number; max_attempts: number; semantic_expires_at: Date | string;
+				lease_token: string; lease_owner: string; cancel_requested: boolean;
+				provider_accepted_at: Date | string | null; provider_status: string | null;
+				provider_request_id: string | null;
+			}>(
+				`SELECT j.id, j.event_id, j.channel, j.attempt_count, j.max_attempts, j.semantic_expires_at,
+				 j.lease_token, j.lease_owner, j.cancel_requested, j.provider_accepted_at, j.provider_status,
+				 j.provider_request_id, e.project_id, e.environment_id, e.organization_id, e.actor_id,
+				 e.correlation_id, e.webhook_endpoint_id
+				 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
+				 WHERE j.state='leased' AND j.lease_expires_at <= $1
+				 ORDER BY j.lease_expires_at, j.id FOR UPDATE OF j SKIP LOCKED LIMIT $2`,
 				[now, limit],
 			);
 			for (const row of rows.rows) {
-					const acceptedUnconfirmed = row.provider_accepted_at !== null;
-					const dead = acceptedUnconfirmed || Number(row.attempt_count) >= Number(row.max_attempts) || new Date(row.semantic_expires_at) <= now;
-					const state = row.cancel_requested ? "cancelled" : dead ? "dead" : "retry";
-					const phase = row.cancel_requested ? "cancelled" : acceptedUnconfirmed ? "dead" : "lease_expired";
-					const errorClass = acceptedUnconfirmed ? "provider_accepted_unconfirmed" : "lease_expired";
+				const acceptedUnconfirmed = row.provider_accepted_at !== null;
+				const dead = acceptedUnconfirmed || Number(row.attempt_count) >= Number(row.max_attempts) || new Date(row.semantic_expires_at) <= now;
+				const state = row.cancel_requested ? "cancelled" : dead ? "dead" : "retry";
+				const phase = row.cancel_requested ? "cancelled" : acceptedUnconfirmed ? "dead" : "lease_expired";
+				const errorClass = acceptedUnconfirmed ? "provider_accepted_unconfirmed" : "lease_expired";
 				await client.query(
 					`UPDATE ${this.tables.job} SET state=$2, available_at=$1,
 					 lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL, cancel_requested=false,
 					 updated_at=$1, dead_at=CASE WHEN $2='dead' THEN $1 ELSE dead_at END,
 					 cancelled_at=CASE WHEN $2='cancelled' THEN $1 ELSE cancelled_at END,
 						 last_error_class=$5 WHERE id=$3 AND lease_token=$4`,
-						[now, state, row.id, row.lease_token, errorClass],
+					[now, state, row.id, row.lease_token, errorClass],
 				);
 				await client.query(
 					`INSERT INTO ${this.tables.attempt}
 						 (id, job_id, attempt_number, lease_token, phase, worker_id,
 						  provider_status, provider_request_id, error_class, created_at)
 						 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-						[randomUUID(), row.id, row.attempt_count, row.lease_token, phase, row.lease_owner,
-						 row.provider_status, row.provider_request_id, errorClass, now],
+					[randomUUID(), row.id, row.attempt_count, row.lease_token, phase, row.lease_owner,
+						row.provider_status, row.provider_request_id, errorClass, now],
 				);
+				if (row.channel === "webhook" && state !== "cancelled") {
+					await this.appendWebhookAudit(
+						client,
+						row,
+						state === "retry" ? "delivery.webhook.retried" : "delivery.webhook.dead",
+						state === "retry" ? "retry" : "dead",
+						{
+							providerStatus: row.provider_status,
+							providerRequestId: row.provider_request_id,
+							errorClass,
+							now,
+						},
+					);
+				}
 			}
 			return rows.rows.length;
 		});
@@ -582,16 +705,17 @@ export class DeliveryStore {
 		boundedInteger(limit, "expiry limit", 1, 1_000);
 		return this.transaction(async (client) => {
 			const expired = await client.query<{
-				id: string;
-				state: DeliveryJobState;
-				attempt_count: number;
-				lease_token: string | null;
-				lease_owner: string | null;
+				id: string; event_id: string; channel: "email" | "webhook"; project_id: string;
+				environment_id: string; organization_id: string | null; actor_id: string | null;
+				correlation_id: string | null; webhook_endpoint_id: string | null;
+				state: DeliveryJobState; attempt_count: number; lease_token: string | null; lease_owner: string | null;
 			}>(
-				`SELECT id, state, attempt_count, lease_token, lease_owner
-				 FROM ${this.tables.job}
-				 WHERE state IN ('queued','retry','leased') AND semantic_expires_at <= $1
-				 ORDER BY semantic_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2`,
+				`SELECT j.id, j.event_id, j.channel, j.state, j.attempt_count, j.lease_token, j.lease_owner,
+				 e.project_id, e.environment_id, e.organization_id, e.actor_id, e.correlation_id,
+				 e.webhook_endpoint_id
+				 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
+				 WHERE j.state IN ('queued','retry','leased') AND j.semantic_expires_at <= $1
+				 ORDER BY j.semantic_expires_at, j.id FOR UPDATE OF j SKIP LOCKED LIMIT $2`,
 				[now, limit],
 			);
 			for (const row of expired.rows) {
@@ -609,6 +733,12 @@ export class DeliveryStore {
 						 VALUES ($1,$2,$3,$4,'dead',$5,'semantic_expired',$6)`,
 						[randomUUID(), row.id, row.attempt_count, row.lease_token, row.lease_owner, now],
 					);
+				}
+				if (row.channel === "webhook") {
+					await this.appendWebhookAudit(client, row, "delivery.webhook.dead", "dead", {
+						errorClass: "semantic_expired",
+						now,
+					});
 				}
 			}
 			const erased = await client.query(
