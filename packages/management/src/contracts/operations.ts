@@ -118,6 +118,53 @@ export type OperationConfirmation =
 	| "server-required";
 export type OperationMethod = "GET" | "POST" | "PATCH" | "DELETE";
 
+/** A normalized authorization subject, safe to expose through management APIs. */
+export type AuthorizationSubject =
+	| { kind: "principal"; id: string }
+	| { kind: "service_account"; id: string };
+
+/** A paired optional filter: callers either identify a subject completely or do not filter. */
+export type AuthorizationAssignmentFilter =
+	| { subjectKind: AuthorizationSubject["kind"]; subjectId: string }
+	| { subjectKind?: never; subjectId?: never };
+
+export interface AuthorizationEffectiveView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleIds: string[];
+	actions: string[];
+	revision: string;
+}
+
+export interface AuthorizationAssignmentView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleId: string;
+}
+
+export interface AuthorizationAssignmentSetView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleIds: string[];
+}
+
+export interface ServiceAccountView {
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}
+
+export interface ServiceAccountCredentialView {
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	credentialPrefix: string;
+	credentialFingerprint: string;
+	expiresAt: string | null;
+	version: number;
+}
+
 export interface ManagementOperationTypes {
 	"system.init": {
 		input: { name?: string; environment?: string };
@@ -677,6 +724,150 @@ export interface ManagementOperationTypes {
 			| ({ dryRun: true; scope: ResourceScope } & MemberImportPlan)
 			| (MemberImportResult & { scope: ResourceScope });
 	};
+	"authorization.effective.inspect": {
+		input: {
+			organizationId: string;
+			subjectKind: AuthorizationSubject["kind"];
+			subjectId: string;
+		};
+		output: { effective: AuthorizationEffectiveView; scope: ResourceScope };
+	};
+	"authorization.assignments.list": {
+		input: { organizationId: string } & AuthorizationAssignmentFilter;
+		output: { assignments: AuthorizationAssignmentView[]; scope: ResourceScope };
+	};
+	"authorization.assignments.replace": {
+		input: {
+			organizationId: string;
+			subjectKind: AuthorizationSubject["kind"];
+			subjectId: string;
+			/** Sorted role IDs. */
+			roleIds: string[];
+			expectedRevision?: string;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output:
+			| {
+					assignment: AuthorizationAssignmentSetView;
+					changed: boolean;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					assignment: AuthorizationAssignmentSetView;
+					wouldChange: boolean;
+					currentRevision: string;
+					scope: ResourceScope;
+			  };
+	};
+	"authorization.reconcile": {
+		input: {
+			organizationId: string;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output:
+			| {
+					organizationId: string;
+					initialized: boolean;
+					rolesChanged: number;
+					assignmentsChanged: number;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					initialized: boolean;
+					rolesChanged: number;
+					assignmentsChanged: number;
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.list": {
+		input: { organizationId: string };
+		output: { serviceAccounts: ServiceAccountView[]; scope: ResourceScope };
+	};
+	"service-accounts.inspect": {
+		input: { organizationId: string; accountId: string };
+		output: {
+			serviceAccount: ServiceAccountView;
+			assignments: AuthorizationAssignmentView[];
+			scope: ResourceScope;
+		};
+	};
+	"service-accounts.create": {
+		input: { organizationId: string; name: string; roleIds: string[]; dryRun?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| {
+					dryRun: true;
+					serviceAccount: Pick<ServiceAccountView, "organizationId" | "name"> & { status: "active" };
+					roleIds: string[];
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.disable": {
+		input: { organizationId: string; accountId: string; status: "disabled"; dryRun?: boolean; confirm?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
+	};
+	"service-accounts.enable": {
+		input: { organizationId: string; accountId: string; status: "active"; dryRun?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
+	};
+	"service-accounts.credentials.create": {
+		input: { organizationId: string; accountId: string; expiresAt?: string; dryRun?: boolean };
+		output:
+			| { credential: ServiceAccountCredentialView; secret: string; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; organizationId: string; serviceAccountId: string; expiresAt: string | null; secretGenerated: false; scope: ResourceScope };
+	};
+	"service-accounts.credentials.rotate": {
+		input: { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: boolean; confirm?: boolean };
+		output:
+			| {
+					credential: ServiceAccountCredentialView;
+					secret: string;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					expiresAt: string | null;
+					secretGenerated: false;
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.credentials.revoke": {
+		input: { organizationId: string; accountId: string; credentialId: string; dryRun?: boolean; confirm?: boolean };
+		output:
+			| {
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					wouldChange: boolean;
+					scope: ResourceScope;
+			  };
+	};
 }
 
 export type ManagementOperationId = keyof ManagementOperationTypes;
@@ -940,6 +1131,108 @@ export const ROLE_OPERATIONS = Object.freeze({
 		mutation: true,
 		supportsDryRun: true,
 		confirmation: "none",
+	}),
+});
+
+export const AUTHORIZATION_OPERATIONS = Object.freeze({
+	effectiveInspect: defineOperation({
+		id: "authorization.effective.inspect",
+		cliPath: "orgs authorization effective",
+		http: { method: "GET", path: "/v1/organizations/:id/authorization/effective/:subjectKind/:subjectId" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	assignmentsList: defineOperation({
+		id: "authorization.assignments.list",
+		cliPath: "orgs authorization assignments list",
+		http: { method: "GET", path: "/v1/organizations/:id/authorization/assignments" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	assignmentsReplace: defineOperation({
+		id: "authorization.assignments.replace",
+		cliPath: "orgs authorization assignments replace",
+		http: { method: "PATCH", path: "/v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	reconcile: defineOperation({
+		id: "authorization.reconcile",
+		cliPath: "orgs authorization reconcile",
+		http: { method: "POST", path: "/v1/organizations/:id/authorization/reconcile" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const SERVICE_ACCOUNT_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "service-accounts.list",
+		cliPath: "orgs service-accounts list",
+		http: { method: "GET", path: "/v1/organizations/:id/service-accounts" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "service-accounts.inspect",
+		cliPath: "orgs service-accounts inspect",
+		http: { method: "GET", path: "/v1/organizations/:id/service-accounts/:accountId" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "service-accounts.create",
+		cliPath: "orgs service-accounts create",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	disable: defineOperation({
+		id: "service-accounts.disable",
+		cliPath: "orgs service-accounts disable",
+		http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
+	}),
+	enable: defineOperation({
+		id: "service-accounts.enable",
+		cliPath: "orgs service-accounts enable",
+		http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	credentialCreate: defineOperation({
+		id: "service-accounts.credentials.create",
+		cliPath: "orgs service-accounts credentials create",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	credentialRotate: defineOperation({
+		id: "service-accounts.credentials.rotate",
+		cliPath: "orgs service-accounts credentials rotate",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
+	}),
+	credentialRevoke: defineOperation({
+		id: "service-accounts.credentials.revoke",
+		cliPath: "orgs service-accounts credentials revoke",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
 	}),
 });
 
@@ -1698,6 +1991,8 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(API_KEY_OPERATIONS),
 	...Object.values(SESSION_OPERATIONS),
 	...Object.values(ROLE_OPERATIONS),
+	...Object.values(AUTHORIZATION_OPERATIONS),
+	...Object.values(SERVICE_ACCOUNT_OPERATIONS),
 	...Object.values(SSO_OPERATIONS),
 	...Object.values(SCIM_OPERATIONS),
 	...Object.values(READINESS_OPERATIONS),
