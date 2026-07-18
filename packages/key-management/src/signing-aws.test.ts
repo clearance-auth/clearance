@@ -2,6 +2,7 @@ import {
 	createHash,
 	generateKeyPairSync,
 	sign as signWithPrivateKey,
+	verify,
 } from "node:crypto";
 import {
 	DescribeKeyCommand,
@@ -26,7 +27,7 @@ describe("AWS KMS ES256 signing provider", () => {
 		const publicDer = publicKey.export({ type: "spki", format: "der" });
 		const calls: unknown[] = [];
 		let responseKeyId = currentRawId;
-		let signature = signWithPrivateKey(null, Buffer.from("header.payload"), {
+		let signature = signWithPrivateKey("sha256", Buffer.from("header.payload"), {
 			key: privateKey,
 			dsaEncoding: "der",
 		});
@@ -91,6 +92,12 @@ describe("AWS KMS ES256 signing provider", () => {
 		});
 		const joseSignature = await signer.sign(Buffer.from("header.payload"));
 		expect(joseSignature).toHaveLength(64);
+		expect(verify(
+			"sha256",
+			Buffer.from("header.payload"),
+			{ key: publicKey, dsaEncoding: "ieee-p1363" },
+			joseSignature,
+		)).toBe(true);
 		const signCommand = calls.find((call) => call instanceof SignCommand) as SignCommand;
 		expect(signCommand.input).toMatchObject({
 			KeyId: currentReference,
