@@ -859,6 +859,17 @@ export async function handleProxy(req, res, config, url) {
 		res.statusCode = upstream.status;
 		const ct = upstream.headers.get("content-type");
 		if (ct) res.setHeader("content-type", ct);
+		const upstreamCacheControl = upstream.headers.get("cache-control");
+		const upstreamPragma = upstream.headers.get("pragma");
+		if (upstreamCacheControl) res.setHeader("cache-control", upstreamCacheControl);
+		if (upstreamPragma) res.setHeader("pragma", upstreamPragma);
+		const oneTimeCredentialResponse =
+			req.method === "POST" &&
+			/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials(?:\/[^/]+\/rotate)?$/.test(upstreamPath);
+		if (oneTimeCredentialResponse) {
+			res.setHeader("cache-control", "no-store");
+			res.setHeader("pragma", "no-cache");
+		}
 		setSecurityHeaders(res);
 		res.end(buf);
 	} catch (e) {
@@ -884,6 +895,8 @@ function serveStatic(req, res, config, url) {
 			"/members",
 			"/sessions",
 			"/roles",
+			"/authorization",
+			"/service-accounts",
 			"/events",
 			"/settings",
 			"/readiness",
