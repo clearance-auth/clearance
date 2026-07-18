@@ -47,6 +47,9 @@ describe("authenticated operational API contracts", () => {
 
 	it("requires operator authentication for every operational route", async () => {
 		for (const [method, path, body] of [
+			["GET", "/v1/key-management/status", undefined],
+			["POST", "/v1/key-management/plan", {}],
+			["POST", "/v1/key-management/apply", {}],
 			["GET", "/v1/dev", undefined],
 			["POST", "/v1/backups", {}],
 			["GET", "/v1/upgrades/check", undefined],
@@ -65,6 +68,36 @@ describe("authenticated operational API contracts", () => {
 				}),
 			});
 			expect(response.status, `${method} ${path}`).toBe(401);
+		}
+	});
+
+	it("rejects invalid key-management bodies before the PostgreSQL backend gate", async () => {
+		for (const [path, body] of [
+			["/v1/key-management/plan", "[]"],
+			["/v1/key-management/plan", JSON.stringify({ unexpected: true })],
+			[
+				"/v1/key-management/apply",
+				JSON.stringify({
+					expectedPlanId: "a".repeat(64),
+					dryRun: "true",
+				}),
+			],
+			[
+				"/v1/key-management/apply",
+				JSON.stringify({
+					expectedPlanId: "a".repeat(64),
+					unexpected: true,
+				}),
+			],
+		] as const) {
+			const response = await app.request(path, { method: "POST", headers, body });
+			expect(response.status, path).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: {
+					code: "KEY_MANAGEMENT_INPUT_INVALID",
+					stage: expect.stringMatching(/^key_management\.(plan|apply)$/),
+				},
+			});
 		}
 	});
 
