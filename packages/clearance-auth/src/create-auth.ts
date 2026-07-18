@@ -1122,11 +1122,27 @@ export function createClearanceAuth<
 					return Object.freeze({
 						organizationId: effective.organizationId,
 						subject: Object.freeze({
-							kind: "principal" as const,
+							kind: effective.subject.kind,
 							id: effective.subject.id,
 						}),
 						revision: effective.revision,
 						actions: effective.actions,
+					});
+				},
+				async authenticateServiceAccountCredential(secret) {
+					const authenticated =
+						await authorizationAuthority.authenticateServiceAccountCredential({
+							secret,
+						});
+					return Object.freeze({
+						organizationId: authenticated.organizationId,
+						subject: Object.freeze({
+							kind: "service_account" as const,
+							id: authenticated.subject.id,
+						}),
+						revision: authenticated.revision,
+						actions: authenticated.actions,
+						expiresAt: authenticated.credential.expiresAt,
 					});
 				},
 				async initializeOrganizationOwner(input) {
