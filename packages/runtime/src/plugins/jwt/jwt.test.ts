@@ -7,7 +7,13 @@ import type { JSONWebKeySet } from "jose";
 import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 import { describe, expect, it } from "vitest";
 import { createAuthClient } from "../../client";
-import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { attachInternalAuthorizationAuthority } from "../../internal/authorization-authority";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	attachInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+} from "../../internal/authentication-policy";
+import { organization } from "../organization";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { jwt } from ".";
@@ -62,7 +68,12 @@ function managedJwtOptions(override: JwtOptions = {}) {
 					subjectId: input.subjectId,
 					revision: "1",
 					environment: managedJwtPolicy,
-					organizationMembership: null,
+					organizationMembership: input.organizationId
+						? {
+								subjectId: input.subjectId,
+								organizationId: input.organizationId,
+							}
+						: null,
 					organizationOverride: null,
 					effective: managedJwtPolicy,
 				};
@@ -181,6 +192,138 @@ describe("jwt compatibility", async () => {
 });
 
 describe("jwt session derivative authority", async () => {
+	it("binds sorted live authorization claims and rejects stale or partial claims", async () => {
+		const managedOptions = managedJwtOptions();
+		const options = {
+			...managedOptions,
+			plugins: [...managedOptions.plugins, organization()],
+		} satisfies ClearanceOptions;
+		attachCapturedInternalAuthenticationPolicy(
+			options,
+			readInternalAuthenticationPolicy(managedOptions)!,
+		);
+		const authorization = {
+			revision: "7",
+			actions: ["organization.read", "organization.write"],
+		};
+		const local = await getTestInstance(options);
+		const context = await local.auth.$context;
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: authorization.revision,
+					actions: authorization.actions,
+				};
+			},
+		});
+
+		const signedIn = await local.signInWithTestUser();
+		const organizationClient = local.client as typeof local.client & {
+			organization: {
+				create(input: {
+					name: string;
+					slug: string;
+					fetchOptions: Record<string, unknown>;
+				}): Promise<{ data?: { id: string } }>;
+				setActive(input: {
+					organizationId: string;
+					fetchOptions: Record<string, unknown>;
+				}): Promise<{ data?: { id: string } }>;
+			};
+		};
+		const created = await organizationClient.organization.create({
+			name: "Authorization test",
+			slug: "authorization-test",
+			fetchOptions: {
+				headers: signedIn.headers,
+				onSuccess: local.cookieSetter(signedIn.headers),
+			},
+		});
+		expect(created.data?.id).toEqual(expect.any(String));
+		await organizationClient.organization.setActive({
+			organizationId: created.data!.id,
+			fetchOptions: {
+				headers: signedIn.headers,
+				onSuccess: local.cookieSetter(signedIn.headers),
+			},
+		});
+		const response = await local.auth.handler(
+			new Request("http://localhost:3000/api/auth/token", {
+				method: "GET",
+				headers: signedIn.headers,
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { token } = (await response.json()) as { token: string };
+		const payload = decodeJwt(token);
+		expect(payload).toMatchObject({
+			actions: ["organization.read", "organization.write"],
+			authz_revision: "7",
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).not.toBeNull();
+
+		authorization.revision = "8";
+		authorization.actions = ["organization.read"];
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toBeNull();
+
+		authorization.revision = "7";
+		authorization.actions = ["organization.read", "organization.write"];
+		const partial = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: payload.sub,
+					exp: payload.exp,
+					[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]:
+						payload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM],
+					[JWT_SESSION_SOURCE_SUBJECT_CLAIM]:
+						payload[JWT_SESSION_SOURCE_SUBJECT_CLAIM],
+					[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]:
+						payload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM],
+					actions: ["organization.read"],
+				},
+			},
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token: partial.token } })).payload,
+		).toBeNull();
+		const genericPartial = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-partial-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+					actions: ["organization.read"],
+				},
+			},
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token: genericPartial.token } }))
+				.payload,
+		).toBeNull();
+		const genericAuthorizationPair = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-authorization-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+					actions: ["organization.read"],
+					authz_revision: "7",
+				},
+			},
+		});
+		expect(
+			(
+				await local.auth.api.verifyJWT({
+					body: { token: genericAuthorizationPair.token },
+				})
+			).payload,
+		).toBeNull();
+	});
+
 	it("binds live managed sessions, rejects stale sources, and preserves generic tokens", async () => {
 		const local = await getTestInstance(managedJwtOptions());
 		const signedIn = await local.signInWithTestUser();
