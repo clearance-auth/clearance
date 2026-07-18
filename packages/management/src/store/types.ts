@@ -324,7 +324,10 @@ export interface ManagementStore extends ManagementUnitOfWork {
 		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
 	): Promise<T>;
 	mutateStoreV2Topology?<T>(
-		fn: (topology: StoreV2TopologyRepository) => Promise<T> | T,
+		fn: (context: {
+			topology: StoreV2TopologyRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
 	): Promise<T>;
 	/** Relational-only identity transaction with append-only audit authority. */
 	mutateStoreV2Identity?<T>(
