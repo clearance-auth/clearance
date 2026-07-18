@@ -7,10 +7,11 @@ export interface JwtOptions {
 	jwks?:
 		| {
 				/**
-				 * Disables the /jwks endpoint and uses this endpoint in discovery.
+				 * Disables the local /jwks endpoint and uses this URL in discovery.
 				 *
-				 * Useful if jwks are not managed at /jwks or
-				 * if your jwks are signed with a certificate and placed on your CDN.
+				 * Use this when public keys are hosted remotely. A custom `jwt.sign`
+				 * function must configure this URL or `adapter.getJwks`, which serves
+				 * its public keys from the local /jwks endpoint.
 				 */
 				remoteUrl?: string | undefined;
 				/**
@@ -120,7 +121,7 @@ export interface JwtOptions {
 				 * MUST be defined within this function.
 				 * You can safely define the header `typ: 'JWT'`.
 				 *
-				 * @requires jwks.remoteUrl
+				 * @requires jwks.remoteUrl or adapter.getJwks for public verification keys
 				 * @invalidates other jwt.* options
 				 */
 				sign?: ((payload: JWTPayload) => Awaitable<string>) | undefined;
@@ -149,10 +150,12 @@ export interface JwtOptions {
 	 */
 	adapter?: {
 		/**
-		 * A custom function to get the JWKS from the database or
-		 * other source
+		 * A custom function to get public JWKS entries from the database or
+		 * another source.
 		 *
 		 * This will override the default getJwks from the database
+		 * and backs the local /jwks endpoint. When using a custom `jwt.sign`
+		 * function without `jwks.remoteUrl`, this must return at least one key.
 		 *
 		 * @param ctx - The context of the request
 		 * @returns The JWKS
