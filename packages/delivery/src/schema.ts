@@ -187,6 +187,10 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			FOREIGN KEY (webhook_endpoint_id, project_id, environment_id)
 				REFERENCES ${webhookEndpoint}(id, project_id, environment_id) ON DELETE RESTRICT
 		)`,
+		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.event, "scope_organization_idx"))}
+		ON ${event} (project_id, environment_id, organization_id)`,
+		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.event, "scope_actor_idx"))}
+		ON ${event} (project_id, environment_id, actor_id)`,
 		`CREATE TABLE IF NOT EXISTS ${payload} (
 			event_id text PRIMARY KEY REFERENCES ${event}(id) ON DELETE CASCADE,
 			envelope_version smallint NOT NULL CHECK (envelope_version = 1),
@@ -480,6 +484,8 @@ async function verifyDeliverySchema(
 			schema,
 			[
 				`${names.event}_scope_created_idx`,
+				deliveryIndexName(names.event, "scope_organization_idx"),
+				deliveryIndexName(names.event, "scope_actor_idx"),
 				...(version >= 4 ? [
 					deliveryIndexName(names.webhookEndpoint, "scope_idx"),
 					deliveryIndexName(names.webhookEndpoint, "url_idx"),
@@ -493,6 +499,12 @@ async function verifyDeliverySchema(
 	const indexDefinitions = new Map(indexes.rows.map((row) => [row.indexname, row.indexdef.toUpperCase()]));
 	for (const [indexName, fragments] of [
 		[`${names.event}_scope_created_idx`, ["(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT)"]],
+		[deliveryIndexName(names.event, "scope_organization_idx"), [
+			"(PROJECT_ID, ENVIRONMENT_ID, ORGANIZATION_ID)",
+		]],
+		[deliveryIndexName(names.event, "scope_actor_idx"), [
+			"(PROJECT_ID, ENVIRONMENT_ID, ACTOR_ID)",
+		]],
 		...(version >= 4 ? [
 			[deliveryIndexName(names.webhookEndpoint, "scope_idx"), [
 				"(PROJECT_ID, ENVIRONMENT_ID, CREATED_AT DESC, ID DESC)",
@@ -511,39 +523,67 @@ async function verifyDeliverySchema(
 		if (
 			(!definition || fragments.some((fragment) => !definition.includes(fragment))) &&
 			!(allowMissingAdditiveIndexes &&
-				indexName === `${names.event}_scope_created_idx` &&
+				[
+					`${names.event}_scope_created_idx`,
+					deliveryIndexName(names.event, "scope_organization_idx"),
+					deliveryIndexName(names.event, "scope_actor_idx"),
+				].includes(indexName) &&
 				definition === undefined)
 		) {
 			schemaDrift(`Delivery schema is missing or changed index ${indexName}`);
 		}
 	}
 
-	const triggers = await client.query<{ table_name: string; definition: string; enabled: string }>(
-		`SELECT c.relname table_name, pg_get_triggerdef(t.oid, true) definition, t.tgenabled enabled
+	const expectedRejectMutation = `${quoteIdentifier(schema)}.${quoteIdentifier(names.rejectMutationFunction)}()`;
+	const triggers = await client.query<{
+		table_name: string;
+		trigger_name: string;
+		definition: string;
+		enabled: string;
+		uses_expected_function: boolean | null;
+	}>(
+		`SELECT c.relname table_name, t.tgname trigger_name,
+			pg_get_triggerdef(t.oid, true) definition, t.tgenabled enabled,
+			t.tgfoid = to_regprocedure($3)::oid uses_expected_function
 		 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
 		 JOIN pg_namespace n ON n.oid=c.relnamespace
 		 WHERE n.nspname=$1 AND NOT t.tgisinternal
 		   AND c.relname=ANY($2::text[])`,
-		[schema, [names.event, names.attempt]],
+		[schema, [names.event, names.attempt], expectedRejectMutation],
 	);
-	for (const table of [names.event, names.attempt]) {
-		const trigger = triggers.rows.find((row) => row.table_name === table);
+	for (const [table, triggerName] of [
+		[names.event, `${names.event}_immutable`],
+		[names.attempt, `${names.attempt}_immutable`],
+	] as const) {
+		const trigger = triggers.rows.find((row) =>
+			row.table_name === table && row.trigger_name === triggerName,
+		);
 		if (
-			!trigger || trigger.enabled === "D" ||
-			!trigger.definition.toUpperCase().includes("BEFORE DELETE OR UPDATE") ||
-			!trigger.definition.includes(names.rejectMutationFunction)
+			!trigger || trigger.enabled !== "O" || !trigger.uses_expected_function ||
+			!trigger.definition.toUpperCase().includes("BEFORE DELETE OR UPDATE")
 		) {
 			schemaDrift(`Delivery history guard for ${table} is missing, disabled, or changed`);
 		}
 	}
-	const fn = await client.query<{ definition: string }>(
-		`SELECT pg_get_functiondef(p.oid) definition
+	const fn = await client.query<{
+		definition: string;
+		returns_trigger: boolean;
+		language: string;
+		security_definer: boolean;
+	}>(
+		`SELECT pg_get_functiondef(p.oid) definition,
+			p.prorettype = 'trigger'::regtype::oid returns_trigger,
+			l.lanname language, p.prosecdef security_definer
 		 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-		 WHERE n.nspname=$1 AND p.proname=$2`,
-		[schema, names.rejectMutationFunction],
+		 JOIN pg_language l ON l.oid=p.prolang
+		 WHERE n.nspname=$1 AND p.oid=to_regprocedure($2)::oid`,
+		[schema, expectedRejectMutation],
 	);
-	const functionDefinition = fn.rows[0]?.definition ?? "";
+	const functionMetadata = fn.rows[0];
+	const functionDefinition = functionMetadata?.definition ?? "";
 	if (
+		!functionMetadata?.returns_trigger || functionMetadata.language !== "plpgsql" ||
+		functionMetadata.security_definer ||
 		!functionDefinition.includes("delivery history rows are immutable") ||
 		!functionDefinition.includes("interval '30 days'") ||
 		!functionDefinition.includes(names.job)
@@ -853,12 +893,16 @@ export async function migrateDeliverySchema(
 				await migrateDeliverySchemaV3ToV4(client, schema, names);
 			}
 		}
-		// This performance-only index is additive within the current schema. Create it for
-		// fresh installs and every supported upgrade path before strict verification.
-		await client.query(
+		// These performance-only indexes are additive within the current schema. Create
+		// them for fresh installs and every supported upgrade path before strict verification.
+		for (const statement of [
 			`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${names.event}_scope_created_idx`)}
 			 ON ${fq(schema, names.event)} (project_id, environment_id, created_at)`,
-		);
+			`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.event, "scope_organization_idx"))}
+			 ON ${fq(schema, names.event)} (project_id, environment_id, organization_id)`,
+			`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(deliveryIndexName(names.event, "scope_actor_idx"))}
+			 ON ${fq(schema, names.event)} (project_id, environment_id, actor_id)`,
+		]) await client.query(statement);
 		await verifyDeliverySchema(client, schema, names, DELIVERY_SCHEMA_VERSION);
 		const meta = fq(schema, names.meta);
 		await client.query(
