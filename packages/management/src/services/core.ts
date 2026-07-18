@@ -255,6 +255,30 @@ export function listProjects(store: ManagementStore): Project[] {
 	return store.snapshot.projects;
 }
 
+/** Scope-safe authority-aware project point lookup. */
+export async function inspectProjectAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope: ResourceScope,
+): Promise<Project> {
+	const project = store.storeV2Topology?.authoritative
+		? id === scope.projectId
+			? await store.storeV2Topology.getProjectById(id)
+			: null
+		: store.snapshot.projects.find(
+			(candidate) => candidate.id === id && candidate.id === scope.projectId,
+		) ?? null;
+	if (!project) {
+		throw new ClearanceError({
+			code: "PROJECT_NOT_FOUND",
+			message: "Project not found",
+			stage: "projects.inspect",
+			status: 404,
+		});
+	}
+	return project;
+}
+
 export function createEnvironment(
 	store: ManagementStore,
 	input: {
@@ -344,6 +368,53 @@ export function listEnvironments(
 		});
 }
 
+export const ENVIRONMENTS_LIST_DEFAULT_PAGE_LIMIT = 100;
+export const ENVIRONMENTS_LIST_MAX_PAGE_LIMIT = 1000;
+
+/**
+ * Authority-aware bounded environment listing. The legacy synchronous list is
+ * retained for JSON-backed callers; relational topology never reads its empty
+ * post-cutover snapshot projection.
+ */
+export async function listEnvironmentsPageAuthoritative(
+	store: ManagementStore,
+	opts?: { scope?: ResourceScope; limit?: number; cursor?: string },
+): Promise<{ environments: Environment[]; nextCursor: string | null }> {
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "envs.list",
+		code: "ENVIRONMENTS_LIST_LIMIT_INVALID",
+		defaultValue: ENVIRONMENTS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: ENVIRONMENTS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "environments", "envs.list");
+	if (!store.storeV2Topology?.authoritative) {
+		const page = paginateByCreatedAt(listEnvironments(store, { scope }), {
+			surface: "environments",
+			order: "asc",
+			limit,
+			cursor,
+		});
+		return { environments: page.items, nextCursor: page.nextCursor };
+	}
+	const page = await store.storeV2Topology.listEnvironmentsPage({
+		projectId: scope.projectId,
+		limit,
+		...(cursor ? { cursor } : {}),
+	});
+	const last = page.environments[page.environments.length - 1];
+	return {
+		environments: page.environments,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("environments", {
+					createdAt: last.createdAt,
+					id: last.id,
+				})
+				: null,
+	};
+}
+
 function findEnvironmentInProject(
 	store: ManagementStore,
 	idOrSlug: string,
@@ -398,12 +469,16 @@ export type EnvironmentLocalStatus = {
 	resourceCounts: {
 		principals: number;
 		organizations: number;
-		memberships: number;
-		identityConnections: number;
-		directoryConnections: number;
+		/** Null when relational topology makes organization membership unavailable. */
+		memberships: number | null;
+		/** Null when relational topology makes organization connections unavailable. */
+		identityConnections: number | null;
+		/** Null when relational topology makes organization connections unavailable. */
+		directoryConnections: number | null;
 		roles: number;
 		sessions: number;
-		events: number;
+		/** Null when the authoritative event projection is relational. */
+		events: number | null;
 	};
 };
 
@@ -541,35 +616,151 @@ export async function inspectEnvironmentAuthoritative(
 	id?: string,
 	opts?: { scope?: ResourceScope },
 ): Promise<EnvironmentInspectResult> {
-	if (!store.storeV2Principals?.authoritative) return inspectEnvironment(store, id, opts);
-	const result = inspectEnvironmentSnapshot(store, id, opts, true);
-	const scope = {
-		projectId: result.environment.projectId,
-		environmentId: result.environment.id,
-	};
-	const countReader = store.storeV2Principals.countByScope;
-	if (!countReader) {
+	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
+	const principalsAuthoritative = store.storeV2Principals?.authoritative === true;
+	const eventsAuthoritative = store.storeV2Events?.authoritative === true;
+	if (!topologyAuthoritative && !principalsAuthoritative && !eventsAuthoritative) {
+		return inspectEnvironment(store, id, opts);
+	}
+	const operatorScope = opts?.scope ?? resolveOperatorScope(store);
+	const key = id?.trim() || operatorScope.environmentId;
+	const environment = topologyAuthoritative
+		? await store.storeV2Topology!.getEnvironment({
+			projectId: operatorScope.projectId,
+			id: key,
+		})
+		: findEnvironmentInProject(store, key, operatorScope.projectId, "env.inspect");
+	if (!environment) {
 		throw new ClearanceError({
-			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
-			message: "Relational principal count reader is unavailable",
+			code: "ENV_NOT_FOUND",
+			message: "Environment not found",
 			stage: "env.inspect",
-			status: 500,
+			status: 404,
+			remediation:
+				"Pass an environment id that belongs to the operator project",
 		});
 	}
-	const [counts, sessions] = await Promise.all([
-		countReader({ scope }),
-		store.storeV2Principals.countActiveSessions?.({ scope }) ?? Promise.resolve(0),
+	const scope = {
+		projectId: environment.projectId,
+		environmentId: environment.id,
+	};
+	const project = topologyAuthoritative
+		? await store.storeV2Topology!.getProjectById(environment.projectId)
+		: store.snapshot.projects.find((candidate) => candidate.id === environment.projectId) ?? null;
+	const snapshotOrganizations = topologyAuthoritative
+		? []
+		: store.snapshot.organizations.filter(
+			(candidate) =>
+				candidate.projectId === scope.projectId &&
+				candidate.environmentId === scope.environmentId &&
+				candidate.status !== "archived",
+		);
+	const [principalCounts, activeSessions, organizationCount] = await Promise.all([
+		principalsAuthoritative
+			? (() => {
+				const countReader = store.storeV2Principals?.countByScope;
+				if (!countReader) {
+					throw new ClearanceError({
+						code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+						message: "Relational principal count reader is unavailable",
+						stage: "env.inspect",
+						status: 500,
+					});
+				}
+				return countReader({ scope });
+			})()
+			: Promise.resolve({
+				total: principalReadView(store).filter(
+					(principal) =>
+						principal.projectId === scope.projectId &&
+						principal.environmentId === scope.environmentId &&
+						principal.status !== "deleted",
+				).length,
+				active: 0,
+			}),
+		principalsAuthoritative
+			? store.storeV2Principals?.countActiveSessions?.({ scope }) ?? Promise.resolve(0)
+			: Promise.resolve(
+				store.snapshot.sessions.filter(
+					(session) =>
+						session.environmentId === scope.environmentId &&
+						session.status === "active",
+				).length,
+			),
+		topologyAuthoritative
+			? store.storeV2Topology!.countOrganizations({ scope })
+			: Promise.resolve(snapshotOrganizations.length),
 	]);
+	const auxiliaryOrganizationCounts = topologyAuthoritative
+		? {
+			memberships: null,
+			identityConnections: null,
+			directoryConnections: null,
+		}
+		: (() => {
+			const orgIds = new Set(
+				snapshotOrganizations.map((organization) => organization.id),
+			);
+			return {
+				memberships: store.snapshot.memberships.filter(
+					(membership) =>
+						orgIds.has(membership.organizationId) && membership.status === "active",
+				).length,
+				identityConnections: store.snapshot.identityConnections.filter((connection) =>
+					orgIds.has(connection.organizationId),
+				).length,
+				directoryConnections: store.snapshot.directoryConnections.filter((connection) =>
+					orgIds.has(connection.organizationId),
+				).length,
+			};
+		})();
 	return {
-		...result,
+		environment,
+		project,
+		scope: operatorScope,
 		local: {
-			...result.local,
+			active: environment.id === operatorScope.environmentId,
+			storeBackend: store.backend,
+			storePathPresent: existsSync(store.path),
+			schemaVersion: store.snapshot.meta.schemaVersion,
+			expectedSchemaVersion: STORE_SCHEMA_VERSION,
+			releaseVersion: store.snapshot.releaseVersion ?? CLEARANCE_RELEASE_VERSION,
+			initialized: Boolean(store.snapshot.meta.initializedAt),
+			config: {
+				hasClearanceSecret: Boolean(process.env.CLEARANCE_SECRET?.trim()),
+				hasDatabaseUrl: Boolean(process.env.DATABASE_URL?.trim()),
+				hasOperatorToken: Boolean(process.env.CLEARANCE_OPERATOR_TOKEN?.trim()),
+				hasCredentialKey: Boolean(process.env.CLEARANCE_CREDENTIAL_KEY?.trim()),
+				nodeEnv: process.env.NODE_ENV ?? "development",
+				operatorProjectIdConfigured: Boolean(
+					process.env.CLEARANCE_PROJECT_ID?.trim() ||
+						store.snapshot.meta.config.projectId,
+				),
+				operatorEnvironmentIdConfigured: Boolean(
+					process.env.CLEARANCE_ENV_ID?.trim() ||
+						store.snapshot.meta.config.environmentId,
+				),
+			},
 			resourceCounts: {
-				...result.local.resourceCounts,
-				principals: counts.total,
-				sessions,
+				principals: principalCounts.total,
+				organizations: organizationCount,
+				...auxiliaryOrganizationCounts,
+				roles: store.snapshot.roles.filter(
+					(role) =>
+						role.projectId === scope.projectId &&
+						role.environmentId === scope.environmentId,
+				).length,
+				sessions: activeSessions,
+				events: eventsAuthoritative
+					? null
+					: store.snapshot.events.filter(
+						(event) =>
+							event.projectId === scope.projectId &&
+							event.environmentId === scope.environmentId,
+					).length,
 			},
 		},
+		correlationId: correlationId(),
 	};
 }
 
@@ -1472,6 +1663,44 @@ export function listOrganizationsPage(
 	return { organizations: page.items, nextCursor: page.nextCursor };
 }
 
+/** Authority-aware bounded active-organization listing. */
+export async function listOrganizationsPageAuthoritative(
+	store: ManagementStore,
+	opts?: {
+		scope?: ResourceScope;
+		limit?: number;
+		cursor?: string;
+	},
+): Promise<{ organizations: Organization[]; nextCursor: string | null }> {
+	if (!store.storeV2Topology?.authoritative) {
+		return listOrganizationsPage(store, opts);
+	}
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "orgs.list",
+		code: "ORGS_LIST_LIMIT_INVALID",
+		defaultValue: ORGS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: ORGS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "organizations", "orgs.list");
+	const page = await store.storeV2Topology.listOrganizationsPage({
+		scope,
+		limit,
+		...(cursor ? { cursor } : {}),
+	});
+	const last = page.organizations[page.organizations.length - 1];
+	return {
+		organizations: page.organizations,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("organizations", {
+					createdAt: last.createdAt,
+					id: last.id,
+				})
+				: null,
+	};
+}
+
 export function inspectOrganization(
 	store: ManagementStore,
 	id: string,
@@ -1494,6 +1723,31 @@ export function inspectOrganization(
 		});
 	}
 	return org;
+}
+
+/** Scope-safe authority-aware active-organization point lookup. */
+export async function inspectOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<Organization> {
+	if (!store.storeV2Topology?.authoritative) {
+		return inspectOrganization(store, id, scope);
+	}
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const organization = await store.storeV2Topology.getOrganization({
+		scope: resolvedScope,
+		id,
+	});
+	if (!organization || organization.status === "archived") {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage: "orgs.inspect",
+			status: 404,
+		});
+	}
+	return organization;
 }
 
 const ORG_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -2259,40 +2513,86 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	};
 }
 
+export type AuthoritativeOverviewStats = Omit<
+	ReturnType<typeof overviewStats>,
+	"resourceCounts"
+> & {
+	/** Only authority-unavailable resources are nullable. */
+	resourceCounts: Record<string, number | null>;
+};
+
 export async function overviewStatsAuthoritative(
 	store: ManagementStore,
 	scope?: ResourceScope,
-): Promise<ReturnType<typeof overviewStats>> {
-	if (!store.storeV2Principals?.authoritative) return overviewStats(store, scope);
-	const resolvedScope = scope ?? resolveOperatorScope(store);
-	const countReader = store.storeV2Principals.countByScope;
-	if (!countReader) {
-		throw new ClearanceError({
-			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
-			message: "Relational principal count reader is unavailable",
-			stage: "overview",
-			status: 500,
-		});
+): Promise<AuthoritativeOverviewStats> {
+	const principalsAuthoritative = store.storeV2Principals?.authoritative === true;
+	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
+	const eventsAuthoritative = store.storeV2Events?.authoritative === true;
+	if (!principalsAuthoritative && !topologyAuthoritative && !eventsAuthoritative) {
+		return overviewStats(store, scope);
 	}
-	const [counts, activeSessions] = await Promise.all([
-		countReader({ scope: resolvedScope }),
-		store.storeV2Principals.countActiveSessions?.({ scope: resolvedScope }) ??
-			Promise.resolve(0),
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const principalCounts = principalsAuthoritative
+		? (() => {
+			const countReader = store.storeV2Principals?.countByScope;
+			if (!countReader) {
+				throw new ClearanceError({
+					code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+					message: "Relational principal count reader is unavailable",
+					stage: "overview",
+					status: 500,
+				});
+			}
+			return countReader({ scope: resolvedScope });
+		})()
+		: Promise.resolve((() => {
+			const users = listUsers(store, { scope: resolvedScope });
+			return {
+				total: users.length,
+				active: users.filter((user) => user.status === "active").length,
+			};
+		})());
+	const activeSessions = principalsAuthoritative
+		? store.storeV2Principals?.countActiveSessions?.({ scope: resolvedScope }) ??
+			Promise.resolve(0)
+		: Promise.resolve(store.snapshot.sessions.filter((session) => {
+			if (session.status !== "active") return false;
+			const principal = principalReadView(store).find(
+				(candidate) => candidate.id === session.principalId,
+			);
+			return principal
+				? principal.projectId === resolvedScope.projectId &&
+					principal.environmentId === resolvedScope.environmentId
+				: false;
+		}).length);
+	const organizationCount = topologyAuthoritative
+		? store.storeV2Topology!.countOrganizations({ scope: resolvedScope })
+		: Promise.resolve(listOrganizations(store, { scope: resolvedScope }).length);
+	const [counts, sessions, organizations] = await Promise.all([
+		principalCounts,
+		activeSessions,
+		organizationCount,
 	]);
-	const orgs = listOrganizations(store, { scope: resolvedScope });
-	const recentEvents = listEvents(store, { limit: 10, scope: resolvedScope });
+	const recentEvents = eventsAuthoritative
+		? (await store.storeV2Events.listPage({
+				scope: resolvedScope,
+				limit: 10,
+			})).events
+		: listEvents(store, { limit: 10, scope: resolvedScope });
+	const resourceCounts = store.resourceCounts();
 	return {
 		totalUsers: counts.total,
 		activeUsers: counts.active,
-		organizations: orgs.length,
-		activeSessions,
+		organizations,
+		activeSessions: sessions,
 		recentEvents,
 		releaseVersion: store.snapshot.releaseVersion,
 		schemaVersion: store.snapshot.meta.schemaVersion,
 		resourceCounts: {
-			...store.resourceCounts(),
+			...resourceCounts,
 			principals: counts.total,
-			sessions: activeSessions,
+			sessions,
+			events: eventsAuthoritative ? null : resourceCounts.events,
 		},
 	};
 }
