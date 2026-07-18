@@ -9,6 +9,7 @@ import {
 	listOrganizationsPageAuthoritative,
 	overviewStatsAuthoritative,
 } from "../services/core.js";
+import { appendAuditEvent } from "../services/audit.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
@@ -421,6 +422,137 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			).organizations.map((organization) => organization.id),
 		).toEqual(["org_imported", "org_shadow"]);
 
+		const coordinatedTopologyRevision =
+			(await store.storeV2!.status()).topologyRevision;
+		let expiredTopology!: {
+			getProjectById(id: string): Promise<unknown>;
+		};
+		const coordinated = await store.mutateCoordinated!(async ({
+			data,
+			topology,
+			appendAudit,
+		}) => {
+			expect(topology).toBeDefined();
+			expiredTopology = topology!;
+			data.meta.config.coordinatedTopology = "committed";
+			const project = await topology!.upsertProject({
+					id: "project_coordinated",
+					name: "Coordinated Project",
+					slug: "coordinated-project",
+					createdAt: now,
+					updatedAt: now,
+				});
+			return {
+				project,
+				audit: appendAudit(topologyAudit("project", "project_coordinated")),
+				directAudit: appendAuditEvent(
+					data,
+					topologyAudit("project", "project_coordinated_direct_audit"),
+				),
+			};
+		});
+		expect(
+			await store.storeV2Topology!.getProjectById("project_coordinated"),
+		).toMatchObject({ id: coordinated.project.id });
+		expect((await store.storeV2!.status()).topologyRevision).toBe(
+			coordinatedTopologyRevision! + 1,
+		);
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		expect(store.snapshot.organizations).toEqual([]);
+		expect(store.snapshot.meta.config.coordinatedTopology).toBe("committed");
+		expect(
+			(await store.storeV2Events!.listPage({ scope, limit: 100 })).events,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: coordinated.audit.id }),
+				expect.objectContaining({ id: coordinated.directAudit.id }),
+			]),
+		);
+		await expect(
+			expiredTopology.getProjectById("project_coordinated"),
+		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_REPOSITORY_REVOKED" });
+		const coordinatedPool = new pg.Pool({ connectionString: DATABASE_URL });
+		try {
+			const result = await coordinatedPool.query<{
+				data: {
+					projects: unknown[];
+					environments: unknown[];
+					organizations: unknown[];
+					meta: { config: Record<string, string> };
+				};
+			}>(`SELECT data FROM ${TABLE} WHERE id = 1`);
+			expect(result.rows[0]?.data).toMatchObject({
+				projects: [],
+				environments: [],
+				organizations: [],
+				meta: { config: { coordinatedTopology: "committed" } },
+			});
+		} finally {
+			await coordinatedPool.end();
+		}
+
+		await expect(
+			store.mutateCoordinated!(async ({ data, topology, appendAudit }) => {
+				data.meta.config.coordinatedTopology = "callback-rollback";
+				appendAudit(topologyAudit("project", "project_coordinated_callback"));
+				await topology!.upsertProject({
+					id: "project_coordinated_callback",
+					name: "Callback Rollback",
+					slug: "callback-rollback",
+					createdAt: now,
+					updatedAt: now,
+				});
+				throw new Error("coordinated callback failure");
+			}),
+		).rejects.toThrow("coordinated callback failure");
+		expect(
+			await store.storeV2Topology!.getProjectById(
+				"project_coordinated_callback",
+			),
+		).toBeNull();
+		expect(store.snapshot.meta.config.coordinatedTopology).toBe("committed");
+
+		await expect(
+			store.mutateCoordinated!(({ data, topology, appendAudit }) => {
+				data.meta.config.coordinatedTopology = "issued-rollback";
+				appendAudit(topologyAudit("environment", "env_coordinated_issued"));
+				void topology!.upsertEnvironment({
+					id: "env_coordinated_issued",
+					projectId: "project_missing",
+					name: "Issued Rollback",
+					slug: "issued-rollback",
+					kind: "development",
+					createdAt: now,
+					updatedAt: now,
+				});
+			}),
+		).rejects.toMatchObject({ code: "23503" });
+		expect(
+			await store.storeV2Topology!.getEnvironment({
+				projectId: "project_missing",
+				id: "env_coordinated_issued",
+			}),
+		).toBeNull();
+		expect(store.snapshot.meta.config.coordinatedTopology).toBe("committed");
+
+		await expect(
+			store.mutateCoordinated!(async ({ topology }) => {
+				await topology!.upsertProject({
+					id: "project_coordinated_missing_audit",
+					name: "Coordinated Missing Audit",
+					slug: "coordinated-missing-audit",
+					createdAt: now,
+					updatedAt: now,
+				});
+			}),
+		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_AUDIT_REQUIRED" });
+		expect(
+			await store.storeV2Topology!.getProjectById(
+				"project_coordinated_missing_audit",
+			),
+		).toBeNull();
+
 		const snapshotLocker = new pg.Pool({ connectionString: DATABASE_URL });
 		const lockClient = await snapshotLocker.connect();
 		try {
@@ -470,7 +602,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
 			);
 			expect(result.rows).toEqual([
-				{ projects: 2, environments: 2, organizations: shadowCountBefore + 3 },
+				{ projects: 3, environments: 2, organizations: shadowCountBefore + 3 },
 			]);
 		} finally {
 			await lockClient.query("ROLLBACK").catch(() => undefined);
@@ -792,7 +924,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				 FROM ${PREFIX}meta WHERE key = 'store_v2_topology_state'`,
 			);
 			expect(result.rows).toEqual([
-				{ projects: 2, environments: 2, organizations: shadowCountBefore + 4 },
+				{ projects: 3, environments: 2, organizations: shadowCountBefore + 4 },
 			]);
 		} finally {
 			await rollbackStatePool.end();
