@@ -199,6 +199,7 @@ export function getAuthBundle(): ClearanceAuthBundle {
 		enableSso: true,
 		enableScim: true,
 		credentialAuthority,
+		runtimeAudit: projectEnv(),
 		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
 		...keyManagementRuntimeOptions(),
 	});
