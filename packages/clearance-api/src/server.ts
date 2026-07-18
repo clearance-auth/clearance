@@ -14,6 +14,7 @@ import {
 	getAuthBundle,
 	createScimConnectionReal,
 	createSsoConnectionReal,
+	KEY_MANAGEMENT_OPERATIONS,
 	isClearanceError,
 	isForbiddenDefaultSecret,
 	assertIdempotencyKeyValid,
@@ -35,6 +36,7 @@ import {
 } from "@clearance/management";
 import { registerAccessRoutes } from "./routes/access.js";
 import { registerAuthenticationPolicyRoutes } from "./routes/authentication-policy.js";
+import { registerKeyManagementRoutes } from "./routes/key-management.js";
 import { registerConfigRoutes } from "./routes/config.js";
 import { registerDeliveryRoutes } from "./routes/delivery.js";
 import { registerWebhookEndpointRoutes } from "./routes/webhook-endpoints.js";
@@ -443,7 +445,16 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 app.use("/v1/*", requireManagementPrincipal);
 
 app.use("/v1/*", async (c, next) => {
-	if (!runtimeDatabaseConfigured() || c.req.path.startsWith("/v1/schema/")) {
+	const keyManagementRead =
+		(c.req.method === KEY_MANAGEMENT_OPERATIONS.status.http.method &&
+			c.req.path === KEY_MANAGEMENT_OPERATIONS.status.http.path) ||
+		(c.req.method === KEY_MANAGEMENT_OPERATIONS.plan.http.method &&
+			c.req.path === KEY_MANAGEMENT_OPERATIONS.plan.http.path);
+	if (
+		!runtimeDatabaseConfigured() ||
+		c.req.path.startsWith("/v1/schema/") ||
+		keyManagementRead
+	) {
 		return next();
 	}
 	try {
@@ -470,6 +481,7 @@ app.use("/v1/*", async (c, next) => {
 
 app.use("/v1/*", async (c, next) => {
 	if (!["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) return next();
+	if (c.req.path.startsWith("/v1/key-management/")) return next();
 	if (!(c.req.header("content-type") ?? "").toLowerCase().includes("application/json")) return next();
 	const request = await c.req.raw.clone().json().catch(() => undefined);
 	if (!request || typeof request !== "object" || Array.isArray(request)) return next();
@@ -585,6 +597,10 @@ function idempotencyBackendFor(
 
 app.use("/v1/*", async (c, next) => {
 	if (!IDEMPOTENT_METHODS.has(c.req.method)) return next();
+	if (
+		c.req.method === KEY_MANAGEMENT_OPERATIONS.plan.http.method &&
+		c.req.path === KEY_MANAGEMENT_OPERATIONS.plan.http.path
+	) return next();
 	const key = c.req.header("idempotency-key");
 	if (key === undefined) return next();
 	try {
@@ -994,6 +1010,11 @@ app.route("/", registerWebhookEndpointRoutes({ storeForRequest, scopeForRequest,
 app.route(
 	"/",
 	registerAuthenticationPolicyRoutes({ storeForRequest, scopeForRequest, handleError }),
+);
+
+app.route(
+	"/",
+	registerKeyManagementRoutes({ storeForRequest, scopeForRequest, handleError }),
 );
 
 app.route(
