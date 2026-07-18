@@ -84,6 +84,7 @@ import {
 import {
 	attachInternalSessionDerivativeAuthority,
 	ManagedSessionDerivativeAuthorityError,
+	validateInternalSessionDerivativeAuthority,
 } from "../internal/session-derivative-authority";
 import {
 	attachStagedAuthenticationContinuation,
@@ -2721,7 +2722,8 @@ export const createInternalAdapter = (
 			const capturedIssuanceAuthority =
 				managedIssuanceContext?.purpose === "replacement" ||
 				managedIssuanceContext?.purpose === "device" ||
-				managedIssuanceContext?.purpose === "organization"
+				managedIssuanceContext?.purpose === "organization" ||
+				managedIssuanceContext?.purpose === "impersonation"
 					? requireCapturedSessionIssuanceAuthority(issuanceContext)
 					: undefined;
 			if (
@@ -2733,6 +2735,7 @@ export const createInternalAdapter = (
 			}
 			if (
 				capturedIssuanceAuthority &&
+				managedIssuanceContext?.purpose !== "impersonation" &&
 				capturedIssuanceAuthority.sourceSubjectId !== userId
 			) {
 				throw new ManagedSessionIssuanceError("subject_mismatch");
@@ -2760,6 +2763,21 @@ export const createInternalAdapter = (
 			const safeOverride = stripReservedSessionAuthority(
 				(override ?? {}) as Record<string, unknown>,
 			);
+			if (
+				authenticationPolicy &&
+				managedIssuanceContext?.purpose !== "impersonation" &&
+				Object.hasOwn(safeOverride, "impersonatedBy")
+			) {
+				throw new ManagedSessionIssuanceError("context_invalid");
+			}
+			if (
+				managedIssuanceContext?.purpose === "impersonation" &&
+				(!capturedIssuanceAuthority ||
+					safeOverride.impersonatedBy !==
+						capturedIssuanceAuthority.sourceSubjectId)
+			) {
+				throw new ManagedSessionIssuanceError("context_invalid");
+			}
 			const {
 				// Authority and identity fields are always derived by the runtime.
 				id: _discardedId,
@@ -2791,6 +2809,7 @@ export const createInternalAdapter = (
 			const defaultAdditionalFields = stripReservedSessionAuthority(
 				getSessionDefaultFields(options),
 			);
+			if (authenticationPolicy) delete defaultAdditionalFields.impersonatedBy;
 			const policyExpiresAt = dontRememberMe
 				? getDate(60 * 60 * 24, "sec")
 				: getDate(sessionExpiration, "sec");
@@ -2809,9 +2828,15 @@ export const createInternalAdapter = (
 				capturedIssuanceAuthority.sourceExpiresAt < requestedExpiresAt
 					? new Date(capturedIssuanceAuthority.sourceExpiresAt)
 					: requestedExpiresAt;
-			const organizationTransitionTarget =
-				managedIssuanceContext?.purpose === "organization"
+			const managedSessionTargetOrganizationId =
+				managedIssuanceContext?.purpose === "organization" ||
+				managedIssuanceContext?.purpose === "device" ||
+				managedIssuanceContext?.purpose === "impersonation"
 					? managedIssuanceContext.targetOrganizationId
+					: undefined;
+			const impersonatedBy =
+				managedIssuanceContext?.purpose === "impersonation"
+					? capturedIssuanceAuthority?.sourceSubjectId
 					: undefined;
 			const buildSessionData = (
 				twoFactorSessionGeneration?: string,
@@ -2847,12 +2872,13 @@ export const createInternalAdapter = (
 						}
 					: {}),
 				...(overrideAll ? rest : {}),
-				...(organizationTransitionTarget !== undefined
+				...(managedSessionTargetOrganizationId !== undefined
 					? {
-							activeOrganizationId: organizationTransitionTarget,
+							activeOrganizationId: managedSessionTargetOrganizationId,
 							activeTeamId: null,
 						}
 					: {}),
+				...(impersonatedBy ? { impersonatedBy } : {}),
 				...(passkeySessionGeneration
 					? {
 							[PASSKEY_SESSION_GENERATION_FIELD]: passkeySessionGeneration,
@@ -2878,6 +2904,7 @@ export const createInternalAdapter = (
 				const safeHookedData = stripReservedSessionAuthority(
 					unsafeHookedData,
 				);
+				if (authenticationPolicy) delete safeHookedData.impersonatedBy;
 				return {
 					...safeHookedData,
 					...(requestedSessionId ? { id: requestedSessionId } : {}),
@@ -2900,12 +2927,13 @@ export const createInternalAdapter = (
 							}
 						: {}),
 					...(assuranceFields ?? {}),
-					...(organizationTransitionTarget !== undefined
+					...(managedSessionTargetOrganizationId !== undefined
 						? {
-								activeOrganizationId: organizationTransitionTarget,
+								activeOrganizationId: managedSessionTargetOrganizationId,
 								activeTeamId: null,
 							}
 						: {}),
+					...(impersonatedBy ? { impersonatedBy } : {}),
 				} as T;
 			};
 			const persistSecondarySession = async (
@@ -3023,7 +3051,9 @@ export const createInternalAdapter = (
 					(managedIssuanceContext || stagedIssuanceAuthority)
 				) {
 					const requestedTargetOrganizationId =
-						managedIssuanceContext?.purpose === "organization"
+						managedIssuanceContext?.purpose === "organization" ||
+						managedIssuanceContext?.purpose === "device" ||
+						managedIssuanceContext?.purpose === "impersonation"
 							? managedIssuanceContext.targetOrganizationId
 							: (capturedIssuanceAuthority?.sourceOrganizationId ??
 									managedIssuanceContext?.targetOrganizationId);
@@ -3082,7 +3112,8 @@ export const createInternalAdapter = (
 									managedIssuanceContext!.purpose === "impersonation"
 										? managedIssuanceContext!.evidence
 										: [],
-								...(capturedIssuanceAuthority
+								...(capturedIssuanceAuthority &&
+								managedIssuanceContext?.purpose !== "impersonation"
 									? {
 											sourceAssurance:
 												capturedIssuanceAuthority.sourceAssurance,
@@ -3438,10 +3469,81 @@ export const createInternalAdapter = (
 									capturedSourceCredential?.status !== "active";
 							}
 						}
+						let capturedDerivativeSourceUnchanged = true;
+						if (
+							capturedIssuanceAuthority &&
+							managedIssuanceContext?.purpose === "device"
+						) {
+							try {
+								const source = await validateInternalSessionDerivativeAuthority(
+									internalAdapter,
+									managedIssuanceContext.sourceSessionDerivativeAuthority,
+									{
+										purpose: "device",
+										subjectId: userId,
+										organizationId:
+											managedIssuanceContext.targetOrganizationId,
+									},
+								);
+								capturedDerivativeSourceUnchanged =
+									source !== undefined &&
+									source.sourceSessionId ===
+										capturedIssuanceAuthority.sourceSessionId &&
+									source.sourceSubjectId ===
+										capturedIssuanceAuthority.sourceSubjectId &&
+									source.sourceOrganizationId ===
+										capturedIssuanceAuthority.sourceOrganizationId &&
+									source.sourceExpiresAt ===
+										capturedIssuanceAuthority.sourceExpiresAt.getTime() &&
+									source.policyProjectId ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyProjectId &&
+									source.policyEnvironmentId ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyEnvironmentId &&
+									source.policyRevision ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyRevision;
+							} catch {
+								capturedDerivativeSourceUnchanged = false;
+							}
+						}
+						if (
+							capturedIssuanceAuthority &&
+							managedIssuanceContext?.purpose === "impersonation"
+						) {
+							try {
+								const source = await loadStrictManagedSessionAuthorityById(
+									capturedIssuanceAuthority.sourceSessionId,
+								);
+								const sourceExpiresAt = source?.session.expiresAt;
+								const sourceAssurance = source?.assurance;
+								capturedDerivativeSourceUnchanged =
+									Boolean(source && sourceAssurance) &&
+									source!.user.id === capturedIssuanceAuthority.sourceSubjectId &&
+									sourceAssurance!.authenticationPolicyOrganizationId ===
+										capturedIssuanceAuthority.sourceOrganizationId &&
+									sourceExpiresAt instanceof Date &&
+									sourceExpiresAt.getTime() ===
+										capturedIssuanceAuthority.sourceExpiresAt.getTime() &&
+									sourceAssurance!.authenticationPolicyProjectId ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyProjectId &&
+									sourceAssurance!.authenticationPolicyEnvironmentId ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyEnvironmentId &&
+									sourceAssurance!.authenticationPolicyRevision ===
+										capturedIssuanceAuthority.sourceAssurance
+											.authenticationPolicyRevision;
+							} catch {
+								capturedDerivativeSourceUnchanged = false;
+							}
+						}
 						if (
 							!activeUser ||
 							!stagedPolicyUnchanged ||
 							!capturedReplacementSourceRetired ||
+							!capturedDerivativeSourceUnchanged ||
 							capturedIssuanceAuthority?.sourceSessionId ===
 								persistedSessionId ||
 							finalRecord?.user?.id !== activeUser.id ||
@@ -5985,7 +6087,7 @@ export const createInternalAdapter = (
 		>();
 		attachInternalSessionIssuanceCaptureAuthority(
 			internalAdapter,
-			async (issuanceContext) => {
+			async (issuanceContext, derivativeAuthority) => {
 				if (!(await isTransactionActive(adapter))) {
 					throw new ManagedSessionIssuanceError("context_invalid");
 				}
@@ -5993,9 +6095,16 @@ export const createInternalAdapter = (
 				if (transactionAdapter === adapter) {
 					throw new ManagedSessionIssuanceError("context_invalid");
 				}
-				const source = await resolveManagedSessionUpdateAuthority(
-					issuanceContext.sourceSessionToken,
-				);
+				const source =
+					issuanceContext.purpose === "device"
+						? derivativeAuthority
+							? await loadStrictManagedSessionAuthorityById(
+									derivativeAuthority.sourceSessionId,
+								)
+							: null
+						: await resolveManagedSessionUpdateAuthority(
+							issuanceContext.sourceSessionToken,
+						);
 				if (!source) {
 					throw new ManagedSessionIssuanceError("policy_unsatisfied");
 				}
@@ -6020,15 +6129,37 @@ export const createInternalAdapter = (
 					!Number.isFinite(sourceExpiresAt.getTime()) ||
 					sourceExpiresAt <= new Date() ||
 					(issuanceContext.purpose !== "organization" &&
+						issuanceContext.purpose !== "impersonation" &&
 						issuanceContext.targetOrganizationId !== null &&
 						issuanceContext.targetOrganizationId !==
 							sourceAssurance.authenticationPolicyOrganizationId)
 				) {
 					throw new ManagedSessionIssuanceError("policy_unsatisfied");
 				}
+				if (
+					issuanceContext.purpose === "device" &&
+					(!derivativeAuthority ||
+						derivativeAuthority.sourceSessionId !== source.session.id ||
+						derivativeAuthority.sourceSubjectId !== source.user.id ||
+						derivativeAuthority.sourceOrganizationId !==
+							sourceAssurance.authenticationPolicyOrganizationId ||
+						derivativeAuthority.sourceExpiresAt !==
+							sourceExpiresAt.getTime() ||
+						derivativeAuthority.policyProjectId !==
+							sourceAssurance.authenticationPolicyProjectId ||
+						derivativeAuthority.policyEnvironmentId !==
+							sourceAssurance.authenticationPolicyEnvironmentId ||
+						derivativeAuthority.policyRevision !==
+							sourceAssurance.authenticationPolicyRevision)
+				) {
+					throw new ManagedSessionIssuanceError("policy_unsatisfied");
+				}
 				return Object.freeze({
 					sourceSessionId: source.session.id,
-					sourceCredentialId: source.credential?.id ?? null,
+					sourceCredentialId:
+						"lineage" in source
+							? source.lineage.active.id
+							: source.credential?.id ?? null,
 					sourceSubjectId: source.user.id,
 					sourceOrganizationId:
 						sourceAssurance.authenticationPolicyOrganizationId,
