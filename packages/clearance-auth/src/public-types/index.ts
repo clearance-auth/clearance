@@ -279,6 +279,14 @@ export type CreateClearanceAuthOptions<
 	/** Product-guarded runtime extensions such as OIDC Provider and MCP. */
 	plugins?: ClearancePlugin[];
 	authenticationSecurity?: Security;
+	/**
+	 * Immutable product scope for the managed PostgreSQL authentication-policy
+	 * authority. Omit to keep the runtime policy-unmanaged.
+	 */
+	authenticationPolicy?: {
+		projectId: string;
+		environmentId: string;
+	};
 	/** Enabled by default. Set to `false` to omit the passkey server surface. */
 	passkeys?: Passkeys;
 	credentialAuthority?: {
