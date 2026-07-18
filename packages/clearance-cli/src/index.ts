@@ -21,6 +21,7 @@ import {
 } from "./operator-auth.js";
 import { resolveApiSession } from "./api-client.js";
 import { registerDeliveryCommands } from "./delivery-command.js";
+import { registerAuthenticationPolicyCommands } from "./authentication-policy-command.js";
 import {
 	commandPath,
 	dispatchRemoteCommand,
@@ -346,6 +347,7 @@ async function main() {
 		.action(remoteCommandAction);
 
 	registerDeliveryCommands(program, remoteCommandAction);
+	registerAuthenticationPolicyCommands(program, remoteCommandAction);
 
 	// keys — digest-only project/environment scoped API-key lifecycle
 	const keys = program.command("keys").description("Project and environment API keys");
