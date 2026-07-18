@@ -6,7 +6,40 @@ import {
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "@clearance/runtime/crypto";
-import type { SCIMOptions } from "./types";
+import type { SCIMOptions, SCIMTokenStorageContext } from "./types";
+
+const MAX_STORAGE_CONTEXT_ID_CHARACTERS = 512;
+
+function validateStorageContextId(value: string, name: string): string {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > MAX_STORAGE_CONTEXT_ID_CHARACTERS ||
+		value.trim() !== value ||
+		/[\u0000-\u001f\u007f]/.test(value)
+	) {
+		throw new Error(`SCIM token storage ${name} is invalid`);
+	}
+	return value;
+}
+
+/**
+ * Validates and freezes the exact storage context before a custom provider is
+ * called. Keep this narrow: it is an authenticated identity, not a transport
+ * payload.
+ */
+export function createSCIMTokenStorageContext(
+	context: SCIMTokenStorageContext,
+): SCIMTokenStorageContext {
+	const providerId = validateStorageContextId(context.providerId, "providerId");
+	const organizationId =
+		context.organizationId === undefined
+			? undefined
+			: validateStorageContextId(context.organizationId, "organizationId");
+	return Object.freeze(
+		organizationId === undefined ? { providerId } : { providerId, organizationId },
+	);
+}
 
 const defaultKeyHasher = async (token: string) => {
 	const hash = await createHash("SHA-256").digest(
@@ -19,6 +52,7 @@ export async function storeSCIMToken(
 	ctx: GenericEndpointContext,
 	opts: SCIMOptions,
 	scimToken: string,
+	storageContext: SCIMTokenStorageContext,
 ) {
 	if (opts.storeSCIMToken === "encrypted") {
 		return await symmetricEncrypt({
@@ -39,7 +73,10 @@ export async function storeSCIMToken(
 		typeof opts.storeSCIMToken === "object" &&
 		"encrypt" in opts.storeSCIMToken
 	) {
-		return await opts.storeSCIMToken.encrypt(scimToken);
+		return await opts.storeSCIMToken.encrypt(
+			scimToken,
+			createSCIMTokenStorageContext(storageContext),
+		);
 	}
 
 	return scimToken;
@@ -50,6 +87,7 @@ export async function verifySCIMToken(
 	opts: SCIMOptions,
 	storedSCIMToken: string,
 	scimToken: string,
+	storageContext: SCIMTokenStorageContext,
 ): Promise<boolean> {
 	if (opts.storeSCIMToken === "encrypted") {
 		return constantTimeEqual(
@@ -75,8 +113,10 @@ export async function verifySCIMToken(
 		typeof opts.storeSCIMToken === "object" &&
 		"decrypt" in opts.storeSCIMToken
 	) {
-		const decryptedSCIMToken =
-			await opts.storeSCIMToken.decrypt(storedSCIMToken);
+		const decryptedSCIMToken = await opts.storeSCIMToken.decrypt(
+			storedSCIMToken,
+			createSCIMTokenStorageContext(storageContext),
+		);
 		return constantTimeEqual(decryptedSCIMToken, scimToken);
 	}
 
