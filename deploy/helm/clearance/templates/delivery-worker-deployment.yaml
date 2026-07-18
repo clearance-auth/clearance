@@ -65,7 +65,7 @@ spec:
         - name: delivery-worker
           image: "{{ required "image.repository is required" .Values.image.repository }}@{{ required "image.digest is required; deploy an immutable release digest" .Values.image.digest }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["node", "packages/delivery-worker/dist/cli.mjs"]
+          command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/delivery-worker/dist/cli.mjs"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
