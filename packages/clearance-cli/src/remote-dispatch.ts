@@ -215,6 +215,8 @@ export async function dispatchRemoteCommand(
 		case STORE_V2_OPERATIONS.eventsRollback.cliPath:
 		case STORE_V2_OPERATIONS.principalsCutover.cliPath:
 		case STORE_V2_OPERATIONS.principalsRollback.cliPath:
+		case STORE_V2_OPERATIONS.topologyCutover.cliPath:
+		case STORE_V2_OPERATIONS.topologyRollback.cliPath:
 			return dispatchStoreV2Command({ session, path, args, opts, global });
 		default:
 			throw error(
