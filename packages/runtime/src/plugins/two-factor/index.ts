@@ -42,7 +42,7 @@ import {
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditDraft,
-} from "../../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import {
 	consumeInternalVerificationChallenge,
 	createInternalVerificationChallenge,
