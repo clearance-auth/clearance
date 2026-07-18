@@ -509,7 +509,10 @@ export const generateSCIMToken = (opts: SCIMOptions) =>
 				data: {
 					providerId,
 					organizationId,
-					scimToken: await storeSCIMToken(ctx, opts, baseToken),
+					scimToken: await storeSCIMToken(ctx, opts, baseToken, {
+						providerId,
+						organizationId,
+					}),
 					...(isProviderOwnershipEnabled(opts) ? { userId: user.id } : {}),
 				},
 			});
