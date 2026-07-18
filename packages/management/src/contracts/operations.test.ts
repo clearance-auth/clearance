@@ -60,7 +60,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(125);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(127);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -302,6 +302,22 @@ describe("management operation contracts", () => {
 		});
 		expect(STORE_V2_OPERATIONS.principalsRollback).toMatchObject({
 			http: { method: "POST", path: "/v1/schema/store-v2/principals/rollback" },
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.topologyCutover).toMatchObject({
+			id: "schema.store-v2.topology.cutover",
+			cliPath: "schema store-v2 topology cutover",
+			http: { method: "POST", path: "/v1/schema/store-v2/topology/cutover" },
+			mutation: true,
+			supportsDryRun: false,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.topologyRollback).toMatchObject({
+			id: "schema.store-v2.topology.rollback",
+			cliPath: "schema store-v2 topology rollback",
+			http: { method: "POST", path: "/v1/schema/store-v2/topology/rollback" },
+			mutation: true,
+			supportsDryRun: false,
 			confirmation: "server-required",
 		});
 	});
