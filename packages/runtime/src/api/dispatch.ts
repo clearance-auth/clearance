@@ -41,7 +41,7 @@ import {
 	readInternalRuntimeAudit,
 	runWithRuntimeAuditRequestContext,
 	type InternalRuntimeAuditRequestContext,
-} from "../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
 
 const rejectActiveTransactionSymbol = Symbol.for(
