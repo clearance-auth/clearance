@@ -15,13 +15,17 @@ import {
 	listEvents,
 	listEventsPageOperational,
 	replayDiagnosticTrace,
+	replayDiagnosticTraceOperational,
 	testScimConnection,
 	EVENTS_EXPORT_MAX_LIMIT,
 	beginEventsTail,
 	pollEventsTail,
 } from "../index.js";
 import type { AuditEvent } from "../types/resources.js";
-import type { ManagementStore } from "../store/types.js";
+import type {
+	ManagementStore,
+	StoreV2TopologyRepository,
+} from "../store/types.js";
 
 const dirs: string[] = [];
 
@@ -427,6 +431,101 @@ describe("events replay (SCIM diagnostic only)", () => {
 				scope: { projectId: "proj_wrong", environmentId: "env_wrong" },
 			}),
 		).toThrow(/not found/i);
+	});
+
+	it("replays through normalized topology after snapshot topology cutover", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "Normalized Replay" });
+		const scope = {
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		};
+		const org = createOrganization(store, { name: "Normalized Customer" });
+		const scim = createScimConnection(store, {
+			organizationId: org.id,
+			provider: "okta",
+		});
+		const traceId = testScimConnection(store, scim.id, { dryRun: true }).trace.id;
+		let organizationReads = 0;
+		const topology = {
+			authoritative: true,
+			getProjectById: async (id: string) =>
+				id === initialized.project.id ? initialized.project : null,
+			findProjectConflict: async () => null,
+			getEnvironment: async ({ projectId, id }: { projectId: string; id: string }) =>
+				projectId === initialized.project.id && id === initialized.environment.id
+					? initialized.environment
+					: null,
+			getOrganization: async ({ scope: candidate, id }: { scope: typeof scope; id: string }) => {
+				organizationReads += 1;
+				return candidate.projectId === scope.projectId &&
+					candidate.environmentId === scope.environmentId && id === org.id
+					? org
+					: null;
+			},
+			lockOrganization: async ({ scope: candidate, id }: { scope: typeof scope; id: string }) => {
+				organizationReads += 1;
+				return candidate.projectId === scope.projectId &&
+					candidate.environmentId === scope.environmentId && id === org.id
+					? org
+					: null;
+			},
+			organizationIdExists: async () => false,
+			getOrganizationBySlug: async () => null,
+			countOrganizations: async () => 1,
+			listProjectsPage: async () => ({ projects: [initialized.project], hasMore: false }),
+			listEnvironmentsPage: async () => ({ environments: [initialized.environment], hasMore: false }),
+			listOrganizationsPage: async () => ({ organizations: [org], hasMore: false }),
+			upsertProject: async () => initialized.project,
+			upsertEnvironment: async () => initialized.environment,
+			upsertOrganization: async () => org,
+		} satisfies StoreV2TopologyRepository;
+		const authoritativeStore = store as unknown as ManagementStore;
+		Object.assign(authoritativeStore, {
+			storeV2Topology: topology,
+			mutateCoordinated: async (
+				fn: NonNullable<ManagementStore["mutateCoordinated"]> extends (
+					callback: infer Callback,
+				) => Promise<unknown> ? Callback : never,
+			) => fn({
+				data: authoritativeStore.snapshot,
+				topology,
+				appendAudit: (input) => {
+					const event = {
+						id: `evt_authoritative_${authoritativeStore.snapshot.events.length}`,
+						correlationId: "corr_authoritative",
+						createdAt: new Date().toISOString(),
+						...input,
+					};
+					authoritativeStore.snapshot.events.unshift(event);
+					return event;
+				},
+			}),
+		});
+		store.mutate((data) => {
+			data.projects = [];
+			data.environments = [];
+			data.organizations = [];
+		});
+
+		const dryRun = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			dryRun: true,
+		});
+		expect(dryRun.dryRun).toBe(true);
+		const applied = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			confirm: true,
+		});
+		expect(applied.trace.id).not.toBe(traceId);
+		const idempotent = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			confirm: true,
+		});
+		expect(idempotent.idempotent).toBe(true);
+		expect(idempotent.trace.id).toBe(applied.trace.id);
+		expect(organizationReads).toBeGreaterThanOrEqual(4);
+		expect(store.snapshot.organizations).toEqual([]);
 	});
 
 	it("inspect distinguishes audit events vs SCIM traces", () => {
