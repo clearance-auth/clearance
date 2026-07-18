@@ -21,6 +21,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/observability-node": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
     "pg": "^8.14.1"
   },
   "devDependencies": {
