@@ -67,4 +67,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["node", "-e", "process.exit(0)"]
 
 # Default to management API; compose overrides command per service.
-CMD ["node", "packages/clearance-api/dist/server.js"]
+CMD ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/clearance-api/dist/server.js"]
