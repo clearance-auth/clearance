@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+	context,
+	trace,
+} from "@opentelemetry/api";
+import { extractDeliveryTraceCarrier } from "@clearance/observability-node";
 import type pg from "pg";
 import { DeliveryError } from "./errors.js";
 import {
@@ -134,6 +139,17 @@ function required(value: string, label: string): string {
 	return normalized;
 }
 
+/** Capture the active W3C parent only; baggage and tracestate are never durable delivery data. */
+function captureActiveDeliveryTraceCarrier() {
+	const spanContext = trace.getSpanContext(context.active());
+	if (!spanContext) return undefined;
+	const flags = spanContext.traceFlags === 1 ? "01" : spanContext.traceFlags === 0 ? "00" : undefined;
+	if (!flags) return undefined;
+	return extractDeliveryTraceCarrier(
+		`00-${spanContext.traceId}-${spanContext.spanId}-${flags}`,
+	);
+}
+
 async function enqueueDeliveryInternal(
 	tx: DeliveryTransactionAdapter,
 	input: InternalEnqueueDeliveryInput,
@@ -230,6 +246,7 @@ async function enqueueDeliveryInternal(
 		expiresAt: semanticExpiresAt,
 	};
 	const encrypted = encryptDeliveryPayload(input.payload, aad, ring);
+	const traceCarrier = captureActiveDeliveryTraceCarrier();
 	const quotaTransaction: DeliveryRawTransaction = {
 		rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
 			text: string,
@@ -292,8 +309,8 @@ async function enqueueDeliveryInternal(
 			  source_dedupe_version,
 				  project_id, environment_id, organization_id, actor_id, correlation_id, webhook_endpoint_id,
 				  destination_fingerprint, destination_fingerprint_key_id, replay_of, created_at,
-				  semantic_expires_at)
-				 VALUES ($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+				  semantic_expires_at, trace_parent)
+				 VALUES ($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 			[
 				eventId,
 				kind,
@@ -311,6 +328,7 @@ async function enqueueDeliveryInternal(
 				input.replayOf ?? null,
 				now,
 				expiresAt,
+				traceCarrier?.traceparent ?? null,
 			],
 		);
 		await tx.query(
