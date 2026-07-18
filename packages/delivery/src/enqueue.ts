@@ -18,6 +18,7 @@ import {
 	lockDeliveryQuotaScopeInExistingTransaction,
 	type DeliveryQuotaPolicy,
 } from "./quota.js";
+import { appendRuntimeAuditInTransaction } from "./runtime-audit.js";
 import { parseWebhookDeliveryPayload } from "./webhook-payload.js";
 
 const transactionAdapterBrand: unique symbol = Symbol("delivery-transaction-adapter");
@@ -335,6 +336,36 @@ async function enqueueDeliveryInternal(
 				now,
 			],
 		);
+		if (input.channel === "webhook" && options.runtimeAudit) {
+			await appendRuntimeAuditInTransaction({
+				rawTransactionQuery: quotaTransaction.rawTransactionQuery!,
+			}, options.runtimeAudit, {
+				correlationId: input.correlationId ?? eventId,
+				projectId,
+				environmentId,
+				organizationId: input.organizationId ?? null,
+				actor: input.actorId ?? "system",
+				action: "delivery.webhook.queued",
+				subjectType: "delivery_job",
+				subjectId: jobId,
+				outcome: "pending",
+				source: "system",
+				message: "Webhook delivery queued",
+				metadata: {
+					eventId,
+					...(webhookEndpointId === null ? {} : { endpointId: webhookEndpointId }),
+					attempt: 0,
+					request: {
+						operationId: "delivery-webhook-enqueue",
+						route: "/internal/delivery/webhook",
+						method: "POST",
+						clientIp: null,
+						userAgent: null,
+					},
+				},
+				createdAt: now,
+			});
+		}
 		await tx.query(`RELEASE SAVEPOINT ${savepoint}`);
 	} catch (error) {
 		if (!savepointCreated && (error as { code?: string }).code === "25P01") {
