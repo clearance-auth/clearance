@@ -10,6 +10,7 @@
     "directory": "packages/observability-node"
   },
   "sideEffects": [
+    "./src/preload.ts",
     "./src/register.ts"
   ],
   "main": "./dist/index.mjs",
@@ -24,6 +25,11 @@
       "dev-source": "./src/register.ts",
       "types": "./dist/register.d.mts",
       "default": "./dist/register.mjs"
+    },
+    "./preload": {
+      "dev-source": "./src/preload.ts",
+      "types": "./dist/preload.d.mts",
+      "default": "./dist/preload.mjs"
     }
   },
   "files": [
@@ -41,6 +47,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
     "@opentelemetry/instrumentation-http": "^0.220.0",
     "@opentelemetry/instrumentation-pg": "^0.72.0",
