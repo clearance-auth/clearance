@@ -5,6 +5,7 @@ import {
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
+import type { DBTransactionAdapter } from "@clearance/core/db/adapter";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { generateId } from "@clearance/core/utils/id";
 import { base64Url } from "@clearance/utils/base64";
@@ -28,6 +29,13 @@ import {
 	captureInternalSessionIssuanceContext,
 	createInternalSessionIssuanceContext,
 } from "../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "../../internal/runtime-audit";
 import {
 	consumePreloadedStagedAuthenticationCapability,
 	createStagedAuthenticationBinding,
@@ -104,6 +112,22 @@ const freshAuthoritativeSessionMiddleware = createAuthMiddleware(async (ctx) => 
 });
 
 const NAME_MAX_LENGTH = 100;
+
+async function appendRuntimeAuditIfBound(
+	ctx: GenericEndpointContext,
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
+}
 
 const transportSchema = z.enum([
 	"ble",
@@ -460,7 +484,7 @@ export const verifyPasskeyRegistration = (options: PasskeyOptions | undefined) =
 						);
 					}
 
-					return adapter.create<Omit<Passkey, "id">, Passkey>({
+					const created = await adapter.create<Omit<Passkey, "id">, Passkey>({
 						model: "passkey",
 						data: {
 							userId: sourceUserId,
@@ -477,6 +501,18 @@ export const verifyPasskeyRegistration = (options: PasskeyOptions | undefined) =
 							updatedAt: new Date(),
 						} as Omit<Passkey, "id">,
 					});
+					await appendRuntimeAuditIfBound(ctx, adapter, {
+						actor: sourceUserId,
+						action: "auth.factor.enrolled",
+						subjectType: "user",
+						subjectId: sourceUserId,
+						outcome: "success",
+						source: "system",
+						organizationId: null,
+						message: "Passkey factor enrolled",
+						metadata: { factor: "passkey" },
+					});
+					return created;
 				});
 			} catch (error) {
 				// A duplicate `credentialID` is enforced by a database unique
@@ -670,6 +706,17 @@ export const verifyPasskeyAuthentication = (options: PasskeyOptions | undefined)
 								PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
 							);
 						}
+						await appendRuntimeAuditIfBound(ctx, trxAdapter, {
+							actor: passkey.userId,
+							action: "auth.factor.used",
+							subjectType: "user",
+							subjectId: passkey.userId,
+							outcome: "success",
+							source: "system",
+							organizationId: null,
+							message: "Passkey factor used",
+							metadata: { factor: "passkey" },
+						});
 						committedAuthentication = {
 							session: newSession,
 							user: activeUser,
@@ -1579,6 +1626,17 @@ export const deletePasskey = (options: PasskeyOptions | undefined) =>
 					) {
 						lifecycleConflict();
 					}
+					await appendRuntimeAuditIfBound(ctx, adapter, {
+						actor: userId,
+						action: "auth.factor.removed",
+						subjectType: "user",
+						subjectId: userId,
+						outcome: "success",
+						source: "system",
+						organizationId: null,
+						message: "Passkey factor removed",
+						metadata: { factor: "passkey" },
+					});
 					committedLifecycle = {
 						kind: "success",
 						replacementSession,
