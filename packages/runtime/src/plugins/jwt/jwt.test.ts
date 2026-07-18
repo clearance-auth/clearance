@@ -19,9 +19,13 @@ import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { jwt } from ".";
 import { jwtClient } from "./client";
 import {
+	JWT_AUTHORIZATION_ACTIONS_CLAIM,
+	JWT_AUTHORIZATION_REVISION_CLAIM,
+	JWT_ORGANIZATION_ID_CLAIM,
 	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
 	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
 	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+	JWT_SUBJECT_KIND_CLAIM,
 } from "./sign";
 import type { JWKOptions, Jwk, JwtOptions } from "./types";
 import { generateExportedKeyPair, toExpJWT } from "./utils";
@@ -229,6 +233,9 @@ describe("jwt session derivative authority", async () => {
 				};
 			},
 			async initializeOrganizationOwner() {},
+			async authenticateServiceAccountCredential() {
+				throw new Error("not used");
+			},
 		});
 
 		const signedIn = await local.signInWithTestUser();
@@ -334,6 +341,129 @@ describe("jwt session derivative authority", async () => {
 				})
 			).payload,
 		).toBeNull();
+	});
+
+	it("issues and verifies revision-bound service-account JWTs", async () => {
+		const local = await getTestInstance({
+			plugins: [jwt({ disableSettingJwtHeader: true })],
+			logger: { level: "error" },
+		});
+		const context = await local.auth.$context;
+		const authorization = {
+			revision: "7",
+			actions: ["organization.read", "organization.write"],
+			available: true,
+		};
+		const expiresAt = new Date(Date.now() + 30_000);
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				if (!authorization.available) throw new Error("unavailable");
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: authorization.revision,
+					actions: authorization.actions,
+				};
+			},
+			async authenticateServiceAccountCredential(secret) {
+				if (secret !== "machine-secret") throw new Error("invalid");
+				return {
+					organizationId: "organization-machine",
+					subject: { kind: "service_account", id: "service-machine" },
+					revision: authorization.revision,
+					actions: authorization.actions,
+					expiresAt,
+				};
+			},
+			async initializeOrganizationOwner() {},
+		});
+
+		const issued = await local.auth.api.issueServiceAccountJWT({
+			body: { secret: "machine-secret" },
+		});
+		const payload = decodeJwt(issued.token);
+		expect(payload).toMatchObject({
+			sub: "service-machine",
+			[JWT_SUBJECT_KIND_CLAIM]: "service_account",
+			[JWT_ORGANIZATION_ID_CLAIM]: "organization-machine",
+			[JWT_AUTHORIZATION_ACTIONS_CLAIM]: [
+				"organization.read",
+				"organization.write",
+			],
+			[JWT_AUTHORIZATION_REVISION_CLAIM]: "7",
+		});
+		expect(payload.exp).toBeLessThanOrEqual(Math.floor(expiresAt.getTime() / 1000));
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).not.toBeNull();
+
+		authorization.revision = "8";
+		authorization.actions = ["organization.read"];
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).toBeNull();
+		authorization.revision = "7";
+		authorization.actions = ["organization.read", "organization.write"];
+		authorization.available = false;
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).toBeNull();
+		authorization.available = true;
+
+		const partial = await local.auth.api.signJWT({
+			body: { payload: { sub: "service-machine", [JWT_SUBJECT_KIND_CLAIM]: "service_account" } },
+		});
+		const generic = await local.auth.api.signJWT({
+			body: { payload: { sub: "generic", [JWT_AUTHORIZATION_ACTIONS_CLAIM]: ["organization.read"], [JWT_AUTHORIZATION_REVISION_CLAIM]: "7" } },
+		});
+		const mixed = await local.auth.api.signJWT({
+			body: { payload: { sub: "service-machine", [JWT_SUBJECT_KIND_CLAIM]: "service_account", [JWT_ORGANIZATION_ID_CLAIM]: "organization-machine", [JWT_AUTHORIZATION_ACTIONS_CLAIM]: ["organization.read", "organization.write"], [JWT_AUTHORIZATION_REVISION_CLAIM]: "7", [JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: "forged", [JWT_SESSION_SOURCE_SUBJECT_CLAIM]: "service-machine", [JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: "organization-machine" } },
+		});
+		for (const token of [partial.token, generic.token, mixed.token]) {
+			expect((await local.auth.api.verifyJWT({ body: { token } })).payload).toBeNull();
+		}
+
+		const subjectChanging = await getTestInstance({
+			plugins: [
+				jwt({
+					jwks: {
+						remoteUrl: "https://example.com/.well-known/jwks.json",
+						keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+					},
+					jwt: {
+						sign(payload) {
+							const encode = (value: unknown) =>
+								Buffer.from(JSON.stringify(value)).toString("base64url");
+							return `${encode({ alg: "EdDSA", typ: "JWT" })}.${encode({ ...payload, sub: "different-service-account" })}.signature`;
+						},
+					},
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const subjectChangingContext = await subjectChanging.auth.$context;
+		attachInternalAuthorizationAuthority(
+			subjectChangingContext.internalAdapter,
+			{
+				async readEffectiveAuthorization(input) {
+					return {
+						organizationId: input.organizationId,
+						subject: input.subject,
+						revision: "7",
+						actions: ["organization.read"],
+					};
+				},
+				async authenticateServiceAccountCredential() {
+					return {
+						organizationId: "organization-machine",
+						subject: { kind: "service_account", id: "service-machine" },
+						revision: "7",
+						actions: ["organization.read"],
+						expiresAt: null,
+					};
+				},
+				async initializeOrganizationOwner() {},
+			},
+		);
+		await expect(
+			subjectChanging.auth.api.issueServiceAccountJWT({
+				body: { secret: "machine-secret" },
+			}),
+		).rejects.toThrow("Cannot issue an access token");
 	});
 
 	it("binds live managed sessions, rejects stale sources, and preserves generic tokens", async () => {
