@@ -62,10 +62,15 @@ function setNoStoreTokenResponseHeaders(ctx: {
 }
 
 export const jwt = <O extends JwtOptions>(options?: O) => {
-	// Remote url must be set when using signing function
-	if (options?.jwt?.sign && !options.jwks?.remoteUrl) {
+	// Custom signers must make their public keys available either remotely or
+	// through the local JWKS endpoint.
+	if (
+		options?.jwt?.sign &&
+		!options.jwks?.remoteUrl &&
+		!options.adapter?.getJwks
+	) {
 		throw new ClearanceError(
-			"options.jwks.remoteUrl must be set when using options.jwt.sign",
+			"options.jwt.sign requires options.jwks.remoteUrl or options.adapter.getJwks",
 		);
 	}
 
@@ -192,6 +197,11 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 					let keySets = await adapter.getAllKeys(ctx);
 
 					if (!keySets || keySets?.length === 0) {
+						if (options?.jwt?.sign && options.adapter?.getJwks) {
+							throw new ClearanceError(
+								"No public JWKS keys found for options.jwt.sign. Make sure options.adapter.getJwks returns at least one key.",
+							);
+						}
 						await createJwk(ctx, options);
 						keySets = await adapter.getAllKeys(ctx);
 					}
