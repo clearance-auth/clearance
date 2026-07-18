@@ -3,6 +3,7 @@
  * Connection checks issue actual SCIM HTTP requests. Tokens are never written
  * to audit/JSON as plaintext — only fingerprints / AEAD envelopes.
  */
+import { timingSafeEqual } from "node:crypto";
 import type { ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, DirectoryConnection } from "../types/resources.js";
@@ -29,8 +30,22 @@ import { deriveSetupConnectionIds } from "./setup-links.js";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 
 export const SCIM_REAL_FIXTURE_MODE = "simulation" as const;
+export type ScimTestScenario = "users" | "group-lifecycle";
+
+type GroupLifecycleEvidence = Readonly<{
+	scenario: "group-lifecycle";
+	group: Readonly<{ id: string; status: "deleted" }>;
+	counts: Readonly<{ usersCreated: number; membersCreated: number; membersAfterPatch: number }>;
+	actions: Readonly<{ create: number; patch: number; get: number; list: number; delete: number }>;
+}>;
 
 const SCIM_SETUP_ENDPOINT = `/api/auth/scim/v2`;
+
+function sameBearer(expected: string, supplied: string): boolean {
+	const expectedBytes = Buffer.from(expected, "utf8");
+	const suppliedBytes = Buffer.from(supplied, "utf8");
+	return expectedBytes.length === suppliedBytes.length && timingSafeEqual(expectedBytes, suppliedBytes);
+}
 
 async function settleScimTestSuccess(
 	store: ManagementStore,
@@ -141,6 +156,308 @@ async function settleScimTestSuccess(
 	return store.snapshot.directoryConnections.find(
 		(connection) => connection.id === input.connection.id,
 	)!;
+}
+
+/**
+ * The Group scenario has to enter through the same PostgreSQL authorities as
+ * a real runtime request. This lock is deliberately a validation-only
+ * coordinated transaction: protocol requests below are handled by the
+ * bundled runtime, which owns their individual rollback-capable transactions
+ * and runtime-audit outbox writes.
+ */
+async function assertGroupLifecycleEntry(
+	store: ManagementStore,
+	connection: DirectoryConnection,
+	scope: ResourceScope,
+	bearerToken: string,
+): Promise<void> {
+	if (connection.status === "disabled") {
+		throw new ClearanceError({
+			code: "SCIM_NOT_FOUND",
+			message: `SCIM connection ${connection.id} not found`,
+			stage: "scim.test",
+			status: 404,
+		});
+	}
+	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
+		throw new ClearanceError({
+			code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED",
+			message: "SCIM group lifecycle requires the coordinated PostgreSQL runtime backend",
+			stage: "sync.apply",
+			status: 500,
+		});
+	}
+	await mutateCoordinatedWithRuntimeSql(store, async ({ data, topology, query }) => {
+		if (!topology) {
+			throw new ClearanceError({
+				code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED",
+				message: "SCIM group lifecycle requires normalized topology authority",
+				stage: "sync.apply",
+				status: 500,
+			});
+		}
+		const organization = await topology.lockOrganization({ scope, id: connection.organizationId });
+		const current = data.directoryConnections.find(
+			(candidate) => candidate.id === connection.id && candidate.organizationId === connection.organizationId,
+		);
+		if (!organization || organization.status === "archived" || !current || current.status === "disabled") {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${connection.id} not found`,
+				stage: "scim.test",
+				status: 404,
+			});
+		}
+		const provider = await query(
+			`select id, "providerId", "organizationId" from "scimProvider" where id = $1 and "organizationId" = $2 for update`,
+			[connection.id, organization.id],
+		);
+		if (provider.rows.length !== 1) {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${connection.id} not found`,
+				stage: "scim.test",
+				status: 404,
+			});
+		}
+		const runtimeProvider = provider.rows[0] as { providerId?: unknown; organizationId?: unknown };
+		if (
+			typeof runtimeProvider.providerId !== "string" ||
+			runtimeProvider.organizationId !== organization.id
+		) {
+			throw new ClearanceError({
+				code: "SCIM_CONNECTION_TOKEN_MISMATCH",
+				message: "Runtime SCIM provider identity does not match the requested connection",
+				stage: "scim.test",
+				status: 409,
+			});
+		}
+		// The bearer encodes the runtime provider and organization. The
+		// authenticated request below then proves the remaining base token.
+		recoverScimBaseToken(bearerToken, runtimeProvider.providerId, organization.id);
+	});
+}
+
+async function scimHandlerJson(
+	path: string,
+	method: "POST" | "PATCH" | "GET" | "DELETE",
+	bearerToken: string,
+	body?: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> | undefined }> {
+	const baseURL = process.env.CLEARANCE_BASE_URL ?? "http://localhost:3300";
+	const response = await getAuthBundle().auth.handler(
+		new Request(`${baseURL}/api/auth/scim/v2${path}`, {
+			method,
+			headers: {
+				accept: "application/scim+json",
+				...(body ? { "content-type": "application/scim+json" } : {}),
+				authorization: `Bearer ${bearerToken}`,
+				origin: baseURL,
+			},
+			...(body ? { body: JSON.stringify(body) } : {}),
+		}),
+	);
+	if (!response.ok) {
+		throw new ClearanceError({
+			code: response.status === 401 || response.status === 403 ? "SCIM_UNAUTHORIZED" : "SCIM_GROUP_LIFECYCLE_FAILED",
+			message: `SCIM Group lifecycle handler failed (${response.status})`,
+			stage: "scim.group-lifecycle",
+			status: response.status,
+		});
+	}
+	if (response.status === 204) return { status: response.status, body: undefined };
+	const parsed: unknown = await response.json().catch(() => undefined);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new ClearanceError({
+			code: "SCIM_GROUP_LIFECYCLE_FAILED",
+			message: "SCIM Group lifecycle handler returned an invalid response",
+			stage: "scim.group-lifecycle",
+			status: 502,
+		});
+	}
+	return { status: response.status, body: parsed as Record<string, unknown> };
+}
+
+async function getScimHandlerStatus(
+	path: string,
+	bearerToken: string,
+	method: "GET" | "DELETE" = "GET",
+): Promise<number> {
+	const baseURL = process.env.CLEARANCE_BASE_URL ?? "http://localhost:3300";
+	const response = await getAuthBundle().auth.handler(new Request(`${baseURL}/api/auth/scim/v2${path}`, {
+		method,
+		headers: { accept: "application/scim+json", authorization: `Bearer ${bearerToken}`, origin: baseURL },
+	}));
+	return response.status;
+}
+
+/**
+ * Product-owned cleanup for the synthetic users created by this diagnostic.
+ * SCIM DELETE first removes its provider/account, organization and team
+ * references. Only then can this coordinated seam hard-delete the otherwise
+ * global runtime user rows. It refuses any unexpected runtime reference.
+ */
+async function hardDeleteGeneratedLifecycleUsers(
+	store: ManagementStore,
+	userIds: readonly string[],
+): Promise<void> {
+	if (userIds.length === 0) return;
+	await mutateCoordinatedWithRuntimeSql(store, async ({ query }) => {
+		const users = await query(`select id, email from "user" where id = any($1::text[]) for update`, [userIds]);
+		if (users.rows.length !== userIds.length) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_CLEANUP_FAILED", message: "Synthetic SCIM lifecycle user is missing during cleanup", stage: "scim.group-lifecycle", status: 500 });
+		const references = await query(
+			`select quote_ident(n.nspname) || '.' || quote_ident(c.relname) as relation, quote_ident(a.attname) as column
+			 from pg_attribute a join pg_class c on c.oid = a.attrelid join pg_namespace n on n.oid = c.relnamespace
+			 where a.attnum > 0 and not a.attisdropped and c.relkind = 'r' and n.nspname = current_schema()
+			 and a.attname in ('userId', 'inviterId')`,
+		);
+		for (const reference of references.rows as Array<{ relation: string; column: string }>) {
+			const count = await query(`select count(*)::int as count from ${reference.relation} where ${reference.column} = any($1::text[])`, [userIds]);
+			if (Number(count.rows[0]?.count ?? 0) !== 0) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_CLEANUP_FAILED", message: "Synthetic SCIM lifecycle user still has runtime references", stage: "scim.group-lifecycle", status: 500 });
+		}
+		const emails = users.rows.map((row) => String(row.email).toLowerCase());
+		const verification = await query(`select count(*)::int as count from verification where lower(identifier) = any($1::text[])`, [emails]);
+		if (Number(verification.rows[0]?.count ?? 0) !== 0) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_CLEANUP_FAILED", message: "Synthetic SCIM lifecycle user still has verification references", stage: "scim.group-lifecycle", status: 500 });
+		await query(`delete from "user" where id = any($1::text[])`, [userIds]);
+		const remaining = await query(`select count(*)::int as count from "user" where id = any($1::text[])`, [userIds]);
+		if (Number(remaining.rows[0]?.count ?? 0) !== 0) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_CLEANUP_FAILED", message: "Synthetic SCIM lifecycle users remain after cleanup", stage: "scim.group-lifecycle", status: 500 });
+	});
+}
+
+async function applyGroupLifecycleScenario(
+	store: ManagementStore,
+	connection: DirectoryConnection,
+	input: { bearerToken: string; scope: ResourceScope; correlationId: string },
+): Promise<GroupLifecycleEvidence> {
+	await assertGroupLifecycleEntry(store, connection, input.scope, input.bearerToken);
+	const stamp = input.correlationId.replace(/[^a-z0-9]/gi, "").slice(-18);
+	const createdName = `SCIM Lifecycle ${stamp}`;
+	const patchedName = `SCIM Lifecycle Updated ${stamp}`;
+	let firstUserId: string | undefined;
+	let secondUserId: string | undefined;
+	let groupId: string | undefined;
+	let evidence: GroupLifecycleEvidence | undefined;
+	const createUser = async (ordinal: "one" | "two") => {
+		const result = await scimHandlerJson("/Users", "POST", input.bearerToken, {
+			userName: `scim-group-${stamp}-${ordinal}@example.invalid`,
+			name: { formatted: `SCIM Group ${ordinal}` },
+		});
+		const id = result.body?.id;
+		if (result.status !== 201 || typeof id !== "string" || !id) {
+			throw new ClearanceError({
+				code: "SCIM_GROUP_LIFECYCLE_FAILED",
+				message: "SCIM Group lifecycle user provisioning returned an invalid resource",
+				stage: "scim.group-lifecycle",
+				status: 502,
+			});
+		}
+		return id;
+	};
+	const assertGroup = (body: Record<string, unknown> | undefined, id: string, name: string, members: readonly string[]) => {
+		const actualMembers = Array.isArray(body?.members) ? body.members.map((member) => typeof member === "object" && member ? (member as { value?: unknown }).value : undefined) : [];
+		if (body?.id !== id || body.displayName !== name || actualMembers.length !== members.length || !members.every((member) => actualMembers.includes(member))) {
+			throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle handler returned an unexpected resource", stage: "scim.group-lifecycle", status: 502 });
+		}
+		return actualMembers as string[];
+	};
+	try {
+		firstUserId = await createUser("one");
+		secondUserId = await createUser("two");
+		const created = await scimHandlerJson("/Groups", "POST", input.bearerToken, {
+			schemas: ["urn:ietf:params:scim:schemas:core:2.0:Group"], displayName: createdName,
+			externalId: `scim-lifecycle-${stamp}`, members: [{ value: firstUserId }],
+		});
+		groupId = typeof created.body?.id === "string" ? created.body.id : undefined;
+		if (created.status !== 201 || !groupId) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle creation returned an invalid resource", stage: "scim.group-lifecycle", status: 502 });
+		const createdMembers = assertGroup(created.body, groupId, createdName, [firstUserId]);
+		const patched = await scimHandlerJson(`/Groups/${encodeURIComponent(groupId)}`, "PATCH", input.bearerToken, {
+			schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+			Operations: [{ op: "replace", path: "urn:ietf:params:scim:schemas:core:2.0:Group:displayName", value: patchedName }, { op: "add", path: "members", value: [{ value: secondUserId }] }],
+		});
+		if (patched.status !== 200) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle patch failed", stage: "scim.group-lifecycle", status: 502 });
+		const patchedMembers = assertGroup(patched.body, groupId, patchedName, [firstUserId, secondUserId]);
+		const fetched = await scimHandlerJson(`/Groups/${encodeURIComponent(groupId)}`, "GET", input.bearerToken);
+		if (fetched.status !== 200) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle read failed", stage: "scim.group-lifecycle", status: 502 });
+		assertGroup(fetched.body, groupId, patchedName, [firstUserId, secondUserId]);
+		const listed = await scimHandlerJson("/Groups", "GET", input.bearerToken);
+		const resources = Array.isArray(listed.body?.Resources) ? listed.body.Resources : [];
+		const matching = resources.find((resource) => typeof resource === "object" && resource && (resource as { id?: unknown }).id === groupId) as Record<string, unknown> | undefined;
+		if (listed.status !== 200 || typeof listed.body?.totalResults !== "number" || typeof listed.body?.itemsPerPage !== "number" || listed.body.totalResults < resources.length || listed.body.itemsPerPage !== resources.length || !matching) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle list failed", stage: "scim.group-lifecycle", status: 502 });
+		assertGroup(matching, groupId, patchedName, [firstUserId, secondUserId]);
+		const deleted = await scimHandlerJson(`/Groups/${encodeURIComponent(groupId)}`, "DELETE", input.bearerToken);
+		if (deleted.status !== 204) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle delete failed", stage: "scim.group-lifecycle", status: 502 });
+		const absent = await getScimHandlerStatus(`/Groups/${encodeURIComponent(groupId)}`, input.bearerToken);
+		if (absent !== 404) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_FAILED", message: "SCIM Group lifecycle delete was not observable", stage: "scim.group-lifecycle", status: 502 });
+		groupId = undefined;
+		evidence = { scenario: "group-lifecycle", group: { id: created.body!.id as string, status: "deleted" }, counts: { usersCreated: [firstUserId, secondUserId].length, membersCreated: createdMembers.length, membersAfterPatch: patchedMembers.length }, actions: { create: created.status, patch: patched.status, get: fetched.status, list: listed.status, delete: deleted.status } };
+		return evidence;
+	} finally {
+		const cleanup: string[] = [];
+		const hardDeleteIds: string[] = [];
+		if (groupId && (await getScimHandlerStatus(`/Groups/${encodeURIComponent(groupId)}`, input.bearerToken)) !== 404) {
+			if ((await getScimHandlerStatus(`/Groups/${encodeURIComponent(groupId)}`, input.bearerToken, "DELETE")) !== 204) cleanup.push("group");
+		}
+		for (const userId of [secondUserId, firstUserId]) {
+			if (!userId) continue;
+			const deleted = await getScimHandlerStatus(`/Users/${encodeURIComponent(userId)}`, input.bearerToken, "DELETE");
+			if (deleted !== 204 || (await getScimHandlerStatus(`/Users/${encodeURIComponent(userId)}`, input.bearerToken)) !== 404) cleanup.push("user");
+			else hardDeleteIds.push(userId);
+		}
+		if (cleanup.length === 0) await hardDeleteGeneratedLifecycleUsers(store, hardDeleteIds);
+		if (cleanup.length) throw new ClearanceError({ code: "SCIM_GROUP_LIFECYCLE_CLEANUP_FAILED", message: "SCIM Group lifecycle cleanup failed", stage: "scim.group-lifecycle", status: 500 });
+	}
+}
+
+async function settleGroupLifecycleSuccess(
+	store: ManagementStore,
+	connection: DirectoryConnection,
+	scope: ResourceScope,
+	trace: DiagnosticTrace,
+	evidence: GroupLifecycleEvidence,
+	actor?: string,
+	source?: "cli" | "console" | "api" | "system",
+): Promise<DirectoryConnection> {
+	const bearerToken = connection.bearerTokenEncrypted
+		? decryptCredential(connection.bearerTokenEncrypted)
+		: "";
+	await assertGroupLifecycleEntry(store, connection, scope, bearerToken);
+	return mutateCoordinatedWithRuntimeSql(store, async ({ data, topology, query, appendAudit }) => {
+		if (!topology) {
+			throw new ClearanceError({
+				code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED",
+				message: "SCIM group lifecycle requires normalized topology authority",
+				stage: "sync.apply",
+				status: 500,
+			});
+		}
+		const organization = await topology.lockOrganization({ scope, id: connection.organizationId });
+		const index = data.directoryConnections.findIndex(
+			(candidate) => candidate.id === connection.id && candidate.organizationId === organization?.id && candidate.status !== "disabled",
+		);
+		if (!organization || organization.status === "archived" || index < 0) {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${connection.id} not found`,
+				stage: "scim.test",
+				status: 404,
+			});
+		}
+		const provider = await query(`select id from "scimProvider" where id = $1 and "organizationId" = $2 for update`, [connection.id, organization.id]);
+		if (provider.rows.length !== 1) {
+			throw new ClearanceError({ code: "SCIM_NOT_FOUND", message: `SCIM connection ${connection.id} not found`, stage: "scim.test", status: 404 });
+		}
+		const updated = { ...data.directoryConnections[index]!, status: "testing" as const, updatedAt: nowIso() };
+		data.directoryConnections[index] = updated;
+		data.traces.unshift(trace);
+		appendAudit({
+			actor: actor ?? "system", action: "scim.test", subjectType: "directory_connection", subjectId: connection.id,
+			outcome: "success", source: source ?? "scim", organizationId: organization.id,
+			projectId: organization.projectId, environmentId: organization.environmentId, correlationId: trace.correlationId,
+			message: "SCIM Group lifecycle applied through bundled runtime handler",
+			metadata: { scenario: evidence.scenario, group: evidence.group, counts: evidence.counts, actions: evidence.actions },
+		});
+		return updated;
+	});
 }
 
 function recoverScimBaseToken(
@@ -538,6 +855,7 @@ export async function testScimConnectionReal(
 	opts: {
 		dryRun?: boolean;
 		fixture?: "ok" | "malformed" | "unauthorized";
+		scenario?: ScimTestScenario;
 		users?: Array<{ userName: string; displayName?: string; active?: boolean }>;
 		/** Absolute URL override for local fixture protocol verification */
 		endpointOverride?: string;
@@ -555,6 +873,7 @@ export async function testScimConnectionReal(
 	connection: DirectoryConnection;
 	mode: "simulation";
 	evidence?: string;
+	groupLifecycle?: GroupLifecycleEvidence;
 	externalProviderCertified: false;
 }> {
 	const conn = await resolveScimConnectionAuthoritative(store, id, {
@@ -562,6 +881,15 @@ export async function testScimConnectionReal(
 		stage: "scim.test",
 	});
 
+	const scenario = opts.scenario ?? "users";
+	if (scenario !== "users" && scenario !== "group-lifecycle") {
+		throw new ClearanceError({
+			code: "SCIM_SCENARIO_INVALID",
+			message: "SCIM scenario must be users or group-lifecycle",
+			stage: "scim.test",
+			status: 400,
+		});
+	}
 	const fixture = opts.fixture ?? "ok";
 	if (!["ok", "malformed", "unauthorized"].includes(fixture)) {
 		throw new ClearanceError({
@@ -622,9 +950,10 @@ export async function testScimConnectionReal(
 	}
 
 	// Prefer absolute endpoint / override → real HTTP probe
-	const absoluteEndpoint =
-		opts.endpointOverride ??
-		(/^https?:\/\//i.test(conn.endpoint) ? conn.endpoint : null);
+	const absoluteEndpoint = scenario === "group-lifecycle"
+		? null
+		: opts.endpointOverride ??
+			(/^https?:\/\//i.test(conn.endpoint) ? conn.endpoint : null);
 
 	if (absoluteEndpoint) {
 		const token =
@@ -681,11 +1010,20 @@ export async function testScimConnectionReal(
 	}
 
 	// Plugin-relative path: real SCIM HTTP via auth.handler (no account-creation fallback)
-	const token =
-		opts.bearerToken ??
-		(conn.bearerTokenEncrypted
-			? decryptCredential(conn.bearerTokenEncrypted)
-			: null);
+	const storedToken = conn.bearerTokenEncrypted
+		? decryptCredential(conn.bearerTokenEncrypted)
+		: null;
+	const token = scenario === "group-lifecycle"
+		? (() => {
+			if (!storedToken) {
+				throw new ClearanceError({ code: "SCIM_UNAUTHORIZED", message: "SCIM group lifecycle requires the requested connection credential", stage: "sync.apply", status: 401 });
+			}
+			if (opts.bearerToken && !sameBearer(storedToken, opts.bearerToken)) {
+				throw new ClearanceError({ code: "SCIM_UNAUTHORIZED", message: "SCIM group lifecycle credential does not match the requested connection", stage: "sync.apply", status: 401 });
+			}
+			return storedToken;
+		})()
+		: opts.bearerToken ?? storedToken;
 	const users = opts.users ?? [
 		{
 			userName: `scim.user.${Date.now()}@customer.example`,
@@ -700,7 +1038,7 @@ export async function testScimConnectionReal(
 
 	const dryRun = opts.dryRun !== false;
 	if (
-		!dryRun &&
+		(!dryRun || scenario === "group-lifecycle") &&
 		!(store.backend === "postgres" && typeof store.mutateCoordinated === "function")
 	) {
 		throw new ClearanceError({
@@ -754,6 +1092,103 @@ export async function testScimConnectionReal(
 				stage: "response.parse",
 			});
 		}
+	}
+	if (scenario === "group-lifecycle" && dryRun) {
+		if (!token) {
+			throw new ClearanceError({
+				code: "SCIM_UNAUTHORIZED",
+				message: "SCIM group lifecycle requires the requested connection credential",
+				stage: "auth.bearer",
+				status: 401,
+			});
+		}
+		const expectedOrganization = await inspectOrganizationAuthoritative(
+			store,
+			conn.organizationId,
+			opts.scope,
+		);
+		await assertGroupLifecycleEntry(
+			store,
+			conn,
+			opts.scope ?? {
+				projectId: expectedOrganization.projectId,
+				environmentId: expectedOrganization.environmentId,
+			},
+			token,
+		);
+	}
+	const plannedGroups = scenario === "group-lifecycle" && dryRun
+		? await scimHandlerJson("/Groups", "GET", token ?? "")
+		: undefined;
+
+	if (scenario === "group-lifecycle") {
+		if (dryRun) {
+			const trace: DiagnosticTrace = {
+				...base,
+				stage: "sync.dry_run",
+				outcome: "pass",
+				cause: "SCIM Group lifecycle planned and unexecuted (dry-run)",
+				causeConfidence: 1,
+				owner: "application",
+				checks: [
+					{ name: "auth.bearer", pass: plannedGroups?.status === 200, detail: "authenticated Groups list" },
+					{ name: "http_probe", pass: true, detail: "ServiceProviderConfig" },
+					{ name: "group_lifecycle", pass: false, detail: "planned; unexecuted" },
+				],
+			};
+			return {
+				pass: true,
+				trace,
+				proposed: [],
+				connection: publicDirectoryConnection(conn) as DirectoryConnection,
+				mode: SCIM_REAL_FIXTURE_MODE,
+				evidence: SCIM_LOCAL_PROTOCOL_EVIDENCE,
+				externalProviderCertified: false,
+			};
+		}
+		if (!token) {
+			throw new ClearanceError({
+				code: "SCIM_UNAUTHORIZED",
+				message: "SCIM apply requires a bearer token",
+				stage: "sync.apply",
+				status: 401,
+			});
+		}
+		const expectedOrganization = await inspectOrganizationAuthoritative(store, conn.organizationId, opts.scope);
+		const scope = opts.scope ?? {
+			projectId: expectedOrganization.projectId,
+			environmentId: expectedOrganization.environmentId,
+		};
+		const groupLifecycle = await applyGroupLifecycleScenario(store, conn, {
+			bearerToken: token,
+			scope,
+			correlationId: corr,
+		});
+		const trace: DiagnosticTrace = {
+			...base,
+			stage: "sync.apply",
+			outcome: "pass",
+			cause: "SCIM Group lifecycle applied through bundled runtime handler",
+			causeConfidence: 1,
+			owner: "application",
+			checks: [
+				{ name: "auth.bearer", pass: true },
+				{ name: "http_probe", pass: true, detail: "ServiceProviderConfig" },
+				{ name: "group_lifecycle", pass: true, detail: "create, patch, get, list, delete" },
+			],
+			redactedResponse: groupLifecycle,
+		};
+		const connection = await settleGroupLifecycleSuccess(store, conn, scope, trace, groupLifecycle, opts.actor, opts.source);
+		return {
+			pass: true,
+			trace,
+			proposed: [],
+			connection: publicDirectoryConnection(connection) as DirectoryConnection,
+			mode: SCIM_REAL_FIXTURE_MODE,
+			evidence: SCIM_LOCAL_PROTOCOL_EVIDENCE,
+			groupLifecycle,
+			externalProviderCertified: false,
+		};
 	}
 
 	if (!dryRun) {
