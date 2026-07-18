@@ -13,9 +13,11 @@ import { DEFAULT_JWKS_GRACE_PERIOD_SECONDS } from "./constant";
 import {
 	JWT_AUTHORIZATION_ACTIONS_CLAIM,
 	JWT_AUTHORIZATION_REVISION_CLAIM,
+	JWT_ORGANIZATION_ID_CLAIM,
 	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
 	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
 	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+	JWT_SUBJECT_KIND_CLAIM,
 } from "./sign";
 import type { JwtOptions } from "./types";
 
@@ -134,6 +136,12 @@ export async function verifyJWT<T extends JWTPayload = JWTPayload>(
 		) {
 			return null;
 		}
+		const hasMachineKind = Object.hasOwn(payload, JWT_SUBJECT_KIND_CLAIM);
+		const hasMachineOrganization = Object.hasOwn(
+			payload,
+			JWT_ORGANIZATION_ID_CLAIM,
+		);
+		if (hasMachineKind !== hasMachineOrganization) return null;
 
 		const hasAuthority = Object.hasOwn(
 			payload,
@@ -147,7 +155,39 @@ export async function verifyJWT<T extends JWTPayload = JWTPayload>(
 			payload,
 			JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
 		);
-		if (
+		if (hasMachineKind) {
+			if (
+				!hasAuthorizationActions ||
+				hasAuthority ||
+				hasSourceSubject ||
+				hasSourceOrganization ||
+				payload[JWT_SUBJECT_KIND_CLAIM] !== "service_account" ||
+				typeof payload[JWT_ORGANIZATION_ID_CLAIM] !== "string" ||
+				payload[JWT_ORGANIZATION_ID_CLAIM].length === 0
+			) {
+				return null;
+			}
+			const effective = await readInternalEffectiveAuthorization(
+				ctx.context.internalAdapter,
+				{
+					organizationId: payload[JWT_ORGANIZATION_ID_CLAIM],
+					subject: { kind: "service_account", id: payload.sub },
+				},
+			);
+			if (
+				!effective ||
+				effective.subject.kind !== "service_account" ||
+				effective.subject.id !== payload.sub ||
+				effective.organizationId !== payload[JWT_ORGANIZATION_ID_CLAIM] ||
+				payload[JWT_AUTHORIZATION_REVISION_CLAIM] !== effective.revision ||
+				!equalStringArrays(
+					payload[JWT_AUTHORIZATION_ACTIONS_CLAIM] as readonly string[],
+					effective.actions,
+				)
+			) {
+				return null;
+			}
+		} else if (
 			hasAuthorizationActions &&
 			(!hasAuthority || !hasSourceSubject || !hasSourceOrganization)
 		) {
