@@ -1550,6 +1550,10 @@ describe.sequential.skipIf(!available)(
 					"passkeyChallenge.origin": { type: "text", nullable: "NO" },
 					"passkeyChallenge.userId": { type: "text", nullable: "YES" },
 					"passkeyChallenge.userHandle": { type: "text", nullable: "YES" },
+					"passkeyChallenge.stagedSubjectId": {
+						type: "text",
+						nullable: "YES",
+					},
 					"passkeyChallenge.targetPasskeyId": {
 						type: "text",
 						nullable: "YES",
@@ -1590,7 +1594,8 @@ describe.sequential.skipIf(!available)(
 					  AND index_record.relname IN (
 					    'user_passkeyUserHandle_uidx', 'passkey_credentialID_uidx',
 					    'passkey_userId_idx', 'passkeyChallenge_digestId_uidx',
-					    'passkeyChallenge_expiresAt_idx'
+					    'passkeyChallenge_expiresAt_idx', 'passkeyChallenge_userId_idx',
+					    'passkeyChallenge_stagedSubjectId_idx'
 					  )
 					GROUP BY index_record.relname, table_record.relname, index_state.indisunique
 					ORDER BY index_record.relname
@@ -1607,6 +1612,18 @@ describe.sequential.skipIf(!available)(
 						tableName: "passkeyChallenge",
 						unique: false,
 						columns: ["expiresAt"],
+					},
+					{
+						name: "passkeyChallenge_stagedSubjectId_idx",
+						tableName: "passkeyChallenge",
+						unique: false,
+						columns: ["stagedSubjectId"],
+					},
+					{
+						name: "passkeyChallenge_userId_idx",
+						tableName: "passkeyChallenge",
+						unique: false,
+						columns: ["userId"],
 					},
 					{
 						name: "passkey_credentialID_uidx",
@@ -1918,6 +1935,89 @@ describe.sequential.skipIf(!available)(
 				await staleBridgeBundle?.destroy();
 				await logoutBridgeBundle?.destroy();
 				await bridgeBundle?.destroy();
+				await scopedPool?.end();
+				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+				await basePool.end();
+			}
+		});
+
+		it("creates rollback-safe passkey challenge catalog indexes", async () => {
+			const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+			const schema = `auth_passkey_challenge_indexes_${suffix}`;
+			const basePool = new pg.Pool({ connectionString: DATABASE_URL });
+			let bundle: ClearanceAuthBundle | undefined;
+			let scopedPool: pg.Pool | undefined;
+			try {
+				await basePool.query(`CREATE SCHEMA "${schema}"`);
+				const url = new URL(DATABASE_URL);
+				url.searchParams.set("options", `-csearch_path=${schema}`);
+				const databaseUrl = url.toString();
+				scopedPool = new pg.Pool({ connectionString: databaseUrl });
+				await scopedPool.query(`
+					CREATE TABLE "user" (id text PRIMARY KEY);
+					CREATE TABLE session (id text PRIMARY KEY);
+					CREATE TABLE account (id text PRIMARY KEY);
+				`);
+				bundle = createClearanceAuth({
+					baseURL: "http://localhost:3300/api/auth",
+					secret: "passkey-challenge-index-proof-secret!!",
+					databaseUrl,
+					rateLimitEnabled: false,
+					enableSso: false,
+					enableScim: false,
+					authenticationSecurity: {
+						breachedPassword: { enabled: false },
+						asymmetricAccessTokens: { enabled: false },
+					},
+					credentialAuthority: {
+						generation: "legacy-v1",
+						deploymentId: `passkey-challenge-index-${suffix}`,
+						instanceId: `passkey-challenge-index-pod-${suffix}`,
+					},
+				});
+
+				await bundle.prepareCredentialAuthorityRuntime();
+				await bundle.prepareCredentialAuthorityRuntime();
+				const indexes = await scopedPool.query<{
+					name: string;
+					unique: boolean;
+					columns: string[];
+				}>(`
+					SELECT index_record.relname AS name,
+					       index_state.indisunique AS unique,
+					       array_agg(attribute_record.attname::text ORDER BY index_key.ordinality) AS columns
+					FROM pg_index AS index_state
+					JOIN pg_class AS table_record ON table_record.oid = index_state.indrelid
+					JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+					JOIN pg_class AS index_record ON index_record.oid = index_state.indexrelid
+					CROSS JOIN LATERAL unnest(index_state.indkey)
+					  WITH ORDINALITY AS index_key(attnum, ordinality)
+					JOIN pg_attribute AS attribute_record
+					  ON attribute_record.attrelid = table_record.oid
+					 AND attribute_record.attnum = index_key.attnum
+					WHERE namespace_record.nspname = current_schema()
+					  AND table_record.relname = 'passkeyChallenge'
+					  AND index_record.relname IN (
+					    'passkeyChallenge_userId_idx',
+					    'passkeyChallenge_stagedSubjectId_idx'
+					  )
+					GROUP BY index_record.relname, index_state.indisunique
+					ORDER BY index_record.relname
+				`);
+				expect(indexes.rows).toEqual([
+					{
+						name: "passkeyChallenge_stagedSubjectId_idx",
+						unique: false,
+						columns: ["stagedSubjectId"],
+					},
+					{
+						name: "passkeyChallenge_userId_idx",
+						unique: false,
+						columns: ["userId"],
+					},
+				]);
+			} finally {
+				await bundle?.destroy();
 				await scopedPool?.end();
 				await basePool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
 				await basePool.end();
