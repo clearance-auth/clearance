@@ -2,6 +2,7 @@ import type {
 	ClearanceOptions,
 	ClearancePlugin,
 	GenericEndpointContext,
+	InternalAdapter,
 	SecretConfig,
 } from "@clearance/core";
 import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
@@ -25,6 +26,7 @@ import { decodeJwt, jwtVerify, SignJWT } from "jose";
 import * as z from "zod";
 import {
 	APIError,
+	getAuthoritativeSessionFromCtx,
 	getSessionFromCtx,
 	sensitiveSessionMiddleware,
 	sessionMiddleware,
@@ -48,13 +50,30 @@ import {
 	parseCredentialOperationKey,
 } from "../../utils/operation-key";
 import { PACKAGE_VERSION } from "../../version";
-import { getJwtToken, verifyJWT } from "../jwt";
+import { signJWT, verifyJWT } from "../jwt";
 import { authorize } from "./authorize";
 import type { OAuthApplication } from "./schema";
 import { schema } from "./schema";
-import { setNoStoreTokenResponseHeaders } from "./token-response";
+import {
+	oauthExpiresIn,
+	restoreOAuthResponseHeaders,
+	setNoStoreTokenResponseHeaders,
+	snapshotOAuthResponseHeaders,
+} from "./token-response";
 import { lockAndReadActiveUser } from "../../db/user-authority";
-import { consumeInternalVerificationChallenge } from "../../internal/verification-challenge-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
+import {
+	runManagedAuthenticationTransaction,
+	usesManagedAuthenticationPolicy,
+} from "../../internal/managed-authentication-transaction";
+import {
+	type InternalSessionDerivativeAuthority,
+	ManagedSessionDerivativeAuthorityError,
+	validateInternalSessionDerivativeAuthority,
+} from "../../internal/session-derivative-authority";
 import {
 	attachInternalCredentialAuthority,
 	readInternalCredentialAuthority,
@@ -258,6 +277,42 @@ const RESERVED_OIDC_PROTOCOL_CLAIMS = new Set([
 	"stpl",
 ]);
 
+function assertIssuedOIDCIdToken(
+	token: string,
+	expected: Readonly<{
+		subject: string;
+		audience: string;
+		issuer: string;
+		sessionId: string;
+		issuedAt: number;
+		authTime: number;
+		nonce?: string | undefined;
+		maxExpiresAt: Date;
+	}>,
+): void {
+	let claims: ReturnType<typeof decodeJwt>;
+	try {
+		claims = decodeJwt(token);
+	} catch {
+		throw new ClearanceError("OIDC signer returned an invalid ID token");
+	}
+	if (
+		claims.sub !== expected.subject ||
+		claims.aud !== expected.audience ||
+		claims.iss !== expected.issuer ||
+		claims.sid !== expected.sessionId ||
+		claims.iat !== expected.issuedAt ||
+		claims.auth_time !== expected.authTime ||
+		claims.nonce !== expected.nonce ||
+		claims.acr !== "urn:mace:incommon:iap:silver" ||
+		!Number.isFinite(claims.exp) ||
+		!Number.isInteger(claims.exp) ||
+		claims.exp! > Math.floor(expected.maxExpiresAt.getTime() / 1000)
+	) {
+		throw new ClearanceError("OIDC signer changed required ID-token authority");
+	}
+}
+
 export function filterAdditionalUserClaims(
 	claims: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -276,8 +331,9 @@ export async function getClient(
 	trustedClients: (Client & { skipConsent?: boolean | undefined })[] = [],
 ): Promise<(Client & { skipConsent?: boolean | undefined }) | null> {
 	const {
-		context: { adapter },
+		context: { adapter: rootAdapter },
 	} = await getCurrentAuthContext();
+	const adapter = await getCurrentAdapter(rootAdapter);
 	const trustedClient = trustedClients.find(
 		(client) => client.clientId === clientId,
 	);
@@ -412,8 +468,23 @@ const codeVerificationValueSchema = z
 		codeChallenge: z.string().min(1).optional(),
 		codeChallengeMethod: z.enum(["s256", "sha256", "plain"]).optional(),
 		nonce: z.string().optional(),
+		sessionDerivativeAuthority: z.string().min(1).optional(),
+		organizationId: z.string().min(1).nullish(),
 	})
 	.passthrough();
+
+export function parseCodeVerificationValue(
+	value: string,
+): CodeVerificationValue | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(value);
+	} catch {
+		return null;
+	}
+	const result = codeVerificationValueSchema.safeParse(parsed);
+	return result.success ? (result.data as CodeVerificationValue) : null;
+}
 
 const oAuth2TokenBodySchema = z.record(z.any(), z.any());
 
@@ -780,6 +851,98 @@ export async function findOAuthTokenBySecret(
 		: null;
 }
 
+export type OAuthSessionDerivativePurpose = "oidc" | "mcp";
+
+export async function validateOAuthSessionDerivativeAuthority(
+	internalAdapter: InternalAdapter,
+	token: Pick<
+		OAuthAccessToken,
+		"userId" | "organizationId" | "sessionDerivativeAuthority"
+	>,
+	purpose: OAuthSessionDerivativePurpose,
+	managed: boolean,
+): Promise<InternalSessionDerivativeAuthority | undefined> {
+	if (!managed && !token.sessionDerivativeAuthority) return undefined;
+	const authority = await validateInternalSessionDerivativeAuthority(
+		internalAdapter,
+		token.sessionDerivativeAuthority,
+		{
+			purpose,
+			subjectId: token.userId,
+			organizationId: token.organizationId ?? null,
+		},
+	);
+	if (!authority) {
+		throw new ManagedSessionDerivativeAuthorityError("authority_missing");
+	}
+	return authority;
+}
+
+export async function revokeOAuthTokenFamily(
+	adapter: DBAdapter | DBTransactionAdapter,
+	model: string,
+	token: Pick<OAuthAccessToken, "id" | "familyId">,
+): Promise<void> {
+	const revokedAt = new Date();
+	await adapter.updateMany({
+		model,
+		where: [
+			token.familyId
+				? { field: "familyId", value: token.familyId }
+				: { field: "id", value: token.id },
+		],
+		update: {
+			refreshTokenDigest: null,
+			refreshStatus: "revoked",
+			revokedAt,
+			updatedAt: revokedAt,
+		},
+	});
+}
+
+export async function withOAuthAccessTokenAuthority<R>(
+	ctx: GenericEndpointContext,
+	model: string,
+	presentedToken: string,
+	purpose: OAuthSessionDerivativePurpose,
+	read: (
+		adapter: DBAdapter | DBTransactionAdapter,
+		token: OAuthAccessToken,
+	) => Promise<R>,
+): Promise<R | null> {
+	return runManagedAuthenticationTransaction(ctx, async () => {
+		const adapter = await getCurrentAdapter(ctx.context.adapter);
+		const token = await findOAuthTokenBySecret(
+			adapter,
+			model,
+			"access",
+			presentedToken,
+		);
+		if (
+			!token ||
+			token.refreshStatus === "revoked" ||
+			token.accessTokenExpiresAt <= new Date()
+		) {
+			return null;
+		}
+		try {
+			await validateOAuthSessionDerivativeAuthority(
+				ctx.context.internalAdapter,
+				token,
+				purpose,
+				usesManagedAuthenticationPolicy(ctx),
+			);
+		} catch (error) {
+			if (!(error instanceof ManagedSessionDerivativeAuthorityError)) {
+				throw error;
+			}
+			await revokeOAuthTokenFamily(adapter, model, token);
+			return null;
+		}
+		return read(adapter, token);
+	});
+}
+
 type OAuthTokenIssueInput = {
 	clientId: string;
 	userId: string;
@@ -792,6 +955,8 @@ type OAuthTokenIssueInput = {
 	issueRefreshToken: boolean;
 	accessToken?: string;
 	refreshToken?: string;
+	sessionDerivativeAuthority?: string | null;
+	organizationId?: string | null;
 };
 
 export async function createOAuthTokenPair(
@@ -837,8 +1002,8 @@ export async function createOAuthTokenPair(
 			`INSERT INTO ${quotedModel} (
 				id, "accessToken", "refreshToken", "accessTokenExpiresAt",
 				"refreshTokenExpiresAt", "clientId", "userId", scopes,
-				"createdAt", "updatedAt"
-			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+				"sessionDerivativeAuthority", "organizationId", "createdAt", "updatedAt"
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
 			 RETURNING *`,
 			[
 				id,
@@ -849,6 +1014,8 @@ export async function createOAuthTokenPair(
 				input.clientId,
 				input.userId,
 				input.scopes,
+				input.sessionDerivativeAuthority ?? null,
+				input.organizationId ?? null,
 				now,
 			],
 		);
@@ -884,6 +1051,9 @@ export async function createOAuthTokenPair(
 			// access-only rows on legacy schemas where this column was NOT NULL.
 			refreshTokenExpiresAt:
 				input.refreshTokenExpiresAt ?? input.accessTokenExpiresAt,
+			sessionDerivativeAuthority:
+				input.sessionDerivativeAuthority ?? null,
+			organizationId: input.organizationId ?? null,
 			clientId: input.clientId,
 			userId: input.userId,
 			scopes: input.scopes,
@@ -903,6 +1073,13 @@ export async function rotateOAuthRefreshToken(
 		accessTokenExpiresAt: Date;
 		secretConfig: string | SecretConfig;
 		idempotencyKey?: string | undefined;
+		derivativeAuthority?:
+			| {
+					internalAdapter: InternalAdapter;
+					purpose: OAuthSessionDerivativePurpose;
+					managed: boolean;
+			  }
+			| undefined;
 	},
 ) {
 	if (typeof adapter.options?.adapterConfig.transaction !== "function") {
@@ -938,6 +1115,27 @@ export async function rotateOAuthRefreshToken(
 			) {
 				return { kind: "expired" as const };
 			}
+			let sourceAuthority: InternalSessionDerivativeAuthority | undefined;
+			try {
+				sourceAuthority = input.derivativeAuthority
+					? await validateOAuthSessionDerivativeAuthority(
+							input.derivativeAuthority.internalAdapter,
+							token,
+							input.derivativeAuthority.purpose,
+							input.derivativeAuthority.managed,
+						)
+					: undefined;
+			} catch (error) {
+				if (!(error instanceof ManagedSessionDerivativeAuthorityError)) {
+					throw error;
+				}
+				await revokeOAuthTokenFamily(tx, model, token);
+				return { kind: "invalid" as const };
+			}
+			if (sourceAuthority && sourceAuthority.sourceExpiresAt <= Date.now()) {
+				await revokeOAuthTokenFamily(tx, model, token);
+				return { kind: "expired" as const };
+			}
 			const userAuthority = token.userId
 				? await lockAndReadActiveUser(tx, token.userId)
 				: null;
@@ -946,9 +1144,25 @@ export async function rotateOAuthRefreshToken(
 				clientId: token.clientId,
 				userId: token.userId,
 				scopes: token.scopes,
-				accessTokenExpiresAt: input.accessTokenExpiresAt,
-				refreshTokenExpiresAt: token.refreshTokenExpiresAt,
+				accessTokenExpiresAt: sourceAuthority
+					? new Date(
+							Math.min(
+								input.accessTokenExpiresAt.getTime(),
+								sourceAuthority.sourceExpiresAt,
+							),
+						)
+					: input.accessTokenExpiresAt,
+				refreshTokenExpiresAt: sourceAuthority
+					? new Date(
+							Math.min(
+								token.refreshTokenExpiresAt.getTime(),
+								sourceAuthority.sourceExpiresAt,
+							),
+						)
+					: token.refreshTokenExpiresAt,
 				issueRefreshToken: true,
+				sessionDerivativeAuthority: token.sessionDerivativeAuthority,
+				organizationId: token.organizationId,
 			});
 			return { kind: "rotated" as const, successor, token };
 		});
@@ -1004,6 +1218,27 @@ export async function rotateOAuthRefreshToken(
 				},
 			});
 		};
+		let sourceAuthority: InternalSessionDerivativeAuthority | undefined;
+		try {
+			sourceAuthority = input.derivativeAuthority
+				? await validateOAuthSessionDerivativeAuthority(
+						input.derivativeAuthority.internalAdapter,
+						token,
+						input.derivativeAuthority.purpose,
+						input.derivativeAuthority.managed,
+					)
+				: undefined;
+		} catch (error) {
+			if (!(error instanceof ManagedSessionDerivativeAuthorityError)) {
+				throw error;
+			}
+			await revokeFamily();
+			return { kind: "invalid" as const };
+		}
+		if (sourceAuthority && sourceAuthority.sourceExpiresAt <= Date.now()) {
+			await revokeFamily();
+			return { kind: "expired" as const };
+		}
 		const userAuthority = token.userId
 			? await lockAndReadActiveUser(tx, token.userId)
 			: null;
@@ -1134,12 +1369,28 @@ export async function rotateOAuthRefreshToken(
 			clientId: token.clientId,
 			userId: token.userId,
 			scopes: token.scopes,
-			accessTokenExpiresAt: input.accessTokenExpiresAt,
-			refreshTokenExpiresAt: token.refreshTokenExpiresAt,
+			accessTokenExpiresAt: sourceAuthority
+				? new Date(
+						Math.min(
+							input.accessTokenExpiresAt.getTime(),
+							sourceAuthority.sourceExpiresAt,
+						),
+					)
+				: input.accessTokenExpiresAt,
+			refreshTokenExpiresAt: sourceAuthority
+				? new Date(
+						Math.min(
+							token.refreshTokenExpiresAt.getTime(),
+							sourceAuthority.sourceExpiresAt,
+						),
+					)
+				: token.refreshTokenExpiresAt,
 			familyId,
 			parentTokenId: token.id,
 			rotationCounter: (token.rotationCounter ?? 0) + 1,
 			issueRefreshToken: true,
+			sessionDerivativeAuthority: token.sessionDerivativeAuthority,
+			organizationId: token.organizationId,
 			...(derived ?? {}),
 		});
 		if (token.parentTokenId) {
@@ -1194,6 +1445,10 @@ export const oidcProvider = (options: OIDCOptions) => {
 		oauthAccessToken: "oauthAccessToken",
 		oauthConsent: "oauthConsent",
 	};
+	const sessionDerivativePurpose =
+		options.__sessionDerivativePurpose ?? "oidc";
+	const authorizationChallengePurpose =
+		`${sessionDerivativePurpose}-authorization-code`;
 
 	const opts = {
 		codeExpiresIn: DEFAULT_CODE_EXPIRES_IN,
@@ -1513,90 +1768,132 @@ export const oidcProvider = (options: OIDCOptions) => {
 						});
 					}
 
-					const verification =
-						await ctx.context.internalAdapter.findVerificationValue(
-							consentCode,
-						);
-					if (!verification) {
-						throw invalidCode();
-					}
-
-					let parsedValue: unknown;
+					const responseHeaderSnapshot = snapshotOAuthResponseHeaders(ctx);
+					let result: { redirectURI: string };
 					try {
-						parsedValue = JSON.parse(verification.value);
-					} catch {
-						throw invalidCode();
-					}
-					const parsed = codeVerificationValueSchema.safeParse(parsedValue);
-					const sessionSubject = ctx.context.session?.user.id;
-					if (
-						!parsed.success ||
-						typeof sessionSubject !== "string" ||
-						sessionSubject.length === 0 ||
-						sessionSubject !== parsed.data.userId
-					) {
-						throw invalidCode();
-					}
-					const value = parsed.data as unknown as CodeVerificationValue;
-					if (verification.expiresAt < new Date()) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "Code expired",
-							error: "invalid_request",
-						});
+						result = await runWithTransaction(
+							ctx.context.adapter,
+							async () => {
+							const currentSession = usesManagedAuthenticationPolicy(ctx)
+								? await getAuthoritativeSessionFromCtx(ctx)
+								: ctx.context.session;
+							const verification =
+								await ctx.context.internalAdapter.findVerificationValue(
+									consentCode,
+								);
+							if (!verification) throw invalidCode();
+
+							const value = parseCodeVerificationValue(verification.value);
+							const sessionSubject = currentSession?.user.id;
+							if (
+								!value ||
+								typeof sessionSubject !== "string" ||
+								sessionSubject.length === 0 ||
+								sessionSubject !== value.userId
+							) {
+								throw invalidCode();
+							}
+							if (verification.expiresAt <= new Date()) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "Code expired",
+									error: "invalid_request",
+								});
+							}
+							if (!value.requireConsent) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "Consent not required",
+									error: "invalid_request",
+								});
+							}
+
+							const sourceAuthority =
+								await validateOAuthSessionDerivativeAuthority(
+									ctx.context.internalAdapter,
+									value,
+									sessionDerivativePurpose,
+									usesManagedAuthenticationPolicy(ctx),
+								);
+							const consumed = await consumeInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: authorizationChallengePurpose,
+									subject: value.clientId,
+									identifier: consentCode,
+								},
+							);
+							if (
+								!consumed ||
+								!constantTimeEqual(consumed.value, verification.value)
+							) {
+								throw invalidCode();
+							}
+
+							if (!ctx.body.accept) {
+								return {
+									redirectURI: `${value.redirectURI}?error=access_denied&error_description=User denied access`,
+								};
+							}
+
+							const code = generateRandomString(32, "a-z", "A-Z", "0-9");
+							const codeExpiresInMs =
+								(opts?.codeExpiresIn ?? DEFAULT_CODE_EXPIRES_IN) * 1000;
+							const expiresAt = new Date(
+								Math.min(
+									Date.now() + codeExpiresInMs,
+									sourceAuthority?.sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+								),
+							);
+							if (expiresAt.getTime() <= Date.now()) throw invalidCode();
+							await createInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								{
+									purpose: authorizationChallengePurpose,
+									subject: value.clientId,
+								},
+								{
+									value: JSON.stringify({
+										...value,
+										requireConsent: false,
+									}),
+									identifier: code,
+									expiresAt,
+								},
+							);
+							const adapter = await getCurrentAdapter(ctx.context.adapter);
+							const now = new Date();
+							await adapter.create({
+								model: modelName.oauthConsent,
+								data: {
+									clientId: value.clientId,
+									userId: value.userId,
+									scopes: value.scope.join(" "),
+									consentGiven: true,
+									createdAt: now,
+									updatedAt: now,
+								},
+							});
+							const redirectURI = new URL(value.redirectURI);
+							redirectURI.searchParams.set("code", code);
+							if (value.state) {
+								redirectURI.searchParams.set("state", value.state);
+							}
+							return { redirectURI: redirectURI.toString() };
+							},
+						);
+					} catch (error) {
+						restoreOAuthResponseHeaders(ctx, responseHeaderSnapshot);
+						if (error instanceof ManagedSessionDerivativeAuthorityError) {
+							throw invalidCode();
+						}
+						throw error;
 					}
 
-					// Clear the cookie only after the code is proven to belong to this subject.
+					// Publish cookie cleanup only after the consent transaction commits.
 					expireCookie(ctx, {
 						name: "oidc_consent_prompt",
 						attributes: { path: "/" },
 					});
-					if (!value.requireConsent) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "Consent not required",
-							error: "invalid_request",
-						});
-					}
-
-					if (!ctx.body.accept) {
-						await ctx.context.internalAdapter.deleteVerificationByIdentifier(
-							consentCode,
-						);
-						return ctx.json({
-							redirectURI: `${value.redirectURI}?error=access_denied&error_description=User denied access`,
-						});
-					}
-					const code = generateRandomString(32, "a-z", "A-Z", "0-9");
-					const codeExpiresInMs =
-						(opts?.codeExpiresIn ?? DEFAULT_CODE_EXPIRES_IN) * 1000;
-					const expiresAt = new Date(Date.now() + codeExpiresInMs);
-					await ctx.context.internalAdapter.updateVerificationByIdentifier(
-						consentCode,
-						{
-							value: JSON.stringify({
-								...value,
-								requireConsent: false,
-							}),
-							identifier: code,
-							expiresAt,
-						},
-					);
-					await ctx.context.adapter.create({
-						model: modelName.oauthConsent,
-						data: {
-							clientId: value.clientId,
-							userId: value.userId,
-							scopes: value.scope.join(" "),
-							consentGiven: true,
-							createdAt: new Date(),
-							updatedAt: new Date(),
-						},
-					});
-					const redirectURI = new URL(value.redirectURI);
-					redirectURI.searchParams.set("code", code);
-					if (value.state) redirectURI.searchParams.set("state", value.state);
-					return ctx.json({
-						redirectURI: redirectURI.toString(),
-					});
+					return ctx.json(result);
 				},
 			),
 			oAuth2token: createAuthEndpoint(
@@ -1773,6 +2070,11 @@ export const oidcProvider = (options: OIDCOptions) => {
 								accessTokenExpiresAt,
 								secretConfig: ctx.context.secretConfig,
 								idempotencyKey,
+								derivativeAuthority: {
+									internalAdapter: ctx.context.internalAdapter,
+									purpose: "oidc",
+									managed: usesManagedAuthenticationPolicy(ctx),
+								},
 							},
 						);
 						if (rotation.kind !== "rotated") {
@@ -1788,7 +2090,9 @@ export const oidcProvider = (options: OIDCOptions) => {
 						return ctx.json({
 							access_token: rotation.successor.accessToken,
 							token_type: "Bearer",
-							expires_in: opts.accessTokenExpiresIn,
+							expires_in: oauthExpiresIn(
+								rotation.successor.row.accessTokenExpiresAt,
+							),
 							refresh_token: rotation.successor.refreshToken,
 							scope: rotation.token.scopes,
 						});
@@ -1858,9 +2162,13 @@ export const oidcProvider = (options: OIDCOptions) => {
 						});
 					}
 
-					const value = JSON.parse(
-						verificationValue.value,
-					) as CodeVerificationValue;
+					const value = parseCodeVerificationValue(verificationValue.value);
+					if (!value) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "invalid code",
+							error: "invalid_grant",
+						});
+					}
 					if (value.clientId !== client_id.toString()) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "invalid client_id",
@@ -1925,120 +2233,6 @@ export const oidcProvider = (options: OIDCOptions) => {
 						}
 					}
 
-					const requestedScopes = value.scope;
-					const oauthFamilyId = generateRandomString(32, "a-z", "A-Z", "0-9");
-					const accessToken = generateRandomString(48, "a-z", "A-Z", "0-9");
-					const issueRefreshToken = requestedScopes.includes("offline_access");
-					const refreshToken = issueRefreshToken
-						? generateRandomString(48, "A-Z", "a-z", "0-9")
-						: undefined;
-					const user = await ctx.context.internalAdapter.findUserById(
-						value.userId,
-					);
-					if (!user || (user as Record<string, unknown>).banned === true) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "user is unavailable",
-							error: "invalid_grant",
-						});
-					}
-
-					const profile = {
-						given_name: user.name.split(" ")[0]!,
-						family_name: user.name.split(" ")[1]!,
-						name: user.name,
-						profile: user.image,
-						updated_at: Math.floor(new Date(user.updatedAt).getTime() / 1000),
-					};
-					const email = {
-						email: user.email,
-						email_verified: user.emailVerified,
-					};
-					const userClaims = {
-						...(requestedScopes.includes("profile") ? profile : {}),
-						...(requestedScopes.includes("email") ? email : {}),
-					};
-
-					const additionalUserClaims = options.getAdditionalUserInfoClaim
-						? await options.getAdditionalUserInfoClaim(
-								user,
-								requestedScopes,
-								client,
-							)
-						: {};
-					const extensionClaims =
-						filterAdditionalUserClaims(additionalUserClaims);
-
-					const payload = {
-						...userClaims,
-						...extensionClaims,
-						sub: user.id,
-						aud: client_id.toString(),
-						sid: oauthFamilyId,
-						iat: iat,
-						auth_time: Math.floor(value.authTime / 1000),
-						nonce: value.nonce,
-						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
-					};
-					const expirationTime =
-						Math.floor(Date.now() / 1000) +
-						(opts?.accessTokenExpiresIn ?? DEFAULT_ACCESS_TOKEN_EXPIRES_IN);
-
-					let idToken: string;
-
-					// The JWT plugin is enabled, so we use the JWKS keys to sign
-					if (options.useJWTPlugin) {
-						const jwtPlugin = ctx.context.getPlugin("jwt");
-						if (!jwtPlugin) {
-							ctx.context.logger.error(
-								"OIDC: `useJWTPlugin` is enabled but the JWT plugin is not available. Make sure you have the JWT Plugin in your plugins array or set `useJWTPlugin` to false.",
-							);
-							throw new APIError("INTERNAL_SERVER_ERROR", {
-								error_description: "JWT plugin is not enabled",
-								error: "internal_server_error",
-							});
-						}
-						idToken = await getJwtToken(
-							{
-								...ctx,
-								context: {
-									...ctx.context,
-									session: {
-										session: {
-											id: generateRandomString(32, "a-z", "A-Z"),
-											createdAt: new Date(iat * 1000),
-											updatedAt: new Date(iat * 1000),
-											userId: user.id,
-											expiresAt: accessTokenExpiresAt,
-											token: accessToken,
-											ipAddress: ctx.request?.headers.get("x-forwarded-for"),
-										},
-										user,
-									},
-								},
-							},
-							{
-								...jwtPlugin.options,
-								jwt: {
-									...jwtPlugin.options?.jwt,
-									getSubject: () => user.id,
-									audience: client_id.toString(),
-									issuer: getOIDCIssuer(ctx, options),
-									expirationTime,
-									definePayload: () => payload,
-								},
-							},
-						);
-
-						// If the JWT token is not enabled, create a key and use it to sign
-					} else {
-						idToken = await new SignJWT(payload)
-							.setProtectedHeader({ alg: "HS256" })
-							.setIssuer(getOIDCIssuer(ctx, options))
-							.setIssuedAt(iat)
-							.setExpirationTime(accessTokenExpiresAt)
-							.sign(new TextEncoder().encode(client.clientSecret));
-					}
-
 					const issued = await runWithTransaction(
 						ctx.context.adapter,
 						async () => {
@@ -2054,7 +2248,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 								!consumed ||
 								!constantTimeEqual(consumed.value, verificationValue.value)
 							) {
-								return false;
+								return null;
 							}
 							const adapter = await getCurrentAdapter(ctx.context.adapter);
 							const authority = readInternalCredentialAuthority(
@@ -2063,6 +2257,43 @@ export const oidcProvider = (options: OIDCOptions) => {
 							if (authority) {
 								attachInternalCredentialAuthority(adapter, authority);
 							}
+							let sourceAuthority: InternalSessionDerivativeAuthority | undefined;
+							try {
+								sourceAuthority = await validateOAuthSessionDerivativeAuthority(
+									ctx.context.internalAdapter,
+									value,
+									"oidc",
+									usesManagedAuthenticationPolicy(ctx),
+								);
+							} catch (error) {
+								if (!(error instanceof ManagedSessionDerivativeAuthorityError)) {
+									throw error;
+								}
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "invalid code",
+									error: "invalid_grant",
+								});
+							}
+							const issuedAt = Math.floor(Date.now() / 1000);
+							const sourceExpiresAt = sourceAuthority?.sourceExpiresAt;
+							const accessTokenExpiresAt = new Date(
+								Math.min(
+									(issuedAt + opts.accessTokenExpiresIn) * 1000,
+									sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+								),
+							);
+							if (accessTokenExpiresAt.getTime() <= Date.now()) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "source session expired",
+									error: "invalid_grant",
+								});
+							}
+							const refreshTokenExpiresAt = new Date(
+								Math.min(
+									(issuedAt + (opts.refreshTokenExpiresIn ?? 604800)) * 1000,
+									sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+								),
+							);
 							const activeUser = await lockAndReadActiveUser(
 								adapter,
 								value.userId,
@@ -2073,7 +2304,103 @@ export const oidcProvider = (options: OIDCOptions) => {
 									error: "invalid_grant",
 								});
 							}
-							await createOAuthTokenPair(adapter, modelName.oauthAccessToken, {
+							const requestedScopes = value.scope;
+							const oauthFamilyId = generateRandomString(
+								32,
+								"a-z",
+								"A-Z",
+								"0-9",
+							);
+							const accessToken = generateRandomString(
+								48,
+								"a-z",
+								"A-Z",
+								"0-9",
+							);
+							const issueRefreshToken = requestedScopes.includes("offline_access");
+							const refreshToken = issueRefreshToken
+								? generateRandomString(48, "A-Z", "a-z", "0-9")
+								: undefined;
+							const profile = {
+								given_name: activeUser.name.split(" ")[0]!,
+								family_name: activeUser.name.split(" ")[1]!,
+								name: activeUser.name,
+								profile: activeUser.image,
+								updated_at: Math.floor(
+									new Date(activeUser.updatedAt).getTime() / 1000,
+								),
+							};
+							const email = {
+								email: activeUser.email,
+								email_verified: activeUser.emailVerified,
+							};
+							const userClaims = {
+								...(requestedScopes.includes("profile") ? profile : {}),
+								...(requestedScopes.includes("email") ? email : {}),
+							};
+							const extensionClaims = filterAdditionalUserClaims(
+								options.getAdditionalUserInfoClaim
+									? await options.getAdditionalUserInfoClaim(
+											activeUser,
+											requestedScopes,
+											client,
+										)
+									: {},
+							);
+							const payload = {
+								...userClaims,
+								...extensionClaims,
+								sub: activeUser.id,
+								aud: client_id.toString(),
+								sid: oauthFamilyId,
+								iat: issuedAt,
+								auth_time: Math.floor(value.authTime / 1000),
+								nonce: value.nonce,
+								acr: "urn:mace:incommon:iap:silver",
+							};
+							let idToken: string;
+							if (options.useJWTPlugin) {
+								const jwtPlugin = ctx.context.getPlugin("jwt");
+								if (!jwtPlugin) {
+									throw new APIError("INTERNAL_SERVER_ERROR", {
+										error_description: "JWT plugin is not enabled",
+										error: "internal_server_error",
+									});
+								}
+								idToken = await signJWT(ctx, {
+									options: {
+										...jwtPlugin.options,
+										jwt: {
+											...jwtPlugin.options?.jwt,
+											audience: client_id.toString(),
+											issuer: getOIDCIssuer(ctx, options),
+											expirationTime: Math.floor(
+												accessTokenExpiresAt.getTime() / 1000,
+											),
+										},
+									},
+									maxExpiresAt: accessTokenExpiresAt,
+									payload,
+								});
+							} else {
+								idToken = await new SignJWT(payload)
+									.setProtectedHeader({ alg: "HS256" })
+									.setIssuer(getOIDCIssuer(ctx, options))
+									.setIssuedAt(issuedAt)
+										.setExpirationTime(accessTokenExpiresAt)
+										.sign(new TextEncoder().encode(client.clientSecret));
+								}
+								assertIssuedOIDCIdToken(idToken, {
+									subject: activeUser.id,
+									audience: client_id.toString(),
+									issuer: getOIDCIssuer(ctx, options),
+									sessionId: oauthFamilyId,
+									issuedAt,
+									authTime: Math.floor(value.authTime / 1000),
+									nonce: value.nonce,
+									maxExpiresAt: accessTokenExpiresAt,
+								});
+								await createOAuthTokenPair(adapter, modelName.oauthAccessToken, {
 								clientId: client_id.toString(),
 								userId: value.userId,
 								scopes: requestedScopes.join(" "),
@@ -2085,8 +2412,17 @@ export const oidcProvider = (options: OIDCOptions) => {
 								familyId: oauthFamilyId,
 								accessToken,
 								refreshToken,
+								sessionDerivativeAuthority:
+									value.sessionDerivativeAuthority ?? null,
+								organizationId: value.organizationId ?? null,
 							});
-							return true;
+							return {
+								accessToken,
+								refreshToken,
+								idToken,
+								requestedScopes,
+								accessTokenExpiresAt,
+							};
 						},
 					);
 					if (!issued) {
@@ -2098,12 +2434,14 @@ export const oidcProvider = (options: OIDCOptions) => {
 
 					setNoStoreTokenResponseHeaders(ctx);
 					return ctx.json({
-						access_token: accessToken,
+						access_token: issued.accessToken,
 						token_type: "Bearer",
-						expires_in: opts.accessTokenExpiresIn,
-						refresh_token: refreshToken,
-						scope: requestedScopes.join(" "),
-						id_token: requestedScopes.includes("openid") ? idToken : undefined,
+						expires_in: oauthExpiresIn(issued.accessTokenExpiresAt),
+						refresh_token: issued.refreshToken,
+						scope: issued.requestedScopes.join(" "),
+						id_token: issued.requestedScopes.includes("openid")
+							? issued.idToken
+							: undefined,
 					});
 				},
 			),
@@ -2191,79 +2529,73 @@ export const oidcProvider = (options: OIDCOptions) => {
 						});
 					}
 					const token = authorization.replace("Bearer ", "");
-					const accessToken = await findOAuthTokenBySecret(
-						ctx.context.adapter,
+					const claims = await withOAuthAccessTokenAuthority(
+						ctx,
 						modelName.oauthAccessToken,
-						"access",
 						token,
+						"oidc",
+						async (adapter, accessToken) => {
+							const client = await getClient(
+								accessToken.clientId,
+								trustedClients,
+							);
+							const user = await ctx.context.internalAdapter.findUserById(
+								accessToken.userId,
+							);
+							if (
+								!client ||
+								client.disabled === true ||
+								!user ||
+								(user as Record<string, unknown>).banned === true
+							) {
+								await revokeOAuthTokenFamily(
+									adapter,
+									modelName.oauthAccessToken,
+									accessToken,
+								);
+								return null;
+							}
+							const requestedScopes = accessToken.scopes.split(" ");
+							const baseUserClaims = {
+								sub: user.id,
+								email: requestedScopes.includes("email")
+									? user.email
+									: undefined,
+								name: requestedScopes.includes("profile")
+									? user.name
+									: undefined,
+								picture: requestedScopes.includes("profile")
+									? user.image
+									: undefined,
+								given_name: requestedScopes.includes("profile")
+									? user.name.split(" ")[0]!
+									: undefined,
+								family_name: requestedScopes.includes("profile")
+									? user.name.split(" ")[1]!
+									: undefined,
+								email_verified: requestedScopes.includes("email")
+									? user.emailVerified
+									: undefined,
+							};
+							const userClaims = options.getAdditionalUserInfoClaim
+								? filterAdditionalUserClaims(
+										await options.getAdditionalUserInfoClaim(
+											user,
+											requestedScopes,
+											client,
+										),
+									)
+								: {};
+							return { ...baseUserClaims, ...userClaims };
+						},
 					);
-					if (!accessToken) {
+					if (!claims) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "invalid access token",
 							error: "invalid_token",
 						});
 					}
-					if (accessToken.refreshStatus === "revoked") {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "access token family revoked",
-							error: "invalid_token",
-						});
-					}
-					if (accessToken.accessTokenExpiresAt < new Date()) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "The Access Token expired",
-							error: "invalid_token",
-						});
-					}
-
-					const client = await getClient(accessToken.clientId, trustedClients);
-					if (!client || client.disabled === true) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "client unavailable",
-							error: "invalid_token",
-						});
-					}
-
-					const user = await ctx.context.internalAdapter.findUserById(
-						accessToken.userId,
-					);
-					if (!user || (user as Record<string, unknown>).banned === true) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "user is unavailable",
-							error: "invalid_token",
-						});
-					}
-					const requestedScopes = accessToken.scopes.split(" ");
-					const baseUserClaims = {
-						sub: user.id,
-						email: requestedScopes.includes("email") ? user.email : undefined,
-						name: requestedScopes.includes("profile") ? user.name : undefined,
-						picture: requestedScopes.includes("profile")
-							? user.image
-							: undefined,
-						given_name: requestedScopes.includes("profile")
-							? user.name.split(" ")[0]!
-							: undefined,
-						family_name: requestedScopes.includes("profile")
-							? user.name.split(" ")[1]!
-							: undefined,
-						email_verified: requestedScopes.includes("email")
-							? user.emailVerified
-							: undefined,
-					};
-					const userClaims = options.getAdditionalUserInfoClaim
-						? filterAdditionalUserClaims(
-								await options.getAdditionalUserInfoClaim(
-									user,
-									requestedScopes,
-									client,
-								),
-							)
-						: {};
-					return ctx.json({
-						...baseUserClaims,
-						...userClaims,
-					});
+					return ctx.json(claims);
 				},
 			),
 			/**
