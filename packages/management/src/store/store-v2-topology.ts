@@ -252,6 +252,10 @@ export class PgStoreV2TopologyRepository {
 				this.getEnvironment(input),
 			getOrganization: (input: { scope: ResourceScope; id: string }) =>
 				this.getOrganization(input),
+			countOrganizations: (input: {
+				scope: ResourceScope;
+				includeArchived?: boolean;
+			}) => this.countOrganizations(input),
 			listProjectsPage: (input: { limit: number; cursor?: PageCursorKey }) =>
 				this.listProjectsPage(input),
 			listEnvironmentsPage: (input: {
@@ -348,6 +352,21 @@ export class PgStoreV2TopologyRepository {
 				[input.scope.projectId, input.scope.environmentId, input.id],
 			);
 			return result.rows[0] ? mapOrganization(result.rows[0]) : null;
+		});
+	}
+
+	countOrganizations(input: {
+		scope: ResourceScope;
+		includeArchived?: boolean;
+	}): Promise<number> {
+		return this.issue(async () => {
+			const result = await this.client.query<{ count: number }>(
+				`SELECT COUNT(*)::integer AS count
+				 FROM ${this.tables.organizations}
+				 WHERE project_id = $1 AND environment_id = $2${input.includeArchived ? "" : " AND status <> 'archived'"}`,
+				[input.scope.projectId, input.scope.environmentId],
+			);
+			return result.rows[0]?.count ?? 0;
 		});
 	}
 
