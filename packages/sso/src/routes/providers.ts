@@ -16,6 +16,7 @@ import {
 	validateSkipDiscoveryEndpoints,
 } from "../oidc";
 import { decryptOIDCConfig, encryptOIDCConfig } from "../oidc-secret-storage";
+import { isSSOKeyManagementWriter } from "../internal/key-management-writer";
 import { validateConfigAlgorithms } from "../saml";
 import type { Member, OIDCConfig, SAMLConfig, SSOOptions } from "../types";
 import { maskClientId, parseCertificate, safeJsonParse } from "../utils";
@@ -30,6 +31,8 @@ interface SSOProviderRecord {
 	domainVerified?: boolean;
 	userId: string;
 	oidcConfig?: string | null;
+	keyManagementVersion?: number | null;
+	keyManagementRevision?: number | null;
 	samlConfig?: string | null;
 }
 
@@ -622,6 +625,11 @@ export const updateSSOProvider = (options: SSOOptions) => {
 						options,
 					),
 				);
+				if (isSSOKeyManagementWriter(options?.storeOIDCClientSecret)) {
+					updateData.keyManagementVersion = 1;
+					updateData.keyManagementRevision =
+						(existingProvider.keyManagementRevision ?? 0) + 1;
+				}
 			}
 
 			if (providerIdentityBoundaryChanged) {
