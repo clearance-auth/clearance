@@ -775,51 +775,65 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
 				if (!body.oidcConfig) return null;
 
 				if (body.oidcConfig.skipDiscovery) {
-					return JSON.stringify(await encryptOIDCConfig({
-						issuer: body.issuer,
-						clientId: body.oidcConfig.clientId,
-						clientSecret: body.oidcConfig.clientSecret,
-						authorizationEndpoint: body.oidcConfig.authorizationEndpoint,
-						tokenEndpoint: body.oidcConfig.tokenEndpoint,
-						tokenEndpointAuthentication:
-							body.oidcConfig.tokenEndpointAuthentication ||
-							"client_secret_basic",
-						jwksEndpoint: body.oidcConfig.jwksEndpoint,
-							pkce: body.oidcConfig.pkce ?? true,
-						discoveryEndpoint:
-							body.oidcConfig.discoveryEndpoint ||
-							`${body.issuer}/.well-known/openid-configuration`,
-						mapping: body.oidcConfig.mapping,
-						scopes: body.oidcConfig.scopes,
-						userInfoEndpoint: body.oidcConfig.userInfoEndpoint,
-						overrideUserInfo:
-							ctx.body.overrideUserInfo ||
-							options?.defaultOverrideUserInfo ||
-							false,
-					}, options));
+					return JSON.stringify(
+						await encryptOIDCConfig(
+							{
+								issuer: body.issuer,
+								clientId: body.oidcConfig.clientId,
+								clientSecret: body.oidcConfig.clientSecret,
+								authorizationEndpoint:
+									body.oidcConfig.authorizationEndpoint,
+								tokenEndpoint: body.oidcConfig.tokenEndpoint,
+								tokenEndpointAuthentication:
+									body.oidcConfig.tokenEndpointAuthentication ||
+									"client_secret_basic",
+								jwksEndpoint: body.oidcConfig.jwksEndpoint,
+								pkce: body.oidcConfig.pkce ?? true,
+								discoveryEndpoint:
+									body.oidcConfig.discoveryEndpoint ||
+									`${body.issuer}/.well-known/openid-configuration`,
+								mapping: body.oidcConfig.mapping,
+								scopes: body.oidcConfig.scopes,
+								userInfoEndpoint: body.oidcConfig.userInfoEndpoint,
+								overrideUserInfo:
+									ctx.body.overrideUserInfo ||
+									options?.defaultOverrideUserInfo ||
+									false,
+							},
+							body.providerId,
+							options,
+						),
+					);
 				}
 
 				if (!hydratedOIDCConfig) return null;
 
-				return JSON.stringify(await encryptOIDCConfig({
-					issuer: hydratedOIDCConfig.issuer,
-					clientId: body.oidcConfig.clientId,
-					clientSecret: body.oidcConfig.clientSecret,
-					authorizationEndpoint: hydratedOIDCConfig.authorizationEndpoint,
-					tokenEndpoint: hydratedOIDCConfig.tokenEndpoint,
-					tokenEndpointAuthentication:
-						hydratedOIDCConfig.tokenEndpointAuthentication,
-					jwksEndpoint: hydratedOIDCConfig.jwksEndpoint,
-						pkce: body.oidcConfig.pkce ?? true,
-					discoveryEndpoint: hydratedOIDCConfig.discoveryEndpoint,
-					mapping: body.oidcConfig.mapping,
-					scopes: body.oidcConfig.scopes,
-					userInfoEndpoint: hydratedOIDCConfig.userInfoEndpoint,
-					overrideUserInfo:
-						ctx.body.overrideUserInfo ||
-						options?.defaultOverrideUserInfo ||
-						false,
-				}, options));
+				return JSON.stringify(
+					await encryptOIDCConfig(
+						{
+							issuer: hydratedOIDCConfig.issuer,
+							clientId: body.oidcConfig.clientId,
+							clientSecret: body.oidcConfig.clientSecret,
+							authorizationEndpoint:
+								hydratedOIDCConfig.authorizationEndpoint,
+							tokenEndpoint: hydratedOIDCConfig.tokenEndpoint,
+							tokenEndpointAuthentication:
+								hydratedOIDCConfig.tokenEndpointAuthentication,
+							jwksEndpoint: hydratedOIDCConfig.jwksEndpoint,
+							pkce: body.oidcConfig.pkce ?? true,
+							discoveryEndpoint: hydratedOIDCConfig.discoveryEndpoint,
+							mapping: body.oidcConfig.mapping,
+							scopes: body.oidcConfig.scopes,
+							userInfoEndpoint: hydratedOIDCConfig.userInfoEndpoint,
+							overrideUserInfo:
+								ctx.body.overrideUserInfo ||
+								options?.defaultOverrideUserInfo ||
+								false,
+						},
+						body.providerId,
+						options,
+					),
+				);
 			};
 
 			if (body.samlConfig) {
@@ -1240,7 +1254,11 @@ export const signInSSO = (options?: SSOOptions) => {
 			if (provider.userId !== "default" && provider.oidcConfig) {
 				provider = {
 					...provider,
-					oidcConfig: await decryptOIDCConfig(provider.oidcConfig, options),
+					oidcConfig: await decryptOIDCConfig(
+						provider.oidcConfig,
+						provider.providerId,
+						options,
+					),
 				};
 			}
 
@@ -1552,7 +1570,11 @@ async function handleOIDCCallback(
 	if (provider.userId !== "default" && provider.oidcConfig) {
 		provider = {
 			...provider,
-			oidcConfig: await decryptOIDCConfig(provider.oidcConfig, options),
+			oidcConfig: await decryptOIDCConfig(
+				provider.oidcConfig,
+				provider.providerId,
+				options,
+			),
 		};
 	}
 
