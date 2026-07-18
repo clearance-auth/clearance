@@ -180,7 +180,12 @@ export interface AuditEvent {
 	organizationId?: ResourceId;
 	actor: string;
 	action: string;
-	subjectType: string;
+	/**
+	 * Runtime audit events may intentionally be subject-free (for example,
+	 * anonymous authentication failures). When present, subjectType and
+	 * subjectId remain a pair.
+	 */
+	subjectType?: string;
 	subjectId?: string;
 	outcome: "success" | "failure" | "pending";
 	source: "cli" | "console" | "api" | "system" | "migration" | "sso" | "scim";
