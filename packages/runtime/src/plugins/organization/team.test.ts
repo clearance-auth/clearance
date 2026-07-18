@@ -1,8 +1,11 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { AuthContext } from "@clearance/core";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { createAuthClient } from "../../client";
 import { setCookieToHeader } from "../../cookies";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { isAPIError } from "../../utils/is-api-error";
+import { getOrgAdapter } from "./adapter";
 import { organizationClient } from "./client";
 import { ORGANIZATION_ERROR_CODES } from "./error-codes";
 import { organization } from "./organization";
@@ -1873,3 +1876,589 @@ describe("addMember fails closed when a function team cap needs a session", asyn
 		).rejects.toThrow();
 	});
 });
+
+describe("organization dependent deletion", () => {
+	it("deletes organizations with teams disabled without accessing team models", async () => {
+		let afterDeleteOrganization = false;
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [
+				organization({
+					async sendInvitationEmail() {},
+					organizationHooks: {
+						afterDeleteOrganization: async () => {
+							afterDeleteOrganization = true;
+						},
+					},
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const context = await auth.$context;
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "No Teams Delete Org", slug: "no-teams-delete-org" },
+		});
+		const originalTransaction = context.adapter.transaction.bind(context.adapter);
+		const transactionSpy = vi
+			.spyOn(context.adapter, "transaction")
+			.mockImplementation(async (callback: any) =>
+				originalTransaction(async (transaction: any) => {
+					const findMany = transaction.findMany.bind(transaction);
+					transaction.findMany = async (input: any) => {
+						if (input.model === "team" || input.model === "teamMember") {
+							throw new Error("teams-disabled deletion accessed a team model");
+						}
+						return findMany(input);
+					};
+					const deleteMany = transaction.deleteMany.bind(transaction);
+					transaction.deleteMany = async (input: any) => {
+						if (input.model === "team" || input.model === "teamMember") {
+							throw new Error("teams-disabled deletion accessed a team model");
+						}
+						return deleteMany(input);
+					};
+					return callback(transaction);
+				}),
+			);
+		try {
+			await auth.api.deleteOrganization({
+				headers: owner.headers,
+				body: { organizationId: org.id },
+			});
+		} finally {
+			transactionSpy.mockRestore();
+		}
+
+		expect(afterDeleteOrganization).toBe(true);
+		expect(
+			await context.adapter.findOne({
+				model: "organization",
+				where: [{ field: "id", value: org.id }],
+			}),
+		).toBeNull();
+	});
+
+	it("deletes every organization dependent and rolls back the whole cascade", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [
+				organization({
+					async sendInvitationEmail() {},
+					teams: { enabled: true },
+					dynamicAccessControl: { enabled: true },
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const context = await auth.$context;
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "Dependent Delete Org", slug: "dependent-delete-org" },
+		});
+		const team = await auth.api.createTeam({
+			headers: owner.headers,
+			body: { name: "Dependent Delete Team", organizationId: org.id },
+		});
+		await context.adapter.create({
+			model: "teamMember",
+			data: {
+				teamId: team.id,
+				userId: owner.user.id,
+				createdAt: new Date(),
+			},
+		});
+		await context.adapter.create({
+			model: "organizationRole",
+			data: {
+				organizationId: org.id,
+				role: "support",
+				permission: JSON.stringify({ organization: ["read"] }),
+				createdAt: new Date(),
+			},
+		});
+		await context.adapter.create({
+			model: "invitation",
+			data: {
+				organizationId: org.id,
+				email: "dependent-delete-invitee@example.test",
+				role: "member",
+				status: "pending",
+				inviterId: owner.user.id,
+				expiresAt: new Date(Date.now() + 60_000),
+				createdAt: new Date(),
+			},
+		});
+
+		const dependentCounts = async () => ({
+			teamMembers: await context.adapter.count({
+				model: "teamMember",
+				where: [{ field: "teamId", value: team.id }],
+			}),
+			teams: await context.adapter.count({
+				model: "team",
+				where: [{ field: "organizationId", value: org.id }],
+			}),
+			roles: await context.adapter.count({
+				model: "organizationRole",
+				where: [{ field: "organizationId", value: org.id }],
+			}),
+			members: await context.adapter.count({
+				model: "member",
+				where: [{ field: "organizationId", value: org.id }],
+			}),
+			invitations: await context.adapter.count({
+				model: "invitation",
+				where: [{ field: "organizationId", value: org.id }],
+			}),
+		});
+
+		const originalTransaction = context.adapter.transaction.bind(context.adapter);
+		const beforeDelete = await dependentCounts();
+		const transactionSpy = vi
+			.spyOn(context.adapter, "transaction")
+			.mockImplementation(async (callback: any) =>
+				originalTransaction(async (transaction: any) => {
+					const deleteMany = transaction.deleteMany.bind(transaction);
+					transaction.deleteMany = async (input: any) => {
+						if (input.model === "organizationRole") {
+							throw new Error("simulated organization cascade failure");
+						}
+						return deleteMany(input);
+					};
+					return callback(transaction);
+				}),
+			);
+		try {
+			await expect(
+				auth.api.deleteOrganization({
+					headers: owner.headers,
+					body: { organizationId: org.id },
+				}),
+			).rejects.toThrow("simulated organization cascade failure");
+		} finally {
+			transactionSpy.mockRestore();
+		}
+
+		expect(await dependentCounts()).toEqual(beforeDelete);
+		expect(
+			await context.adapter.findOne({
+				model: "organization",
+				where: [{ field: "id", value: org.id }],
+			}),
+		).not.toBeNull();
+
+		await auth.api.deleteOrganization({
+			headers: owner.headers,
+			body: { organizationId: org.id },
+		});
+		expect(await dependentCounts()).toEqual({
+			teamMembers: 0,
+			teams: 0,
+			roles: 0,
+			members: 0,
+			invitations: 0,
+		});
+		expect(
+			await context.adapter.findOne({
+				model: "organization",
+				where: [{ field: "id", value: org.id }],
+			}),
+		).toBeNull();
+	});
+});
+
+describe("organization adapter authority invariants", () => {
+	it("rejects team mutations when the adapter has only the sequential transaction fallback", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization({ async sendInvitationEmail() {}, teams: { enabled: true } })],
+			logger: { level: "error" },
+		});
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "No Transaction Org", slug: "no-transaction-org" },
+		});
+		const context = await auth.$context;
+		const originalTransaction = context.adapter.options?.adapterConfig.transaction;
+		context.adapter.options!.adapterConfig.transaction = false;
+		try {
+			const adapter = getOrgAdapter(context as unknown as AuthContext);
+			expect(
+				await adapter.createTeam({
+					name: "Rejected Team",
+					organizationId: org.id,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				}),
+			).toEqual({ status: "transactionRequired" });
+		} finally {
+			context.adapter.options!.adapterConfig.transaction = originalTransaction;
+		}
+	});
+
+	it("accepts the active rollback-capable owner when given its transaction adapter", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization({ async sendInvitationEmail() {}, teams: { enabled: true } })],
+			logger: { level: "error" },
+		});
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "Owner Transaction Org", slug: "owner-transaction-org" },
+		});
+		const context = await auth.$context;
+		const result = await runWithTransaction(context.adapter, async () => {
+			const transactionAdapter = await getCurrentAdapter(context.adapter);
+			const adapter = getOrgAdapter({
+				...context,
+				adapter: transactionAdapter,
+			} as unknown as AuthContext);
+			return adapter.createTeam({
+				name: "Owner Transaction Team",
+				organizationId: org.id,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			});
+		});
+		expect(result.status).toBe("created");
+	});
+
+	it("never returns organization updatedAt through public adapter results", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization({ async sendInvitationEmail() {} })],
+			logger: { level: "error" },
+		});
+		const context = await auth.$context;
+		const owner = await signInWithTestUser();
+		const created = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "Private Timestamp Org", slug: "private-timestamp-org" },
+		});
+		expect(created).not.toHaveProperty("updatedAt");
+
+		await context.adapter.update({
+			model: "organization",
+			where: [{ field: "id", value: created.id }],
+			update: { updatedAt: new Date() },
+		});
+		expect(
+			await context.adapter.findOne({
+				model: "organization",
+				where: [{ field: "id", value: created.id }],
+			}),
+		).toHaveProperty("updatedAt");
+
+		const adapter = getOrgAdapter(context as unknown as AuthContext);
+		expect(await adapter.findOrganizationById(created.id)).not.toHaveProperty(
+			"updatedAt",
+		);
+		expect((await adapter.listOrganizations(owner.user.id))[0]).not.toHaveProperty(
+			"updatedAt",
+		);
+		expect(
+			await adapter.updateOrganization(created.id, { name: "Still Private" }),
+		).not.toHaveProperty("updatedAt");
+	});
+
+	it("returns one durable row for concurrent uncapped same-user admissions", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [
+				organization({
+					async sendInvitationEmail() {},
+					teams: { enabled: true },
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const context = await auth.$context;
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "Uncapped Admission Org", slug: "uncapped-admission-org" },
+		});
+		const team = await auth.api.createTeam({
+			headers: owner.headers,
+			body: { name: "Uncapped Admission Team", organizationId: org.id },
+		});
+		const adapter = getOrgAdapter(context as unknown as AuthContext);
+		const [first, second] = await Promise.all([
+			adapter.findOrCreateTeamMember({
+				organizationId: org.id,
+				teamId: team.id,
+				userId: owner.user.id,
+			}),
+			adapter.findOrCreateTeamMember({
+				organizationId: org.id,
+				teamId: team.id,
+				userId: owner.user.id,
+			}),
+		]);
+		expect(first.status).toBe("added");
+		expect(second.status).toBe("added");
+		if (first.status !== "added" || second.status !== "added") {
+			throw new Error("expected an admitted team member");
+		}
+		expect(first.member.id).toBe(second.member.id);
+		expect(
+			await context.adapter.findMany({
+				model: "teamMember",
+				where: [
+					{ field: "teamId", value: team.id },
+					{ field: "userId", value: owner.user.id },
+				],
+			}),
+		).toHaveLength(1);
+		await context.adapter.create({
+			model: "teamMember",
+			data: {
+				teamId: team.id,
+				userId: owner.user.id,
+				createdAt: new Date(),
+			},
+		});
+		const legacyDuplicates = await context.adapter.findMany<{ id: string }>({
+			model: "teamMember",
+			where: [
+				{ field: "teamId", value: team.id },
+				{ field: "userId", value: owner.user.id },
+			],
+			sortBy: { field: "id", direction: "asc" },
+		});
+		const repaired = await adapter.findOrCreateTeamMember({
+			organizationId: org.id,
+			teamId: team.id,
+			userId: owner.user.id,
+		});
+		expect(repaired.status).toBe("added");
+		if (repaired.status !== "added") throw new Error("expected repair");
+		expect(repaired.member.id).toBe(legacyDuplicates[0]?.id);
+		expect(
+			await context.adapter.findMany({
+				model: "teamMember",
+				where: [
+					{ field: "teamId", value: team.id },
+					{ field: "userId", value: owner.user.id },
+				],
+			}),
+		).toHaveLength(1);
+	});
+
+	it("repairs legacy duplicates before capped admission counts distinct users", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [
+				organization({
+					async sendInvitationEmail() {},
+					teams: { enabled: true },
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const context = await auth.$context;
+		const owner = await signInWithTestUser();
+		const org = await auth.api.createOrganization({
+			headers: owner.headers,
+			body: { name: "Legacy Duplicate Org", slug: "legacy-duplicate-org" },
+		});
+		const team = await auth.api.createTeam({
+			headers: owner.headers,
+			body: { name: "Legacy Duplicate Team", organizationId: org.id },
+		});
+		const candidate = await auth.api.signUpEmail({
+			body: {
+				name: "Distinct Candidate",
+				email: "distinct-candidate@example.test",
+				password: "password12345",
+			},
+		});
+		await Promise.all([
+			context.adapter.create({
+				model: "teamMember",
+				data: {
+					teamId: team.id,
+					userId: owner.user.id,
+					createdAt: new Date(),
+				},
+			}),
+			context.adapter.create({
+				model: "teamMember",
+				data: {
+					teamId: team.id,
+					userId: owner.user.id,
+					createdAt: new Date(),
+				},
+			}),
+		]);
+		const adapter = getOrgAdapter(context as unknown as AuthContext);
+		const result = await adapter.addTeamMemberWithLimit({
+			organizationId: org.id,
+			teamId: team.id,
+			userId: candidate.user.id,
+			maximumMembersPerTeam: 2,
+		});
+		expect(result.status).toBe("added");
+		const members = await context.adapter.findMany<{ id: string; userId: string }>(
+			{
+				model: "teamMember",
+				where: [{ field: "teamId", value: team.id }],
+			},
+		);
+		expect(members).toHaveLength(2);
+		expect(members.filter((member) => member.userId === owner.user.id)).toHaveLength(
+			1,
+		);
+		expect(
+			members.filter((member) => member.userId === candidate.user.id),
+		).toHaveLength(1);
+	});
+});
+
+const hasPostgres = Boolean(
+	process.env.CLEARANCE_TEST_POSTGRES_URL ??
+		process.env.CLEARANCE_TEST_DATABASE_URL,
+);
+
+describe.skipIf(!hasPostgres)(
+	"team member limits with PostgreSQL concurrency",
+	() => {
+		it("admits exactly one of two distinct users competing for the final slot", async () => {
+			const { auth, signInWithTestUser } = await getTestInstance(
+				{
+					plugins: [
+						organization({
+							async sendInvitationEmail() {},
+							teams: { enabled: true, maximumMembersPerTeam: 2 },
+						}),
+					],
+					logger: { level: "error" },
+					databaseHooks: {
+						user: {
+							create: {
+								before: async (user) => ({
+									data: { ...user, emailVerified: true },
+								}),
+							},
+						},
+					},
+				},
+				{ testWith: "postgres" },
+			);
+			const context = await auth.$context;
+			const owner = await signInWithTestUser();
+			const org = await auth.api.createOrganization({
+				headers: owner.headers,
+				body: { name: "Concurrent Limit Org", slug: "concurrent-limit-org" },
+			});
+			const team = await auth.api.createTeam({
+				headers: owner.headers,
+				body: { name: "Concurrent Limit Team", organizationId: org.id },
+			});
+
+			let userNumber = 0;
+			const createOrganizationMember = async () => {
+				const user = await auth.api.signUpEmail({
+					body: {
+						name: `Concurrent ${userNumber}`,
+						email: `concurrent-${userNumber++}@example.test`,
+						password: "password12345",
+					},
+				});
+				await auth.api.addMember({
+					headers: owner.headers,
+					body: {
+						organizationId: org.id,
+						userId: user.user.id,
+						role: "member",
+					},
+				});
+				return user.user.id;
+			};
+
+			const seatedUserId = await createOrganizationMember();
+			const firstContenderId = await createOrganizationMember();
+			const secondContenderId = await createOrganizationMember();
+			await auth.api.addTeamMember({
+				headers: owner.headers,
+				body: { teamId: team.id, userId: seatedUserId },
+			});
+
+			let resolveFirstLock: (() => void) | undefined;
+			const firstLock = new Promise<void>((resolve) => {
+				resolveFirstLock = resolve;
+			});
+			let resolveSecondAttempt: (() => void) | undefined;
+			const secondAttempt = new Promise<void>((resolve) => {
+				resolveSecondAttempt = resolve;
+			});
+			let releaseFirst: (() => void) | undefined;
+			const firstRelease = new Promise<void>((resolve) => {
+				releaseFirst = resolve;
+			});
+			let teamLockAttempts = 0;
+			const originalTransaction = context.adapter.transaction.bind(context.adapter);
+			const transactionSpy = vi
+				.spyOn(context.adapter, "transaction")
+				.mockImplementation(async (callback: any) =>
+					originalTransaction(async (transaction: any) => {
+						const update = transaction.update.bind(transaction);
+						transaction.update = async (input: any) => {
+							if (input.model !== "team" || input.where?.[0]?.value !== team.id) {
+								return update(input);
+							}
+							teamLockAttempts += 1;
+							if (teamLockAttempts === 1) {
+								const locked = await update(input);
+								resolveFirstLock?.();
+								await firstRelease;
+								return locked;
+							}
+							resolveSecondAttempt?.();
+							return update(input);
+						};
+						return callback(transaction);
+					}),
+				);
+			try {
+				const first = auth.api.addTeamMember({
+					headers: owner.headers,
+					body: { teamId: team.id, userId: firstContenderId },
+				});
+				await firstLock;
+				const second = auth.api.addTeamMember({
+					headers: owner.headers,
+					body: { teamId: team.id, userId: secondContenderId },
+				});
+				await secondAttempt;
+				resolveFirstLock = undefined;
+				releaseFirst?.();
+
+				const results = await Promise.allSettled([first, second]);
+				expect(teamLockAttempts).toBe(2);
+				expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+				expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+				const loser = results.find(
+					(result): result is PromiseRejectedResult => result.status === "rejected",
+				);
+				expect(loser?.reason).toMatchObject({
+					status: "FORBIDDEN",
+					body: { code: "TEAM_MEMBER_LIMIT_REACHED" },
+				});
+			} finally {
+				transactionSpy.mockRestore();
+			}
+
+			const members = await context.adapter.findMany<{ userId: string }>({
+				model: "teamMember",
+				where: [{ field: "teamId", value: team.id }],
+			});
+			expect(members).toHaveLength(2);
+			expect(
+				members.filter(
+					(member) =>
+						member.userId === firstContenderId ||
+						member.userId === secondContenderId,
+				).length,
+			).toBe(1);
+		});
+	},
+);
