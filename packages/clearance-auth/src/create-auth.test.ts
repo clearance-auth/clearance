@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+	createKeyProviderRegistry,
+	createLocalKeyProvider,
+} from "@clearance/key-management";
+import {
 	CLEARANCE_AUTH_VERSION,
 	RUNTIME_BASELINE,
 	createClearanceAuth,
@@ -15,6 +19,36 @@ const durableKeyring = {
 	fingerprintKeys: { "fingerprint-current": Buffer.alloc(32, 2).toString("base64") },
 	sourceDedupeKey: Buffer.alloc(32, 3).toString("base64"),
 };
+
+function testKeyManagement(
+	projectId = "project-test",
+	environmentId = "environment-test",
+) {
+	return {
+		projectId,
+		environmentId,
+		registry: createKeyProviderRegistry({
+			"oidc-client-secret": createLocalKeyProvider({
+				providerId: "test-oidc",
+				purpose: "oidc-client-secret",
+				currentKeyId: "v1",
+				keys: { v1: Buffer.alloc(32, 11) },
+			}),
+			"scim-bearer-token": createLocalKeyProvider({
+				providerId: "test-scim",
+				purpose: "scim-bearer-token",
+				currentKeyId: "v1",
+				keys: { v1: Buffer.alloc(32, 12) },
+			}),
+			"access-token-signing-key": createLocalKeyProvider({
+				providerId: "test-jwt",
+				purpose: "access-token-signing-key",
+				currentKeyId: "v1",
+				keys: { v1: Buffer.alloc(32, 13) },
+			}),
+		}),
+	};
+}
 
 function durableDelivery(invitationUrl: (invitationId: string) => string) {
 	return {
@@ -153,11 +187,20 @@ describe("@clearance/auth runtime wrapper", () => {
 	});
 
 	it("enables breached-password defense in strict mode and bounds key overlap", async () => {
+		expect(() =>
+			createClearanceAuth({
+				baseURL: "https://auth.example.test",
+				secret: "unit-test-secret-value-not-default!!",
+				databaseUrl,
+				strictSecrets: true,
+			}),
+		).toThrow(/explicit purpose-separated keyManagement providers/);
 		const strict = createClearanceAuth({
 			baseURL: "https://auth.example.test",
 			secret: "unit-test-secret-value-not-default!!",
 			databaseUrl,
 			strictSecrets: true,
+			keyManagement: testKeyManagement(),
 		});
 		try {
 			expect(strict.plugins.breachedPassword).toBe(true);
@@ -266,6 +309,16 @@ describe("@clearance/auth runtime wrapper", () => {
 						}) => boolean | Promise<boolean>;
 						providerOwnership?: { enabled?: boolean };
 						requiredRole?: string[];
+						storeSCIMToken?: {
+							encrypt(token: string, context: {
+								providerId: string;
+								organizationId?: string;
+							}): Promise<string>;
+							decrypt(stored: string, context: {
+								providerId: string;
+								organizationId?: string;
+							}): Promise<string>;
+						};
 				  }
 				| undefined;
 
@@ -282,6 +335,24 @@ describe("@clearance/auth runtime wrapper", () => {
 			expect(
 				await scimOptions?.canGenerateToken?.({ organizationId: "org_1" }),
 			).toBe(true);
+			const tokenContext = {
+				providerId: "provider_1",
+				organizationId: "org_1",
+			};
+			const storedToken = await scimOptions?.storeSCIMToken?.encrypt(
+				"base-token",
+				tokenContext,
+			);
+			expect(storedToken).toMatch(/^clr-scim:v1:clrkm\$v1\$/);
+			expect(
+				await scimOptions?.storeSCIMToken?.decrypt(storedToken!, tokenContext),
+			).toBe("base-token");
+			await expect(
+				scimOptions?.storeSCIMToken?.decrypt(
+					"clr-scim:v1:legacy-general-secret-ciphertext",
+					tokenContext,
+				),
+			).rejects.toThrow("Stored SCIM token envelope is invalid");
 		} finally {
 			await bundle.destroy();
 		}
@@ -359,6 +430,7 @@ describe("@clearance/auth runtime wrapper", () => {
 			secret: "unit-test-secret-value-not-default!!",
 			databaseUrl,
 			strictSecrets: true,
+			keyManagement: testKeyManagement(),
 			enableSso: false,
 			enableScim: false,
 			durableDelivery: durableDelivery(
