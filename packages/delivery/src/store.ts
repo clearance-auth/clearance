@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import {
+	extractDeliveryTraceCarrier,
+	type DeliveryTraceCarrier,
+} from "@clearance/observability-node";
 import pg from "pg";
 import { DeliveryError, StaleDeliveryLeaseError } from "./errors.js";
 import {
@@ -66,12 +70,15 @@ type JobRow = {
 	delivered_at: Date | string | null;
 	dead_at: Date | string | null;
 	cancelled_at: Date | string | null;
+	trace_parent: string | null;
 };
 
 export type LeasedDeliveryJob = DeliveryJobRecord & {
 	leaseToken: string;
 	leaseOwner: string;
 	leaseExpiresAt: string;
+	/** Internal worker-only propagation state; omitted from all job inspection records. */
+	traceCarrier?: DeliveryTraceCarrier;
 };
 
 function iso(value: Date | string | null): string | null {
@@ -336,11 +343,13 @@ export class DeliveryStore {
 					 provider_accepted_at=NULL, provider_status=NULL, provider_request_id=NULL
 				FROM candidate c, ${this.tables.event} e
 				WHERE j.id=c.id AND e.id=j.event_id
-				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id`,
+				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id,
+				 e.trace_parent`,
 				[now, leaseToken, workerId, leaseExpiresAt],
 			);
 			const row = claimed.rows[0];
 			if (!row) return null;
+			const traceCarrier = extractDeliveryTraceCarrier(row.trace_parent);
 			await client.query(
 				`INSERT INTO ${this.tables.attempt}
 				 (id, job_id, attempt_number, lease_token, phase, worker_id, created_at)
@@ -352,6 +361,7 @@ export class DeliveryStore {
 				leaseToken,
 				leaseOwner: workerId,
 				leaseExpiresAt: leaseExpiresAt.toISOString(),
+				...(traceCarrier === undefined ? {} : { traceCarrier }),
 			};
 		});
 	}
