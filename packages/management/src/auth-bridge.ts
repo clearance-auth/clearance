@@ -23,10 +23,12 @@ import {
 	decryptRuntimeCredential,
 	type ClearanceAuthBundle,
 } from "@clearance/auth";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type {
 	AuditEvent,
 	DataStoreSnapshot,
+	DirectoryConnection,
+	IdentityConnection,
 	Membership,
 	Organization,
 	Principal,
@@ -81,8 +83,11 @@ import {
 } from "./services/pagination.js";
 import type {
 	InternalManagementCoordinatedMutationContext,
+	ManagementCoordinatedQuery,
 	ManagementStore,
 	StoreV2PrincipalRepository,
+	StoreV2TopologyReader,
+	StoreV2TopologyRepository,
 } from "./store/types.js";
 import { mutateCoordinatedWithRuntimeSql } from "./store/coordinated-internal.js";
 import { advancingPrincipalUpdatedAt } from "./store/store-v2-principals.js";
@@ -232,6 +237,48 @@ export async function ensureAuthMigrated(): Promise<void> {
 		return;
 	}
 	await b.migrate();
+}
+
+/**
+ * Management-owned startup seam for the additive authorization terminalization
+ * migration. PgStore supplies its exact normalized organization table only
+ * after its schema is ready; this bridge verifies that the authz-v2 migration
+ * is actually pending, applies auth migrations, then reconciles once.
+ */
+export async function reconcileAuthorizationTerminalizationAtManagementStartup(
+	store: ManagementStore,
+): Promise<void> {
+	const management = store.storeV2OrganizationAuthority;
+	if (!management) return;
+	const b = getAuthBundle();
+	await b.migrate();
+	if (!b.authorization) {
+		throw new Error("Authorization authority is unavailable for terminalization reconciliation");
+	}
+	const authorization = b.authorization;
+	await mutateCoordinatedWithRuntimeSql(store, async ({ appendAudit, query }) => {
+		const reconciled = await authorization.reconcileRuntimeOrganizations({
+			management,
+			transaction: authorizationTransaction(query),
+		});
+		if (reconciled.terminalizedOrganizations === 0) return;
+		appendAudit({
+			actor: "system",
+			action: "authorization.organizations.reconcile",
+			subjectType: "system",
+			subjectId: "authorization-authority-v2",
+			outcome: "success",
+			source: "migration",
+			message: "Reconciled terminal authorization organizations after normalized topology became authoritative",
+			metadata: {
+				terminalizedOrganizations: reconciled.terminalizedOrganizations,
+				terminalizedOrganizationIds: reconciled.terminalizedOrganizationIds,
+				removedAssignments: reconciled.removedAssignments,
+				disabledServiceAccounts: reconciled.disabledServiceAccounts,
+				revokedCredentials: reconciled.revokedCredentials,
+			},
+		});
+	});
 }
 
 function projectEnv() {
@@ -666,7 +713,7 @@ async function assertSsoRowScope(
  * and fail closed on organization/provider/protocol/domain mismatch.
  * Without `id`, generates a new id (CLI/operator path).
  */
-export async function insertSsoProvider(input: {
+type SsoProviderInput = {
 	/** Deterministic runtime/management id for setup-attempt recovery */
 	id?: string;
 	providerId: string;
@@ -676,14 +723,24 @@ export async function insertSsoProvider(input: {
 	protocol: "saml" | "oidc";
 	oidc?: { clientId: string; clientSecret: string };
 	saml?: { entryPoint: string; cert: string; audience?: string };
-}): Promise<{ id: string; clientSecretFingerprint?: string; reused?: boolean }> {
+};
+
+/**
+ * Package-internal variant used only inside a coordinated management/runtime
+ * transaction. `query` is deliberately not part of the public helper input:
+ * callers cannot acquire the raw transaction capability from ManagementStore.
+ */
+export async function insertSsoProviderInTransaction(
+	query: ManagementCoordinatedQuery,
+	input: SsoProviderInput,
+): Promise<{ id: string; clientSecretFingerprint?: string; reused?: boolean }> {
 	const b = getAuthBundle();
 	const userId = await ensureOperatorUser();
 	const id = input.id ?? newId("sso").replace(/^sso_/, "sso");
 	const secretFp = input.oidc ? fingerprint(input.oidc.clientSecret) : undefined;
 
 	const loadById = async (lookupId: string): Promise<SsoProviderRow | null> => {
-		const r = await b.pool.query(
+		const r = await query(
 			`select id, issuer, "providerId", "organizationId", domain, "oidcConfig", "samlConfig"
        from "ssoProvider" where id = $1 limit 1`,
 			[lookupId],
@@ -694,7 +751,7 @@ export async function insertSsoProvider(input: {
 	const loadByProviderId = async (
 		providerId: string,
 	): Promise<SsoProviderRow | null> => {
-		const r = await b.pool.query(
+		const r = await query(
 			`select id, issuer, "providerId", "organizationId", domain, "oidcConfig", "samlConfig"
        from "ssoProvider" where "providerId" = $1 limit 1`,
 			[providerId],
@@ -743,7 +800,7 @@ export async function insertSsoProvider(input: {
 		: null;
 
 	try {
-		await b.pool.query(
+		await query(
 			`insert into "ssoProvider" (
 			  id, issuer, "oidcConfig", "samlConfig", "userId", "providerId",
 			  "organizationId", domain, "keyManagementVersion", "keyManagementRevision"
@@ -776,9 +833,31 @@ export async function insertSsoProvider(input: {
 	};
 }
 
+/** Insert SSO provider outside a coordinated lifecycle transaction. */
+export async function insertSsoProvider(
+	input: SsoProviderInput,
+): Promise<{ id: string; clientSecretFingerprint?: string; reused?: boolean }> {
+	const b = getAuthBundle();
+	return insertSsoProviderInTransaction(
+		(sql, params) => b.pool.query(sql, params) as ReturnType<ManagementCoordinatedQuery>,
+		input,
+	);
+}
+
+/** Package-internal runtime delete bound to the active coordinated transaction. */
+export async function deleteSsoProviderByIdInTransaction(
+	query: ManagementCoordinatedQuery,
+	id: string,
+): Promise<void> {
+	await query(`delete from "ssoProvider" where id = $1`, [id]);
+}
+
 export async function deleteSsoProviderById(id: string): Promise<void> {
 	const b = getAuthBundle();
-	await b.pool.query(`delete from "ssoProvider" where id = $1`, [id]);
+	await deleteSsoProviderByIdInTransaction(
+		(sql, params) => b.pool.query(sql, params) as ReturnType<ManagementCoordinatedQuery>,
+		id,
+	);
 }
 
 type ScimProviderRow = {
@@ -863,18 +942,24 @@ async function scimBearerFromStoredBase(
  * On reuse, reconstructs the bearer handoff in-memory from encrypted stored
  * material only (never persists plaintext). Without `id`, generates new ids.
  */
-export async function insertScimProvider(input: {
+type ScimProviderInput = {
 	/** Deterministic runtime/management id for setup-attempt recovery */
 	id?: string;
 	providerId: string;
 	organizationId?: string;
 	token?: string;
-}): Promise<{ id: string; token: string; reused?: boolean }> {
+};
+
+/** Package-internal runtime insert/reconcile bound to a coordinated transaction. */
+export async function insertScimProviderInTransaction(
+	query: ManagementCoordinatedQuery,
+	input: ScimProviderInput,
+): Promise<{ id: string; token: string; reused?: boolean }> {
 	const b = getAuthBundle();
 	const id = input.id ?? newId("scim").replace(/^scim_/, "scim");
 
 	const loadById = async (lookupId: string): Promise<ScimProviderRow | null> => {
-		const r = await b.pool.query(
+		const r = await query(
 			`select id, "providerId", "scimToken", "organizationId"
        from "scimProvider" where id = $1 limit 1`,
 			[lookupId],
@@ -885,7 +970,7 @@ export async function insertScimProvider(input: {
 	const loadByProviderId = async (
 		providerId: string,
 	): Promise<ScimProviderRow | null> => {
-		const r = await b.pool.query(
+		const r = await query(
 			`select id, "providerId", "scimToken", "organizationId"
        from "scimProvider" where "providerId" = $1 limit 1`,
 			[providerId],
@@ -927,7 +1012,7 @@ export async function insertScimProvider(input: {
 	const storedToken = await sealScimBaseToken(b, input, baseToken);
 
 	try {
-		await b.pool.query(
+		await query(
 			`insert into "scimProvider" (
 			  id, "providerId", "scimToken", "organizationId",
 			  "keyManagementVersion", "keyManagementRevision"
@@ -951,9 +1036,377 @@ export async function insertScimProvider(input: {
 	return { id, token, reused: false };
 }
 
+/** Insert SCIM provider outside a coordinated lifecycle transaction. */
+export async function insertScimProvider(
+	input: ScimProviderInput,
+): Promise<{ id: string; token: string; reused?: boolean }> {
+	const b = getAuthBundle();
+	return insertScimProviderInTransaction(
+		(sql, params) => b.pool.query(sql, params) as ReturnType<ManagementCoordinatedQuery>,
+		input,
+	);
+}
+
+/** Package-internal runtime delete bound to the active coordinated transaction. */
+export async function deleteScimProviderByIdInTransaction(
+	query: ManagementCoordinatedQuery,
+	id: string,
+): Promise<void> {
+	await query(`delete from "scimProvider" where id = $1`, [id]);
+}
+
 export async function deleteScimProviderById(id: string): Promise<void> {
 	const b = getAuthBundle();
-	await b.pool.query(`delete from "scimProvider" where id = $1`, [id]);
+	await deleteScimProviderByIdInTransaction(
+		(sql, params) => b.pool.query(sql, params) as ReturnType<ManagementCoordinatedQuery>,
+		id,
+	);
+}
+
+export type SetupConnectionCompensationInput = {
+	kind: "sso" | "scim";
+	connectionId: string;
+	/** Runtime provider id derived from the immutable setup reservation. */
+	runtimeProviderId: string;
+	organizationId: string;
+	provider: string;
+	scope: ResourceScope;
+	actor?: string;
+};
+
+export type SetupConnectionCompensationResult = {
+	managementRemoved: boolean;
+	runtimeRemoved: boolean;
+};
+
+function setupCompensationError(
+	code: "SETUP_COMPENSATION_SCOPE_MISMATCH" | "SETUP_COMPENSATION_CONNECTION_MISMATCH" | "SETUP_COMPENSATION_RUNTIME_MISMATCH",
+): ClearanceError {
+	return new ClearanceError({
+		code,
+		message: "Setup connection cleanup could not verify the exact provisioned resource",
+		stage: "setup.compensate",
+		status: 409,
+	});
+}
+
+function exactSetupManagementConnection(
+	data: DataStoreSnapshot,
+	input: SetupConnectionCompensationInput,
+): IdentityConnection | DirectoryConnection | undefined {
+	const connections = input.kind === "sso"
+		? data.identityConnections
+		: data.directoryConnections;
+	const byId = connections.find((connection) => connection.id === input.connectionId);
+	if (!byId) return undefined;
+	if (
+		byId.organizationId !== input.organizationId ||
+		byId.provider !== input.provider
+	) {
+		throw setupCompensationError("SETUP_COMPENSATION_CONNECTION_MISMATCH");
+	}
+	return byId;
+}
+
+async function deleteExactSetupRuntimeProvider(
+	query: ManagementCoordinatedQuery,
+	input: SetupConnectionCompensationInput,
+): Promise<boolean> {
+	const table = input.kind === "sso" ? `"ssoProvider"` : `"scimProvider"`;
+	const exact = await query(
+		`SELECT id FROM ${table}
+		 WHERE id = $1 AND "providerId" = $2 AND "organizationId" = $3
+		 FOR UPDATE`,
+		[input.connectionId, input.runtimeProviderId, input.organizationId],
+	);
+	if (exact.rows.length === 0) {
+		const sameId = await query(`SELECT id FROM ${table} WHERE id = $1 FOR UPDATE`, [
+			input.connectionId,
+		]);
+		if (sameId.rows.length > 0) {
+			throw setupCompensationError("SETUP_COMPENSATION_RUNTIME_MISMATCH");
+		}
+		return false;
+	}
+	if (input.kind === "sso") {
+		await deleteSsoProviderByIdInTransaction(query, input.connectionId);
+	} else {
+		await deleteScimProviderByIdInTransaction(query, input.connectionId);
+	}
+	return true;
+}
+
+function removeExactSetupManagementConnection(
+	data: DataStoreSnapshot,
+	input: SetupConnectionCompensationInput,
+): boolean {
+	const connection = exactSetupManagementConnection(data, input);
+	if (!connection) return false;
+	if (input.kind === "sso") {
+		data.identityConnections = data.identityConnections.filter(
+			(candidate) => candidate.id !== input.connectionId,
+		);
+	} else {
+		data.directoryConnections = data.directoryConnections.filter(
+			(candidate) => candidate.id !== input.connectionId,
+		);
+	}
+	return true;
+}
+
+function appendSetupCompensationAudit(
+	data: DataStoreSnapshot,
+	input: SetupConnectionCompensationInput,
+	append: (audit: Parameters<typeof appendAuditEvent>[1]) => unknown =
+		(audit) => appendAuditEvent(data, audit),
+): void {
+	append({
+		actor: input.actor ?? "customer-setup",
+		action: `${input.kind}.setup-link.compensate`,
+		subjectType: input.kind === "sso" ? "identity_connection" : "directory_connection",
+		subjectId: input.connectionId,
+		outcome: "success",
+		source: "api",
+		organizationId: input.organizationId,
+		projectId: input.scope.projectId,
+		environmentId: input.scope.environmentId,
+		message: `Compensated incomplete ${input.kind.toUpperCase()} setup connection`,
+		metadata: { runtimeProviderId: input.runtimeProviderId },
+	});
+}
+
+/**
+ * Delete one exact setup-attempt connection. PostgreSQL performs the runtime
+ * delete, snapshot removal, and audit in one coordinated transaction; any
+ * mismatch or SQL failure rolls every part back so the setup reservation can
+ * remain held for recovery. JsonStore keeps the local-dev durable path.
+ */
+export async function compensateSetupConnection(
+	store: ManagementStore,
+	input: SetupConnectionCompensationInput,
+): Promise<SetupConnectionCompensationResult> {
+	if (store.backend === "postgres") {
+		return mutateCoordinatedWithRuntimeSql(store, async ({
+			data,
+			topology,
+			query,
+			appendAudit,
+		}) => {
+			const organization = topology
+				? await topology.lockOrganization({ scope: input.scope, id: input.organizationId })
+				: data.organizations.find(
+					(organization) =>
+						organization.id === input.organizationId &&
+						organization.projectId === input.scope.projectId &&
+						organization.environmentId === input.scope.environmentId,
+				);
+			if (
+				!organization ||
+				organization.projectId !== input.scope.projectId ||
+				organization.environmentId !== input.scope.environmentId
+			) {
+				throw setupCompensationError("SETUP_COMPENSATION_SCOPE_MISMATCH");
+			}
+			const runtimeRemoved = await deleteExactSetupRuntimeProvider(query, input);
+			const managementRemoved = removeExactSetupManagementConnection(data, input);
+			appendSetupCompensationAudit(data, input, appendAudit);
+			return { managementRemoved, runtimeRemoved };
+		});
+	}
+
+	const managementRemoved = await store.mutateDurable((data) => {
+		const organization = data.organizations.find(
+			(candidate) =>
+				candidate.id === input.organizationId &&
+				candidate.projectId === input.scope.projectId &&
+				candidate.environmentId === input.scope.environmentId,
+		);
+		if (!organization) throw setupCompensationError("SETUP_COMPENSATION_SCOPE_MISMATCH");
+		const removed = removeExactSetupManagementConnection(data, input);
+		appendSetupCompensationAudit(data, input);
+		return removed;
+	});
+	if (input.kind === "sso") {
+		await deleteSsoProviderById(input.connectionId);
+	} else {
+		await deleteScimProviderById(input.connectionId);
+	}
+	return { managementRemoved, runtimeRemoved: true };
+}
+
+function sameScimBearer(expected: string, supplied: string): boolean {
+	const expectedBytes = Buffer.from(expected, "utf8");
+	const suppliedBytes = Buffer.from(supplied, "utf8");
+	return expectedBytes.length === suppliedBytes.length && timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
+/**
+ * Apply SCIM users entirely inside an existing coordinated transaction. This
+ * is intentionally a narrow runtime seam: it neither opens a transaction nor
+ * creates sessions, and it never returns or persists bearer plaintext.
+ */
+export async function applyScimUsersInTransaction(input: {
+	query: ManagementCoordinatedQuery;
+	principals: StoreV2PrincipalRepository;
+	data: DataStoreSnapshot;
+	connectionId: string;
+	organization: Organization;
+	bearerToken: string;
+	users: Array<{ userName: string; displayName?: string; active?: boolean }>;
+	timestamp: string;
+}): Promise<{ created: number; updated: number; membershipsCreated: number }> {
+	const providerResult = await input.query(
+		`select id, "providerId", "scimToken", "organizationId"
+		 from "scimProvider" where id = $1 for update`,
+		[input.connectionId],
+	);
+	const provider = providerResult.rows[0] as ScimProviderRow | undefined;
+	if (!provider || provider.organizationId !== input.organization.id) {
+		throw new ClearanceError({
+			code: "SCIM_UNAUTHORIZED",
+			message: "Unauthorized",
+			stage: "scim.runtime.apply",
+			status: 401,
+		});
+	}
+	const expectedBearer = await scimBearerFromStoredBase(
+		await openScimBaseToken(getAuthBundle(), provider),
+		provider.providerId,
+		provider.organizationId,
+	);
+	if (!sameScimBearer(expectedBearer, input.bearerToken)) {
+		throw new ClearanceError({
+			code: "SCIM_UNAUTHORIZED",
+			message: "Unauthorized",
+			stage: "scim.runtime.apply",
+			status: 401,
+		});
+	}
+
+	const scope = {
+		projectId: input.organization.projectId,
+		environmentId: input.organization.environmentId,
+	};
+	let created = 0;
+	let updated = 0;
+	let membershipsCreated = 0;
+	for (const sourceUser of input.users) {
+		if (sourceUser.active === false) continue;
+		const email = sourceUser.userName.trim().toLowerCase();
+		if (!email) {
+			throw new ClearanceError({
+				code: "SCIM_MALFORMED",
+				message: "Malformed SCIM payload",
+				stage: "scim.runtime.apply",
+				status: 400,
+			});
+		}
+		const name = sourceUser.displayName?.trim() || email;
+		const accountResult = await input.query(
+			`select id, "userId" as user_id from account
+			 where "providerId" = $1 and "accountId" = $2 for update`,
+			[provider.providerId, email],
+		);
+		if (accountResult.rows.length > 1) {
+			throw new ClearanceError({ code: "SCIM_RUNTIME_ACCOUNT_INVALID", message: "SCIM provider account is invalid", stage: "scim.runtime.apply", status: 409 });
+		}
+		const account = accountResult.rows[0] as { id: string; user_id: string } | undefined;
+		let runtimeUserId: string;
+		let changed = false;
+		if (account) {
+			const runtimeResult = await input.query(
+				`select id, email, name from "user" where id = $1 for update`,
+				[account.user_id],
+			);
+			const runtimeUser = runtimeResult.rows[0] as
+				| { id: string; email: string; name: string }
+				| undefined;
+			if (!runtimeUser) {
+				throw new ClearanceError({
+					code: "SCIM_RUNTIME_ACCOUNT_INVALID",
+					message: "SCIM provider account is invalid",
+					stage: "scim.runtime.apply",
+					status: 409,
+				});
+			}
+			const emailOwner = await input.query(
+				`select id from "user" where email = $1 and id <> $2 for update`,
+				[email, runtimeUser.id],
+			);
+			if (emailOwner.rows.length > 0) {
+				throw new ClearanceError({ code: "SCIM_RUNTIME_EMAIL_CONFLICT", message: "SCIM user email conflicts with an existing runtime user", stage: "scim.runtime.apply", status: 409 });
+			}
+			if (runtimeUser.email !== email || runtimeUser.name !== name) {
+				await input.query(`update "user" set email = $2, name = $3, "updatedAt" = $4 where id = $1`, [runtimeUser.id, email, name, new Date(input.timestamp)]);
+				changed = true;
+			}
+			runtimeUserId = runtimeUser.id;
+		} else {
+			const existing = await input.query(
+				`select id from "user" where email = $1 for update`,
+				[email],
+			);
+			if (existing.rows.length > 0) {
+				throw new ClearanceError({ code: "SCIM_RUNTIME_EMAIL_CONFLICT", message: "SCIM user email conflicts with an existing runtime user", stage: "scim.runtime.apply", status: 409 });
+			}
+			runtimeUserId = newId("user");
+			const now = new Date(input.timestamp);
+			await input.query(
+				`insert into "user" (id, email, name, "emailVerified", image, "createdAt", "updatedAt") values ($1, $2, $3, false, null, $4, $4)`,
+				[runtimeUserId, email, name, now],
+			);
+			await input.query(
+				`insert into account (id, "accountId", "providerId", "userId", "createdAt", "updatedAt") values ($1, $2, $3, $4, $5, $5)`,
+				[newId("account"), email, provider.providerId, runtimeUserId, now],
+			);
+			created += 1;
+		}
+
+		let principal = await input.principals.getById({ scope, id: runtimeUserId, includeDeleted: true });
+		if (!principal) {
+			const emailPrincipal = await input.principals.findActiveByEmail({ scope, email });
+			if (emailPrincipal && emailPrincipal.id !== runtimeUserId) {
+				throw new ClearanceError({ code: "IDENTITY_EMAIL_CONFLICT", message: "SCIM user email conflicts with a management principal", stage: "scim.runtime.apply", status: 409 });
+			}
+			principal = await input.principals.insert({ id: runtimeUserId, ...scope, email, name, status: "active", createdAt: input.timestamp, updatedAt: input.timestamp } satisfies Principal);
+		} else if (principal.email !== email || principal.name !== name || principal.status !== "active") {
+			const synchronized = await input.principals.update({ ...principal, email, name, status: "active", updatedAt: advancingPrincipalUpdatedAt(input.timestamp, principal.updatedAt) }, { expectedUpdatedAt: principal.updatedAt });
+			if (!synchronized) throw new ClearanceError({ code: "IDENTITY_SYNC_CONFLICT", message: "Canonical identity changed during synchronization", stage: "scim.runtime.apply", status: 409 });
+			principal = synchronized;
+			changed = true;
+		}
+		if (changed) updated += 1;
+
+		const snapshotMembership = input.data.memberships.find((membership) => membership.organizationId === input.organization.id && membership.principalId === runtimeUserId);
+		const runtimeMembership = await input.query(
+			`select id from member where "organizationId" = $1 and "userId" = $2 for update`,
+			[input.organization.id, runtimeUserId],
+		);
+		if (runtimeMembership.rows.length > 1) {
+			throw new ClearanceError({ code: "SCIM_RUNTIME_MEMBERSHIP_INVALID", message: "SCIM runtime membership is invalid", stage: "scim.runtime.apply", status: 409 });
+		}
+		const runtimeMembershipId = typeof runtimeMembership.rows[0]?.id === "string"
+			? runtimeMembership.rows[0].id
+			: snapshotMembership?.id ?? newId("mem");
+		if (runtimeMembership.rows.length === 0) {
+			await input.query(
+				`insert into member (id, "organizationId", "userId", role, "createdAt") values ($1, $2, $3, 'member', $4)`,
+				[runtimeMembershipId, input.organization.id, runtimeUserId, new Date(input.timestamp)],
+			);
+		}
+		if (!snapshotMembership) {
+			input.data.memberships.push({ id: runtimeMembershipId, organizationId: input.organization.id, principalId: runtimeUserId, role: "member", status: "active", source: "scim", createdAt: input.timestamp, updatedAt: input.timestamp } satisfies Membership);
+			membershipsCreated += 1;
+		} else if (snapshotMembership.status !== "active") {
+			Object.assign(snapshotMembership, {
+				role: "member",
+				status: "active",
+				source: "scim",
+				updatedAt: input.timestamp,
+			});
+		}
+	}
+	return { created, updated, membershipsCreated };
 }
 
 /**
@@ -1507,6 +1960,18 @@ type NormalizedAuthorizationFacade = Readonly<{
 		organizationId: string;
 		transaction?: AuthorizationTransaction;
 	}): Promise<{ organizationId: string; revision: string; initialized: boolean }>;
+	archiveOrganization(input: {
+		organizationId: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<{
+		organizationId: string;
+		previousRevision: string;
+		revision: string;
+		archived: boolean;
+		removedAssignments: number;
+		disabledServiceAccounts: number;
+		revokedCredentials: number;
+	}>;
 	upsertRole(input: {
 		role: {
 			roleId: string;
@@ -1768,12 +2233,61 @@ async function synchronizePrincipalAuthorization(
 		stage: input.stage,
 	});
 	const custom = customAuthorityRoleFromDraft(data, resolved, input.scope);
-	if (custom) await authorization.upsertRole({ ...custom, transaction });
-	return authorization.replaceSubjectRoles({
+	const customRoleSync = custom
+		? await authorization.upsertRole({ ...custom, transaction })
+		: undefined;
+	const customRoleRevision = customRoleSync?.affectedOrganizations.find(
+		(candidate) => candidate.organizationId === input.organizationId,
+	);
+	const assignmentSync = await authorization.replaceSubjectRoles({
 		organizationId: input.organizationId,
 		subject: { kind: "principal", id: input.principalId },
 		roleIds: [resolved.roleId],
 		transaction,
+	});
+	return {
+		changed: Boolean(customRoleSync?.changed) || assignmentSync.changed,
+		previousRevision:
+			customRoleRevision?.previousRevision ?? assignmentSync.previousRevision,
+		revision: assignmentSync.revision,
+	};
+}
+
+function appendAuthorizationAssignmentReconcileAudit(
+	data: DataStoreSnapshot,
+	input: {
+		organization: Organization;
+		principalId: string;
+		role: string;
+		previousRevision: string;
+		revision: string;
+		membershipRepaired: boolean;
+		authorizationRepaired: boolean;
+		actor?: string;
+		source?: MembershipActorSource;
+	},
+): void {
+	const repairedPlanes = [
+		...(input.membershipRepaired ? ["membership"] : []),
+		...(input.authorizationRepaired ? ["authorization"] : []),
+	];
+	appendAuditEvent(data, {
+		actor: input.actor ?? "operator",
+		action: "authorization.assignment.reconcile",
+		subjectType: "principal",
+		subjectId: input.principalId,
+		outcome: "success",
+		source: input.source === "import" ? "migration" : input.source ?? "cli",
+		organizationId: input.organization.id,
+		projectId: input.organization.projectId,
+		environmentId: input.organization.environmentId,
+		message: `Reconciled ${repairedPlanes.join(" and ")} state for principal ${input.principalId}`,
+		metadata: {
+			role: input.role,
+			previousRevision: input.previousRevision,
+			revision: input.revision,
+			repairedPlanes,
+		},
 	});
 }
 
@@ -1811,7 +2325,7 @@ export async function provisionOrganizationInAuth(
 	const ownerMembershipId = newId("mem").replace(/^mem_/, "mem");
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, principals, query }) => {
+	return mutateCoordinated(async ({ data, principals, topology, query, appendAudit }) => {
 		const owner = await findPrincipalInScope(
 			data,
 			principals,
@@ -1820,7 +2334,11 @@ export async function provisionOrganizationInAuth(
 			stage,
 		);
 		await requireRuntimeUser(query, owner.id, stage);
-		if (
+		if (topology) {
+			await requireTopologyScope(topology, scope, stage);
+			assertTopologyOrganizationSlug(slug, stage);
+			await assertTopologyOrganizationSlugAvailable(topology, scope, slug, stage);
+		} else if (
 			data.organizations.some(
 				(organization) =>
 					organization.slug === slug &&
@@ -1856,7 +2374,11 @@ export async function provisionOrganizationInAuth(
 			createdAt: now,
 			updatedAt: now,
 		};
-		data.organizations.push(organization);
+		if (topology) {
+			await topology.upsertOrganization(organization);
+		} else {
+			data.organizations.push(organization);
+		}
 		data.memberships.push({
 			id: ownerMembershipId,
 			organizationId,
@@ -1867,7 +2389,7 @@ export async function provisionOrganizationInAuth(
 			createdAt: now,
 			updatedAt: now,
 		});
-		appendAuditEvent(data, {
+		appendAudit({
 			actor: input.actor ?? owner.email,
 			action: "orgs.sync_runtime",
 			subjectType: "organization",
@@ -1879,7 +2401,7 @@ export async function provisionOrganizationInAuth(
 			environmentId: scope.environmentId,
 			message: `Synced runtime organization ${organization.slug}`,
 		});
-		appendAuditEvent(data, {
+		appendAudit({
 			actor: input.actor ?? owner.email,
 			action: "orgs.members.sync_runtime",
 			subjectType: "membership",
@@ -1901,6 +2423,276 @@ export async function provisionOrganizationInAuth(
 			roleIds: ["role_builtin_owner"],
 			transaction,
 		});
+		return { ...organization };
+	});
+}
+
+/**
+ * Reconcile a runtime organization that already exists with management. This
+ * deliberately differs from provisioning: the runtime organization and owner
+ * membership must be present before the transaction begins. Their exact rows
+ * are locked and validated, then topology, management membership, audit, and
+ * normalized authorization are reconciled through that same transaction.
+ *
+ * This is exported only for the identity bridge; callers creating a new org
+ * must use provisionOrganizationInAuth so the runtime insert is atomic too.
+ */
+export async function reconcileExistingRuntimeOrganizationInAuth(
+	store: ManagementStore,
+	input: {
+		organization: {
+			id: string;
+			name: string;
+			slug: string;
+			createdAt?: string | Date;
+			ownerMembershipId?: string;
+		};
+		ownerPrincipalId: string;
+		scope?: ResourceScope;
+		actor?: string;
+	},
+): Promise<Organization> {
+	await ensureAuthMigrated();
+	const stage = "identity.organization_sync";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const { mutateCoordinated } = requireCoordinatedStore(
+		store,
+		stage,
+		"ORGANIZATION_SYNC_BACKEND_INVALID",
+	);
+	const requestedMembershipId = input.organization.ownerMembershipId?.trim() || undefined;
+
+	return mutateCoordinated(async ({ data, principals, topology, query, appendAudit }) => {
+		const runtimeOrganizationResult = await query(
+			`select id, name, slug, "createdAt" from organization where id = $1 for update`,
+			[input.organization.id],
+		);
+		const runtimeOrganization = runtimeOrganizationResult.rows[0];
+		if (!runtimeOrganization) {
+			throw new ClearanceError({
+				code: "RUNTIME_ORGANIZATION_NOT_FOUND",
+				message: "Runtime organization was not found; refusing management-only reconciliation",
+				stage,
+				status: 404,
+			});
+		}
+		if (
+			String(runtimeOrganization.name) !== input.organization.name ||
+			String(runtimeOrganization.slug) !== input.organization.slug
+		) {
+			throw new ClearanceError({
+				code: "RUNTIME_ORGANIZATION_MISMATCH",
+				message: "Runtime organization no longer matches the requested reconciliation identity",
+				stage,
+				status: 409,
+			});
+		}
+
+		const membershipResult = requestedMembershipId
+			? await query(
+				`select id, "organizationId", "userId", role from member where id = $1 for update`,
+				[requestedMembershipId],
+			)
+			: await query(
+				`select id, "organizationId", "userId", role
+				 from member where "organizationId" = $1 and "userId" = $2
+				 order by "createdAt" asc, id asc limit 2 for update`,
+				[input.organization.id, input.ownerPrincipalId],
+			);
+		if (membershipResult.rows.length !== 1) {
+			throw new ClearanceError({
+				code: "RUNTIME_OWNER_MEMBERSHIP_NOT_FOUND",
+				message: "Runtime owner membership was not found or is ambiguous",
+				stage,
+				status: 409,
+			});
+		}
+		const runtimeMembership = membershipResult.rows[0]!;
+		const runtimeMembershipId = String(runtimeMembership.id);
+		if (
+			String(runtimeMembership.organizationId) !== input.organization.id ||
+			String(runtimeMembership.userId) !== input.ownerPrincipalId ||
+			String(runtimeMembership.role) !== "owner"
+		) {
+			throw new ClearanceError({
+				code: "RUNTIME_OWNER_MEMBERSHIP_MISMATCH",
+				message: "Runtime membership is not the requested organization's owner binding",
+				stage,
+				status: 409,
+			});
+		}
+
+		const owner = await findPrincipalInScope(
+			data,
+			principals,
+			input.ownerPrincipalId,
+			scope,
+			stage,
+		);
+		await requireRuntimeUser(query, owner.id, stage);
+		const now = nowIso();
+		const runtimeCreatedAt = runtimeOrganization.createdAt instanceof Date
+			? runtimeOrganization.createdAt
+			: new Date(String(runtimeOrganization.createdAt));
+		const createdAt = Number.isNaN(runtimeCreatedAt.getTime())
+			? now
+			: runtimeCreatedAt.toISOString();
+		const candidate: Organization = {
+			id: input.organization.id,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+			name: String(runtimeOrganization.name),
+			slug: String(runtimeOrganization.slug),
+			status: "active",
+			createdAt,
+			updatedAt: now,
+		};
+
+		let organization: Organization;
+		let organizationChanged = false;
+		if (topology) {
+			await requireTopologyScope(topology, scope, stage);
+			assertTopologyOrganizationSlug(candidate.slug, stage);
+			const existing = await topology.lockOrganization({ scope, id: candidate.id });
+			const [idExists, slugConflict] = await Promise.all([
+				topology.organizationIdExists(candidate.id),
+				topology.getOrganizationBySlug({ scope, slug: candidate.slug }),
+			]);
+			if (idExists && !existing) {
+				throw new ClearanceError({
+					code: "ORGANIZATION_SCOPE_CONFLICT",
+					message: "Runtime organization id is already bound to another scope",
+					stage,
+					status: 409,
+				});
+			}
+			if (slugConflict && slugConflict.id !== candidate.id) {
+				throw new ClearanceError({
+					code: "ORG_SLUG_EXISTS",
+					message: `Organization slug ${candidate.slug} already exists`,
+					stage,
+					status: 409,
+				});
+			}
+			organizationChanged = !existing ||
+				existing.name !== candidate.name ||
+				existing.slug !== candidate.slug ||
+				existing.status !== "active";
+			organization = organizationChanged
+				? await topology.upsertOrganization(existing ? { ...existing, ...candidate } : candidate)
+				: existing!;
+		} else {
+			const existing = data.organizations.find((item) => item.id === candidate.id);
+			if (existing && (existing.projectId !== scope.projectId || existing.environmentId !== scope.environmentId)) {
+				throw new ClearanceError({ code: "ORGANIZATION_SCOPE_CONFLICT", message: "Runtime organization id is already bound to another scope", stage, status: 409 });
+			}
+			const slugConflict = data.organizations.find(
+				(item) => item.id !== candidate.id && item.slug === candidate.slug && item.projectId === scope.projectId && item.environmentId === scope.environmentId && item.status !== "archived",
+			);
+			if (slugConflict) {
+				throw new ClearanceError({ code: "ORG_SLUG_EXISTS", message: `Organization slug ${candidate.slug} already exists`, stage, status: 409 });
+			}
+			organizationChanged = !existing || existing.name !== candidate.name || existing.slug !== candidate.slug || existing.status !== "active";
+			if (existing) {
+				Object.assign(existing, candidate);
+				organization = existing;
+			} else {
+				data.organizations.push(candidate);
+				organization = candidate;
+			}
+		}
+
+		const byStableId = data.memberships.find((membership) => membership.id === runtimeMembershipId);
+		if (byStableId && (byStableId.organizationId !== organization.id || byStableId.principalId !== owner.id)) {
+			throw new ClearanceError({ code: "MEMBERSHIP_ID_CONFLICT", message: "Runtime owner membership id is already bound to a different organization or principal", stage, status: 409 });
+		}
+		const activeMembership = data.memberships.find(
+			(membership) => membership.organizationId === organization.id && membership.principalId === owner.id && membership.status === "active",
+		);
+		let membershipChanged = false;
+		if (activeMembership) {
+			if (activeMembership.id !== runtimeMembershipId) {
+				if (byStableId && byStableId !== activeMembership) {
+					const index = data.memberships.indexOf(byStableId);
+					if (index >= 0) data.memberships.splice(index, 1);
+				}
+				activeMembership.id = runtimeMembershipId;
+				membershipChanged = true;
+			}
+			if (activeMembership.role !== "owner") {
+				activeMembership.role = "owner";
+				membershipChanged = true;
+			}
+			if (membershipChanged) activeMembership.updatedAt = now;
+		} else if (byStableId) {
+			byStableId.status = "active";
+			byStableId.role = "owner";
+			byStableId.updatedAt = now;
+			membershipChanged = true;
+		} else {
+			data.memberships.push({
+				id: runtimeMembershipId,
+				organizationId: organization.id,
+				principalId: owner.id,
+				role: "owner",
+				status: "active",
+				source: "manual",
+				createdAt: now,
+				updatedAt: now,
+			});
+			membershipChanged = true;
+		}
+
+		if (organizationChanged) {
+			appendAudit({
+				actor: input.actor ?? owner.email,
+				action: "orgs.sync_runtime",
+				subjectType: "organization",
+				subjectId: organization.id,
+				outcome: "success",
+				source: "system",
+				organizationId: organization.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Synced runtime organization ${organization.slug}`,
+			});
+		}
+		if (membershipChanged) {
+			appendAudit({
+				actor: input.actor ?? owner.email,
+				action: "orgs.members.sync_runtime",
+				subjectType: "membership",
+				subjectId: runtimeMembershipId,
+				outcome: "success",
+				source: "system",
+				organizationId: organization.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Synced runtime owner ${owner.email}`,
+			});
+		}
+		const authorizationSync = await synchronizePrincipalAuthorization(data, query, {
+			organizationId: organization.id,
+			principalId: owner.id,
+			roleSlug: "owner",
+			scope,
+			stage,
+		});
+		if (authorizationSync.changed && !organizationChanged && !membershipChanged) {
+			appendAudit({
+				actor: input.actor ?? owner.email,
+				action: "authorization.owner.reconcile",
+				subjectType: "organization",
+				subjectId: organization.id,
+				outcome: "success",
+				source: "system",
+				organizationId: organization.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Reconciled normalized owner authorization for ${organization.slug}`,
+				metadata: { revision: authorizationSync.revision },
+			});
+		}
 		return { ...organization };
 	});
 }
@@ -2525,6 +3317,98 @@ function findOrgInScope(
 	return org;
 }
 
+async function requireTopologyScope(
+	topology: StoreV2TopologyRepository,
+	scope: ResourceScope,
+	stage: string,
+): Promise<void> {
+	const project = await topology.lockProject({ id: scope.projectId });
+	const environment = project
+		? await topology.lockEnvironment({
+			projectId: scope.projectId,
+			id: scope.environmentId,
+		})
+		: null;
+	if (project && environment) return;
+	throw new ClearanceError({
+		code: "ORG_SCOPE_NOT_FOUND",
+		message: "Organization project/environment scope was not found",
+		stage,
+		status: 404,
+	});
+}
+
+function assertTopologyOrganizationSlug(slug: string, stage: string): void {
+	if (!slug || !ORG_SLUG_RE.test(slug) || slug.length > 48) {
+		throw new ClearanceError({
+			code: "ORG_SLUG_INVALID",
+			message:
+				"Slug must be 1–48 chars of lowercase alphanumeric segments separated by single hyphens",
+			stage,
+			status: 400,
+			remediation: "Use a slug like acme-corp (lowercase, hyphens only)",
+		});
+	}
+}
+
+async function assertTopologyOrganizationSlugAvailable(
+	topology: StoreV2TopologyReader,
+	scope: ResourceScope,
+	slug: string,
+	stage: string,
+	excludeId?: string,
+): Promise<void> {
+	const conflict = await topology.getOrganizationBySlug({ scope, slug });
+	if (conflict && conflict.id !== excludeId) {
+		throw new ClearanceError({
+			code: "ORG_SLUG_EXISTS",
+			message: `Organization slug ${slug} already exists in this environment`,
+			stage,
+			status: 409,
+		});
+	}
+}
+
+async function findTopologyOrgInScope(
+	topology: StoreV2TopologyReader,
+	id: string,
+	scope: ResourceScope,
+	stage: string,
+	includeArchived = false,
+): Promise<Organization> {
+	const organization = await topology.getOrganization({ scope, id });
+	if (!organization || (!includeArchived && organization.status === "archived")) {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage,
+			status: 404,
+		});
+	}
+	return organization;
+}
+
+async function findCoordinatedOrgInScope(
+	data: DataStoreSnapshot,
+	topology: StoreV2TopologyRepository | undefined,
+	id: string,
+	scope: ResourceScope,
+	stage: string,
+): Promise<Organization> {
+	if (!topology) return findOrgInScope(data, id, scope, stage);
+	await requireTopologyScope(topology, scope, stage);
+	const organization = await topology.lockOrganization({ scope, id });
+	if (!organization || organization.status === "archived") {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage,
+			status: 404,
+		});
+	}
+	return organization;
+}
+
 async function requireRuntimeOrg(
 	query: CoordinatedQuery,
 	id: string,
@@ -2622,8 +3506,14 @@ export async function addMemberInAuth(
 		stage,
 	});
 
-	return mutateCoordinated(async ({ data, principals, query }) => {
-		const org = findOrgInScope(data, input.organizationId, scope, stage);
+	return mutateCoordinated(async ({ data, principals, topology, query }) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			input.organizationId,
+			scope,
+			stage,
+		);
 		const principal = await findPrincipalInScope(
 			data,
 			principals,
@@ -2667,10 +3557,12 @@ export async function addMemberInAuth(
 
 		// Idempotent: both sides present with stable id → return without second audit
 		if (mgmtActive && runtimeMember) {
+			let membershipRepaired = false;
 			if (mgmtActive.id !== runtimeMember.id) {
 				// Prefer runtime id as canonical; rewrite management id deterministically
 				mgmtActive.id = runtimeMember.id;
 				mgmtActive.updatedAt = now;
+				membershipRepaired = true;
 			}
 			// Keep existing role on pure duplicate (do not silently change)
 			if (runtimeMember.role !== mgmtActive.role) {
@@ -2678,14 +3570,28 @@ export async function addMemberInAuth(
 					mgmtActive.role,
 					runtimeMember.id,
 				]);
+				membershipRepaired = true;
 			}
-			await synchronizePrincipalAuthorization(data, query, {
+			const authorizationSync = await synchronizePrincipalAuthorization(data, query, {
 				organizationId: org.id,
 				principalId: principal.id,
 				roleSlug: mgmtActive.role,
 				scope,
 				stage,
 			});
+			if (membershipRepaired || authorizationSync.changed) {
+				appendAuthorizationAssignmentReconcileAudit(data, {
+					organization: org,
+					principalId: principal.id,
+					role: mgmtActive.role,
+					previousRevision: authorizationSync.previousRevision,
+					revision: authorizationSync.revision,
+					membershipRepaired,
+					authorizationRepaired: authorizationSync.changed,
+					actor: input.actor,
+					source: input.auditSource,
+				});
+			}
 			return { ...mgmtActive };
 		}
 
@@ -2831,7 +3737,7 @@ export async function updateMemberInAuth(
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, principals, query }) => {
+	return mutateCoordinated(async ({ data, principals, topology, query }) => {
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			// Try runtime-only membership by id — fail closed (not auto-create on update)
@@ -2855,7 +3761,13 @@ export async function updateMemberInAuth(
 			});
 		}
 
-		const org = findOrgInScope(data, row.organizationId, scope, stage);
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			row.organizationId,
+			scope,
+			stage,
+		);
 		const principal = await findPrincipalInScope(
 			data,
 			principals,
@@ -2887,16 +3799,30 @@ export async function updateMemberInAuth(
 					remediation: "Repair runtime/management membership parity before updating",
 				});
 			}
-			if (runtime.id !== row.id) {
+			const membershipRepaired = runtime.id !== row.id;
+			if (membershipRepaired) {
 				row.id = runtime.id;
 			}
-			await synchronizePrincipalAuthorization(data, query, {
+			const authorizationSync = await synchronizePrincipalAuthorization(data, query, {
 				organizationId: org.id,
 				principalId: principal.id,
 				roleSlug: row.role,
 				scope,
 				stage,
 			});
+			if (membershipRepaired || authorizationSync.changed) {
+				appendAuthorizationAssignmentReconcileAudit(data, {
+					organization: org,
+					principalId: principal.id,
+					role: row.role,
+					previousRevision: authorizationSync.previousRevision,
+					revision: authorizationSync.revision,
+					membershipRepaired,
+					authorizationRepaired: authorizationSync.changed,
+					actor: input.actor,
+					source: input.auditSource,
+				});
+			}
 			return { ...row };
 		}
 
@@ -2987,7 +3913,7 @@ export async function removeMemberInAuth(
 	const scope = input?.scope ?? resolveOperatorScope(store);
 	const now = nowIso();
 
-	return mutateCoordinated(async ({ data, principals, query }) => {
+	return mutateCoordinated(async ({ data, principals, topology, query }) => {
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			const runtimeOnly = await loadRuntimeMemberById(query, id);
@@ -3010,7 +3936,13 @@ export async function removeMemberInAuth(
 			});
 		}
 
-		const org = findOrgInScope(data, row.organizationId, scope, stage);
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			row.organizationId,
+			scope,
+			stage,
+		);
 		// Principal may already be disabled; still allow remove if in scope
 		const principal = principals
 			? await principals.getById({ scope, id: row.principalId, includeDeleted: true })
@@ -3123,8 +4055,16 @@ export async function listRolesFromAuth(
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const authorization = requireAuthorizationFacade(scope, "roles.list");
 	if (input.organizationId) {
-		findOrgInScope(store.snapshot, input.organizationId, scope, "roles.list");
-		await authorization.initializeOrganization({ organizationId: input.organizationId });
+		if (store.storeV2Topology?.authoritative) {
+			await findTopologyOrgInScope(
+				store.storeV2Topology,
+				input.organizationId,
+				scope,
+				"roles.list",
+			);
+		} else {
+			findOrgInScope(store.snapshot, input.organizationId, scope, "roles.list");
+		}
 	}
 	const shadows = new Map(
 		(store.snapshot.roles ?? []).map((role) => [role.id, role]),
@@ -3190,15 +4130,34 @@ export async function createRoleInAuth(
 	const description = typeof input.description === "string" && input.description.trim()
 		? input.description.trim().slice(0, 256)
 		: undefined;
-	if (input.organizationId) findOrgInScope(store.snapshot, input.organizationId, scope, stage);
+	if (input.organizationId) {
+		if (store.storeV2Topology?.authoritative) {
+			await findTopologyOrgInScope(
+				store.storeV2Topology,
+				input.organizationId,
+				scope,
+				stage,
+			);
+		} else {
+			findOrgInScope(store.snapshot, input.organizationId, scope, stage);
+		}
+	}
 	const { mutateCoordinated } = requireCoordinatedStore(
 		store,
 		stage,
 		"ROLE_LIFECYCLE_BACKEND",
 	);
-	return mutateCoordinated(async ({ data, query }) => {
+	return mutateCoordinated(async ({ data, topology, query }) => {
 		const authorization = requireAuthorizationFacade(scope, stage);
-		if (input.organizationId) findOrgInScope(data, input.organizationId, scope, stage);
+		if (input.organizationId) {
+			await findCoordinatedOrgInScope(
+				data,
+				topology,
+				input.organizationId,
+				scope,
+				stage,
+			);
+		}
 		if (!Array.isArray(data.roles)) data.roles = [];
 		const conflict = data.roles.find(
 			(role) =>
@@ -3372,8 +4331,14 @@ export async function reconcileAuthorizationOrganizationInAuth(
 		"AUTHORIZATION_RECONCILE_BACKEND",
 	);
 	const apply = input.dryRun === false && input.confirm === true;
-	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
-		const org = findOrgInScope(data, input.organizationId, scope, stage);
+	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			input.organizationId,
+			scope,
+			stage,
+		);
 		const authorization = requireAuthorizationFacade(scope, stage);
 		const transaction = authorizationTransaction(query);
 		const initialized = await authorization.initializeOrganization({
@@ -3778,7 +4743,11 @@ export async function inspectEffectiveAuthorizationInAuth(
 	const stage = "authorization.inspect";
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
-	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	if (store.storeV2Topology?.authoritative) {
+		await findTopologyOrgInScope(store.storeV2Topology, organizationId, scope, stage);
+	} else {
+		findOrgInScope(store.snapshot, organizationId, scope, stage);
+	}
 	const authorization = requireAuthorizationFacade(scope, stage);
 	const subject = authorizationSubject(input.subject, stage);
 	await requireAuthorizationSubjectInOrganization(store.snapshot, authorization, {
@@ -3802,7 +4771,11 @@ export async function listAuthorizationAssignmentsInAuth(
 	const stage = "authorization.assignments.list";
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
-	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	if (store.storeV2Topology?.authoritative) {
+		await findTopologyOrgInScope(store.storeV2Topology, organizationId, scope, stage);
+	} else {
+		findOrgInScope(store.snapshot, organizationId, scope, stage);
+	}
 	const authorization = requireAuthorizationFacade(scope, stage);
 	const subject = input.subject ? authorizationSubject(input.subject, stage) : undefined;
 	if (subject) {
@@ -3831,8 +4804,14 @@ export async function replaceAuthorizationAssignmentsInAuth(
 	const roleIds = authorizationRoleIds(input.roleIds, stage);
 	const expectedRevision = input.expectedRevision === undefined ? undefined : authorizationInputId(input.expectedRevision, "expectedRevision", stage);
 	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_ASSIGNMENT_BACKEND");
-	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
-		const org = findOrgInScope(data, organizationId, scope, stage);
+	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			organizationId,
+			scope,
+			stage,
+		);
 		const authorization = requireAuthorizationFacade(scope, stage);
 		const transaction = authorizationTransaction(query);
 		await requireAuthorizationSubjectInOrganization(data, authorization, {
@@ -3876,7 +4855,11 @@ export async function listServiceAccountsInAuth(
 	const stage = "authorization.service_accounts.list";
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
-	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	if (store.storeV2Topology?.authoritative) {
+		await findTopologyOrgInScope(store.storeV2Topology, organizationId, scope, stage);
+	} else {
+		findOrgInScope(store.snapshot, organizationId, scope, stage);
+	}
 	return (await requireAuthorizationFacade(scope, stage).listServiceAccounts({ organizationId })).map(authorizationServiceAccountView);
 }
 
@@ -3905,8 +4888,14 @@ export async function createServiceAccountInAuth(
 	const roleIds = authorizationRoleIds(input.roleIds ?? [], stage);
 	const serviceAccountId = input.serviceAccountId === undefined ? newId("svc") : authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
 	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_SERVICE_ACCOUNT_BACKEND");
-	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
-		const org = findOrgInScope(data, organizationId, scope, stage);
+	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			organizationId,
+			scope,
+			stage,
+		);
 		const result = await requireAuthorizationFacade(scope, stage).createServiceAccount({ organizationId: org.id, serviceAccountId, name, roleIds, transaction: authorizationTransaction(query) });
 		authorizationAudit(data, { action: "authorization.service_accounts.create", subjectType: "service_account", subjectId: serviceAccountId, organization: org, actor: input.actor, source: input.source, message: `Created service account ${name}`, metadata: { serviceAccountId, roleIds, previousRevision: result.previousRevision, revision: result.revision } });
 		return { serviceAccount: authorizationServiceAccountView(result.serviceAccount), previousRevision: result.previousRevision, revision: result.revision };
@@ -3935,8 +4924,14 @@ export async function setServiceAccountStatusInAuth(
 	const serviceAccountId = authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
 	if (input.status !== "active" && input.status !== "disabled") throw new ClearanceError({ code: "AUTHORIZATION_SERVICE_ACCOUNT_STATUS_INVALID", message: "status must be active or disabled", stage, status: 400 });
 	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_SERVICE_ACCOUNT_BACKEND");
-	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
-		const org = findOrgInScope(data, organizationId, scope, stage);
+	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			organizationId,
+			scope,
+			stage,
+		);
 		const result = await requireAuthorizationFacade(scope, stage).setServiceAccountStatus({ organizationId: org.id, serviceAccountId, status: input.status, transaction: authorizationTransaction(query) });
 		if (result.previousRevision !== result.revision) authorizationAudit(data, { action: "authorization.service_accounts.status", subjectType: "service_account", subjectId: serviceAccountId, organization: org, actor: input.actor, source: input.source, message: `Set service account ${serviceAccountId} ${input.status}`, metadata: { status: input.status, previousRevision: result.previousRevision, revision: result.revision } });
 		return { serviceAccount: authorizationServiceAccountView(result.serviceAccount), previousRevision: result.previousRevision, revision: result.revision };
@@ -3965,8 +4960,14 @@ async function mutateServiceAccountCredentialInAuth<Operation extends Authorizat
 	if ((operation === "rotate" || operation === "revoke") && !credentialId) throw new ClearanceError({ code: "AUTHORIZATION_CREDENTIAL_ID_REQUIRED", message: "credentialId is required", stage, status: 400 });
 	const expiresAt = operation === "revoke" ? undefined : authorizationExpiry(input.expiresAt, stage);
 	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_CREDENTIAL_BACKEND");
-	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
-		const org = findOrgInScope(data, organizationId, scope, stage);
+	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = await findCoordinatedOrgInScope(
+			data,
+			topology,
+			organizationId,
+			scope,
+			stage,
+		);
 		const authorization = requireAuthorizationFacade(scope, stage);
 		const transaction = authorizationTransaction(query);
 		if (operation === "revoke") {
@@ -4118,11 +5119,22 @@ export async function updateOrganizationInAuth(
 
 	return mutateCoordinated(async ({
 		data,
+		topology,
 		query,
+		appendAudit,
 		enqueueDelivery,
 		fanoutWebhookEndpoints,
 	}) => {
-		const org = findOrgInScope(data, id, scope, "orgs.update");
+		const org = topology
+			? await (async () => {
+				await requireTopologyScope(topology, scope, "orgs.update");
+				const locked = await topology.lockOrganization({ scope, id });
+				if (!locked || locked.status === "archived") {
+					throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.update", status: 404 });
+				}
+				return locked;
+			})()
+			: findOrgInScope(data, id, scope, "orgs.update");
 		const runtime = await requireRuntimeOrg(query, org.id, "orgs.update");
 
 		// Intended final canonical values: request overlays management snapshot.
@@ -4142,7 +5154,15 @@ export async function updateOrganizationInAuth(
 		}
 
 		// Fail closed on slug uniqueness before any write.
-		if (finalSlug !== org.slug) {
+		if (finalSlug !== org.slug && topology) {
+			await assertTopologyOrganizationSlugAvailable(
+				topology,
+				scope,
+				finalSlug,
+				"orgs.update",
+				org.id,
+			);
+		} else if (finalSlug !== org.slug) {
 			const conflict = data.organizations.find(
 				(o) =>
 					o.id !== org.id &&
@@ -4202,28 +5222,36 @@ export async function updateOrganizationInAuth(
 			});
 		}
 
-		org.name = finalName;
-		org.slug = finalSlug;
-		org.updatedAt = now;
+		const nextOrganization: Organization = {
+			...org,
+			name: finalName,
+			slug: finalSlug,
+			updatedAt: now,
+		};
+		if (topology) {
+			await topology.upsertOrganization(nextOrganization);
+		} else {
+			Object.assign(org, nextOrganization);
+		}
 
-		appendAuditEvent(data, {
+		appendAudit({
 			correlationId: corr,
 			actor: input.actor ?? "operator",
 			action: "orgs.update",
 			subjectType: "organization",
-			subjectId: org.id,
+			subjectId: nextOrganization.id,
 			outcome: "success",
 			source,
-			projectId: org.projectId,
-			environmentId: org.environmentId,
-			organizationId: org.id,
+			projectId: nextOrganization.projectId,
+			environmentId: nextOrganization.environmentId,
+			organizationId: nextOrganization.id,
 			message: runtimeDiverged && !managementChanged
-				? `Reconciled organization ${org.name} runtime to management`
-				: `Updated organization ${org.name}`,
+				? `Reconciled organization ${nextOrganization.name} runtime to management`
+				: `Updated organization ${nextOrganization.name}`,
 			metadata: {
 				fields,
 				before,
-				after: { name: org.name, slug: org.slug },
+				after: { name: nextOrganization.name, slug: nextOrganization.slug },
 				...(runtimeDiverged
 					? {
 							runtimeBefore,
@@ -4239,7 +5267,7 @@ export async function updateOrganizationInAuth(
 				source,
 				correlationId: corr,
 			},
-			organization: { ...org },
+			organization: { ...nextOrganization },
 			before,
 			occurredAt: new Date(now),
 		}) ?? [];
@@ -4258,12 +5286,12 @@ export async function updateOrganizationInAuth(
 				source,
 				correlationId: corr,
 			},
-			organization: { ...org },
+			organization: { ...nextOrganization },
 			before,
 			occurredAt: new Date(now),
 		});
 
-		return { ...org };
+		return { ...nextOrganization };
 	});
 }
 
@@ -4276,6 +5304,8 @@ export async function updateOrganizationInAuth(
  * - Preserve management organization row with status=archived (tombstone keeps
  *   the stable organization id for audit/recovery).
  * - Soft-remove all active management memberships for the org (status=removed).
+ * - Terminalize normalized authorization, including machine credentials, in
+ *   the same transaction so no archived organization retains live access.
  * - Exactly one success audit on first archive; re-archive is idempotent with
  *   no duplicate audit.
  * - Owner/last-owner membership invariants are intentionally not enforced: archive
@@ -4294,6 +5324,8 @@ export async function archiveOrganizationInAuth(
 		actor?: string;
 		source?: OrgLifecycleSource;
 		scope?: ResourceScope;
+		correlationId?: string;
+		webhookTargets?: readonly ValidatedManagementWebhookTarget[];
 	},
 ): Promise<ArchiveOrganizationResult> {
 	const scope = input?.scope ?? resolveOperatorScope(store);
@@ -4309,20 +5341,32 @@ export async function archiveOrganizationInAuth(
 	}
 
 	// Locate including already-archived for idempotent re-archive under scope.
-	const existing = store.snapshot.organizations.find((o) => o.id === orgId);
-	if (!existing) {
-		throw new ClearanceError({
-			code: "ORG_NOT_FOUND",
-			message: "Organization not found",
-			stage: "orgs.archive",
-			status: 404,
-		});
-	}
-	assertResourceInScope(existing, scope, {
-		code: "ORG_NOT_FOUND",
-		stage: "orgs.archive",
-		label: "Organization",
-	});
+	// Once topology is authoritative the snapshot intentionally has no org rows.
+	const existing = store.storeV2Topology?.authoritative
+		? await findTopologyOrgInScope(
+			store.storeV2Topology,
+			orgId,
+			scope,
+			"orgs.archive",
+			true,
+		)
+		: (() => {
+			const organization = store.snapshot.organizations.find((o) => o.id === orgId);
+			if (!organization) {
+				throw new ClearanceError({
+					code: "ORG_NOT_FOUND",
+					message: "Organization not found",
+					stage: "orgs.archive",
+					status: 404,
+				});
+			}
+			assertResourceInScope(organization, scope, {
+				code: "ORG_NOT_FOUND",
+				stage: "orgs.archive",
+				label: "Organization",
+			});
+			return organization;
+		})();
 
 	const alreadyArchived = existing.status === "archived";
 	if (dryRun) {
@@ -4341,22 +5385,43 @@ export async function archiveOrganizationInAuth(
 		"ORG_LIFECYCLE_BACKEND",
 	);
 	const now = nowIso();
+	const corr = input?.correlationId ?? correlationId();
+	const source = input?.source === "import"
+		? "migration"
+		: input?.source ?? "cli";
 
-	return mutateCoordinated(async ({ data, query }) => {
-		const org = data.organizations.find((o) => o.id === orgId);
-		if (!org) {
-			throw new ClearanceError({
-				code: "ORG_NOT_FOUND",
-				message: "Organization not found",
-				stage: "orgs.archive",
-				status: 404,
-			});
-		}
-		assertResourceInScope(org, scope, {
-			code: "ORG_NOT_FOUND",
-			stage: "orgs.archive",
-			label: "Organization",
-		});
+	return mutateCoordinated(async ({
+		data,
+		topology,
+		query,
+		appendAudit,
+		enqueueDelivery,
+		fanoutWebhookEndpoints,
+	}) => {
+		const org = topology
+			? await (async () => {
+				await requireTopologyScope(topology, scope, "orgs.archive");
+				const locked = await topology.lockOrganization({ scope, id: orgId });
+				if (!locked) throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.archive", status: 404 });
+				return locked;
+			})()
+			: (() => {
+				const organization = data.organizations.find((o) => o.id === orgId);
+				if (!organization) {
+					throw new ClearanceError({
+						code: "ORG_NOT_FOUND",
+						message: "Organization not found",
+						stage: "orgs.archive",
+						status: 404,
+					});
+				}
+				assertResourceInScope(organization, scope, {
+					code: "ORG_NOT_FOUND",
+					stage: "orgs.archive",
+					label: "Organization",
+				});
+				return organization;
+			})();
 
 		const wasArchived = org.status === "archived";
 
@@ -4381,6 +5446,65 @@ export async function archiveOrganizationInAuth(
 			});
 		}
 
+		// Always terminalize authorization, including a topology tombstone. This
+		// closes legacy rows and lets an idempotent re-archive heal any active
+		// service account or credential that survived a prior partial archive.
+		const authorizationArchive = await requireAuthorizationFacade(
+			scope,
+			"orgs.archive",
+		).archiveOrganization({
+			organizationId: org.id,
+			transaction: authorizationTransaction(query),
+		});
+
+		// Settle every organization-bound enterprise control before removing the
+		// runtime organization. These provider tables do not rely on a runtime
+		// FK for their lifecycle, so an explicit in-transaction delete prevents
+		// archived organizations from retaining live SSO/SCIM credentials.
+		const removedSsoProviders = await query(
+			`delete from "ssoProvider" where "organizationId" = $1 returning id`,
+			[orgId],
+		);
+		const removedScimProviders = await query(
+			`delete from "scimProvider" where "organizationId" = $1 returning id`,
+			[orgId],
+		);
+		const removedIdentityConnections = data.identityConnections.filter(
+			(connection) => connection.organizationId === orgId,
+		).length;
+		const removedDirectoryConnections = data.directoryConnections.filter(
+			(connection) => connection.organizationId === orgId,
+		).length;
+		data.identityConnections = data.identityConnections.filter(
+			(connection) => connection.organizationId !== orgId,
+		);
+		data.directoryConnections = data.directoryConnections.filter(
+			(connection) => connection.organizationId !== orgId,
+		);
+		let revokedSetupCapabilities = 0;
+		for (const capability of data.setupLinks ?? []) {
+			const outstanding =
+				capability.organizationId === orgId &&
+				!capability.revokedAt &&
+				!capability.redeemedAt &&
+				capability.useCount < capability.maxUses;
+			if (outstanding) {
+				capability.revokedAt = now;
+				delete capability.reservedAt;
+				delete capability.reservationId;
+				delete capability.reservationExpiresAt;
+				revokedSetupCapabilities += 1;
+			}
+		}
+		let settledManagementMemberships = 0;
+		for (const membership of data.memberships) {
+			if (membership.organizationId === org.id && membership.status !== "removed") {
+				membership.status = "removed";
+				membership.updatedAt = now;
+				settledManagementMemberships += 1;
+			}
+		}
+
 		if (runtimeRow) {
 			// Prefer explicit member delete then org delete (documented order).
 			// Invitations cascade via organization FK ON DELETE CASCADE.
@@ -4388,45 +5512,147 @@ export async function archiveOrganizationInAuth(
 			await query(`delete from organization where id = $1`, [orgId]);
 		}
 
-		if (!wasArchived) {
-			org.status = "archived";
-			org.updatedAt = now;
+		const enqueueArchiveDelivery = async (organization: Organization): Promise<void> => {
+			const before = { name: organization.name, slug: organization.slug };
+			const context: OperationContext = {
+				scope,
+				actor: input?.actor ?? "operator",
+				source,
+				correlationId: corr,
+			};
+			const managedDeliveries = await fanoutWebhookEndpoints?.({
+				context,
+				organization,
+				before,
+				occurredAt: new Date(now),
+			}) ?? [];
+			await enqueueOrganizationUpdatedWebhooks({
+				enqueue: enqueueDelivery,
+				targets: input?.webhookTargets ?? [],
+				excludeTargetIds: new Set(managedDeliveries.map((delivery) => delivery.endpointId)),
+				excludeDestinationUrls: new Set(managedDeliveries.map((delivery) => delivery.destinationUrl)),
+				context,
+				organization,
+				before,
+				occurredAt: new Date(now),
+			});
+		};
 
-			// Soft-remove management memberships; do not enforce last-owner.
-			for (const membership of data.memberships) {
-				if (
-					membership.organizationId === org.id &&
-					membership.status === "active"
-				) {
-					membership.status = "removed";
-					membership.updatedAt = now;
-				}
+		if (!wasArchived) {
+			const archivedOrganization: Organization = {
+				...org,
+				status: "archived",
+				updatedAt: now,
+			};
+			if (topology) {
+				await topology.upsertOrganization(archivedOrganization);
+			} else {
+				Object.assign(org, archivedOrganization);
 			}
 
-			appendAuditEvent(data, {
+			appendAudit({
 				actor: input?.actor ?? "operator",
 				action: "orgs.archive",
 				subjectType: "organization",
 				subjectId: org.id,
 				outcome: "success",
-				source: (input?.source as "cli") ?? "cli",
-				projectId: org.projectId,
-				environmentId: org.environmentId,
-				organizationId: org.id,
-				message: `Archived organization ${org.name}`,
+				source,
+				projectId: archivedOrganization.projectId,
+				environmentId: archivedOrganization.environmentId,
+				organizationId: archivedOrganization.id,
+				message: `Archived organization ${archivedOrganization.name}`,
 				metadata: {
 					idempotent: false,
 					runtimeDeleted: Boolean(runtimeRow),
 					membershipsSoftRemoved: true,
+					membershipsSettled: settledManagementMemberships,
+					authorizationArchived: authorizationArchive?.archived ?? false,
+					authorizationRevision: authorizationArchive?.revision,
+					disabledServiceAccounts:
+						authorizationArchive?.disabledServiceAccounts ?? 0,
+					revokedCredentials: authorizationArchive?.revokedCredentials ?? 0,
+					enterpriseSettlement: {
+						runtimeSsoProvidersDeleted: removedSsoProviders.rowCount ?? 0,
+						runtimeScimProvidersDeleted: removedScimProviders.rowCount ?? 0,
+						identityConnectionsRemoved: removedIdentityConnections,
+						directoryConnectionsRemoved: removedDirectoryConnections,
+						setupCapabilitiesRevoked: revokedSetupCapabilities,
+					},
 				},
 			});
+			await enqueueArchiveDelivery({
+				...org,
+				status: "archived",
+				updatedAt: now,
+			});
+		} else {
+			const authorizationHealed =
+				authorizationArchive.previousRevision !== authorizationArchive.revision ||
+				authorizationArchive.removedAssignments > 0 ||
+				authorizationArchive.disabledServiceAccounts > 0 ||
+				authorizationArchive.revokedCredentials > 0;
+			const rearchiveHealed =
+				Boolean(runtimeRow) ||
+				authorizationHealed ||
+				(removedSsoProviders.rowCount ?? 0) > 0 ||
+				(removedScimProviders.rowCount ?? 0) > 0 ||
+				removedIdentityConnections > 0 ||
+				removedDirectoryConnections > 0 ||
+				revokedSetupCapabilities > 0 ||
+				settledManagementMemberships > 0;
+			if (rearchiveHealed) {
+				appendAudit({
+					actor: input?.actor ?? "operator",
+					action: "orgs.archive.reconcile",
+					subjectType: "organization",
+					subjectId: org.id,
+					outcome: "success",
+					source,
+					projectId: org.projectId,
+					environmentId: org.environmentId,
+					organizationId: org.id,
+					message: `Reconciled archived organization ${org.name}`,
+					metadata: {
+						idempotent: false,
+						runtimeDeleted: Boolean(runtimeRow),
+						authorizationRevision: authorizationArchive.revision,
+						disabledServiceAccounts:
+							authorizationArchive.disabledServiceAccounts,
+						revokedCredentials: authorizationArchive.revokedCredentials,
+						membershipsSettled: settledManagementMemberships,
+						enterpriseSettlement: {
+							runtimeSsoProvidersDeleted:
+								removedSsoProviders.rowCount ?? 0,
+							runtimeScimProvidersDeleted:
+								removedScimProviders.rowCount ?? 0,
+							identityConnectionsRemoved:
+								removedIdentityConnections,
+							directoryConnectionsRemoved:
+								removedDirectoryConnections,
+							setupCapabilitiesRevoked:
+								revokedSetupCapabilities,
+						},
+					},
+				});
+				await enqueueArchiveDelivery({ ...org });
+			}
+			return {
+				organization: { ...org },
+				dryRun: false,
+				idempotent: !rearchiveHealed,
+				wouldChange: rearchiveHealed,
+			};
 		}
 
 		return {
-			organization: { ...org },
+			organization: wasArchived ? { ...org } : {
+				...org,
+				status: "archived",
+				updatedAt: now,
+			},
 			dryRun: false,
-			idempotent: wasArchived,
-			wouldChange: !wasArchived,
+			idempotent: false,
+			wouldChange: true,
 		};
 	});
 }
