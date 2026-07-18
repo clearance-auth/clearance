@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/delivery-worker" },
-  "bin": { "clearance-delivery-worker": "./dist/cli.mjs" },
+  "bin": { "clearance-delivery-worker": "./dist/bin.mjs" },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@clearance/delivery": "workspace:*",
+    "@clearance/observability-node": "workspace:*",
     "nodemailer": "^7.0.5",
     "pg": "^8.14.1"
   },
