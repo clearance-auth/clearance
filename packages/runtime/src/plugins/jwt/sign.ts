@@ -7,7 +7,10 @@ import { ClearanceError } from "@clearance/core/error";
 import type { JWTPayload } from "jose";
 import { decodeJwt, importJWK, SignJWT } from "jose";
 import { symmetricDecrypt } from "../../crypto";
-import { readInternalEffectiveAuthorization } from "../../internal/authorization-authority";
+import {
+	authenticateInternalServiceAccountCredential,
+	readInternalEffectiveAuthorization,
+} from "../../internal/authorization-authority";
 import {
 	captureInternalSessionDerivativeAuthority,
 	validateInternalSessionDerivativeAuthority,
@@ -84,6 +87,18 @@ export const JWT_SESSION_SOURCE_ORGANIZATION_CLAIM =
 	"urn:clearance:claims:session-source-organization";
 export const JWT_AUTHORIZATION_ACTIONS_CLAIM = "actions";
 export const JWT_AUTHORIZATION_REVISION_CLAIM = "authz_revision";
+export const JWT_SUBJECT_KIND_CLAIM = "urn:clearance:claims:subject-kind";
+export const JWT_ORGANIZATION_ID_CLAIM = "urn:clearance:claims:organization-id";
+
+const JWT_RESERVED_AUTHORITY_CLAIMS = [
+	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+	JWT_AUTHORIZATION_ACTIONS_CLAIM,
+	JWT_AUTHORIZATION_REVISION_CLAIM,
+	JWT_SUBJECT_KIND_CLAIM,
+	JWT_ORGANIZATION_ID_CLAIM,
+] as const;
 
 function equalStringArrays(left: unknown, right: unknown): boolean {
 	return (
@@ -153,7 +168,13 @@ export async function signJWT(
 			aud: aud ?? defaultAud,
 		};
 		const token = await options.jwt.sign(jwtPayload);
-		if (jwtPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] !== undefined) {
+		if (
+			JWT_RESERVED_AUTHORITY_CLAIMS.some(
+				(claim) => jwtPayload[claim] !== undefined,
+			)
+		) {
+			const isMachineToken =
+				jwtPayload[JWT_SUBJECT_KIND_CLAIM] === "service_account";
 			let returnedPayload: JWTPayload;
 			try {
 				returnedPayload = decodeJwt(token);
@@ -162,42 +183,22 @@ export async function signJWT(
 					"Custom JWT signer returned an invalid session-bound token",
 				);
 			}
-			const hasAuthorizationActions =
-				jwtPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM] !== undefined;
-			const hasAuthorizationRevision =
-				jwtPayload[JWT_AUTHORIZATION_REVISION_CLAIM] !== undefined;
 			if (
-				!Object.hasOwn(
-					returnedPayload,
-					JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
-				) ||
-				!Object.hasOwn(returnedPayload, JWT_SESSION_SOURCE_SUBJECT_CLAIM) ||
-				!Object.hasOwn(
-					returnedPayload,
-					JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
-				) ||
-				returnedPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] !==
-					jwtPayload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM] ||
-				returnedPayload[JWT_SESSION_SOURCE_SUBJECT_CLAIM] !==
-					jwtPayload[JWT_SESSION_SOURCE_SUBJECT_CLAIM] ||
-				returnedPayload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM] !==
-					jwtPayload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM] ||
 				!Number.isFinite(returnedPayload.exp) ||
 				!Number.isInteger(returnedPayload.exp) ||
-				returnedPayload.exp! > exp
-				||
-				hasAuthorizationActions !==
-					Object.hasOwn(returnedPayload, JWT_AUTHORIZATION_ACTIONS_CLAIM) ||
-				hasAuthorizationRevision !==
-					Object.hasOwn(returnedPayload, JWT_AUTHORIZATION_REVISION_CLAIM) ||
-				(hasAuthorizationActions &&
-					!equalStringArrays(
-						returnedPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM],
-						jwtPayload[JWT_AUTHORIZATION_ACTIONS_CLAIM],
-					)) ||
-				(hasAuthorizationRevision &&
-					returnedPayload[JWT_AUTHORIZATION_REVISION_CLAIM] !==
-						jwtPayload[JWT_AUTHORIZATION_REVISION_CLAIM])
+				returnedPayload.exp! > exp ||
+				(isMachineToken && returnedPayload.sub !== jwtPayload.sub) ||
+				JWT_RESERVED_AUTHORITY_CLAIMS.some((claim) => {
+					const expected = jwtPayload[claim];
+					const present = Object.hasOwn(returnedPayload, claim);
+					if (expected === undefined) return present;
+					return (
+						!present ||
+						(claim === JWT_AUTHORIZATION_ACTIONS_CLAIM
+							? !equalStringArrays(returnedPayload[claim], expected)
+							: returnedPayload[claim] !== expected)
+					);
+				})
 			) {
 				throw new ClearanceError(
 					"Custom JWT signer changed session-bound authority",
@@ -257,6 +258,39 @@ export async function signJWT(
 	if (payload.nbf) jwt.setNotBefore(payload.nbf);
 	if (payload.jti) jwt.setJti(payload.jti);
 	return await jwt.sign(privateKey);
+}
+
+/** Issues a short-lived, revision-bound JWT from a service-account credential. */
+export async function issueServiceAccountJWT(
+	ctx: GenericEndpointContext,
+	options: JwtOptions | undefined,
+	input: Readonly<{ secret: string }>,
+): Promise<string> {
+	try {
+		return await runWithTransaction(ctx.context.adapter, async () => {
+			const authenticated = await authenticateInternalServiceAccountCredential(
+				ctx.context.internalAdapter,
+				input.secret,
+			);
+			if (!authenticated) throw new Error("authority unavailable");
+			return signJWT(ctx, {
+				options,
+				maxExpiresAt: authenticated.expiresAt ?? undefined,
+				payload: {
+					iat: Math.floor(Date.now() / 1000),
+					sub: authenticated.subject.id,
+					[JWT_SUBJECT_KIND_CLAIM]: "service_account",
+					[JWT_ORGANIZATION_ID_CLAIM]: authenticated.organizationId,
+					[JWT_AUTHORIZATION_ACTIONS_CLAIM]: Object.freeze([
+						...authenticated.actions,
+					]),
+					[JWT_AUTHORIZATION_REVISION_CLAIM]: authenticated.revision,
+				},
+			});
+		});
+	} catch {
+		throw new ClearanceError("Cannot issue an access token");
+	}
 }
 
 export async function getJwtToken(
