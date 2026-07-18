@@ -1,5 +1,7 @@
 import type { AuthContext, HookEndpointContext } from "@clearance/core";
 import type { AuthMiddleware } from "@clearance/core/api";
+import { generateId } from "@clearance/core/utils/id";
+import { getIp } from "@clearance/core/utils/ip";
 import {
 	getActiveTransactionAdapter,
 	isTransactionActive,
@@ -31,6 +33,15 @@ import {
 	issueInitialStagedAuthenticationCapability,
 	takeStagedAuthenticationContinuation,
 } from "../internal/staged-authentication-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	classifyRuntimeInteractiveAuthenticationRoute,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	runWithRuntimeAuditRequestContext,
+	type InternalRuntimeAuditRequestContext,
+} from "../internal/runtime-audit";
 const credentialMigrationChecks = new WeakMap<object, Promise<void>>();
 
 const rejectActiveTransactionSymbol = Symbol.for(
@@ -172,6 +183,130 @@ export function getOperationId(endpoint: Endpoint, fallback?: string): string {
 		endpoint.path ??
 		"/:virtual"
 	);
+}
+
+function dispatchRequestHeaders(input: DispatchContext): Headers | undefined {
+	if (input.headers) return new Headers(input.headers);
+	const headers = input.request?.headers;
+	return headers ? new Headers(headers) : undefined;
+}
+
+function validRequestId(value: string | null): string | null {
+	if (
+		!value ||
+		value.length > 128 ||
+		value.trim() !== value ||
+		!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)
+	) {
+		return null;
+	}
+	return value;
+}
+
+function boundedHeader(value: string | null, maximum: number): string | null {
+	if (
+		value === null ||
+		value.length > maximum ||
+		value.trim() !== value ||
+		/[\0\r\n]/.test(value)
+	) {
+		return null;
+	}
+	return value;
+}
+
+function normalizedMethod(value: string): string {
+	const method = value.toUpperCase();
+	return /^[A-Z]+$/.test(method) && method.length <= 16 ? method : "DIRECT";
+}
+
+function safeClientIp(value: string | null): string | null {
+	return value && value.length <= 64 && /^[0-9A-Fa-f:.]+$/.test(value)
+		? value
+		: null;
+}
+
+function createRuntimeAuditRequestContext(
+	input: DispatchContext,
+	operationId: string,
+	route: string,
+	method: string,
+): InternalRuntimeAuditRequestContext {
+	const headers = dispatchRequestHeaders(input);
+	return Object.freeze({
+		correlationId:
+			validRequestId(headers?.get("x-request-id") ?? null) ??
+			`rt_${generateId(24)}`,
+		operationId: operationId.slice(0, 256) || "/:virtual",
+		route: route.slice(0, 512),
+		method,
+		clientIp: safeClientIp(
+			headers ? getIp(headers, input.context.options) : null,
+		),
+		userAgent: boundedHeader(headers?.get("user-agent") ?? null, 512),
+	});
+}
+
+function stableAuditErrorCode(error: APIError): string | undefined {
+	const code = error.body?.code;
+	return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,127}$/.test(code)
+		? code
+		: undefined;
+}
+
+async function appendFailedLoginAudit(
+	context: AuthContext,
+	route: string,
+	error: APIError,
+	status: number | undefined,
+): Promise<void> {
+	const authenticationMethod =
+		classifyRuntimeInteractiveAuthenticationRoute(route);
+	if (
+		!authenticationMethod ||
+		error.body?.code === "MANAGED_AUTHENTICATION_REQUIRED"
+	) {
+		return;
+	}
+	const binding =
+		readInternalRuntimeAudit(context.options) ??
+		readInternalRuntimeAudit(context.adapter);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) {
+		throw new Error("Runtime audit request context is unavailable");
+	}
+	const httpStatus =
+		typeof status === "number" &&
+		Number.isSafeInteger(status) &&
+		status >= 100 &&
+		status <= 599
+			? status
+			: 500;
+	const code = stableAuditErrorCode(error);
+	await runWithTransaction(context.adapter, async () => {
+		const transaction = await activeDispatchTransaction(context);
+		if (!transaction) {
+			throw new Error("Runtime audit transaction is unavailable");
+		}
+		attachCapturedInternalRuntimeAudit(transaction, binding);
+		await appendInternalRuntimeAudit(transaction, {
+			actor: "anonymous",
+			action: "auth.login.failed",
+			subjectType: null,
+			subjectId: null,
+			outcome: "failure",
+			source: "system",
+			organizationId: null,
+			message: "Interactive authentication failed",
+			metadata: {
+				status: httpStatus,
+				...(code ? { code } : {}),
+				method: authenticationMethod,
+			},
+			request,
+		});
+	});
 }
 
 /**
@@ -417,6 +552,23 @@ export async function dispatchAuthEndpoint(
 	endpoint: Endpoint,
 	input: DispatchContext,
 ): Promise<unknown> {
+	const inheritedRuntimeAuditContext = await getRuntimeAuditRequestContext();
+	if (!inheritedRuntimeAuditContext) {
+		const operationId = input.operationId ?? getOperationId(endpoint);
+		const route = endpoint.path ?? "/:virtual";
+		const endpointMethod = endpoint.options?.method;
+		const defaultMethod = Array.isArray(endpointMethod)
+			? endpointMethod[0]
+			: endpointMethod;
+		const method = normalizedMethod(
+			input.method ?? input.request?.method ?? defaultMethod ?? "DIRECT",
+		);
+		return runWithRuntimeAuditRequestContext(
+			createRuntimeAuditRequestContext(input, operationId, route, method),
+			() => dispatchAuthEndpoint(endpoint, input),
+		);
+	}
+
 	const activeTransaction = await activeDispatchTransaction(input.context);
 	const createActiveTransactionError = (
 		endpoint as Endpoint & {
@@ -573,6 +725,14 @@ export async function dispatchAuthEndpoint(
 
 				internalContext.context.returned = result.response;
 				internalContext.context.responseHeaders = result.headers ?? undefined;
+				if (isAPIError(result.response)) {
+					await appendFailedLoginAudit(
+						internalContext.context,
+						route,
+						result.response,
+						result.status ?? result.response.statusCode,
+					);
+				}
 
 				const managedRemediation =
 						isAPIError(result.response) &&
@@ -592,7 +752,6 @@ export async function dispatchAuthEndpoint(
 					result.response = after.response;
 				}
 				result.headers = after.headers ?? result.headers;
-
 				if (
 					isAPIError(result.response) &&
 					shouldPublishLog(internalContext.context.logger.level, "debug")
