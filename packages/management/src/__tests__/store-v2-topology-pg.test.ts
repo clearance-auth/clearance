@@ -4,13 +4,38 @@ import {
 	inspectEnvironmentAuthoritative,
 	inspectOrganizationAuthoritative,
 	inspectProjectAuthoritative,
+	archiveOrganizationAuthoritative,
+	createEnvironmentAuthoritative,
+	createOrganizationAuthoritative,
+	createProjectAuthoritative,
 	initProject,
+	initProjectAuthoritative,
 	listEnvironmentsPageAuthoritative,
 	listOrganizationsPageAuthoritative,
 	overviewStatsAuthoritative,
+	planProjectCreateAuthoritative,
+	updateOrganizationAuthoritative,
 } from "../services/core.js";
 import { appendAuditEvent } from "../services/audit.js";
+import { runDoctor } from "../services/doctor.js";
+import {
+	createSsoConnectionAuthoritative,
+	disableSsoConnectionReal,
+	inspectSsoConnectionAuthoritative,
+	testSsoConnectionAuthoritative,
+} from "../services/sso.js";
+import {
+	createScimConnectionAuthoritative,
+	inspectScimConnectionAuthoritative,
+	testScimConnectionAuthoritative,
+} from "../services/scim.js";
+import { replayDiagnosticTraceOperational } from "../services/events.js";
+import { testScimConnectionLive } from "../services/live-conformance.js";
+import { runReadinessCheckAuthoritative } from "../services/readiness.js";
+import { createSetupLinkAuthoritative } from "../services/setup-links.js";
+import { emptySnapshot } from "../store/json-store.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
+import type { ManagementStore } from "../store/types.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
 const DATABASE_URL =
@@ -19,7 +44,29 @@ const DATABASE_URL =
 	"postgres://clearance:clearance@localhost:5434/clearance";
 const TABLE = `clearance_store_v2_topology_${process.pid}`;
 const PREFIX = `${TABLE}_n_`;
+const LIFECYCLE_TABLE = `clearance_store_v2_lifecycle_${process.pid}`;
+const LIFECYCLE_PREFIX = `${LIFECYCLE_TABLE}_n_`;
+const DOCTOR_TABLE = `clearance_store_v2_doctor_${process.pid}`;
+const DOCTOR_PREFIX = `${DOCTOR_TABLE}_n_`;
+const ENTERPRISE_TABLE = `clearance_store_v2_enterprise_${process.pid}`;
+const ENTERPRISE_PREFIX = `${ENTERPRISE_TABLE}_n_`;
 const available = await gatePostgresSuite(DATABASE_URL, "store-v2-topology-pg");
+
+function snapshotDoctorStore(
+	snapshot: ReturnType<typeof emptySnapshot>,
+): ManagementStore {
+	return {
+		backend: "json",
+		path: "/dev/null",
+		snapshot,
+		mutate(fn) {
+			fn(snapshot);
+			return snapshot;
+		},
+		async ready() {},
+		async refresh() {},
+	} as unknown as ManagementStore;
+}
 
 describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 	const stores: PgStore[] = [];
@@ -28,8 +75,38 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		for (const store of stores) await store.destroy().catch(() => undefined);
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
-			for (const table of [
-				`${PREFIX}events`,
+		for (const table of [
+			`${ENTERPRISE_PREFIX}events`,
+			`${ENTERPRISE_PREFIX}principals`,
+			`${ENTERPRISE_PREFIX}organizations`,
+			`${ENTERPRISE_PREFIX}environments`,
+			`${ENTERPRISE_PREFIX}projects`,
+			`${ENTERPRISE_PREFIX}meta`,
+			`${ENTERPRISE_TABLE}_principal_email`,
+			`${ENTERPRISE_TABLE}_organization_slug`,
+			`${ENTERPRISE_TABLE}_idempotency`,
+			ENTERPRISE_TABLE,
+			`${DOCTOR_PREFIX}events`,
+			`${DOCTOR_PREFIX}principals`,
+			`${DOCTOR_PREFIX}organizations`,
+			`${DOCTOR_PREFIX}environments`,
+			`${DOCTOR_PREFIX}projects`,
+			`${DOCTOR_PREFIX}meta`,
+			`${DOCTOR_TABLE}_principal_email`,
+			`${DOCTOR_TABLE}_organization_slug`,
+			`${DOCTOR_TABLE}_idempotency`,
+			DOCTOR_TABLE,
+			`${LIFECYCLE_PREFIX}events`,
+			`${LIFECYCLE_PREFIX}principals`,
+			`${LIFECYCLE_PREFIX}organizations`,
+			`${LIFECYCLE_PREFIX}environments`,
+			`${LIFECYCLE_PREFIX}projects`,
+			`${LIFECYCLE_PREFIX}meta`,
+			`${LIFECYCLE_TABLE}_principal_email`,
+			`${LIFECYCLE_TABLE}_organization_slug`,
+			`${LIFECYCLE_TABLE}_idempotency`,
+			LIFECYCLE_TABLE,
+			`${PREFIX}events`,
 				`${PREFIX}principals`,
 				`${PREFIX}organizations`,
 				`${PREFIX}environments`,
@@ -130,6 +207,16 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		expect(store.snapshot.projects).toEqual([]);
 		expect(store.snapshot.environments).toEqual([]);
 		expect(store.snapshot.organizations).toEqual([]);
+		const doctor = await runDoctor(store, {
+			secrets: {
+				CLEARANCE_SECRET: "super-secret-value-32chars!!",
+				DATABASE_URL: undefined,
+			},
+		});
+		expect(doctor.checks.find((check) => check.id === "project")).toMatchObject({
+			status: "pass",
+			detail: "Project Topology Authority",
+		});
 		await expect(
 			store.mutateDurable((data) => {
 				data.projects.push({
@@ -188,6 +275,33 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		expect(
 			await inspectOrganizationAuthoritative(store, "org_imported", scope),
 		).toMatchObject({ id: "org_imported" });
+		// Enterprise consumers must use relational topology after cutover: the
+		// snapshot has no organizations at this point.
+		const sso = await createSsoConnectionAuthoritative(store, {
+			organizationId: "org_imported",
+			protocol: "oidc",
+			provider: "topology-test",
+		});
+		await store.ready();
+		expect(await inspectSsoConnectionAuthoritative(store, sso.id, { scope })).toMatchObject({
+			organizationId: "org_imported",
+		});
+		const scim = await createScimConnectionAuthoritative(store, {
+			organizationId: "org_imported",
+			provider: "topology-test",
+		});
+		await store.ready();
+		expect(await inspectScimConnectionAuthoritative(store, scim.id, { scope })).toMatchObject({
+			organizationId: "org_imported",
+		});
+		expect(await createSetupLinkAuthoritative(store, {
+			organizationId: "org_imported",
+			kind: "sso",
+			scope,
+		})).toMatchObject({ capabilityId: expect.any(String) });
+		expect(await runReadinessCheckAuthoritative(store, "org_imported", scope)).toMatchObject({
+			organizationId: "org_imported",
+		});
 		const organizationFirstPage = await listOrganizationsPageAuthoritative(store, {
 			scope,
 			limit: 1,
@@ -951,5 +1065,343 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			"org_refresh_race",
 			"org_shadow",
 		]);
+	});
+
+	it("keeps lifecycle mutations and audit in relational authority without restoring snapshot topology", async () => {
+		const store = await createPgStore(DATABASE_URL, {
+			tableName: LIFECYCLE_TABLE,
+			normalizedPrefix: LIFECYCLE_PREFIX,
+		});
+		stores.push(store);
+		await store.storeV2!.apply();
+		await store.storeV2!.cutoverEvents();
+		await store.storeV2!.cutoverTopology();
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		expect(store.snapshot.organizations).toEqual([]);
+
+		const initialized = await initProjectAuthoritative(store, {
+			name: "Authority Lifecycle",
+			source: "api",
+		});
+		await store.mutateDurable((data) => {
+			const { projectId: _projectId, environmentId: _environmentId, ...config } =
+				data.meta.config;
+			data.meta.config = config;
+		});
+		const restored = await initProjectAuthoritative(store, {
+			name: "Authority Lifecycle",
+			source: "api",
+		});
+		expect(restored).toEqual(initialized);
+		expect(store.snapshot.meta.config).toMatchObject({
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		});
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		const restoredRevision = store.currentRevision;
+		await initProjectAuthoritative(store, {
+			name: "Authority Lifecycle",
+			source: "api",
+		});
+		expect(store.currentRevision).toBe(restoredRevision);
+		const scope = {
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		};
+		const extraProject = await createProjectAuthoritative(store, {
+			name: "Authority Extra",
+			source: "api",
+		});
+		await expect(
+			planProjectCreateAuthoritative(store, { name: "Authority Extra" }),
+		).rejects.toMatchObject({ code: "PROJECT_ALREADY_EXISTS" });
+		const extraEnvironment = await createEnvironmentAuthoritative(store, {
+			projectId: extraProject.id,
+			name: "preview",
+			kind: "preview",
+			source: "api",
+		});
+		expect(extraEnvironment.projectId).toBe(extraProject.id);
+		await store.mutateDurable((data) => {
+			data.meta.config = {
+				...data.meta.config,
+				projectId: extraProject.id,
+				environmentId: extraEnvironment.id,
+			};
+		});
+		await expect(
+			initProjectAuthoritative(store, { name: "ignored", source: "api" }),
+		).resolves.toEqual({ project: extraProject, environment: extraEnvironment });
+		await store.mutateDurable((data) => {
+			const { projectId: _projectId, environmentId: _environmentId, ...config } =
+				data.meta.config;
+			data.meta.config = config;
+		});
+		await expect(
+			initProjectAuthoritative(store, { name: "ambiguous", source: "api" }),
+		).rejects.toMatchObject({ code: "SCOPE_REQUIRED", stage: "init" });
+		const organization = await createOrganizationAuthoritative(store, {
+			name: "Authority Org",
+			slug: "authority-org",
+			...scope,
+			source: "api",
+		});
+		const updated = await updateOrganizationAuthoritative(store, organization.id, {
+			name: "Authority Org Updated",
+			slug: "authority-org-updated",
+			scope,
+			source: "api",
+		});
+		expect(updated.name).toBe("Authority Org Updated");
+		expect(
+			await archiveOrganizationAuthoritative(store, organization.id, {
+				dryRun: true,
+				scope,
+			}),
+		).toMatchObject({ dryRun: true, wouldChange: true });
+		expect(
+			await archiveOrganizationAuthoritative(store, organization.id, {
+				confirm: true,
+				scope,
+				source: "api",
+			}),
+		).toMatchObject({ dryRun: false, idempotent: false, wouldChange: true });
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		expect(store.snapshot.organizations).toEqual([]);
+		expect(
+			(await store.storeV2Events!.listPage({ scope, limit: 20 })).events.map(
+				(event) => event.action,
+			),
+		).toEqual(
+			expect.arrayContaining([
+				"project.init",
+				"orgs.create",
+				"orgs.update",
+				"orgs.archive",
+			]),
+		);
+	});
+
+	it("locks enterprise test, replay, and disable to active normalized topology", async () => {
+		const store = await createPgStore(DATABASE_URL, { tableName: ENTERPRISE_TABLE, normalizedPrefix: ENTERPRISE_PREFIX });
+		stores.push(store);
+		const initialized = initProject(store, { name: "Enterprise topology", source: "cli" });
+		await store.storeV2!.apply();
+		await store.storeV2!.cutoverEvents();
+		await store.storeV2!.cutoverTopology();
+		const scopeA = { projectId: initialized.project.id, environmentId: initialized.environment.id };
+		const environmentB = await createEnvironmentAuthoritative(store, { projectId: scopeA.projectId, name: "preview", kind: "preview", source: "cli" });
+		const scopeB = { projectId: scopeA.projectId, environmentId: environmentB.id };
+		const orgA = await createOrganizationAuthoritative(store, { ...scopeA, name: "Archived enterprise", slug: "archived-enterprise", source: "cli" });
+		const orgB = await createOrganizationAuthoritative(store, { ...scopeB, name: "Scoped enterprise", slug: "scoped-enterprise", source: "cli" });
+		const ssoA = await createSsoConnectionAuthoritative(store, { organizationId: orgA.id, protocol: "oidc", provider: "archive-idp", issuer: "https://idp.example.test", scope: scopeA });
+		const scimA = await createScimConnectionAuthoritative(store, { organizationId: orgA.id, provider: "archive-directory", endpoint: "https://directory.example.test", bearerToken: "must-not-leave-process", scope: scopeA });
+		const ssoB = await createSsoConnectionAuthoritative(store, { organizationId: orgB.id, protocol: "oidc", provider: "scope-idp", issuer: "https://idp.example.test", scope: scopeB });
+
+		// Explicit env-B scope is honored after topology cutover; the empty
+		// snapshot cannot supply this authorization boundary.
+		await expect(testSsoConnectionAuthoritative(store, ssoB.id, { scope: scopeB })).resolves.toMatchObject({ pass: true });
+		const seed = await testScimConnectionAuthoritative(store, scimA.id, { scope: scopeA, dryRun: true });
+		await archiveOrganizationAuthoritative(store, orgA.id, { scope: scopeA, confirm: true, source: "cli" });
+		const before = {
+			traces: store.snapshot.traces.length,
+			events: store.resourceCounts().events,
+			principals: store.resourceCounts().principals,
+			connections: store.snapshot.identityConnections.find((connection) => connection.id === ssoA.id)?.status,
+		};
+		await expect(testScimConnectionAuthoritative(store, scimA.id, { scope: scopeA, dryRun: true })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
+		let fetchCalls = 0;
+		await expect(testScimConnectionLive(store, scimA.id, { scope: scopeA, fetchImpl: async () => {
+			fetchCalls += 1;
+			return new Response("unexpected", { status: 500 });
+		} })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
+		expect(fetchCalls).toBe(0);
+		await expect(replayDiagnosticTraceOperational(store, seed.trace.id, { scope: scopeA, confirm: true })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
+		await expect(disableSsoConnectionReal(store, ssoA.id, { scope: scopeA })).rejects.toMatchObject({ code: "SSO_NOT_FOUND" });
+		expect({
+			traces: store.snapshot.traces.length,
+			events: store.resourceCounts().events,
+			principals: store.resourceCounts().principals,
+			connections: store.snapshot.identityConnections.find((connection) => connection.id === ssoA.id)?.status,
+		}).toEqual(before);
+	});
+
+	it("lets doctor traverse more than fifty scoped topology pages within its global item cap", async () => {
+		const store = await createPgStore(DATABASE_URL, {
+			tableName: DOCTOR_TABLE,
+			normalizedPrefix: DOCTOR_PREFIX,
+		});
+		stores.push(store);
+		await store.storeV2!.apply();
+		await store.storeV2!.cutoverEvents();
+		await store.storeV2!.cutoverTopology();
+		const initialized = await initProjectAuthoritative(store, {
+			name: "Doctor Pagination",
+			source: "cli",
+		});
+		const now = "2026-07-18T00:00:00.000Z";
+		await store.mutateStoreV2Topology!(async ({ topology, appendAudit }) => {
+			for (let index = 1; index <= 50; index += 1) {
+				const suffix = String(index).padStart(2, "0");
+				const projectId = `doctor_project_${suffix}`;
+				const environmentId = `doctor_environment_${suffix}`;
+				await topology.upsertProject({
+					id: projectId,
+					name: `Doctor Project ${suffix}`,
+					slug: `doctor-project-${suffix}`,
+					createdAt: now,
+					updatedAt: now,
+				});
+				await topology.upsertEnvironment({
+					id: environmentId,
+					projectId,
+					name: "development",
+					slug: "development",
+					kind: "development",
+					createdAt: now,
+					updatedAt: now,
+				});
+				await topology.upsertOrganization({
+					id: `doctor_organization_${suffix}`,
+					projectId,
+					environmentId,
+					name: `Doctor Organization ${suffix}`,
+					slug: `doctor-organization-${suffix}`,
+					status: "active",
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			appendAudit({
+				actor: "cli",
+				action: "doctor.pagination.fixture",
+				projectId: initialized.project.id,
+				environmentId: initialized.environment.id,
+				subjectType: "system",
+				subjectId: "doctor-pagination",
+				outcome: "success",
+				source: "cli",
+				message: "Created doctor pagination fixture",
+			});
+		});
+
+		const doctor = await runDoctor(store, {
+			secrets: { CLEARANCE_SECRET: "super-secret-value-32chars!!" },
+		});
+		expect(doctor.checks.find((check) => check.id === "project")).toMatchObject({
+			status: "pass",
+		});
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		expect(store.snapshot.organizations).toEqual([]);
+	});
+
+	it("detects delimiter-colliding runtime and management membership pairs", async () => {
+		const pool = new pg.Pool({ connectionString: DATABASE_URL });
+		const fixture = `doctor-collision-${process.pid}`;
+		const projectId = `${fixture}:project`;
+		const environmentId = `${fixture}:environment`;
+		const organizationA = `${fixture}:a:b`;
+		const organizationB = `${fixture}:a`;
+		const principalA = `${fixture}:c`;
+		const principalB = `b:${fixture}:c`;
+		const now = "2026-07-18T00:00:00.000Z";
+		let createdManagementTable = false;
+		try {
+			const managementTable = await pool.query<{ table: string | null }>(
+				`select to_regclass('public.clearance_management_snapshot')::text as table`,
+			);
+			if (!managementTable.rows[0]?.table) {
+				await pool.query(
+					`create table clearance_management_snapshot (id text primary key)`,
+				);
+				createdManagementTable = true;
+			}
+			await pool.query(
+				`insert into "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+				 values ($1, $2, $3, false, $4, $4), ($5, $6, $7, false, $4, $4)`,
+				[principalA, "Doctor collision A", `${fixture}-a@example.test`, now, principalB, "Doctor collision B", `${fixture}-b@example.test`],
+			);
+			await pool.query(
+				`insert into organization (id, name, slug, "createdAt")
+				 values ($1, $2, $3, $4), ($5, $6, $7, $4)`,
+				[organizationA, "Doctor collision A", `${fixture}-a-b`, now, organizationB, "Doctor collision B", `${fixture}-a`],
+			);
+			await pool.query(
+				`insert into member (id, "organizationId", "userId", role, "createdAt")
+				 values ($1, $2, $3, 'member', $4)`,
+				[`${fixture}:runtime-membership`, organizationB, principalB, now],
+			);
+
+			const snapshot = emptySnapshot();
+			snapshot.meta.initializedAt = now;
+			snapshot.projects.push({ id: projectId, name: "Doctor collision", slug: fixture, createdAt: now, updatedAt: now });
+			snapshot.environments.push({ id: environmentId, projectId, name: "development", slug: "development", kind: "development", createdAt: now, updatedAt: now });
+			snapshot.organizations.push(
+				{ id: organizationA, projectId, environmentId, name: "Doctor collision A", slug: `${fixture}-a-b`, status: "active", createdAt: now, updatedAt: now },
+				{ id: organizationB, projectId, environmentId, name: "Doctor collision B", slug: `${fixture}-a`, status: "active", createdAt: now, updatedAt: now },
+			);
+			snapshot.principals.push(
+				{ id: principalA, projectId, environmentId, email: `${fixture}-a@example.test`, name: "Doctor collision A", status: "active", createdAt: now, updatedAt: now },
+				{ id: principalB, projectId, environmentId, email: `${fixture}-b@example.test`, name: "Doctor collision B", status: "active", createdAt: now, updatedAt: now },
+			);
+			snapshot.memberships.push({
+				id: `${fixture}:management-membership`,
+				organizationId: organizationA,
+				principalId: principalA,
+				role: "member",
+				status: "active",
+				source: "manual",
+				createdAt: now,
+				updatedAt: now,
+			});
+
+			const doctor = await runDoctor(snapshotDoctorStore(snapshot), {
+				secrets: {
+					CLEARANCE_SECRET: "super-secret-value-32chars!!",
+					DATABASE_URL,
+				},
+			});
+			expect(doctor.checks.find((check) => check.id === "runtime-management-parity"))
+				.toMatchObject({
+					status: "fail",
+					detail: expect.stringContaining("memberships=1"),
+				});
+		} finally {
+			await pool.query(`delete from member where id = $1`, [`${fixture}:runtime-membership`]).catch(() => undefined);
+			await pool.query(`delete from organization where id = any($1::text[])`, [[organizationA, organizationB]]).catch(() => undefined);
+			await pool.query(`delete from "user" where id = any($1::text[])`, [[principalA, principalB]]).catch(() => undefined);
+			if (createdManagementTable) {
+				await pool.query(`drop table clearance_management_snapshot`).catch(() => undefined);
+			}
+			await pool.end();
+		}
+	});
+
+	it("fails closed when snapshot membership authority exceeds the doctor cap", async () => {
+		const snapshot = emptySnapshot();
+		const now = "2026-07-18T00:00:00.000Z";
+		snapshot.meta.initializedAt = now;
+		snapshot.memberships = Array.from({ length: 50_001 }, (_, index) => ({
+			id: `doctor_membership_${index}`,
+			organizationId: "doctor-organization",
+			principalId: `doctor-principal-${index}`,
+			role: "member",
+			status: "active" as const,
+			source: "manual" as const,
+			createdAt: now,
+			updatedAt: now,
+		}));
+		const doctor = await runDoctor(snapshotDoctorStore(snapshot), {
+			secrets: { CLEARANCE_SECRET: "super-secret-value-32chars!!" },
+		});
+		expect(doctor.checks.find((check) => check.id === "runtime-management-parity"))
+			.toMatchObject({
+				status: "fail",
+				detail: "Cannot evaluate management memberships: Memberships exceeds the doctor read safety cap of 50000 items",
+			});
 	});
 });
