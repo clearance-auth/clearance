@@ -1,7 +1,9 @@
+import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
 	createKeyProviderRegistry,
 	createLocalKeyProvider,
+	createLocalSigningProvider,
 } from "@clearance/key-management";
 import {
 	CLEARANCE_AUTH_VERSION,
@@ -24,6 +26,9 @@ function testKeyManagement(
 	projectId = "project-test",
 	environmentId = "environment-test",
 ) {
+	const signingKey = generateKeyPairSync("ec", {
+		namedCurve: "prime256v1",
+	}).privateKey.export({ format: "der", type: "pkcs8" });
 	return {
 		projectId,
 		environmentId,
@@ -46,6 +51,11 @@ function testKeyManagement(
 				currentKeyId: "v1",
 				keys: { v1: Buffer.alloc(32, 13) },
 			}),
+		}),
+		signingProvider: createLocalSigningProvider({
+			providerId: "test-access-token-signer",
+			currentKeyReference: "v1",
+			keys: { v1: signingKey },
 		}),
 	};
 }
@@ -112,7 +122,7 @@ describe("@clearance/auth runtime wrapper", () => {
 		}
 	});
 
-	it("installs encrypted two-factor, bounded HIBP, and rotating EdDSA defaults", async () => {
+	it("installs encrypted two-factor, bounded HIBP, and ES256 signing defaults", async () => {
 		const bundle = createClearanceAuth({
 			baseURL: "http://localhost:3300",
 			secret: "unit-test-secret-value-not-default!!",
@@ -170,14 +180,14 @@ describe("@clearance/auth runtime wrapper", () => {
 			expect(breached?.options).toMatchObject({ enabled: true, timeoutMs: 1_250 });
 			expect(accessTokens?.options).toMatchObject({
 				jwks: {
-					keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
-					rotationInterval: 3_600,
+					keyPairConfig: { alg: "ES256" },
 					gracePeriod: 7_200,
 				},
 				jwt: {
 					issuer: "http://localhost:3300",
 					audience: "http://localhost:3300",
 					expirationTime: "5m",
+					sign: expect.any(Function),
 				},
 			});
 			expect(options.account?.encryptOAuthTokens).toBe(true);
