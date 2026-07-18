@@ -23,6 +23,7 @@
   "dependencies": {
     "@clearance/auth": "workspace:*",
     "@clearance/delivery": "workspace:*",
+    "@clearance/key-management": "workspace:*",
     "pg": "^8.14.1"
   },
   "devDependencies": {
