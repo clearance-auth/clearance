@@ -16,6 +16,11 @@ import {
 	readInternalAuthenticationPolicy,
 	type InternalRuntimeAuthenticationPolicyBinding,
 } from "../internal/authentication-policy";
+import {
+	attachCapturedInternalRuntimeAudit,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditBinding,
+} from "../internal/runtime-audit";
 import { isPromise } from "../utils/is-promise";
 import {
 	getBaseURL,
@@ -54,9 +59,39 @@ function preserveAuthenticationPolicyBinding(
 	attachCapturedInternalAuthenticationPolicy(target, binding);
 }
 
+function assertCompatibleRuntimeAuditBinding(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	const existing = readInternalRuntimeAudit(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced runtime audit authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options runtime audit authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveRuntimeAuditBinding(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	assertCompatibleRuntimeAuditBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(target, binding);
+}
+
 export async function runPluginInit(context: AuthContext) {
 	let options = context.options;
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const runtimeAudit = readInternalRuntimeAudit(options);
 	const plugins = options.plugins || [];
 	const pluginTrustedOrigins: NonNullable<
 		ClearanceOptions["trustedOrigins"]
@@ -81,6 +116,7 @@ export async function runPluginInit(context: AuthContext) {
 						result.options,
 						authenticationPolicy,
 					);
+					assertCompatibleRuntimeAuditBinding(result.options, runtimeAudit);
 					const { databaseHooks, trustedOrigins, ...restOpts } = result.options;
 					if (databaseHooks) {
 						dbHooks.push({
@@ -96,6 +132,7 @@ export async function runPluginInit(context: AuthContext) {
 						normalizedOptions,
 						authenticationPolicy,
 					);
+					preserveRuntimeAuditBinding(normalizedOptions, runtimeAudit);
 					options = normalizedOptions;
 				}
 				if (result.context) {
@@ -137,6 +174,7 @@ export async function runPluginInit(context: AuthContext) {
 		});
 	}
 	preserveAuthenticationPolicyBinding(options, authenticationPolicy);
+	preserveRuntimeAuditBinding(options, runtimeAudit);
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {
 		options,
