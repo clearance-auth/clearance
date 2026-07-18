@@ -25,7 +25,6 @@ export async function encryptOIDCConfig(
 	const storage = options?.storeOIDCClientSecret;
 	if (!storage || !config.clientSecret) return config;
 	const exactProviderId = validateProviderId(providerId);
-	if (config.clientSecret.startsWith(OIDC_SECRET_ENVELOPE_PREFIX)) return config;
 	return {
 		...config,
 		clientSecret: `${OIDC_SECRET_ENVELOPE_PREFIX}${await storage.encrypt(config.clientSecret, exactProviderId)}`,
