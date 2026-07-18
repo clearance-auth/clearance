@@ -23,7 +23,7 @@ import {
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditDraft,
-} from "../../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import { getDate } from "../../utils/date";
 import type { AccessControl, ArrayElement } from "../access";
 import type { defaultStatements } from "./access";
