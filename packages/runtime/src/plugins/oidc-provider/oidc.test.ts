@@ -1,6 +1,13 @@
-import type { ClearancePlugin } from "@clearance/core";
+import type {
+	ClearanceOptions,
+	ClearancePlugin,
+	GenericEndpointContext,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import {
 	createLocalJWKSet,
+	decodeJwt,
 	decodeProtectedHeader,
 	jwtVerify,
 	SignJWT,
@@ -19,7 +26,10 @@ import {
 import type { AuthClient } from "../../client";
 import { createAuthMiddleware, getSessionFromCtx } from "../../api";
 import { createAuthClient } from "../../client";
+import { makeSignature } from "../../crypto";
 import { toNodeHandler } from "../../integrations/node";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { genericOAuth } from "../generic-oauth";
@@ -33,6 +43,10 @@ import {
 } from ".";
 import type { OidcClientPlugin } from "./client";
 import { oidcClient } from "./client";
+import {
+	restoreOAuthResponseHeaders,
+	snapshotOAuthResponseHeaders,
+} from "./token-response";
 import type { Client } from "./types";
 
 // Pre-verifies any user the RP creates via OAuth signup so the existing-user
@@ -3600,5 +3614,464 @@ describe("oidc end session cross-site protection (security)", async () => {
 		);
 		expect(refreshResponse.status).toBe(200);
 		expect((await refreshResponse.json()).access_token).toBeDefined();
+	});
+});
+
+const managedOidcIdentity = {
+	projectId: "managed-oidc-project",
+	environmentId: "managed-oidc-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedOidcPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+async function createManagedOidcRuntime() {
+	let revision = "1";
+	let failConsentReissue = false;
+	let readerError: Error | null = null;
+	const organizationId = "managed-oidc-organization";
+	const client: Client = {
+		clientId: "managed-oidc-client",
+		clientSecret: "managed-oidc-client-secret-value",
+		redirectUrls: ["http://localhost/managed-oidc-callback"],
+		metadata: {},
+		type: "web",
+		disabled: false,
+		name: "Managed OIDC client",
+	};
+	const options = {
+		baseURL: "http://localhost:3000",
+		secret: "managed-oidc-runtime-secret-value",
+		session: {
+			expiresIn: 120,
+			storeSessionInDatabase: true,
+			additionalFields: {
+				activeOrganizationId: { type: "string", required: false },
+			},
+		},
+		databaseHooks: {
+			verification: {
+				create: {
+					async before(data) {
+						if (failConsentReissue) {
+							throw new Error("managed consent reissue failed");
+						}
+						return { data };
+					},
+				},
+			},
+		},
+		plugins: [
+			oidcProvider({
+				loginPage: "/login",
+				consentPage: "/consent",
+				requirePKCE: false,
+			}),
+		],
+		logger: { level: "error" },
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity: managedOidcIdentity,
+		reader: {
+			async readForSubject(input) {
+				if (readerError) throw readerError;
+				return {
+					scope: managedOidcIdentity,
+					subjectId: input.subjectId,
+					revision,
+					environment: managedOidcPolicy,
+					organizationMembership:
+						input.organizationId === organizationId
+							? {
+									subjectId: input.subjectId,
+									organizationId,
+								}
+							: null,
+					organizationOverride: null,
+					effective: managedOidcPolicy,
+				};
+			},
+		},
+	});
+	const runtime = await getTestInstance(options, { disableTestUser: true });
+	const context = await runtime.auth.$context;
+	await runtime.db.create({
+		model: "oauthApplication",
+		data: {
+			clientId: client.clientId,
+			clientSecret: client.clientSecret,
+			type: client.type,
+			name: client.name,
+			redirectUrls: client.redirectUrls.join(","),
+			disabled: false,
+			metadata: null,
+			icon: null,
+			userId: null,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		},
+	});
+	const user = await context.internalAdapter.createUser({
+		email: "managed-oidc@example.test",
+		name: "Managed OIDC User",
+	});
+	await runtime.db.create({
+		model: "oauthConsent",
+		data: {
+			clientId: client.clientId,
+			userId: user.id,
+			scopes: "openid profile email offline_access",
+			consentGiven: true,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		},
+	});
+	const source = await context.internalAdapter.createSession(
+		user.id,
+		false,
+		{ activeOrganizationId: organizationId },
+		false,
+		createInternalSessionIssuanceContext({
+			purpose: "interactive",
+			subjectId: user.id,
+			evidence: [{ kind: "primary", primaryMethod: "password" }],
+			targetOrganizationId: organizationId,
+		}),
+	);
+	const headers = new Headers({
+		cookie: `clearance.session_token=${source.token}.${await makeSignature(source.token, context.secret)}`,
+	});
+	const authorize = async (
+		requestedClient: Pick<Client, "clientId" | "redirectUrls"> = client,
+		prompt?: "consent",
+	) => {
+		const url = new URL("http://localhost:3000/api/auth/oauth2/authorize");
+		url.searchParams.set("client_id", requestedClient.clientId);
+		url.searchParams.set("redirect_uri", requestedClient.redirectUrls[0]!);
+		url.searchParams.set("response_type", "code");
+		url.searchParams.set("scope", "openid profile email offline_access");
+		if (prompt) url.searchParams.set("prompt", prompt);
+		return runtime.auth.handler(new Request(url, { headers }));
+	};
+	const exchange = (
+		authorizationCode: string,
+		requestedClient: Pick<
+			Client,
+			"clientId" | "clientSecret" | "redirectUrls"
+		> = client,
+	) =>
+		runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "authorization_code",
+					code: authorizationCode,
+					redirect_uri: requestedClient.redirectUrls[0],
+					client_id: requestedClient.clientId,
+					client_secret: requestedClient.clientSecret,
+				}),
+			}),
+		);
+	return {
+		...runtime,
+		authorize,
+		client,
+		context,
+		exchange,
+		headers,
+		organizationId,
+		source,
+		setRevision(value: string) {
+			revision = value;
+		},
+		setFailConsentReissue(value: boolean) {
+			failConsentReissue = value;
+		},
+		setReaderError(value: Error | null) {
+			readerError = value;
+		},
+	};
+}
+
+describe("managed OIDC session derivative authority", () => {
+	it("binds issuance to the exact live source and revokes stale token families", async () => {
+		const runtime = await createManagedOidcRuntime();
+		const authorizeCode = async () =>
+			new URL((await runtime.authorize()).headers.get("location")!).searchParams.get(
+				"code",
+			)!;
+		const code = await authorizeCode();
+
+		runtime.setRevision("2");
+		const staleExchange = await runtime.exchange(code);
+		expect(staleExchange.status).toBe(401);
+		expect(await staleExchange.json()).toMatchObject({ error: "invalid_grant" });
+		expect(await runtime.db.count({ model: "oauthAccessToken" })).toBe(0);
+
+		runtime.setRevision("1");
+		const issuedResponse = await runtime.exchange(code);
+		expect(issuedResponse.status).toBe(200);
+		const issued = await issuedResponse.json();
+		const [row] = await runtime.db.findMany<Record<string, any>>({
+			model: "oauthAccessToken",
+		});
+		expect(row).toMatchObject({
+			organizationId: runtime.organizationId,
+			sessionDerivativeAuthority: expect.any(String),
+			refreshStatus: "active",
+		});
+		const authoritativeSource = await runtime.db.findOne<Record<string, any>>({
+			model: "session",
+			where: [{ field: "id", value: runtime.source.id }],
+		});
+		expect(row!.accessTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			authoritativeSource!.expiresAt.getTime(),
+		);
+		expect(row!.refreshTokenExpiresAt.getTime()).toBeLessThanOrEqual(
+			authoritativeSource!.expiresAt.getTime(),
+		);
+		expect(decodeJwt(issued.id_token).exp! * 1000).toBeLessThanOrEqual(
+			authoritativeSource!.expiresAt.getTime(),
+		);
+		const refreshOnlyResponse = await runtime.exchange(await authorizeCode());
+		expect(refreshOnlyResponse.status).toBe(200);
+		const refreshOnly = await refreshOnlyResponse.json();
+
+		const rotatedSource = await runtime.context.internalAdapter.rotateSessionCredential(
+			runtime.source.token,
+			generateCredentialOperationKey(),
+		);
+		expect(rotatedSource?.session.id).toBe(runtime.source.id);
+		const refreshResponse = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: issued.refresh_token,
+					client_id: runtime.client.clientId,
+					client_secret: runtime.client.clientSecret,
+				}),
+			}),
+		);
+		expect(refreshResponse.status).toBe(200);
+		const refreshed = await refreshResponse.json();
+		const familyState = async () =>
+			(
+				await runtime.db.findMany<Record<string, any>>({
+					model: "oauthAccessToken",
+					sortBy: { field: "id", direction: "asc" },
+				})
+			).map(({ id, refreshStatus, revokedAt }) => ({
+				id,
+				refreshStatus,
+				revokedAt,
+			}));
+		const beforeReaderOutage = await familyState();
+		runtime.setReaderError(new Error("managed OIDC policy reader outage"));
+		const outageRefresh = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: refreshOnly.refresh_token,
+					client_id: runtime.client.clientId,
+					client_secret: runtime.client.clientSecret,
+				}),
+			}),
+		);
+		expect(outageRefresh.status).toBe(500);
+		const outageUserInfo = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/userinfo", {
+				headers: { authorization: `Bearer ${refreshed.access_token}` },
+			}),
+		);
+		expect(outageUserInfo.status).toBe(500);
+		expect(await familyState()).toEqual(beforeReaderOutage);
+
+		runtime.setReaderError(null);
+		const recoveredRefreshResponse = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: refreshOnly.refresh_token,
+					client_id: runtime.client.clientId,
+					client_secret: runtime.client.clientSecret,
+				}),
+			}),
+		);
+		expect(recoveredRefreshResponse.status).toBe(200);
+		const recoveredRefresh = await recoveredRefreshResponse.json();
+		expect(
+			(
+				await runtime.auth.handler(
+					new Request("http://localhost:3000/api/auth/oauth2/userinfo", {
+						headers: { authorization: `Bearer ${refreshed.access_token}` },
+					}),
+				)
+			).status,
+		).toBe(200);
+
+		runtime.setRevision("2");
+		const staleRefresh = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/token", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					grant_type: "refresh_token",
+					refresh_token: recoveredRefresh.refresh_token,
+					client_id: runtime.client.clientId,
+					client_secret: runtime.client.clientSecret,
+				}),
+			}),
+		);
+		expect(staleRefresh.status).toBe(401);
+		const userInfo = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/userinfo", {
+				headers: { authorization: `Bearer ${refreshed.access_token}` },
+			}),
+		);
+		expect(userInfo.status).toBe(401);
+		expect(
+			(await runtime.db.findMany<Record<string, any>>({
+				model: "oauthAccessToken",
+			})).every((token) => token.refreshStatus === "revoked"),
+		).toBe(true);
+	});
+
+	it("keeps managed consent single-use and publishes no output after source drift", async () => {
+		const runtime = await createManagedOidcRuntime();
+		const consentClient: Client = {
+			clientId: "managed-oidc-consent-client",
+			clientSecret: "managed-oidc-consent-client-secret",
+			redirectUrls: ["http://localhost/managed-oidc-consent-callback"],
+			metadata: {},
+			type: "web",
+			disabled: false,
+			name: "Managed OIDC consent client",
+		};
+		await runtime.db.create({
+			model: "oauthApplication",
+			data: {
+				...consentClient,
+				redirectUrls: consentClient.redirectUrls.join(","),
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const prompted = await runtime.authorize(consentClient, "consent");
+		const consentCode = new URL(
+			prompted.headers.get("location")!,
+			"http://localhost",
+		).searchParams.get("consent_code")!;
+		const consent = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/consent", {
+				method: "POST",
+				headers: {
+					cookie: runtime.headers.get("cookie")!,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ accept: true, consent_code: consentCode }),
+			}),
+		);
+		expect(consent.status).toBe(200);
+		const redirectURI = (await consent.json()).redirectURI as string;
+		const code = new URL(redirectURI).searchParams.get("code")!;
+		const replayedConsent = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/consent", {
+				method: "POST",
+				headers: {
+					cookie: runtime.headers.get("cookie")!,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ accept: true, consent_code: consentCode }),
+			}),
+		);
+		expect(replayedConsent.status).toBe(401);
+		expect((await runtime.exchange(code, consentClient)).status).toBe(200);
+		expect((await runtime.exchange(code, consentClient)).status).toBe(401);
+
+		const secondPrompt = await runtime.authorize(consentClient, "consent");
+		const secondConsentCode = new URL(
+			secondPrompt.headers.get("location")!,
+			"http://localhost",
+		).searchParams.get("consent_code")!;
+		runtime.setFailConsentReissue(true);
+		const failed = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/consent", {
+				method: "POST",
+				headers: {
+					cookie: runtime.headers.get("cookie")!,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					accept: true,
+					consent_code: secondConsentCode,
+				}),
+			}),
+		);
+		runtime.setFailConsentReissue(false);
+		expect(failed.status).not.toBe(200);
+		expect(failed.headers.getSetCookie().join("\n")).not.toContain(
+			"oidc_consent_prompt=;",
+		);
+		expect(failed.headers.get("location")).toBeNull();
+		expect(await failed.text()).not.toContain("code=");
+		const retried = await runtime.auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/consent", {
+				method: "POST",
+				headers: {
+					cookie: runtime.headers.get("cookie")!,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					accept: true,
+					consent_code: secondConsentCode,
+				}),
+			}),
+		);
+		expect(retried.status).toBe(200);
+		expect((await retried.json()).redirectURI).toContain("code=");
+	});
+
+	it("restores exact pre-transaction response headers", () => {
+		const responseHeaders = new Headers();
+		responseHeaders.append(
+			"set-cookie",
+			"clearance.session_token=source.signature; Path=/; HttpOnly",
+		);
+		responseHeaders.set("x-existing", "before");
+		const ctx = {
+			responseHeaders,
+			context: { responseHeaders },
+		} as unknown as GenericEndpointContext;
+		const snapshot = snapshotOAuthResponseHeaders(ctx);
+
+		responseHeaders.append(
+			"set-cookie",
+			"oidc_consent_prompt=; Max-Age=0; Path=/",
+		);
+		responseHeaders.set("x-existing", "attempt");
+		responseHeaders.set("x-attempt", "leak");
+		restoreOAuthResponseHeaders(ctx, snapshot);
+
+		expect(responseHeaders.getSetCookie()).toEqual([
+			"clearance.session_token=source.signature; Path=/; HttpOnly",
+		]);
+		expect(responseHeaders.get("x-existing")).toBe("before");
+		expect(responseHeaders.get("x-attempt")).toBeNull();
 	});
 });
