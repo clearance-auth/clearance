@@ -7,8 +7,16 @@ const MAX_ACTIONS = 256;
 const ACTION_TOKEN = /^[a-z][a-z0-9._:-]{0,127}$/;
 
 export type InternalAuthorizationSubject = Readonly<{
-	kind: "principal";
+	kind: "principal" | "service_account";
 	id: string;
+}>;
+
+export type InternalServiceAccountCredentialAuthentication = Readonly<{
+	organizationId: string;
+	subject: Readonly<{ kind: "service_account"; id: string }>;
+	revision: string;
+	actions: readonly string[];
+	expiresAt: Date | null;
 }>;
 
 export type InternalAuthorizationReadInput = Readonly<{
@@ -45,6 +53,9 @@ export type InternalAuthorizationAuthority = Readonly<{
 	readEffectiveAuthorization(
 		input: InternalAuthorizationReadInput,
 	): Promise<InternalEffectiveAuthorization>;
+	authenticateServiceAccountCredential(
+		secret: string,
+	): Promise<InternalServiceAccountCredentialAuthentication>;
 	initializeOrganizationOwner(
 		input: InternalAuthorizationOrganizationOwnerInput,
 	): Promise<void>;
@@ -147,8 +158,16 @@ function revision(value: unknown): string {
 
 function subject(value: unknown): InternalAuthorizationSubject {
 	const input = exactObject(value, ["kind", "id"]);
-	if (input.kind !== "principal") invalid();
-	return Object.freeze({ kind: "principal", id: identifier(input.id) });
+	if (input.kind !== "principal" && input.kind !== "service_account") invalid();
+	return Object.freeze({ kind: input.kind, id: identifier(input.id) });
+}
+
+function serviceAccountSubject(
+	value: unknown,
+): Readonly<{ kind: "service_account"; id: string }> {
+	const normalized = subject(value);
+	if (normalized.kind !== "service_account") invalid();
+	return Object.freeze({ kind: "service_account", id: normalized.id });
 }
 
 function actions(value: unknown): readonly string[] {
@@ -190,6 +209,32 @@ function readResult(value: unknown): InternalEffectiveAuthorization {
 	});
 }
 
+function credentialExpiresAt(value: unknown): Date | null {
+	if (value === null) return null;
+	if (!(value instanceof Date) || !Number.isFinite(value.getTime())) invalid();
+	if (value.getTime() <= Date.now()) invalid();
+	return new Date(value.getTime());
+}
+
+function credentialAuthentication(
+	value: unknown,
+): InternalServiceAccountCredentialAuthentication {
+	const input = exactObject(value, [
+		"organizationId",
+		"subject",
+		"revision",
+		"actions",
+		"expiresAt",
+	]);
+	return Object.freeze({
+		organizationId: identifier(input.organizationId),
+		subject: serviceAccountSubject(input.subject),
+		revision: revision(input.revision),
+		actions: actions(input.actions),
+		expiresAt: credentialExpiresAt(input.expiresAt),
+	});
+}
+
 /** Attach the private, uncached effective-authorization reader once per adapter. */
 export function attachInternalAuthorizationAuthority<Target extends object>(
 	internalAdapter: Target,
@@ -197,19 +242,43 @@ export function attachInternalAuthorizationAuthority<Target extends object>(
 ): Target {
 	if (authorities.has(internalAdapter)) invalid();
 	const readEffectiveAuthorization = authority?.readEffectiveAuthorization;
+	const authenticateServiceAccountCredential =
+		authority?.authenticateServiceAccountCredential;
 	const initializeOrganizationOwner = authority?.initializeOrganizationOwner;
 	if (
 		typeof readEffectiveAuthorization !== "function" ||
+		typeof authenticateServiceAccountCredential !== "function" ||
 		typeof initializeOrganizationOwner !== "function"
 	) invalid();
 	const captured = Object.freeze({
 		readEffectiveAuthorization: readEffectiveAuthorization.bind(authority),
+		authenticateServiceAccountCredential:
+			authenticateServiceAccountCredential.bind(authority),
 		initializeOrganizationOwner:
 			initializeOrganizationOwner.bind(authority),
 	});
 	capturedAuthorities.add(captured);
 	authorities.set(internalAdapter, captured);
 	return internalAdapter;
+}
+
+/** Authenticates a machine credential through the private product authority. */
+export async function authenticateInternalServiceAccountCredential(
+	internalAdapter: InternalAdapter,
+	secret: unknown,
+): Promise<InternalServiceAccountCredentialAuthentication | undefined> {
+	const authority = authorities.get(internalAdapter);
+	if (!authority) return undefined;
+	if (typeof secret !== "string" || secret.length === 0 || secret.length > 16_384) {
+		invalid();
+	}
+	let result: InternalServiceAccountCredentialAuthentication;
+	try {
+		result = await authority.authenticateServiceAccountCredential(secret);
+	} catch (error) {
+		throw new InternalAuthorizationAuthorityUnavailableError(error);
+	}
+	return credentialAuthentication(result);
 }
 
 /** Propagates an already-validated private reader without reattaching it. */
