@@ -494,6 +494,9 @@ describe("organization hooks", async () => {
 		});
 		const finalize = vi.fn(async () => {});
 		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async authenticateServiceAccountCredential() {
+				throw new Error("not used by this organization test");
+			},
 			async readEffectiveAuthorization(input) {
 				return {
 					organizationId: input.organizationId,
@@ -538,6 +541,9 @@ describe("organization hooks", async () => {
 				),
 		});
 		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async authenticateServiceAccountCredential() {
+				throw new Error("not used by this organization test");
+			},
 			async readEffectiveAuthorization(input) {
 				return {
 					organizationId: input.organizationId,
