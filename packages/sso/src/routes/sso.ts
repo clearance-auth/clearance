@@ -14,6 +14,11 @@ import {
 	getSessionFromCtx,
 	sessionMiddleware,
 } from "@clearance/runtime/api";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { deleteSessionCookie, setSessionCookie } from "@clearance/runtime/cookies";
 import { generateRandomString } from "@clearance/runtime/crypto";
 import { handleOAuthUserInfo } from "@clearance/runtime/oauth2";
@@ -68,6 +73,12 @@ import {
 } from "./helpers";
 import { hasOrgAdminRole } from "./providers";
 import { getSafeRedirectUrl, processSAMLResponse } from "./saml-pipeline";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../../../runtime/src/internal/runtime-audit";
 
 const BUILT_IN_ACCOUNT_PROVIDER_IDS = [
 	"credential",
@@ -77,6 +88,81 @@ const BUILT_IN_ACCOUNT_PROVIDER_IDS = [
 	"anonymous",
 	"siwe",
 ] as const;
+
+function runtimeAuditBinding(ctx: { context: { options: object; adapter: object } }) {
+	return (
+		readInternalRuntimeAudit(ctx.context.options) ??
+		readInternalRuntimeAudit(ctx.context.adapter)
+	);
+}
+
+async function runSSOAuditTransaction<T>(
+	ctx: { context: { options: object; adapter: any } },
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (!runtimeAuditBinding(ctx) || (await isTransactionActive(ctx.context.adapter))) {
+		return fn();
+	}
+	return runWithTransaction(ctx.context.adapter, fn);
+}
+
+async function appendSSOAudit(
+	ctx: { context: { options: object; adapter: any } },
+	input: {
+		action: "sso.login.succeeded" | "sso.provisioned";
+		userId: string;
+		isRegistration: boolean;
+		organizationId: string | null;
+	},
+) {
+	const binding = runtimeAuditBinding(ctx);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	const transaction = await getCurrentAdapter(ctx.context.adapter);
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	await appendInternalRuntimeAudit(transaction, {
+		actor: input.userId,
+		action: input.action,
+		subjectType: "user",
+		subjectId: input.userId,
+		outcome: "success",
+		source: "sso",
+		organizationId: input.organizationId,
+		message: "SSO protocol lifecycle completed",
+		metadata: {
+			protocol: "oidc",
+			isRegistration: input.isRegistration,
+		},
+		request,
+	});
+}
+
+async function appendSSOFailureAudit(
+	ctx: { context: { options: object; adapter: any } },
+	protocol: "oidc" | "saml",
+) {
+	const binding = runtimeAuditBinding(ctx);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await runWithTransaction(ctx.context.adapter, async () => {
+		const transaction = await getCurrentAdapter(ctx.context.adapter);
+		attachCapturedInternalRuntimeAudit(transaction, binding);
+		await appendInternalRuntimeAudit(transaction, {
+			actor: "anonymous",
+			action: "sso.login.failed",
+			subjectType: null,
+			subjectId: null,
+			outcome: "failure",
+			source: "sso",
+			organizationId: null,
+			message: "SSO protocol login failed",
+			metadata: { protocol },
+			request,
+		});
+	});
+}
 
 /**
  * Builds the OIDC redirect URI. Uses the shared `redirectURI` option
@@ -1781,18 +1867,21 @@ async function handleOIDCCallback(
 			}?error=invalid_provider&error_description=missing_user_info`,
 		);
 	}
+	const providerUserId = userInfo.id;
+	const providerEmail = userInfo.email;
 	const isTrustedProvider =
 		"domainVerified" in provider &&
 		(provider as { domainVerified?: boolean }).domainVerified === true &&
 		validateEmailDomain(userInfo.email, provider.domain);
 
+	return runSSOAuditTransaction(ctx, async () => {
 	let linked: Awaited<ReturnType<typeof handleOAuthUserInfo>>;
 	try {
 		linked = await handleOAuthUserInfo(ctx, {
 			userInfo: {
-				email: userInfo.email,
+				email: providerEmail,
 				name: userInfo.name || "",
-				id: userInfo.id,
+				id: providerUserId,
 				image: userInfo.image,
 				emailVerified: options?.trustEmailVerified
 					? userInfo.emailVerified || false
@@ -1802,7 +1891,7 @@ async function handleOIDCCallback(
 				idToken: tokenResponse.idToken,
 				accessToken: tokenResponse.accessToken,
 				refreshToken: tokenResponse.refreshToken,
-				accountId: userInfo.id,
+				accountId: providerUserId,
 				providerId: provider.providerId,
 				accessTokenExpiresAt: tokenResponse.accessTokenExpiresAt,
 				refreshTokenExpiresAt: tokenResponse.refreshTokenExpiresAt,
@@ -1846,6 +1935,14 @@ async function handleOIDCCallback(
 			token: tokenResponse,
 			provider,
 		});
+		if (linked.isRegister) {
+			await appendSSOAudit(ctx, {
+				action: "sso.provisioned",
+				userId: user.id,
+				isRegistration: true,
+				organizationId: provider.organizationId ?? null,
+			});
+		}
 	}
 
 	await assignOrganizationFromProvider(ctx as any, {
@@ -1853,14 +1950,20 @@ async function handleOIDCCallback(
 		profile: {
 			providerType: "oidc",
 			providerId: provider.providerId,
-			accountId: userInfo.id,
-			email: userInfo.email,
+			accountId: providerUserId,
+			email: providerEmail,
 			emailVerified: Boolean(userInfo.emailVerified),
 			rawAttributes: userInfo,
 		},
 		provider,
 		token: tokenResponse,
 		provisioningOptions: options?.organizationProvisioning,
+	});
+	await appendSSOAudit(ctx, {
+		action: "sso.login.succeeded",
+		userId: user.id,
+		isRegistration: Boolean(linked.isRegister),
+		organizationId: provider.organizationId ?? null,
 	});
 
 	await setSessionCookie(ctx, {
@@ -1874,7 +1977,8 @@ async function handleOIDCCallback(
 	} catch {
 		toRedirectTo = linked.isRegister ? newUserURL || callbackURL : callbackURL;
 	}
-	throw ctx.redirect(toRedirectTo);
+	return ctx.redirect(toRedirectTo);
+	});
 }
 
 const callbackSSOEndpointConfig = {
@@ -1905,7 +2009,12 @@ export const callbackSSO = (options?: SSOOptions) => {
 		"/sso/callback/:providerId",
 		callbackSSOEndpointConfig,
 		async (ctx) => {
-			return handleOIDCCallback(ctx, options, ctx.params.providerId);
+			try {
+				return await handleOIDCCallback(ctx, options, ctx.params.providerId);
+			} catch (error) {
+				await appendSSOFailureAudit(ctx, "oidc");
+				throw error;
+			}
 		},
 	);
 };
@@ -1937,18 +2046,25 @@ export const callbackSSOShared = (options?: SSOOptions) => {
 				const errorURL =
 					ctx.context.options.onAPIError?.errorURL ||
 					`${ctx.context.baseURL}/error`;
+				await appendSSOFailureAudit(ctx, "oidc");
 				throw ctx.redirect(`${errorURL}?error=invalid_state`);
 			}
 
 			const providerId = stateData.ssoProviderId as string | undefined;
 			if (!providerId) {
 				const errorURL = stateData.errorURL || stateData.callbackURL;
+				await appendSSOFailureAudit(ctx, "oidc");
 				throw ctx.redirect(
 					`${errorURL}?error=invalid_state&error_description=missing_provider_id`,
 				);
 			}
 
-			return handleOIDCCallback(ctx, options, providerId, stateData);
+			try {
+				return await handleOIDCCallback(ctx, options, providerId, stateData);
+			} catch (error) {
+				await appendSSOFailureAudit(ctx, "oidc");
+				throw error;
+			}
 		},
 	);
 };
@@ -2024,6 +2140,7 @@ export const callbackSSOSAML = (options?: SSOOptions) => {
 			}
 
 			if (!ctx.body?.SAMLResponse) {
+				await appendSSOFailureAudit(ctx, "saml");
 				throw new APIError("BAD_REQUEST", {
 					message: "SAMLResponse is required for POST requests",
 				});
@@ -2031,21 +2148,27 @@ export const callbackSSOSAML = (options?: SSOOptions) => {
 			const samlResponse = ctx.body.SAMLResponse;
 			const relayState = ctx.body.RelayState;
 
-			const safeRedirectUrl = await runSSOVerificationTransaction(
-				options,
-				ctx,
-				() =>
-					processSAMLResponse(
-						ctx,
-						{
-							SAMLResponse: samlResponse,
-							RelayState: relayState,
-							providerId,
-							currentCallbackPath,
-						},
-						options,
-					),
-			);
+			let safeRedirectUrl: string;
+			try {
+				safeRedirectUrl = await runSSOVerificationTransaction(
+					options,
+					ctx,
+					() =>
+						processSAMLResponse(
+							ctx,
+							{
+								SAMLResponse: samlResponse,
+								RelayState: relayState,
+								providerId,
+								currentCallbackPath,
+							},
+							options,
+						),
+				);
+			} catch (error) {
+				await appendSSOFailureAudit(ctx, "saml");
+				throw error;
+			}
 			throw ctx.redirect(safeRedirectUrl);
 		},
 	);
@@ -2117,6 +2240,7 @@ export const acsEndpoint = (options?: SSOOptions) => {
 				) {
 					throw error;
 				}
+				await appendSSOFailureAudit(ctx, "saml");
 				// Translate structural SAML errors (400) into browser-friendly redirects
 				// so the user returns to the app instead of seeing raw JSON.
 				// Non-400 errors (404 provider not found, 401 unauthorized) propagate as-is.
