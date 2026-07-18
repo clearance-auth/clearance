@@ -494,6 +494,19 @@ export type ClearanceAuthorizationFacade = Readonly<{
         projectId: string;
         environmentId: string;
     }>;
+    reconcileRuntimeOrganizations(input: Readonly<{
+        management: Readonly<{
+            schema: string;
+            table: string;
+        }>;
+        transaction?: ClearanceTransactionQuery;
+    }>): Promise<Readonly<{
+        terminalizedOrganizations: number;
+        terminalizedOrganizationIds: readonly string[];
+        removedAssignments: number;
+        disabledServiceAccounts: number;
+        revokedCredentials: number;
+    }>>;
     readEffective(input: Readonly<{
         organizationId: string;
         subject: ClearanceAuthorizationSubject;
