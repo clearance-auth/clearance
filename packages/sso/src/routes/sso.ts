@@ -41,6 +41,7 @@ import {
 	createSSOVerificationChallenge,
 	runSSOVerificationTransaction,
 } from "../internal/verification-challenge-authority";
+import { isSSOKeyManagementWriter } from "../internal/key-management-writer";
 import type {
 	AuthnRequestRecord,
 	Member,
@@ -899,6 +900,10 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
 					organizationId: body.organizationId,
 					userId: ctx.context.session.user.id,
 					providerId: body.providerId,
+					...(isSSOKeyManagementWriter(options?.storeOIDCClientSecret) &&
+					body.oidcConfig
+						? { keyManagementVersion: 1, keyManagementRevision: 1 }
+						: {}),
 				},
 			});
 
