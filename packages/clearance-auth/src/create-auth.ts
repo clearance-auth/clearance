@@ -44,7 +44,20 @@ import {
 import { PostgresAuthenticationPolicyAuthority } from "./authentication-policy-authority.js";
 import type {
 	ClearanceAuthBundle,
+	ClearanceAuthenticationAssuranceLevel,
+	ClearanceAuthenticationPolicy,
+	ClearanceAuthenticationPolicyApplyResult,
+	ClearanceAuthenticationPolicyCandidateInput,
+	ClearanceAuthenticationPolicyFacade,
+	ClearanceAuthenticationPolicyGetResult,
+	ClearanceAuthenticationPolicyOverride,
+	ClearanceAuthenticationPolicyPlanResult,
+	ClearanceAuthenticationPolicyTransaction,
 	ClearanceAuthenticationSecurityOptions,
+	ClearanceAuthenticationUnlockAuthorityCounts,
+	ClearanceAuthenticationUnlockKind,
+	ClearanceAuthenticationUnlockPreview,
+	ClearanceAuthenticationUnlockResult,
 	ClearancePasskeyOptions,
 	ClearanceProductAuthRuntime,
 	ClearanceRuntimeMigrationPlan,
@@ -62,11 +75,24 @@ export const RUNTIME_BASELINE = {
 
 export type {
 	ClearanceAuthBundle,
+	ClearanceAuthenticationAssuranceLevel,
+	ClearanceAuthenticationPolicy,
+	ClearanceAuthenticationPolicyApplyResult,
+	ClearanceAuthenticationPolicyCandidateInput,
+	ClearanceAuthenticationPolicyFacade,
+	ClearanceAuthenticationPolicyGetResult,
+	ClearanceAuthenticationPolicyOverride,
+	ClearanceAuthenticationPolicyPlanResult,
+	ClearanceAuthenticationPolicyTransaction,
 	ClearanceRuntimeMigrationPlan,
 	ClearanceRuntimeMigrationResult,
 	ClearanceRuntimeUser,
 	CreateClearanceAuthOptions,
 	ClearanceAuthenticationSecurityOptions,
+	ClearanceAuthenticationUnlockAuthorityCounts,
+	ClearanceAuthenticationUnlockKind,
+	ClearanceAuthenticationUnlockPreview,
+	ClearanceAuthenticationUnlockResult,
 	ClearancePasskeyOptions,
 	SocialProviderConfig,
 } from "./public-types/index.js";
@@ -984,7 +1010,7 @@ export function createClearanceAuth<
 	function combineMigrationPlans(
 		runtimePlan: ClearanceRuntimeMigrationPlan,
 		policyPlan?: Awaited<
-			ReturnType<PostgresAuthenticationPolicyAuthority["plan"]>
+			ReturnType<PostgresAuthenticationPolicyAuthority["planMigration"]>
 		>,
 	): ClearanceRuntimeMigrationPlan {
 		if (!policyPlan) return runtimePlan;
@@ -1017,7 +1043,7 @@ export function createClearanceAuth<
 	): Promise<ClearanceRuntimeMigrationPlan> {
 		const [runtimePlan, policyPlan] = await Promise.all([
 			runtimeMigrationPlanFor(migrationDatabase, migrationDrainId),
-			authenticationPolicyAuthority?.plan(),
+			authenticationPolicyAuthority?.planMigration(),
 		]);
 		return combineMigrationPlans(runtimePlan, policyPlan);
 	}
@@ -1642,6 +1668,17 @@ export function createClearanceAuth<
 			credentialAuthority.beginDrain(input),
 		assertRuntimeServing: () => assertProductRuntimeServing(),
 	});
+	const authenticationPolicyFacade = authenticationPolicyAuthority
+		? Object.freeze({
+				scope: authenticationPolicyAuthority.identity,
+				get: authenticationPolicyAuthority.get.bind(authenticationPolicyAuthority),
+				plan: authenticationPolicyAuthority.plan.bind(authenticationPolicyAuthority),
+				apply: authenticationPolicyAuthority.apply.bind(authenticationPolicyAuthority),
+				planUnlock:
+					authenticationPolicyAuthority.planUnlock.bind(authenticationPolicyAuthority),
+				unlock: authenticationPolicyAuthority.unlock.bind(authenticationPolicyAuthority),
+			})
+		: undefined;
 	const passwordSetupFacade = Object.freeze({
 		async create(input: { userId: string; token: string; expiresAt: Date }) {
 			const identifier = `reset-password:${input.token}`;
@@ -1663,6 +1700,9 @@ export function createClearanceAuth<
 		pool,
 		db,
 		credentialAuthority: credentialAuthorityFacade,
+		...(authenticationPolicyFacade
+			? { authenticationPolicy: authenticationPolicyFacade }
+			: {}),
 		passwordSetup: passwordSetupFacade,
 		plugins: {
 			organization: true,
@@ -1682,7 +1722,7 @@ export function createClearanceAuth<
 			await bootstrapCredentialAuthorityFence(pool);
 			const [runtimePlan, policyPlan] = await Promise.all([
 				runtimeMigrationPlanFor(),
-				authenticationPolicyAuthority?.plan(),
+				authenticationPolicyAuthority?.planMigration(),
 			]);
 			const plan = combineMigrationPlans(runtimePlan, policyPlan);
 			const apply = async () => {
