@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import type { ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { ReadinessCheck, ReadinessReport } from "../types/resources.js";
+import type { DataStoreSnapshot, ReadinessCheck, ReadinessReport } from "../types/resources.js";
 import { recordEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import { inspectOrganization } from "./core.js";
+import { inspectOrganization, inspectOrganizationAuthoritative } from "./core.js";
+import type { ResourceScope } from "./scope.js";
 
 function fp(obj: unknown): string {
 	return createHash("sha256").update(JSON.stringify(obj)).digest("hex").slice(0, 16);
@@ -19,16 +20,65 @@ export function runReadinessCheck(
 	organizationId: string,
 ): ReadinessReport {
 	const org = inspectOrganization(store, organizationId);
-	const sso = store.snapshot.identityConnections.filter(
+	const report = buildReadinessReport(store.snapshot, organizationId, org);
+	persistReadinessReport(store, report);
+	return report;
+}
+
+/** Run readiness against normalized topology after cutover. */
+export async function runReadinessCheckAuthoritative(
+	store: ManagementStore,
+	organizationId: string,
+	scope: ResourceScope,
+): Promise<ReadinessReport> {
+	if (!store.storeV2Topology?.authoritative) {
+		const org = await inspectOrganizationAuthoritative(store, organizationId, scope);
+		const report = buildReadinessReport(store.snapshot, organizationId, org);
+		persistReadinessReport(store, report);
+		return report;
+	}
+	if (!store.mutateCoordinated) {
+		throw new ClearanceError({
+			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+			message: "Relational topology authority requires a coordinated transaction",
+			stage: "readiness.check",
+			status: 500,
+		});
+	}
+	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+		const org = topology
+			? await topology.lockOrganization({ scope, id: organizationId })
+			: null;
+		if (!org || org.status === "archived") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.inspect",
+				status: 404,
+			});
+		}
+		const report = buildReadinessReport(data, organizationId, org);
+		data.readinessReports.unshift(report);
+		appendAudit(readinessAuditInput(report));
+		return report;
+	});
+}
+
+function buildReadinessReport(
+	snapshot: DataStoreSnapshot,
+	organizationId: string,
+	org: { id: string; name: string; slug: string },
+): ReadinessReport {
+	const sso = snapshot.identityConnections.filter(
 		(c) => c.organizationId === organizationId,
 	);
-	const scim = store.snapshot.directoryConnections.filter(
+	const scim = snapshot.directoryConnections.filter(
 		(c) => c.organizationId === organizationId,
 	);
-	const ssoTraces = store.snapshot.traces.filter(
+	const ssoTraces = snapshot.traces.filter(
 		(t) => t.organizationId === organizationId && t.subsystem === "sso",
 	);
-	const scimTraces = store.snapshot.traces.filter(
+	const scimTraces = snapshot.traces.filter(
 		(t) => t.organizationId === organizationId && t.subsystem === "scim",
 	);
 
@@ -155,7 +205,7 @@ export function runReadinessCheck(
 		}
 	}
 
-	const members = store.snapshot.memberships.filter(
+	const members = snapshot.memberships.filter(
 		(m) => m.organizationId === organizationId && m.status === "active",
 	);
 	checks.push({
@@ -211,27 +261,34 @@ export function runReadinessCheck(
 		signature: fp({ organizationId, checks, overall, liveCertified }),
 	};
 
+	return report;
+}
+
+function readinessAuditInput(report: ReadinessReport) {
+	return {
+		actor: "system",
+		action: "readiness.check",
+		subjectType: "organization" as const,
+		subjectId: report.organizationId,
+		outcome: report.overall === "blocked" ? "failure" as const : "success" as const,
+		source: "cli" as const,
+		organizationId: report.organizationId,
+		message: `Readiness ${report.overall} (conformance=${report.conformance.mode}, liveCertified=${report.conformance.liveCertified})`,
+		metadata: {
+			reportId: report.id,
+			overall: report.overall,
+			checkCount: report.checks.length,
+			liveCertified: report.conformance.liveCertified,
+		},
+	};
+}
+
+function persistReadinessReport(store: ManagementStore, report: ReadinessReport): void {
 	store.mutate((data) => {
 		data.readinessReports.unshift(report);
 	});
-	recordEvent(store, {
-		actor: "system",
-		action: "readiness.check",
-		subjectType: "organization",
-		subjectId: organizationId,
-		outcome: overall === "blocked" ? "failure" : "success",
-		source: "cli",
-		organizationId,
-		message: `Readiness ${overall} (conformance=${report.conformance.mode}, liveCertified=${report.conformance.liveCertified})`,
-		metadata: {
-			reportId: report.id,
-			overall,
-			checkCount: checks.length,
-			liveCertified: report.conformance.liveCertified,
-		},
-	});
+	recordEvent(store, readinessAuditInput(report));
 
-	return report;
 }
 
 export function getLatestReadiness(
