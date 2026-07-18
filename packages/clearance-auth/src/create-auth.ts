@@ -25,6 +25,7 @@ import {
 	type PasskeyOptions,
 } from "../../runtime/src/plugins/index.js";
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
+import { attachInternalAuthenticationPolicy } from "../../runtime/src/internal/authentication-policy.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
 import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
 import { attachSSOInternalVerificationChallengeAuthority } from "../../sso/src/internal/verification-challenge-authority.js";
@@ -40,6 +41,7 @@ import {
 	PostgresCredentialAuthorityFence,
 	bootstrapCredentialAuthorityFence,
 } from "./credential-authority-fence.js";
+import { PostgresAuthenticationPolicyAuthority } from "./authentication-policy-authority.js";
 import type {
 	ClearanceAuthBundle,
 	ClearanceAuthenticationSecurityOptions,
@@ -526,10 +528,53 @@ export function createClearanceAuth<
 	const authenticationSecurity = resolveAuthenticationSecurity(options, strict);
 	const passkeyOptions: PasskeyOptions | undefined =
 		options.passkeys === false ? undefined : options.passkeys;
-
-	const pool = new pg.Pool({ connectionString: options.databaseUrl });
 	const credentialAuthorityGeneration =
 		options.credentialAuthority?.generation ?? "digest-v1";
+	if (
+		options.authenticationPolicy &&
+		credentialAuthorityGeneration !== "digest-v1"
+	) {
+		throw new Error(
+			"authenticationPolicy requires credentialAuthority.generation to be digest-v1",
+		);
+	}
+	if (
+		options.authenticationPolicy &&
+		authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds >
+			30 * 24 * 60 * 60
+	) {
+		throw new Error(
+			"authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds must not exceed 2592000 when authenticationPolicy is enabled",
+		);
+	}
+
+	const pool = new pg.Pool({ connectionString: options.databaseUrl });
+	const authenticationPolicyAuthority = options.authenticationPolicy
+		? new PostgresAuthenticationPolicyAuthority(
+				pool,
+				options.authenticationPolicy,
+				{
+					passwordLockout: authenticationSecurity.passwordLockout,
+					factorLockout: {
+						enabled: authenticationSecurity.twoFactor.enabled,
+						maxFailedAttempts:
+							authenticationSecurity.twoFactor.maxFailedAttempts,
+						durationSeconds: authenticationSecurity.twoFactor.lockoutSeconds,
+					},
+					minimumAssurance: "single_factor",
+					allowedFactors: {
+						totp: authenticationSecurity.twoFactor.enabled,
+						passkey: options.passkeys !== false,
+					},
+					trustedDevice: {
+						enabled: authenticationSecurity.twoFactor.enabled,
+						maxAgeSeconds:
+							authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds,
+					},
+					assuranceMaxAgeSeconds: null,
+				},
+			)
+		: null;
 	const credentialAuthority = new PostgresCredentialAuthorityFence(pool, {
 		generation: credentialAuthorityGeneration,
 		deploymentId:
@@ -604,6 +649,22 @@ export function createClearanceAuth<
 		db,
 		type: "postgres" as const,
 		transaction: true as const,
+	};
+	const attachProductAuthorities = <Target extends object>(
+		target: Target,
+		migrationDrainId?: string,
+	): Target => {
+		attachInternalCredentialAuthority(target, {
+			generation: credentialAuthorityGeneration,
+			...(migrationDrainId ? { migrationDrainId } : {}),
+		});
+		if (authenticationPolicyAuthority) {
+			attachInternalAuthenticationPolicy(target, {
+				identity: authenticationPolicyAuthority.identity,
+				reader: authenticationPolicyAuthority,
+			});
+		}
+		return target;
 	};
 
 	const plugins = [
@@ -722,7 +783,7 @@ export function createClearanceAuth<
 	};
 
 	const underlyingAuth = clearance(
-		attachInternalCredentialAuthority(
+		attachProductAuthorities(
 			{
 		appName: "Clearance",
 		baseURL: options.baseURL,
@@ -791,9 +852,6 @@ export function createClearanceAuth<
 			},
 		},
 		plugins,
-			},
-			{
-				generation: credentialAuthorityGeneration,
 			},
 		),
 	);
@@ -881,7 +939,7 @@ export function createClearanceAuth<
 		migrationDatabase = database,
 		migrationDrainId?: string,
 	) =>
-		attachInternalCredentialAuthority(
+		attachProductAuthorities(
 			{
 		database: migrationDatabase,
 		secret: options.secret,
@@ -894,13 +952,10 @@ export function createClearanceAuth<
 		rateLimit,
 		plugins,
 			},
-			{
-				generation: credentialAuthorityGeneration,
-				...(migrationDrainId ? { migrationDrainId } : {}),
-			},
+			migrationDrainId,
 		) as Parameters<typeof getMigrations>[0];
 
-	async function planMigrationsFor(
+	async function runtimeMigrationPlanFor(
 		migrationDatabase = database,
 		migrationDrainId?: string,
 	): Promise<ClearanceRuntimeMigrationPlan> {
@@ -924,6 +979,47 @@ export function createClearanceAuth<
 			compileSql: compileMigrations,
 			apply: runMigrations,
 		};
+	}
+
+	function combineMigrationPlans(
+		runtimePlan: ClearanceRuntimeMigrationPlan,
+		policyPlan?: Awaited<
+			ReturnType<PostgresAuthenticationPolicyAuthority["plan"]>
+		>,
+	): ClearanceRuntimeMigrationPlan {
+		if (!policyPlan) return runtimePlan;
+		return {
+			pendingTables: runtimePlan.pendingTables + policyPlan.pendingTables,
+			pendingFields: runtimePlan.pendingFields + policyPlan.pendingFields,
+			pendingSecurityMigrations: Object.freeze([
+				...new Set([
+					...runtimePlan.pendingSecurityMigrations,
+					...policyPlan.pendingSecurityMigrations,
+				]),
+			]),
+			async compileSql() {
+				const statements = [
+					await runtimePlan.compileSql(),
+					await policyPlan.compileSql(),
+				].filter((statement) => statement.trim().length > 0);
+				return statements.join("\n");
+			},
+			async apply() {
+				await runtimePlan.apply();
+				await policyPlan.apply();
+			},
+		};
+	}
+
+	async function planMigrationsFor(
+		migrationDatabase = database,
+		migrationDrainId?: string,
+	): Promise<ClearanceRuntimeMigrationPlan> {
+		const [runtimePlan, policyPlan] = await Promise.all([
+			runtimeMigrationPlanFor(migrationDatabase, migrationDrainId),
+			authenticationPolicyAuthority?.plan(),
+		]);
+		return combineMigrationPlans(runtimePlan, policyPlan);
 	}
 
 	async function inspectPreFenceCredentialSchema(): Promise<{
@@ -1584,9 +1680,13 @@ export function createClearanceAuth<
 		async migrate(input) {
 			const preFenceSchema = await inspectPreFenceCredentialSchema();
 			await bootstrapCredentialAuthorityFence(pool);
-			const plan = await planMigrationsFor();
+			const [runtimePlan, policyPlan] = await Promise.all([
+				runtimeMigrationPlanFor(),
+				authenticationPolicyAuthority?.plan(),
+			]);
+			const plan = combineMigrationPlans(runtimePlan, policyPlan);
 			const apply = async () => {
-				await plan.apply();
+				await runtimePlan.apply();
 				await ensureAuthenticationSecurityCompatibility();
 				await ensureLifecycleCompatibility();
 				if (options.durableDelivery) {
@@ -1597,14 +1697,15 @@ export function createClearanceAuth<
 							options.durableDelivery.legacyFingerprintKeyId,
 					});
 				}
+				await policyPlan?.apply();
 			};
 			const state = await credentialAuthority.status();
 			if (
 				state.phase === "digest-live" &&
-				plan.pendingSecurityMigrations.length > 0
+				runtimePlan.pendingSecurityMigrations.length > 0
 			) {
 				throw new Error(
-					`Credential authority markers conflict with the durable digest-live generation: ${plan.pendingSecurityMigrations.join(", ")}`,
+					`Credential authority markers conflict with the durable digest-live generation: ${runtimePlan.pendingSecurityMigrations.join(", ")}`,
 				);
 			}
 			if (state.phase !== "digest-live") {
@@ -1640,7 +1741,7 @@ export function createClearanceAuth<
 							transaction: true as const,
 						};
 						try {
-							const leasePlan = await planMigrationsFor(
+							const leasePlan = await runtimeMigrationPlanFor(
 								leaseDatabase,
 								drainId,
 							);
@@ -1655,6 +1756,7 @@ export function createClearanceAuth<
 										options.durableDelivery.legacyFingerprintKeyId,
 								});
 							}
+							await policyPlan?.apply();
 						} finally {
 							await leaseDatabase.db.destroy();
 						}
