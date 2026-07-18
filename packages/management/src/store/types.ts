@@ -1,7 +1,10 @@
 import type {
 	AuditEvent,
 	DataStoreSnapshot,
+	Environment,
+	Organization,
 	Principal,
+	Project,
 } from "../types/resources.js";
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
@@ -46,6 +49,8 @@ export interface StoreV2Status {
 	relationalRevision: number | null;
 	/** Changes only when relational principal rows change or authority moves. */
 	principalRevision: number | null;
+	/** Changes only when relational topology rows change or authority moves. */
+	topologyRevision: number | null;
 	consistent: boolean;
 	authoritativeCollections: StoreV2Collection[];
 	collections: Record<StoreV2Collection, StoreV2CollectionStatus>;
@@ -78,6 +83,8 @@ export interface StoreV2MigrationControl {
 	rollbackEvents(): Promise<StoreV2Status>;
 	cutoverPrincipals(): Promise<StoreV2Status>;
 	rollbackPrincipals(): Promise<StoreV2Status>;
+	cutoverTopology(): Promise<StoreV2Status>;
+	rollbackTopology(): Promise<StoreV2Status>;
 }
 
 /** Postgres event reads once store-v2 events are relational-authoritative. */
@@ -167,10 +174,38 @@ export interface StoreV2PrincipalRepository extends StoreV2PrincipalReader {
 	}): Promise<Principal | null>;
 }
 
+/** Scoped relational topology reads; every cursor is deterministic and bounded. */
+export interface StoreV2TopologyReader {
+	readonly authoritative: boolean;
+	getProjectById(id: string): Promise<Project | null>;
+	getEnvironment(input: { projectId: string; id: string }): Promise<Environment | null>;
+	getOrganization(input: { scope: ResourceScope; id: string }): Promise<Organization | null>;
+	listProjectsPage(input: { limit: number; cursor?: PageCursorKey }): Promise<{ projects: Project[]; hasMore: boolean }>;
+	listEnvironmentsPage(input: {
+		projectId: string;
+		limit: number;
+		cursor?: PageCursorKey;
+	}): Promise<{ environments: Environment[]; hasMore: boolean }>;
+	listOrganizationsPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		includeArchived?: boolean;
+	}): Promise<{ organizations: Organization[]; hasMore: boolean }>;
+}
+
+/** Physical topology deletion is intentionally not a public capability. */
+export interface StoreV2TopologyRepository extends StoreV2TopologyReader {
+	upsertProject(project: Project): Promise<Project>;
+	upsertEnvironment(environment: Environment): Promise<Environment>;
+	upsertOrganization(organization: Organization): Promise<Organization>;
+}
+
 /** Read-only view used by domain queries and validation. */
 export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
 	readonly storeV2Principals?: StoreV2PrincipalReader;
+	readonly storeV2Topology?: StoreV2TopologyReader;
 }
 
 export type DeliveryControlScope = {
@@ -287,6 +322,9 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Direct normalized transaction, available only after principal authority. */
 	mutateStoreV2Principals?<T>(
 		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
+	): Promise<T>;
+	mutateStoreV2Topology?<T>(
+		fn: (topology: StoreV2TopologyRepository) => Promise<T> | T,
 	): Promise<T>;
 	/** Relational-only identity transaction with append-only audit authority. */
 	mutateStoreV2Identity?<T>(
