@@ -298,6 +298,7 @@ export interface MigrationPlan {
 				slug: string;
 				status: Organization["status"];
 				externalId?: string;
+				createdAt: string;
 				updatedAt: string;
 			}>;
 			memberships: Array<{
@@ -307,6 +308,7 @@ export interface MigrationPlan {
 				role: string;
 				status: Membership["status"];
 				source: Membership["source"];
+				createdAt: string;
 				updatedAt: string;
 			}>;
 		};
@@ -319,6 +321,7 @@ export interface MigrationPlan {
 				image: string | null;
 				banned: boolean;
 				banReason: string | null;
+				createdAt: string;
 				updatedAt: string;
 			}>;
 			organizations: Array<{
@@ -327,8 +330,9 @@ export interface MigrationPlan {
 				slug: string;
 				logo: string | null;
 				metadata: string | null;
+				createdAt: string;
 			}>;
-			memberships: Array<{ id: ResourceId; organizationId: ResourceId; principalId: ResourceId; role: string }>;
+			memberships: Array<{ id: ResourceId; organizationId: ResourceId; principalId: ResourceId; role: string; createdAt: string }>;
 		};
 	};
 	steps: Array<{
