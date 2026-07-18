@@ -18,6 +18,7 @@ import {
 	listEvents,
 	listMembers,
 	planMemberImport,
+	planMemberImportAuthoritative,
 	executeMemberImportPlan,
 	removeMember,
 	resolveAssignableRole,
@@ -183,6 +184,51 @@ describe("resolveAssignableRole", () => {
 });
 
 describe("membership lifecycle (JsonStore)", () => {
+	it("uses normalized topology for member reads and authoritative import planning", async () => {
+		const store = tempStore();
+		initProject(store, { name: "Topology member import" });
+		const scope = resolveOperatorScope(store);
+		const principal = createUser(store, {
+			email: "topology-member@import.test",
+			name: "Topology Member",
+		});
+		const organization = createOrganization(store, { name: "Topology Import Org" });
+		store.mutate((data) => {
+			data.organizations.splice(0);
+		});
+		Object.defineProperty(store, "storeV2Topology", {
+			value: {
+				authoritative: true,
+				getOrganization: async ({ scope: requestedScope, id }: {
+					scope: typeof scope;
+					id: string;
+				}) =>
+					requestedScope.projectId === scope.projectId &&
+					requestedScope.environmentId === scope.environmentId &&
+					id === organization.id
+						? organization
+						: null,
+			},
+		});
+
+		await expect(planMemberImportAuthoritative(store, {
+			organizationId: organization.id,
+			format: "json",
+			content: JSON.stringify([{ principalId: principal.id }]),
+			scope,
+		})).resolves.toMatchObject({
+			organizationId: organization.id,
+			summary: { total: 1, wouldAdd: 1, idempotent: 0 },
+		});
+		expect(listMembers(store, organization.id, { scope, organization })).toEqual([]);
+		await expect(planMemberImportAuthoritative(store, {
+			organizationId: "org_missing",
+			format: "json",
+			content: JSON.stringify([{ principalId: principal.id }]),
+			scope,
+		})).rejects.toMatchObject({ code: "ORG_NOT_FOUND", status: 404 });
+	});
+
 	it("plans strict JSON and CSV imports before applying any membership", async () => {
 		const store = tempStore();
 		initProject(store, { name: "Import" });
