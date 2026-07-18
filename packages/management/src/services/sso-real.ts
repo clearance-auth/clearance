@@ -13,10 +13,14 @@ import { createHash, X509Certificate } from "node:crypto";
 import type { ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
-import { deleteSsoProviderById, insertSsoProvider } from "../auth-bridge.js";
+import {
+	deleteSsoProviderById,
+	insertSsoProvider,
+	insertSsoProviderInTransaction,
+} from "../auth-bridge.js";
 import { appendAuditEvent, recordEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import { inspectOrganization } from "./core.js";
+import { inspectOrganizationAuthoritative } from "./core.js";
 import {
 	loadJsonFixture,
 	type AdversarialFixtureFile,
@@ -28,7 +32,10 @@ import {
 } from "./sso-local.js";
 import { decryptCredential, encryptCredential } from "./credentials.js";
 import { publicIdentityConnection } from "./redact.js";
+import type { ResourceScope } from "./scope.js";
 import { deriveSetupConnectionIds } from "./setup-links.js";
+import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
+import { resolveSsoConnectionAuthoritative } from "./sso.js";
 
 export type SsoTestFixture =
 	| "ok"
@@ -47,15 +54,112 @@ export const SSO_REAL_FIXTURE_MODE = "simulation" as const;
 /** Matrix fixtures (okta/entra JSON) are never tenant certification. */
 export const SSO_MATRIX_NOT_CERTIFIED = false as const;
 
-function pushTrace(store: ManagementStore, trace: DiagnosticTrace): DiagnosticTrace {
-	const withMode: DiagnosticTrace = {
-		...trace,
-		mode: trace.mode ?? SSO_REAL_FIXTURE_MODE,
+async function settleSsoTestSuccess(
+	store: ManagementStore,
+	input: {
+		connection: IdentityConnection;
+		trace: DiagnosticTrace;
+		actor?: string;
+		source?: "cli" | "console" | "api" | "system" | "sso";
+		scope?: ResourceScope;
+		message: string;
+		metadata: Record<string, unknown>;
+	},
+): Promise<IdentityConnection> {
+	const expectedOrganization = await inspectOrganizationAuthoritative(
+		store,
+		input.connection.organizationId,
+		input.scope,
+	);
+	const scope = input.scope ?? {
+		projectId: expectedOrganization.projectId,
+		environmentId: expectedOrganization.environmentId,
 	};
-	store.mutate((d) => {
-		d.traces.unshift(withMode);
+	if (store.backend === "postgres" && typeof store.mutateCoordinated === "function") {
+		return mutateCoordinatedWithRuntimeSql(store, async ({
+			data,
+			topology,
+			appendAudit,
+		}) => {
+			const organization = topology
+				? await topology.lockOrganization({ scope, id: expectedOrganization.id })
+				: data.organizations.find(
+					(organization) =>
+						organization.id === expectedOrganization.id &&
+						organization.projectId === scope.projectId &&
+						organization.environmentId === scope.environmentId,
+				);
+			if (!organization || organization.status === "archived") {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: `SSO connection ${input.connection.id} not found`,
+					stage: "sso.test",
+					status: 404,
+				});
+			}
+			const index = data.identityConnections.findIndex(
+				(connection) =>
+					connection.id === input.connection.id &&
+					connection.organizationId === organization.id,
+			);
+			if (index < 0) {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: `SSO connection ${input.connection.id} not found`,
+					stage: "sso.test",
+					status: 404,
+				});
+			}
+			const current = data.identityConnections[index]!;
+			const updated = { ...current, status: "testing" as const, updatedAt: nowIso() };
+			data.identityConnections[index] = updated;
+			data.traces.unshift({ ...input.trace, mode: SSO_REAL_FIXTURE_MODE });
+			appendAudit({
+				actor: input.actor ?? "system",
+				action: "sso.test",
+				subjectType: "identity_connection",
+				subjectId: updated.id,
+				outcome: "success",
+				source: input.source ?? "sso",
+				organizationId: organization.id,
+				projectId: organization.projectId,
+				environmentId: organization.environmentId,
+				correlationId: input.trace.correlationId,
+				message: input.message,
+				metadata: input.metadata,
+			});
+			return updated;
+		});
+	}
+
+	store.mutate((data) => {
+		const index = data.identityConnections.findIndex(
+			(connection) => connection.id === input.connection.id,
+		);
+		if (index >= 0) {
+			data.identityConnections[index] = {
+				...data.identityConnections[index],
+				status: "testing",
+				updatedAt: nowIso(),
+			};
+		}
+		data.traces.unshift({ ...input.trace, mode: SSO_REAL_FIXTURE_MODE });
 	});
-	return withMode;
+	recordEvent(store, {
+		actor: input.actor ?? "system",
+		action: "sso.test",
+		subjectType: "identity_connection",
+		subjectId: input.connection.id,
+		outcome: "success",
+		source: input.source ?? "sso",
+		organizationId: input.connection.organizationId,
+		correlationId: input.trace.correlationId,
+		message: input.message,
+		metadata: input.metadata,
+	});
+	return store.snapshot.identityConnections.find(
+		(connection) => connection.id === input.connection.id,
+	)!;
 }
 
 function discoveryErrorStage(err: unknown): string {
@@ -192,6 +296,8 @@ export async function createSsoConnectionReal(
 		fixturePath?: string;
 		actor?: string;
 		source?: "cli" | "console" | "api" | "system";
+		/** Server-derived request scope; callers may not select it from client input. */
+		scope?: ResourceScope;
 		/**
 		 * Setup reservation/attempt id. When set, derives stable runtime +
 		 * management ids and reuses them across retries after lease expiry.
@@ -199,7 +305,11 @@ export async function createSsoConnectionReal(
 		setupAttemptId?: string;
 	},
 ): Promise<IdentityConnection> {
-	const org = inspectOrganization(store, input.organizationId);
+	const org = await inspectOrganizationAuthoritative(
+		store,
+		input.organizationId,
+		input.scope,
+	);
 
 	let fixture: SsoOidcFixture | null = null;
 	if (input.fixturePath) {
@@ -266,6 +376,168 @@ export async function createSsoConnectionReal(
 	const providerId =
 		deterministic?.providerId ?? `${provider}-${org.slug}-${Date.now()}`;
 	const connectionId = deterministic?.connectionId;
+
+	/*
+	 * Runtime provider rows and their control-plane connections have one commit
+	 * boundary on Postgres. The earlier authoritative read prevents an
+	 * unscoped caller from reaching this point; the lookup below repeats it in
+	 * the same transaction so archive/re-scope cannot strand a live provider.
+	 * JsonStore retains the explicit fixture/dev recovery path below.
+	 */
+	if (store.backend === "postgres" && typeof store.mutateCoordinated === "function") {
+		return mutateCoordinatedWithRuntimeSql(store, async ({
+			data,
+			topology,
+			query,
+			appendAudit,
+		}) => {
+			const active = topology
+				? await topology.lockOrganization({
+					scope: {
+						projectId: org.projectId,
+						environmentId: org.environmentId,
+					},
+					id: org.id,
+				})
+				: data.organizations.find(
+					(organization) =>
+						organization.id === org.id &&
+						organization.projectId === org.projectId &&
+						organization.environmentId === org.environmentId,
+				);
+			if (!active || active.status === "archived") {
+				throw new ClearanceError({
+					code: "ORG_NOT_FOUND",
+					message: "Organization not found",
+					stage: "sso.create",
+					status: 404,
+				});
+			}
+
+			const prior = connectionId
+				? data.identityConnections.find((connection) => connection.id === connectionId)
+				: undefined;
+			if (prior) {
+				assertMatchingSsoConnection(prior, {
+					organizationId: active.id,
+					provider,
+					protocol,
+					issuer,
+					domain,
+					clientId,
+					samlEntryPoint: saml?.entryPoint,
+					samlCertificateFingerprint: saml?.fingerprint,
+				});
+				const reconciledClientSecret =
+					protocol === "oidc"
+						? prior.clientSecretEncrypted
+							? decryptCredential(prior.clientSecretEncrypted)
+							: (() => {
+									throw new ClearanceError({
+										code: "SSO_CONNECTION_SECRET_MISSING",
+										message: "Existing deterministic OIDC connection has no encrypted client secret",
+										stage: "sso.management.reconcile",
+										status: 409,
+									});
+								})()
+						: clientSecret;
+				await insertSsoProviderInTransaction(query, {
+					id: connectionId,
+					providerId,
+					issuer,
+					domain,
+					organizationId: active.id,
+					protocol,
+					oidc:
+						protocol === "oidc"
+							? { clientId: prior.clientId ?? clientId, clientSecret: reconciledClientSecret! }
+							: undefined,
+					saml:
+						protocol === "saml"
+							? {
+								entryPoint: prior.samlEntryPoint ?? saml!.entryPoint,
+								cert: prior.samlCertificate ?? saml!.certificate,
+								audience,
+							}
+							: undefined,
+				});
+				return publicIdentityConnection(prior) as IdentityConnection;
+			}
+
+			const inserted = await insertSsoProviderInTransaction(query, {
+				id: connectionId,
+				providerId,
+				issuer,
+				domain,
+				organizationId: active.id,
+				protocol,
+				oidc: protocol === "oidc" ? { clientId, clientSecret: clientSecret! } : undefined,
+				saml:
+					protocol === "saml"
+						? { entryPoint: saml!.entryPoint, cert: saml!.certificate, audience }
+						: undefined,
+			});
+			const raced = data.identityConnections.find((connection) => connection.id === inserted.id);
+			if (raced) {
+				assertMatchingSsoConnection(raced, {
+					organizationId: active.id,
+					provider,
+					protocol,
+					issuer,
+					domain,
+					clientId,
+					samlEntryPoint: saml?.entryPoint,
+					samlCertificateFingerprint: saml?.fingerprint,
+				});
+				return publicIdentityConnection(raced) as IdentityConnection;
+			}
+
+			const enc = clientSecret ? encryptCredential(clientSecret) : undefined;
+			const now = nowIso();
+			const conn: IdentityConnection = {
+				id: inserted.id,
+				organizationId: active.id,
+				protocol,
+				provider,
+				status: "draft",
+				domains: [domain],
+				issuer,
+				audience,
+				clientId,
+				clientSecretFingerprint: enc?.fingerprint,
+				clientSecretEncrypted: enc?.ciphertext,
+				clientSecretKeyId: enc?.keyId,
+				samlEntryPoint: saml?.entryPoint,
+				samlCertificate: saml?.certificate,
+				samlCertificateFingerprint: saml?.fingerprint,
+				attributeMapping: { email: "email", name: "name" },
+				createdAt: now,
+				updatedAt: now,
+			};
+			data.identityConnections.push(conn);
+			appendAudit({
+				actor: input.actor ?? "operator",
+				action: "sso.create",
+				subjectType: "identity_connection",
+				subjectId: conn.id,
+				outcome: "success",
+				source: input.source ?? "cli",
+				organizationId: active.id,
+				message: `Created SSO provider ${providerId} (matrix=${fixture?.matrix ?? "custom"}) via coordinated provider/control settlement`,
+				metadata: {
+					fixturePath: input.fixturePath ?? (input.matrix ? `sso/${input.matrix}-oidc.json` : null),
+					discoveryUrl,
+					hasClientSecret: Boolean(clientSecret),
+					clientSecretKeyId: enc?.keyId ?? null,
+					samlCertificateFingerprint: saml?.fingerprint ?? null,
+					matrixCertifiedExternalTenant: SSO_MATRIX_NOT_CERTIFIED,
+					setupAttemptId: input.setupAttemptId ?? null,
+					reusedRuntime: Boolean(inserted.reused),
+				},
+			});
+			return publicIdentityConnection(conn) as IdentityConnection;
+		});
+	}
 
 	if (connectionId) {
 		const existing = store.snapshot.identityConnections.find((c) => c.id === connectionId);
@@ -439,22 +711,17 @@ export async function createSsoConnectionReal(
  * Test SSO using real @clearance/sso validators.
  * Fixture names map to fixtures/sso/adversarial-cases.json or matrix discovery files.
  */
-export function testSsoConnectionReal(
+export async function testSsoConnectionReal(
 	store: ManagementStore,
 	id: string,
 	opts: {
 		fixture?: SsoTestFixture;
 		actor?: string;
 		source?: "cli" | "console" | "api" | "system" | "sso";
+		/** Server-derived operator scope. */
+		scope?: ResourceScope;
 	} = {},
-): {
-	pass: boolean;
-	trace: DiagnosticTrace;
-	connection: IdentityConnection;
-	mode: "simulation";
-	certifiedExternalTenant?: false;
-	evidence?: string;
-} | Promise<{
+): Promise<{
 	pass: boolean;
 	trace: DiagnosticTrace;
 	connection: IdentityConnection;
@@ -463,15 +730,10 @@ export function testSsoConnectionReal(
 	evidence?: string;
 	authorizationUrl?: string;
 }> {
-	const conn = store.snapshot.identityConnections.find((c) => c.id === id);
-	if (!conn) {
-		throw new ClearanceError({
-			code: "SSO_NOT_FOUND",
-			message: `SSO connection ${id} not found`,
-			stage: "sso.test",
-			status: 404,
-		});
-	}
+	const conn = await resolveSsoConnectionAuthoritative(store, id, {
+		scope: opts.scope,
+		stage: "sso.test",
+	});
 
 	const fixtureName = opts.fixture ?? "ok";
 	const known: SsoTestFixture[] = [
@@ -496,7 +758,7 @@ export function testSsoConnectionReal(
 
 	// Full local OIDC authorize+state+nonce+PKCE+callback path
 	if (fixtureName === "local-oidc") {
-		return verifySsoOidcLocalProtocol(store, id);
+		return verifySsoOidcLocalProtocol(store, id, { scope: opts.scope });
 	}
 	const corr = `corr_sso_${newId("t").slice(4)}`;
 	const base = {
@@ -551,7 +813,7 @@ export function testSsoConnectionReal(
 			throw new Error("unreachable");
 		}
 
-		const trace = pushTrace(store, {
+		const trace: DiagnosticTrace = {
 			...base,
 			stage: "assertion.accept",
 			outcome: "pass",
@@ -575,26 +837,13 @@ export function testSsoConnectionReal(
 				certifiedExternalTenant: false,
 				matrixShape: matrix,
 			},
-		});
-		store.mutate((data) => {
-			const idx = data.identityConnections.findIndex((c) => c.id === id);
-			if (idx >= 0) {
-				data.identityConnections[idx] = {
-					...conn,
-					status: "testing",
-					updatedAt: nowIso(),
-				};
-			}
-		});
-		recordEvent(store, {
-			actor: opts.actor ?? "system",
-			action: "sso.test",
-			subjectType: "identity_connection",
-			subjectId: id,
-			outcome: "success",
-			source: opts.source ?? "sso",
-			organizationId: conn.organizationId,
-			correlationId: corr,
+		};
+		const connection = await settleSsoTestSuccess(store, {
+			connection: conn,
+			trace,
+			actor: opts.actor,
+			source: opts.source,
+			scope: opts.scope,
 			message: `SSO simulation via @clearance/sso (${matrix} shape) — ${SSO_LOCAL_EVIDENCE_LABEL}`,
 			metadata: {
 				fixture: `sso/${matrix}-oidc.json`,
@@ -606,9 +855,7 @@ export function testSsoConnectionReal(
 		return {
 			pass: true,
 			trace,
-			connection: publicIdentityConnection(
-				store.snapshot.identityConnections.find((c) => c.id === id)!,
-			) as IdentityConnection,
+			connection: publicIdentityConnection(connection) as IdentityConnection,
 			mode: SSO_REAL_FIXTURE_MODE,
 			certifiedExternalTenant: false,
 			evidence: SSO_LOCAL_EVIDENCE_LABEL,
@@ -644,36 +891,10 @@ export function testSsoConnectionReal(
 				throw e;
 			}
 			const stage = discoveryErrorStage(e);
-			const trace = pushTrace(store, {
-				...base,
-				stage,
-				outcome: "fail",
-				cause: e instanceof Error ? e.message : String(e),
-				causeConfidence: 0.99,
-				owner: "customer",
-				remediation:
-					stage === "discovery.issuer"
-						? "Align IdP discovery issuer with registered ssoProvider.issuer"
-						: "Provide complete OIDC discovery document fields",
-				checks: [
-					{
-						name: "validateDiscoveryDocument",
-						pass: false,
-						detail: `fixtures/sso/adversarial-cases.json#${advCase.id}`,
-					},
-				],
-			});
-			recordEvent(store, {
-				actor: opts.actor ?? "system",
-				action: "sso.test",
-				subjectType: "identity_connection",
-				subjectId: id,
-				outcome: "failure",
-				source: opts.source ?? "sso",
-				organizationId: conn.organizationId,
-				correlationId: corr,
-				message: `SSO test failed at ${stage}`,
-			});
+			const remediation =
+				stage === "discovery.issuer"
+					? "Align IdP discovery issuer with registered ssoProvider.issuer"
+					: "Provide complete OIDC discovery document fields";
 			throw new ClearanceError({
 				code:
 					stage === "discovery.issuer"
@@ -681,7 +902,7 @@ export function testSsoConnectionReal(
 						: "SSO_DISCOVERY_INVALID",
 				message: e instanceof Error ? e.message : "Discovery validation failed",
 				stage,
-				remediation: trace.remediation!,
+				remediation,
 			});
 		}
 	}
@@ -710,30 +931,15 @@ export function testSsoConnectionReal(
 			if (e instanceof Error && e.message === "expected timestamp failure") throw e;
 			const stage =
 				fixtureName === "clock-skew" ? "assertion.clock" : "assertion.validity";
-			const trace = pushTrace(store, {
-				...base,
-				stage,
-				outcome: "fail",
-				cause: e instanceof Error ? e.message : String(e),
-				causeConfidence: 0.97,
-				owner: "customer",
-				remediation:
-					fixtureName === "clock-skew"
-						? `Sync NTP; skew tolerance ${DEFAULT_CLOCK_SKEW_MS}ms`
-						: "Retry sign-in; check IdP assertion lifetime",
-				checks: [
-					{
-						name: "validateSAMLTimestamp",
-						pass: false,
-						detail: "fixtures/sso/adversarial-cases.json",
-					},
-				],
-			});
+			const remediation =
+				fixtureName === "clock-skew"
+					? `Sync NTP; skew tolerance ${DEFAULT_CLOCK_SKEW_MS}ms`
+					: "Retry sign-in; check IdP assertion lifetime";
 			throw new ClearanceError({
 				code: fixtureName === "clock-skew" ? "SSO_CLOCK_SKEW" : "SSO_EXPIRED",
 				message: e instanceof Error ? e.message : fixtureName,
 				stage,
-				remediation: trace.remediation!,
+				remediation,
 			});
 		}
 	}
@@ -742,27 +948,11 @@ export function testSsoConnectionReal(
 		const assertionAud = advCase.audience ?? "wrong-sp";
 		const configured = conn.audience ?? advCase.configuredAudience ?? "clearance-sp";
 		if (assertionAud !== configured) {
-			const trace = pushTrace(store, {
-				...base,
-				stage: "assertion.audience",
-				outcome: "fail",
-				cause: `Audience ${assertionAud} does not match configured ${configured}`,
-				causeConfidence: 0.98,
-				owner: "customer",
-				remediation: "Align SP EntityID/audience in IdP with connection config",
-				checks: [
-					{
-						name: "audience_match",
-						pass: false,
-						detail: `got ${assertionAud}, expected ${configured}`,
-					},
-				],
-			});
 			throw new ClearanceError({
 				code: "SSO_WRONG_AUDIENCE",
 				message: "Wrong audience",
 				stage: "assertion.audience",
-				remediation: trace.remediation!,
+				remediation: "Align SP EntityID/audience in IdP with connection config",
 			});
 		}
 	}
@@ -775,19 +965,14 @@ export function testSsoConnectionReal(
 }
 
 /** Run Okta + Entra positive matrix against a connection's registered issuer. */
-export function runSsoMatrix(
+export async function runSsoMatrix(
 	store: ManagementStore,
 	connectionId: string,
-): { okta: boolean; entra: boolean } {
-	const okta = testSsoConnectionReal(store, connectionId, { fixture: "okta" });
-	const entra = testSsoConnectionReal(store, connectionId, { fixture: "entra" });
-	// testSsoConnectionReal may return a Promise for live/local paths; matrix uses sync fixtures
-	if (okta instanceof Promise || entra instanceof Promise) {
-		throw new ClearanceError({
-			code: "SSO_MATRIX_ASYNC",
-			message: "SSO matrix fixtures must resolve synchronously",
-			stage: "sso.matrix",
-		});
-	}
+	opts: { scope?: ResourceScope } = {},
+): Promise<{ okta: boolean; entra: boolean }> {
+	const [okta, entra] = await Promise.all([
+		testSsoConnectionReal(store, connectionId, { fixture: "okta", scope: opts.scope }),
+		testSsoConnectionReal(store, connectionId, { fixture: "entra", scope: opts.scope }),
+	]);
 	return { okta: okta.pass, entra: entra.pass };
 }
