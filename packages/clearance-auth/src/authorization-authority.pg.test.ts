@@ -72,6 +72,13 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 		expect(sql).toContain(`CREATE TABLE IF NOT EXISTS "${schema}"."clearance_authz_actions"`);
 		expect(sql).toContain("authz_service_account_credentials");
 		await plan.apply();
+		await expect(authority.listRoles({})).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ roleId: "role_builtin_owner", builtIn: true }),
+				expect.objectContaining({ roleId: "role_builtin_admin", builtIn: true }),
+				expect.objectContaining({ roleId: "role_builtin_member", builtIn: true }),
+			]),
+		);
 		const installed = await authority.planMigration();
 		expect(installed).toMatchObject({ pendingTables: 0, pendingFields: 0, pendingSecurityMigrations: [] });
 		expect(await installed.compileSql()).toBe("");
