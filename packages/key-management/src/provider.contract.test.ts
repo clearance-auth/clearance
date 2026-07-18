@@ -94,7 +94,7 @@ describe("purpose-bound local key provider", () => {
 				if (command instanceof EncryptCommand) {
 					expect(command.input.EncryptionContext).toEqual({
 						environmentId: context.environmentId,
-						keyId: "arn:aws:kms:us-east-1:123456789012:key/oidc",
+						keyId: "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111",
 						projectId: context.projectId,
 						provider: "aws-kms",
 						providerId: "aws-oidc",
@@ -126,10 +126,19 @@ describe("purpose-bound local key provider", () => {
 				throw new Error("unexpected command");
 			},
 		} as unknown as KMSClient;
+		expect(() =>
+			createAwsKmsKeyProvider({
+				providerId: "aws-alias",
+				purpose: "oidc-client-secret",
+				currentKeyId: "alias/clearance-oidc",
+				region: "us-east-1",
+				client: awsClient,
+			}),
+		).toThrowError(expect.objectContaining({ code: "KEY_INPUT_INVALID" }));
 		const aws = createAwsKmsKeyProvider({
 			providerId: "aws-oidc",
 			purpose: "oidc-client-secret",
-			currentKeyId: "arn:aws:kms:us-east-1:123456789012:key/oidc",
+			currentKeyId: "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111",
 			region: "us-east-1",
 			client: awsClient,
 		});
