@@ -160,7 +160,7 @@ describe("CLI transport parity", () => {
 		expect(JSON.parse(String(calls[5]?.[1].body))).toEqual({ dryRun: true });
 	});
 
-	it("routes store-v2 reads and gates apply, rollback, event, and principal authority", async () => {
+	it("routes store-v2 reads and gates apply, rollback, event, principal, and topology authority", async () => {
 		const calls: Array<[string, RequestInit]> = [];
 		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
 			calls.push([url, init]);
@@ -211,6 +211,26 @@ describe("CLI transport parity", () => {
 			{ yes: true },
 		);
 		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 topology cutover", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_CUTOVER_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 topology cutover",
+			[],
+			{},
+			{ yes: true },
+		);
+		await expect(
+			dispatchRemoteCommand(session, "schema store-v2 topology rollback", [], {}, {}),
+		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_ROLLBACK_CONFIRMATION_REQUIRED" });
+		await dispatchRemoteCommand(
+			session,
+			"schema store-v2 topology rollback",
+			[],
+			{},
+			{ yes: true },
+		);
+		await expect(
 			dispatchRemoteCommand(session, "schema store-v2 events cutover", [], {}, {}),
 		).rejects.toMatchObject({ code: "STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED" });
 		await dispatchRemoteCommand(
@@ -239,6 +259,8 @@ describe("CLI transport parity", () => {
 			"https://api.clearance.test/v1/schema/store-v2/rollback",
 			"https://api.clearance.test/v1/schema/store-v2/principals/cutover",
 			"https://api.clearance.test/v1/schema/store-v2/principals/rollback",
+			"https://api.clearance.test/v1/schema/store-v2/topology/cutover",
+			"https://api.clearance.test/v1/schema/store-v2/topology/rollback",
 			"https://api.clearance.test/v1/schema/store-v2/events/cutover",
 			"https://api.clearance.test/v1/schema/store-v2/events/rollback",
 		]);
@@ -248,6 +270,8 @@ describe("CLI transport parity", () => {
 		expect(JSON.parse(String(calls[6]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[7]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[8]?.[1].body))).toEqual({ confirm: true });
+		expect(JSON.parse(String(calls[9]?.[1].body))).toEqual({ confirm: true });
+		expect(JSON.parse(String(calls[10]?.[1].body))).toEqual({ confirm: true });
 	});
 
 	it("routes credential-authority status, arm, and drain with exact confirmation payloads", async () => {
