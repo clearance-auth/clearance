@@ -204,11 +204,20 @@ export function storeV2SchemaStatements(
 	const environmentCursorIndex = derivedIdentifier(
 		`${tables.environments}_cursor`,
 	);
+	const environmentNameIndex = derivedIdentifier(
+		`${tables.environments}_project_name`,
+	);
+	const environmentSlugIndex = derivedIdentifier(
+		`${tables.environments}_project_slug`,
+	);
 	const principalEmailIndex = storeV2PrincipalEmailUniqueIndex(tables);
 	const principalExternalIdIndex = storeV2PrincipalExternalIdUniqueIndex(tables);
 	const principalCursorIndex = derivedIdentifier(`${tables.principals}_cursor`);
 	const organizationSlugIndex = derivedIdentifier(
 		`${tables.organizations}_slug_unique`,
+	);
+	const organizationExternalIdIndex = derivedIdentifier(
+		`${tables.organizations}_external_id`,
 	);
 	const organizationCursorIndex = derivedIdentifier(
 		`${tables.organizations}_cursor`,
@@ -261,6 +270,10 @@ export function storeV2SchemaStatements(
 				USING date_trunc('milliseconds', updated_at)`,
 		`CREATE INDEX IF NOT EXISTS ${environmentCursorIndex}
 			ON ${tables.environments} (project_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${environmentNameIndex}
+			ON ${tables.environments} (project_id, name)`,
+		`CREATE INDEX IF NOT EXISTS ${environmentSlugIndex}
+			ON ${tables.environments} (project_id, slug)`,
 		`CREATE TABLE IF NOT EXISTS ${tables.principals} (
 			id text PRIMARY KEY,
 			project_id text NOT NULL,
@@ -309,6 +322,9 @@ export function storeV2SchemaStatements(
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${organizationSlugIndex}
 			ON ${tables.organizations} (project_id, environment_id, slug)
 			WHERE status <> 'archived'`,
+		`CREATE INDEX IF NOT EXISTS ${organizationExternalIdIndex}
+			ON ${tables.organizations} (project_id, environment_id, external_id)
+			WHERE status <> 'archived' AND external_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS ${organizationCursorIndex}
 			ON ${tables.organizations}
 				(project_id, environment_id, created_at DESC, id DESC)`,
