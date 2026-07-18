@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import {
 	API_KEY_OPERATIONS,
+	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
 	DELIVERY_OPERATIONS,
@@ -26,6 +27,7 @@ import {
 } from "@clearance/management";
 import type { ApiSession } from "./api-client.js";
 import { dispatchAccessCommand } from "./dispatch/access.js";
+import { dispatchAuthenticationPolicyCommand } from "./dispatch/authentication-policy.js";
 import { dispatchCoreCommand } from "./dispatch/core.js";
 import { dispatchDeliveryCommand } from "./dispatch/delivery.js";
 import { dispatchEnterpriseCommand } from "./dispatch/enterprise.js";
@@ -125,6 +127,11 @@ export async function dispatchRemoteCommand(
 		case WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath:
 		case WEBHOOK_ENDPOINT_OPERATIONS.test.cliPath:
 			return dispatchDeliveryCommand({ session, path, args, opts, global });
+		case AUTHENTICATION_POLICY_OPERATIONS.get.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.plan.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.apply.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.unlock.cliPath:
+			return dispatchAuthenticationPolicyCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
 		case API_KEY_OPERATIONS.rotate.cliPath:
