@@ -117,6 +117,20 @@ function normalizeCursor(value: PageCursorKey): PageCursorKey {
 	return { createdAt: timestamp.toISOString(), id: value.id };
 }
 
+function assertLookupString(value: unknown): asserts value is string {
+	if (
+		typeof value !== "string" ||
+		!value ||
+		value.length > 1_024 ||
+		value.includes("\0")
+	) {
+		throw new StoreV2TopologyAuthorityError(
+			"STORE_V2_TOPOLOGY_LOOKUP_INVALID",
+			"Topology lookup strings must be non-empty, bounded strings.",
+		);
+	}
+}
+
 export async function readStoreV2TopologyState(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
@@ -231,6 +245,11 @@ async function assertAuthority(
 	}
 }
 
+const TOPOLOGY_REPOSITORY_CONTROLLERS = new WeakMap<
+	StoreV2TopologyRepository,
+	PgStoreV2TopologyRepository
+>();
+
 export class PgStoreV2TopologyRepository {
 	readonly capability: StoreV2TopologyRepository;
 	private active = true;
@@ -245,13 +264,29 @@ export class PgStoreV2TopologyRepository {
 		private readonly tables: StoreV2TableNames,
 		private readonly trackIssued = true,
 	) {
-		this.capability = Object.freeze({
+		const capability: StoreV2TopologyRepository = {
 			authoritative: true as const,
 			getProjectById: (id: string) => this.getProjectById(id),
+			findProjectConflict: (input: {
+				name: string;
+				slug: string;
+				excludeId?: string;
+			}) => this.findProjectConflict(input),
 			getEnvironment: (input: { projectId: string; id: string }) =>
 				this.getEnvironment(input),
+			findEnvironmentByKey: (input: { projectId: string; key: string }) =>
+				this.findEnvironmentByKey(input),
 			getOrganization: (input: { scope: ResourceScope; id: string }) =>
 				this.getOrganization(input),
+			organizationIdExists: (id: string) => this.organizationIdExists(id),
+			getOrganizationBySlug: (input: {
+				scope: ResourceScope;
+				slug: string;
+			}) => this.getOrganizationBySlug(input),
+			getOrganizationByExternalId: (input: {
+				scope: ResourceScope;
+				externalId: string;
+			}) => this.getOrganizationByExternalId(input),
 			countOrganizations: (input: {
 				scope: ResourceScope;
 				includeArchived?: boolean;
@@ -269,10 +304,17 @@ export class PgStoreV2TopologyRepository {
 				cursor?: PageCursorKey;
 				includeArchived?: boolean;
 			}) => this.listOrganizationsPage(input),
+			lockProject: (input: { id: string }) => this.lockProject(input),
+			lockEnvironment: (input: { projectId: string; id: string }) =>
+				this.lockEnvironment(input),
+			lockOrganization: (input: { scope: ResourceScope; id: string }) =>
+				this.lockOrganization(input),
 			upsertProject: (input: Project) => this.upsertProject(input),
 			upsertEnvironment: (input: Environment) => this.upsertEnvironment(input),
 			upsertOrganization: (input: Organization) => this.upsertOrganization(input),
-		});
+		};
+		this.capability = Object.freeze(capability);
+		TOPOLOGY_REPOSITORY_CONTROLLERS.set(this.capability, this);
 	}
 
 	revoke(): void {
@@ -330,6 +372,29 @@ export class PgStoreV2TopologyRepository {
 		});
 	}
 
+	findProjectConflict(input: {
+		name: string;
+		slug: string;
+		excludeId?: string;
+	}): Promise<Project | null> {
+		return this.issue(async () => {
+			assertLookupString(input.name);
+			assertLookupString(input.slug);
+			if (input.excludeId !== undefined) assertLookupString(input.excludeId);
+			const values = [input.name, input.slug];
+			const exclude = input.excludeId === undefined ? "" : " AND id <> $3";
+			if (input.excludeId !== undefined) values.push(input.excludeId);
+			const result = await this.client.query<ProjectRow>(
+				`SELECT id, name, slug, created_at, updated_at
+				 FROM ${this.tables.projects}
+				 WHERE (lower(name) = lower($1) OR lower(slug) = lower($2))${exclude}
+				 LIMIT 1`,
+				values,
+			);
+			return result.rows[0] ? mapProject(result.rows[0]) : null;
+		});
+	}
+
 	getEnvironment(input: { projectId: string; id: string }): Promise<Environment | null> {
 		return this.issue(async () => {
 			const result = await this.client.query<EnvironmentRow>(
@@ -342,6 +407,25 @@ export class PgStoreV2TopologyRepository {
 		});
 	}
 
+	findEnvironmentByKey(input: {
+		projectId: string;
+		key: string;
+	}): Promise<Environment | null> {
+		return this.issue(async () => {
+			assertLookupString(input.projectId);
+			assertLookupString(input.key);
+			const result = await this.client.query<EnvironmentRow>(
+				`SELECT id, project_id, name, slug, kind, created_at, updated_at
+				 FROM ${this.tables.environments}
+				 WHERE project_id = $1 AND (id = $2 OR name = $2 OR slug = $2)
+				 ORDER BY created_at ASC, id ASC
+				 LIMIT 1`,
+				[input.projectId, input.key],
+			);
+			return result.rows[0] ? mapEnvironment(result.rows[0]) : null;
+		});
+	}
+
 	getOrganization(input: { scope: ResourceScope; id: string }): Promise<Organization | null> {
 		return this.issue(async () => {
 			const result = await this.client.query<OrganizationRow>(
@@ -349,6 +433,115 @@ export class PgStoreV2TopologyRepository {
 				        created_at, updated_at
 				 FROM ${this.tables.organizations}
 				 WHERE project_id = $1 AND environment_id = $2 AND id = $3`,
+				[input.scope.projectId, input.scope.environmentId, input.id],
+			);
+			return result.rows[0] ? mapOrganization(result.rows[0]) : null;
+		});
+	}
+
+	organizationIdExists(id: string): Promise<boolean> {
+		return this.issue(async () => {
+			assertLookupString(id);
+			const result = await this.client.query<{ exists: boolean }>(
+				`SELECT EXISTS(
+					SELECT 1 FROM ${this.tables.organizations} WHERE id = $1
+				) AS exists`,
+				[id],
+			);
+			return result.rows[0]?.exists ?? false;
+		});
+	}
+
+	getOrganizationBySlug(input: {
+		scope: ResourceScope;
+		slug: string;
+	}): Promise<Organization | null> {
+		return this.issue(async () => {
+			assertLookupString(input.scope.projectId);
+			assertLookupString(input.scope.environmentId);
+			assertLookupString(input.slug);
+			const result = await this.client.query<OrganizationRow>(
+				`SELECT id, project_id, environment_id, name, slug, status, external_id,
+				        created_at, updated_at
+				 FROM ${this.tables.organizations}
+				 WHERE project_id = $1 AND environment_id = $2 AND slug = $3
+				   AND status <> 'archived'
+				 LIMIT 1`,
+				[input.scope.projectId, input.scope.environmentId, input.slug],
+			);
+			return result.rows[0] ? mapOrganization(result.rows[0]) : null;
+		});
+	}
+
+	getOrganizationByExternalId(input: {
+		scope: ResourceScope;
+		externalId: string;
+	}): Promise<Organization | null> {
+		return this.issue(async () => {
+			assertLookupString(input.scope.projectId);
+			assertLookupString(input.scope.environmentId);
+			assertLookupString(input.externalId);
+			const result = await this.client.query<OrganizationRow>(
+				`SELECT id, project_id, environment_id, name, slug, status, external_id,
+				        created_at, updated_at
+				 FROM ${this.tables.organizations}
+				 WHERE project_id = $1 AND environment_id = $2 AND external_id = $3
+				   AND external_id IS NOT NULL AND status <> 'archived'
+				 LIMIT 1`,
+				[input.scope.projectId, input.scope.environmentId, input.externalId],
+			);
+			return result.rows[0] ? mapOrganization(result.rows[0]) : null;
+		});
+	}
+
+	/**
+	 * Transaction-only topology lock order: project, then environment, then
+	 * organization before dependent snapshot, runtime, or authorization writes.
+	 */
+	lockProject(input: { id: string }): Promise<Project | null> {
+		return this.issue(async () => {
+			const result = await this.client.query<ProjectRow>(
+				`SELECT id, name, slug, created_at, updated_at
+				 FROM ${this.tables.projects}
+				 WHERE id = $1
+				 FOR UPDATE`,
+				[input.id],
+			);
+			return result.rows[0] ? mapProject(result.rows[0]) : null;
+		});
+	}
+
+	lockEnvironment(input: {
+		projectId: string;
+		id: string;
+	}): Promise<Environment | null> {
+		return this.issue(async () => {
+			const result = await this.client.query<EnvironmentRow>(
+				`SELECT id, project_id, name, slug, kind, created_at, updated_at
+				 FROM ${this.tables.environments}
+				 WHERE project_id = $1 AND id = $2
+				 FOR UPDATE`,
+				[input.projectId, input.id],
+			);
+			return result.rows[0] ? mapEnvironment(result.rows[0]) : null;
+		});
+	}
+
+	/**
+	 * Acquire the project and environment locks first. Organization upserts
+	 * contend on this same row before dependent writes.
+	 */
+	lockOrganization(input: {
+		scope: ResourceScope;
+		id: string;
+	}): Promise<Organization | null> {
+		return this.issue(async () => {
+			const result = await this.client.query<OrganizationRow>(
+				`SELECT id, project_id, environment_id, name, slug, status, external_id,
+				        created_at, updated_at
+				 FROM ${this.tables.organizations}
+				 WHERE project_id = $1 AND environment_id = $2 AND id = $3
+				 FOR UPDATE`,
 				[input.scope.projectId, input.scope.environmentId, input.id],
 			);
 			return result.rows[0] ? mapOrganization(result.rows[0]) : null;
@@ -570,4 +763,52 @@ export class PgStoreV2TopologyRepository {
 			}))!;
 		});
 	}
+
+	hardDeleteImportedOrganization(organization: Organization): Promise<boolean> {
+		const captured = structuredClone(organization);
+		return this.issue(async () => {
+			await assertAuthority(this.client, this.tables);
+			const result = await this.client.query(
+				`DELETE FROM ${this.tables.organizations}
+				 WHERE id = $1 AND project_id = $2 AND environment_id = $3
+				   AND name = $4 AND slug = $5 AND status = $6
+				   AND external_id IS NOT DISTINCT FROM $7
+				   AND created_at = $8::timestamptz
+				   AND updated_at = $9::timestamptz`,
+				[
+					captured.id,
+					captured.projectId,
+					captured.environmentId,
+					captured.name,
+					captured.slug,
+					captured.status,
+					captured.externalId ?? null,
+					captured.createdAt,
+					captured.updatedAt,
+				],
+			);
+			if (result.rowCount !== 1) return false;
+			this.insertedOrganizations -= 1;
+			this.mutated = true;
+			return true;
+		});
+	}
+}
+
+/**
+ * Internal migration rollback seam. The public repository surface cannot issue
+ * physical deletion, and this exact checkpoint is matched in the DELETE itself.
+ */
+export function hardDeleteImportedOrganizationForRollback(
+	repository: StoreV2TopologyRepository,
+	checkpoint: Organization,
+): Promise<boolean> {
+	const controller = TOPOLOGY_REPOSITORY_CONTROLLERS.get(repository);
+	if (!controller) {
+		throw new StoreV2TopologyAuthorityError(
+			"STORE_V2_TOPOLOGY_ROLLBACK_CAPABILITY_INVALID",
+			"Physical organization deletion requires the internal Postgres migration rollback capability.",
+		);
+	}
+	return controller.hardDeleteImportedOrganization(structuredClone(checkpoint));
 }
