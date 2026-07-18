@@ -12,6 +12,7 @@ import type {
 import {
 	AfterTransactionHookError,
 	getCurrentAdapter,
+	isTransactionActive,
 	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
@@ -29,6 +30,10 @@ import {
 	createInternalSessionIssuanceContext,
 	ManagedSessionIssuanceError,
 } from "../internal/session-issuance-context";
+import {
+	captureInternalSessionDerivativeAuthority,
+	validateInternalSessionDerivativeAuthority,
+} from "../internal/session-derivative-authority";
 import {
 	consumeInternalVerificationChallenge,
 	createInternalVerificationChallengeContext,
@@ -7310,6 +7315,155 @@ describe("managed complete-topology session reads", () => {
 			unmanaged.context.internalAdapter.findSession(unmanagedSession.token),
 		).resolves.not.toBeNull();
 	});
+});
+
+describe("managed session derivative authority", () => {
+		it("requires an owning transaction and survives credential rotation for the same source session", async () => {
+			const runtime = await setupManagedRuntime();
+			const session = await issuePasswordSession(runtime);
+			await expect(
+				captureInternalSessionDerivativeAuthority(
+					runtime.context.internalAdapter,
+					{ purpose: "jwt", sourceSessionToken: session.token },
+				),
+			).rejects.toMatchObject({ reason: "authority_invalid" });
+
+			const [fromToken, fromId] = await runWithTransaction(
+				runtime.context.adapter,
+				async () =>
+					Promise.all([
+						captureInternalSessionDerivativeAuthority(
+							runtime.context.internalAdapter,
+							{ purpose: "jwt", sourceSessionToken: session.token },
+						),
+						captureInternalSessionDerivativeAuthority(
+							runtime.context.internalAdapter,
+							{ purpose: "jwt", sourceSessionId: session.id },
+						),
+					]),
+			);
+			expect(fromToken).toBe(fromId);
+			expect(fromToken).not.toContain(session.token);
+
+			const read = () =>
+				runWithTransaction(runtime.context.adapter, () =>
+					validateInternalSessionDerivativeAuthority(
+						runtime.context.internalAdapter,
+						fromToken,
+						{ purpose: "jwt", subjectId: runtime.user.id },
+					),
+				);
+			await expect(read()).resolves.toMatchObject({
+				sourceSessionId: session.id,
+				sourceSubjectId: runtime.user.id,
+			});
+			await expect(
+				runtime.context.internalAdapter.rotateSessionCredential(session.token),
+			).resolves.toBeTruthy();
+			await expect(read()).resolves.toMatchObject({ sourceSessionId: session.id });
+
+			let releaseDetached!: () => void;
+			const detachedRelease = new Promise<void>((resolve) => {
+				releaseDetached = resolve;
+			});
+			let detachedCapture!: Promise<unknown>;
+			let detachedValidation!: Promise<unknown>;
+			let detachedState!: Promise<{
+				active: boolean;
+				adapter: object;
+			}>;
+			await runWithTransaction(runtime.context.adapter, async () => {
+				detachedState = (async () => {
+					await detachedRelease;
+					return {
+						active: await isTransactionActive(runtime.context.adapter),
+						adapter: await getCurrentAdapter(runtime.context.adapter),
+					};
+				})();
+				detachedCapture = (async () => {
+					await detachedRelease;
+					return captureInternalSessionDerivativeAuthority(
+						runtime.context.internalAdapter,
+						{ purpose: "jwt", sourceSessionId: session.id },
+					);
+				})();
+				detachedValidation = (async () => {
+					await detachedRelease;
+					return validateInternalSessionDerivativeAuthority(
+						runtime.context.internalAdapter,
+						fromToken,
+						{ purpose: "jwt", subjectId: runtime.user.id },
+					);
+				})();
+			});
+			releaseDetached();
+			await expect(detachedState).resolves.toEqual({
+				active: false,
+				adapter: runtime.context.adapter,
+			});
+			await expect(
+				Promise.allSettled([detachedCapture, detachedValidation]),
+			).resolves.toEqual([
+				{
+					status: "rejected",
+					reason: expect.objectContaining({ reason: "authority_invalid" }),
+				},
+				{
+					status: "rejected",
+					reason: expect.objectContaining({ reason: "authority_invalid" }),
+				},
+			]);
+		});
+
+		it("fails a captured derivative authority after live policy, expiry, and revocation changes", async () => {
+			let revision = "7";
+			const runtime = await setupManagedRuntime({
+				reader: (input) => policyResult(input, { revision }),
+			});
+			const capture = async () => {
+				const session = await issuePasswordSession(runtime);
+				const binding = await runWithTransaction(
+					runtime.context.adapter,
+					() =>
+						captureInternalSessionDerivativeAuthority(
+							runtime.context.internalAdapter,
+							{ purpose: "oidc", sourceSessionId: session.id },
+						),
+				);
+				const validate = () =>
+					runWithTransaction(runtime.context.adapter, () =>
+						validateInternalSessionDerivativeAuthority(
+							runtime.context.internalAdapter,
+							binding,
+							{ purpose: "oidc" },
+						),
+					);
+				return { session, validate };
+			};
+
+			const policyChanged = await capture();
+			revision = "8";
+			await expect(policyChanged.validate()).rejects.toMatchObject({
+				reason: "authority_stale",
+			});
+			revision = "7";
+
+			const expired = await capture();
+			await runtime.context.adapter.update({
+				model: "session",
+				where: [{ field: "id", value: expired.session.id }],
+				update: { expiresAt: new Date(Date.now() - 1_000) },
+			});
+			await expect(expired.validate()).rejects.toMatchObject({
+				reason: "authority_stale",
+			});
+
+			const revoked = await capture();
+			await runtime.context.internalAdapter.deleteSession(revoked.session.token);
+			await expect(revoked.validate()).rejects.toMatchObject({
+				reason: "authority_stale",
+			});
+		});
 });
 
 describe("managed user session reconciliation", () => {
