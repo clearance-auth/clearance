@@ -42,6 +42,7 @@ import {
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalAuthenticationPolicy } from "../../runtime/src/internal/authentication-policy.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
+import { attachCapturedInternalRuntimeAudit } from "../../runtime/src/internal/runtime-audit.js";
 import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
 import { attachSSOInternalVerificationChallengeAuthority } from "../../sso/src/internal/verification-challenge-authority.js";
 import { attachSSOKeyManagementWriter } from "../../sso/src/internal/key-management-writer.js";
@@ -59,6 +60,7 @@ import {
 	bootstrapCredentialAuthorityFence,
 } from "./credential-authority-fence.js";
 import { PostgresAuthenticationPolicyAuthority } from "./authentication-policy-authority.js";
+import { createRuntimeAuditOutbox } from "./runtime-audit.js";
 import type {
 	ClearanceAuthBundle,
 	ClearanceAuthenticationAssuranceLevel,
@@ -342,6 +344,41 @@ function resolveProductKeyManagement<
 		environmentId,
 		registry,
 		signingProvider,
+	});
+}
+
+function resolveRuntimeAuditScope<
+	Security extends ClearanceAuthenticationSecurityOptions | undefined,
+	Passkeys extends ClearancePasskeyOptions | false | undefined,
+>(
+	options: CreateClearanceAuthOptions<Security, Passkeys>,
+	strict: boolean,
+):
+	| Readonly<{ projectId: string; environmentId: string; schema?: string; prefix?: string }>
+	| undefined {
+	if (options.runtimeAudit === false) return undefined;
+	const explicit = options.runtimeAudit;
+	const scopes = [
+		options.authenticationPolicy,
+		options.keyManagement,
+		options.durableDelivery,
+	].filter((scope): scope is { projectId: string; environmentId: string } => Boolean(scope));
+	if (explicit) scopes.push(explicit);
+	if (scopes.length === 0) return undefined;
+	const [first] = scopes;
+	if (!first || scopes.some((scope) =>
+		scope.projectId !== first.projectId || scope.environmentId !== first.environmentId,
+	)) {
+		throw new Error("runtimeAudit scope must match every managed product scope");
+	}
+	if (strict && !first.projectId.trim()) {
+		throw new Error("runtimeAudit requires one unambiguous managed product scope");
+	}
+	return Object.freeze({
+		projectId: first.projectId,
+		environmentId: first.environmentId,
+		...(explicit?.schema === undefined ? {} : { schema: explicit.schema }),
+		...(explicit?.prefix === undefined ? {} : { prefix: explicit.prefix }),
 	});
 }
 
@@ -906,6 +943,10 @@ export function createClearanceAuth<
 	}
 
 	const pool = new pg.Pool({ connectionString: options.databaseUrl });
+	const runtimeAuditScope = resolveRuntimeAuditScope(options, strict);
+	const runtimeAuditOutbox = runtimeAuditScope
+		? createRuntimeAuditOutbox(pool, runtimeAuditScope)
+		: null;
 	const authenticationPolicyAuthority = options.authenticationPolicy
 		? new PostgresAuthenticationPolicyAuthority(
 				pool,
@@ -1024,6 +1065,9 @@ export function createClearanceAuth<
 				identity: authenticationPolicyAuthority.identity,
 				reader: authenticationPolicyAuthority,
 			});
+		}
+		if (runtimeAuditOutbox) {
+			attachCapturedInternalRuntimeAudit(target, runtimeAuditOutbox.binding);
 		}
 		return target;
 	};
@@ -1384,31 +1428,27 @@ export function createClearanceAuth<
 	}
 
 	function combineMigrationPlans(
-		runtimePlan: ClearanceRuntimeMigrationPlan,
-		policyPlan?: Awaited<
-			ReturnType<PostgresAuthenticationPolicyAuthority["planMigration"]>
-		>,
+		...plans: readonly (ClearanceRuntimeMigrationPlan | undefined)[]
 	): ClearanceRuntimeMigrationPlan {
-		if (!policyPlan) return runtimePlan;
+		const activePlans = plans.filter(
+			(plan): plan is ClearanceRuntimeMigrationPlan => plan !== undefined,
+		);
+		const [first] = activePlans;
+		if (!first) throw new Error("At least one migration plan is required");
+		if (activePlans.length === 1) return first;
 		return {
-			pendingTables: runtimePlan.pendingTables + policyPlan.pendingTables,
-			pendingFields: runtimePlan.pendingFields + policyPlan.pendingFields,
+			pendingTables: activePlans.reduce((total, plan) => total + plan.pendingTables, 0),
+			pendingFields: activePlans.reduce((total, plan) => total + plan.pendingFields, 0),
 			pendingSecurityMigrations: Object.freeze([
-				...new Set([
-					...runtimePlan.pendingSecurityMigrations,
-					...policyPlan.pendingSecurityMigrations,
-				]),
+				...new Set(activePlans.flatMap((plan) => plan.pendingSecurityMigrations)),
 			]),
 			async compileSql() {
-				const statements = [
-					await runtimePlan.compileSql(),
-					await policyPlan.compileSql(),
-				].filter((statement) => statement.trim().length > 0);
+				const statements = (await Promise.all(activePlans.map((plan) => plan.compileSql())))
+					.filter((statement) => statement.trim().length > 0);
 				return statements.join("\n");
 			},
 			async apply() {
-				await runtimePlan.apply();
-				await policyPlan.apply();
+				for (const plan of activePlans) await plan.apply();
 			},
 		};
 	}
@@ -1417,11 +1457,12 @@ export function createClearanceAuth<
 		migrationDatabase = database,
 		migrationDrainId?: string,
 	): Promise<ClearanceRuntimeMigrationPlan> {
-		const [runtimePlan, policyPlan] = await Promise.all([
+		const [runtimePlan, policyPlan, auditPlan] = await Promise.all([
 			runtimeMigrationPlanFor(migrationDatabase, migrationDrainId),
 			authenticationPolicyAuthority?.planMigration(),
+			runtimeAuditOutbox?.planMigration(),
 		]);
-		return combineMigrationPlans(runtimePlan, policyPlan);
+		return combineMigrationPlans(runtimePlan, policyPlan, auditPlan);
 	}
 
 	async function inspectPreFenceCredentialSchema(): Promise<{
@@ -2910,16 +2951,18 @@ export function createClearanceAuth<
 		async migrate(input) {
 			const preFenceSchema = await inspectPreFenceCredentialSchema();
 			await bootstrapCredentialAuthorityFence(pool);
-			const [runtimePlan, policyPlan] = await Promise.all([
+			const [runtimePlan, policyPlan, auditPlan] = await Promise.all([
 				runtimeMigrationPlanFor(),
 				authenticationPolicyAuthority?.planMigration(),
+				runtimeAuditOutbox?.planMigration(),
 			]);
-			const plan = combineMigrationPlans(runtimePlan, policyPlan);
+			const plan = combineMigrationPlans(runtimePlan, policyPlan, auditPlan);
 			const apply = async () => {
 				await runtimePlan.apply();
 				await ensureAuthenticationSecurityCompatibility();
 				await ensureLifecycleCompatibility();
 				await ensurePurposeSeparatedCredentialCompatibility();
+				await auditPlan?.apply();
 				if (options.durableDelivery) {
 					await migrateDeliverySchema(pool, {
 						schema: options.durableDelivery.schema,
@@ -2980,6 +3023,9 @@ export function createClearanceAuth<
 							await ensureAuthenticationSecurityCompatibility();
 							await ensureLifecycleCompatibility();
 							await ensurePurposeSeparatedCredentialCompatibility();
+							if (runtimeAuditOutbox) {
+								await runtimeAuditOutbox.applyMigration(leaseClient);
+							}
 							if (options.durableDelivery) {
 								await migrateDeliverySchema(pool, {
 									schema: options.durableDelivery.schema,
