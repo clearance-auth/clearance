@@ -1,6 +1,14 @@
 import pg from "pg";
 import { afterAll, describe, expect, it } from "vitest";
-import { initProject } from "../services/core.js";
+import {
+	inspectEnvironmentAuthoritative,
+	inspectOrganizationAuthoritative,
+	inspectProjectAuthoritative,
+	initProject,
+	listEnvironmentsPageAuthoritative,
+	listOrganizationsPageAuthoritative,
+	overviewStatsAuthoritative,
+} from "../services/core.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
@@ -149,6 +157,65 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			projectId: initialized.project.id,
 			environmentId: initialized.environment.id,
 		};
+		await expect(
+			inspectProjectAuthoritative(store, "project_foreign", scope),
+		).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+		expect(
+			await inspectProjectAuthoritative(store, initialized.project.id, scope),
+		).toMatchObject({ id: initialized.project.id });
+		expect(
+			await listEnvironmentsPageAuthoritative(store, { scope, limit: 1 }),
+		).toMatchObject({
+			environments: [expect.objectContaining({ id: initialized.environment.id })],
+			nextCursor: null,
+		});
+		expect(
+			await inspectEnvironmentAuthoritative(store, initialized.environment.id, { scope }),
+		).toMatchObject({
+			environment: { id: initialized.environment.id },
+			project: { id: initialized.project.id },
+			local: {
+				resourceCounts: {
+					organizations: 2,
+					memberships: null,
+					identityConnections: null,
+					directoryConnections: null,
+					events: null,
+				},
+			},
+		});
+		expect(
+			await inspectOrganizationAuthoritative(store, "org_imported", scope),
+		).toMatchObject({ id: "org_imported" });
+		const organizationFirstPage = await listOrganizationsPageAuthoritative(store, {
+			scope,
+			limit: 1,
+		});
+		expect(organizationFirstPage.organizations).toEqual([
+			expect.objectContaining({ id: "org_imported" }),
+		]);
+		await expect(
+			listEnvironmentsPageAuthoritative(store, {
+				scope,
+				limit: 1,
+				cursor: organizationFirstPage.nextCursor!,
+			}),
+		).rejects.toMatchObject({ code: "CURSOR_INVALID" });
+		expect(
+			await listOrganizationsPageAuthoritative(store, {
+				scope,
+				limit: 1,
+				cursor: organizationFirstPage.nextCursor!,
+			}),
+		).toMatchObject({
+			organizations: [expect.objectContaining({ id: "org_shadow" })],
+			nextCursor: null,
+		});
+		const overview = await overviewStatsAuthoritative(store, scope);
+		expect(overview).toMatchObject({
+			organizations: 2,
+			resourceCounts: { events: null },
+		});
 		const authorityShadow = (
 			store as unknown as {
 				storeV2Shadow: {
@@ -308,6 +375,9 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				})
 			).events.map((event) => event.id),
 		).toContain(insertedTopology.audit.id);
+		expect(
+			(await overviewStatsAuthoritative(store, scope)).recentEvents,
+		).toContainEqual(expect.objectContaining({ id: insertedTopology.audit.id }));
 		expect(store.resourceCounts()).toMatchObject({
 			projects: 2,
 			environments: 2,
