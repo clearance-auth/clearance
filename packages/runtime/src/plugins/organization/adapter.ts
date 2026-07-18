@@ -1,11 +1,15 @@
 import type { AuthContext, GenericEndpointContext } from "@clearance/core";
 import {
 	AfterTransactionHookError,
+	getCurrentDBAdapterAsyncLocalStorage,
 	getCurrentAdapter,
 	runWithTransaction,
 } from "@clearance/core/context";
-import type { WhereOperator } from "@clearance/core/db/adapter";
-import { ClearanceError } from "@clearance/core/error";
+import type {
+	DBTransactionAdapter,
+	WhereOperator,
+} from "@clearance/core/db/adapter";
+import { APIError, ClearanceError } from "@clearance/core/error";
 import { filterOutputFields } from "@clearance/core/utils/db";
 import { parseJSON } from "../../client/parser";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../db";
@@ -37,6 +41,13 @@ import type { OrganizationOptions } from "./types";
 
 export type ActiveOrganizationTransitionOrchestration = Readonly<{
 	/**
+	 * Runs as the first operation inside the owning transition transaction,
+	 * before source-session or policy reads can establish a repeatable-read
+	 * snapshot. Lifecycle routes use this seam to acquire their organization
+	 * mutation lock before any authorization or invariant check.
+	 */
+	beforeCapture?: (() => void | Promise<void>) | undefined;
+	/**
 	 * Runs after managed source authority has been captured and while its owning
 	 * transaction is still active. Lifecycle routes use this seam for membership
 	 * or organization mutations that must commit with the successor session.
@@ -55,7 +66,40 @@ export type ActiveOrganizationTransitionOrchestration = Readonly<{
 	 * boundary reports AfterTransactionHookError after commit.
 	 */
 	onSuccessorPrepared?: ((successor: Session) => void) | undefined;
+	/**
+	 * Re-throw a post-commit transaction hook failure after the successor has
+	 * been prepared. Omit this to preserve the legacy recovery behavior, which
+	 * returns the committed successor when one is available.
+	 */
+	propagateAfterTransactionHookError?: boolean | undefined;
 }>;
+
+export const MANAGED_ORGANIZATION_SECONDARY_SESSION_TRANSITION_UNSUPPORTED = {
+	code: "MANAGED_ORGANIZATION_SECONDARY_SESSION_TRANSITION_UNSUPPORTED",
+	message:
+		"Managed organization transitions require database-backed sessions when secondary storage is configured",
+} as const;
+
+/**
+ * Managed session replacement needs one rollback boundary for source revocation
+ * and successor publication. Secondary-authoritative session storage cannot
+ * provide that boundary, so every lifecycle route must reject it before hooks
+ * or request-derived transition work begins.
+ */
+export function assertManagedOrganizationTransitionSupported(
+	context: AuthContext,
+): void {
+	if (
+		readInternalAuthenticationPolicy(context.options) &&
+		context.options.secondaryStorage &&
+		context.options.session?.storeSessionInDatabase !== true
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			MANAGED_ORGANIZATION_SECONDARY_SESSION_TRANSITION_UNSUPPORTED,
+		);
+	}
+}
 
 type ActiveManagedTransition = { reentrantAttempted: boolean };
 const activeManagedTransitions = new WeakMap<
@@ -102,6 +146,123 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 	const invitationAdditionalFields =
 		options?.schema?.invitation?.additionalFields;
 	const teamAdditionalFields = options?.schema?.team?.additionalFields;
+	const hasAtomicTeamTransaction = async () => {
+		if (typeof baseAdapter.options?.adapterConfig.transaction === "function") {
+			return true;
+		}
+		// A transaction adapter can omit the root's options. Locate *its* active
+		// owner rather than trusting the current ALS root: an unrelated nested
+		// transaction may be current while this adapter is owned by a parent.
+		type TransactionOwner = {
+			rootAdapter: DBTransactionAdapter;
+			adapter: DBTransactionAdapter;
+			activeTransactions?: ReadonlyMap<object, TransactionOwner>;
+			isTransactionActive: boolean;
+			parent?: TransactionOwner;
+		};
+		const store = (await getCurrentDBAdapterAsyncLocalStorage()).getStore() as
+			| TransactionOwner
+			| undefined;
+		const findOwner = (current: TransactionOwner | undefined): TransactionOwner | undefined => {
+			for (let owner = current; owner; owner = owner.parent) {
+				const registered = owner.activeTransactions?.get(baseAdapter);
+				if (registered?.isTransactionActive) return registered;
+				if (
+					owner.isTransactionActive &&
+					(owner.rootAdapter === baseAdapter || owner.adapter === baseAdapter)
+				) {
+					return owner;
+				}
+			}
+			return undefined;
+		};
+		const owner = findOwner(store);
+		return (
+			typeof owner?.rootAdapter.options?.adapterConfig.transaction ===
+			"function"
+		);
+	};
+	const filterOrganizationOutput = <
+		T extends Record<string, unknown> | null,
+	>(organization: T): T => {
+		const filtered = filterOutputFields(organization, orgAdditionalFields);
+		if (!filtered) return filtered;
+		const { updatedAt: _updatedAt, ...visible } = filtered;
+		return visible as T;
+	};
+	const lockTeamMembership = async (
+		adapter: DBTransactionAdapter,
+		data: { organizationId: string; teamId: string },
+	): Promise<
+		| {
+				status: "ready";
+				organization: InferOrganization<O, false>;
+				team: Team;
+		  }
+		| { status: "organizationNotFound" }
+		| { status: "teamNotFound" }
+	> => {
+		// This must remain the first transaction operation. Locking the parent
+		// serializes team deletion with every admission that depends on it.
+		const organization = await adapter.update<InferOrganization<O, false>>({
+			model: "organization",
+			where: [{ field: "id", value: data.organizationId }],
+			update: { updatedAt: new Date() },
+		});
+		if (!organization) return { status: "organizationNotFound" };
+		const team = await adapter.update<Team>({
+			model: "team",
+			where: [{ field: "id", value: data.teamId }],
+			update: { updatedAt: new Date() },
+		});
+		if (!team || team.organizationId !== data.organizationId) {
+			return { status: "teamNotFound" };
+		}
+		return { status: "ready", organization, team };
+	};
+	const deduplicateTeamMemberPair = async (
+		adapter: DBTransactionAdapter,
+		data: { teamId: string; userId: string },
+	): Promise<TeamMember | null> => {
+		const members = await adapter.findMany<TeamMember>({
+			model: "teamMember",
+			where: [
+				{ field: "teamId", value: data.teamId },
+				{ field: "userId", value: data.userId },
+			],
+			sortBy: { field: "id", direction: "asc" },
+		});
+		const [member, ...duplicates] = members;
+		for (const duplicate of duplicates) {
+			await adapter.delete({
+				model: "teamMember",
+				where: [{ field: "id", value: duplicate.id }],
+			});
+		}
+		return member ?? null;
+	};
+	const deduplicateTeamMembers = async (
+		adapter: DBTransactionAdapter,
+		teamId: string,
+	): Promise<Map<string, TeamMember>> => {
+		const members = await adapter.findMany<TeamMember>({
+			model: "teamMember",
+			where: [{ field: "teamId", value: teamId }],
+			sortBy: { field: "id", direction: "asc" },
+		});
+		const membersByUserId = new Map<string, TeamMember>();
+		for (const member of members) {
+			if (!membersByUserId.has(member.userId)) {
+				membersByUserId.set(member.userId, member);
+				continue;
+			}
+			await adapter.delete({
+				model: "teamMember",
+				where: [{ field: "id", value: member.id }],
+			});
+		}
+		return membersByUserId;
+	};
 	return {
 		findOrganizationBySlug: async (
 			slug: string,
@@ -116,10 +277,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					},
 				],
 			});
-			return filterOutputFields(
-				organization,
-				orgAdditionalFields,
-			) as InferOrganization<O> | null;
+			return filterOrganizationOutput(organization) as InferOrganization<O> | null;
 		},
 		createOrganization: async (data: {
 			organization: OrganizationInput &
@@ -148,10 +306,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 						? JSON.parse(organization.metadata)
 						: undefined,
 			};
-			return filterOutputFields(
-				result,
-				orgAdditionalFields,
-			) as InferOrganization<O>;
+			return filterOrganizationOutput(result) as InferOrganization<O>;
 		},
 		findMemberByEmail: async (data: {
 			email: string;
@@ -474,14 +629,33 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					? parseJSON<Record<string, any>>(organization.metadata)
 					: undefined,
 			};
-			return filterOutputFields(
-				result,
-				orgAdditionalFields,
-			) as InferOrganization<O>;
+			return filterOrganizationOutput(result) as InferOrganization<O>;
 		},
 		deleteOrganization: async (organizationId: string) => {
 			return runWithTransaction(baseAdapter, async () => {
 				const adapter = await getCurrentAdapter(baseAdapter);
+				if (options?.teams?.enabled === true) {
+					const teams = await adapter.findMany<Team>({
+						model: "team",
+						where: [{ field: "organizationId", value: organizationId }],
+					});
+					for (const team of teams) {
+						await adapter.deleteMany({
+							model: "teamMember",
+							where: [{ field: "teamId", value: team.id }],
+						});
+					}
+					await adapter.deleteMany({
+						model: "team",
+						where: [{ field: "organizationId", value: organizationId }],
+					});
+				}
+				if (options?.dynamicAccessControl?.enabled) {
+					await adapter.deleteMany({
+						model: "organizationRole",
+						where: [{ field: "organizationId", value: organizationId }],
+					});
+				}
 				await adapter.deleteMany({
 					model: "member",
 					where: [
@@ -526,6 +700,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					"Organization transitions require the adapter's authoritative endpoint context",
 				);
 			}
+			assertManagedOrganizationTransitionSupported(context);
 			if (
 				orchestration?.dontRememberMe !== undefined &&
 				typeof orchestration.dontRememberMe !== "boolean"
@@ -555,7 +730,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 				);
 			}
 			if (
-				orchestration?.afterCapture &&
+				(orchestration?.beforeCapture || orchestration?.afterCapture) &&
 				typeof context.adapter.options?.adapterConfig.transaction !== "function"
 			) {
 				throw new ClearanceError(
@@ -564,6 +739,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 			}
 			if (!managed) {
 				const updateLegacySession = async (): Promise<Session> => {
+					await orchestration?.beforeCapture?.();
 					await orchestration?.afterCapture?.();
 					const session = await context.internalAdapter.updateSession(
 						sessionToken,
@@ -579,7 +755,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					}
 					return session as Session;
 				};
-				return orchestration?.afterCapture
+				return orchestration?.beforeCapture || orchestration?.afterCapture
 					? runWithTransaction(context.adapter, updateLegacySession)
 					: updateLegacySession();
 			}
@@ -613,6 +789,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 						transactionTransitions,
 					);
 					try {
+						await orchestration?.beforeCapture?.();
 						const issuanceContext = await captureInternalSessionIssuanceContext(
 							context.internalAdapter,
 							{
@@ -750,7 +927,11 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					}
 				});
 			} catch (error) {
-				if (error instanceof AfterTransactionHookError && committedSuccessor) {
+				if (
+					error instanceof AfterTransactionHookError &&
+					committedSuccessor &&
+					!orchestration?.propagateAfterTransactionHookError
+				) {
 					return committedSuccessor;
 				}
 				throw error;
@@ -769,10 +950,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 					},
 				],
 			});
-			return filterOutputFields(
-				organization,
-				orgAdditionalFields,
-			) as InferOrganization<O> | null;
+			return filterOrganizationOutput(organization) as InferOrganization<O> | null;
 		},
 		checkMembership: async ({
 			userId,
@@ -873,7 +1051,7 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 				};
 			});
 
-			const filteredOrg = filterOutputFields(org, orgAdditionalFields);
+			const filteredOrg = filterOrganizationOutput(org);
 			const filteredInvitations = invitations.map((inv) =>
 				filterOutputFields(inv, invitationAdditionalFields),
 			);
@@ -913,22 +1091,58 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 
 			const organizations = result.map(
 				(member) =>
-					filterOutputFields(
-						member.organization,
-						orgAdditionalFields,
-					) as InferOrganization<O>,
+					filterOrganizationOutput(member.organization) as InferOrganization<O>,
 			);
 
 			return organizations;
 		},
-		createTeam: async (data: TeamInput) => {
-			const adapter = await getCurrentAdapter(baseAdapter);
-			const team = await adapter.create<TeamInput, InferTeam<O, false>>({
-				model: "team",
-				data,
-				forceAllowId: true,
+		createTeam: async (
+			data: TeamInput,
+			maximumTeams?: number,
+			beforeCreate?: (
+				organization: InferOrganization<O>,
+			) => Promise<TeamInput> | TeamInput,
+		): Promise<
+			| { status: "created"; team: InferTeam<O, false> }
+			| { status: "organizationNotFound" }
+			| { status: "limitReached" }
+			| { status: "transactionRequired" }
+		> => {
+			if (!(await hasAtomicTeamTransaction())) {
+				return { status: "transactionRequired" };
+			}
+			return runWithTransaction(baseAdapter, async () => {
+				const adapter = await getCurrentAdapter(baseAdapter);
+				// Lock before the count so an organization deletion cannot interleave
+				// with the team insert and leave an orphaned team behind.
+				const organization = await adapter.update<InferOrganization<O, false>>({
+					model: "organization",
+					where: [{ field: "id", value: data.organizationId }],
+					update: { updatedAt: new Date() },
+				});
+				if (!organization) return { status: "organizationNotFound" };
+				const preparedData = beforeCreate
+					? await beforeCreate(
+							filterOrganizationOutput(organization) as InferOrganization<O>,
+						)
+					: data;
+				if (maximumTeams !== undefined) {
+					const teams = await adapter.findMany<Team>({
+						model: "team",
+						where: [
+							{ field: "organizationId", value: data.organizationId },
+						],
+					});
+					if (teams.length >= maximumTeams) return { status: "limitReached" };
+				}
+				const team = await adapter.create<TeamInput, InferTeam<O, false>>({
+					model: "team",
+					// Hooks can add fields but cannot move this mutation to another org.
+					data: { ...preparedData, organizationId: data.organizationId },
+					forceAllowId: true,
+				});
+				return { status: "created", team };
 			});
-			return team;
 		},
 		findTeamById: async <IncludeMembers extends boolean>({
 			teamId,
@@ -1004,28 +1218,70 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 			return team;
 		},
 
-		deleteTeam: async (teamId: string) => {
-			const adapter = await getCurrentAdapter(baseAdapter);
-			await adapter.deleteMany({
-				model: "teamMember",
-				where: [
-					{
-						field: "teamId",
-						value: teamId,
-					},
-				],
+		deleteTeam: async (data: {
+			organizationId: string;
+			teamId: string;
+			allowRemovingAllTeams: boolean;
+			beforeDelete?: (snapshot: {
+				organization: InferOrganization<O, false>;
+				team: Team;
+			}) => Promise<void>;
+		}): Promise<
+			| { status: "deleted"; organization: InferOrganization<O, false>; team: Team }
+			| { status: "organizationNotFound" }
+			| { status: "teamNotFound" }
+			| { status: "lastTeam" }
+			| { status: "transactionRequired" }
+		> => {
+			if (!(await hasAtomicTeamTransaction())) {
+				return { status: "transactionRequired" };
+			}
+			return runWithTransaction(baseAdapter, async () => {
+				const adapter = await getCurrentAdapter(baseAdapter);
+				const locked = await lockTeamMembership(adapter, data);
+				if (locked.status !== "ready") return locked;
+				await data.beforeDelete?.(locked);
+				if (!data.allowRemovingAllTeams) {
+					const teams = await adapter.findMany<Team>({
+						model: "team",
+						where: [{ field: "organizationId", value: data.organizationId }],
+					});
+					if (teams.length <= 1) return { status: "lastTeam" };
+				}
+				await adapter.deleteMany({
+					model: "teamMember",
+					where: [{ field: "teamId", value: data.teamId }],
+				});
+				const invitations = await adapter.findMany<
+					InferInvitation<O, false> & { teamId?: string | null }
+				>({
+					model: "invitation",
+					where: [
+						{ field: "organizationId", value: data.organizationId },
+						{ field: "status", value: "pending" },
+					],
+				});
+				for (const invitation of invitations) {
+					if (!invitation.teamId) continue;
+					const teamIds = invitation.teamId.split(",");
+					if (!teamIds.includes(data.teamId)) continue;
+					const remaining = teamIds.filter((id) => id !== data.teamId);
+					await adapter.update({
+						model: "invitation",
+						where: [{ field: "id", value: invitation.id }],
+						update: { teamId: remaining.length ? remaining.join(",") : null },
+					});
+				}
+				await adapter.delete<Team>({
+					model: "team",
+					where: [{ field: "id", value: data.teamId }],
+				});
+				return {
+					status: "deleted",
+					organization: locked.organization,
+					team: locked.team,
+				};
 			});
-
-			const team = await adapter.delete<InferTeam<O, false>>({
-				model: "team",
-				where: [
-					{
-						field: "id",
-						value: teamId,
-					},
-				],
-			});
-			return team;
 		},
 
 		listTeams: async (organizationId: string) => {
@@ -1164,72 +1420,120 @@ export const getOrgAdapter = <O extends OrganizationOptions>(
 
 			return member;
 		},
-
-		findOrCreateTeamMember: async (data: {
+		admitTeamMember: async (data: {
+			organizationId: string;
 			teamId: string;
 			userId: string;
-		}) => {
-			const adapter = await getCurrentAdapter(baseAdapter);
-			const member = await adapter.findOne<TeamMember>({
-				model: "teamMember",
-				where: [
-					{
-						field: "teamId",
-						value: data.teamId,
+			prepare: (snapshot: {
+				organization: InferOrganization<O, false>;
+				team: Team;
+			}) => Promise<number | undefined>;
+		}): Promise<
+			| {
+					status: "added";
+					member: TeamMember;
+					organization: InferOrganization<O, false>;
+					team: Team;
+				  }
+			| { status: "limitReached" }
+			| { status: "organizationNotFound" }
+			| { status: "teamNotFound" }
+			| { status: "transactionRequired" }
+		> => {
+			if (!(await hasAtomicTeamTransaction())) {
+				return { status: "transactionRequired" };
+			}
+			return runWithTransaction(baseAdapter, async () => {
+				const adapter = await getCurrentAdapter(baseAdapter);
+				const locked = await lockTeamMembership(adapter, data);
+				if (locked.status !== "ready") return locked;
+				const maximumMembersPerTeam = await data.prepare(locked);
+				const membersByUserId = await deduplicateTeamMembers(adapter, data.teamId);
+				const existing = membersByUserId.get(data.userId);
+				if (existing) return { ...locked, status: "added", member: existing };
+				if (
+					maximumMembersPerTeam !== undefined &&
+					membersByUserId.size >= maximumMembersPerTeam
+				) {
+					return { status: "limitReached" };
+				}
+				const member = await adapter.create<Omit<TeamMember, "id">, TeamMember>({
+					model: "teamMember",
+					data: {
+						teamId: data.teamId,
+						userId: data.userId,
+						createdAt: new Date(),
 					},
-					{
-						field: "userId",
-						value: data.userId,
-					},
-				],
+				});
+				return { ...locked, status: "added", member };
 			});
+		},
 
-			if (member) return member;
-
-			return await adapter.create<Omit<TeamMember, "id">, TeamMember>({
-				model: "teamMember",
-				data: {
-					teamId: data.teamId,
-					userId: data.userId,
-					createdAt: new Date(),
-				},
+		findOrCreateTeamMember: async (data: {
+			organizationId: string;
+			teamId: string;
+			userId: string;
+		}): Promise<
+			| { status: "added"; member: TeamMember }
+			| { status: "organizationNotFound" }
+			| { status: "teamNotFound" }
+			| { status: "transactionRequired" }
+		> => {
+			if (!(await hasAtomicTeamTransaction())) {
+				return { status: "transactionRequired" };
+			}
+			return runWithTransaction(baseAdapter, async () => {
+				const adapter = await getCurrentAdapter(baseAdapter);
+				const locked = await lockTeamMembership(adapter, data);
+				if (locked.status !== "ready") return locked;
+				const member = await deduplicateTeamMemberPair(adapter, data);
+				if (member) return { status: "added", member };
+				const created = await adapter.create<Omit<TeamMember, "id">, TeamMember>({
+					model: "teamMember",
+					data: {
+						teamId: data.teamId,
+						userId: data.userId,
+						createdAt: new Date(),
+					},
+				});
+				return { status: "added", member: created };
 			});
 		},
 		/**
-		 * Adds a user to a team only when the team is below its member limit,
-		 * reading the count and creating the membership in one transaction.
-		 * Returns the existing membership unchanged (no capacity charge) when the
-		 * user already belongs to the team.
-		 *
-		 * FIXME(team-cap-race): the count-then-create is not atomic under READ
-		 * COMMITTED, so two concurrent adds can both pass the count check and
-		 * exceed maximumMembersPerTeam. A durable fix needs a unique constraint on
-		 * teamMember(teamId, userId) or serializable isolation. Affects every
-		 * caller (acceptInvitation, addMember, addTeamMember).
+		 * Adds a user to a team only when the team is below its member limit.
+		 * Touching the exact team row acquires a portable write lock, so every
+		 * distinct-user admission for that team serializes through one transaction
+		 * under READ COMMITTED. Existing-member handling remains independent from
+		 * capacity accounting.
 		 */
 		addTeamMemberWithLimit: async (data: {
+			organizationId: string;
 			teamId: string;
 			userId: string;
 			maximumMembersPerTeam: number;
 		}): Promise<
-			{ status: "added"; member: TeamMember } | { status: "limitReached" }
+			| { status: "added"; member: TeamMember }
+			| { status: "limitReached" }
+			| { status: "organizationNotFound" }
+			| { status: "teamNotFound" }
+			| { status: "transactionRequired" }
 		> => {
+			if (!(await hasAtomicTeamTransaction())) {
+				return { status: "transactionRequired" };
+			}
 			return runWithTransaction(baseAdapter, async () => {
 				const adapter = await getCurrentAdapter(baseAdapter);
-				const existing = await adapter.findOne<TeamMember>({
-					model: "teamMember",
-					where: [
-						{ field: "teamId", value: data.teamId },
-						{ field: "userId", value: data.userId },
-					],
-				});
+				const locked = await lockTeamMembership(adapter, data);
+				if (locked.status !== "ready") return locked;
+				const membersByUserId = await deduplicateTeamMembers(
+					adapter,
+					data.teamId,
+				);
+				const existing = membersByUserId.get(data.userId);
 				if (existing) {
 					return { status: "added", member: existing };
 				}
-				const count = await adapter.count({
-					model: "teamMember",
-					where: [{ field: "teamId", value: data.teamId }],
-				});
+				const count = membersByUserId.size;
 				if (count >= data.maximumMembersPerTeam) {
 					return { status: "limitReached" };
 				}
