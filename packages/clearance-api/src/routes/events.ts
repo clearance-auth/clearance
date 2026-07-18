@@ -3,7 +3,7 @@ import {
 	exportEventsOperational,
 	inspectEventOperational,
 	listEventsPageOperational,
-	replayDiagnosticTrace,
+	replayDiagnosticTraceOperational,
 } from "@clearance/management";
 import { Hono } from "hono";
 import { requestActor } from "../request-auth.js";
@@ -106,7 +106,7 @@ export function registerEventRoutes({
 				const confirm =
 					body && typeof body === "object" && (body as { confirm?: unknown }).confirm === true;
 				const dryRun = bodyDryRun || !confirm;
-				const result = replayDiagnosticTrace(store, id, {
+				const result = await replayDiagnosticTraceOperational(store, id, {
 					scope,
 					dryRun,
 					confirm: confirm && !bodyDryRun,
