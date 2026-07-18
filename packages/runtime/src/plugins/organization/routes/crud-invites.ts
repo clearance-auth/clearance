@@ -22,7 +22,7 @@ import {
 	attachCapturedInternalRuntimeAudit,
 	getRuntimeAuditRequestContext,
 	readInternalRuntimeAudit,
-} from "../../../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import { defaultRoles } from "../access/statement";
 import {
 	assertManagedOrganizationTransitionSupported,
