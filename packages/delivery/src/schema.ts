@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 import type pg from "pg";
 import { DeliveryError } from "./errors.js";
 
-export const DELIVERY_SCHEMA_VERSION = 4 as const;
+export const DELIVERY_SCHEMA_VERSION = 5 as const;
 export const DELIVERY_SCHEMA_OWNER = "clearance.delivery" as const;
-const deliverySchemaAssetMarker = (version: 1 | 2 | 3 | 4) => `clearance.delivery:v${version}`;
+const deliverySchemaAssetMarker = (version: 1 | 2 | 3 | 4 | 5) => `clearance.delivery:v${version}`;
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
 const IDENTIFIER_MAX = 63;
+const ZERO_TRACE_ID = "00000000000000000000000000000000";
+const ZERO_SPAN_ID = "0000000000000000";
+const TRACE_PARENT_PATTERN = "^00-[0-9a-f]{32}-[0-9a-f]{16}-(00|01)$";
 
 export type DeliverySchemaOptions = {
 	schema?: string;
@@ -68,11 +71,22 @@ export function deliveryTableNames(options: DeliverySchemaOptions = {}): Deliver
 		`${names.job}_lease_idx`,
 		`${names.attempt}_job_idx`,
 		`${names.event}_immutable`,
+		`${names.event}_trace_parent_check`,
 		`${names.attempt}_immutable`,
 	]) {
 		identifier(derived);
 	}
 	return names;
+}
+
+function traceParentConstraintDefinition(): string {
+	return `CHECK (trace_parent IS NULL OR trace_parent ~ '${TRACE_PARENT_PATTERN}'::text
+		AND split_part(trace_parent, '-'::text, 2) <> '${ZERO_TRACE_ID}'::text
+		AND split_part(trace_parent, '-'::text, 3) <> '${ZERO_SPAN_ID}'::text)`;
+}
+
+function traceParentConstraint(name: string): string {
+	return `CONSTRAINT ${quoteIdentifier(`${name}_trace_parent_check`)} ${traceParentConstraintDefinition()}`;
 }
 
 function fq(schema: string, name: string): string {
@@ -180,10 +194,12 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			destination_fingerprint text NOT NULL CHECK (destination_fingerprint ~ '^[0-9a-f]{64}$'),
 			destination_fingerprint_key_id text NOT NULL CHECK (destination_fingerprint_key_id ~ '^[A-Za-z0-9._-]{1,64}$'),
 			webhook_endpoint_id text,
+			trace_parent text,
 			replay_of text REFERENCES ${event}(id) ON DELETE RESTRICT,
 			created_at timestamptz NOT NULL,
 			semantic_expires_at timestamptz NOT NULL,
 			CHECK (semantic_expires_at > created_at),
+			${traceParentConstraint(names.event)},
 			FOREIGN KEY (webhook_endpoint_id, project_id, environment_id)
 				REFERENCES ${webhookEndpoint}(id, project_id, environment_id) ON DELETE RESTRICT
 		)`,
@@ -261,8 +277,8 @@ function schemaStatements(schema: string, names: DeliveryTableNames): string[] {
 			last_seen_at timestamptz NOT NULL
 		)`,
 		...([names.meta, names.webhookEndpoint, names.event, names.payload, names.job, names.attempt, names.worker] as const)
-			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(4)}'`),
-		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(4)}'`,
+			.map((name) => `COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(5)}'`),
+		`COMMENT ON FUNCTION ${rejectMutation}() IS '${deliverySchemaAssetMarker(5)}'`,
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${names.event}_immutable' AND tgrelid = '${event}'::regclass) THEN
 				CREATE TRIGGER ${quoteIdentifier(`${names.event}_immutable`)}
@@ -288,7 +304,7 @@ async function verifyDeliverySchema(
 	client: pg.PoolClient,
 	schema: string,
 	names: DeliveryTableNames,
-	version: 1 | 2 | 3 | 4,
+	version: 1 | 2 | 3 | 4 | 5,
 	allowMissingAdditiveIndexes = false,
 ): Promise<void> {
 	const expectedColumns = new Map<string, string[]>([
@@ -313,6 +329,7 @@ async function verifyDeliverySchema(
 				"source_dedupe_version:smallint:true", "source_fingerprint_key_id:text:true",
 			] : []),
 			...(version >= 4 ? ["webhook_endpoint_id:text:false"] : []),
+			...(version >= 5 ? ["trace_parent:text:false"] : []),
 		]],
 		[names.payload, [
 			"created_at:timestamp with time zone:true", "envelope:text:true", "envelope_version:smallint:true",
@@ -368,9 +385,10 @@ async function verifyDeliverySchema(
 
 	const constraints = await client.query<{
 		table_name: string;
+		constraint_name: string;
 		definition: string;
 	}>(
-		`SELECT c.relname table_name, pg_get_constraintdef(k.oid, true) definition
+		`SELECT c.relname table_name, k.conname constraint_name, pg_get_constraintdef(k.oid, true) definition
 		 FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
 		 JOIN pg_namespace n ON n.oid=c.relnamespace
 		 WHERE n.nspname=$1 AND c.relname=ANY($2::text[])`,
@@ -399,6 +417,31 @@ async function verifyDeliverySchema(
 		].sort();
 		if (JSON.stringify(endpointDefinitions) !== JSON.stringify(expectedEndpointDefinitions)) {
 			schemaDrift(`Delivery table ${names.webhookEndpoint} constraints differ from schema v${version}`);
+		}
+	}
+	if (version >= 5) {
+		const traceParentChecks = constraints.rows.filter(
+			(row) => row.table_name === names.event && row.constraint_name === `${names.event}_trace_parent_check`,
+		);
+		const expectedTraceParentCheck = traceParentConstraintDefinition()
+			.replace(/\s+/g, " ")
+			.trim()
+			.toUpperCase();
+		const actualTraceParentCheck = traceParentChecks[0]?.definition
+			.replace(/\s+/g, " ")
+			.trim()
+			.toUpperCase();
+		if (traceParentChecks.length !== 1 || actualTraceParentCheck !== expectedTraceParentCheck) {
+			schemaDrift("Delivery event trace parent constraint differs from schema v5");
+		}
+		const defaults = await client.query<{ column_name: string; definition: string }>(
+			`SELECT a.attname column_name, pg_get_expr(d.adbin, d.adrelid) definition
+			 FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
+			 WHERE d.adrelid=$1::regclass AND a.attname='trace_parent'`,
+			[fq(schema, names.event)],
+		);
+		if (defaults.rows.length !== 0) {
+			schemaDrift("Delivery event trace parent must not have a default");
 		}
 	}
 	const requiredConstraintFragments = new Map<string, string[]>([
@@ -781,6 +824,25 @@ async function migrateDeliverySchemaV3ToV4(
 	);
 }
 
+async function migrateDeliverySchemaV4ToV5(
+	client: pg.PoolClient,
+	schema: string,
+	names: DeliveryTableNames,
+): Promise<void> {
+	await client.query(`ALTER TABLE ${fq(schema, names.event)}
+		ADD COLUMN trace_parent text,
+		ADD ${traceParentConstraint(names.event)}`);
+	for (const name of [
+		names.meta, names.webhookEndpoint, names.event, names.payload,
+		names.job, names.attempt, names.worker,
+	]) {
+		await client.query(`COMMENT ON TABLE ${fq(schema, name)} IS '${deliverySchemaAssetMarker(5)}'`);
+	}
+	await client.query(
+		`COMMENT ON FUNCTION ${fq(schema, names.rejectMutationFunction)}() IS '${deliverySchemaAssetMarker(5)}'`,
+	);
+}
+
 export async function migrateDeliverySchema(
 	pool: pg.Pool,
 	options: DeliverySchemaOptions = {},
@@ -821,7 +883,7 @@ export async function migrateDeliverySchema(
 				"Refusing to adopt unowned delivery tables or functions",
 			);
 		}
-		let existingVersion: 1 | 2 | 3 | 4 | null = null;
+		let existingVersion: 1 | 2 | 3 | 4 | 5 | null = null;
 		if (metaExists) {
 			const metadata = await client.query<{ key: string; value: unknown }>(
 				`SELECT key, value FROM ${fq(schema, names.meta)} WHERE key IN ('owner', 'schema_version')`,
@@ -840,7 +902,7 @@ export async function migrateDeliverySchema(
 					`Delivery schema version ${version} is newer than supported version ${DELIVERY_SCHEMA_VERSION}`,
 				);
 			}
-			existingVersion = version as 1 | 2 | 3 | 4;
+			existingVersion = version as 1 | 2 | 3 | 4 | 5;
 			const versionTargets = existingVersion >= 4 ? targets : legacyTargets;
 			if (existing.rows.length !== versionTargets.length || !functionExisting.rowCount) {
 				throw new DeliveryError(
@@ -891,6 +953,9 @@ export async function migrateDeliverySchema(
 			}
 			if (existingVersion <= 3) {
 				await migrateDeliverySchemaV3ToV4(client, schema, names);
+			}
+			if (existingVersion <= 4) {
+				await migrateDeliverySchemaV4ToV5(client, schema, names);
 			}
 		}
 		// These performance-only indexes are additive within the current schema. Create
