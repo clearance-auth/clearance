@@ -5,6 +5,8 @@ export interface SCIMProvider {
 	id: string;
 	providerId: string;
 	scimToken: string;
+	keyManagementVersion?: number;
+	keyManagementRevision?: number;
 	organizationId?: string;
 	userId?: string;
 }
