@@ -1,8 +1,8 @@
 import {
 	EVENT_OPERATIONS,
-	exportEvents,
-	inspectEvent,
-	listEventsPage,
+	exportEventsOperational,
+	inspectEventOperational,
+	listEventsPageOperational,
 	replayDiagnosticTrace,
 } from "@clearance/management";
 import { Hono } from "hono";
@@ -25,7 +25,7 @@ export function registerEventRoutes({
 				const cursor = c.req.query("cursor");
 				const action = c.req.query("action");
 				const organizationId = c.req.query("organizationId");
-				const page = listEventsPage(store, {
+				const page = await listEventsPageOperational(store, {
 					scope,
 					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
 					...(cursor !== undefined ? { cursor } : {}),
@@ -41,7 +41,7 @@ export function registerEventRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				const result = inspectEvent(store, c.req.param("id"), { scope });
+				const result = await inspectEventOperational(store, c.req.param("id"), { scope });
 				return c.json(result);
 			} catch (error) {
 				return handleError(c, error);
@@ -76,7 +76,7 @@ export function registerEventRoutes({
 					typeof (body as { before?: unknown }).before === "string"
 						? (body as { before: string }).before
 						: undefined;
-				const envelope = exportEvents(store, {
+				const envelope = await exportEventsOperational(store, {
 					scope,
 					format,
 					limit,
