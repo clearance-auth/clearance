@@ -1,9 +1,13 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import pg from "pg";
 
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 const MAX_EFFECTIVE_ACTIONS = 256;
 const MIGRATION_ID = "authorization-authority-v1";
 const DEFAULT_PREFIX = "clearance";
+const SERVICE_ACCOUNT_CREDENTIAL_PREFIX = "clr_sac_v1";
+const SERVICE_ACCOUNT_CREDENTIAL_SECRET_BYTES = 32;
+const SERVICE_ACCOUNT_CREDENTIAL_DIGEST_DOMAIN = "clearance:service-account-credential:v1:";
 const BUILT_IN_ROLE_DEFINITIONS = Object.freeze([
 	Object.freeze({
 		roleId: "role_builtin_owner",
@@ -141,6 +145,95 @@ export type AuthorizationAuthorityAssignment = Readonly<{
 	roleId: string;
 }>;
 
+export type AuthorizationServiceAccount = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}>;
+
+export type AuthorizationServiceAccountMutation = Readonly<{
+	serviceAccount: AuthorizationServiceAccount;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationServiceAccountCredential = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	credentialPrefix: string;
+	credentialFingerprint: string;
+	expiresAt: Date | null;
+	version: number;
+}>;
+
+export type AuthorizationServiceAccountCredentialMutation = Readonly<{
+	credential: AuthorizationServiceAccountCredential;
+	secret: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationCreateServiceAccountInput = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	roleIds: readonly string[];
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationListServiceAccountsInput = Readonly<{
+	organizationId: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationSetServiceAccountStatusInput = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	status: "active" | "disabled";
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationCreateServiceAccountCredentialInput = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId?: string;
+	expiresAt?: Date;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationRotateServiceAccountCredentialInput = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	expiresAt?: Date;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationRevokeServiceAccountCredentialInput = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthenticateServiceAccountCredentialInput = Readonly<{
+	secret: string;
+	transaction?: AuthorizationAuthorityTransaction;
+}>;
+
+export type AuthorizationAuthenticateServiceAccountCredentialResult = Readonly<{
+	projectId: string;
+	environmentId: string;
+	organizationId: string;
+	subject: Readonly<{ kind: "service_account"; id: string }>;
+	credential: AuthorizationServiceAccountCredential;
+	roleIds: readonly string[];
+	actions: readonly string[];
+	revision: string;
+}>;
+
 export type AuthorizationAuthorityListSubjectAssignmentsInput = Readonly<{
 	organizationId: string;
 	subject?: AuthorizationSubject;
@@ -214,6 +307,11 @@ function error(message: string, cause?: unknown, code?: string): PostgresAuthori
 		...(cause === undefined ? {} : { cause }),
 		...(code === undefined ? {} : { code }),
 	});
+}
+
+function postgresErrorCode(value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || !("code" in value)) return undefined;
+	return typeof value.code === "string" ? value.code : undefined;
 }
 
 function scopeString(value: unknown, label: string): string {
@@ -636,6 +734,63 @@ function roleName(value: unknown, label: string): string {
 	return name;
 }
 
+function serviceAccountStatus(value: unknown, label: string): AuthorizationServiceAccount["status"] {
+	if (value === "active" || value === "disabled") return value;
+	throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+}
+
+function credentialId(value: unknown, label: string): string {
+	return scopeString(value, label);
+}
+
+function optionalCredentialExpiry(value: unknown, label: string): Date | null {
+	if (value === undefined || value === null) return null;
+	if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+		throw error(`${label} is invalid`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	}
+	if (value.getTime() <= Date.now()) throw error(`${label} must be in the future`, undefined, "AUTHORIZATION_INPUT_INVALID");
+	return new Date(value.getTime());
+}
+
+function storedCredentialExpiry(value: unknown): Date | null {
+	if (value === null || value === undefined) return null;
+	if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw error("Stored credential expiry is invalid");
+	return new Date(value.getTime());
+}
+
+function credentialVersion(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1) throw error("Stored credential version is invalid");
+	return parsed;
+}
+
+function nextCredentialVersion(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed >= 2_147_483_647) {
+		throw error("Service account credential version overflow", undefined, "AUTHORIZATION_CREDENTIAL_VERSION_OVERFLOW");
+	}
+	return parsed + 1;
+}
+
+function serviceAccountCredentialSecret(): string {
+	return `${SERVICE_ACCOUNT_CREDENTIAL_PREFIX}_${randomBytes(SERVICE_ACCOUNT_CREDENTIAL_SECRET_BYTES).toString("base64url")}`;
+}
+
+function credentialSecretDigest(secret: string): string {
+	return `v1:${createHash("sha256").update(`${SERVICE_ACCOUNT_CREDENTIAL_DIGEST_DOMAIN}${secret}`, "utf8").digest("hex")}`;
+}
+
+function credentialSecretFingerprint(secret: string): string {
+	return createHash("sha256").update(`${SERVICE_ACCOUNT_CREDENTIAL_DIGEST_DOMAIN}${secret}`, "utf8").digest("base64url").slice(0, 22);
+}
+
+function assertCredentialSecret(value: unknown): string {
+	if (typeof value !== "string" || !new RegExp(`^${SERVICE_ACCOUNT_CREDENTIAL_PREFIX}_[A-Za-z0-9_-]{43}$`).test(value)) {
+		throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
+	}
+	return value;
+}
+
 function roleDescription(value: unknown, label: string): string | null {
 	if (value === null) return null;
 	const description = scopeString(value, label);
@@ -692,6 +847,18 @@ type RoleRow = {
 };
 type RoleListRow = RoleRow & { actions: unknown };
 type AssignmentRow = { organization_id: unknown; subject_kind: unknown; subject_id: unknown; role_id: unknown };
+type ServiceAccountRow = { organization_id: unknown; service_account_id: unknown; name: unknown; status: unknown };
+type CredentialRow = {
+	organization_id: unknown;
+	service_account_id: unknown;
+	credential_id: unknown;
+	credential_digest: unknown;
+	credential_prefix: unknown;
+	credential_fingerprint: unknown;
+	expires_at: unknown;
+	version: unknown;
+};
+type CredentialAuthenticationRow = CredentialRow & { revision: unknown; role_ids: unknown; actions: unknown };
 
 export class PostgresAuthorizationAuthority {
 	readonly identity: AuthorizationAuthorityIdentity;
@@ -862,6 +1029,72 @@ export class PostgresAuthorizationAuthority {
 		}
 	}
 
+	#serviceAccountFromRow(row: ServiceAccountRow): AuthorizationServiceAccount {
+		return Object.freeze({
+			organizationId: scopeString(row.organization_id, "stored service account organizationId"),
+			serviceAccountId: scopeString(row.service_account_id, "stored service accountId"),
+			name: roleName(row.name, "stored service account name"),
+			status: serviceAccountStatus(row.status, "stored service account status"),
+		});
+	}
+
+	#credentialFromRow(row: CredentialRow): AuthorizationServiceAccountCredential {
+		const prefix = scopeString(row.credential_prefix, "stored credential prefix");
+		const fingerprint = scopeString(row.credential_fingerprint, "stored credential fingerprint");
+		if (!/^[A-Za-z0-9_-]{1,32}$/.test(prefix) || !/^[A-Za-z0-9_-]{6,128}$/.test(fingerprint)) {
+			throw error("Stored credential is invalid");
+		}
+		return Object.freeze({
+			organizationId: scopeString(row.organization_id, "stored credential organizationId"),
+			serviceAccountId: scopeString(row.service_account_id, "stored credential serviceAccountId"),
+			credentialId: credentialId(row.credential_id, "stored credentialId"),
+			credentialPrefix: prefix,
+			credentialFingerprint: fingerprint,
+			expiresAt: storedCredentialExpiry(row.expires_at),
+			version: credentialVersion(row.version),
+		});
+	}
+
+	async #requireServiceAccount(queryable: Queryable, organizationId: string, serviceAccountId: string, active: boolean): Promise<AuthorizationServiceAccount> {
+		const rows = await queryable.query<ServiceAccountRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status FROM ${this.#table(this.#names.serviceAccounts)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId]);
+		if (rows.rows.length !== 1) throw error("Service account was not found", undefined, "AUTHORIZATION_SERVICE_ACCOUNT_NOT_FOUND");
+		const account = this.#serviceAccountFromRow(rows.rows[0]!);
+		if (active && account.status !== "active") throw error("Service account is disabled", undefined, "AUTHORIZATION_SERVICE_ACCOUNT_DISABLED");
+		return account;
+	}
+
+	async #validateServiceAccountRoleIds(queryable: Queryable, organizationId: string, roleIds: readonly string[]): Promise<void> {
+		if (roleIds.length === 0) return;
+		const roles = this.#table(this.#names.roles);
+		const requestedRoles = await queryable.query<RoleRow>(`SELECT "roleId" AS role_id, "organizationId" AS organization_id, slug, name, description, "builtIn" AS built_in, status FROM ${roles} WHERE "projectId" = $1 AND "environmentId" = $2 AND "roleId" = ANY($3::text[]) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, roleIds]);
+		if (requestedRoles.rows.length !== roleIds.length) throw error("Authorization role was not found", undefined, "AUTHORIZATION_ROLE_NOT_FOUND");
+		for (const row of requestedRoles.rows) {
+			const role = authorizationRole({ roleId: row.role_id, organizationId: row.organization_id, slug: row.slug, name: row.name, description: row.description, builtIn: row.built_in, status: row.status }, Object.freeze([]), "stored role");
+			if (role.status !== "active") throw error("Authorization role is inactive", undefined, "AUTHORIZATION_ROLE_INACTIVE");
+			if (role.organizationId !== null && role.organizationId !== organizationId) throw error("Authorization role scope mismatch", undefined, "AUTHORIZATION_ROLE_SCOPE_MISMATCH");
+		}
+		const requestedActions = await queryable.query<{ action_name: unknown }>(`SELECT DISTINCT a."actionName" AS action_name FROM ${this.#table(this.#names.roleActions)} ra JOIN ${this.#table(this.#names.actions)} a ON a."projectId" = ra."projectId" AND a."environmentId" = ra."environmentId" AND a."actionId" = ra."actionId" WHERE ra."projectId" = $1 AND ra."environmentId" = $2 AND ra."roleId" = ANY($3::text[])`, [this.identity.projectId, this.identity.environmentId, roleIds]);
+		if (new Set(requestedActions.rows.map((row) => canonicalActionName(row.action_name, "stored requested action"))).size > MAX_EFFECTIVE_ACTIONS) {
+			throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+		}
+	}
+
+	async #insertServiceAccountCredential(queryable: Queryable, input: Readonly<{ organizationId: string; serviceAccountId: string; credentialId: string; expiresAt: Date | null; version: number; replacedCredentialId: string | null }>): Promise<AuthorizationServiceAccountCredentialMutation["credential"] & { readonly secret: string }> {
+		const secret = serviceAccountCredentialSecret();
+		const digest = credentialSecretDigest(secret);
+		let row: { rows: CredentialRow[]; rowCount: number | null };
+		try {
+			row = await queryable.query<CredentialRow>(`INSERT INTO ${this.#table(this.#names.credentials)} ("projectId", "environmentId", "organizationId", "credentialId", "serviceAccountId", "credentialDigest", "credentialPrefix", "credentialFingerprint", status, "expiresAt", "replacedCredentialId", version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10, $11) RETURNING "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, "credentialId" AS credential_id, "credentialDigest" AS credential_digest, "credentialPrefix" AS credential_prefix, "credentialFingerprint" AS credential_fingerprint, "expiresAt" AS expires_at, version`, [this.identity.projectId, this.identity.environmentId, input.organizationId, input.credentialId, input.serviceAccountId, digest, SERVICE_ACCOUNT_CREDENTIAL_PREFIX, credentialSecretFingerprint(secret), input.expiresAt, input.replacedCredentialId, input.version]);
+		} catch (cause) {
+			if (postgresErrorCode(cause) === "23505") {
+				throw error("Service account credential is unavailable", undefined, "AUTHORIZATION_CREDENTIAL_COLLISION");
+			}
+			throw cause;
+		}
+		if (row.rows.length !== 1) throw error("Service account credential is unavailable");
+		return Object.freeze({ ...this.#credentialFromRow(row.rows[0]!), secret });
+	}
+
 	async upsertRole(input: AuthorizationAuthorityUpsertRoleInput): Promise<AuthorizationAuthorityUpsertRoleResult> {
 		const actions = sortedUnique(input.actions, "actions", canonicalActionName);
 		const role = authorizationRole(input.role, actions, "role");
@@ -962,6 +1195,123 @@ export class PostgresAuthorizationAuthority {
 			const advanced = affected[0]!;
 			return Object.freeze({ changed: true, previousRevision: advanced.previousRevision, revision: advanced.revision, roleIds });
 		});
+	}
+
+	async createServiceAccount(input: AuthorizationCreateServiceAccountInput): Promise<AuthorizationServiceAccountMutation> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
+		const name = roleName(input.name, "name");
+		const roleIds = sortedUnique(input.roleIds, "roleIds", roleId);
+		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#validateServiceAccountRoleIds(queryable, organizationId, roleIds);
+			const inserted = await queryable.query<ServiceAccountRow>(`INSERT INTO ${this.#table(this.#names.serviceAccounts)} ("projectId", "environmentId", "organizationId", "serviceAccountId", name, status) VALUES ($1, $2, $3, $4, $5, 'active') RETURNING "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, name]);
+			if (inserted.rows.length !== 1) throw error("Service account is unavailable");
+			if (roleIds.length > 0) {
+				await queryable.query(`INSERT INTO ${this.#table(this.#names.assignments)} ("projectId", "environmentId", "organizationId", "subjectKind", "subjectId", "roleId") SELECT $1, $2, $3, 'service_account', $4, role_id FROM unnest($5::text[]) AS requested(role_id)`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, roleIds]);
+			}
+			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
+			return Object.freeze({ serviceAccount: this.#serviceAccountFromRow(inserted.rows[0]!), previousRevision: advanced.previousRevision, revision: advanced.revision });
+		});
+	}
+
+	async listServiceAccounts(input: AuthorizationListServiceAccountsInput): Promise<readonly AuthorizationServiceAccount[]> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		const rows = await queryable.query<ServiceAccountRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status FROM ${this.#table(this.#names.serviceAccounts)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 ORDER BY name, "serviceAccountId"`, [this.identity.projectId, this.identity.environmentId, organizationId]);
+		return Object.freeze(rows.rows.map((row) => this.#serviceAccountFromRow(row)));
+	}
+
+	async setServiceAccountStatus(input: AuthorizationSetServiceAccountStatusInput): Promise<AuthorizationServiceAccountMutation> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
+		const status = serviceAccountStatus(input.status, "status");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			const account = await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, false);
+			if (account.status === status) {
+				const revision = await this.#requireRevision(queryable, organizationId);
+				return Object.freeze({ serviceAccount: account, previousRevision: revision, revision });
+			}
+			const updated = await queryable.query<ServiceAccountRow>(`UPDATE ${this.#table(this.#names.serviceAccounts)} SET status = $5, "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 RETURNING "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, name, status`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, status]);
+			if (updated.rows.length !== 1) throw error("Service account is unavailable");
+			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
+			return Object.freeze({ serviceAccount: this.#serviceAccountFromRow(updated.rows[0]!), previousRevision: advanced.previousRevision, revision: advanced.revision });
+		});
+	}
+
+	async createServiceAccountCredential(input: AuthorizationCreateServiceAccountCredentialInput): Promise<AuthorizationServiceAccountCredentialMutation> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
+		const expiresAt = optionalCredentialExpiry(input.expiresAt, "expiresAt");
+		const requestedCredentialId = input.credentialId === undefined ? `credential_${randomUUID()}` : credentialId(input.credentialId, "credentialId");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, true);
+			const versionRows = await queryable.query<{ version: unknown }>(`SELECT COALESCE(max(version), 0)::text AS version FROM ${this.#table(this.#names.credentials)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId]);
+			const version = nextCredentialVersion(versionRows.rows[0]?.version ?? 0);
+			const created = await this.#insertServiceAccountCredential(queryable, { organizationId, serviceAccountId, credentialId: requestedCredentialId, expiresAt, version, replacedCredentialId: null });
+			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
+			const { secret, ...credential } = created;
+			return Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision });
+		});
+	}
+
+	async rotateServiceAccountCredential(input: AuthorizationRotateServiceAccountCredentialInput): Promise<AuthorizationServiceAccountCredentialMutation> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
+		const oldCredentialId = credentialId(input.credentialId, "credentialId");
+		const expiresAt = optionalCredentialExpiry(input.expiresAt, "expiresAt");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, true);
+			const oldRows = await queryable.query<CredentialRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, "credentialId" AS credential_id, "credentialDigest" AS credential_digest, "credentialPrefix" AS credential_prefix, "credentialFingerprint" AS credential_fingerprint, "expiresAt" AS expires_at, version FROM ${this.#table(this.#names.credentials)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 AND "credentialId" = $5 AND status = 'active' AND ("expiresAt" IS NULL OR "expiresAt" > clock_timestamp()) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, oldCredentialId]);
+			if (oldRows.rows.length !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
+			this.#credentialFromRow(oldRows.rows[0]!);
+			const versionRows = await queryable.query<{ version: unknown }>(`SELECT COALESCE(max(version), 0)::text AS version FROM ${this.#table(this.#names.credentials)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId]);
+			const created = await this.#insertServiceAccountCredential(queryable, { organizationId, serviceAccountId, credentialId: `credential_${randomUUID()}`, expiresAt, version: nextCredentialVersion(versionRows.rows[0]?.version ?? 0), replacedCredentialId: oldCredentialId });
+			const revoked = await queryable.query(`UPDATE ${this.#table(this.#names.credentials)} SET status = 'revoked', "revokedAt" = now(), "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 AND "credentialId" = $5 AND status = 'active'`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, oldCredentialId]);
+			if (revoked.rowCount !== 1) throw error("Service account credential is unavailable");
+			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
+			const { secret, ...credential } = created;
+			return Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision });
+		});
+	}
+
+	async revokeServiceAccountCredential(input: AuthorizationRevokeServiceAccountCredentialInput): Promise<AuthorizationAuthorityAffectedRevision> {
+		const organizationId = scopeString(input.organizationId, "organizationId");
+		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
+		const revokedCredentialId = credentialId(input.credentialId, "credentialId");
+		return this.#withMutation(input.transaction, async (queryable) => {
+			await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, false);
+			const revoked = await queryable.query(`UPDATE ${this.#table(this.#names.credentials)} SET status = 'revoked', "revokedAt" = now(), "updatedAt" = now() WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 AND "credentialId" = $5 AND status = 'active'`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, revokedCredentialId]);
+			if (revoked.rowCount !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
+			return (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
+		});
+	}
+
+	async authenticateServiceAccountCredential(input: AuthorizationAuthenticateServiceAccountCredentialInput): Promise<AuthorizationAuthenticateServiceAccountCredentialResult> {
+		const secret = assertCredentialSecret(input.secret);
+		const digest = credentialSecretDigest(secret);
+		const queryable = input.transaction ? transactionQueryable(input.transaction) : this.#database;
+		const t = (name: string) => this.#table(name);
+		const rows = await queryable.query<CredentialAuthenticationRow>(`WITH credential AS (
+			SELECT c."organizationId", c."serviceAccountId", c."credentialId", c."credentialDigest", c."credentialPrefix", c."credentialFingerprint", c."expiresAt", c.version
+			FROM ${t(this.#names.credentials)} c JOIN ${t(this.#names.serviceAccounts)} sa ON sa."projectId" = c."projectId" AND sa."environmentId" = c."environmentId" AND sa."organizationId" = c."organizationId" AND sa."serviceAccountId" = c."serviceAccountId"
+			WHERE c."credentialDigest" = $1 AND c."projectId" = $2 AND c."environmentId" = $3 AND c.status = 'active' AND (c."expiresAt" IS NULL OR c."expiresAt" > clock_timestamp()) AND sa.status = 'active'
+		), effective_roles AS (
+			SELECT DISTINCT r."roleId" FROM credential c JOIN ${t(this.#names.assignments)} a ON a."projectId" = $2 AND a."environmentId" = $3 AND a."organizationId" = c."organizationId" AND a."subjectKind" = 'service_account' AND a."subjectId" = c."serviceAccountId"
+			JOIN ${t(this.#names.roles)} r ON r."projectId" = a."projectId" AND r."environmentId" = a."environmentId" AND r."roleId" = a."roleId"
+			WHERE r.status = 'active' AND (r."organizationId" IS NULL OR r."organizationId" = a."organizationId")
+		), effective_actions AS (
+			SELECT DISTINCT ac."actionName" FROM effective_roles er JOIN ${t(this.#names.roleActions)} ra ON ra."projectId" = $2 AND ra."environmentId" = $3 AND ra."roleId" = er."roleId"
+			JOIN ${t(this.#names.actions)} ac ON ac."projectId" = ra."projectId" AND ac."environmentId" = ra."environmentId" AND ac."actionId" = ra."actionId"
+		)
+		SELECT c."organizationId" AS organization_id, c."serviceAccountId" AS service_account_id, c."credentialId" AS credential_id, c."credentialDigest" AS credential_digest, c."credentialPrefix" AS credential_prefix, c."credentialFingerprint" AS credential_fingerprint, c."expiresAt" AS expires_at, c.version,
+			r.revision::text AS revision, COALESCE((SELECT array_agg("roleId" ORDER BY "roleId") FROM effective_roles), ARRAY[]::text[]) AS role_ids, COALESCE((SELECT array_agg("actionName" ORDER BY "actionName") FROM effective_actions), ARRAY[]::text[]) AS actions
+		FROM credential c JOIN ${t(this.#names.revisions)} r ON r."projectId" = $2 AND r."environmentId" = $3 AND r."organizationId" = c."organizationId"`, [digest, this.identity.projectId, this.identity.environmentId]);
+		if (rows.rows.length !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
+		const row = rows.rows[0]!;
+		const actions = decodeSortedStrings(row.actions, "actions").map((action) => canonicalActionName(action, "stored action"));
+		if (actions.length > MAX_EFFECTIVE_ACTIONS) throw error("Authorization action limit was exceeded", undefined, "AUTHORIZATION_ACTION_LIMIT_EXCEEDED");
+		const credential = this.#credentialFromRow(row);
+		return Object.freeze({ projectId: this.identity.projectId, environmentId: this.identity.environmentId, organizationId: credential.organizationId, subject: Object.freeze({ kind: "service_account", id: credential.serviceAccountId }), credential, roleIds: decodeSortedStrings(row.role_ids, "roles"), actions: Object.freeze(actions), revision: canonicalRevision(row.revision) });
 	}
 
 	async listRoles(input: AuthorizationAuthorityListRolesInput): Promise<readonly AuthorizationAuthorityRole[]> {
