@@ -1,12 +1,12 @@
 import {
 	createUserInAuth,
 	createUserWithPasswordSetupInAuth,
-	createOrgInAuth,
 	addMemberInAuth,
 	archiveOrganizationInAuth,
 	deleteUserInAuth,
 	disableUserInAuth,
 	ensureAuthMigrated,
+	provisionOrganizationInAuth,
 	inspectSessionInAuth,
 	listSessionsPageInAuth,
 	removeMemberInAuth,
@@ -15,7 +15,6 @@ import {
 	updateOrganizationInAuth,
 	updateUserInAuth,
 } from "../auth-bridge.js";
-import { syncRuntimeOrganizationToManagementDurable } from "../services/identity.js";
 import type { AuthRuntimeGateway } from "../application/auth-runtime-gateway.js";
 import type { ManagementStore } from "../store/types.js";
 import {
@@ -94,23 +93,13 @@ export function createAuthBridgeRuntimeGateway(input: {
 		},
 		organizations: {
 			async provision(context, provisionInput) {
-				await ensureAuthMigrated();
-				const runtimeOrganization = await createOrgInAuth({
+				return provisionOrganizationInAuth(store, {
 					name: provisionInput.name,
 					...(provisionInput.slug !== undefined ? { slug: provisionInput.slug } : {}),
-					userId: provisionInput.ownerUserId,
+					ownerUserId: provisionInput.ownerUserId,
+					scope: context.scope,
+					actor: context.actor,
 				});
-				return syncRuntimeOrganizationToManagementDurable(
-					store,
-					runtimeOrganization,
-					provisionInput.ownerUserId,
-					{
-						projectId: context.scope.projectId,
-						environmentId: context.scope.environmentId,
-						actor: context.actor,
-						role: "owner",
-					},
-				);
 			},
 			updateCoordinated: (context, id, updateInput) =>
 				updateOrganizationInAuth(store, id, {
