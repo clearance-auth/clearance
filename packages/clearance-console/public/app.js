@@ -41,6 +41,16 @@ const routes = {
     cli: "clearance roles list --json",
     render: renderRoles,
   },
+  authorization: {
+    title: "Authorization",
+    cli: "clearance orgs authorization assignments list --org <id> --json",
+    render: renderAuthorization,
+  },
+  "service-accounts": {
+    title: "Service accounts",
+    cli: "clearance orgs service-accounts list --org <id> --json",
+    render: renderServiceAccounts,
+  },
   events: {
     title: "Events",
     cli: "clearance events list --json",
@@ -364,6 +374,8 @@ if (signoutBtn) {
 function setRoute(name, params) {
   const route = routes[name] || routes.overview;
   activeRouteName = routes[name] ? name : "overview";
+  if (activeRouteName !== "authorization") authorizationState.preview = null;
+  if (activeRouteName !== "service-accounts") serviceAccountState.selected = null;
   const routeVersion = ++navigationVersion;
   title.textContent = route.title;
   cliHint.textContent = route.cli;
@@ -1762,6 +1774,298 @@ async function loadRolesTable() {
     );
     wireCopyButtons(host);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Normalized authorization — inspect effective access; preview before changing
+// assignments or reconciling one organization. The API owns revision/CAS.
+// ---------------------------------------------------------------------------
+let authorizationState = { preview: null };
+
+function parseLineIds(text) {
+  const seen = new Set();
+  const out = [];
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const value = line.trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function organizationOptions(orgs, selected) {
+  return orgs
+    .map(
+      (org) =>
+        `<option value="${escapeAttr(org.id)}" ${org.id === selected ? "selected" : ""}>${escapeHtml(org.name)} (${escapeHtml(org.id)})</option>`,
+    )
+    .join("");
+}
+
+/** Reject delayed work once its route or selected organization has changed. */
+function isScopedRouteCurrent(route, routeVersion, organizationId, organizationSelectId) {
+  if (activeRouteName !== route || routeVersion !== navigationVersion) return false;
+  if (!organizationId) return true;
+  const organizationSelect = document.getElementById(organizationSelectId);
+  return !organizationSelect || organizationSelect.value === organizationId;
+}
+
+function authorizationAssignmentsHtml(assignments) {
+  if (!assignments.length) return stateEmpty("No role assignments for this organization");
+  return `<table><thead><tr><th>Subject</th><th>Kind</th><th>Role ID</th></tr></thead><tbody>${assignments
+    .map(
+      (assignment) => `<tr><td><code>${escapeHtml(assignment.subject?.id)}</code></td><td>${escapeHtml(assignment.subject?.kind)}</td><td><code>${escapeHtml(assignment.roleId)}</code></td></tr>`,
+    )
+    .join("")}</tbody></table>`;
+}
+
+async function renderAuthorization(params) {
+	// A preview is scoped to this rendered organization and draft. Never retain
+	// one across navigation, where Enter could otherwise submit stale intent.
+  authorizationState.preview = null;
+  const routeVersion = params?.routeVersion;
+  view.innerHTML = stateLoading("Loading organizations and roles…");
+  try {
+    const [orgData, roleData] = await Promise.all([api("/v1/organizations"), api("/v1/roles")]);
+    if (!isScopedRouteCurrent("authorization", routeVersion, undefined, "az-org")) return;
+    const orgs = Array.isArray(orgData.organizations) ? orgData.organizations : [];
+    const roles = Array.isArray(roleData.roles) ? roleData.roles : [];
+    const selectedOrg = params?.org || new URLSearchParams(location.search).get("org") || orgs[0]?.id;
+    if (!selectedOrg) {
+      view.innerHTML = stateEmpty("No organizations — create one before administering authorization", "clearance orgs create --name Acme --json");
+      wireCopyButtons(view);
+      return;
+    }
+    const mutable = canMutate();
+    const roleHint = roles
+      .map((role) => [role.id, role.slug ? "(" + role.slug + ")" : ""].filter(Boolean).join(" "))
+      .join("\n");
+    view.innerHTML = `
+      ${cliBlock(`clearance orgs authorization assignments list --org ${selectedOrg} --json`)}
+      <div class="form-row"><label class="field-label" for="az-org">Organization</label><select id="az-org">${organizationOptions(orgs, selectedOrg)}</select></div>
+      ${mutable ? "" : `<div class="card role-viewer-note" role="status"><p>Signed in as <strong>viewer</strong> — you can inspect effective access and assignments. Changes require an admin operator session.</p></div>`}
+      <div class="admin-grid">
+        <div class="card">
+          <div class="label">Effective access</div>
+          <form id="az-effective-form" class="admin-form" autocomplete="off">
+            <div class="field"><label class="field-label" for="az-effective-kind">Subject kind</label><select id="az-effective-kind"><option value="principal">Principal</option><option value="service_account">Service account</option></select></div>
+            <div class="field"><label class="field-label" for="az-effective-id">Subject ID</label><input id="az-effective-id" required placeholder="user_… or svc_…" /></div>
+            <button type="submit" class="ghost">Inspect effective access</button>
+          </form>
+          <div id="az-effective-result" class="account-detail" aria-live="polite"></div>
+        </div>
+        <div class="card">
+          <div class="label">Assignments</div>
+          <div id="az-assignments">${stateLoading("Loading assignments…")}</div>
+        </div>
+      </div>
+      <div class="admin-grid">
+        <div class="card">
+          <div class="label">Replace subject role assignments</div>
+          <p class="field-hint">Preview first. Applying requires an explicit confirmation and the live revision check.</p>
+          <form id="az-replace-form" class="admin-form" autocomplete="off">
+            <div class="field"><label class="field-label" for="az-replace-kind">Subject kind</label><select id="az-replace-kind"><option value="principal">Principal</option><option value="service_account">Service account</option></select></div>
+            <div class="field"><label class="field-label" for="az-replace-id">Subject ID</label><input id="az-replace-id" required placeholder="Subject ID" /></div>
+            <div class="field"><label class="field-label" for="az-role-ids">Role IDs</label><textarea id="az-role-ids" required aria-describedby="az-role-ids-hint" placeholder="${escapeAttr(roleHint)}"></textarea><p class="field-hint" id="az-role-ids-hint">One role ID per line. Existing assignments are replaced exactly.</p></div>
+            <div class="row-actions"><button type="button" id="az-preview" class="ghost" ${mutable ? "" : "disabled"}>Preview replacement</button><button type="submit" id="az-apply" class="primary" disabled>Apply replacement</button></div>
+          </form>
+          <div id="az-replace-msg" class="form-msg" aria-live="polite"></div><div id="az-replace-preview" hidden class="authorization-preview" aria-live="polite"></div>
+        </div>
+        <div class="card">
+          <div class="label">Bounded organization reconciliation</div>
+          <p class="field-hint">Reconciles only the selected organization. Preview reports the exact role and assignment changes.</p>
+          <div class="row-actions"><button type="button" id="az-reconcile-preview" class="ghost" ${mutable ? "" : "disabled"}>Preview reconciliation</button><button type="button" id="az-reconcile-apply" class="primary" disabled>Confirm reconciliation</button></div>
+          <div id="az-reconcile-msg" class="form-msg" aria-live="polite"></div><div id="az-reconcile-result" hidden class="authorization-preview" aria-live="polite"></div>
+        </div>
+      </div>`;
+    wireCopyButtons(view);
+    document.getElementById("az-org").addEventListener("change", (event) => setRoute("authorization", { org: event.target.value }));
+    document.getElementById("az-effective-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const kind = document.getElementById("az-effective-kind").value;
+      const subjectId = document.getElementById("az-effective-id").value.trim();
+      const host = document.getElementById("az-effective-result");
+      if (!subjectId) return setFormMessage(host, "Subject ID is required", "err");
+      host.innerHTML = stateLoading("Inspecting effective access…");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/effective/${encodeURIComponent(kind)}/${encodeURIComponent(subjectId)}`);
+        if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+        const effective = data.effective || {};
+        host.innerHTML = `<div class="authorization-preview"><div class="label">Live effective authorization</div><p>Revision <code>${escapeHtml(effective.revision)}</code></p><p>Roles: <code>${escapeHtml((effective.roleIds || []).join(", ") || "—")}</code></p><p>Actions: <code>${escapeHtml((effective.actions || []).join(", ") || "—")}</code></p></div>`;
+      } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) host.innerHTML = stateError(formatApiError(error)); }
+    });
+    const loadAssignments = async () => {
+      const host = document.getElementById("az-assignments");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/assignments`);
+        if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+        host.innerHTML = authorizationAssignmentsHtml(Array.isArray(data.assignments) ? data.assignments : []);
+      } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) host.innerHTML = stateError(`Failed to load assignments: ${formatApiError(error)}`); }
+    };
+    await loadAssignments();
+    if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+    const clearPreview = () => { authorizationState.preview = null; document.getElementById("az-apply").disabled = true; document.getElementById("az-replace-preview").hidden = true; };
+    ["az-replace-kind", "az-replace-id", "az-role-ids"].forEach((id) => {
+      document.getElementById(id).addEventListener("input", clearPreview);
+      document.getElementById(id).addEventListener("change", clearPreview);
+    });
+    document.getElementById("az-preview").addEventListener("click", async () => {
+      const kind = document.getElementById("az-replace-kind").value;
+      const subjectId = document.getElementById("az-replace-id").value.trim();
+      const roleIds = parseLineIds(document.getElementById("az-role-ids").value);
+      const message = document.getElementById("az-replace-msg");
+      if (!subjectId || roleIds.length === 0) return setFormMessage(message, "Subject ID and at least one role ID are required", "err");
+      setFormMessage(message, "Previewing replacement…", "");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/assignments/${encodeURIComponent(kind)}/${encodeURIComponent(subjectId)}`, { method: "PATCH", body: JSON.stringify({ roleIds, dryRun: true }) });
+        if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+        authorizationState.preview = { kind, subjectId, roleIds, revision: data.currentRevision || null, organizationId: selectedOrg, routeVersion };
+        const preview = document.getElementById("az-replace-preview");
+        preview.hidden = false;
+        preview.innerHTML = `<div class="label">Preview only</div><p>${data.wouldChange ? "Assignments will change." : "Assignments already match."}</p><p>Role IDs: <code>${escapeHtml((data.assignment?.roleIds || roleIds).join(", "))}</code></p>`;
+        document.getElementById("az-apply").disabled = !data.wouldChange;
+        setFormMessage(message, data.wouldChange ? "Review the preview, then apply." : "No change required.", "ok");
+      } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) { setFormMessage(message, formatApiError(error), "err"); clearPreview(); } }
+    });
+    document.getElementById("az-replace-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const preview = authorizationState.preview;
+      const message = document.getElementById("az-replace-msg");
+      if (!preview || preview.organizationId !== selectedOrg || preview.routeVersion !== routeVersion || !isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return setFormMessage(message, "Preview the replacement for this organization before applying it", "err");
+      if (!confirmDestructive(`Replace all role assignments for ${preview.kind} ${preview.subjectId} in ${selectedOrg}?`)) return setFormMessage(message, "Replacement cancelled", "");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/assignments/${encodeURIComponent(preview.kind)}/${encodeURIComponent(preview.subjectId)}`, { method: "PATCH", body: JSON.stringify({ roleIds: preview.roleIds, ...(preview.revision ? { expectedRevision: preview.revision } : {}), dryRun: false, confirm: true }) });
+        if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+        setFormMessage(message, `Assignments applied at revision ${data.revision || "current"}`, "ok"); clearPreview(); await loadAssignments();
+      } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) setFormMessage(message, formatApiError(error), "err"); }
+    });
+    let reconcilePreview = null;
+    document.getElementById("az-reconcile-preview").addEventListener("click", async () => {
+      const message = document.getElementById("az-reconcile-msg");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/reconcile`, { method: "POST", body: JSON.stringify({ dryRun: true }) });
+        if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return;
+        reconcilePreview = { ...data, organizationId: selectedOrg, routeVersion };
+        const host = document.getElementById("az-reconcile-result"); host.hidden = false;
+        host.innerHTML = `<div class="label">Preview only</div><p>Initialize: ${escapeHtml(data.initialized)} · roles: ${escapeHtml(data.rolesChanged)} · assignments: ${escapeHtml(data.assignmentsChanged)}</p>`;
+        document.getElementById("az-reconcile-apply").disabled = false;
+        setFormMessage(message, "Review the bounded reconciliation preview, then confirm.", "ok");
+      } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) setFormMessage(message, formatApiError(error), "err"); }
+    });
+    document.getElementById("az-reconcile-apply").addEventListener("click", async () => {
+      const message = document.getElementById("az-reconcile-msg");
+      if (!reconcilePreview || reconcilePreview.organizationId !== selectedOrg || reconcilePreview.routeVersion !== routeVersion || !isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return setFormMessage(message, "Preview reconciliation for this organization before confirming", "err");
+      if (!confirmDestructive(`Reconcile authorization only for organization ${selectedOrg}?`)) return setFormMessage(message, "Reconciliation cancelled", "");
+      try { const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/authorization/reconcile`, { method: "POST", body: JSON.stringify({ dryRun: false, confirm: true }) }); if (!isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) return; setFormMessage(message, `Reconciled ${data.organizationId}; revision ${data.revision}`, "ok"); await loadAssignments(); } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, selectedOrg, "az-org")) setFormMessage(message, formatApiError(error), "err"); }
+    });
+  } catch (error) { if (isScopedRouteCurrent("authorization", routeVersion, undefined, "az-org")) { view.innerHTML = stateError(`Failed to load authorization administration: ${formatApiError(error)}`, "clearance orgs authorization assignments list --org <id> --json"); wireCopyButtons(view); } }
+}
+
+// ---------------------------------------------------------------------------
+// Service accounts — credentials are one-time material. They live only in the
+// immediately rendered copy block, never URLs, storage, or diagnostics.
+// ---------------------------------------------------------------------------
+let serviceAccountState = { selected: null };
+
+function showOneTimeSecret(host, result) {
+  const secret = typeof result?.secret === "string" ? result.secret : "";
+  if (!secret) return;
+  host.innerHTML = `<div class="secret-once" role="status"><div class="label">One-time credential secret</div><p>Copy this value now. Clearance will not show it again.</p><code>${escapeHtml(secret)}</code><button type="button" class="ghost" data-copy="${escapeAttr(secret)}">Copy secret</button></div>`;
+  wireCopyButtons(host);
+}
+
+function serviceAccountRows(accounts, mutable) {
+  if (!accounts.length) return stateEmpty("No service accounts for this organization");
+  return `<table><thead><tr><th>Name</th><th>Status</th><th>Service account ID</th><th></th></tr></thead><tbody>${accounts.map((account) => `<tr><td>${escapeHtml(account.name)}</td><td class="status-${escapeAttr(account.status)}">${escapeHtml(account.status)}</td><td><code>${escapeHtml(account.serviceAccountId)}</code></td><td><button type="button" class="ghost" data-inspect-account="${escapeAttr(account.serviceAccountId)}">Inspect</button>${mutable ? `<button type="button" class="ghost" data-status-account="${escapeAttr(account.serviceAccountId)}" data-next-status="${account.status === "active" ? "disabled" : "active"}">${account.status === "active" ? "Disable" : "Enable"}</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
+}
+
+async function renderServiceAccounts(params) {
+  serviceAccountState.selected = null;
+  const routeVersion = params?.routeVersion;
+  view.innerHTML = stateLoading("Loading organizations and roles…");
+  try {
+    const [orgData, roleData] = await Promise.all([api("/v1/organizations"), api("/v1/roles")]);
+    if (!isScopedRouteCurrent("service-accounts", routeVersion, undefined, "sa-org")) return;
+    const orgs = Array.isArray(orgData.organizations) ? orgData.organizations : [];
+    const roles = Array.isArray(roleData.roles) ? roleData.roles : [];
+    const selectedOrg = params?.org || new URLSearchParams(location.search).get("org") || orgs[0]?.id;
+    if (!selectedOrg) { view.innerHTML = stateEmpty("No organizations — create one before creating service accounts", "clearance orgs create --name Acme --json"); wireCopyButtons(view); return; }
+    const mutable = canMutate();
+    view.innerHTML = `
+      ${cliBlock(`clearance orgs service-accounts list --org ${selectedOrg} --json`)}
+      <div class="form-row"><label class="field-label" for="sa-org">Organization</label><select id="sa-org">${organizationOptions(orgs, selectedOrg)}</select></div>
+      ${mutable ? "" : `<div class="card role-viewer-note" role="status"><p>Signed in as <strong>viewer</strong> — you can inspect service accounts. Changes require an admin operator session.</p></div>`}
+      <div class="admin-grid">
+        <div class="card"><div class="label">Create service account</div>
+          <form id="sa-create-form" class="admin-form" autocomplete="off"><div class="field"><label class="field-label" for="sa-name">Name</label><input id="sa-name" required maxlength="128" placeholder="Deploy automation" /></div><div class="field"><label class="field-label" for="sa-role-ids">Role IDs</label><textarea id="sa-role-ids" required placeholder="role_builtin_member"></textarea><p class="field-hint">One role ID per line. Available roles: ${escapeHtml(roles.map((role) => role.id).join(", ") || "none")}</p></div><button type="submit" class="primary" ${mutable ? "" : "disabled"}>Create service account</button></form><div id="sa-create-msg" class="form-msg" aria-live="polite"></div>
+        </div>
+        <div class="card"><div class="label">Service accounts</div><div id="sa-list">${stateLoading("Loading service accounts…")}</div></div>
+      </div>
+      <div class="card"><div class="label">Selected account</div><div id="sa-detail" class="account-detail">Select an account to inspect assignments and manage credentials.</div></div>`;
+    wireCopyButtons(view);
+    document.getElementById("sa-org").addEventListener("change", (event) => setRoute("service-accounts", { org: event.target.value }));
+    const listHost = document.getElementById("sa-list");
+    const detailHost = document.getElementById("sa-detail");
+    const loadAccounts = async () => {
+      try { const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts`); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; const accounts = Array.isArray(data.serviceAccounts) ? data.serviceAccounts : []; listHost.innerHTML = serviceAccountRows(accounts, mutable); wireAccountButtons(accounts); }
+      catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) listHost.innerHTML = stateError(`Failed to load service accounts: ${formatApiError(error)}`); }
+    };
+    const renderDetail = async (accountId) => {
+      if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+      detailHost.innerHTML = stateLoading("Loading service account…");
+      try {
+        const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts/${encodeURIComponent(accountId)}`);
+        if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+        const account = data.serviceAccount || {};
+        const assignments = Array.isArray(data.assignments) ? data.assignments : [];
+        serviceAccountState.selected = account.serviceAccountId || accountId;
+        detailHost.innerHTML = `<div class="admin-grid"><div><p><strong>${escapeHtml(account.name)}</strong> · <code>${escapeHtml(account.serviceAccountId)}</code> · <span class="status-${escapeAttr(account.status)}">${escapeHtml(account.status)}</span></p><div class="label">Assigned roles</div>${assignments.length ? `<ul class="action-list">${assignments.map((assignment) => `<li><code>${escapeHtml(assignment.roleId)}</code></li>`).join("")}</ul>` : stateEmpty("No role assignments")}</div><div>${mutable ? `<div class="label">Credentials</div><form id="sa-credential-form" class="admin-form" autocomplete="off"><div class="field"><label class="field-label" for="sa-credential-id">Existing credential ID</label><input id="sa-credential-id" placeholder="Required to rotate or revoke" /></div><div class="field"><label class="field-label" for="sa-expires-at">Expires at <span class="optional">(optional ISO timestamp)</span></label><input id="sa-expires-at" placeholder="2030-01-01T00:00:00.000Z" /></div><div class="row-actions"><button type="button" class="ghost" data-credential-action="create">Create credential</button><button type="button" class="ghost" data-credential-action="rotate">Rotate</button><button type="button" class="ghost danger-action" data-credential-action="revoke">Revoke</button></div></form><div id="sa-credential-msg" class="form-msg" aria-live="polite"></div><div id="sa-secret-once"></div>` : `<p class="field-hint">Viewer role cannot create, rotate, or revoke credentials.</p>`}</div></div>`;
+        if (mutable) wireCredentialButtons(account.serviceAccountId || accountId);
+      } catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) detailHost.innerHTML = stateError(`Failed to inspect service account: ${formatApiError(error)}`); }
+    };
+    const wireAccountButtons = (accounts) => {
+      listHost.querySelectorAll("[data-inspect-account]").forEach((button) => button.addEventListener("click", () => renderDetail(button.getAttribute("data-inspect-account"))));
+      if (!mutable) return;
+      listHost.querySelectorAll("[data-status-account]").forEach((button) => button.addEventListener("click", async () => {
+        if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+        const accountId = button.getAttribute("data-status-account"); const status = button.getAttribute("data-next-status");
+        if (!accountId || !status) return;
+        if (status === "disabled" && !confirmDestructive(`Disable service account ${accountId}? Existing machine tokens will be invalidated.`)) return;
+        button.disabled = true;
+        try { await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts/${encodeURIComponent(accountId)}/status`, { method: "PATCH", body: JSON.stringify({ status }) }); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; await loadAccounts(); if (serviceAccountState.selected === accountId) await renderDetail(accountId); }
+        catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) detailHost.innerHTML = stateError(`Failed to change account status: ${formatApiError(error)}`); }
+        finally { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) button.disabled = false; }
+      }));
+    };
+    const wireCredentialButtons = (accountId) => {
+      detailHost.querySelectorAll("[data-credential-action]").forEach((button) => button.addEventListener("click", async () => {
+        if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+        const action = button.getAttribute("data-credential-action"); const credentialId = document.getElementById("sa-credential-id").value.trim(); const expiresAt = document.getElementById("sa-expires-at").value.trim(); const message = document.getElementById("sa-credential-msg"); const secretHost = document.getElementById("sa-secret-once");
+		// The secret is one-time material. Any subsequent attempt clears it before
+		// network activity, including revoke and failed create/rotate requests.
+		secretHost.innerHTML = "";
+        if ((action === "rotate" || action === "revoke") && !credentialId) return setFormMessage(message, "Credential ID is required", "err");
+        if ((action === "rotate" || action === "revoke") && !confirmDestructive(`${action === "rotate" ? "Rotate" : "Revoke"} credential ${credentialId}?`)) return setFormMessage(message, `${action} cancelled`, "");
+        const base = `/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts/${encodeURIComponent(accountId)}/credentials`;
+        const path = action === "create" ? base : `${base}/${encodeURIComponent(credentialId)}/${action}`;
+        const body = action === "revoke" ? {} : { ...(expiresAt ? { expiresAt } : {}) };
+        button.disabled = true; setFormMessage(message, `${action[0].toUpperCase()}${action.slice(1)}ing credential…`, "");
+        try { const data = await api(path, { method: "POST", body: JSON.stringify(body) }); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; setFormMessage(message, action === "revoke" ? "Credential revoked" : "Credential ready — copy the one-time secret now.", "ok"); if (action !== "revoke") showOneTimeSecret(secretHost, data); }
+        catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) setFormMessage(message, formatApiError(error), "err"); }
+        finally { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) button.disabled = false; }
+      }));
+    };
+    document.getElementById("sa-create-form").addEventListener("submit", async (event) => {
+      event.preventDefault(); const name = document.getElementById("sa-name").value.trim(); const roleIds = parseLineIds(document.getElementById("sa-role-ids").value); const message = document.getElementById("sa-create-msg");
+      if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+      if (!name || !roleIds.length) return setFormMessage(message, "Name and at least one role ID are required", "err");
+      if (!confirmDestructive(`Create service account ${name} for organization ${selectedOrg}?`)) return setFormMessage(message, "Creation cancelled", "");
+      try { await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts`, { method: "POST", body: JSON.stringify({ name, roleIds }) }); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; document.getElementById("sa-create-form").reset(); setFormMessage(message, "Service account created", "ok"); await loadAccounts(); }
+      catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) setFormMessage(message, formatApiError(error), "err"); }
+    });
+    await loadAccounts();
+  } catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, undefined, "sa-org")) { view.innerHTML = stateError(`Failed to load service-account administration: ${formatApiError(error)}`, "clearance orgs service-accounts list --org <id> --json"); wireCopyButtons(view); } }
 }
 
 // ---------------------------------------------------------------------------
