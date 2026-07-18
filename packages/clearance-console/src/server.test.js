@@ -116,6 +116,8 @@ describe("console shell assets", () => {
 			"Members",
 			"Sessions",
 			"Roles",
+			"Authorization",
+			"Service accounts",
 			"Events",
 			"Readiness",
 			"Settings",
@@ -126,6 +128,28 @@ describe("console shell assets", () => {
 		assert.match(indexHtml, /data-route="roles"/);
 		assert.match(indexHtml, /data-route="sessions"/);
 		assert.match(indexHtml, /data-route="members"/);
+		assert.match(indexHtml, /data-route="authorization"/);
+		assert.match(indexHtml, /data-route="service-accounts"/);
+	});
+
+	it("ships normalized authorization and one-time credential administration", () => {
+		assert.match(appJs, /authorization\s*:/);
+		assert.match(appJs, /"service-accounts"\s*:/);
+		assert.match(appJs, /renderAuthorization/);
+		assert.match(appJs, /renderServiceAccounts/);
+		assert.match(appJs, /authorization\/effective/);
+		assert.match(appJs, /authorization\/assignments/);
+		assert.match(appJs, /authorization\/reconcile/);
+		assert.match(appJs, /service-accounts/);
+		assert.match(appJs, /dryRun:\s*true/);
+		assert.match(appJs, /dryRun:\s*false, confirm:\s*true/);
+		assert.match(appJs, /authorizationState\.preview = null/);
+		assert.match(appJs, /showOneTimeSecret/);
+		assert.match(appJs, /secretHost\.innerHTML = ""/);
+		assert.match(appJs, /not show it again/i);
+		assert.match(appJs, /canMutate/);
+		assert.doesNotMatch(appJs, /\blocalStorage\b/);
+		assert.doesNotMatch(appJs, /\bsessionStorage\b/);
 	});
 
 	it("app.js declares readiness route fetching readiness API", () => {
@@ -370,6 +394,14 @@ describe("operator sessions, roles, CSRF", () => {
 
 	before(async () => {
 		mockApi = createMockApi((req, res) => {
+			if (/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials(?:\/[^/]+\/rotate)?$/.test(req.url || "")) {
+				res.statusCode = 201;
+				res.setHeader("content-type", "application/json");
+				res.setHeader("cache-control", "public, max-age=600");
+				res.setHeader("pragma", "cache");
+				res.end(JSON.stringify({ secret: "one-time-secret" }));
+				return;
+			}
 			if (req.url?.startsWith("/health")) {
 				res.statusCode = 200;
 				res.setHeader("content-type", "application/json");
@@ -809,6 +841,23 @@ describe("operator sessions, roles, CSRF", () => {
 		assert.equal(mockApi.requests[0].headers["x-forwarded-for"], "127.0.0.1");
 	});
 
+	it("forces no-store for one-time credential create and rotate responses", async () => {
+		const { cookie, csrf, origin } = await login(consolePort, ADMIN.username, ADMIN.password);
+		for (const path of [
+			"/api/v1/organizations/org_1/service-accounts/svc_1/credentials",
+			"/api/v1/organizations/org_1/service-accounts/svc_1/credentials/cred_1/rotate",
+		]) {
+			const response = await fetch(`http://127.0.0.1:${consolePort}${path}`, {
+				method: "POST",
+				headers: { cookie, origin, "x-csrf-token": csrf, "content-type": "application/json" },
+				body: "{}",
+			});
+			assert.equal(response.status, 201);
+			assert.equal(response.headers.get("cache-control"), "no-store");
+			assert.equal(response.headers.get("pragma"), "no-cache");
+		}
+	});
+
 	it("viewer can read but mutations are forbidden", async () => {
 		const { cookie, csrf, origin } = await login(
 			consolePort,
@@ -1055,6 +1104,27 @@ describe("roles surface helpers and integration", () => {
 			const html = await res.text();
 			assert.match(html, /Clearance Console/);
 			assert.match(html, /data-route="roles"/);
+		} finally {
+			await close(server);
+		}
+	});
+
+	it("authorization administration SPA deep links are served", async () => {
+		const server = createConsoleServer({
+			apiBase: "http://127.0.0.1:1",
+			operatorToken: "authorization-spa-shell-token-32chars!!",
+			sessionSecret: "authorization-spa-shell-session-secret!!",
+			operators: [{ username: "a", password: "p", role: "admin" }],
+			nodeEnv: "development",
+			secureCookies: false,
+		});
+		const port = await listen(server);
+		try {
+			for (const route of ["authorization", "service-accounts"]) {
+				const res = await fetch(`http://127.0.0.1:${port}/${route}`);
+				assert.equal(res.status, 200, route);
+				assert.match(await res.text(), /Clearance Console/);
+			}
 		} finally {
 			await close(server);
 		}
