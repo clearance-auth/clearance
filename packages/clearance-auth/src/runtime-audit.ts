@@ -16,6 +16,44 @@ import type { ClearanceTransactionQuery } from "./public-types/index.js";
 
 const MIGRATION_ID = "runtime-audit-outbox-v2";
 const DEFAULT_TABLE = "clearance_runtime_audit_events";
+const ROLLBACK_FENCE_TRIGGER = "clearance_import_rollback_guard_v1";
+const ROLLBACK_FENCE_FUNCTION = "clearance_import_rollback_guard_v1";
+const ROLLBACK_FENCE_FUNCTION_BODY = `
+		DECLARE
+			argument_index integer := 0;
+			fence_kind text;
+			reference_column text;
+			condition_column text;
+			condition_value text;
+			reference_id text;
+			row_data jsonb := to_jsonb(NEW);
+		BEGIN
+			WHILE argument_index < TG_NARGS LOOP
+				fence_kind := TG_ARGV[argument_index];
+				reference_column := TG_ARGV[argument_index + 1];
+				condition_column := TG_ARGV[argument_index + 2];
+				condition_value := TG_ARGV[argument_index + 3];
+				reference_id := row_data ->> reference_column;
+				IF reference_id IS NOT NULL AND (
+					condition_column = '' OR row_data ->> condition_column = condition_value
+				) THEN
+					PERFORM pg_advisory_xact_lock(hashtextextended(
+						'clearance-import-rollback:v1:' || fence_kind || ':' || reference_id,
+						0
+					));
+					IF EXISTS (
+						SELECT 1 FROM "public"."clearance_import_rollback_tombstones"
+						WHERE kind = fence_kind AND resource_id = reference_id
+					) THEN
+						RAISE EXCEPTION 'Clearance rollback-fenced resource cannot be referenced'
+							USING ERRCODE = '23503';
+					END IF;
+				END IF;
+				argument_index := argument_index + 4;
+			END LOOP;
+			RETURN NEW;
+		END
+		`;
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 const MAX_IDENTIFIER_LENGTH = 63;
 const SENSITIVE_METADATA_KEY =
@@ -304,7 +342,7 @@ async function setupReady(target: Queryable, names: ReturnType<typeof tableNames
 						OR (t.tgname=$14 AND t.tgtype=34 AND t.tgenabled='O'))
 			)
 			AND (SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
-				WHERE NOT t.tgisinternal) = 3
+				WHERE NOT t.tgisinternal AND t.tgname IN ($12,$13,$14)) = 3
 			AND (SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
 				WHERE NOT t.tgisinternal AND t.tgname IN ($12,$13,$14) AND octet_length(t.tgargs)=0) = 3
 			AND NOT EXISTS (
@@ -318,6 +356,32 @@ async function setupReady(target: Queryable, names: ReturnType<typeof tableNames
 					AND p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql')
 					AND NOT p.prosecdef
 					AND regexp_replace(lower(p.prosrc), '\\s+', '', 'g') = 'beginraiseexception''runtimeauditeventsareappend-only''usingerrcode=''clr01'';end') = 3
+			AND (
+				(SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
+					WHERE NOT t.tgisinternal) = 3
+				OR (
+					(SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
+						WHERE NOT t.tgisinternal) = 4
+					AND (SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
+						WHERE NOT t.tgisinternal AND t.tgname=$18) = 1
+					AND NOT EXISTS (
+						SELECT 1 FROM pg_trigger t
+						JOIN pg_proc p ON p.oid=t.tgfoid
+						JOIN pg_namespace n ON n.oid=p.pronamespace
+						JOIN target ON target.oid=t.tgrelid
+						WHERE NOT t.tgisinternal AND t.tgname=$18
+							AND NOT (
+								t.tgtype=23 AND t.tgenabled='O' AND t.tgnargs=4
+								AND encode(t.tgargs, 'hex')='6f7267616e697a6174696f6e006f7267616e697a6174696f6e5f6964000000'
+								AND n.nspname='public' AND p.proname=$19 AND p.pronargs=0
+								AND p.prorettype='trigger'::regtype
+								AND p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql')
+								AND NOT p.prosecdef
+								AND regexp_replace(lower(p.prosrc), '\\s+', '', 'g') = regexp_replace(lower($20), '\\s+', '', 'g')
+							)
+					)
+				)
+			)
 			AS ready`,
 		[
 			schema, names.table, expectedColumns,
@@ -326,6 +390,7 @@ async function setupReady(target: Queryable, names: ReturnType<typeof tableNames
 			names.scopeCreatedIdIndex, names.scopeActionCreatedIdIndex,
 			names.updateTrigger, names.deleteTrigger, names.truncateTrigger,
 			names.updateFunction, names.deleteFunction, names.truncateFunction,
+			ROLLBACK_FENCE_TRIGGER, ROLLBACK_FENCE_FUNCTION, ROLLBACK_FENCE_FUNCTION_BODY,
 		],
 	);
 	return result.rows[0]?.ready === true;
