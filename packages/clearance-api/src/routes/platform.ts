@@ -7,8 +7,8 @@ import {
 	createProject,
 	initProject,
 	inspectEnvironmentAuthoritative,
-	listEnvironments,
-	listProjects,
+	inspectProjectAuthoritative,
+	listEnvironmentsPageAuthoritative,
 	overviewStatsAuthoritative,
 	planEnvironmentCreate,
 	planProjectCreate,
@@ -91,7 +91,7 @@ export function registerPlatformRoutes({
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
 				return c.json({
-					projects: listProjects(store).filter((project) => project.id === scope.projectId),
+					projects: [await inspectProjectAuthoritative(store, scope.projectId, scope)],
 					scope,
 				});
 			} catch (error) {
@@ -102,15 +102,7 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				const project = listProjects(store).find((candidate) => candidate.id === scope.projectId);
-				if (!project) {
-					throw new ClearanceError({
-						code: "PROJECT_NOT_FOUND",
-						message: "Project not found.",
-						stage: "project.inspect",
-						status: 404,
-					});
-				}
+				const project = await inspectProjectAuthoritative(store, scope.projectId, scope);
 				return c.json({ project, overview: await overviewStatsAuthoritative(store, scope), scope });
 			} catch (error) {
 				return handleError(c, error);
@@ -120,17 +112,7 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				const project = listProjects(store).find(
-					(candidate) => candidate.id === c.req.param("id") && candidate.id === scope.projectId,
-				);
-				if (!project) {
-					throw new ClearanceError({
-						code: "PROJECT_NOT_FOUND",
-						message: "Project not found.",
-						stage: "project.inspect",
-						status: 404,
-					});
-				}
+				const project = await inspectProjectAuthoritative(store, c.req.param("id"), scope);
 				return c.json({ project, overview: await overviewStatsAuthoritative(store, scope), scope });
 			} catch (error) {
 				return handleError(c, error);
@@ -157,7 +139,20 @@ export function registerPlatformRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				return c.json({ environments: listEnvironments(store, { scope }), scope });
+				const limitRaw = c.req.query("limit");
+				const cursor = c.req.query("cursor");
+				const page = await listEnvironmentsPageAuthoritative(store, {
+					scope,
+					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
+					...(cursor !== undefined ? { cursor } : {}),
+				});
+				const includeNextCursor =
+					limitRaw !== undefined || cursor !== undefined || page.nextCursor !== null;
+				return c.json({
+					environments: page.environments,
+					...(includeNextCursor ? { nextCursor: page.nextCursor } : {}),
+					scope,
+				});
 			} catch (error) {
 				return handleError(c, error);
 			}
