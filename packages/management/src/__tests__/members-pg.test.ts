@@ -11,10 +11,11 @@ import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import {
 	addMemberInAuth,
-	createOrgInAuth,
 	createUserInAuth,
 	ensureAuthMigrated,
 	getAuthBundle,
+	provisionOrganizationInAuth,
+	reconcileAuthorizationOrganizationInAuth,
 	removeMemberInAuth,
 	resetAuthBundle,
 	updateMemberInAuth,
@@ -24,7 +25,6 @@ import {
 	initProject,
 	listEvents,
 	resolveOperatorScope,
-	syncRuntimeOrganizationToManagementDurable,
 } from "../index.js";
 import { ClearanceError } from "../services/errors.js";
 
@@ -186,36 +186,28 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			managementStore: store,
 		});
 		trackUser(owner);
-		const runtimeOrg = await createOrgInAuth({
+		const organization = await provisionOrganizationInAuth(store, {
 			name: `Org ${stamp}`,
 			slug: `org-${stamp}`,
-			userId: owner.id,
+			ownerUserId: owner.id,
+			actor: "test",
 		});
-		trackOrg(runtimeOrg);
-		// Capture owner membership id from runtime (must equal createOrgInAuth return)
+		trackOrg(organization);
+		// Capture the exact owner membership id committed with the provision.
 		const b = getAuthBundle();
 		const mem = await b.pool.query(
 			`select id from member where "organizationId" = $1 and "userId" = $2`,
-			[runtimeOrg.id, owner.id],
+			[organization.id, owner.id],
 		);
 		const runtimeOwnerMembershipId = mem.rows[0]?.id
 			? String(mem.rows[0].id)
 			: undefined;
 		if (runtimeOwnerMembershipId) trackMember(runtimeOwnerMembershipId);
-		expect(runtimeOrg.ownerMembershipId).toBe(runtimeOwnerMembershipId);
-
-		const organization = await syncRuntimeOrganizationToManagementDurable(
-			store,
-			runtimeOrg,
-			owner.id,
-			{ actor: "test", role: "owner" },
-		);
 		return {
 			owner,
 			organization,
 			stamp,
 			runtimeOwnerMembershipId,
-			runtimeOrg,
 		};
 	}
 
@@ -245,17 +237,15 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			: undefined;
 	}
 
-	it("org sync preserves runtime owner membership id immediately and is idempotent", async () => {
+	it("provision commits the owner membership and effective owner actions without reconciliation", async () => {
 		const store = await freshStore();
 		const {
 			owner,
 			organization,
 			runtimeOwnerMembershipId,
-			runtimeOrg,
 		} = await seedOwnerAndOrg(store);
 
 		expect(runtimeOwnerMembershipId).toBeTruthy();
-		expect(runtimeOrg.ownerMembershipId).toBe(runtimeOwnerMembershipId);
 
 		const rt = await runtimeMember(organization.id, owner.id);
 		expect(rt?.id).toBe(runtimeOwnerMembershipId);
@@ -272,23 +262,14 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(mgmt[0]?.id).toBe(runtimeOwnerMembershipId);
 		expect(mgmt[0]?.role).toBe("owner");
 
-		// Re-sync is idempotent: one canonical active membership, same stable id
-		await syncRuntimeOrganizationToManagementDurable(
-			store,
-			runtimeOrg,
-			owner.id,
-			{ actor: "test", role: "owner" },
-		);
-		const after = store.snapshot.memberships.filter(
-			(m) =>
-				m.organizationId === organization.id &&
-				m.principalId === owner.id &&
-				m.status === "active",
-		);
-		expect(after).toHaveLength(1);
-		expect(after[0]?.id).toBe(runtimeOwnerMembershipId);
-		const rtAgain = await runtimeMember(organization.id, owner.id);
-		expect(rtAgain?.id).toBe(runtimeOwnerMembershipId);
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const effective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(effective.roleIds).toEqual(["role_builtin_owner"]);
+		expect(effective.actions).toContain("organization:delete");
 	});
 
 	it("built-in role add parity: same id/role in runtime and management, one audit", async () => {
@@ -323,7 +304,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 
 	it("custom scoped role add and update parity with exactly one audit each", async () => {
 		const store = await freshStore();
-		const { organization, stamp } = await seedOwnerAndOrg(store);
+		const { organization, owner, stamp } = await seedOwnerAndOrg(store);
 		const user = await createMemberUser(store, stamp, "billing");
 		await createRole(store, {
 			name: "Billing",
@@ -331,6 +312,13 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			permissions: ["billing:read"],
 		});
 		await store.ready();
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const ownerEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(ownerEffective.actions).toContain("organization:delete");
 
 		const membership = await addMemberInAuth(store, {
 			organizationId: organization.id,
@@ -342,6 +330,14 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		trackMember(membership.id);
 		expect(membership.role).toBe("billing");
 		expect((await runtimeMember(organization.id, user.id))?.role).toBe("billing");
+		const billingEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(billingEffective.actions).toEqual(["billing:read"]);
+		expect(BigInt(billingEffective.revision)).toBeGreaterThan(
+			BigInt(ownerEffective.revision),
+		);
 
 		const updated = await updateMemberInAuth(store, membership.id, {
 			role: "member",
@@ -351,6 +347,24 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(updated.id).toBe(membership.id);
 		expect(updated.role).toBe("member");
 		expect((await runtimeMember(organization.id, user.id))?.role).toBe("member");
+		const memberEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(memberEffective.actions).toEqual(["ac:read"]);
+		expect(BigInt(memberEffective.revision)).toBeGreaterThan(
+			BigInt(billingEffective.revision),
+		);
+		await updateMemberInAuth(store, membership.id, {
+			role: "member",
+			actor: "test",
+			auditSource: "api",
+		});
+		const noOpEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(noOpEffective.revision).toBe(memberEffective.revision);
 
 		const adds = listEvents(store, { limit: 200 }).filter(
 			(e) => e.action === "orgs.members.add" && e.subjectId === membership.id,
@@ -457,11 +471,44 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(
 			store.snapshot.memberships.find((m) => m.id === membership.id)?.status,
 		).toBe("removed");
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const effective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(effective.roleIds).toEqual([]);
+		expect(effective.actions).toEqual([]);
 
 		const audits = listEvents(store, { limit: 200 }).filter(
 			(e) => e.action === "orgs.members.remove" && e.subjectId === membership.id,
 		);
 		expect(audits).toHaveLength(1);
+	});
+
+	it("bounded reconciliation clears only stale principal assignments in its organization", async () => {
+		const store = await freshStore();
+		const { organization } = await seedOwnerAndOrg(store);
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const stalePrincipalId = `stale-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		await authorization.replaceSubjectRoles({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: stalePrincipalId },
+			roleIds: ["role_builtin_member"],
+		});
+
+		const reconciled = await reconcileAuthorizationOrganizationInAuth(store, {
+			organizationId: organization.id,
+			actor: "test",
+		});
+		expect(reconciled.assignmentsChanged).toBe(1);
+		expect(
+			await authorization.listSubjectAssignments({
+				organizationId: organization.id,
+				subject: { kind: "principal", id: stalePrincipalId },
+			}),
+		).toEqual([]);
 	});
 
 	it("final-owner invariant blocks demote and remove", async () => {
