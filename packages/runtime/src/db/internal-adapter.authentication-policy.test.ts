@@ -1048,18 +1048,6 @@ describe("managed session issuance", () => {
 			evidence: [{ kind: "primary" as const, primaryMethod: "passkey" as const }],
 			expectedPrimaryMethod: "passkey",
 		},
-		{
-			label: "impersonation",
-			minimumAssurance: "single_factor" as const,
-			purpose: "impersonation" as const,
-			evidence: [
-				{
-					kind: "primary" as const,
-					primaryMethod: "admin_impersonation" as const,
-				},
-			],
-			expectedPrimaryMethod: "admin_impersonation",
-		},
 	])("stamps valid $label evidence", async (testCase) => {
 		const { context, user } = await setupManagedRuntime({
 			reader: (input) =>
@@ -2877,6 +2865,354 @@ describe("managed session issuance", () => {
 			await runtime.context.adapter.count({ model: "sessionCredential" }),
 		).toBe(1);
 		expect(secondarySet).toHaveBeenCalledTimes(1);
+	});
+
+	it("issues a device session only from its exact live derivative and preserves source scope through hooks", async () => {
+		const sourceExpiry = new Date(Date.now() + 60_000);
+		let tamperSuccessor = false;
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: {
+					additionalFields: {
+						activeOrganizationId: { type: "string", required: false },
+						activeTeamId: { type: "string", required: false },
+					},
+				},
+				databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => ({
+								data: {
+									...data,
+									...(tamperSuccessor
+										? {
+											activeOrganizationId: "hooked-organization",
+											activeTeamId: "hooked-team",
+											expiresAt: new Date(Date.now() + 86_400_000),
+										}
+										: {}),
+								},
+							}),
+						},
+					},
+				},
+			},
+		});
+		const source = await runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			false,
+			{
+				activeOrganizationId: "organization_a",
+				activeTeamId: "team_a",
+				expiresAt: sourceExpiry,
+				__preserveSessionExpiresAt: true,
+			},
+			true,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: "organization_a",
+			}),
+		);
+		tamperSuccessor = true;
+
+		const issued = await runWithTransaction(runtime.context.adapter, async () => {
+			const binding = await captureInternalSessionDerivativeAuthority(
+				runtime.context.internalAdapter,
+				{ purpose: "device", sourceSessionToken: source.token },
+			);
+			const context = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "device",
+					subjectId: runtime.user.id,
+					sourceSessionDerivativeAuthority: binding,
+					targetOrganizationId: "organization_a",
+				},
+			);
+			return runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				undefined,
+				false,
+				context,
+			);
+		});
+		const stored = await runtime.context.adapter.findOne<Record<string, unknown>>({
+			model: "session",
+			where: [{ field: "id", value: issued.id }],
+		});
+		expect(stored).toMatchObject({
+			activeOrganizationId: "organization_a",
+			activeTeamId: null,
+		});
+		expect(new Date(stored!.expiresAt as Date).getTime()).toBe(
+			sourceExpiry.getTime(),
+		);
+	});
+
+	it("rejects mismatched device bindings and consumes a captured context once", async () => {
+		const runtime = await setupManagedRuntime();
+		const source = await issuePasswordSession(runtime);
+		const binding = await runWithTransaction(runtime.context.adapter, () =>
+			captureInternalSessionDerivativeAuthority(runtime.context.internalAdapter, {
+				purpose: "device",
+				sourceSessionToken: source.token,
+			}),
+		);
+		await expect(
+			runWithTransaction(runtime.context.adapter, () =>
+				captureInternalSessionIssuanceContext(runtime.context.internalAdapter, {
+					purpose: "device",
+					subjectId: "other-user",
+					sourceSessionDerivativeAuthority: binding,
+					targetOrganizationId: null,
+				}),
+			),
+		).rejects.toMatchObject({ reason: "authority_mismatched" });
+		let captured: SessionIssuanceContext | undefined;
+		await runWithTransaction(runtime.context.adapter, async () => {
+				captured = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "device",
+						subjectId: runtime.user.id,
+						sourceSessionDerivativeAuthority: binding,
+						targetOrganizationId: null,
+					},
+				);
+				await expect(
+					runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					captured,
+					),
+				).resolves.toBeTruthy();
+				await expect(
+				runtime.context.internalAdapter.createSession(
+					runtime.user.id,
+					false,
+					undefined,
+					false,
+					captured,
+					),
+				).rejects.toMatchObject({ reason: "context_invalid" });
+			});
+		await expect(
+			runtime.context.internalAdapter.createSession(
+				runtime.user.id,
+				false,
+				{ impersonatedBy: runtime.user.id },
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: runtime.user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
+			),
+		).rejects.toMatchObject({ reason: "context_invalid" });
+	});
+
+	it("binds impersonation actor, target organization, and source expiry after hooks", async () => {
+		const sourceExpiry = new Date(Date.now() + 60_000);
+		let tamperSuccessor = false;
+		let injectOrdinaryActor = false;
+		const runtime = await setupManagedRuntime({
+			options: {
+				session: {
+					additionalFields: {
+						impersonatedBy: { type: "string", required: false },
+						activeOrganizationId: { type: "string", required: false },
+						activeTeamId: { type: "string", required: false },
+					},
+				},
+				databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => ({
+								data: {
+									...data,
+									...(tamperSuccessor
+										? {
+											impersonatedBy: "hooked-actor",
+											activeOrganizationId: "hooked-organization",
+											activeTeamId: "hooked-team",
+											expiresAt: new Date(Date.now() + 86_400_000),
+										}
+										: injectOrdinaryActor
+											? { impersonatedBy: "hooked-actor" }
+											: {}),
+								},
+							}),
+						},
+					},
+				},
+			},
+		});
+		const target = await runtime.context.internalAdapter.createUser({
+			email: "impersonation-target@example.com",
+			name: "Impersonation Target",
+		});
+		const source = await runtime.context.internalAdapter.createSession(
+			runtime.user.id,
+			false,
+			{ expiresAt: sourceExpiry, __preserveSessionExpiresAt: true },
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: runtime.user.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+				targetOrganizationId: null,
+			}),
+		);
+		injectOrdinaryActor = true;
+		const ordinary = await runtime.context.internalAdapter.createSession(
+			target.id,
+			false,
+			undefined,
+			false,
+			createInternalSessionIssuanceContext({
+				purpose: "interactive",
+				subjectId: target.id,
+				evidence: [{ kind: "primary", primaryMethod: "password" }],
+			}),
+		);
+		const ordinaryStored =
+			await runtime.context.adapter.findOne<Record<string, unknown>>({
+				model: "session",
+				where: [{ field: "id", value: ordinary.id }],
+			});
+		expect(ordinaryStored?.impersonatedBy).toBeNull();
+		injectOrdinaryActor = false;
+		tamperSuccessor = true;
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const wrongActorContext = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "impersonation",
+						subjectId: target.id,
+						evidence: [
+							{ kind: "primary", primaryMethod: "admin_impersonation" },
+						],
+						sourceSessionToken: source.token,
+						targetOrganizationId: null,
+					},
+				);
+				await expect(
+					runtime.context.internalAdapter.createSession(
+						target.id,
+						false,
+						{ impersonatedBy: "other-actor" },
+						true,
+						wrongActorContext,
+					),
+				).rejects.toMatchObject({ reason: "context_invalid" });
+			}),
+		).resolves.toBeUndefined();
+		const issued = await runWithTransaction(runtime.context.adapter, async () => {
+			const context = await captureInternalSessionIssuanceContext(
+				runtime.context.internalAdapter,
+				{
+					purpose: "impersonation",
+					subjectId: target.id,
+					evidence: [
+						{ kind: "primary", primaryMethod: "admin_impersonation" },
+					],
+					sourceSessionToken: source.token,
+					targetOrganizationId: null,
+				},
+			);
+			return runtime.context.internalAdapter.createSession(
+				target.id,
+				false,
+				{ impersonatedBy: runtime.user.id },
+				true,
+				context,
+			);
+		});
+		const stored = await runtime.context.adapter.findOne<Record<string, unknown>>({
+			model: "session",
+			where: [{ field: "id", value: issued.id }],
+		});
+		expect(stored).toMatchObject({
+			impersonatedBy: runtime.user.id,
+			activeOrganizationId: null,
+			activeTeamId: null,
+		});
+		expect(new Date(stored!.expiresAt as Date).getTime()).toBe(
+			sourceExpiry.getTime(),
+		);
+	});
+
+	it("rolls impersonation issuance back when a hook changes the live source policy", async () => {
+		let sourceSubjectId: string | null = null;
+		let sourceRevision = "7";
+		let driftSourcePolicy = false;
+		const runtime = await setupManagedRuntime({
+			reader: (input) =>
+				policyResult(input, {
+					revision:
+						input.subjectId === sourceSubjectId ? sourceRevision : "7",
+				}),
+			options: {
+				session: {
+					additionalFields: {
+						impersonatedBy: { type: "string", required: false },
+					},
+				},
+				databaseHooks: {
+					session: {
+						create: {
+							before: async (data) => {
+								if (driftSourcePolicy) sourceRevision = "8";
+								return { data };
+							},
+						},
+					},
+				},
+			},
+		});
+		sourceSubjectId = runtime.user.id;
+		const target = await runtime.context.internalAdapter.createUser({
+			email: "impersonation-policy-drift@example.com",
+			name: "Impersonation Policy Drift",
+		});
+		const source = await issuePasswordSession(runtime);
+		driftSourcePolicy = true;
+		await expect(
+			runWithTransaction(runtime.context.adapter, async () => {
+				const context = await captureInternalSessionIssuanceContext(
+					runtime.context.internalAdapter,
+					{
+						purpose: "impersonation",
+						subjectId: target.id,
+						evidence: [
+							{ kind: "primary", primaryMethod: "admin_impersonation" },
+						],
+						sourceSessionToken: source.token,
+						targetOrganizationId: null,
+					},
+				);
+				return runtime.context.internalAdapter.createSession(
+					target.id,
+					false,
+					{ impersonatedBy: runtime.user.id },
+					true,
+					context,
+				);
+			}),
+		).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+		expect(
+			await runtime.context.adapter.findOne({
+				model: "session",
+				where: [{ field: "id", value: source.id }],
+			}),
+		).not.toBeNull();
+		expect(await runtime.context.adapter.count({ model: "session" })).toBe(1);
 	});
 });
 
