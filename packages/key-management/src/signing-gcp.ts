@@ -238,7 +238,7 @@ export function createGcpKmsSigningProvider(
 				if (
 					!(signature instanceof Uint8Array) ||
 					signature.length === 0 ||
-					(result.name !== undefined && result.name !== currentKeyReference) ||
+					result.name !== currentKeyReference ||
 					result.verifiedDigestCrc32c !== true ||
 					!crc32cMatches(result.signatureCrc32c, signature)
 				) {
