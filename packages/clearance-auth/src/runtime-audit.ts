@@ -1,5 +1,9 @@
-import { randomUUID } from "node:crypto";
 import type pg from "pg";
+import {
+	appendRuntimeAuditInTransaction,
+	createRuntimeAuditTable,
+	type RuntimeAuditTable,
+} from "@clearance/delivery";
 import type {
 	InternalRuntimeAuditBinding,
 	InternalRuntimeAuditDraft,
@@ -10,13 +14,13 @@ import {
 } from "../../runtime/src/internal/runtime-audit.js";
 import type { ClearanceTransactionQuery } from "./public-types/index.js";
 
-const MIGRATION_ID = "runtime-audit-outbox-v1";
+const MIGRATION_ID = "runtime-audit-outbox-v2";
 const DEFAULT_TABLE = "clearance_runtime_audit_events";
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 const MAX_IDENTIFIER_LENGTH = 63;
 const SENSITIVE_METADATA_KEY =
 	/(?:authorization|cookie|credential|password|secret|token|bearer|jwt|api[-_]?key|private[-_]?key)/i;
-const SENSITIVE_METADATA_VALUE = /(?:bearer\s+|clr(?:_|-)[a-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.)/i;
+const SENSITIVE_METADATA_VALUE = /(?:bearer\s+|clr(?:_|-)[a-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.|(?:https?|wss?):\/\/|\b[^\s@]+@[^\s@]+\.[^\s@]+\b)/i;
 
 type RuntimeAuditScope = Readonly<{
 	projectId: string;
@@ -50,6 +54,7 @@ export class RuntimeAuditSchemaError extends Error {
 
 export type RuntimeAuditOutbox = Readonly<{
 	readonly binding: InternalRuntimeAuditBinding;
+	readonly auditTable: RuntimeAuditTable;
 	planMigration(): Promise<RuntimeAuditOutboxMigrationPlan>;
 	applyMigration(transaction?: Queryable): Promise<void>;
 }>;
@@ -106,6 +111,8 @@ function tableNames(input: RuntimeAuditOptions): Readonly<{
 	truncateTrigger: string;
 	scopeTimeIndex: string;
 	scopeActionIndex: string;
+	scopeCreatedIdIndex: string;
+	scopeActionCreatedIdIndex: string;
 }> {
 	const schema = assertIdentifier(input.schema, "schema");
 	const prefix = assertIdentifier(input.prefix, "prefix", 30);
@@ -131,6 +138,8 @@ function tableNames(input: RuntimeAuditOptions): Readonly<{
 		truncateTrigger: name("append_only_truncate_v1"),
 		scopeTimeIndex: name("scope_time_v1"),
 		scopeActionIndex: name("scope_action_v1"),
+		scopeCreatedIdIndex: name("scope_created_id_v2"),
+		scopeActionCreatedIdIndex: name("scope_action_created_id_v2"),
 	});
 }
 
@@ -175,6 +184,8 @@ function migrationSql(names: ReturnType<typeof tableNames>): string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(names.scopeTimeIndex)} ON ${names.qualifiedTable} (project_id, environment_id, created_at DESC, sequence DESC)`,
 		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(names.scopeActionIndex)} ON ${names.qualifiedTable} (project_id, environment_id, action, created_at DESC, sequence DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(names.scopeCreatedIdIndex)} ON ${names.qualifiedTable} (project_id, environment_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(names.scopeActionCreatedIdIndex)} ON ${names.qualifiedTable} (project_id, environment_id, action, created_at DESC, id DESC)`,
 		`CREATE OR REPLACE FUNCTION ${qualifiedFunction(names.updateFunction)}()
 		RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN RAISE EXCEPTION 'runtime audit events are append-only' USING ERRCODE = 'CLR01'; END $$`,
@@ -275,24 +286,34 @@ async function setupReady(target: Queryable, names: ReturnType<typeof tableNames
 				WHERE c.relname=$9 AND i.indisvalid AND i.indisready AND NOT i.indisunique AND i.indnkeyatts=5 AND i.indnatts=5
 					AND i.indkey::text='4 5 8 15 1' AND i.indoption::text='0 0 0 3 3' AND i.indpred IS NULL
 			)
+			AND EXISTS (
+				SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN target ON target.oid=i.indrelid
+				WHERE c.relname=$10 AND i.indisvalid AND i.indisready AND NOT i.indisunique AND i.indnkeyatts=4 AND i.indnatts=4
+					AND i.indkey::text='4 5 15 2' AND i.indoption::text='0 0 3 3' AND i.indpred IS NULL
+			)
+			AND EXISTS (
+				SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN target ON target.oid=i.indrelid
+				WHERE c.relname=$11 AND i.indisvalid AND i.indisready AND NOT i.indisunique AND i.indnkeyatts=5 AND i.indnatts=5
+					AND i.indkey::text='4 5 8 15 2' AND i.indoption::text='0 0 0 3 3' AND i.indpred IS NULL
+			)
 			AND NOT EXISTS (
 				SELECT 1 FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
-				WHERE NOT t.tgisinternal AND t.tgname IN ($10,$11,$12)
-					AND NOT ((t.tgname=$10 AND t.tgtype=19 AND t.tgenabled='O')
-						OR (t.tgname=$11 AND t.tgtype=11 AND t.tgenabled='O')
-						OR (t.tgname=$12 AND t.tgtype=34 AND t.tgenabled='O'))
+				WHERE NOT t.tgisinternal AND t.tgname IN ($12,$13,$14)
+					AND NOT ((t.tgname=$12 AND t.tgtype=19 AND t.tgenabled='O')
+						OR (t.tgname=$13 AND t.tgtype=11 AND t.tgenabled='O')
+						OR (t.tgname=$14 AND t.tgtype=34 AND t.tgenabled='O'))
 			)
 			AND (SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
 				WHERE NOT t.tgisinternal) = 3
 			AND (SELECT count(*) FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
-				WHERE NOT t.tgisinternal AND t.tgname IN ($10,$11,$12) AND octet_length(t.tgargs)=0) = 3
+				WHERE NOT t.tgisinternal AND t.tgname IN ($12,$13,$14) AND octet_length(t.tgargs)=0) = 3
 			AND NOT EXISTS (
 				SELECT 1 FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace JOIN target ON target.oid=t.tgrelid
-				WHERE NOT t.tgisinternal AND t.tgname IN ($10,$11,$12)
-					AND NOT (n.nspname=$1 AND ((t.tgname=$10 AND p.proname=$13) OR (t.tgname=$11 AND p.proname=$14) OR (t.tgname=$12 AND p.proname=$15)))
+				WHERE NOT t.tgisinternal AND t.tgname IN ($12,$13,$14)
+					AND NOT (n.nspname=$1 AND ((t.tgname=$12 AND p.proname=$15) OR (t.tgname=$13 AND p.proname=$16) OR (t.tgname=$14 AND p.proname=$17)))
 			)
 			AND (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-				WHERE n.nspname=$1 AND p.proname IN ($13,$14,$15) AND p.pronargs=0
+				WHERE n.nspname=$1 AND p.proname IN ($15,$16,$17) AND p.pronargs=0
 					AND p.prorettype='trigger'::regtype
 					AND p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql')
 					AND NOT p.prosecdef
@@ -302,6 +323,7 @@ async function setupReady(target: Queryable, names: ReturnType<typeof tableNames
 			schema, names.table, expectedColumns,
 			nameFor(names, "sequence_pkey"), nameFor(names, "id_key"), nameFor(names, "outcome_ck"), nameFor(names, "source_ck"),
 			names.scopeTimeIndex, names.scopeActionIndex,
+			names.scopeCreatedIdIndex, names.scopeActionCreatedIdIndex,
 			names.updateTrigger, names.deleteTrigger, names.truncateTrigger,
 			names.updateFunction, names.deleteFunction, names.truncateFunction,
 		],
@@ -345,9 +367,12 @@ async function baseStructureReady(
 		AND EXISTS (SELECT 1 FROM pg_constraint con JOIN target ON target.oid=con.conrelid WHERE con.conname=$4 AND con.contype='p' AND con.conkey=ARRAY[1]::smallint[] AND NOT con.condeferrable AND con.convalidated)
 		AND EXISTS (SELECT 1 FROM pg_constraint con JOIN target ON target.oid=con.conrelid WHERE con.conname=$5 AND con.contype='u' AND con.conkey=ARRAY[2]::smallint[] AND NOT con.condeferrable AND con.convalidated)
 		AND EXISTS (SELECT 1 FROM pg_constraint con JOIN target ON target.oid=con.conrelid WHERE con.conname=$6 AND con.contype='c' AND con.convalidated AND regexp_replace(lower(pg_get_constraintdef(con.oid,true)), '\\s+', '', 'g')='check(outcome=any(array[''success''::text,''failure''::text,''pending''::text]))')
-		AND EXISTS (SELECT 1 FROM pg_constraint con JOIN target ON target.oid=con.conrelid WHERE con.conname=$7 AND con.contype='c' AND con.convalidated AND regexp_replace(lower(pg_get_constraintdef(con.oid,true)), '\\s+', '', 'g')='check(source=any(array[''system''::text,''sso''::text,''scim''::text]))') AS ready`, [
+		AND EXISTS (SELECT 1 FROM pg_constraint con JOIN target ON target.oid=con.conrelid WHERE con.conname=$7 AND con.contype='c' AND con.convalidated AND regexp_replace(lower(pg_get_constraintdef(con.oid,true)), '\\s+', '', 'g')='check(source=any(array[''system''::text,''sso''::text,''scim''::text]))')
+		AND NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN target ON target.oid=t.tgrelid
+			WHERE NOT t.tgisinternal AND t.tgname NOT IN ($8,$9,$10)) AS ready`, [
 		schema, names.table, columns,
 		nameFor(names, "sequence_pkey"), nameFor(names, "id_key"), nameFor(names, "outcome_ck"), nameFor(names, "source_ck"),
+		names.updateTrigger, names.deleteTrigger, names.truncateTrigger,
 	]);
 	return result.rows[0]?.ready === true;
 }
@@ -359,6 +384,8 @@ function repairSql(names: ReturnType<typeof tableNames>): string {
 	return [
 		`DROP INDEX IF EXISTS ${qualifiedIndex(names.scopeTimeIndex)}`,
 		`DROP INDEX IF EXISTS ${qualifiedIndex(names.scopeActionIndex)}`,
+		`DROP INDEX IF EXISTS ${qualifiedIndex(names.scopeCreatedIdIndex)}`,
+		`DROP INDEX IF EXISTS ${qualifiedIndex(names.scopeActionCreatedIdIndex)}`,
 		migrationSql(names),
 	].map((statement) => `${statement};`).join("\n");
 }
@@ -372,6 +399,10 @@ export function createRuntimeAuditOutbox(
 		environmentId: assertScopePart(input.environmentId, "environmentId"),
 	});
 	const names = tableNames(input);
+	const auditTable = createRuntimeAuditTable({
+		...(names.schema === undefined ? {} : { schema: names.schema }),
+		table: names.table,
+	});
 	const sql = migrationSql(names);
 	const repair = repairSql(names);
 	const rawBinding: InternalRuntimeAuditBinding = Object.freeze({
@@ -390,29 +421,22 @@ export function createRuntimeAuditOutbox(
 					userAgent: draft.request.userAgent,
 				},
 			}) as Record<string, unknown>;
-			await transaction.rawTransactionQuery(
-				`INSERT INTO ${names.qualifiedTable} (
-					id, correlation_id, project_id, environment_id, organization_id,
-					actor, action, subject_type, subject_id, outcome, source, message,
-					metadata, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)`,
-				[
-					randomUUID(),
-					draft.request.correlationId,
-					identity.projectId,
-					identity.environmentId,
-					draft.organizationId,
-					draft.actor,
-					draft.action,
-					draft.subjectType,
-					draft.subjectId,
-					draft.outcome,
-					draft.source,
-					draft.message,
-					JSON.stringify(metadata),
-					new Date(),
-				],
-			);
+			await appendRuntimeAuditInTransaction({
+				rawTransactionQuery: transaction.rawTransactionQuery!,
+			}, auditTable, {
+				correlationId: draft.request.correlationId,
+				projectId: identity.projectId,
+				environmentId: identity.environmentId,
+				organizationId: draft.organizationId,
+				actor: draft.actor,
+				action: draft.action,
+				subjectType: draft.subjectType,
+				subjectId: draft.subjectId,
+				outcome: draft.outcome,
+				source: draft.source,
+				message: draft.message,
+				metadata,
+			});
 		},
 	});
 	const bindingTarget = {};
@@ -464,21 +488,23 @@ export function createRuntimeAuditOutbox(
 	};
 	return Object.freeze({
 		binding,
+		auditTable,
 		applyMigration,
 		async planMigration() {
 			const state = await schemaState(pool, names);
-			const invalid = state === "invalid";
+			const baseReady = state === "invalid" && await baseStructureReady(pool, names);
+			const incompatible = state === "invalid" && !baseReady;
 			const pending = state === "absent";
 			return {
 				pendingTables: Number(pending),
 				pendingFields: pending ? 15 : 0,
 				pendingSecurityMigrations: state === "ready" ? [] : [MIGRATION_ID],
 				compileSql: async () => {
-					if (invalid) throw new RuntimeAuditSchemaError();
-					return pending ? sql : "";
+					if (incompatible) throw new RuntimeAuditSchemaError();
+					return pending ? sql : state === "ready" ? "" : repair;
 				},
 				apply: async () => {
-					if (invalid) throw new RuntimeAuditSchemaError();
+					if (incompatible) throw new RuntimeAuditSchemaError();
 					await applyMigration();
 				},
 			};
