@@ -10,6 +10,7 @@ import {
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
+	KEY_MANAGEMENT_OPERATIONS,
 	MANAGEMENT_OPERATIONS,
 	MEMBER_OPERATIONS,
 	MIGRATION_OPERATIONS,
@@ -57,7 +58,7 @@ describe("management operation contracts", () => {
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(110);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(113);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -89,6 +90,38 @@ describe("management operation contracts", () => {
 				confirmation: "server-required",
 			});
 		}
+	});
+
+	it("defines the complete key-management transport and safety contract", () => {
+		expect(Object.values(KEY_MANAGEMENT_OPERATIONS)).toHaveLength(3);
+		expect(KEY_MANAGEMENT_OPERATIONS.status).toMatchObject({
+			id: "key_management.status",
+			cliPath: "key-management status",
+			http: { method: "GET", path: "/v1/key-management/status" },
+			mutation: false,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(KEY_MANAGEMENT_OPERATIONS.plan).toMatchObject({
+			id: "key_management.plan",
+			cliPath: "key-management plan",
+			http: { method: "POST", path: "/v1/key-management/plan" },
+			mutation: false,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(KEY_MANAGEMENT_OPERATIONS.apply).toMatchObject({
+			id: "key_management.apply",
+			cliPath: "key-management apply",
+			http: { method: "POST", path: "/v1/key-management/apply" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "server-required",
+		});
+		expectTypeOf<OperationOutput<"key_management.apply">>().toEqualTypeOf<
+			| { dryRun: true; result: import("../services/key-management.js").KeyManagementPlanResult }
+			| { dryRun: false; result: import("../services/key-management.js").KeyManagementApplyResult }
+		>();
 	});
 
 	it("defines the complete webhook endpoint transport and safety contract", () => {
