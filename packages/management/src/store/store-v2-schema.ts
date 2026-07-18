@@ -14,6 +14,8 @@ export const STORE_V2_PRINCIPAL_REVISION_META_KEY =
 	"store_v2_principal_revision";
 export const STORE_V2_PRINCIPAL_STATE_META_KEY =
 	"store_v2_principal_state";
+export const STORE_V2_TOPOLOGY_AUTHORITY_VERSION_META_KEY =
+	"store_v2_topology_authority_version";
 
 /** Strict parser shared by every store-v2 revision/version metadata read. */
 export function parseStoreV2MetadataInteger(value: unknown): number | null {
@@ -161,6 +163,16 @@ export function storeV2PrincipalProjectionGuardStatements(
 					ERRCODE = '23514',
 					MESSAGE = 'STORE_V2_PRINCIPAL_AUTHORITY_ROLLBACK_CAPABILITY_REQUIRED';
 			END IF;
+			IF OLD.key = '${STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY}'
+				AND (OLD.value ? 'projects' OR OLD.value ? 'environments' OR OLD.value ? 'organizations')
+				AND NOT (NEW.value ? 'projects' AND NEW.value ? 'environments' AND NEW.value ? 'organizations')
+				AND current_setting('clearance.topology_authority_rollback', true)
+					IS DISTINCT FROM '1'
+			THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '23514',
+					MESSAGE = 'STORE_V2_TOPOLOGY_AUTHORITY_ROLLBACK_CAPABILITY_REQUIRED';
+			END IF;
 			RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql`,
@@ -188,6 +200,7 @@ export function storeV2SchemaStatements(
 ): string[] {
 	const projectNameIndex = derivedIdentifier(`${tables.projects}_name_unique`);
 	const projectSlugIndex = derivedIdentifier(`${tables.projects}_slug_unique`);
+	const projectCursorIndex = derivedIdentifier(`${tables.projects}_cursor`);
 	const environmentCursorIndex = derivedIdentifier(
 		`${tables.environments}_cursor`,
 	);
@@ -217,23 +230,35 @@ export function storeV2SchemaStatements(
 			id text PRIMARY KEY,
 			name text NOT NULL,
 			slug text NOT NULL,
-			created_at timestamptz NOT NULL,
-			updated_at timestamptz NOT NULL
+			created_at timestamptz(3) NOT NULL,
+			updated_at timestamptz(3) NOT NULL
 		)`,
+		`ALTER TABLE ${tables.projects}
+			ALTER COLUMN created_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', created_at),
+			ALTER COLUMN updated_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', updated_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${projectNameIndex}
 			ON ${tables.projects} (lower(name))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${projectSlugIndex}
 			ON ${tables.projects} (lower(slug))`,
+		`CREATE INDEX IF NOT EXISTS ${projectCursorIndex}
+			ON ${tables.projects} (created_at ASC, id ASC)`,
 		`CREATE TABLE IF NOT EXISTS ${tables.environments} (
 			id text PRIMARY KEY,
 			project_id text NOT NULL REFERENCES ${tables.projects}(id) ON DELETE RESTRICT,
 			name text NOT NULL,
 			slug text NOT NULL,
 			kind text NOT NULL CHECK (kind IN ('development', 'preview', 'production')),
-			created_at timestamptz NOT NULL,
-			updated_at timestamptz NOT NULL,
+			created_at timestamptz(3) NOT NULL,
+			updated_at timestamptz(3) NOT NULL,
 			UNIQUE (project_id, id)
 		)`,
+		`ALTER TABLE ${tables.environments}
+			ALTER COLUMN created_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', created_at),
+			ALTER COLUMN updated_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', updated_at)`,
 		`CREATE INDEX IF NOT EXISTS ${environmentCursorIndex}
 			ON ${tables.environments} (project_id, created_at DESC, id DESC)`,
 		`CREATE TABLE IF NOT EXISTS ${tables.principals} (
@@ -271,11 +296,16 @@ export function storeV2SchemaStatements(
 			slug text NOT NULL,
 			status text NOT NULL CHECK (status IN ('active', 'archived')),
 			external_id text,
-			created_at timestamptz NOT NULL,
-			updated_at timestamptz NOT NULL,
+			created_at timestamptz(3) NOT NULL,
+			updated_at timestamptz(3) NOT NULL,
 			FOREIGN KEY (project_id, environment_id)
 				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
 		)`,
+		`ALTER TABLE ${tables.organizations}
+			ALTER COLUMN created_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', created_at),
+			ALTER COLUMN updated_at TYPE timestamptz(3)
+				USING date_trunc('milliseconds', updated_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ${organizationSlugIndex}
 			ON ${tables.organizations} (project_id, environment_id, slug)
 			WHERE status <> 'archived'`,
