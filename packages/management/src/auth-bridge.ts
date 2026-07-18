@@ -1529,7 +1529,7 @@ type NormalizedAuthorizationFacade = Readonly<{
 	}>;
 	replaceSubjectRoles(input: {
 		organizationId: string;
-		subject: { kind: "principal"; id: string };
+		subject: { kind: "principal" | "service_account"; id: string };
 		roleIds: readonly string[];
 		expectedRevision?: string;
 		transaction?: AuthorizationTransaction;
@@ -1540,13 +1540,85 @@ type NormalizedAuthorizationFacade = Readonly<{
 	}): Promise<readonly NormalizedAuthorizationRole[]>;
 	listSubjectAssignments(input: {
 		organizationId: string;
-		subject?: { kind: "principal"; id: string };
+		subject?: { kind: "principal" | "service_account"; id: string };
 		transaction?: AuthorizationTransaction;
 	}): Promise<readonly {
 		organizationId: string;
 		subject: { kind: "principal" | "service_account"; id: string };
 		roleId: string;
 	}[]>;
+	readEffective(input: {
+		organizationId: string;
+		subject: { kind: "principal" | "service_account"; id: string };
+		transaction?: AuthorizationTransaction;
+	}): Promise<{
+		projectId: string;
+		environmentId: string;
+		organizationId: string;
+		subject: { kind: "principal" | "service_account"; id: string };
+		roleIds: readonly string[];
+		actions: readonly string[];
+		revision: string;
+	}>;
+	createServiceAccount(input: {
+		organizationId: string;
+		serviceAccountId: string;
+		name: string;
+		roleIds: readonly string[];
+		transaction?: AuthorizationTransaction;
+	}): Promise<{ serviceAccount: NormalizedAuthorizationServiceAccount; previousRevision: string; revision: string }>;
+	listServiceAccounts(input: {
+		organizationId: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<readonly NormalizedAuthorizationServiceAccount[]>;
+	setServiceAccountStatus(input: {
+		organizationId: string;
+		serviceAccountId: string;
+		status: "active" | "disabled";
+		transaction?: AuthorizationTransaction;
+	}): Promise<{ serviceAccount: NormalizedAuthorizationServiceAccount; previousRevision: string; revision: string }>;
+	createServiceAccountCredential(input: {
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId?: string;
+		expiresAt?: Date;
+		transaction?: AuthorizationTransaction;
+	}): Promise<NormalizedAuthorizationCredentialMutation>;
+	rotateServiceAccountCredential(input: {
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		expiresAt?: Date;
+		transaction?: AuthorizationTransaction;
+	}): Promise<NormalizedAuthorizationCredentialMutation>;
+	revokeServiceAccountCredential(input: {
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		transaction?: AuthorizationTransaction;
+	}): Promise<{ organizationId: string; previousRevision: string; revision: string }>;
+}>;
+
+type NormalizedAuthorizationServiceAccount = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}>;
+
+type NormalizedAuthorizationCredentialMutation = Readonly<{
+	credential: Readonly<{
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		credentialPrefix: string;
+		credentialFingerprint: string;
+		expiresAt: Date | null;
+		version: number;
+	}>;
+	secret: string;
+	previousRevision: string;
+	revision: string;
 }>;
 
 function authorizationTransaction(query: CoordinatedQuery): AuthorizationTransaction {
@@ -1586,6 +1658,39 @@ function requireAuthorizationFacade(
 		});
 	}
 	return authorization;
+}
+
+async function requireAuthorizationSubjectInOrganization(
+	data: DataStoreSnapshot,
+	authorization: NormalizedAuthorizationFacade,
+	input: {
+		organizationId: string;
+		subject: AuthorizationSubjectView;
+		stage: string;
+		transaction?: AuthorizationTransaction;
+	},
+): Promise<void> {
+	if (input.subject.kind === "principal") {
+		const membership = data.memberships.find(
+			(candidate) =>
+				candidate.organizationId === input.organizationId &&
+				candidate.principalId === input.subject.id &&
+				candidate.status === "active",
+		);
+		if (membership) return;
+	} else {
+		const accounts = await authorization.listServiceAccounts({
+			organizationId: input.organizationId,
+			...(input.transaction ? { transaction: input.transaction } : {}),
+		});
+		if (accounts.some((account) => account.serviceAccountId === input.subject.id)) return;
+	}
+	throw new ClearanceError({
+		code: "AUTHORIZATION_SUBJECT_NOT_FOUND",
+		message: "Authorization subject was not found in this organization",
+		stage: input.stage,
+		status: 404,
+	});
 }
 
 function customAuthorityRoleFromDraft(
@@ -3254,14 +3359,10 @@ export async function reconcileAuthorizationOrganizationInAuth(
 		scope?: ResourceScope;
 		actor?: string;
 		auditSource?: MembershipActorSource;
+		dryRun?: boolean;
+		confirm?: boolean;
 	},
-): Promise<{
-	organizationId: string;
-	initialized: boolean;
-	rolesChanged: number;
-	assignmentsChanged: number;
-	revision: string;
-}> {
+): Promise<AuthorizationReconcileLiveResult | AuthorizationReconcilePreview> {
 	await ensureAuthMigrated();
 	const scope = input.scope ?? resolveOperatorScope(store);
 	const stage = "authorization.reconcile";
@@ -3270,7 +3371,8 @@ export async function reconcileAuthorizationOrganizationInAuth(
 		stage,
 		"AUTHORIZATION_RECONCILE_BACKEND",
 	);
-	return mutateCoordinated(async ({ data, query }) => {
+	const apply = input.dryRun === false && input.confirm === true;
+	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
 		const org = findOrgInScope(data, input.organizationId, scope, stage);
 		const authorization = requireAuthorizationFacade(scope, stage);
 		const transaction = authorizationTransaction(query);
@@ -3281,7 +3383,9 @@ export async function reconcileAuthorizationOrganizationInAuth(
 		const memberships = data.memberships
 			.filter((membership) => membership.organizationId === org.id && membership.status === "active")
 			.slice()
-			.sort((left, right) => left.principalId.localeCompare(right.principalId));
+			.sort((left, right) =>
+				left.principalId < right.principalId ? -1 : left.principalId > right.principalId ? 1 : 0,
+			);
 		const membershipRoles = memberships.map((membership) => ({
 			membership,
 			resolved: resolveAssignableRole({ snapshot: data } as ManagementStore, membership.role, {
@@ -3295,7 +3399,9 @@ export async function reconcileAuthorizationOrganizationInAuth(
 		);
 		let rolesChanged = 0;
 		let revision = initialized.revision;
-		for (const resolved of [...rolesById.values()].sort((left, right) => left.roleId.localeCompare(right.roleId))) {
+		for (const resolved of [...rolesById.values()].sort((left, right) =>
+			left.roleId < right.roleId ? -1 : left.roleId > right.roleId ? 1 : 0,
+		)) {
 			const custom = customAuthorityRoleFromDraft(data, resolved, scope);
 			if (!custom) continue;
 			const result = await authorization.upsertRole({ ...custom, transaction });
@@ -3364,7 +3470,568 @@ export async function reconcileAuthorizationOrganizationInAuth(
 			assignmentsChanged,
 			revision,
 		};
+	};
+	if (apply) return mutateCoordinated(execute);
+	const preview = await previewAuthorizationMutation(mutateCoordinated, execute);
+	return {
+		preview: true,
+		organizationId: preview.organizationId,
+		initialized: preview.initialized,
+		rolesChanged: preview.rolesChanged,
+		assignmentsChanged: preview.assignmentsChanged,
+	};
+}
+
+export type AuthorizationSubjectView = Readonly<{
+	kind: "principal" | "service_account";
+	id: string;
+}>;
+
+export type ManagementAuthorizationEffectiveView = Readonly<{
+	organizationId: string;
+	subject: AuthorizationSubjectView;
+	roleIds: readonly string[];
+	actions: readonly string[];
+	revision: string;
+}>;
+
+export type ManagementAuthorizationAssignmentView = Readonly<{
+	organizationId: string;
+	subject: AuthorizationSubjectView;
+	roleId: string;
+}>;
+
+export type AuthorizationServiceAccountView = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}>;
+
+export type AuthorizationServiceAccountInspection = Readonly<{
+	serviceAccount: AuthorizationServiceAccountView;
+	assignments: readonly ManagementAuthorizationAssignmentView[];
+}>;
+
+export type AuthorizationCredentialView = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	credentialPrefix: string;
+	credentialFingerprint: string;
+	expiresAt: string | null;
+	version: number;
+}>;
+
+export type AuthorizationAssignmentReplaceLiveResult = Readonly<{
+	assignment: Readonly<{
+		organizationId: string;
+		subject: AuthorizationSubjectView;
+		roleIds: readonly string[];
+	}>;
+	changed: boolean;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationAssignmentReplacePreview = Readonly<{
+	preview: true;
+	assignment: Readonly<{
+		organizationId: string;
+		subject: AuthorizationSubjectView;
+		roleIds: readonly string[];
+	}>;
+	wouldChange: boolean;
+	currentRevision: string;
+}>;
+
+export type AuthorizationReconcileLiveResult = Readonly<{
+	organizationId: string;
+	initialized: boolean;
+	rolesChanged: number;
+	assignmentsChanged: number;
+	revision: string;
+}>;
+
+export type AuthorizationReconcilePreview = Readonly<{
+	preview: true;
+	organizationId: string;
+	initialized: boolean;
+	rolesChanged: number;
+	assignmentsChanged: number;
+}>;
+
+export type AuthorizationServiceAccountCreateLiveResult = Readonly<{
+	serviceAccount: AuthorizationServiceAccountView;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationServiceAccountCreatePreview = Readonly<{
+	preview: true;
+	serviceAccount: Pick<AuthorizationServiceAccountView, "organizationId" | "name" | "status">;
+	roleIds: readonly string[];
+}>;
+
+export type AuthorizationServiceAccountStatusLiveResult = Readonly<{
+	serviceAccount: AuthorizationServiceAccountView;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationServiceAccountStatusPreview = Readonly<{
+	preview: true;
+	serviceAccount: AuthorizationServiceAccountView;
+	wouldChange: boolean;
+	currentRevision: string;
+}>;
+
+export type AuthorizationCredentialCreatePreview = Readonly<{
+	preview: true;
+	organizationId: string;
+	serviceAccountId: string;
+	expiresAt: string | null;
+	secretGenerated: false;
+}>;
+
+export type AuthorizationCredentialRotatePreview = AuthorizationCredentialCreatePreview & Readonly<{
+	credentialId: string;
+}>;
+
+export type AuthorizationCredentialRevokePreview = Readonly<{
+	preview: true;
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	wouldChange: boolean;
+}>;
+
+export type AuthorizationCredentialCreateLiveResult = Readonly<{
+	credential: AuthorizationCredentialView;
+	secret: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+export type AuthorizationCredentialRotateLiveResult = AuthorizationCredentialCreateLiveResult;
+
+export type AuthorizationCredentialRevokeLiveResult = Readonly<{
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	previousRevision: string;
+	revision: string;
+}>;
+
+type AuthorizationCredentialOperation = "create" | "rotate" | "revoke";
+type AuthorizationCredentialOperationResult<Operation extends AuthorizationCredentialOperation> =
+	Operation extends "create"
+		? AuthorizationCredentialCreateLiveResult | AuthorizationCredentialCreatePreview
+		: Operation extends "rotate"
+			? AuthorizationCredentialRotateLiveResult | AuthorizationCredentialRotatePreview
+			: AuthorizationCredentialRevokeLiveResult | AuthorizationCredentialRevokePreview;
+
+type AuthorizationMutationOptions = Readonly<{
+	dryRun?: boolean;
+	actor?: string;
+	source?: "cli" | "console" | "api";
+	scope?: ResourceScope;
+}>;
+
+type AuthorizationPreview = Readonly<{ preview: true }>;
+
+class AuthorizationPreviewRollback<T> extends Error {
+	constructor(readonly result: T) {
+		super("authorization preview rollback");
+	}
+}
+
+async function previewAuthorizationMutation<T>(
+	mutateCoordinated: ReturnType<typeof requireCoordinatedStore>["mutateCoordinated"],
+	execute: (context: InternalManagementCoordinatedMutationContext) => Promise<T>,
+): Promise<T & AuthorizationPreview> {
+	try {
+		await mutateCoordinated(async (context) => {
+			throw new AuthorizationPreviewRollback(await execute(context));
+		});
+	} catch (cause) {
+		if (cause instanceof AuthorizationPreviewRollback) {
+			return { ...cause.result, preview: true };
+		}
+		throw cause;
+	}
+	throw new Error("Authorization preview did not roll back");
+}
+
+function authorizationInputId(value: unknown, label: string, stage: string): string {
+	if (typeof value !== "string" || !value.trim()) {
+		throw new ClearanceError({
+			code: "AUTHORIZATION_INPUT_INVALID",
+			message: `${label} is required`,
+			stage,
+			status: 400,
+		});
+	}
+	const normalized = value.trim();
+	if (normalized.length > 256 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+		throw new ClearanceError({
+			code: "AUTHORIZATION_INPUT_INVALID",
+			message: `${label} is invalid`,
+			stage,
+			status: 400,
+		});
+	}
+	return normalized;
+}
+
+function authorizationSubject(
+	value: unknown,
+	stage: string,
+): AuthorizationSubjectView {
+	if (!value || typeof value !== "object") {
+		throw new ClearanceError({ code: "AUTHORIZATION_SUBJECT_INVALID", message: "subject is required", stage, status: 400 });
+	}
+	const subject = value as { kind?: unknown; id?: unknown };
+	if (subject.kind !== "principal" && subject.kind !== "service_account") {
+		throw new ClearanceError({ code: "AUTHORIZATION_SUBJECT_INVALID", message: "subject kind is invalid", stage, status: 400 });
+	}
+	return { kind: subject.kind, id: authorizationInputId(subject.id, "subject id", stage) };
+}
+
+function authorizationRoleIds(value: unknown, stage: string): readonly string[] {
+	if (!Array.isArray(value)) {
+		throw new ClearanceError({ code: "AUTHORIZATION_ROLE_IDS_INVALID", message: "roleIds must be an array", stage, status: 400 });
+	}
+	return [...new Set(value.map((roleId) => authorizationInputId(roleId, "roleId", stage)))].sort();
+}
+
+function authorizationName(value: unknown, stage: string): string {
+	const name = authorizationInputId(value, "name", stage);
+	if (name.length > 256) {
+		throw new ClearanceError({ code: "AUTHORIZATION_INPUT_INVALID", message: "name is too long", stage, status: 400 });
+	}
+	return name;
+}
+
+function authorizationExpiry(value: unknown, stage: string): Date | undefined {
+	if (value === undefined || value === null || value === "") return undefined;
+	if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(value)) {
+		throw new ClearanceError({ code: "AUTHORIZATION_EXPIRY_INVALID", message: "expiresAt must be an ISO timestamp", stage, status: 400 });
+	}
+	const expiresAt = new Date(value);
+	if (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+		throw new ClearanceError({ code: "AUTHORIZATION_EXPIRY_INVALID", message: "expiresAt must be in the future", stage, status: 400 });
+	}
+	return expiresAt;
+}
+
+function authorizationServiceAccountView(
+	account: NormalizedAuthorizationServiceAccount,
+): AuthorizationServiceAccountView {
+	return {
+		organizationId: account.organizationId,
+		serviceAccountId: account.serviceAccountId,
+		name: account.name,
+		status: account.status,
+	};
+}
+
+function authorizationCredentialView(
+	credential: NormalizedAuthorizationCredentialMutation["credential"],
+): AuthorizationCredentialView {
+	return {
+		organizationId: credential.organizationId,
+		serviceAccountId: credential.serviceAccountId,
+		credentialId: credential.credentialId,
+		credentialPrefix: credential.credentialPrefix,
+		credentialFingerprint: credential.credentialFingerprint,
+		expiresAt: credential.expiresAt?.toISOString() ?? null,
+		version: credential.version,
+	};
+}
+
+function authorizationAudit(
+	data: DataStoreSnapshot,
+	input: { action: string; subjectType: string; subjectId: string; organization: Organization; actor?: string; source?: "cli" | "console" | "api"; message: string; metadata?: Record<string, unknown> },
+): void {
+	appendAuditEvent(data, {
+		actor: input.actor ?? "operator",
+		action: input.action,
+		subjectType: input.subjectType,
+		subjectId: input.subjectId,
+		outcome: "success",
+		source: input.source ?? "cli",
+		organizationId: input.organization.id,
+		projectId: input.organization.projectId,
+		environmentId: input.organization.environmentId,
+		message: input.message,
+		...(input.metadata ? { metadata: input.metadata } : {}),
 	});
+}
+
+/** Uncached canonical effective authorization inspection. */
+export async function inspectEffectiveAuthorizationInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; subject: AuthorizationSubjectView; scope?: ResourceScope },
+): Promise<ManagementAuthorizationEffectiveView> {
+	await ensureAuthMigrated();
+	const stage = "authorization.inspect";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	const authorization = requireAuthorizationFacade(scope, stage);
+	const subject = authorizationSubject(input.subject, stage);
+	await requireAuthorizationSubjectInOrganization(store.snapshot, authorization, {
+		organizationId,
+		subject,
+		stage,
+	});
+	const effective = await authorization.readEffective({
+		organizationId,
+		subject,
+	});
+	return { organizationId: effective.organizationId, subject: effective.subject, roleIds: [...effective.roleIds], actions: [...effective.actions], revision: effective.revision };
+}
+
+/** Uncached canonical assignment listing. */
+export async function listAuthorizationAssignmentsInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; subject?: AuthorizationSubjectView; scope?: ResourceScope },
+): Promise<readonly ManagementAuthorizationAssignmentView[]> {
+	await ensureAuthMigrated();
+	const stage = "authorization.assignments.list";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	const authorization = requireAuthorizationFacade(scope, stage);
+	const subject = input.subject ? authorizationSubject(input.subject, stage) : undefined;
+	if (subject) {
+		await requireAuthorizationSubjectInOrganization(store.snapshot, authorization, {
+			organizationId,
+			subject,
+			stage,
+		});
+	}
+	const assignments = await authorization.listSubjectAssignments({
+		organizationId,
+		...(subject ? { subject } : {}),
+	});
+	return assignments.map((assignment) => ({ organizationId: assignment.organizationId, subject: assignment.subject, roleId: assignment.roleId }));
+}
+
+export async function replaceAuthorizationAssignmentsInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; subject: AuthorizationSubjectView; roleIds: readonly string[]; expectedRevision?: string; dryRun?: boolean; confirm?: boolean; actor?: string; source?: "cli" | "console" | "api"; scope?: ResourceScope },
+): Promise<AuthorizationAssignmentReplaceLiveResult | AuthorizationAssignmentReplacePreview> {
+	await ensureAuthMigrated();
+	const stage = "authorization.assignments.replace";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	const subject = authorizationSubject(input.subject, stage);
+	const roleIds = authorizationRoleIds(input.roleIds, stage);
+	const expectedRevision = input.expectedRevision === undefined ? undefined : authorizationInputId(input.expectedRevision, "expectedRevision", stage);
+	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_ASSIGNMENT_BACKEND");
+	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = findOrgInScope(data, organizationId, scope, stage);
+		const authorization = requireAuthorizationFacade(scope, stage);
+		const transaction = authorizationTransaction(query);
+		await requireAuthorizationSubjectInOrganization(data, authorization, {
+			organizationId: org.id,
+			subject,
+			stage,
+			transaction,
+		});
+		const result = await authorization.replaceSubjectRoles({ organizationId: org.id, subject, roleIds, ...(expectedRevision ? { expectedRevision } : {}), transaction });
+		if (result.changed) authorizationAudit(data, { action: "authorization.assignments.replace", subjectType: subject.kind, subjectId: subject.id, organization: org, actor: input.actor, source: input.source, message: `Replaced authorization assignments for ${subject.kind} ${subject.id}`, metadata: { roleIds: result.roleIds, previousRevision: result.previousRevision, revision: result.revision } });
+		return {
+			assignment: {
+				organizationId: org.id,
+				subject,
+				roleIds: [...result.roleIds],
+			},
+			changed: result.changed,
+			previousRevision: result.previousRevision,
+			revision: result.revision,
+		};
+	};
+	if (input.dryRun === false && input.confirm === true) return mutateCoordinated(execute);
+	const preview = await previewAuthorizationMutation(mutateCoordinated, execute);
+	return {
+		preview: true,
+		assignment: {
+			organizationId,
+			subject,
+			roleIds: [...preview.assignment.roleIds],
+		},
+		wouldChange: preview.changed,
+		currentRevision: preview.previousRevision,
+	};
+}
+
+export async function listServiceAccountsInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; scope?: ResourceScope },
+): Promise<readonly AuthorizationServiceAccountView[]> {
+	await ensureAuthMigrated();
+	const stage = "authorization.service_accounts.list";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	findOrgInScope(store.snapshot, organizationId, scope, stage);
+	return (await requireAuthorizationFacade(scope, stage).listServiceAccounts({ organizationId })).map(authorizationServiceAccountView);
+}
+
+export async function inspectServiceAccountInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; scope?: ResourceScope },
+): Promise<AuthorizationServiceAccountInspection> {
+	const stage = "authorization.service_accounts.inspect";
+	const serviceAccountId = authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
+	const accounts = await listServiceAccountsInAuth(store, { organizationId: input.organizationId, scope: input.scope });
+	const account = accounts.find((candidate) => candidate.serviceAccountId === serviceAccountId);
+	if (!account) throw new ClearanceError({ code: "AUTHORIZATION_SERVICE_ACCOUNT_NOT_FOUND", message: "Service account not found", stage, status: 404 });
+	const assignments = await listAuthorizationAssignmentsInAuth(store, { organizationId: input.organizationId, subject: { kind: "service_account", id: serviceAccountId }, scope: input.scope });
+	return { serviceAccount: account, assignments };
+}
+
+export async function createServiceAccountInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; name: string; roleIds?: readonly string[]; serviceAccountId?: string } & AuthorizationMutationOptions,
+): Promise<AuthorizationServiceAccountCreateLiveResult | AuthorizationServiceAccountCreatePreview> {
+	await ensureAuthMigrated();
+	const stage = "authorization.service_accounts.create";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	const name = authorizationName(input.name, stage);
+	const roleIds = authorizationRoleIds(input.roleIds ?? [], stage);
+	const serviceAccountId = input.serviceAccountId === undefined ? newId("svc") : authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
+	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_SERVICE_ACCOUNT_BACKEND");
+	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = findOrgInScope(data, organizationId, scope, stage);
+		const result = await requireAuthorizationFacade(scope, stage).createServiceAccount({ organizationId: org.id, serviceAccountId, name, roleIds, transaction: authorizationTransaction(query) });
+		authorizationAudit(data, { action: "authorization.service_accounts.create", subjectType: "service_account", subjectId: serviceAccountId, organization: org, actor: input.actor, source: input.source, message: `Created service account ${name}`, metadata: { serviceAccountId, roleIds, previousRevision: result.previousRevision, revision: result.revision } });
+		return { serviceAccount: authorizationServiceAccountView(result.serviceAccount), previousRevision: result.previousRevision, revision: result.revision };
+	};
+	if (input.dryRun !== true) return mutateCoordinated(execute);
+	const preview = await previewAuthorizationMutation(mutateCoordinated, execute);
+	return {
+		preview: true,
+		serviceAccount: {
+			organizationId: preview.serviceAccount.organizationId,
+			name: preview.serviceAccount.name,
+			status: preview.serviceAccount.status,
+		},
+		roleIds,
+	};
+}
+
+export async function setServiceAccountStatusInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; status: "active" | "disabled" } & AuthorizationMutationOptions,
+): Promise<AuthorizationServiceAccountStatusLiveResult | AuthorizationServiceAccountStatusPreview> {
+	await ensureAuthMigrated();
+	const stage = "authorization.service_accounts.status";
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	const serviceAccountId = authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
+	if (input.status !== "active" && input.status !== "disabled") throw new ClearanceError({ code: "AUTHORIZATION_SERVICE_ACCOUNT_STATUS_INVALID", message: "status must be active or disabled", stage, status: 400 });
+	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_SERVICE_ACCOUNT_BACKEND");
+	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = findOrgInScope(data, organizationId, scope, stage);
+		const result = await requireAuthorizationFacade(scope, stage).setServiceAccountStatus({ organizationId: org.id, serviceAccountId, status: input.status, transaction: authorizationTransaction(query) });
+		if (result.previousRevision !== result.revision) authorizationAudit(data, { action: "authorization.service_accounts.status", subjectType: "service_account", subjectId: serviceAccountId, organization: org, actor: input.actor, source: input.source, message: `Set service account ${serviceAccountId} ${input.status}`, metadata: { status: input.status, previousRevision: result.previousRevision, revision: result.revision } });
+		return { serviceAccount: authorizationServiceAccountView(result.serviceAccount), previousRevision: result.previousRevision, revision: result.revision };
+	};
+	if (input.dryRun !== true) return mutateCoordinated(execute);
+	const preview = await previewAuthorizationMutation(mutateCoordinated, execute);
+	return {
+		preview: true,
+		serviceAccount: preview.serviceAccount,
+		wouldChange: preview.previousRevision !== preview.revision,
+		currentRevision: preview.previousRevision,
+	};
+}
+
+async function mutateServiceAccountCredentialInAuth<Operation extends AuthorizationCredentialOperation>(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; credentialId?: string; expiresAt?: string; dryRun?: boolean; actor?: string; source?: "cli" | "console" | "api"; scope?: ResourceScope },
+	operation: Operation,
+): Promise<AuthorizationCredentialOperationResult<Operation>> {
+	await ensureAuthMigrated();
+	const stage = `authorization.credentials.${operation}`;
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const organizationId = authorizationInputId(input.organizationId, "organizationId", stage);
+	const serviceAccountId = authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
+	const credentialId = input.credentialId === undefined ? undefined : authorizationInputId(input.credentialId, "credentialId", stage);
+	if ((operation === "rotate" || operation === "revoke") && !credentialId) throw new ClearanceError({ code: "AUTHORIZATION_CREDENTIAL_ID_REQUIRED", message: "credentialId is required", stage, status: 400 });
+	const expiresAt = operation === "revoke" ? undefined : authorizationExpiry(input.expiresAt, stage);
+	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_CREDENTIAL_BACKEND");
+	const execute = async ({ data, query }: InternalManagementCoordinatedMutationContext) => {
+		const org = findOrgInScope(data, organizationId, scope, stage);
+		const authorization = requireAuthorizationFacade(scope, stage);
+		const transaction = authorizationTransaction(query);
+		if (operation === "revoke") {
+			const result = await authorization.revokeServiceAccountCredential({ organizationId: org.id, serviceAccountId, credentialId: credentialId!, transaction });
+			authorizationAudit(data, { action: "authorization.credentials.revoke", subjectType: "service_account_credential", subjectId: credentialId!, organization: org, actor: input.actor, source: input.source, message: `Revoked service account credential ${credentialId}`, metadata: { serviceAccountId, credentialId, previousRevision: result.previousRevision, revision: result.revision } });
+			return { organizationId: org.id, serviceAccountId, credentialId, previousRevision: result.previousRevision, revision: result.revision };
+		}
+		const result = operation === "create"
+			? await authorization.createServiceAccountCredential({ organizationId: org.id, serviceAccountId, ...(credentialId ? { credentialId } : {}), ...(expiresAt ? { expiresAt } : {}), transaction })
+			: await authorization.rotateServiceAccountCredential({ organizationId: org.id, serviceAccountId, credentialId: credentialId!, ...(expiresAt ? { expiresAt } : {}), transaction });
+		authorizationAudit(data, { action: `authorization.credentials.${operation}`, subjectType: "service_account_credential", subjectId: result.credential.credentialId, organization: org, actor: input.actor, source: input.source, message: `${operation === "create" ? "Created" : "Rotated"} service account credential`, metadata: { serviceAccountId, credentialId: result.credential.credentialId, credentialPrefix: result.credential.credentialPrefix, credentialFingerprint: result.credential.credentialFingerprint, previousRevision: result.previousRevision, revision: result.revision } });
+		return { credential: authorizationCredentialView(result.credential), secret: result.secret, previousRevision: result.previousRevision, revision: result.revision };
+	};
+	if (input.dryRun !== true) {
+		return mutateCoordinated(execute) as Promise<AuthorizationCredentialOperationResult<Operation>>;
+	}
+	await previewAuthorizationMutation(mutateCoordinated, execute);
+	const expiresAtIso = expiresAt?.toISOString() ?? null;
+	if (operation === "create") {
+		return {
+			preview: true,
+			organizationId,
+			serviceAccountId,
+			expiresAt: expiresAtIso,
+			secretGenerated: false,
+		} as AuthorizationCredentialOperationResult<Operation>;
+	}
+	if (operation === "rotate") {
+		return {
+			preview: true,
+			organizationId,
+			serviceAccountId,
+			credentialId: credentialId!,
+			expiresAt: expiresAtIso,
+			secretGenerated: false,
+		} as AuthorizationCredentialOperationResult<Operation>;
+	}
+	return {
+		preview: true,
+		organizationId,
+		serviceAccountId,
+		credentialId: credentialId!,
+		wouldChange: true,
+	} as AuthorizationCredentialOperationResult<Operation>;
+}
+
+export function createServiceAccountCredentialInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; credentialId?: string; expiresAt?: string } & AuthorizationMutationOptions,
+): Promise<AuthorizationCredentialCreateLiveResult | AuthorizationCredentialCreatePreview> {
+	return mutateServiceAccountCredentialInAuth(store, input, "create");
+}
+
+export function rotateServiceAccountCredentialInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; credentialId: string; expiresAt?: string } & AuthorizationMutationOptions,
+): Promise<AuthorizationCredentialRotateLiveResult | AuthorizationCredentialRotatePreview> {
+	return mutateServiceAccountCredentialInAuth(store, input, "rotate");
+}
+
+export function revokeServiceAccountCredentialInAuth(
+	store: ManagementStore,
+	input: { organizationId: string; serviceAccountId: string; credentialId: string } & AuthorizationMutationOptions,
+): Promise<AuthorizationCredentialRevokeLiveResult | AuthorizationCredentialRevokePreview> {
+	return mutateServiceAccountCredentialInAuth(store, input, "revoke");
 }
 
 // ---------------------------------------------------------------------------
