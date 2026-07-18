@@ -1,5 +1,6 @@
 import type { ClearancePlugin } from "@clearance/core";
 import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import { ClearanceError } from "@clearance/core/error";
 import type { JSONWebKeySet, JWTPayload } from "jose";
 import * as z from "zod";
@@ -305,30 +306,41 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 							message: CREDENTIAL_OPERATION_KEY_REQUIREMENT,
 						});
 					}
-					const rotated =
-						await ctx.context.internalAdapter.rotateSessionCredential(
-							refreshSecret,
-							idempotencyKey,
-						);
-					if (!rotated) {
+					const issued = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							const rotated =
+								await ctx.context.internalAdapter.rotateSessionCredential(
+									refreshSecret,
+									idempotencyKey,
+								);
+							if (!rotated) return null;
+							ctx.context.session = {
+								session: rotated.session,
+								user: rotated.user,
+							};
+							const token = await getJwtToken(ctx, options, {
+								sid: rotated.session.id,
+								session_family: rotated.familyId,
+								session_generation: rotated.rotationCounter,
+							});
+							return { rotated, token };
+						},
+					);
+					if (!issued) {
 						deleteSessionCookie(ctx);
 						throw new APIError("UNAUTHORIZED");
 					}
 					ctx.context.session = {
-						session: rotated.session,
-						user: rotated.user,
+						session: issued.rotated.session,
+						user: issued.rotated.user,
 					};
 					await setSessionCookie(ctx, {
-						session: rotated.session,
-						user: rotated.user,
-					});
-					const jwt = await getJwtToken(ctx, options, {
-						sid: rotated.session.id,
-						session_family: rotated.familyId,
-						session_generation: rotated.rotationCounter,
+						session: issued.rotated.session,
+						user: issued.rotated.user,
 					});
 					setNoStoreTokenResponseHeaders(ctx);
-					return ctx.json({ token: jwt });
+					return ctx.json({ token: issued.token });
 				},
 			),
 			legacyGetToken: createAuthEndpoint(
