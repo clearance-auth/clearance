@@ -36,6 +36,7 @@ export type WorkerReadiness = {
 	database: boolean;
 	schema: boolean;
 	keyring: boolean;
+	audit: boolean;
 	heartbeat: boolean;
 	email: boolean;
 	emailTransport: "smtp" | "ses";
@@ -82,6 +83,7 @@ export class DeliveryWorker {
 			schema: config.schema,
 			prefix: config.prefix,
 			legacyFingerprintKeyId: config.legacyFingerprintKeyId,
+			...(config.runtimeAudit ? { runtimeAudit: config.runtimeAudit } : {}),
 		});
 		this.sender = dependencies.sender ?? createEmailSender(config);
 		this.webhookSender = dependencies.webhookSender ?? createWebhookSender(config);
@@ -91,6 +93,7 @@ export class DeliveryWorker {
 	async initialize(options: { verifyEmail?: boolean; verifySmtp?: boolean } = {}): Promise<void> {
 		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state: "starting" }).catch(() => undefined);
 		const result = await this.store.migrate();
+		await this.store.assertRuntimeAuditTableReady();
 		await this.store.assertFingerprintKeysAvailable(this.config.keyring);
 		this.schemaHealthy = result.version === DELIVERY_SCHEMA_VERSION;
 		const shouldVerifyEmail = options.verifyEmail ?? options.verifySmtp ?? true;
@@ -125,6 +128,7 @@ export class DeliveryWorker {
 		const transport = configuredEmailTransport(this.config);
 		let database = false;
 		let keyring = false;
+		let audit = !this.config.runtimeAudit;
 		try { await this.pool.query("SELECT 1"); database = true; } catch { database = false; }
 		if (database) {
 			try {
@@ -153,16 +157,25 @@ export class DeliveryWorker {
 					keyring = false;
 				}
 			}
+			if (this.schemaHealthy && this.config.runtimeAudit) {
+				try {
+					await this.store.assertRuntimeAuditTableReady();
+					audit = true;
+				} catch {
+					audit = false;
+				}
+			}
 		} else {
 			this.schemaHealthy = false;
 		}
 		const heartbeat = this.lastHeartbeatAt > 0 && Date.now() - this.lastHeartbeatAt <= this.config.heartbeatMs * 3;
 		return {
-			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && heartbeat && this.emailHealthy,
+			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && audit && heartbeat && this.emailHealthy,
 			draining: this.draining,
 			database,
 			schema: this.schemaHealthy,
 			keyring,
+			audit,
 			heartbeat,
 			email: this.emailHealthy,
 			emailTransport: transport,
