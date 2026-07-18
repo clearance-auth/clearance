@@ -65,6 +65,7 @@ export default defineConfig({
 		"./src/plugins/mcp/client/index.ts",
 		"./src/plugins/mcp/client/adapters.ts",
 		"./src/test-utils/index.ts",
+		"./src/internal/runtime-audit.ts",
 	],
 	treeshake: true,
 	clean: true,
