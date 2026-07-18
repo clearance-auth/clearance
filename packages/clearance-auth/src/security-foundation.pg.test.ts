@@ -765,7 +765,79 @@ describe.sequential.skipIf(!available)(
 					[`jwk-${suffix}`, publicKey, "invalid-legacy-private-key"],
 				);
 
-				await expect(bundle.migrate()).rejects.toThrow(
+				const applyKeyMigration = async (planId: string) => {
+					const client = await scopedPool!.connect();
+					try {
+						await client.query("BEGIN");
+						const result = await bundle!.keyManagement.applyMigration({
+							expectedPlanId: planId,
+							transaction: {
+								rawTransactionQuery: async <
+									Row extends Record<string, unknown> = Record<string, unknown>,
+								>(text: string, values?: readonly unknown[]) => {
+									const queryResult = await client.query<Row>(
+										text,
+										values === undefined ? undefined : [...values],
+									);
+									return {
+										rows: queryResult.rows,
+										rowCount: queryResult.rowCount,
+									};
+								},
+							},
+						});
+						await client.query("COMMIT");
+						return result;
+					} catch (error) {
+						await client.query("ROLLBACK").catch(() => undefined);
+						throw error;
+					} finally {
+						client.release();
+					}
+				};
+				const statusBefore = await bundle.keyManagement.status();
+				const stalePlan = await bundle.keyManagement.planMigration();
+				expect(statusBefore).toMatchObject({
+					ready: false,
+					schema: { setup: "pending" },
+					migration: { complete: false },
+				});
+				expect(stalePlan).toMatchObject({
+					phase: "setup",
+					nextBatch: {
+						oidcClientSecrets: 1,
+						scimTokens: 1,
+						jwks: 1,
+						total: 3,
+					},
+				});
+				const triggerCountAfterRead = await scopedPool.query<{ count: number }>(
+					`SELECT count(*)::int AS count FROM pg_trigger
+					 WHERE tgname IN ('clearance_require_oidc_key_v1',
+					                  'clearance_require_scim_key_v1',
+					                  'clearance_require_jwt_key_v1')
+					   AND NOT tgisinternal`,
+				);
+				expect(triggerCountAfterRead.rows[0]?.count).toBe(0);
+
+				const changedLegacyOidcConfig = JSON.stringify({
+					clientId: "changed-client",
+					clientSecret: `clr-sso:v1:${legacyOidc}`,
+				});
+				await scopedPool.query(
+					`UPDATE "ssoProvider" SET "oidcConfig"=$2 WHERE "providerId"=$1`,
+					[oidcProviderId, changedLegacyOidcConfig],
+				);
+				await expect(applyKeyMigration(stalePlan.planId)).rejects.toMatchObject({
+					code: "KEY_MANAGEMENT_PLAN_STALE",
+				});
+				await scopedPool.query(
+					`UPDATE "ssoProvider" SET "oidcConfig"=$2 WHERE "providerId"=$1`,
+					[oidcProviderId, legacyOidcConfig],
+				);
+
+				const invalidPlan = await bundle.keyManagement.planMigration();
+				await expect(applyKeyMigration(invalidPlan.planId)).rejects.toThrow(
 					`Cannot migrate invalid JWT private-key storage for key jwk-${suffix}`,
 				);
 				const rolledBack = (
@@ -792,7 +864,20 @@ describe.sequential.skipIf(!available)(
 					`jwk-${suffix}`,
 					legacyJwk,
 				]);
-				await bundle.migrate();
+				const migrationPlan = await bundle.keyManagement.planMigration();
+				const migrationResult = await applyKeyMigration(migrationPlan.planId);
+				expect(migrationResult).toMatchObject({
+					applied: {
+						oidcClientSecrets: 1,
+						scimTokens: 1,
+						jwks: 1,
+						total: 3,
+					},
+					changed: 3,
+					complete: true,
+					remainingPlan: { phase: "complete" },
+					status: { ready: true, migration: { complete: true } },
+				});
 
 				const oidc = (
 					await scopedPool.query<{ oidcConfig: string }>(
