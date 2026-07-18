@@ -1,7 +1,12 @@
 import { performance } from "node:perf_hooks";
 import pg from "pg";
 import { afterAll, describe, expect, it } from "vitest";
-import { createSessionAuthoritative, initProject } from "../services/core.js";
+import {
+	createEnvironmentAuthoritative,
+	createProjectAuthoritative,
+	createSessionAuthoritative,
+	initProject,
+} from "../services/core.js";
 import { createManagementApplication } from "../application/management-application.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { syncRuntimeUserToManagementDurable } from "../services/identity.js";
@@ -12,6 +17,10 @@ import {
 	advanceStoreV2PrincipalState,
 	readStoreV2PrincipalState,
 } from "../store/store-v2-principals.js";
+import {
+	advanceStoreV2TopologyState,
+	readStoreV2TopologyState,
+} from "../store/store-v2-topology.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 import type { PageCursorKey } from "../services/pagination.js";
 
@@ -33,7 +42,7 @@ function quantile(sorted: readonly number[], value: number): number {
 	return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * value))]!;
 }
 
-describe.skipIf(!available)("store-v2 principal production-path scale", () => {
+describe.skipIf(!available)("store-v2 principal and topology production-path scale", () => {
 	const stores: PgStore[] = [];
 
 	afterAll(async () => {
@@ -57,7 +66,7 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 		}
 	});
 
-	it("holds bounded production create-user plus audit latency at 5k and 50k rows", async () => {
+	it("holds bounded principal and topology lifecycle latency at 5k and 50k rows", async () => {
 		const store = await createPgStore(DATABASE_URL, {
 			tableName: TABLE,
 			normalizedPrefix: PREFIX,
@@ -67,34 +76,45 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 		await store.ready();
 		await store.storeV2!.apply();
 		await store.storeV2!.cutoverEvents();
-		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		await store.storeV2!.cutoverPrincipals();
+		await store.storeV2!.cutoverTopology();
+		expect(store.storeV2Topology?.authoritative).toBe(true);
+		expect(store.snapshot.projects).toEqual([]);
+		expect(store.snapshot.environments).toEqual([]);
+		expect(store.snapshot.organizations).toEqual([]);
+		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		const scope = {
 			projectId: initialized.project.id,
 			environmentId: initialized.environment.id,
 		};
+		const otherProject = await createProjectAuthoritative(store, {
+			name: "Other Scale",
+			actor: "scale-proof",
+			source: "cli",
+		});
+		const otherEnvironment = await createEnvironmentAuthoritative(store, {
+			projectId: otherProject.id,
+			name: "Other",
+			kind: "preview",
+			actor: "scale-proof",
+			source: "cli",
+		});
 		const otherScope = {
-			projectId: "scale_other_project",
-			environmentId: "scale_other_environment",
+			projectId: otherProject.id,
+			environmentId: otherEnvironment.id,
 		};
-		await pool.query(
-			`INSERT INTO ${PREFIX}projects (id, name, slug, created_at, updated_at)
-			 VALUES ($1, 'Other Scale', 'other-scale', now(), now())
-			 ON CONFLICT (id) DO NOTHING`,
-			[otherScope.projectId],
-		);
-		await pool.query(
-			`INSERT INTO ${PREFIX}environments
-			 (id, project_id, name, slug, kind, created_at, updated_at)
-			 VALUES ($1, $2, 'Other', 'other', 'preview', now(), now())
-			 ON CONFLICT (id) DO NOTHING`,
-			[otherScope.environmentId, otherScope.projectId],
-		);
 		const results: Array<{ count: number; p50Ms: number; p95Ms: number }> = [];
+		const topologyResults: Array<{ count: number; p50Ms: number; p95Ms: number }> = [];
+		const observer = await createPgStore(DATABASE_URL, {
+			tableName: TABLE,
+			normalizedPrefix: PREFIX,
+		});
+		stores.push(observer);
 
 		try {
 			for (const count of COUNTS) {
 				await pool.query(`TRUNCATE ${PREFIX}principals`);
+				await pool.query(`TRUNCATE ${PREFIX}organizations`);
 				await pool.query(
 					`INSERT INTO ${PREFIX}principals
 					 (id, project_id, environment_id, email, name, status, external_id, created_at, updated_at)
@@ -125,6 +145,29 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 						TABLES,
 						count + 1 - state.count,
 					);
+					const topologyState = await readStoreV2TopologyState(
+						stateClient,
+						TABLES,
+						true,
+					);
+					if (!topologyState) {
+						throw new Error("topology state missing in scale setup");
+					}
+					await stateClient.query(
+						`INSERT INTO ${PREFIX}organizations
+						 (id, project_id, environment_id, name, slug, status, created_at, updated_at)
+						 SELECT 'topology_' || lpad(value::text, 6, '0'), $1, $2,
+						        'Topology ' || value::text, 'topology-' || value::text, 'active',
+						        '2026-01-01T00:00:00Z'::timestamptz + value * interval '1 millisecond',
+						        '2026-01-01T00:00:00Z'::timestamptz
+						 FROM generate_series(1, $3::integer) AS value`,
+						[scope.projectId, scope.environmentId, count],
+					);
+					await advanceStoreV2TopologyState(stateClient, TABLES, {
+						projectCount: 0,
+						environmentCount: 0,
+						organizationCount: count - topologyState.organizationCount,
+					});
 					await stateClient.query("COMMIT");
 				} catch (error) {
 					await stateClient.query("ROLLBACK").catch(() => undefined);
@@ -139,11 +182,33 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 					actor: "scale-proof",
 					source: "cli" as const,
 				};
-				const beforeProjection = await pool.query<{ digest: string; companion: string }>(
+				const otherContext = {
+					scope: otherScope,
+					actor: "scale-proof",
+					source: "cli" as const,
+				};
+				await observer.refresh();
+				const observerTopologyRevision =
+					(await observer.storeV2!.status()).topologyRevision;
+				const beforeProjection = await pool.query<{
+					digest: string;
+					companion: string;
+					projects: number;
+					environments: number;
+					organizations: number;
+				}>(
 					`SELECT md5(snapshot.data::text) AS digest,
-					        (SELECT count(*)::text FROM ${TABLE}_principal_email) AS companion
+					        (SELECT count(*)::text FROM ${TABLE}_principal_email) AS companion,
+					        jsonb_array_length(snapshot.data->'projects') AS projects,
+					        jsonb_array_length(snapshot.data->'environments') AS environments,
+					        jsonb_array_length(snapshot.data->'organizations') AS organizations
 					 FROM ${TABLE} AS snapshot WHERE id = 1`,
 				);
+				expect(beforeProjection.rows[0]).toMatchObject({
+					projects: 0,
+					environments: 0,
+					organizations: 0,
+				});
 
 				for (let warmup = 0; warmup < 5; warmup += 1) {
 					await application.users.create(context, {
@@ -153,7 +218,7 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 				}
 				const samples: number[] = [];
 				const createdIds: string[] = [];
-				for (let sample = 0; sample < 20; sample += 1) {
+				for (let sample = 0; sample < 50; sample += 1) {
 					const started = performance.now();
 					const created = await application.users.create(context, {
 						email: `scale-create-${count}-${sample}@example.test`,
@@ -169,7 +234,64 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 					      WHERE action = 'users.create' AND subject_id = ANY($1::text[])) AS audits`,
 					[createdIds],
 				);
-				expect(durable.rows[0]).toEqual({ principals: "20", audits: "20" });
+				expect(durable.rows[0]).toEqual({ principals: "50", audits: "50" });
+
+				const topologyCreatedIds: string[] = [];
+				for (let warmup = 0; warmup < 5; warmup += 1) {
+					await application.organizations.create(context, {
+						name: `Topology Warmup ${count}-${warmup}`,
+						slug: `topology-warmup-${count}-${warmup}`,
+					});
+				}
+				const topologySamples: number[] = [];
+				for (let sample = 0; sample < 50; sample += 1) {
+					const started = performance.now();
+					const created = await application.organizations.create(context, {
+						name: `Topology Create ${count}-${sample}`,
+						slug: `topology-create-${count}-${sample}`,
+					});
+					topologySamples.push(performance.now() - started);
+					topologyCreatedIds.push(created.id);
+				}
+				const topologyDurable = await pool.query<{
+					organizations: string;
+					audits: string;
+				}>(
+					`SELECT
+					   (SELECT count(*)::text FROM ${PREFIX}organizations WHERE id = ANY($1::text[])) AS organizations,
+					   (SELECT count(*)::text FROM ${PREFIX}events
+					      WHERE action = 'orgs.create' AND subject_id = ANY($1::text[])) AS audits`,
+					[topologyCreatedIds],
+				);
+				expect(topologyDurable.rows[0]).toEqual({ organizations: "50", audits: "50" });
+				await observer.refresh();
+				expect(observer.resourceCounts()).toMatchObject({
+					organizations: count + 55,
+				});
+				expect((await observer.storeV2!.status()).topologyRevision).toBe(
+					observerTopologyRevision! + 55,
+				);
+				expect(observer.snapshot.organizations).toEqual([]);
+
+				const snapshotLock = await pool.connect();
+				let unrelated: Promise<unknown> | undefined;
+				try {
+					await snapshotLock.query("BEGIN");
+					await snapshotLock.query(`SELECT id FROM ${TABLE} WHERE id = 1 FOR UPDATE`);
+					unrelated = application.organizations.create(otherContext, {
+						name: `Unrelated Topology ${count}`,
+						slug: `unrelated-topology-${count}`,
+					});
+					const completed = await Promise.race([
+						unrelated.then(() => true),
+						new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+					]);
+					expect(completed).toBe(true);
+				} finally {
+					await snapshotLock.query("ROLLBACK").catch(() => undefined);
+					snapshotLock.release();
+					await unrelated;
+				}
 				const parallelStarted = performance.now();
 				const parallelCreated = await Promise.all(
 					Array.from({ length: 10 }, (_, index) =>
@@ -188,15 +310,28 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 				expect(parallelCreated).toHaveLength(10);
 				expect((performance.now() - parallelStarted) / 10).toBeLessThan(50);
 				expect(store.snapshot.principals).toEqual([]);
-				const projection = await pool.query<{ digest: string; principals: number; companion: string }>(
+				const projection = await pool.query<{
+					digest: string;
+					principals: number;
+					projects: number;
+					environments: number;
+					organizations: number;
+					companion: string;
+				}>(
 					`SELECT md5(snapshot.data::text) AS digest,
 					        jsonb_array_length(snapshot.data->'principals') AS principals,
+					        jsonb_array_length(snapshot.data->'projects') AS projects,
+					        jsonb_array_length(snapshot.data->'environments') AS environments,
+					        jsonb_array_length(snapshot.data->'organizations') AS organizations,
 					        (SELECT count(*)::text FROM ${TABLE}_principal_email) AS companion
 					 FROM ${TABLE} AS snapshot WHERE id = 1`,
 				);
 				expect(projection.rows[0]).toEqual({
 					digest: beforeProjection.rows[0]!.digest,
 					principals: 0,
+					projects: 0,
+					environments: 0,
+					organizations: 0,
 					companion: beforeProjection.rows[0]!.companion,
 				});
 
@@ -246,7 +381,7 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 					expect.objectContaining({ id: session.id, principalId: "scale_000001" }),
 				);
 
-				const expectedScopedCount = count + 35;
+				const expectedScopedCount = count + 65;
 				const seen = new Set<string>();
 				let cursor: PageCursorKey | undefined;
 				let firstId: string | undefined;
@@ -305,23 +440,33 @@ describe.skipIf(!available)("store-v2 principal production-path scale", () => {
 				expect(externalIdPlan).toMatch(/Index(?: Only)? Scan/);
 				expect(externalIdPlan).not.toContain('"Node Type":"Seq Scan"');
 				samples.sort((a, b) => a - b);
+				topologySamples.sort((a, b) => a - b);
 				results.push({
 					count,
 					p50Ms: quantile(samples, 0.5),
 					p95Ms: quantile(samples, 0.95),
 				});
+				topologyResults.push({
+					count,
+					p50Ms: quantile(topologySamples, 0.5),
+					p95Ms: quantile(topologySamples, 0.95),
+				});
 			}
 
-			for (const result of results) {
+			for (const result of [...results, ...topologyResults]) {
 				expect(result.p50Ms).toBeLessThan(25);
 				expect(result.p95Ms).toBeLessThan(50);
 			}
 			expect(results[1]!.p95Ms).toBeLessThanOrEqual(
 				2 * results[0]!.p95Ms + 5,
 			);
+			expect(topologyResults[1]!.p95Ms).toBeLessThanOrEqual(
+				2 * topologyResults[0]!.p95Ms + 5,
+			);
 			console.log(`STORE_V2_PRINCIPALS_SCALE ${JSON.stringify(results)}`);
+			console.log(`STORE_V2_TOPOLOGY_SCALE ${JSON.stringify(topologyResults)}`);
 		} finally {
 			await pool.end();
 		}
-	});
+	}, 30_000);
 });
