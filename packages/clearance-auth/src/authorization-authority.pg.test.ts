@@ -64,13 +64,15 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 	});
 
 	it("plans, applies, validates its owned catalog, and is idempotent", async () => {
+		const principalSubjectIndex = "clearance_az_assignments_principal_subject_idx";
 		const plan = await authority.planMigration();
 		expect(plan.pendingTables).toBe(7);
 		expect(plan.pendingFields).toBeGreaterThan(40);
-		expect(plan.pendingSecurityMigrations).toEqual(["authorization-authority-v1"]);
+		expect(plan.pendingSecurityMigrations).toEqual(["authorization-authority-v2"]);
 		const sql = await plan.compileSql();
 		expect(sql).toContain(`CREATE TABLE IF NOT EXISTS "${schema}"."clearance_authz_actions"`);
 		expect(sql).toContain("authz_service_account_credentials");
+		expect(sql).toContain(`CREATE INDEX IF NOT EXISTS "${principalSubjectIndex}" ON "${schema}"."clearance_authz_subject_role_assignments" ("projectId", "environmentId", "subjectKind", "subjectId")`);
 		await plan.apply();
 		await expect(authority.listRoles({})).resolves.toEqual(
 			expect.arrayContaining([
@@ -83,6 +85,22 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 		expect(installed).toMatchObject({ pendingTables: 0, pendingFields: 0, pendingSecurityMigrations: [] });
 		expect(await installed.compileSql()).toBe("");
 		await installed.apply();
+		const catalogIndex = await pool.query<{ columns: string[] }>(`SELECT array_agg(attribute_record.attname::text ORDER BY index_key.ordinality) AS columns
+			FROM pg_index AS index_state
+			JOIN pg_class AS table_record ON table_record.oid = index_state.indrelid
+			JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+			JOIN pg_class AS index_record ON index_record.oid = index_state.indexrelid
+			JOIN unnest(index_state.indkey) WITH ORDINALITY AS index_key(attribute_number, ordinality) ON true
+			JOIN pg_attribute AS attribute_record ON attribute_record.attrelid = table_record.oid AND attribute_record.attnum = index_key.attribute_number
+			WHERE namespace_record.nspname = $1 AND table_record.relname = $2 AND index_record.relname = $3
+			GROUP BY index_state.indexrelid`, [schema, "clearance_authz_subject_role_assignments", principalSubjectIndex]);
+		expect(catalogIndex.rows).toEqual([{ columns: ["projectId", "environmentId", "subjectKind", "subjectId"] }]);
+		await pool.query(`DROP INDEX "${schema}"."${principalSubjectIndex}"`);
+		const indexUpgrade = await authority.planMigration();
+		expect(indexUpgrade).toMatchObject({ pendingTables: 0, pendingFields: 0, pendingSecurityMigrations: ["authorization-authority-v2"] });
+		expect(await indexUpgrade.compileSql()).toBe(`CREATE INDEX IF NOT EXISTS "${principalSubjectIndex}" ON "${schema}"."clearance_authz_subject_role_assignments" ("projectId", "environmentId", "subjectKind", "subjectId")`);
+		await indexUpgrade.apply();
+		expect(await authority.planMigration()).toMatchObject({ pendingTables: 0, pendingFields: 0, pendingSecurityMigrations: [] });
 	});
 
 	it("unions and stably sorts environment-wide and organization-bound roles for a principal", async () => {
@@ -234,6 +252,12 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 			const custom = new PostgresAuthorizationAuthority(pool, { ...identity, schema: customSchema, prefix: "authority7a" });
 			await (await custom.planMigration()).apply();
 			await expect(custom.readEffective({ organizationId: "empty_org", subject: { kind: "principal", id: "principal_empty" } })).rejects.toMatchObject({ code: "AUTHORIZATION_REVISION_NOT_FOUND" });
+			await custom.initializeOrganization({ organizationId: "legacy_terminalization" });
+			await pool.query(`ALTER TABLE ${table(customSchema, "authority7a_authz_revisions")} DROP COLUMN terminal`);
+			const terminalizationUpgrade = await custom.planMigration();
+			expect(terminalizationUpgrade).toMatchObject({ pendingTables: 0, pendingFields: 1, pendingSecurityMigrations: ["authorization-authority-v2"] });
+			await terminalizationUpgrade.apply();
+			await expect(custom.initializeOrganization({ organizationId: "legacy_terminalization" })).resolves.toEqual({ organizationId: "legacy_terminalization", revision: "1", initialized: false });
 			await pool.query(`DROP TRIGGER "authority7a_az_assignments_role_scope_trg" ON ${table(customSchema, "authority7a_authz_subject_role_assignments")}`);
 			await expect(custom.planMigration()).rejects.toMatchObject({ code: "AUTHORIZATION_AUTHORITY_UNAVAILABLE" });
 			await pool.query(`CREATE TABLE ${table(partialSchema, "clearance_authz_actions")} ("projectId" text PRIMARY KEY)`);
@@ -332,5 +356,128 @@ describe.sequential.skipIf(!available)("PostgreSQL authorization authority", () 
 		}
 		await expect(authority.listServiceAccounts({ organizationId })).resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ serviceAccountId: "service_rolled_back" })]));
 		await expect(authority.readEffective({ organizationId, subject: { kind: "principal", id: "principal_rollback_check" } })).resolves.toMatchObject({ revision: "1" });
+	});
+
+	it("terminalizes organization authorization atomically and fails every live authority path closed", async () => {
+		const organizationId = "org_terminal";
+		const principal = { kind: "principal" as const, id: "principal_terminal" };
+		const serviceAccountId = "service_terminal";
+		await authority.initializeOrganization({ organizationId });
+		await authority.upsertRole({
+			role: { roleId: "role.terminal", organizationId, slug: "terminal", name: "Terminal", description: null, builtIn: false, status: "active" },
+			actions: ["terminal:read"],
+		});
+		await authority.replaceSubjectRoles({ organizationId, subject: principal, roleIds: ["role.terminal"] });
+		await authority.createServiceAccount({ organizationId, serviceAccountId, name: "Terminal machine", roleIds: ["role.terminal"] });
+		const credential = await authority.createServiceAccountCredential({ organizationId, serviceAccountId, credentialId: "credential_terminal" });
+		const before = await authority.readEffective({ organizationId, subject: principal });
+		const archived = await authority.archiveOrganization({ organizationId });
+		expect(archived).toEqual({
+			organizationId,
+			previousRevision: before.revision,
+			revision: (BigInt(before.revision) + 1n).toString(),
+			archived: true,
+			removedAssignments: 2,
+			disabledServiceAccounts: 1,
+			revokedCredentials: 1,
+		});
+		await expect(authority.readEffective({ organizationId, subject: principal })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.listRoles({ organizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.listSubjectAssignments({ organizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.listServiceAccounts({ organizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.listRoles({})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ roleId: "role_builtin_owner" })]));
+		await expect(authority.authenticateServiceAccountCredential({ secret: credential.secret })).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+		await expect(authority.replaceSubjectRoles({ organizationId, subject: principal, roleIds: [] })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.upsertRole({
+			role: { roleId: "role.terminal", organizationId, slug: "terminal", name: "Terminal updated", description: null, builtIn: false, status: "active" },
+			actions: ["terminal:read"],
+		})).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.createServiceAccount({ organizationId, serviceAccountId: "service_terminal_new", name: "Terminal new machine", roleIds: [] })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.setServiceAccountStatus({ organizationId, serviceAccountId, status: "active" })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.initializeOrganization({ organizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+		await expect(authority.archiveOrganization({ organizationId })).resolves.toEqual({
+			organizationId,
+			previousRevision: archived.revision,
+			revision: archived.revision,
+			archived: true,
+			removedAssignments: 0,
+			disabledServiceAccounts: 0,
+			revokedCredentials: 0,
+		});
+
+		const rollbackOrganizationId = "org_terminal_rollback";
+		const rollbackPrincipal = { kind: "principal" as const, id: "principal_terminal_rollback" };
+		await authority.initializeOrganization({ organizationId: rollbackOrganizationId });
+		await authority.replaceSubjectRoles({ organizationId: rollbackOrganizationId, subject: rollbackPrincipal, roleIds: ["role_builtin_member"] });
+		await authority.createServiceAccount({ organizationId: rollbackOrganizationId, serviceAccountId: "service_terminal_rollback", name: "Rollback machine", roleIds: ["role_builtin_member"] });
+		const rollbackCredential = await authority.createServiceAccountCredential({ organizationId: rollbackOrganizationId, serviceAccountId: "service_terminal_rollback" });
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await authority.archiveOrganization({ organizationId: rollbackOrganizationId, transaction: { rawTransactionQuery: client.query.bind(client) } });
+			await client.query("ROLLBACK");
+		} finally {
+			client.release();
+		}
+		await expect(authority.readEffective({ organizationId: rollbackOrganizationId, subject: rollbackPrincipal })).resolves.toMatchObject({ actions: ["ac:read"] });
+		await expect(authority.authenticateServiceAccountCredential({ secret: rollbackCredential.secret })).resolves.toMatchObject({ organizationId: rollbackOrganizationId, actions: ["ac:read"] });
+		await expect(authority.archiveOrganization({ organizationId: "org_terminal_missing_revision" })).resolves.toEqual({
+			organizationId: "org_terminal_missing_revision",
+			previousRevision: "0",
+			revision: "1",
+			archived: true,
+			removedAssignments: 0,
+			disabledServiceAccounts: 0,
+			revokedCredentials: 0,
+		});
+		await expect(authority.initializeOrganization({ organizationId: "org_terminal_missing_revision" })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+	});
+
+	it("preserves active normalized organizations and terminalizes only organizations absent from both authorities", async () => {
+		const reconciliationSchema = `authorization_reconcile_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+		try {
+			await admin.query(`CREATE SCHEMA "${reconciliationSchema}"; CREATE TABLE "${reconciliationSchema}"."organization" (id text PRIMARY KEY); CREATE TABLE "${reconciliationSchema}"."mgmt_organizations" (id text PRIMARY KEY, project_id text NOT NULL, environment_id text NOT NULL, status text NOT NULL)`);
+			const reconciler = new PostgresAuthorizationAuthority(
+				pool,
+				{ ...identity, schema: reconciliationSchema, prefix: "reconcile7a" },
+				{ schema: reconciliationSchema, table: "organization", management: { schema: reconciliationSchema, table: "mgmt_organizations" } },
+			);
+			await (await reconciler.planMigration()).apply();
+			const activeOrganizationId = "org_reconcile_active";
+			const managementOnlyOrganizationId = "org_reconcile_management_only";
+			const absentOrganizationId = "org_reconcile_absent";
+			await pool.query(`INSERT INTO "${reconciliationSchema}"."organization" (id) VALUES ($1)`, [activeOrganizationId]);
+			await pool.query(`INSERT INTO "${reconciliationSchema}"."mgmt_organizations" (id, project_id, environment_id, status) VALUES ($1, $2, $3, 'active')`, [managementOnlyOrganizationId, identity.projectId, identity.environmentId]);
+			await reconciler.initializeOrganization({ organizationId: activeOrganizationId });
+			await reconciler.replaceSubjectRoles({ organizationId: activeOrganizationId, subject: { kind: "principal", id: "principal_reconcile_active" }, roleIds: ["role_builtin_member"] });
+			await reconciler.initializeOrganization({ organizationId: managementOnlyOrganizationId });
+			await reconciler.replaceSubjectRoles({ organizationId: managementOnlyOrganizationId, subject: { kind: "principal", id: "principal_reconcile_management_only" }, roleIds: ["role_builtin_member"] });
+			await reconciler.initializeOrganization({ organizationId: absentOrganizationId });
+			await reconciler.replaceSubjectRoles({ organizationId: absentOrganizationId, subject: { kind: "principal", id: "principal_reconcile_absent" }, roleIds: ["role_builtin_member"] });
+			await reconciler.createServiceAccount({ organizationId: absentOrganizationId, serviceAccountId: "service_reconcile_absent", name: "Absent machine", roleIds: ["role_builtin_member"] });
+			const absentCredential = await reconciler.createServiceAccountCredential({ organizationId: absentOrganizationId, serviceAccountId: "service_reconcile_absent" });
+			await pool.query(`ALTER TABLE "${reconciliationSchema}"."reconcile7a_authz_revisions" DROP COLUMN terminal`);
+			await (await reconciler.planMigration()).apply();
+			await expect(reconciler.reconcileRuntimeOrganizations()).resolves.toEqual({
+				terminalizedOrganizations: 1,
+				terminalizedOrganizationIds: [absentOrganizationId],
+				removedAssignments: 2,
+				disabledServiceAccounts: 1,
+				revokedCredentials: 1,
+			});
+			await expect(reconciler.readEffective({ organizationId: activeOrganizationId, subject: { kind: "principal", id: "principal_reconcile_active" } })).resolves.toMatchObject({ actions: ["ac:read"] });
+			await expect(reconciler.readEffective({ organizationId: managementOnlyOrganizationId, subject: { kind: "principal", id: "principal_reconcile_management_only" } })).resolves.toMatchObject({ actions: ["ac:read"] });
+			await expect(reconciler.readEffective({ organizationId: absentOrganizationId, subject: { kind: "principal", id: "principal_reconcile_absent" } })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+			await expect(reconciler.authenticateServiceAccountCredential({ secret: absentCredential.secret })).rejects.toMatchObject({ code: "AUTHORIZATION_CREDENTIAL_INVALID" });
+			const archivedManagementOrganizationId = "org_reconcile_management_archived";
+			await pool.query(`INSERT INTO "${reconciliationSchema}"."organization" (id) VALUES ($1)`, [archivedManagementOrganizationId]);
+			await pool.query(`INSERT INTO "${reconciliationSchema}"."mgmt_organizations" (id, project_id, environment_id, status) VALUES ($1, $2, $3, 'archived')`, [archivedManagementOrganizationId, identity.projectId, identity.environmentId]);
+			await reconciler.initializeOrganization({ organizationId: archivedManagementOrganizationId });
+			await expect(reconciler.reconcileRuntimeOrganizations()).resolves.toEqual({ terminalizedOrganizations: 1, terminalizedOrganizationIds: [archivedManagementOrganizationId], removedAssignments: 0, disabledServiceAccounts: 0, revokedCredentials: 0 });
+			await expect(reconciler.initializeOrganization({ organizationId: archivedManagementOrganizationId })).rejects.toMatchObject({ code: "AUTHORIZATION_ORGANIZATION_ARCHIVED" });
+			await expect(reconciler.reconcileRuntimeOrganizations()).resolves.toEqual({ terminalizedOrganizations: 0, terminalizedOrganizationIds: [], removedAssignments: 0, disabledServiceAccounts: 0, revokedCredentials: 0 });
+		} finally {
+			await admin.query(`DROP SCHEMA IF EXISTS "${reconciliationSchema}" CASCADE`);
+		}
 	});
 });
