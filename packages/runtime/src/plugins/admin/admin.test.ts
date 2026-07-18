@@ -16,6 +16,7 @@ import {
 import { createAuthMiddleware, getSessionFromCtx } from "../../api";
 import { createAuthClient } from "../../client";
 import { signJWT } from "../../crypto";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { createAccessControl } from "../access";
@@ -1035,6 +1036,106 @@ describe("Admin plugin", async () => {
 		);
 		expect(res.data?.session).toBeDefined();
 		expect(res.data?.user?.id).toBe(session.data?.user.id);
+	});
+
+	it("binds managed impersonation to the live source and rolls back hook-time source drift", async () => {
+		let revision = "7";
+		let driftSourcePolicy = false;
+		const managedOptions = {
+			plugins: [admin()],
+			session: {
+				additionalFields: {
+					impersonatedBy: { type: "string" as const, required: false },
+				},
+			},
+			databaseHooks: {
+				user: {
+					create: {
+						before: async (user: Record<string, unknown>) => ({
+							data: {
+								...user,
+								emailVerified: true,
+								...(user.name === "Managed Admin" ? { role: "admin" } : {}),
+							},
+						}),
+					},
+				},
+				session: {
+					create: {
+						before: async (session: Record<string, unknown>) => {
+							if (driftSourcePolicy) revision = "8";
+							return { data: session };
+						},
+					},
+				},
+			},
+		};
+		attachInternalAuthenticationPolicy(managedOptions, {
+			identity: {
+				projectId: "admin-managed-project",
+				environmentId: "admin-managed-environment",
+			},
+			reader: {
+				readForSubject: async (input) => {
+					const effective = {
+						passwordLockout: {
+							enabled: true,
+							maxFailedAttempts: 10,
+							durationSeconds: 900,
+						},
+						factorLockout: {
+							enabled: true,
+							maxFailedAttempts: 10,
+							durationSeconds: 900,
+						},
+						minimumAssurance: "single_factor" as const,
+						allowedFactors: { totp: true, passkey: true },
+						trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+						assuranceMaxAgeSeconds: 300,
+					};
+					return {
+						scope: {
+							projectId: "admin-managed-project",
+							environmentId: "admin-managed-environment",
+						},
+						subjectId: input.subjectId,
+						revision,
+						environment: effective,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective,
+					};
+				},
+			},
+		});
+		const { client: managedBaseClient, customFetchImpl: managedFetch, signInWithTestUser, db } =
+			await getTestInstance(managedOptions, {
+				testUser: { name: "Managed Admin" },
+			});
+		const managedClient = createAuthClient({
+			baseURL: "http://localhost:3000",
+			plugins: [adminClient()],
+			fetchOptions: { customFetchImpl: managedFetch },
+		});
+		const { headers: managedAdminHeaders } = await signInWithTestUser();
+		const target = await managedBaseClient.signUp.email({
+			email: "managed-impersonation-target@example.test",
+			password: "password",
+			name: "Managed Target",
+		});
+		const first = await managedClient.admin.impersonateUser(
+			{ userId: target.data?.user.id ?? "" },
+			{ headers: managedAdminHeaders },
+		);
+		expect(first.data?.session).toBeDefined();
+		const sessionsBeforeRollback = await db.count({ model: "session" });
+		driftSourcePolicy = true;
+		const rejected = await managedClient.admin.impersonateUser(
+			{ userId: target.data?.user.id ?? "" },
+			{ headers: managedAdminHeaders },
+		);
+		expect(rejected.error?.status).toBe(500);
+		expect(await db.count({ model: "session" })).toBe(sessionsBeforeRollback);
 	});
 
 	/**
