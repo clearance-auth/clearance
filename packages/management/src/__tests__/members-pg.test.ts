@@ -14,10 +14,19 @@ import {
 	createUserInAuth,
 	ensureAuthMigrated,
 	getAuthBundle,
+	inspectEffectiveAuthorizationInAuth,
+	inspectServiceAccountInAuth,
+	listAuthorizationAssignmentsInAuth,
+	listServiceAccountsInAuth,
 	provisionOrganizationInAuth,
 	reconcileAuthorizationOrganizationInAuth,
+	replaceAuthorizationAssignmentsInAuth,
+	createServiceAccountInAuth,
+	createServiceAccountCredentialInAuth,
+	revokeServiceAccountCredentialInAuth,
 	removeMemberInAuth,
 	resetAuthBundle,
+	setServiceAccountStatusInAuth,
 	updateMemberInAuth,
 } from "../auth-bridge.js";
 import {
@@ -497,10 +506,24 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			subject: { kind: "principal", id: stalePrincipalId },
 			roleIds: ["role_builtin_member"],
 		});
+		const preview = await reconcileAuthorizationOrganizationInAuth(store, {
+			organizationId: organization.id,
+			actor: "test",
+		});
+		expect(preview).toMatchObject({ preview: true, assignmentsChanged: 1 });
+		expect(preview).not.toHaveProperty("revision");
+		expect(
+			await authorization.listSubjectAssignments({
+				organizationId: organization.id,
+				subject: { kind: "principal", id: stalePrincipalId },
+			}),
+		).toHaveLength(1);
 
 		const reconciled = await reconcileAuthorizationOrganizationInAuth(store, {
 			organizationId: organization.id,
 			actor: "test",
+			dryRun: false,
+			confirm: true,
 		});
 		expect(reconciled.assignmentsChanged).toBe(1);
 		expect(
@@ -509,6 +532,157 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 				subject: { kind: "principal", id: stalePrincipalId },
 			}),
 		).toEqual([]);
+	});
+
+	it("manages normalized authorization and service-account credentials through the coordinated bridge", async () => {
+		const store = await freshStore();
+		const { owner, organization } = await seedOwnerAndOrg(store);
+		const ownerEffective = await inspectEffectiveAuthorizationInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(ownerEffective.roleIds).toEqual(["role_builtin_owner"]);
+		const assignmentAuditCount = listEvents(store, { limit: 200 }).filter(
+			(event) => event.action === "authorization.assignments.replace",
+		).length;
+		await expect(
+			replaceAuthorizationAssignmentsInAuth(store, {
+				organizationId: organization.id,
+				subject: { kind: "principal", id: `nonmember-${Date.now()}` },
+				roleIds: ["role_builtin_member"],
+				dryRun: false,
+				confirm: true,
+			}),
+		).rejects.toMatchObject({ code: "AUTHORIZATION_SUBJECT_NOT_FOUND", status: 404 });
+		expect((await inspectEffectiveAuthorizationInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		})).revision).toBe(ownerEffective.revision);
+		expect(listEvents(store, { limit: 200 }).filter(
+			(event) => event.action === "authorization.assignments.replace",
+		)).toHaveLength(assignmentAuditCount);
+
+		const previewAccount = await createServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			name: "Preview deployer",
+			roleIds: ["role_builtin_member"],
+			dryRun: true,
+		});
+		expect(previewAccount).toEqual({
+			preview: true,
+			serviceAccount: {
+				organizationId: organization.id,
+				name: "Preview deployer",
+				status: "active",
+			},
+			roleIds: ["role_builtin_member"],
+		});
+		expect(previewAccount.serviceAccount).not.toHaveProperty("serviceAccountId");
+		expect(await listServiceAccountsInAuth(store, { organizationId: organization.id })).toEqual([]);
+
+		const account = await createServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			name: "Release deployer",
+			roleIds: ["role_builtin_member"],
+			actor: "test",
+		});
+		if ("preview" in account) throw new Error("live service account creation returned a preview");
+		expect(account.serviceAccount.status).toBe("active");
+		expect(await listServiceAccountsInAuth(store, { organizationId: organization.id })).toEqual([account.serviceAccount]);
+		expect(await inspectServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+		})).toEqual({
+			serviceAccount: account.serviceAccount,
+			assignments: [{
+				organizationId: organization.id,
+				subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+				roleId: "role_builtin_member",
+			}],
+		});
+
+		const assignmentPreview = await replaceAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+			roleIds: ["role_builtin_admin"],
+		});
+		expect(assignmentPreview).toMatchObject({
+			preview: true,
+			assignment: {
+				organizationId: organization.id,
+				subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+				roleIds: ["role_builtin_admin"],
+			},
+			wouldChange: true,
+		});
+		expect(assignmentPreview).not.toHaveProperty("revision");
+		expect(await listAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+		})).toEqual([{ organizationId: organization.id, subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId }, roleId: "role_builtin_member" }]);
+		const replacement = await replaceAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+			roleIds: ["role_builtin_admin"],
+			dryRun: false,
+			confirm: true,
+			actor: "test",
+		});
+		if ("preview" in replacement) throw new Error("live assignment replacement returned a preview");
+		expect(replacement.revision).not.toBe(replacement.previousRevision);
+
+		const credentialPreview = await createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			dryRun: true,
+		});
+		expect(credentialPreview).toEqual({
+			preview: true,
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			expiresAt: null,
+			secretGenerated: false,
+		});
+		expect(credentialPreview).not.toHaveProperty("credential");
+		expect(credentialPreview).not.toHaveProperty("credentialId");
+		expect(credentialPreview).not.toHaveProperty("credentialPrefix");
+		expect(credentialPreview).not.toHaveProperty("credentialFingerprint");
+		expect(credentialPreview).not.toHaveProperty("revision");
+		const credential = await createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			actor: "test",
+		});
+		if ("preview" in credential) throw new Error("live credential creation returned a preview");
+		expect(credential.secret).toMatch(/^clr_sac_v1_/);
+		expect(credential.credential.expiresAt).toBeNull();
+		const disabled = await setServiceAccountStatusInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			status: "disabled",
+			actor: "test",
+		});
+		if ("preview" in disabled) throw new Error("live status change returned a preview");
+		expect(disabled.revision).not.toBe(disabled.previousRevision);
+		const enabled = await setServiceAccountStatusInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			status: "active",
+			actor: "test",
+		});
+		if ("preview" in enabled) throw new Error("live status change returned a preview");
+		const revoked = await revokeServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			credentialId: credential.credential!.credentialId,
+			actor: "test",
+		});
+		if ("preview" in revoked) throw new Error("live credential revocation returned a preview");
+		expect(enabled.revision).not.toBe(enabled.previousRevision);
+		expect(revoked.revision).not.toBe(revoked.previousRevision);
+		const auditJson = JSON.stringify(listEvents(store, { limit: 200 }).filter((event) => event.action.startsWith("authorization.")));
+		expect(auditJson).not.toContain(credential.secret!);
+		expect(auditJson).not.toContain("credentialDigest");
 	});
 
 	it("final-owner invariant blocks demote and remove", async () => {
