@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
 	createScimConnectionReal: vi.fn(),
 	deleteSsoProviderById: vi.fn(async () => undefined),
 	deleteScimProviderById: vi.fn(async () => undefined),
+	compensateSetupConnection: vi.fn(),
 }));
 
 vi.mock("@clearance/management", async (importOriginal) => {
@@ -51,6 +52,7 @@ vi.mock("@clearance/management", async (importOriginal) => {
 		createScimConnectionReal: mocks.createScimConnectionReal,
 		deleteSsoProviderById: mocks.deleteSsoProviderById,
 		deleteScimProviderById: mocks.deleteScimProviderById,
+		compensateSetupConnection: mocks.compensateSetupConnection,
 	};
 });
 
@@ -82,11 +84,41 @@ afterEach(() => {
 	mocks.createScimConnectionReal.mockReset();
 	mocks.deleteSsoProviderById.mockReset();
 	mocks.deleteScimProviderById.mockReset();
+	mocks.compensateSetupConnection.mockReset();
 	mocks.deleteSsoProviderById.mockImplementation(async (id: string) => {
 		runtimeSso.delete(id);
 	});
 	mocks.deleteScimProviderById.mockImplementation(async (id: string) => {
 		runtimeScim.delete(id);
+	});
+	mocks.compensateSetupConnection.mockImplementation(async (store, input) => {
+		const managementRemoved = await store.mutateDurable((data: {
+			identityConnections: Array<{ id: string; organizationId: string; provider: string }>;
+			directoryConnections: Array<{ id: string; organizationId: string; provider: string }>;
+		}) => {
+			const connections = input.kind === "sso"
+				? data.identityConnections
+				: data.directoryConnections;
+			const exact = connections.find((connection) =>
+				connection.id === input.connectionId &&
+				connection.organizationId === input.organizationId &&
+				connection.provider === input.provider,
+			);
+			if (!exact) throw new Error("setup compensation exact connection missing");
+			if (input.kind === "sso") {
+				data.identityConnections = data.identityConnections.filter(
+					(connection) => connection.id !== input.connectionId,
+				);
+			} else {
+				data.directoryConnections = data.directoryConnections.filter(
+					(connection) => connection.id !== input.connectionId,
+				);
+			}
+			return true;
+		});
+		if (input.kind === "sso") await mocks.deleteSsoProviderById(input.connectionId);
+		else await mocks.deleteScimProviderById(input.connectionId);
+		return { managementRemoved, runtimeRemoved: true };
 	});
 });
 
@@ -458,6 +490,46 @@ describe("setup capability completion safety", () => {
 		expect(cap.reservationId).toBeFalsy();
 	});
 
+	it("retains the setup reservation when exact compensation fails", async () => {
+		const { app, store, org, createSetupLink } = await boot();
+		const link = createSetupLink(store, { organizationId: org.id, kind: "sso" });
+		await store.ready();
+
+		mocks.createSsoConnectionReal.mockImplementation(async (s, input) => {
+			const connection = {
+				id: "sso_cleanup_hold",
+				organizationId: input.organizationId,
+				provider: "okta",
+				protocol: "oidc",
+				status: "draft",
+				hasClientSecret: true,
+			};
+			s.mutate((data: {
+				identityConnections: unknown[];
+				setupLinks: Array<{ reservationExpiresAt?: string }>;
+			}) => {
+				data.identityConnections.push(connection);
+				data.setupLinks[0]!.reservationExpiresAt = new Date(0).toISOString();
+			});
+			return connection;
+		});
+		mocks.deleteSsoProviderById.mockRejectedValueOnce(new Error("runtime cleanup unavailable"));
+
+		const response = await app.request("/setup/sso", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(ssoBody(link.token, org.id)),
+		});
+		expect(response.status).toBe(500);
+		expect(await response.json()).toMatchObject({
+			error: { code: "SETUP_COMPENSATION_FAILED" },
+		});
+		const capability = store.snapshot.setupLinks.find((candidate) => candidate.id === link.capabilityId)!;
+		expect(capability).toMatchObject({ useCount: 0 });
+		expect(capability.reservationId).toBeTruthy();
+		expect(mocks.deleteSsoProviderById).toHaveBeenCalledWith("sso_cleanup_hold");
+	});
+
 	it("two concurrent completions produce one success, one in-progress/replay, one connection", async () => {
 		const { app, store, org, createSetupLink } = await boot();
 		const link = createSetupLink(store, {
@@ -695,6 +767,10 @@ describe("setup capability completion safety", () => {
 			expect.objectContaining({
 				setupAttemptId: expectedAttempt,
 				organizationId: org.id,
+				scope: {
+					projectId: org.projectId,
+					environmentId: org.environmentId,
+				},
 			}),
 		);
 	});
