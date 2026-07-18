@@ -1,6 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+	createDeliveryKeyring,
+	createDeliveryTransactionAdapter,
+	DeliveryStore,
+	enqueueDelivery,
+	migrateDeliverySchema,
+} from "@clearance/delivery";
 import { createClearanceAuth } from "./create-auth.js";
 import { createRuntimeAuditOutbox } from "./runtime-audit.js";
 
@@ -36,8 +43,13 @@ describe("runtime audit outbox", () => {
 			schema,
 		});
 		const plan = await outbox.planMigration();
-		expect(plan.pendingSecurityMigrations).toContain("runtime-audit-outbox-v1");
+		expect(plan.pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
 		await plan.apply();
+		await pool.query(`DROP INDEX "${schema}".clearance_runtime_audit_scope_created_id_v2`);
+		const repair = await outbox.planMigration();
+		expect(repair.pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
+		expect(await repair.compileSql()).toContain("scope_created_id_v2");
+		await repair.apply();
 		expect((await outbox.planMigration()).pendingSecurityMigrations).toEqual([]);
 		const client = await pool.connect();
 		const transaction = { rawTransactionQuery: client.query.bind(client) };
@@ -50,7 +62,13 @@ describe("runtime audit outbox", () => {
 			source: "system" as const,
 			organizationId: null,
 			message: "Session issued",
-			metadata: { safe: "kept", password: "must-not-store", nested: { token: "must-not-store" } },
+			metadata: {
+				safe: "kept",
+				password: "must-not-store",
+				email: "person@example.com",
+				callback: "https://example.com/callback",
+				nested: { token: "must-not-store" },
+			},
 			request: {
 				correlationId: "request_test",
 				operationId: "sign-in-email",
@@ -72,7 +90,10 @@ describe("runtime audit outbox", () => {
 			);
 			expect(committed.rows).toHaveLength(1);
 			expect(committed.rows[0]?.metadata).toMatchObject({ safe: "kept" });
-			expect(JSON.stringify(committed.rows[0]?.metadata)).not.toContain("must-not-store");
+			const serializedMetadata = JSON.stringify(committed.rows[0]?.metadata);
+			expect(serializedMetadata).not.toContain("must-not-store");
+			expect(serializedMetadata).not.toContain("person@example.com");
+			expect(serializedMetadata).not.toContain("https://example.com/callback");
 
 			await client.query("BEGIN");
 			await outbox.binding.append(transaction as never, { ...draft, request: { ...draft.request, correlationId: "request_rollback" } });
@@ -162,7 +183,7 @@ describe("runtime audit outbox", () => {
 			}
 			await pool.query(`ALTER TABLE "${schema}".clearance_runtime_audit_events ADD COLUMN tampered text`);
 			const tampered = await outbox.planMigration();
-			expect(tampered.pendingSecurityMigrations).toContain("runtime-audit-outbox-v1");
+			expect(tampered.pendingSecurityMigrations).toContain("runtime-audit-outbox-v2");
 			await expect(tampered.apply()).rejects.toMatchObject({
 				code: "RUNTIME_AUDIT_SCHEMA_INVALID",
 			});
@@ -173,5 +194,100 @@ describe("runtime audit outbox", () => {
 			await client.query("ROLLBACK").catch(() => undefined);
 			client.release();
 		}
+	});
+
+	it("binds webhook enqueue and terminal transitions to the product audit transaction", async () => {
+		if (!available) return;
+		const outbox = createRuntimeAuditOutbox(pool, {
+			projectId: "project_delivery_audit",
+			environmentId: "environment_delivery_audit",
+			schema,
+			prefix: `audit_${randomUUID().slice(0, 8)}`,
+		});
+		await outbox.applyMigration();
+		const prefix = `delivery_audit_${randomUUID().slice(0, 8)}_`;
+		const options = { schema, prefix, runtimeAudit: outbox.auditTable };
+		await migrateDeliverySchema(pool, options);
+		const keyring = createDeliveryKeyring({
+			currentKeyId: "current",
+			keys: { current: randomBytes(32) },
+			currentFingerprintKeyId: "fingerprint-current",
+			fingerprintKeys: { "fingerprint-current": randomBytes(32) },
+			sourceDedupeKey: randomBytes(32),
+		});
+		const eventId = `event-${randomUUID()}`;
+		const jobId = `job-${randomUUID()}`;
+		const now = new Date();
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+			await enqueueDelivery(createDeliveryTransactionAdapter(client), {
+				eventId,
+				jobId,
+				kind: "webhook.endpoint.test",
+				sourceKey: `source-${eventId}`,
+				projectId: "project_delivery_audit",
+				environmentId: "environment_delivery_audit",
+				organizationId: null,
+				actorId: "actor_delivery_audit",
+				correlationId: "correlation_delivery_audit",
+				channel: "webhook",
+				destination: "https://example.test/hooks/secret-destination",
+				payload: {
+					version: 1,
+					endpoint: {
+						id: "endpoint_delivery_audit",
+						url: "https://example.test/hooks/secret-destination",
+						signingSecret: "delivery-audit-signing-secret-0123456789",
+					},
+					event: {
+						id: eventId,
+						type: "webhook.endpoint.test",
+						occurredAt: now.toISOString(),
+						context: {
+							projectId: "project_delivery_audit",
+							environmentId: "environment_delivery_audit",
+							organizationId: null,
+							actor: "actor_delivery_audit",
+							correlationId: "correlation_delivery_audit",
+						},
+						data: { endpointId: "endpoint_delivery_audit" },
+					},
+				},
+				semanticExpiresAt: new Date(now.getTime() + 60_000),
+				now,
+			}, keyring, options);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		const store = new DeliveryStore(pool, options);
+		const leased = await store.claimNext({ workerId: "delivery-audit-worker", now });
+		expect(leased?.id).toBe(jobId);
+		await store.complete({
+			jobId,
+			leaseToken: leased!.leaseToken,
+			workerId: leased!.leaseOwner,
+			providerStatus: "204",
+			providerRequestId: "provider_request_1",
+			now: new Date(now.getTime() + 1),
+		});
+		const events = await pool.query<{
+			action: string;
+			correlation_id: string;
+			subject_id: string;
+			metadata: Record<string, unknown>;
+		}>(`SELECT action, correlation_id, subject_id, metadata FROM ${outbox.auditTable.qualifiedTable}
+			WHERE correlation_id='correlation_delivery_audit' ORDER BY sequence`);
+		expect(events.rows.map((event) => event.action)).toEqual([
+			"delivery.webhook.queued",
+			"delivery.webhook.delivered",
+		]);
+		expect(events.rows.every((event) => event.subject_id === jobId)).toBe(true);
+		expect(JSON.stringify(events.rows)).not.toContain("secret-destination");
+		expect(JSON.stringify(events.rows)).not.toContain("signing-secret");
 	});
 });
