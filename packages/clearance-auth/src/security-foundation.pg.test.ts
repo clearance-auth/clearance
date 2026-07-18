@@ -697,6 +697,12 @@ describe.sequential.skipIf(!available)(
 					},
 				});
 				await bundle.migrate();
+				// Recreate the pre-Unit-5B write boundary so legacy rows can be staged.
+				await scopedPool.query(`
+					DROP TRIGGER clearance_require_oidc_key_v1 ON "ssoProvider";
+					DROP TRIGGER clearance_require_scim_key_v1 ON "scimProvider";
+					DROP TRIGGER clearance_require_jwt_key_v1 ON jwks;
+				`);
 				const signup = await bundle.auth.api.signUpEmail({
 					body: {
 						email: `key-migration-${suffix}@example.test`,
@@ -842,6 +848,24 @@ describe.sequential.skipIf(!available)(
 						scimStored,
 					),
 				).rejects.toThrow();
+				await expect(
+					scopedPool.query(
+						`UPDATE "ssoProvider" SET "oidcConfig"=$2 WHERE "providerId"=$1`,
+						[oidcProviderId, legacyOidcConfig],
+					),
+				).rejects.toMatchObject({ code: "23514" });
+				await expect(
+					scopedPool.query(
+						`UPDATE "scimProvider" SET "scimToken"=$2 WHERE "providerId"=$1`,
+						[scimProviderId, legacyScim],
+					),
+				).rejects.toMatchObject({ code: "23514" });
+				await expect(
+					scopedPool.query(`UPDATE jwks SET "privateKey"=$2 WHERE id=$1`, [
+						`jwk-${suffix}`,
+						legacyJwk,
+					]),
+				).rejects.toMatchObject({ code: "23514" });
 
 				await bundle.migrate();
 				const repeated = (
