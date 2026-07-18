@@ -144,6 +144,40 @@ export const isTransactionActive = async (
 	}
 };
 
+/** Return the exact active transaction adapter owned by `adapter`, if any. */
+export const getActiveTransactionAdapter = async <
+	Options extends ClearanceOptions = ClearanceOptions,
+>(adapter: object): Promise<DBTransactionAdapter<Options> | null> => {
+	try {
+		const store = (await ensureAsyncStorage()).getStore();
+		const owner = findActiveTransactionContext(store, adapter);
+		return owner
+			? (owner.adapter as DBTransactionAdapter<Options>)
+			: null;
+	} catch {
+		return null;
+	}
+};
+
+/** True only when `adapter` belongs to an active rollback-capable transaction. */
+export const isRollbackCapableTransactionActive = async (
+	adapter: object,
+): Promise<boolean> => {
+	try {
+		const store = (await ensureAsyncStorage()).getStore();
+		const owner = findActiveTransactionContext(store, adapter);
+		const rootAdapter = owner?.rootAdapter as
+			| DBTransactionAdapter<ClearanceOptions>
+			| undefined;
+		return (
+			owner !== undefined &&
+			typeof rootAdapter?.options?.adapterConfig.transaction === "function"
+		);
+	} catch {
+		return false;
+	}
+};
+
 export const getCurrentAdapter = async <
 	Options extends ClearanceOptions = ClearanceOptions,
 >(
