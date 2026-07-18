@@ -1,6 +1,14 @@
 import type { ClearancePlugin } from "@clearance/runtime";
 import { authMiddlewareFactory } from "./middlewares";
 import {
+	createSCIMGroup,
+	deleteSCIMGroup,
+	getSCIMGroup,
+	listSCIMGroups,
+	patchSCIMGroup,
+	updateSCIMGroup,
+} from "./group-routes";
+import {
 	createSCIMUser,
 	deleteSCIMProviderConnection,
 	deleteSCIMUser,
@@ -55,6 +63,12 @@ export const scim = (options?: SCIMOptions) => {
 			deleteSCIMUser: deleteSCIMUser(authMiddleware),
 			updateSCIMUser: updateSCIMUser(authMiddleware),
 			listSCIMUsers: listSCIMUsers(authMiddleware),
+			getSCIMGroup: getSCIMGroup(authMiddleware),
+			createSCIMGroup: createSCIMGroup(authMiddleware),
+			patchSCIMGroup: patchSCIMGroup(authMiddleware),
+			deleteSCIMGroup: deleteSCIMGroup(authMiddleware),
+			updateSCIMGroup: updateSCIMGroup(authMiddleware),
+			listSCIMGroups: listSCIMGroups(authMiddleware),
 			getSCIMServiceProviderConfig,
 			getSCIMSchemas,
 			getSCIMSchema,
@@ -96,6 +110,17 @@ export const scim = (options?: SCIMOptions) => {
 								},
 							}
 						: {}),
+				},
+			},
+			scimGroup: {
+				fields: {
+					providerId: { type: "string", required: true },
+					organizationId: { type: "string", required: true },
+					teamId: { type: "string", required: true, unique: true },
+					externalId: { type: "string", required: false },
+					externalIdKey: { type: "string", required: false, unique: true, returned: false },
+					createdAt: { type: "date", required: true },
+					updatedAt: { type: "date", required: false },
 				},
 			},
 		},
