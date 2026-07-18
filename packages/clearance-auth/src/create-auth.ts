@@ -43,7 +43,7 @@ import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalAuthenticationPolicy } from "../../runtime/src/internal/authentication-policy.js";
 import { attachInternalAuthorizationAuthority } from "../../runtime/src/internal/authorization-authority.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
-import { attachCapturedInternalRuntimeAudit } from "../../runtime/src/internal/runtime-audit.js";
+import { attachCapturedInternalRuntimeAudit } from "@clearance/runtime/internal/runtime-audit";
 import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
 import { attachSSOInternalVerificationChallengeAuthority } from "../../sso/src/internal/verification-challenge-authority.js";
 import { attachSSOKeyManagementWriter } from "../../sso/src/internal/key-management-writer.js";
@@ -1175,7 +1175,15 @@ export function createClearanceAuth<
 	};
 
 	const plugins = [
-		organization(),
+		organization(options.enableScim !== false ? {
+			// SCIM Groups are the organization team authority. Do not create an
+			// unrelated default team for organizations provisioned by management.
+			teams: {
+				enabled: true,
+				defaultTeam: { enabled: false },
+				allowRemovingAllTeams: true,
+			},
+		} : undefined),
 		...(options.passkeys === false ? [] : [passkey(passkeyOptions)]),
 		...(authenticationSecurity.twoFactor.enabled
 			? [
