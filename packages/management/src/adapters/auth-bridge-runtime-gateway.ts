@@ -118,6 +118,10 @@ export function createAuthBridgeRuntimeGateway(input: {
 					actor: context.actor,
 					source: context.source,
 					scope: context.scope,
+					...(context.correlationId
+						? { correlationId: context.correlationId }
+						: {}),
+					webhookTargets,
 				}),
 		},
 		members: {
