@@ -208,6 +208,17 @@ describe("jwt session derivative authority", async () => {
 		};
 		const local = await getTestInstance(options);
 		const context = await local.auth.$context;
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		Object.assign(context.adapter, {
+			transaction: async (callback: any) =>
+				transaction(async (activeTransaction) =>
+					callback(
+						Object.assign(activeTransaction, {
+							rawTransactionQuery: async () => ({ rows: [], rowCount: 0 }),
+						}),
+					),
+				),
+		});
 		attachInternalAuthorizationAuthority(context.internalAdapter, {
 			async readEffectiveAuthorization(input) {
 				return {
@@ -217,6 +228,7 @@ describe("jwt session derivative authority", async () => {
 					actions: authorization.actions,
 				};
 			},
+			async initializeOrganizationOwner() {},
 		});
 
 		const signedIn = await local.signInWithTestUser();
