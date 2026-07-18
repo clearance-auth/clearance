@@ -120,6 +120,8 @@ export interface SAMLAssertionExtract {
 type BaseSSOProvider = {
 	issuer: string;
 	oidcConfig?: OIDCConfig | undefined;
+	keyManagementVersion?: number | undefined;
+	keyManagementRevision?: number | undefined;
 	samlConfig?: SAMLConfig | undefined;
 	userId: string;
 	providerId: string;
