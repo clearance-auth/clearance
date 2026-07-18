@@ -1042,6 +1042,9 @@ export function createClearanceAuth<
 							{
 								schema: options.durableDelivery!.schema,
 								prefix: options.durableDelivery!.prefix,
+								...(runtimeAuditOutbox
+									? { runtimeAudit: runtimeAuditOutbox.auditTable }
+									: {}),
 							},
 						);
 					},
