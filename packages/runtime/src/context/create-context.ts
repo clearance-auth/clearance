@@ -55,7 +55,7 @@ import {
 	attachCapturedInternalRuntimeAudit,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditBinding,
-} from "../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 
 function sameAuthenticationPolicyBinding(
 	left: InternalRuntimeAuthenticationPolicyBinding,
