@@ -89,6 +89,15 @@ import type {
 	WebhookEndpointUpdateResult,
 } from "../services/webhook-endpoints.js";
 import type {
+	AuthenticationPolicyApplyControlResult,
+	AuthenticationPolicyApplyInput,
+	AuthenticationPolicyGetResult,
+	AuthenticationPolicyPlanInput,
+	AuthenticationPolicyPlanResult,
+	AuthenticationUnlockControlResult,
+	AuthenticationUnlockInput,
+} from "../services/authentication-policy.js";
+import type {
 	DeliveryJobState,
 	DeliveryQuotaStatus,
 	DeliveryReadinessSummary,
@@ -390,6 +399,22 @@ export interface ManagementOperationTypes {
 	"delivery.webhook_endpoints.test": {
 		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
 		output: WebhookEndpointControlResult;
+	};
+	"authentication_policy.get": {
+		input: { organizationId?: string };
+		output: AuthenticationPolicyGetResult;
+	};
+	"authentication_policy.plan": {
+		input: AuthenticationPolicyPlanInput;
+		output: AuthenticationPolicyPlanResult;
+	};
+	"authentication_policy.apply": {
+		input: AuthenticationPolicyApplyInput & { dryRun?: boolean; confirm?: boolean };
+		output: AuthenticationPolicyApplyControlResult;
+	};
+	"authentication_policy.unlock": {
+		input: AuthenticationUnlockInput & { dryRun?: boolean; confirm?: boolean };
+		output: AuthenticationUnlockControlResult;
 	};
 	"config.get": {
 		input: { key?: string };
@@ -1155,6 +1180,41 @@ export const WEBHOOK_ENDPOINT_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const AUTHENTICATION_POLICY_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "authentication_policy.get",
+		cliPath: "auth-policy get",
+		http: { method: "GET", path: "/v1/authentication-policy" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "authentication_policy.plan",
+		cliPath: "auth-policy plan",
+		http: { method: "POST", path: "/v1/authentication-policy/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "authentication_policy.apply",
+		cliPath: "auth-policy apply",
+		http: { method: "PATCH", path: "/v1/authentication-policy" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	unlock: defineOperation({
+		id: "authentication_policy.unlock",
+		cliPath: "auth-policy unlock",
+		http: { method: "POST", path: "/v1/authentication-policy/unlock" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const CONFIG_OPERATIONS = Object.freeze({
 	get: defineOperation({
 		id: "config.get",
@@ -1598,6 +1658,7 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(READINESS_OPERATIONS),
 	...Object.values(DELIVERY_OPERATIONS),
 	...Object.values(WEBHOOK_ENDPOINT_OPERATIONS),
+	...Object.values(AUTHENTICATION_POLICY_OPERATIONS),
 	...Object.values(CONFIG_OPERATIONS),
 	...Object.values(IMPORT_OPERATIONS),
 	...Object.values(MIGRATION_OPERATIONS),
