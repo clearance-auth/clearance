@@ -35,6 +35,11 @@ function managedOrganizationOptions(
 	const options = {
 		plugins: [organization({ organizationHooks })],
 	} satisfies ClearanceOptions;
+	attachManagedOrganizationPolicy(options);
+	return options;
+}
+
+function attachManagedOrganizationPolicy(options: ClearanceOptions) {
 	attachInternalAuthenticationPolicy(options, {
 		identity: managedIdentity,
 		reader: {
@@ -70,7 +75,109 @@ function managedOrganizationOptions(
 			},
 		},
 	});
-	return options;
+}
+
+async function setupManagedSecondaryActiveOrganization(
+	organizationHooks?: OrganizationOptions["organizationHooks"],
+) {
+	const secondary = new Map<string, string>();
+	const organizationOptions = { organizationHooks };
+	const options = {
+		session: { storeSessionInDatabase: false },
+		secondaryStorage: {
+			namespace: "crud-members-managed-secondary",
+			get: async (key: string) => secondary.get(key) ?? null,
+			set: async (key: string, value: string) => {
+				secondary.set(key, value);
+			},
+			delete: async (key: string) => {
+				secondary.delete(key);
+			},
+		},
+		plugins: [organization(organizationOptions)],
+	} satisfies ClearanceOptions;
+	const fixture = await getTestInstance(options, {
+		clientOptions: { plugins: [organizationClient()] },
+	});
+	const owner = await fixture.signInWithTestUser();
+	const secondOwner = await fixture.auth.api.signUpEmail({
+		body: {
+			email: `managed-secondary-owner-${crypto.randomUUID()}@test.com`,
+			name: "owner",
+			password: "password",
+		},
+	});
+	const context = await fixture.auth.$context;
+	const organizationId = `managed-secondary-${crypto.randomUUID()}`;
+	const memberId = `managed-secondary-member-${crypto.randomUUID()}`;
+	await context.adapter.create({
+		model: "organization",
+		data: {
+			id: organizationId,
+			name: "Managed secondary organization",
+			slug: organizationId,
+			logo: null,
+			metadata: null,
+			createdAt: new Date(),
+		},
+		forceAllowId: true,
+	});
+	await context.adapter.create({
+		model: "member",
+		data: {
+			id: memberId,
+			organizationId,
+			userId: owner.user.id,
+			role: "owner",
+			createdAt: new Date(),
+		},
+		forceAllowId: true,
+	});
+	const secondMemberId = `managed-secondary-second-owner-${crypto.randomUUID()}`;
+	await context.adapter.create({
+		model: "member",
+		data: {
+			id: secondMemberId,
+			organizationId,
+			userId: secondOwner.user.id,
+			role: "owner",
+			createdAt: new Date(),
+		},
+		forceAllowId: true,
+	});
+	const sourceBeforeTransition = await fixture.auth.api.getSession({
+		headers: owner.headers,
+	});
+	if (!sourceBeforeTransition) throw new Error("Managed source session missing");
+	const sourceRecord = [...secondary.entries()].find(([, value]) => {
+		try {
+			return JSON.parse(value)?.session?.id === sourceBeforeTransition.session.id;
+		} catch {
+			return false;
+		}
+	});
+	if (!sourceRecord) throw new Error("Managed secondary source record missing");
+	const [sourceRecordKey, sourceRecordValue] = sourceRecord;
+	const sourceRecordData = JSON.parse(sourceRecordValue) as {
+		session: Record<string, unknown>;
+		user: { id: string };
+	};
+	sourceRecordData.session.activeOrganizationId = organizationId;
+	secondary.set(sourceRecordKey, JSON.stringify(sourceRecordData));
+	attachManagedOrganizationPolicy(options);
+	attachManagedOrganizationPolicy(context.options);
+	return {
+		...fixture,
+		context,
+		headers: owner.headers,
+		memberId,
+		secondMemberId,
+		organizationId,
+		organizationOptions,
+		owner,
+		secondary,
+		source: sourceBeforeTransition,
+	};
 }
 
 describe("listMembers", async () => {
@@ -739,6 +846,221 @@ describe("updateMemberRole", async () => {
 });
 
 describe("member removal session authority", () => {
+	it("rejects managed secondary active self-removal through the authenticated endpoint before hooks, cookies, or mutation", async () => {
+		const beforeRemoveMember = vi.fn();
+		const afterRemoveMember = vi.fn();
+		const {
+			auth,
+			context,
+			headers,
+			memberId,
+			organizationId,
+			secondary,
+			source,
+		} = await setupManagedSecondaryActiveOrganization({
+			beforeRemoveMember,
+			afterRemoveMember,
+		});
+		const secondaryBefore = [...secondary.entries()].sort();
+		const activeSession = {
+			...source.session,
+			activeOrganizationId: organizationId,
+		};
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: activeSession,
+		});
+		const response = await auth.api.removeMember({
+			body: { organizationId, memberIdOrEmail: memberId },
+			headers,
+			asResponse: true,
+		});
+
+		expect(response.status).toBe(500);
+		expect(await response.clone().json()).toMatchObject({
+			code: "MANAGED_ORGANIZATION_SECONDARY_SESSION_TRANSITION_UNSUPPORTED",
+		});
+		expect(response.headers.get("set-cookie")).toBeNull();
+		expect(beforeRemoveMember).not.toHaveBeenCalled();
+		expect(afterRemoveMember).not.toHaveBeenCalled();
+		expect(await context.adapter.findOne({
+			model: "member",
+			where: [{ field: "id", value: memberId }],
+		})).not.toBeNull();
+		expect([...secondary.entries()].sort()).toEqual(secondaryBefore);
+		const sourceAfter = await auth.api.getSession({ headers });
+		expect(sourceAfter?.session).toMatchObject({
+			id: source.session.id,
+			activeOrganizationId: organizationId,
+		});
+	});
+
+	it("rejects managed secondary active leave through the authenticated endpoint before hooks, cookies, or mutation", async () => {
+		const beforeRemoveMember = vi.fn();
+		const afterRemoveMember = vi.fn();
+		const {
+			auth,
+			context,
+			headers,
+			memberId,
+			organizationId,
+			secondary,
+			source,
+		} = await setupManagedSecondaryActiveOrganization({
+			beforeRemoveMember,
+			afterRemoveMember,
+		});
+		const secondaryBefore = [...secondary.entries()].sort();
+		const activeSession = {
+			...source.session,
+			activeOrganizationId: organizationId,
+		};
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: activeSession,
+		});
+		const response = await auth.api.leaveOrganization({
+			body: { organizationId },
+			headers,
+			asResponse: true,
+		});
+
+		expect(response.status).toBe(500);
+		expect(await response.clone().json()).toMatchObject({
+			code: "MANAGED_ORGANIZATION_SECONDARY_SESSION_TRANSITION_UNSUPPORTED",
+		});
+		expect(response.headers.get("set-cookie")).toBeNull();
+		expect(beforeRemoveMember).not.toHaveBeenCalled();
+		expect(afterRemoveMember).not.toHaveBeenCalled();
+		expect(await context.adapter.findOne({
+			model: "member",
+			where: [{ field: "id", value: memberId }],
+		})).not.toBeNull();
+		expect([...secondary.entries()].sort()).toEqual(secondaryBefore);
+		const sourceAfter = await auth.api.getSession({ headers });
+		expect(sourceAfter?.session).toMatchObject({
+			id: source.session.id,
+			activeOrganizationId: organizationId,
+		});
+	});
+
+	it("preserves member-not-found precedence for stale active managed-secondary memberships", async () => {
+		const {
+			auth,
+			context,
+			headers,
+			memberId,
+			organizationId,
+			secondary,
+			source,
+		} = await setupManagedSecondaryActiveOrganization();
+		await context.adapter.delete({
+			model: "member",
+			where: [{ field: "id", value: memberId }],
+		});
+		const secondaryBefore = [...secondary.entries()].sort();
+		const removeResponse = await auth.api.removeMember({
+			body: { organizationId, memberIdOrEmail: memberId },
+			headers,
+			asResponse: true,
+		});
+		const leaveResponse = await auth.api.leaveOrganization({
+			body: { organizationId },
+			headers,
+			asResponse: true,
+		});
+
+		for (const response of [removeResponse, leaveResponse]) {
+			expect(response.status).toBe(400);
+			expect(await response.clone().json()).toMatchObject({
+				code: ORGANIZATION_ERROR_CODES.MEMBER_NOT_FOUND.code,
+			});
+			expect(response.headers.get("set-cookie")).toBeNull();
+		}
+		expect([...secondary.entries()].sort()).toEqual(secondaryBefore);
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: {
+				id: source.session.id,
+				activeOrganizationId: organizationId,
+			},
+		});
+	});
+
+	it("preserves sole-owner precedence for active managed-secondary departures", async () => {
+		const {
+			auth,
+			context,
+			headers,
+			memberId,
+			organizationId,
+			secondMemberId,
+			secondary,
+			source,
+		} = await setupManagedSecondaryActiveOrganization();
+		await context.adapter.delete({
+			model: "member",
+			where: [{ field: "id", value: secondMemberId }],
+		});
+		const secondaryBefore = [...secondary.entries()].sort();
+		const removeResponse = await auth.api.removeMember({
+			body: { organizationId, memberIdOrEmail: memberId },
+			headers,
+			asResponse: true,
+		});
+		const leaveResponse = await auth.api.leaveOrganization({
+			body: { organizationId },
+			headers,
+			asResponse: true,
+		});
+
+		for (const response of [removeResponse, leaveResponse]) {
+			expect(response.status).toBe(400);
+			expect(await response.clone().json()).toMatchObject({
+				code:
+					ORGANIZATION_ERROR_CODES
+						.YOU_CANNOT_LEAVE_THE_ORGANIZATION_AS_THE_ONLY_OWNER.code,
+			});
+			expect(response.headers.get("set-cookie")).toBeNull();
+		}
+		expect(await context.adapter.findOne({
+			model: "member",
+			where: [{ field: "id", value: memberId }],
+		})).not.toBeNull();
+		expect([...secondary.entries()].sort()).toEqual(secondaryBefore);
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: {
+				id: source.session.id,
+				activeOrganizationId: organizationId,
+			},
+		});
+	});
+
+	it("allows managed-secondary removal when it does not remove the active member", async () => {
+		const {
+			auth,
+			context,
+			headers,
+			organizationId,
+			secondMemberId,
+			source,
+		} = await setupManagedSecondaryActiveOrganization();
+		const response = await auth.api.removeMember({
+			body: { organizationId, memberIdOrEmail: secondMemberId },
+			headers,
+			asResponse: true,
+		});
+
+		expect(response.status).toBe(200);
+		expect(await context.adapter.findOne({
+			model: "member",
+			where: [{ field: "id", value: secondMemberId }],
+		})).toBeNull();
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: {
+				id: source.session.id,
+				activeOrganizationId: organizationId,
+			},
+		});
+	});
+
 	it("rejects removal when the target changes during beforeRemoveMember", async () => {
 		let release!: () => void;
 		let entered!: () => void;
