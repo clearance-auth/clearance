@@ -41,6 +41,7 @@ import {
 } from "../../runtime/src/plugins/index.js";
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalAuthenticationPolicy } from "../../runtime/src/internal/authentication-policy.js";
+import { attachInternalAuthorizationAuthority } from "../../runtime/src/internal/authorization-authority.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
 import { attachCapturedInternalRuntimeAudit } from "../../runtime/src/internal/runtime-audit.js";
 import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
@@ -60,9 +61,16 @@ import {
 	bootstrapCredentialAuthorityFence,
 } from "./credential-authority-fence.js";
 import { PostgresAuthenticationPolicyAuthority } from "./authentication-policy-authority.js";
+import { PostgresAuthorizationAuthority } from "./authorization-authority.js";
 import { createRuntimeAuditOutbox } from "./runtime-audit.js";
 import type {
 	ClearanceAuthBundle,
+	ClearanceAuthorizationFacade,
+	ClearanceAuthorizationAffectedRevision,
+	ClearanceAuthorizationAssignment,
+	ClearanceAuthorizationReadResult,
+	ClearanceAuthorizationRole,
+	ClearanceAuthorizationSubject,
 	ClearanceAuthenticationAssuranceLevel,
 	ClearanceAuthenticationPolicy,
 	ClearanceAuthenticationPolicyApplyResult,
@@ -302,20 +310,25 @@ function resolveProductKeyManagement<
 			"Production requires an explicit keyManagement signingProvider",
 		);
 	}
-	const inferredScope = options.authenticationPolicy ?? options.durableDelivery;
+	const inferredScope =
+		options.authenticationPolicy ?? options.durableDelivery ?? options.authorization;
 	const projectId = explicit?.projectId ?? inferredScope?.projectId ?? "development";
 	const environmentId =
 		explicit?.environmentId ?? inferredScope?.environmentId ?? "development";
 	if (!projectId.trim() || !environmentId.trim()) {
 		throw new Error("keyManagement projectId and environmentId are required");
 	}
-	for (const scoped of [options.authenticationPolicy, options.durableDelivery]) {
+	for (const scoped of [
+		options.authenticationPolicy,
+		options.durableDelivery,
+		options.authorization,
+	]) {
 		if (
 			scoped &&
 			(scoped.projectId !== projectId || scoped.environmentId !== environmentId)
 		) {
 			throw new Error(
-				"keyManagement scope must match authentication policy and durable delivery scope",
+				"keyManagement scope must match every managed product scope",
 			);
 		}
 	}
@@ -362,6 +375,7 @@ function resolveRuntimeAuditScope<
 		options.authenticationPolicy,
 		options.keyManagement,
 		options.durableDelivery,
+		options.authorization,
 	].filter((scope): scope is { projectId: string; environmentId: string } => Boolean(scope));
 	if (explicit) scopes.push(explicit);
 	if (scopes.length === 0) return undefined;
@@ -384,6 +398,12 @@ function resolveRuntimeAuditScope<
 
 export type {
 	ClearanceAuthBundle,
+	ClearanceAuthorizationFacade,
+	ClearanceAuthorizationAffectedRevision,
+	ClearanceAuthorizationAssignment,
+	ClearanceAuthorizationReadResult,
+	ClearanceAuthorizationRole,
+	ClearanceAuthorizationSubject,
 	ClearanceAuthenticationAssuranceLevel,
 	ClearanceAuthenticationPolicy,
 	ClearanceAuthenticationPolicyApplyResult,
@@ -932,6 +952,19 @@ export function createClearanceAuth<
 			"authenticationPolicy requires credentialAuthority.generation to be digest-v1",
 		);
 	}
+	if (options.authorization && !options.authenticationPolicy) {
+		throw new Error(
+			"authorization requires authenticationPolicy for revision-bound session claims",
+		);
+	}
+	if (
+		options.authorization &&
+		!authenticationSecurity.asymmetricAccessTokens.enabled
+	) {
+		throw new Error(
+			"authorization requires asymmetric access tokens for revision-bound action claims",
+		);
+	}
 	if (
 		options.authenticationPolicy &&
 		authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds >
@@ -946,6 +979,9 @@ export function createClearanceAuth<
 	const runtimeAuditScope = resolveRuntimeAuditScope(options, strict);
 	const runtimeAuditOutbox = runtimeAuditScope
 		? createRuntimeAuditOutbox(pool, runtimeAuditScope)
+		: null;
+	const authorizationAuthority = options.authorization
+		? new PostgresAuthorizationAuthority(pool, options.authorization)
 		: null;
 	const authenticationPolicyAuthority = options.authenticationPolicy
 		? new PostgresAuthenticationPolicyAuthority(
@@ -1067,6 +1103,38 @@ export function createClearanceAuth<
 			attachInternalAuthenticationPolicy(target, {
 				identity: authenticationPolicyAuthority.identity,
 				reader: authenticationPolicyAuthority,
+			});
+		}
+		if (authorizationAuthority) {
+			attachInternalAuthorizationAuthority(target, {
+				async readEffectiveAuthorization(input) {
+					const effective = await authorizationAuthority.readEffective(input);
+					return Object.freeze({
+						organizationId: effective.organizationId,
+						subject: Object.freeze({
+							kind: "principal" as const,
+							id: effective.subject.id,
+						}),
+						revision: effective.revision,
+						actions: effective.actions,
+					});
+				},
+				async initializeOrganizationOwner(input) {
+					const revision = await authorizationAuthority.initializeOrganization({
+						organizationId: input.organizationId,
+						transaction: input.transaction,
+					});
+					await authorizationAuthority.replaceSubjectRoles({
+						organizationId: input.organizationId,
+						subject: {
+							kind: "principal",
+							id: input.ownerPrincipalId,
+						},
+						roleIds: ["role_builtin_owner"],
+						expectedRevision: revision.revision,
+						transaction: input.transaction,
+					});
+				},
 			});
 		}
 		if (runtimeAuditOutbox) {
@@ -1460,12 +1528,18 @@ export function createClearanceAuth<
 		migrationDatabase = database,
 		migrationDrainId?: string,
 	): Promise<ClearanceRuntimeMigrationPlan> {
-		const [runtimePlan, policyPlan, auditPlan] = await Promise.all([
+		const [runtimePlan, policyPlan, auditPlan, authorizationPlan] = await Promise.all([
 			runtimeMigrationPlanFor(migrationDatabase, migrationDrainId),
 			authenticationPolicyAuthority?.planMigration(),
 			runtimeAuditOutbox?.planMigration(),
+			authorizationAuthority?.planMigration(),
 		]);
-		return combineMigrationPlans(runtimePlan, policyPlan, auditPlan);
+		return combineMigrationPlans(
+			runtimePlan,
+			policyPlan,
+			auditPlan,
+			authorizationPlan,
+		);
 	}
 
 	async function inspectPreFenceCredentialSchema(): Promise<{
@@ -2912,6 +2986,24 @@ export function createClearanceAuth<
 				unlock: authenticationPolicyAuthority.unlock.bind(authenticationPolicyAuthority),
 			})
 		: undefined;
+	const authorizationFacade: ClearanceAuthorizationFacade | undefined =
+		authorizationAuthority
+			? Object.freeze({
+					scope: authorizationAuthority.identity,
+					readEffective:
+						authorizationAuthority.readEffective.bind(authorizationAuthority),
+					initializeOrganization:
+						authorizationAuthority.initializeOrganization.bind(authorizationAuthority),
+					upsertRole:
+						authorizationAuthority.upsertRole.bind(authorizationAuthority),
+					replaceSubjectRoles:
+						authorizationAuthority.replaceSubjectRoles.bind(authorizationAuthority),
+					listRoles:
+						authorizationAuthority.listRoles.bind(authorizationAuthority),
+					listSubjectAssignments:
+						authorizationAuthority.listSubjectAssignments.bind(authorizationAuthority),
+				})
+			: undefined;
 	const passwordSetupFacade = Object.freeze({
 		async create(input: { userId: string; token: string; expiresAt: Date }) {
 			const identifier = `reset-password:${input.token}`;
@@ -2937,6 +3029,7 @@ export function createClearanceAuth<
 		...(authenticationPolicyFacade
 			? { authenticationPolicy: authenticationPolicyFacade }
 			: {}),
+		...(authorizationFacade ? { authorization: authorizationFacade } : {}),
 		passwordSetup: passwordSetupFacade,
 		plugins: {
 			organization: true,
@@ -2954,18 +3047,25 @@ export function createClearanceAuth<
 		async migrate(input) {
 			const preFenceSchema = await inspectPreFenceCredentialSchema();
 			await bootstrapCredentialAuthorityFence(pool);
-			const [runtimePlan, policyPlan, auditPlan] = await Promise.all([
+			const [runtimePlan, policyPlan, auditPlan, authorizationPlan] = await Promise.all([
 				runtimeMigrationPlanFor(),
 				authenticationPolicyAuthority?.planMigration(),
 				runtimeAuditOutbox?.planMigration(),
+				authorizationAuthority?.planMigration(),
 			]);
-			const plan = combineMigrationPlans(runtimePlan, policyPlan, auditPlan);
+			const plan = combineMigrationPlans(
+				runtimePlan,
+				policyPlan,
+				auditPlan,
+				authorizationPlan,
+			);
 			const apply = async () => {
 				await runtimePlan.apply();
 				await ensureAuthenticationSecurityCompatibility();
 				await ensureLifecycleCompatibility();
 				await ensurePurposeSeparatedCredentialCompatibility();
 				await auditPlan?.apply();
+				await authorizationPlan?.apply();
 				if (options.durableDelivery) {
 					await migrateDeliverySchema(pool, {
 						schema: options.durableDelivery.schema,
@@ -3029,6 +3129,7 @@ export function createClearanceAuth<
 							if (runtimeAuditOutbox) {
 								await runtimeAuditOutbox.applyMigration(leaseClient);
 							}
+							await authorizationPlan?.apply();
 							if (options.durableDelivery) {
 								await migrateDeliverySchema(pool, {
 									schema: options.durableDelivery.schema,
