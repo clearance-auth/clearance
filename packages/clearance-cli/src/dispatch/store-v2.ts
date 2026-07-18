@@ -104,5 +104,29 @@ export async function dispatchStoreV2Command({
 				path: STORE_V2_OPERATIONS.principalsRollback.http.path,
 				body: { confirm: true },
 			});
+		case STORE_V2_OPERATIONS.topologyCutover.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_TOPOLOGY_CUTOVER_CONFIRMATION_REQUIRED",
+				"Store-v2 topology cutover",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.topologyCutover.http.method,
+				path: STORE_V2_OPERATIONS.topologyCutover.http.path,
+				body: { confirm: true },
+			});
+		case STORE_V2_OPERATIONS.topologyRollback.cliPath:
+			requireRemoteMutation(global, path);
+			requireConfirmation(
+				global,
+				"STORE_V2_TOPOLOGY_ROLLBACK_CONFIRMATION_REQUIRED",
+				"Store-v2 topology rollback",
+			);
+			return requestManagementApi(session, {
+				method: STORE_V2_OPERATIONS.topologyRollback.http.method,
+				path: STORE_V2_OPERATIONS.topologyRollback.http.path,
+				body: { confirm: true },
+			});
 	}
 }
