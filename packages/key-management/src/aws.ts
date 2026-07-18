@@ -35,6 +35,10 @@ const MAX_RETAINED_KEYS = 64;
 const MAX_PLAINTEXT_BYTES = 4_096;
 const MAX_CIPHERTEXT_BYTES = 8_192;
 const CANONICAL_BASE64URL = /^[A-Za-z0-9_-]+$/;
+const RAW_AWS_KEY_ID =
+	/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/;
+const AWS_KEY_ARN =
+	/^arn:(?:aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b):kms:[a-z0-9-]{1,64}:[0-9]{12}:key\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/;
 
 export type AwsKmsKeyProviderOptions = Readonly<{
 	providerId: string;
@@ -61,6 +65,16 @@ function validateRegion(value: unknown): string {
 		/[\u0000-\u001f\u007f]/.test(value)
 	) {
 		return invalidOptions("AWS KMS region is invalid");
+	}
+	return value;
+}
+
+function validateAwsKeyId(value: unknown): string {
+	if (
+		typeof value !== "string" ||
+		(!RAW_AWS_KEY_ID.test(value) && !AWS_KEY_ARN.test(value))
+	) {
+		return invalidOptions("AWS KMS key id must be an immutable key ARN or raw key id");
 	}
 	return value;
 }
@@ -134,12 +148,7 @@ function validateKeyIds(
 	const seen = new Set<string>([current]);
 	const validated: string[] = [];
 	for (const raw of retained ?? []) {
-		let keyId: string;
-		try {
-			keyId = validateProviderIdentifier(raw, "retainedKeyId");
-		} catch {
-			return invalidOptions("AWS KMS retained key id is invalid");
-		}
+		const keyId = validateAwsKeyId(raw);
 		if (seen.has(keyId)) {
 			return invalidOptions("AWS KMS key ids must be unique");
 		}
@@ -183,10 +192,10 @@ export function createAwsKmsKeyProvider(
 	let currentKeyId: string;
 	try {
 		providerId = validateProviderIdentifier(options.providerId, "providerId");
-		currentKeyId = validateProviderIdentifier(options.currentKeyId, "currentKeyId");
 	} catch {
-		return invalidOptions("AWS KMS provider identity or current key id is invalid");
+		return invalidOptions("AWS KMS provider identity is invalid");
 	}
+	currentKeyId = validateAwsKeyId(options.currentKeyId);
 	const purpose = validateKeyPurpose(options.purpose);
 	const retainedKeyIds = validateKeyIds(currentKeyId, options.retainedKeyIds);
 	const region = validateRegion(options.region);
