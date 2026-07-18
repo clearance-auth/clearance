@@ -165,6 +165,34 @@ describe("API Idempotency-Key", () => {
 		});
 	});
 
+	it("omits only service-account credential secrets from create and rotate replays", async () => {
+		const { idempotencyReplayBody } = await import("./server.js");
+		const credential = {
+			organizationId: "org_1",
+			serviceAccountId: "svc_1",
+			credentialId: "cred_1",
+			credentialPrefix: "clr_sac_v1_abc",
+			credentialFingerprint: "fingerprint",
+			expiresAt: null,
+			version: 2,
+		};
+		for (const path of [
+			"/v1/organizations/org_1/service-accounts/svc_1/credentials",
+			"/v1/organizations/org_1/service-accounts/svc_1/credentials/cred_1/rotate",
+		]) {
+			const replayBody = idempotencyReplayBody(
+				path,
+				JSON.stringify({ credential, secret: "clr_sac_v1_one_time", revision: "9", scope: { projectId: "proj_1" } }),
+			);
+			expect(JSON.parse(replayBody ?? "null")).toEqual({
+				credential,
+				revision: "9",
+				scope: { projectId: "proj_1" },
+				oneTimeSecretsOmitted: ["secret"],
+			});
+		}
+	});
+
 	it("omits every API-key, setup-link, and SCIM one-time secret from replay", async () => {
 		const app = await loadApp();
 		const orgResponse = await app.request("/v1/organizations", {
