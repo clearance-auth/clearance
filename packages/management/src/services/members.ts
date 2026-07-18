@@ -136,14 +136,44 @@ export function assertOwnerInvariant(
 export function listMembers(
 	store: ManagementSnapshotReader,
 	organizationId: string,
-	opts?: { scope?: ResourceScope; includeRemoved?: boolean },
+	opts?: {
+		scope?: ResourceScope;
+		includeRemoved?: boolean;
+		/** A caller-provided authoritative organization avoids a stale snapshot gate. */
+		organization?: Organization;
+	},
 ): Membership[] {
-	const org = requireOrganization(
+	const org = opts?.organization ?? requireOrganization(
 		store,
 		organizationId,
 		opts?.scope,
 		"orgs.members.list",
 	);
+	if (opts?.organization) {
+		if (org.status === "archived") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.members.list",
+				status: 404,
+			});
+		}
+		if (opts.scope) {
+			assertResourceInScope(org, opts.scope, {
+				code: "ORG_NOT_FOUND",
+				stage: "orgs.members.list",
+				label: "Organization",
+			});
+		}
+	}
+	if (org.id !== organizationId) {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage: "orgs.members.list",
+			status: 404,
+		});
+	}
 	return store.snapshot.memberships.filter((m) => {
 		if (m.organizationId !== org.id) return false;
 		if (!opts?.includeRemoved && m.status !== "active") return false;
@@ -155,6 +185,7 @@ export function inspectMembership(
 	store: ManagementSnapshotReader,
 	id: string,
 	scope?: ResourceScope,
+	organization?: Organization,
 ): Membership {
 	const stage = "orgs.members.inspect";
 	const membership = store.snapshot.memberships.find((m) => m.id === id);
@@ -168,7 +199,37 @@ export function inspectMembership(
 	}
 	// Scope via parent organization — foreign org ids fail as membership not found
 	try {
-		requireOrganization(store, membership.organizationId, scope, stage);
+		const parent = organization ?? requireOrganization(
+			store,
+			membership.organizationId,
+			scope,
+			stage,
+		);
+		if (organization) {
+			if (parent.status === "archived") {
+				throw new ClearanceError({
+					code: "ORG_NOT_FOUND",
+					message: "Organization not found",
+					stage,
+					status: 404,
+				});
+			}
+			if (scope) {
+				assertResourceInScope(parent, scope, {
+					code: "ORG_NOT_FOUND",
+					stage,
+					label: "Organization",
+				});
+			}
+		}
+		if (parent.id !== membership.organizationId) {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage,
+				status: 404,
+			});
+		}
 	} catch (e) {
 		if (e instanceof ClearanceError && e.code === "ORG_NOT_FOUND") {
 			throw new ClearanceError({
