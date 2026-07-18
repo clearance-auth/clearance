@@ -25,7 +25,7 @@ import {
 	attachCapturedInternalRuntimeAudit,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditBinding,
-} from "../internal/runtime-audit";
+} from "@clearance/runtime/internal/runtime-audit";
 import { isPromise } from "../utils/is-promise";
 import {
 	getBaseURL,
