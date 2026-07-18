@@ -718,9 +718,9 @@ export async function insertSsoProvider(input: {
 	try {
 		await b.pool.query(
 			`insert into "ssoProvider" (
-      id, issuer, "oidcConfig", "samlConfig", "userId", "providerId",
-      "organizationId", domain
-    ) values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			  id, issuer, "oidcConfig", "samlConfig", "userId", "providerId",
+			  "organizationId", domain, "keyManagementVersion", "keyManagementRevision"
+			) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 			[
 				id,
 				input.issuer,
@@ -730,6 +730,8 @@ export async function insertSsoProvider(input: {
 				input.providerId,
 				input.organizationId ?? null,
 				input.domain,
+				input.oidc ? 1 : null,
+				input.oidc ? 1 : null,
 			],
 		);
 	} catch (err) {
@@ -899,8 +901,10 @@ export async function insertScimProvider(input: {
 
 	try {
 		await b.pool.query(
-			`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
-     values ($1,$2,$3,$4)`,
+			`insert into "scimProvider" (
+			  id, "providerId", "scimToken", "organizationId",
+			  "keyManagementVersion", "keyManagementRevision"
+			) values ($1,$2,$3,$4,1,1)`,
 			[id, input.providerId, storedToken, input.organizationId ?? null],
 		);
 	} catch (err) {
