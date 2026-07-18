@@ -99,7 +99,7 @@ resource "docker_container" "api" {
   name    = "${var.name_prefix}-api"
   image   = docker_image.clearance.image_id
   restart = "unless-stopped"
-  command = ["node", "packages/clearance-api/dist/server.js"]
+  command = ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/clearance-api/dist/server.js"]
 
   env = [
     "NODE_ENV=production",
