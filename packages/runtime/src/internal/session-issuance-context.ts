@@ -9,6 +9,10 @@ import type {
 	SessionAssuranceRequirement,
 	ValidatedSessionAssuranceFields,
 } from "../security/session-assurance";
+import {
+	validateInternalSessionDerivativeAuthority,
+	type InternalSessionDerivativeAuthority,
+} from "./session-derivative-authority";
 
 const PRIMARY_METHODS = new Set<AuthenticationPrimaryMethod>([
 	"password",
@@ -31,13 +35,28 @@ const FACTOR_METHODS = new Set<AuthenticationFactorMethod>([
 
 export type InternalSessionIssuanceContext =
 	| Readonly<{
-			purpose: "interactive" | "impersonation";
+			purpose: "interactive";
 			subjectId: string;
 			evidence: readonly VerifiedAuthenticationEvidence[];
 			targetOrganizationId: string | null;
 	  }>
 	| Readonly<{
-			purpose: "replacement" | "device" | "organization";
+			purpose: "replacement" | "organization";
+			sourceSessionToken: string;
+			targetOrganizationId: string | null;
+	  }>
+	| Readonly<{
+			purpose: "device";
+			subjectId: string;
+			sourceSessionDerivativeAuthority: string;
+			targetOrganizationId: string | null;
+	  }>
+	| Readonly<{
+			purpose: "impersonation";
+			subjectId: string;
+			evidence: readonly [
+				Readonly<{ kind: "primary"; primaryMethod: "admin_impersonation" }>,
+			];
 			sourceSessionToken: string;
 			targetOrganizationId: string | null;
 	  }>;
@@ -62,8 +81,9 @@ export type CapturedSessionIssuanceAuthority = Readonly<{
 type SessionIssuanceCaptureAuthority = (
 	context: Extract<
 		InternalSessionIssuanceContext,
-		{ purpose: "replacement" | "device" | "organization" }
+		{ purpose: "replacement" | "device" | "organization" | "impersonation" }
 	>,
+	derivativeAuthority?: InternalSessionDerivativeAuthority,
 ) => Promise<CapturedSessionIssuanceAuthority>;
 
 export class ManagedSessionIssuanceError extends Error {
@@ -205,6 +225,24 @@ function evidence(value: unknown): readonly VerifiedAuthenticationEvidence[] {
 	);
 }
 
+function impersonationEvidence(
+	value: unknown,
+): readonly [
+	Readonly<{ kind: "primary"; primaryMethod: "admin_impersonation" }>,
+] {
+	const normalized = evidence(value);
+	if (
+		normalized.length !== 1 ||
+		normalized[0]?.kind !== "primary" ||
+		normalized[0].primaryMethod !== "admin_impersonation"
+	) {
+		invalid();
+	}
+	return normalized as readonly [
+		Readonly<{ kind: "primary"; primaryMethod: "admin_impersonation" }>,
+	];
+}
+
 export function createInternalSessionIssuanceContext(
 	value: unknown,
 ): SessionIssuanceContext {
@@ -212,10 +250,11 @@ export function createInternalSessionIssuanceContext(
 		"subjectId",
 		"evidence",
 		"sourceSessionToken",
+		"sourceSessionDerivativeAuthority",
 		"targetOrganizationId",
 	]);
 	let normalized: InternalSessionIssuanceContext;
-	if (base.purpose === "interactive" || base.purpose === "impersonation") {
+	if (base.purpose === "interactive") {
 		const input = exactObject(value, ["purpose", "subjectId", "evidence"], [
 			"targetOrganizationId",
 		]);
@@ -227,11 +266,7 @@ export function createInternalSessionIssuanceContext(
 				input.targetOrganizationId,
 			),
 		});
-	} else if (
-		base.purpose === "replacement" ||
-		base.purpose === "device" ||
-		base.purpose === "organization"
-	) {
+	} else if (base.purpose === "replacement" || base.purpose === "organization") {
 		const input = exactObject(value, ["purpose", "sourceSessionToken"], [
 			"targetOrganizationId",
 		]);
@@ -241,6 +276,37 @@ export function createInternalSessionIssuanceContext(
 			targetOrganizationId: targetOrganizationId(
 				input.targetOrganizationId,
 			),
+		});
+	} else if (base.purpose === "device") {
+		const input = exactObject(value, [
+			"purpose",
+			"subjectId",
+			"sourceSessionDerivativeAuthority",
+			"targetOrganizationId",
+		]);
+		normalized = Object.freeze({
+			purpose: "device",
+			subjectId: identifier(input.subjectId),
+			sourceSessionDerivativeAuthority: identifier(
+				input.sourceSessionDerivativeAuthority,
+				4_096,
+			),
+			targetOrganizationId: targetOrganizationId(input.targetOrganizationId),
+		});
+	} else if (base.purpose === "impersonation") {
+		const input = exactObject(value, [
+			"purpose",
+			"subjectId",
+			"evidence",
+			"sourceSessionToken",
+			"targetOrganizationId",
+		]);
+		normalized = Object.freeze({
+			purpose: "impersonation",
+			subjectId: identifier(input.subjectId),
+			evidence: impersonationEvidence(input.evidence),
+			sourceSessionToken: identifier(input.sourceSessionToken, 4_096),
+			targetOrganizationId: targetOrganizationId(input.targetOrganizationId),
 		});
 	} else {
 		return invalid();
@@ -268,7 +334,8 @@ export async function captureInternalSessionIssuanceContext(
 		!context ||
 		(context.purpose !== "replacement" &&
 			context.purpose !== "device" &&
-			context.purpose !== "organization")
+			context.purpose !== "organization" &&
+			context.purpose !== "impersonation")
 	) {
 		contexts.delete(opaque as object);
 		invalid();
@@ -279,7 +346,23 @@ export async function captureInternalSessionIssuanceContext(
 		return undefined;
 	}
 	try {
-		const authority = await capture(context);
+		const derivativeAuthority =
+			context.purpose === "device"
+				? await validateInternalSessionDerivativeAuthority(
+						internalAdapter,
+						context.sourceSessionDerivativeAuthority,
+						{
+							purpose: "device",
+							subjectId: context.subjectId,
+							organizationId: context.targetOrganizationId,
+						},
+					)
+				: undefined;
+		if (context.purpose === "device" && !derivativeAuthority) {
+			contexts.delete(opaque as object);
+			return undefined;
+		}
+		const authority = await capture(context, derivativeAuthority);
 		capturedAuthorities.set(opaque as object, authority);
 		return opaque;
 	} catch (error) {
