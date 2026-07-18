@@ -12,6 +12,8 @@ const IDENTIFIER_MAX = 63;
 export type DeliverySchemaOptions = {
 	schema?: string;
 	prefix?: string;
+	/** Product-owned append-only authority. Delivery never creates or repairs it. */
+	runtimeAudit?: import("./runtime-audit.js").RuntimeAuditTable;
 	/**
 	 * Fingerprint key id active when an owned v1/v2 schema last accepted rows.
 	 * Required only while upgrading legacy rows; migrate before rotating that key.
