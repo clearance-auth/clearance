@@ -599,6 +599,7 @@ export const updateSSOProvider = (options: SSOOptions) => {
 						existingProvider.oidcConfig,
 						"OIDC",
 					),
+					existingProvider.providerId,
 					options,
 				);
 
@@ -615,7 +616,11 @@ export const updateSSOProvider = (options: SSOOptions) => {
 				}
 
 				updateData.oidcConfig = JSON.stringify(
-					await encryptOIDCConfig(updatedOidcConfig, options),
+					await encryptOIDCConfig(
+						updatedOidcConfig,
+						existingProvider.providerId,
+						options,
+					),
 				);
 			}
 
