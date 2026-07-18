@@ -1,8 +1,9 @@
 import type { ManagementStore } from "../store/types.js";
 import type { Membership, Organization, Principal } from "../types/resources.js";
+import { inspectOrganizationAuthoritative } from "./core.js";
 import { ClearanceError, isClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
-import { resolveOperatorScope } from "./scope.js";
+import { resolveOperatorScope, type ResourceScope } from "./scope.js";
 
 const MAX_ROWS = 1000;
 const FIELDS = new Set(["principalId", "user", "email", "role"]);
@@ -123,6 +124,30 @@ function requireOrganization(store: ManagementStore, id: string): Organization {
 	return org;
 }
 
+async function requireOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<Organization> {
+	try {
+		return await inspectOrganizationAuthoritative(
+			store,
+			id,
+			scope ?? resolveOperatorScope(store),
+		);
+	} catch (error) {
+		if (error instanceof ClearanceError && error.code === "ORG_NOT_FOUND") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.members.import",
+				status: 404,
+			});
+		}
+		throw error;
+	}
+}
+
 function resolvePrincipal(store: ManagementStore, org: Organization, row: ImportRow): Principal {
 	const identities = [row.principalId, row.user, row.email].filter((value): value is string => Boolean(value));
 	if (identities.length !== 1) inputError("MEMBER_IMPORT_IDENTITY_INVALID", "Each row must specify exactly one of principalId, user, or email.");
@@ -218,9 +243,18 @@ export function planMemberImport(store: ManagementStore, input: { organizationId
 /** Authority-aware plan with sequential, bounded relational identity lookups. */
 export async function planMemberImportAuthoritative(
 	store: ManagementStore,
-	input: { organizationId: string; content: string; format: MemberImportFormat },
+	input: {
+		organizationId: string;
+		content: string;
+		format: MemberImportFormat;
+		scope?: ResourceScope;
+	},
 ): Promise<MemberImportPlan> {
-	const org = requireOrganization(store, input.organizationId.trim());
+	const org = await requireOrganizationAuthoritative(
+		store,
+		input.organizationId.trim(),
+		input.scope,
+	);
 	const parsed = input.format === "json" ? parseJson(input.content) : parseCsv(input.content);
 	const resolvedRows: Array<{ row: ImportRow; principal: Principal }> = [];
 	for (const row of parsed) {
