@@ -33,7 +33,7 @@ services:
   api:
     build: .
     image: ${CLEARANCE_IMAGE:-clearance-local:dev}
-    command: ["node", "packages/clearance-api/dist/server.js"]
+    command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/clearance-api/dist/server.js"]
     environment:
       CLEARANCE_API_PORT: "3200"
       CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
@@ -102,7 +102,7 @@ services:
   delivery-worker:
     profiles: ["delivery"]
     image: ${CLEARANCE_IMAGE:-clearance-local:dev}
-    command: ["node", "packages/delivery-worker/dist/cli.mjs"]
+    command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/delivery-worker/dist/cli.mjs"]
     environment:
       NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
       DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
