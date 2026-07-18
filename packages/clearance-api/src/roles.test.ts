@@ -69,6 +69,9 @@ describe("API /v1/roles", () => {
 		expect(body.roles.filter((r: { kind: string }) => r.kind === "built_in")).toHaveLength(
 			3,
 		);
+		expect(
+			body.roles.slice(0, 3).map((role: { slug: string }) => role.slug),
+		).toEqual(["owner", "admin", "member"]);
 		expect(body.roles.every((r: { projectId: string }) => r.projectId === projectId)).toBe(
 			true,
 		);
