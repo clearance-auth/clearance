@@ -529,10 +529,15 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 	const webhookEndpointSecretPath =
 		path === "/v1/delivery/webhook-endpoints" ||
 		/^\/v1\/delivery\/webhook-endpoints\/[^/]+\/rotate$/.test(path);
+	const apiKeySecretPath =
+		path === "/v1/keys" || /^\/v1\/keys\/[^/]+\/rotate$/.test(path);
+	const serviceAccountCredentialSecretPath =
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials$/.test(path) ||
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials\/[^/]+\/rotate$/.test(path);
 	const sensitive =
 		path === "/v1/users" ||
-		path === "/v1/keys" ||
-		/^\/v1\/keys\/[^/]+\/rotate$/.test(path) ||
+		apiKeySecretPath ||
+		serviceAccountCredentialSecretPath ||
 		path === "/v1/sso/setup-links" ||
 		path === "/v1/scim/setup-links" ||
 		path === "/v1/scim" ||
@@ -545,7 +550,7 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 			? ["passwordSetupToken"]
 			: path.endsWith("/setup-links")
 				? ["token", "url"]
-				: path === "/v1/keys" || path.endsWith("/rotate")
+				: apiKeySecretPath || serviceAccountCredentialSecretPath
 					? ["secret"]
 					: []) {
 			if (Object.hasOwn(parsed, key)) {
