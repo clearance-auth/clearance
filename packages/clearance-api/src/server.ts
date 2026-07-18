@@ -25,11 +25,12 @@ import {
 	parseCorsOrigins,
 	requireOperatorToken,
 	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
 	reserveSetupLink,
 	commitSetupLink,
 	releaseSetupLink,
-	deleteSsoProviderById,
-	deleteScimProviderById,
+	compensateSetupConnection,
+	deriveSetupConnectionIds,
 	type ManagementStore,
 	type ManagementApplication,
 	type ResourceScope,
@@ -100,6 +101,7 @@ if (strictStartup) {
 
 let storePromise: Promise<ManagementStore> | null = null;
 let managementApplication: ManagementApplication | null = null;
+const requestOperatorScopes = new WeakMap<Context, ResourceScope>();
 function getStore(): Promise<ManagementStore> {
 	if (!storePromise) {
 		const url = process.env.DATABASE_URL?.trim();
@@ -234,6 +236,8 @@ function principalScope(store: ManagementStore, c?: Context): ResourceScope {
 	if (c) {
 		const principal = requestPrincipal(c);
 		if (principal.kind === "api_key") return principal.scope;
+		const resolved = requestOperatorScopes.get(c);
+		if (resolved) return resolved;
 	}
 	return resolveOperatorScope(store);
 }
@@ -372,6 +376,23 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 	const auth = c.req.header("authorization") ?? "";
 	const match = /^Bearer\s+(.+)$/i.exec(auth);
 	if (match && expected && safeEqualToken(match[1]!, expected)) {
+		if (c.req.path !== "/v1/init") {
+			try {
+				requestOperatorScopes.set(
+					c,
+					await resolveOperatorScopeAuthoritative(await storeForRequest()),
+				);
+			} catch (error) {
+				// Init, doctor, and developer guidance remain usable before the
+				// first project exists. Scoped routes still fail below when they
+				// attempt to derive an absent cached scope.
+				if (isClearanceError(error) && error.code === "SCOPE_REQUIRED") {
+					setRequestPrincipal(c, { kind: "operator", id: "operator" });
+					return next();
+				}
+				return handleError(c, error);
+			}
+		}
 		setRequestPrincipal(c, { kind: "operator", id: "operator" });
 		return next();
 	}
@@ -736,6 +757,9 @@ app.post("/setup/:kind", async (c) => {
 
 	let reservationId: string | undefined;
 	let provisionedConnectionId: string | undefined;
+	let provisionedRuntimeProviderId: string | undefined;
+	let provisionedScope: ResourceScope | undefined;
+	let provisionedOrganizationId: string | undefined;
 	/** True when this request inserted a new connection (not a crash-recovery reuse). */
 	let provisionedIsNew = false;
 
@@ -749,6 +773,12 @@ app.post("/setup/:kind", async (c) => {
 		reservationId = reserved.reservationId;
 		// Attempt id is stable across re-reserves of the same capability digest.
 		const setupAttemptId = reserved.reservationId;
+		const scope = {
+			projectId: reserved.capability.projectId,
+			environmentId: reserved.capability.environmentId,
+		};
+		const setupIds = deriveSetupConnectionIds(kind, setupAttemptId);
+		provisionedOrganizationId = reserved.capability.organizationId;
 
 		const beforeIds = new Set(
 			(kind === "sso"
@@ -771,14 +801,18 @@ app.post("/setup/:kind", async (c) => {
 						samlCertificate: body.samlCertificate,
 						actor: "customer-setup",
 						setupAttemptId,
+						scope,
 					})
 				: await createScimConnectionReal(store, {
 						organizationId: reserved.capability.organizationId,
 						provider: body.provider,
 						actor: "customer-setup",
 						setupAttemptId,
+						scope,
 					});
 		provisionedConnectionId = connection.id;
+		provisionedRuntimeProviderId = setupIds.providerId;
+		provisionedScope = scope;
 		provisionedIsNew = !beforeIds.has(connection.id);
 
 		await commitSetupLink(store, {
@@ -829,11 +863,33 @@ app.post("/setup/:kind", async (c) => {
 		// of the same setup capability (deterministic reuse) — leave it for the
 		// next retry after release. Keep the reservation held until cleanup
 		// completes so this capability cannot be re-reserved into the window.
-		if (provisionedConnectionId && provisionedIsNew) {
-			await compensateSetupConnection(store, {
-				kind,
-				connectionId: provisionedConnectionId,
-			}).catch(() => undefined);
+		if (
+			provisionedConnectionId &&
+			provisionedRuntimeProviderId &&
+			provisionedScope &&
+			provisionedOrganizationId &&
+			provisionedIsNew
+		) {
+			try {
+				await compensateSetupConnection(store, {
+					kind,
+					connectionId: provisionedConnectionId,
+					runtimeProviderId: provisionedRuntimeProviderId,
+					organizationId: provisionedOrganizationId,
+					provider: body.provider,
+					scope: provisionedScope,
+					actor: "customer-setup",
+				});
+			} catch {
+				// Keep the reservation held. A retry with the deterministic attempt id
+				// can recover it; releasing here could create a second live provider.
+				return handleError(c, new ClearanceError({
+					code: "SETUP_COMPENSATION_FAILED",
+					message: "Setup cleanup did not complete; retry this setup link later",
+					stage: "setup.compensate",
+					status: 500,
+				}));
+			}
 		}
 		if (reservationId) {
 			await releaseSetupLink(store, {
@@ -856,37 +912,6 @@ function absolutePublicUrl(pathOrUrl: string): string {
 	).replace(/\/$/, "");
 	const path = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
 	return `${base}${path}`;
-}
-
-/**
- * Remove the exact management + runtime connection returned to this setup
- * attempt when a later commit step fails. Best-effort runtime cleanup is
- * skipped when DATABASE_URL / bridge is unavailable.
- */
-async function compensateSetupConnection(
-	store: ManagementStore,
-	opts: {
-		kind: "sso" | "scim";
-		connectionId: string;
-	},
-): Promise<void> {
-	if (opts.kind === "sso") {
-		await store.mutateDurable((data) => {
-			data.identityConnections = data.identityConnections.filter(
-				(connection) => connection.id !== opts.connectionId,
-			);
-		});
-		await store.ready();
-		await deleteSsoProviderById(opts.connectionId).catch(() => undefined);
-		return;
-	}
-	await store.mutateDurable((data) => {
-		data.directoryConnections = data.directoryConnections.filter(
-			(connection) => connection.id !== opts.connectionId,
-		);
-	});
-	await store.ready();
-	await deleteScimProviderById(opts.connectionId).catch(() => undefined);
 }
 
 // --- Bootstrapping (no project scope required) ---
