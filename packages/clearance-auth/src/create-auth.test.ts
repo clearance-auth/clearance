@@ -199,6 +199,47 @@ describe("@clearance/auth runtime wrapper", () => {
 		).toThrow(/passwordLockout.durationSeconds must be an integer between 30 and 86400/);
 	});
 
+	it("rejects incompatible managed-policy rollout settings before database use", async () => {
+		const common = {
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+			authenticationPolicy: {
+				projectId: "project-managed-policy",
+				environmentId: "environment-managed-policy",
+			},
+		} as const;
+		expect(() =>
+			createClearanceAuth({
+				...common,
+				credentialAuthority: {
+					generation: "legacy-v1",
+					deploymentId: "deployment-test",
+					instanceId: "instance-test",
+				},
+			}),
+		).toThrow(
+			"authenticationPolicy requires credentialAuthority.generation to be digest-v1",
+		);
+		expect(() =>
+			createClearanceAuth({
+				...common,
+				authenticationSecurity: {
+					twoFactor: { trustDeviceMaxAgeSeconds: 31 * 24 * 60 * 60 },
+				},
+			}),
+		).toThrow(
+			"authenticationSecurity.twoFactor.trustDeviceMaxAgeSeconds must not exceed 2592000 when authenticationPolicy is enabled",
+		);
+		const boundary = createClearanceAuth({
+			...common,
+			authenticationSecurity: {
+				twoFactor: { trustDeviceMaxAgeSeconds: 30 * 24 * 60 * 60 },
+			},
+		});
+		await boundary.destroy();
+	});
+
 	it("enforces production-safe SAML and SCIM defaults", async () => {
 		const bundle = createClearanceAuth({
 			baseURL: "http://localhost:3300",
