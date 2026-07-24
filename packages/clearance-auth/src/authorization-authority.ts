@@ -1110,19 +1110,31 @@ export class PostgresAuthorizationAuthority {
 		return qualified(this.schema, name);
 	}
 
+	async acquireMutationLock(
+		transaction: AuthorizationAuthorityTransaction,
+	): Promise<void> {
+		const queryable = transactionQueryable(transaction);
+		await queryable.query(
+			"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+			[`${this.schema}:${this.prefix}:authorization-mutation-v1`],
+		);
+	}
+
 	async #withMutation<T>(transaction: AuthorizationAuthorityTransaction | undefined, operation: (queryable: Queryable) => Promise<T>): Promise<T> {
-		const lock = async (queryable: Queryable): Promise<void> => {
-			await queryable.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${this.schema}:${this.prefix}:authorization-mutation-v1`]);
-		};
 		if (transaction) {
 			const queryable = transactionQueryable(transaction);
-			await lock(queryable);
+			await this.acquireMutationLock(transaction);
 			return operation(queryable);
 		}
 		const client = await this.#database.connect();
 		try {
 			await client.query("BEGIN");
-			await lock(client);
+			await this.acquireMutationLock({
+				rawTransactionQuery: <Row extends Record<string, unknown>>(
+					text: string,
+					values?: readonly unknown[],
+				) => client.query<Row>(text, values ? [...values] : undefined),
+			});
 			const result = await operation(client);
 			await client.query("COMMIT");
 			return result;
