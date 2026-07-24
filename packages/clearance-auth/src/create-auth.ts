@@ -63,6 +63,7 @@ import {
 import { PostgresAuthenticationPolicyAuthority } from "./authentication-policy-authority.js";
 import { PostgresAuthorizationAuthority } from "./authorization-authority.js";
 import { createRuntimeAuditOutbox } from "./runtime-audit.js";
+import { createTenantAdministrationPlugin } from "./tenant-administration.js";
 import type {
 	ClearanceAuthBundle,
 	ClearanceAuthorizationFacade,
@@ -1307,6 +1308,14 @@ export function createClearanceAuth<
 								);
 							},
 						}),
+					}),
+				]
+			: []),
+		...(authorizationAuthority && runtimeAuditOutbox
+			? [
+					createTenantAdministrationPlugin({
+						authorization: authorizationAuthority,
+						runtimeAudit: runtimeAuditOutbox.binding,
 					}),
 				]
 			: []),
