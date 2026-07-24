@@ -9,7 +9,12 @@ export type ConfirmationPolicy =
 export type ApiPath = `/v1/${string}`;
 export type ConfirmationLiveValue = string | number | boolean | null;
 export type AnySchema = z.ZodType<unknown, unknown, z.core.$ZodTypeInternals<unknown, unknown>>;
-export type StrictInputSchema = z.ZodObject<z.core.$ZodLooseShape>;
+/** A schema whose accepted and parsed values are semantic input objects. */
+export type StrictInputSchema = z.ZodType<Record<string, unknown>, Record<string, unknown>>;
+/** Semantic input keys mapped to HTTP placeholders; arrays retain fixture compatibility. */
+export type PathProjection = readonly string[] | Readonly<Record<string, string>>;
+/** Semantic input keys mapped to HTTP query keys; arrays retain identity-map fixtures. */
+export type QueryProjection = readonly string[] | Readonly<Record<string, string>>;
 
 /**
  * One strict, semantic input object is the public client contract. Transport
@@ -38,8 +43,8 @@ export interface OperationSpec<
 	};
 	readonly schemas: { readonly input: Input; readonly output: Output };
 	readonly transport: {
-		readonly path: readonly string[];
-		readonly query: readonly string[];
+		readonly path: PathProjection;
+		readonly query: QueryProjection;
 		readonly body: readonly string[];
 	};
 }
@@ -55,8 +60,12 @@ export function defineOperation<const Operation extends AnyOperationSpec>(operat
 		http: Object.freeze({ ...operation.http }),
 		schemas: Object.freeze({ ...operation.schemas }),
 		transport: Object.freeze({
-			path: Object.freeze([...operation.transport.path]),
-			query: Object.freeze([...operation.transport.query]),
+			path: Object.freeze(Array.isArray(operation.transport.path)
+				? [...operation.transport.path]
+				: { ...operation.transport.path }),
+			query: Object.freeze(Array.isArray(operation.transport.query)
+				? [...operation.transport.query]
+				: { ...operation.transport.query }),
 			body: Object.freeze([...operation.transport.body]),
 		}),
 	}) as Operation;
@@ -67,17 +76,25 @@ export function defineOperationRegistry<const Registry extends OperationRegistry
 	for (const [id, operation] of Object.entries(registry)) {
 		if (id !== operation.id) throw new Error(`Registry key ${id} must equal operation id ${operation.id}`);
 	}
-	return Object.freeze({ ...registry }) as Registry;
+	return Object.freeze(Object.assign(Object.create(null), registry)) as Registry;
 }
 
 export function resolveOperationPath(operation: AnyOperationSpec, pathInput: Record<string, unknown>): ApiPath {
+	const path = pathProjectionEntries(operation.transport.path);
 	if (operation.http.currentPath) {
-		const [currentKey] = operation.transport.path;
+		const currentKey = path[0]?.[0];
 		if (currentKey && pathInput[currentKey] === undefined) return operation.http.currentPath;
 	}
 	return operation.http.path.replace(/:([A-Za-z][A-Za-z0-9_]*)/g, (_, name: string) => {
-		const value = pathInput[name];
+		const semanticKey = path.find(([, placeholder]) => placeholder === name)?.[0];
+		const value = semanticKey ? pathInput[semanticKey] : undefined;
 		if (typeof value !== "string" || !value) throw new Error(`Missing path parameter ${name} for ${operation.id}`);
 		return encodeURIComponent(value);
 	}) as ApiPath;
+}
+
+function pathProjectionEntries(path: PathProjection): readonly (readonly [string, string])[] {
+	return Array.isArray(path)
+		? path.map((key) => [key, key] as const)
+		: Object.entries(path);
 }
