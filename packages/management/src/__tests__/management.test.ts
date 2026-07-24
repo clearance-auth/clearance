@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	JsonStore,
@@ -452,10 +452,10 @@ describe("backup and upgrade", () => {
 		const verified = verifyBackup(store, bak.id);
 		expect(verified.verified).toBe(true);
 
-		const isolated = join(dirs[dirs.length - 1], "isolated-restore.json");
-		const restored = restoreBackup(store, bak.id, isolated);
+		const restored = restoreBackup(store, bak.id);
 		expect(restored.counts.projects).toBe(1);
 		expect(restored.checksum).toBe(bak.checksum);
+		expect(dirname(restored.targetPath)).toBe(join(dirname(bak.path), "restores"));
 
 		const upgrade = upgradeCheck(store);
 		expect(upgrade.current).toBeTruthy();
