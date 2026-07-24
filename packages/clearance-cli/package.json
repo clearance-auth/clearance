@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/management-client": "workspace:*",
     "@clearance/management": "workspace:*",
     "commander": "^14.0.3"
   },
