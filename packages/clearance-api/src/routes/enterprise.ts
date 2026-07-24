@@ -46,7 +46,12 @@ export interface EnterpriseRouteDependencies extends ScopedRouteDependencies {
 const ENTERPRISE_SCOPE_ORG_PAGE_SIZE = 1000;
 const ENTERPRISE_SCOPE_ORG_MAXIMUM = 50_000;
 
-async function scopedOrganizationIds(store: Parameters<typeof listOrganizationsPageAuthoritative>[0], scope: Parameters<typeof listOrganizationsPageAuthoritative>[1]["scope"]): Promise<Set<string>> {
+async function scopedOrganizationIds(
+	store: Parameters<typeof listOrganizationsPageAuthoritative>[0],
+	scope: NonNullable<
+		Parameters<typeof listOrganizationsPageAuthoritative>[1]
+	>["scope"],
+): Promise<Set<string>> {
 	const ids = new Set<string>();
 	let cursor: string | undefined;
 	do {
@@ -323,6 +328,23 @@ export function registerEnterpriseRoutes({
 			}
 			await inspectOrganizationAuthoritative(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			if (
+				body.live === true &&
+				(
+					body.dryRun !== false ||
+					body.fixture !== undefined ||
+					body.scenario !== undefined ||
+					body.users !== undefined
+				)
+			) {
+				return c.json({
+					error: {
+						code: "SCIM_LIVE_INPUT_INVALID",
+						message: "Live SCIM tests require dryRun false and cannot include simulation fields",
+						stage: "scim.test",
+					},
+				}, 400);
+			}
 			const scenario = body.scenario ?? "users";
 			if (scenario !== "users" && scenario !== "group-lifecycle") {
 				return c.json(
@@ -350,7 +372,7 @@ export function registerEnterpriseRoutes({
 				return c.json({ error: { code: "SCIM_USERS_INVALID", message: "SCIM users must contain userName with optional displayName and active", stage: "scim.test" } }, 400);
 			}
 			const testInput = {
-				dryRun: body.dryRun === true,
+				dryRun: body.dryRun !== false,
 				fixture: body.fixture,
 				scenario,
 				...(scenario === "users" ? { users } : {}),
