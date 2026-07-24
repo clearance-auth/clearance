@@ -4,7 +4,6 @@ import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleD
 import {
 	startObservability,
 	type ObservabilityHandle,
-	withDeliveryProcessingSpan,
 } from "@clearance/observability-node";
 import type { WorkerConfig } from "./config.js";
 import { classifyEmailError, configuredEmailTransport, createEmailSender } from "./email.js";
@@ -234,15 +233,9 @@ export class DeliveryWorker {
 
 	private async processJob(): Promise<boolean> {
 		if (this.draining || this.stopping) return false;
-		const leased = await this.store.claimNext({ workerId: this.config.workerId, leaseMs: this.config.leaseMs });
-		if (!leased) return false;
-		return withDeliveryProcessingSpan(
-			{
-				carrier: leased.traceCarrier,
-				channel: leased.channel,
-				transport: "postgres",
-			},
-			async () => {
+		const processed = await this.store.claimNextWithTrace(
+			{ workerId: this.config.workerId, leaseMs: this.config.leaseMs },
+			async (leased) => {
 				const claimedAt = performance.now();
 				let metricOutcome: DeliveryMetricOutcome = "finish_failed";
 				this.metrics.recordClaim(leased.channel);
@@ -330,6 +323,7 @@ export class DeliveryWorker {
 				return true;
 			},
 		);
+		return processed ?? false;
 	}
 
 	private async sendWithLeaseRenewal(
