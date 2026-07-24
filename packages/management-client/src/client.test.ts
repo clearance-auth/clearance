@@ -423,6 +423,15 @@ describe("generated management client contract", () => {
 		expect(calls).toBe(0);
 	});
 
+	it("rejects operation names inherited from Object.prototype", () => {
+		const client = createServerManagementClient({
+			baseUrl: "https://api.example.test",
+			registry: ORGANIZATION_MEMBER_FIXTURE_OPERATIONS,
+			bearerToken: "operator-token",
+		});
+		expect(() => client.call("toString" as never, {} as never)).toThrow("Unknown operation id toString");
+	});
+
 	it("rejects unsafe base URLs while retaining explicit loopback HTTP development", () => {
 		for (const baseUrl of [
 			"http://example.com",
