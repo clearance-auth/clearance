@@ -1,10 +1,10 @@
 import { KEY_MANAGEMENT_OPERATIONS } from "@clearance/management";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import {
 	type CliPathOf,
 	type DispatchInput,
 	error,
-	previewConfirmation,
+	managementCallOptions,
 } from "./shared.js";
 
 type KeyManagementCommandPath = CliPathOf<typeof KEY_MANAGEMENT_OPERATIONS>;
@@ -26,24 +26,18 @@ export async function dispatchKeyManagementCommand({
 }: DispatchInput<KeyManagementCommandPath>): Promise<unknown> {
 	switch (path) {
 		case KEY_MANAGEMENT_OPERATIONS.status.cliPath:
-			return requestManagementApi(session, {
-				method: KEY_MANAGEMENT_OPERATIONS.status.http.method,
-				path: KEY_MANAGEMENT_OPERATIONS.status.http.path,
-			});
+			return callManagementOperation(session, "key_management.status", {});
 		case KEY_MANAGEMENT_OPERATIONS.plan.cliPath:
-			return requestManagementApi(session, {
-				method: KEY_MANAGEMENT_OPERATIONS.plan.http.method,
-				path: KEY_MANAGEMENT_OPERATIONS.plan.http.path,
-				body: {},
-			});
+			return callManagementOperation(session, "key_management.plan", {});
 		case KEY_MANAGEMENT_OPERATIONS.apply.cliPath:
-			return requestManagementApi(session, {
-				method: KEY_MANAGEMENT_OPERATIONS.apply.http.method,
-				path: KEY_MANAGEMENT_OPERATIONS.apply.http.path,
-				body: {
+			return callManagementOperation(
+				session,
+				"key_management.apply",
+				{
 					expectedPlanId: expectedPlanId(opts.expectedPlan),
-					...previewConfirmation(global),
+					dryRun: global.dryRun || !global.yes,
 				},
-			});
+				managementCallOptions(global),
+			);
 	}
 }
