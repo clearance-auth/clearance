@@ -21,6 +21,22 @@ vi.mock("@clearance/management", async (importOriginal) => {
 		SERVICE_ACCOUNT_OPERATIONS: source.SERVICE_ACCOUNT_OPERATIONS,
 	};
 });
+
+// These are descriptor-projection tests. Keep the generated input/path/query/body
+// authority real while leaving response-schema conformance to management-client.
+vi.mock("@clearance/management-client", async (importOriginal) => {
+	const original = await importOriginal<typeof import("@clearance/management-client")>();
+	const permissiveOutput = { safeParse: (data: unknown) => ({ success: true, data }) };
+	return {
+		...original,
+		MANAGEMENT_OPERATION_REGISTRY: Object.fromEntries(
+			Object.entries(original.MANAGEMENT_OPERATION_REGISTRY).map(([id, operation]) => [
+				id,
+				{ ...operation, schemas: { ...operation.schemas, output: permissiveOutput } },
+			]),
+		),
+	};
+});
 import {
 	classifyCommandPath,
 	dispatchRemoteCommand,
@@ -264,7 +280,7 @@ describe("CLI transport parity", () => {
 			"https://api.clearance.test/v1/schema/store-v2/events/cutover",
 			"https://api.clearance.test/v1/schema/store-v2/events/rollback",
 		]);
-		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ dryRun: true });
+		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ dryRun: true, confirm: false });
 		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[5]?.[1].body))).toEqual({ confirm: true });
 		expect(JSON.parse(String(calls[6]?.[1].body))).toEqual({ confirm: true });
@@ -350,10 +366,36 @@ describe("CLI transport parity", () => {
 		}));
 		await dispatchRemoteCommand(session, "scim test", ["scim_1"], { apply: true }, { dryRun: true });
 		expect(JSON.parse(String(calls[0]?.[1].body)).dryRun).toBe(true);
+		expect(JSON.parse(String(calls[0]?.[1].body)).scenario).toBe("users");
 		await expect(
 			dispatchRemoteCommand(session, "sso test", ["sso_1"], { fixture: "ok" }, { dryRun: true }),
 		).rejects.toMatchObject({ code: "CLI_REMOTE_DRY_RUN_UNSUPPORTED" });
 		expect(calls).toHaveLength(1);
+	});
+
+	it("forwards only the closed group-lifecycle SCIM scenario", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
+		}));
+		await dispatchRemoteCommand(
+			session,
+			"scim test",
+			["scim_1"],
+			{ scenario: "group-lifecycle" },
+			{},
+		);
+		expect(JSON.parse(String(calls[0]?.[1].body))).toMatchObject({
+			dryRun: true,
+			scenario: "group-lifecycle",
+		});
+	});
+
+	it("refuses the bundled group lifecycle under live conformance mode", async () => {
+		await expect(
+			dispatchRemoteCommand(session, "scim test", ["scim_1"], { live: true, scenario: "group-lifecycle" }, { yes: true }),
+		).rejects.toMatchObject({ code: "SCIM_SCENARIO_LIVE_CONFLICT" });
 	});
 
 	it("uses server-managed backup storage and rejects host paths", async () => {
@@ -369,7 +411,7 @@ describe("CLI transport parity", () => {
 		await dispatchRemoteCommand(session, "backup create", [], {}, {});
 		expect(fetchMock).toHaveBeenCalledOnce();
 		expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.clearance.test/v1/backups");
-		expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({});
+		expect(fetchMock.mock.calls[0]?.[1]?.body).toBeUndefined();
 	});
 
 	it.each(["sso test", "scim test"])("rejects %s --live with --dry-run before issuing a request", async (path) => {
