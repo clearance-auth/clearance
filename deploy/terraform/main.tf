@@ -25,8 +25,8 @@ check "social_provider_pairs" {
 
 check "unique_host_ports" {
   assert {
-    condition     = length(distinct([var.api_port, var.console_port, var.sample_port])) == 3
-    error_message = "api_port, console_port, and sample_port must be unique."
+    condition     = length(distinct([var.api_port, var.console_port, var.sample_port, var.vault_port])) == 4
+    error_message = "api_port, console_port, sample_port, and vault_port must be unique."
   }
 }
 
@@ -35,6 +35,7 @@ locals {
   api_url      = "http://localhost:${var.api_port}"
   console_url  = "http://localhost:${var.console_port}"
   sample_url   = "http://localhost:${var.sample_port}"
+  vault_url    = "http://localhost:${var.vault_port}"
   social_env = compact([
     var.github_client_id == null ? "" : "CLEARANCE_GITHUB_CLIENT_ID=${var.github_client_id}",
     var.github_client_secret == null ? "" : "CLEARANCE_GITHUB_CLIENT_SECRET=${var.github_client_secret}",
@@ -109,6 +110,11 @@ resource "docker_container" "api" {
     "CLEARANCE_SECRET=${var.clearance_secret}",
     "CLEARANCE_CREDENTIAL_KEY=${var.credential_key}",
     "CLEARANCE_CREDENTIAL_KEY_ID=${var.credential_key_id}",
+    "CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1",
+    "CLEARANCE_DEPLOYMENT_ID=${var.deployment_id}",
+    "CLEARANCE_PROJECT_ID=${var.project_id}",
+    "CLEARANCE_ENV_ID=${var.environment_id}",
+    "CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON=${var.key_management_config_json}",
     "CLEARANCE_BASE_URL=${local.sample_url}",
     "CLEARANCE_CONSOLE_URL=${local.console_url}",
     "CLEARANCE_API_HEALTH_URL=http://127.0.0.1:3200",
@@ -184,6 +190,51 @@ resource "docker_container" "console" {
   depends_on = [docker_container.api]
 }
 
+resource "docker_container" "vault" {
+  name    = "${var.name_prefix}-vault"
+  image   = docker_image.clearance.image_id
+  restart = "unless-stopped"
+  command = ["node", "apps/vault-host/dist/server.js"]
+
+  env = [
+    "NODE_ENV=production",
+    "CLEARANCE_STRICT_SECRETS=1",
+    "CLEARANCE_VAULT_PORT=3400",
+    "CLEARANCE_VAULT_URL=${local.vault_url}",
+    "CLEARANCE_BASE_URL=${local.vault_url}",
+    "CLEARANCE_VAULT_PRODUCT_NAME=${var.vault_product_name}",
+    "CLEARANCE_VAULT_HOME_LABEL=${var.vault_home_label}",
+    "CLEARANCE_VAULT_ACCENT_COLOR=${var.vault_accent_color}",
+    "CLEARANCE_SECRET=${var.clearance_secret}",
+    "CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1",
+    "CLEARANCE_DEPLOYMENT_ID=${var.deployment_id}",
+    "CLEARANCE_PROJECT_ID=${var.project_id}",
+    "CLEARANCE_ENV_ID=${var.environment_id}",
+    "CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON=${var.key_management_config_json}",
+    "DATABASE_URL=${local.database_url}",
+  ]
+
+  networks_advanced {
+    name = docker_network.clearance.name
+  }
+
+  ports {
+    ip       = "127.0.0.1"
+    internal = 3400
+    external = var.vault_port
+  }
+
+  healthcheck {
+    test         = ["CMD", "node", "-e", "fetch('http://127.0.0.1:3400/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    interval     = "5s"
+    timeout      = "5s"
+    retries      = 20
+    start_period = "15s"
+  }
+
+  depends_on = [docker_container.api]
+}
+
 resource "docker_container" "sample" {
   name    = "${var.name_prefix}-sample"
   image   = docker_image.clearance.image_id
@@ -230,6 +281,10 @@ output "console_url" {
 
 output "sample_url" {
   value = local.sample_url
+}
+
+output "vault_url" {
+  value = local.vault_url
 }
 
 output "postgres_volume" {
