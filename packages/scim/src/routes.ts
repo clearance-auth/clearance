@@ -105,10 +105,7 @@ async function runSCIMMutationTransaction<T>(
 	ctx: GenericEndpointContext,
 	fn: () => Promise<T>,
 ): Promise<T> {
-	if (runtimeAuditBinding(ctx)) {
-		return runWithTransaction(ctx.context.adapter, fn);
-	}
-	return ctx.context.adapter.transaction(fn);
+	return runWithTransaction(ctx.context.adapter, fn);
 }
 
 /**
@@ -1428,7 +1425,7 @@ export const patchSCIMUser = (authMiddleware: AuthMiddleware) =>
 
 			const deactivating = resolveSCIMActiveDeactivation(ctx, userPatch);
 
-			await runSCIMAuditTransaction(ctx, async () => {
+			await runSCIMMutationTransaction(ctx, async () => {
 				await Promise.all([
 					Object.keys(userPatch).length > 0
 						? ctx.context.internalAdapter.updateUser(userId, {

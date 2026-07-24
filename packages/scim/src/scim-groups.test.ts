@@ -113,8 +113,9 @@ describe("SCIM Groups", () => {
 
 		const second = await auth.api.createSCIMGroup({ body: { displayName: "Design" }, headers: authz(token) });
 		await auth.api.createSCIMGroup({ body: { displayName: "Private", members: [{ value: outsider.id }] }, headers: authz(otherToken) });
+		const scopedGroupIds = [created.id, second.id].sort((left, right) => left.localeCompare(right));
 		const page = await auth.api.listSCIMGroups({ query: { startIndex: 2, count: 1 }, headers: authz(token) });
-		expect(page).toMatchObject({ totalResults: 2, startIndex: 2, itemsPerPage: 1, Resources: [{ id: [created.id, second.id].sort()[1] }] });
+		expect(page).toMatchObject({ totalResults: 2, startIndex: 2, itemsPerPage: 1, Resources: scopedGroupIds.slice(1, 2).map((id) => ({ id })) });
 		const filtered = await auth.api.listSCIMGroups({ query: { filter: 'externalId eq "platform"' }, headers: authz(token) });
 		expect(filtered.Resources).toHaveLength(1);
 		expect(filtered.Resources[0]?.id).toBe(created.id);

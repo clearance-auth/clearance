@@ -1002,7 +1002,7 @@ describe("SCIM provider management", () => {
 			});
 		});
 
-		it("should return 403 when token creator was removed from org (org membership required)", async () => {
+		it("should revoke the removed token creator's session and hide the provider", async () => {
 			const { auth, getAuthCookieHeaders, registerOrganization } =
 				createTestInstance();
 
@@ -1042,13 +1042,29 @@ describe("SCIM provider management", () => {
 					headers: headersUserA,
 				}),
 			).rejects.toMatchObject({
+				status: "UNAUTHORIZED",
+			});
+
+			await expect(
+				auth.api.listSCIMProviderConnections({ headers: headersUserA }),
+			).rejects.toMatchObject({
+				status: "UNAUTHORIZED",
+			});
+
+			const freshHeadersUserA = await getAuthCookieHeaders(policyUserA);
+			await expect(
+				auth.api.getSCIMProviderConnection({
+					query: { providerId: "owner-removed-provider" },
+					headers: freshHeadersUserA,
+				}),
+			).rejects.toMatchObject({
 				status: "FORBIDDEN",
 				message:
 					"You must be a member of the organization to access this provider",
 			});
 
 			const listRes = await auth.api.listSCIMProviderConnections({
-				headers: headersUserA,
+				headers: freshHeadersUserA,
 			});
 			expect(
 				listRes.providers?.some(

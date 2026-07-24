@@ -6,6 +6,7 @@ import { createAuthClient } from "@clearance/runtime/client";
 import { setCookieToHeader } from "@clearance/runtime/cookies";
 import { admin, bearer, organization } from "@clearance/runtime/plugins";
 import { describe, expect, it } from "vitest";
+import { migrateLegacySessionCredentials } from "../../runtime/src/db/session-credential-migration";
 import { scim } from ".";
 import { scimClient } from "./client";
 import type { SCIMOptions } from "./types";
@@ -685,6 +686,7 @@ describe("SCIM", () => {
 				scimProvider: [],
 				organization: [],
 				member: [],
+				securityMigration: [],
 			};
 			const memory = memoryAdapter(data);
 
@@ -694,6 +696,11 @@ describe("SCIM", () => {
 				emailAndPassword: { enabled: true },
 				plugins: [scim(), organization()],
 				secondaryStorage: {
+					namespace: "scim-delete-secondary-storage-test",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -705,6 +712,10 @@ describe("SCIM", () => {
 					},
 				},
 			});
+			await migrateLegacySessionCredentials(
+				(await auth.$context).adapter,
+				auth.options,
+			);
 
 			const authClient = createAuthClient({
 				baseURL: "http://localhost:3000",
@@ -738,14 +749,20 @@ describe("SCIM", () => {
 			const victimSession = await ctx.internalAdapter.createSession(
 				provisioned.id,
 			);
-			expect(store.has(victimSession.token)).toBe(true);
+			const sessionHandleKey = [...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${victimSession.id}`),
+			);
+			expect(sessionHandleKey).toBeDefined();
+			if (!sessionHandleKey) {
+				throw new Error("Missing secondary session handle");
+			}
 
 			await auth.api.deleteSCIMUser({
 				params: { userId: provisioned.id },
 				headers: { authorization: `Bearer ${scimToken}` },
 			});
 
-			expect(store.has(victimSession.token)).toBe(false);
+			expect(store.has(sessionHandleKey)).toBe(false);
 		});
 
 		it("should deprovision (not delete the global user) for an org-scoped DELETE", async () => {
