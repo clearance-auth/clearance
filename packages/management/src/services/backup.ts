@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
+	constants,
 	copyFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	writeFileSync,
@@ -102,13 +105,27 @@ export function verifyBackup(
 	return updated;
 }
 
-/**
- * Restore backup into an isolated target store path (does not clobber source unless same path).
- */
+function isolatedRestoreDirectory(record: BackupRecord): string {
+	const directory = resolve(dirname(record.path), "restores");
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const details = lstatSync(directory);
+	if (!details.isDirectory() || details.isSymbolicLink()) {
+		throw new ClearanceError({
+			code: "BACKUP_RESTORE_DIRECTORY_UNSAFE",
+			message: "The server-owned restore directory must be a real directory",
+			stage: "backup.restore",
+			status: 500,
+			remediation: "Repair the API backup storage directory before restoring.",
+		});
+	}
+	chmodSync(directory, 0o700);
+	return directory;
+}
+
+/** Restores into a newly created file in the backup storage's isolated restore directory. */
 export function restoreBackup(
 	store: ManagementStore,
 	backupId: string,
-	targetPath: string,
 ): { targetPath: string; counts: Record<string, number>; checksum: string } {
 	const record = store.snapshot.backups.find((b) => b.id === backupId);
 	if (!record) {
@@ -120,9 +137,24 @@ export function restoreBackup(
 		});
 	}
 	verifyBackup(store, backupId);
-	const target = resolve(targetPath);
-	mkdirSync(dirname(target), { recursive: true });
-	copyFileSync(record.path, target);
+	const target = join(
+		isolatedRestoreDirectory(record),
+		`${backupId}-${newId("restore")}.json`,
+	);
+	try {
+		copyFileSync(record.path, target, constants.COPYFILE_EXCL);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new ClearanceError({
+				code: "BACKUP_RESTORE_TARGET_EXISTS",
+				message: "Restore target already exists; refusing to overwrite it",
+				stage: "backup.restore",
+				status: 409,
+				remediation: "Retry the restore so the server can create a new isolated target.",
+			});
+		}
+		throw error;
+	}
 	const body = readFileSync(target, "utf8");
 	const snapshot = JSON.parse(body) as DataStoreSnapshot;
 	const counts = {
