@@ -1,16 +1,15 @@
 import {
 	DELIVERY_OPERATIONS,
-	resolveOperationPath,
 	WEBHOOK_ENDPOINT_OPERATIONS,
 } from "@clearance/management";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import {
 	body,
 	type CliPathOf,
 	type DispatchInput,
 	error,
 	firstStringArgument,
-	previewConfirmation,
+	managementCallOptions,
 	requireRemoteMutation,
 } from "./shared.js";
 
@@ -61,24 +60,14 @@ function stateFilters(value: unknown): DeliveryState[] {
 	return [...new Set(states as DeliveryState[])];
 }
 
-function listPath(opts: Readonly<Record<string, unknown>>): `/v1/${string}` {
-	const params = new URLSearchParams();
-	const limit = boundedInteger(opts.limit, "limit", 1, 200);
-	if (limit !== undefined) params.set("limit", String(limit));
-	if (typeof opts.cursor === "string" && opts.cursor !== "") params.set("cursor", opts.cursor);
-	for (const state of stateFilters(opts.state)) params.append("state", state);
-	if (opts.channel !== undefined) {
-		if (opts.channel !== "email" && opts.channel !== "webhook") {
-			throw error(
-				"DELIVERY_OPTION_INVALID",
-				"--channel must be email or webhook.",
-				"Pass --channel email or --channel webhook.",
-			);
-		}
-		params.set("channel", opts.channel);
-	}
-	if (typeof opts.kind === "string" && opts.kind !== "") params.set("kind", opts.kind);
-	return `${DELIVERY_OPERATIONS.list.http.path}${params.size ? `?${params}` : ""}` as `/v1/${string}`;
+function deliveryChannel(value: unknown): "email" | "webhook" | undefined {
+	if (value === undefined) return undefined;
+	if (value === "email" || value === "webhook") return value;
+	throw error(
+		"DELIVERY_OPTION_INVALID",
+		"--channel must be email or webhook.",
+		"Pass --channel email or --channel webhook.",
+	);
 }
 
 function endpointStatuses(value: unknown): Array<"active" | "disabled" | "deleted"> {
@@ -153,20 +142,6 @@ function endpointIdentifier(value: unknown): string {
 	return value;
 }
 
-function endpointListPath(opts: Readonly<Record<string, unknown>>): `/v1/${string}` {
-	const params = new URLSearchParams();
-	const limit = boundedInteger(opts.limit, "limit", 1, 200);
-	if (limit !== undefined) params.set("limit", String(limit));
-	const cursor = endpointText(opts.cursor, "cursor", 8_192);
-	if (cursor !== undefined) params.set("cursor", cursor);
-	for (const status of endpointStatuses(opts.status)) params.append("status", status);
-	const kinds = endpointEventKinds(opts.eventKind);
-	if (kinds?.[0]) params.set("eventKind", kinds[0]);
-	return params.size === 0
-		? WEBHOOK_ENDPOINT_OPERATIONS.list.http.path
-		: `${WEBHOOK_ENDPOINT_OPERATIONS.list.http.path}?${params}`;
-}
-
 export async function dispatchDeliveryCommand({
 	session,
 	path,
@@ -177,15 +152,21 @@ export async function dispatchDeliveryCommand({
 	const id = firstStringArgument(args);
 	switch (path) {
 		case DELIVERY_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.list.http.method,
-				path: listPath(opts),
+			return callManagementOperation(session, "delivery.jobs.list", body({
+				limit: boundedInteger(opts.limit, "limit", 1, 200),
+				cursor: typeof opts.cursor === "string" && opts.cursor !== "" ? opts.cursor : undefined,
+				states: stateFilters(opts.state),
+				channel: deliveryChannel(opts.channel),
+				kind: typeof opts.kind === "string" && opts.kind !== "" ? opts.kind : undefined,
+			}) as {
+				limit?: number;
+				cursor?: string;
+				states?: DeliveryState[];
+				channel?: "email" | "webhook";
+				kind?: string;
 			});
 		case DELIVERY_OPERATIONS.inspect.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.inspect.http.method,
-				path: resolveOperationPath(DELIVERY_OPERATIONS.inspect, { id }),
-			});
+			return callManagementOperation(session, "delivery.jobs.inspect", { id });
 		case DELIVERY_OPERATIONS.readiness.cliPath: {
 			const staleAfterMs = boundedInteger(
 				opts.staleAfterMs,
@@ -193,62 +174,62 @@ export async function dispatchDeliveryCommand({
 				1_000,
 				86_400_000,
 			);
-			const params = new URLSearchParams();
-			if (staleAfterMs !== undefined) params.set("staleAfterMs", String(staleAfterMs));
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.readiness.http.method,
-				path: `${DELIVERY_OPERATIONS.readiness.http.path}${params.size ? `?${params}` : ""}` as `/v1/${string}`,
-			});
+			return callManagementOperation(session, "delivery.readiness", body({ staleAfterMs }));
 		}
 		case DELIVERY_OPERATIONS.quotas.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.quotas.http.method,
-				path: DELIVERY_OPERATIONS.quotas.http.path,
-			});
+			return callManagementOperation(session, "delivery.quotas.get", {});
 		case DELIVERY_OPERATIONS.cancel.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.cancel.http.method,
-				path: resolveOperationPath(DELIVERY_OPERATIONS.cancel, { id }),
-				body: previewConfirmation(global),
-			});
+			return callManagementOperation(session, "delivery.jobs.cancel", {
+				id,
+				dryRun: global.dryRun || !global.yes,
+			}, managementCallOptions(global));
 		case DELIVERY_OPERATIONS.retry.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.retry.http.method,
-				path: resolveOperationPath(DELIVERY_OPERATIONS.retry, { id }),
-				body: previewConfirmation(global),
-			});
+			return callManagementOperation(session, "delivery.jobs.retry", {
+				id,
+				dryRun: global.dryRun || !global.yes,
+			}, managementCallOptions(global));
 		case DELIVERY_OPERATIONS.replay.cliPath:
-			return requestManagementApi(session, {
-				method: DELIVERY_OPERATIONS.replay.http.method,
-				path: resolveOperationPath(DELIVERY_OPERATIONS.replay, { id }),
-				body: body({
+			return callManagementOperation(
+				session,
+				"delivery.jobs.replay",
+				body({
+					id,
 					maxAttempts: boundedInteger(opts.maxAttempts, "max-attempts", 1, 100),
-					...previewConfirmation(global),
-				}),
-			});
+					dryRun: global.dryRun || !global.yes,
+				}) as { id: string; maxAttempts?: number; dryRun?: boolean },
+				managementCallOptions(global),
+			);
 		case WEBHOOK_ENDPOINT_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: WEBHOOK_ENDPOINT_OPERATIONS.list.http.method,
-				path: endpointListPath(opts),
-			});
+			return callManagementOperation(
+				session,
+				"delivery.webhook_endpoints.list",
+				body({
+					limit: boundedInteger(opts.limit, "limit", 1, 200),
+					cursor: endpointText(opts.cursor, "cursor", 8_192),
+					statuses: endpointStatuses(opts.status),
+					eventKind: endpointEventKinds(opts.eventKind)?.[0],
+				}) as {
+					limit?: number;
+					cursor?: string;
+					statuses?: Array<"active" | "disabled" | "deleted">;
+					eventKind?: "organization.updated";
+				},
+			);
 		case WEBHOOK_ENDPOINT_OPERATIONS.inspect.cliPath:
-			return requestManagementApi(session, {
-				method: WEBHOOK_ENDPOINT_OPERATIONS.inspect.http.method,
-				path: resolveOperationPath(WEBHOOK_ENDPOINT_OPERATIONS.inspect, {
-					id: endpointIdentifier(id),
-				}),
+			return callManagementOperation(session, "delivery.webhook_endpoints.inspect", {
+				id: endpointIdentifier(id),
 			});
 		case WEBHOOK_ENDPOINT_OPERATIONS.create.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: WEBHOOK_ENDPOINT_OPERATIONS.create.http.method,
-				path: WEBHOOK_ENDPOINT_OPERATIONS.create.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"delivery.webhook_endpoints.create",
+				body({
 					name: endpointText(opts.name, "name", 128, true),
 					url: endpointText(opts.url, "url", 8_192, true),
 					eventKinds: endpointEventKinds(opts.eventKind),
-				}),
-			});
+				}) as { name: string; url: string; eventKinds?: "organization.updated"[] },
+			);
 		case WEBHOOK_ENDPOINT_OPERATIONS.update.cliPath: {
 			requireRemoteMutation(global, path);
 			const name = endpointText(opts.name, "name", 128);
@@ -269,36 +250,46 @@ export async function dispatchDeliveryCommand({
 					"Pass --name, --url, --event-kind, or --status.",
 				);
 			}
-			return requestManagementApi(session, {
-				method: WEBHOOK_ENDPOINT_OPERATIONS.update.http.method,
-				path: resolveOperationPath(WEBHOOK_ENDPOINT_OPERATIONS.update, {
+			return callManagementOperation(
+				session,
+				"delivery.webhook_endpoints.update",
+				body({
 					id: endpointIdentifier(id),
-				}),
-				body: body({
 					expectedVersion: endpointVersion(opts.expectedVersion),
 					name,
 					url,
 					eventKinds: kinds,
 					status,
-				}),
-			});
+				}) as {
+					id: string;
+					expectedVersion: number;
+					name?: string;
+					url?: string;
+					eventKinds?: "organization.updated"[];
+					status?: "active" | "disabled";
+				},
+			);
 		}
 		case WEBHOOK_ENDPOINT_OPERATIONS.rotate.cliPath:
 		case WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath:
 		case WEBHOOK_ENDPOINT_OPERATIONS.test.cliPath: {
-			const operation = path === WEBHOOK_ENDPOINT_OPERATIONS.rotate.cliPath
-				? WEBHOOK_ENDPOINT_OPERATIONS.rotate
+			const operationId = path === WEBHOOK_ENDPOINT_OPERATIONS.rotate.cliPath
+				? "delivery.webhook_endpoints.rotate"
 				: path === WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath
-					? WEBHOOK_ENDPOINT_OPERATIONS.delete
-					: WEBHOOK_ENDPOINT_OPERATIONS.test;
-			return requestManagementApi(session, {
-				method: operation.http.method,
-				path: resolveOperationPath(operation, { id: endpointIdentifier(id) }),
-				body: body({
-					expectedVersion: endpointVersion(opts.expectedVersion),
-					...previewConfirmation(global),
-				}),
-			});
+					? "delivery.webhook_endpoints.delete"
+					: "delivery.webhook_endpoints.test";
+			const input = {
+				id: endpointIdentifier(id),
+				expectedVersion: endpointVersion(opts.expectedVersion),
+				dryRun: global.dryRun || !global.yes,
+			};
+			if (operationId === "delivery.webhook_endpoints.rotate") {
+				return callManagementOperation(session, operationId, input, managementCallOptions(global));
+			}
+			if (operationId === "delivery.webhook_endpoints.delete") {
+				return callManagementOperation(session, operationId, input, managementCallOptions(global));
+			}
+			return callManagementOperation(session, operationId, input, managementCallOptions(global));
 		}
 	}
 }
