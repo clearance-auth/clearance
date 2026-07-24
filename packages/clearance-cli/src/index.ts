@@ -639,7 +639,7 @@ async function main() {
 	backup
 		.command("restore")
 		.requiredOption("--id <backupId>")
-		.option("--target <path>", "API-host restore path or isolated Postgres database name")
+		.option("--target <database>", "Optional isolated Postgres database name beginning clearance_restore_; file targets are server-managed")
 		.action(remoteCommandAction);
 
 	// upgrade
