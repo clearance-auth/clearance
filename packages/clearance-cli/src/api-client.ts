@@ -1,5 +1,12 @@
-import { randomUUID } from "node:crypto";
 import { ClearanceError } from "@clearance/management";
+import {
+	createServerManagementClient,
+	MANAGEMENT_OPERATION_REGISTRY,
+	ManagementApiError,
+	type ManagementCallOptions,
+	type OperationInput,
+	type OperationOutput,
+} from "@clearance/management-client";
 import {
 	environmentToken,
 	normalizeApiUrl,
@@ -9,18 +16,18 @@ import {
 
 const API_TIMEOUT_MS = 15_000;
 
+type ManagementOperationId = keyof typeof MANAGEMENT_OPERATION_REGISTRY & string;
+type ManagementOperation<Id extends ManagementOperationId> = (typeof MANAGEMENT_OPERATION_REGISTRY)[Id];
+
+/** Call options intentionally expose only the transport controls the CLI owns. */
+export type ManagementOperationCallOptions<Id extends ManagementOperationId> =
+	ManagementCallOptions<ManagementOperation<Id>>;
+
 export type ApiSession = {
 	apiUrl: string;
 	token: string;
 	profile: string;
 	credentialSource: "environment" | "saved";
-};
-
-type ApiRequest = {
-	method?: "GET" | "POST" | "PATCH" | "DELETE";
-	path: `/v1/${string}`;
-	body?: unknown;
-	idempotencyKey?: string;
 };
 
 function cliError(code: string, message: string, remediation: string, retryable = false): ClearanceError {
@@ -73,47 +80,71 @@ export async function resolveApiSession(options: {
 	};
 }
 
-export async function requestManagementApi<T>(session: ApiSession, request: ApiRequest): Promise<T> {
-	const method = request.method ?? "GET";
+/**
+ * Calls the complete generated Management API surface from the operator CLI.
+ * The descriptor owns paths, query encoding, JSON, idempotency, validation,
+ * and server-required confirmation; this adapter owns session binding and the
+ * CLI's bounded transport/error contract.
+ */
+export async function callManagementOperation<Id extends ManagementOperationId>(
+	session: ApiSession,
+	id: Id,
+	input: OperationInput<ManagementOperation<Id>>,
+	options: ManagementOperationCallOptions<Id> = {},
+): Promise<OperationOutput<ManagementOperation<Id>>> {
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-	const headers: Record<string, string> = {
-		authorization: `Bearer ${session.token}`,
-		accept: "application/json",
-	};
-	if (request.body !== undefined) headers["content-type"] = "application/json";
-	if (method !== "GET") headers["idempotency-key"] = request.idempotencyKey ?? randomUUID();
+	let timedOut = false;
+	const abortFromCaller = () => controller.abort(options.signal?.reason);
+	if (options.signal?.aborted) abortFromCaller();
+	else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+	const timer = setTimeout(() => {
+		timedOut = true;
+		controller.abort();
+	}, API_TIMEOUT_MS);
+
 	try {
-		const response = await fetch(`${session.apiUrl}${request.path}`, {
-			method,
-			headers,
-			...(request.body !== undefined ? { body: JSON.stringify(request.body) } : {}),
-			signal: controller.signal,
+		const client = createServerManagementClient({
+			baseUrl: session.apiUrl,
+			bearerToken: session.token,
+			registry: MANAGEMENT_OPERATION_REGISTRY,
 		});
-		const payload = response.status === 204
-			? undefined
-			: await response.json().catch(() => undefined);
-		if (response.ok) return payload as T;
-		const remote = payload && typeof payload === "object"
-			? (payload as { error?: Record<string, unknown> }).error
-			: undefined;
-		throw new ClearanceError({
-			code: typeof remote?.code === "string" ? remote.code : "CLI_API_REQUEST_FAILED",
-			message: typeof remote?.message === "string" ? remote.message : `Clearance API returned HTTP ${response.status}.`,
-			stage: typeof remote?.stage === "string" ? remote.stage : "cli.api",
-			remediation: typeof remote?.remediation === "string"
-				? remote.remediation
-				: "Check the selected profile, API health, and operator authorization.",
-			retryable: typeof remote?.retryable === "boolean" ? remote.retryable : response.status >= 500,
-			status: response.status,
-		});
+		const response = await client.call(id, input, { ...options, signal: controller.signal });
+		return response.data;
 	} catch (cause) {
-		if (cause instanceof ClearanceError) throw cause;
-		if ((cause as Error).name === "AbortError") {
-			throw cliError("CLI_API_TIMEOUT", "Clearance API request timed out.", "Check API reachability and retry.", true);
+		if (timedOut) {
+			throw cliError(
+				"CLI_API_TIMEOUT",
+				"Clearance API request timed out.",
+				"Check API reachability and retry.",
+				true,
+			);
 		}
-		throw cliError("CLI_API_UNREACHABLE", "Clearance API could not be reached.", "Check the selected profile and network connection.", true);
+		if (cause instanceof ManagementApiError) {
+			if (cause.code === "MANAGEMENT_API_UNREACHABLE") {
+				throw cliError(
+					"CLI_API_UNREACHABLE",
+					"Clearance API could not be reached.",
+					"Check the selected profile and network connection.",
+					true,
+				);
+			}
+			throw new ClearanceError({
+				code: cause.code,
+				message: cause.message,
+				stage: cause.stage ?? "cli.api",
+				remediation: cause.remediation ?? "Check the selected profile, API health, and operator authorization.",
+				retryable: cause.retryable,
+				status: cause.status,
+			});
+		}
+		throw cliError(
+			"CLI_API_UNREACHABLE",
+			"Clearance API could not be reached.",
+			"Check the selected profile and network connection.",
+			true,
+		);
 	} finally {
 		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", abortFromCaller);
 	}
 }
