@@ -23,26 +23,13 @@ export function error(code: string, message: string, remediation: string): Clear
 	return new ClearanceError({ code, message, stage: "cli.dispatch", remediation });
 }
 
-export function query(path: string, values: Record<string, unknown>): `/v1/${string}` {
-	const params = new URLSearchParams();
-	for (const [key, value] of Object.entries(values)) {
-		if (value !== undefined && value !== false && value !== "") params.set(key, String(value));
-	}
-	return `${path}${params.size ? `?${params}` : ""}` as `/v1/${string}`;
-}
-
 export function body(values: Record<string, unknown>): Record<string, unknown> {
 	return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
 }
 
-export function previewConfirmation(global: Readonly<GlobalOpts>): {
-	dryRun: boolean | undefined;
-	confirm: boolean | undefined;
-} {
-	return {
-		dryRun: global.dryRun || !global.yes,
-		confirm: global.yes && !global.dryRun,
-	};
+/** The generated client handles policy; dispatchers only forward CLI intent. */
+export function managementCallOptions(global: Readonly<GlobalOpts>): { readonly confirm?: true } {
+	return global.yes && !global.dryRun ? { confirm: true } : {};
 }
 
 export function localFile(path: unknown, code: string, label: string): string {
