@@ -124,22 +124,22 @@ export function registerOperationRoutes({
 				});
 			}
 			const target = typeof body.target === "string" ? body.target : undefined;
+			if (!runtimeDatabaseConfigured() && target !== undefined) {
+				throw new ClearanceError({
+					code: "BACKUP_RESTORE_TARGET_SERVER_MANAGED",
+					message: "The API chooses the isolated file restore destination",
+					stage: "backup.restore",
+					status: 400,
+					remediation: "Omit target; the API will restore into its server-owned backup storage.",
+				});
+			}
 			let result:
 				| Awaited<ReturnType<typeof restorePostgresBackup>>
 				| ReturnType<typeof restoreBackup>;
 			if (runtimeDatabaseConfigured()) {
 				result = await restorePostgresBackup(store, c.req.param("id"), target);
 			} else {
-				if (!target) {
-					throw new ClearanceError({
-						code: "BACKUP_RESTORE_TARGET_REQUIRED",
-						message: "A restore target is required for the development store",
-						stage: "backup.restore",
-						status: 400,
-						remediation: "Send an isolated target path.",
-					});
-				}
-				result = restoreBackup(store, c.req.param("id"), target);
+				result = restoreBackup(store, c.req.param("id"));
 			}
 			await store.ready();
 			return c.json(result);
