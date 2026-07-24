@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import {
 	extractDeliveryTraceCarrier,
 	type DeliveryTraceCarrier,
+	withDeliveryProcessingSpan,
 } from "@clearance/observability-node";
+import { context, ROOT_CONTEXT } from "@opentelemetry/api";
 import pg from "pg";
 import { DeliveryError, StaleDeliveryLeaseError } from "./errors.js";
 import {
@@ -72,6 +74,10 @@ type JobRow = {
 	cancelled_at: Date | string | null;
 	trace_parent: string | null;
 };
+
+function withDetachedTraceContext<T>(operation: () => T): T {
+	return context.with(ROOT_CONTEXT, operation);
+}
 
 export type LeasedDeliveryJob = DeliveryJobRecord & {
 	leaseToken: string;
@@ -320,50 +326,105 @@ export class DeliveryStore {
 		leaseMs?: number;
 		now?: Date;
 	}): Promise<LeasedDeliveryJob | null> {
+		return (await this.#claimNextDetached(input)) ?? null;
+	}
+
+	/**
+	 * Lease the next job without inheriting an ambient trace. Only after the
+	 * claim commits and releases its database client does the worker operation
+	 * begin under that job's durable parent.
+	 */
+	async claimNextWithTrace<T>(input: {
+		workerId: string;
+		leaseMs?: number;
+		now?: Date;
+	}, process: (leased: LeasedDeliveryJob) => Promise<T>): Promise<T | undefined> {
+		const leased = await this.#claimNextDetached(input);
+		if (!leased) return undefined;
+		return withDeliveryProcessingSpan({
+			...(leased.traceCarrier === undefined ? {} : { carrier: leased.traceCarrier }),
+			channel: leased.channel,
+			transport: "postgres",
+		}, () => process(leased));
+	}
+
+	/**
+	 * The complete candidate read and atomic claim run detached from ambient
+	 * context. Lease-only callers therefore create no processing span.
+	 */
+	async #claimNextDetached(input: {
+		workerId: string;
+		leaseMs?: number;
+		now?: Date;
+	}): Promise<LeasedDeliveryJob | undefined> {
 		const now = validDate(input.now ?? new Date(), "now");
 		const workerId = validWorkerId(input.workerId);
 		const leaseMs = boundedInteger(input.leaseMs ?? 60_000, "leaseMs", 1_000, 600_000);
 		const leaseExpiresAt = new Date(now.getTime() + leaseMs);
 		const leaseToken = randomUUID();
-		return this.transaction(async (client) => {
-			const claimed = await client.query<JobRow & {
-				lease_token: string;
-				lease_owner: string;
-				lease_expires_at: Date | string;
-			}>(
-				`WITH candidate AS (
-					SELECT id FROM ${this.tables.job}
-					WHERE state IN ('queued','retry') AND available_at <= $1
-					  AND semantic_expires_at > $1 AND attempt_count < max_attempts
-					ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1
-				)
-					UPDATE ${this.tables.job} j SET
-					 state='leased', lease_token=$2, lease_owner=$3, lease_expires_at=$4,
-					 attempt_count=j.attempt_count+1, updated_at=$1, cancel_requested=false,
-					 provider_accepted_at=NULL, provider_status=NULL, provider_request_id=NULL
-				FROM candidate c, ${this.tables.event} e
-				WHERE j.id=c.id AND e.id=j.event_id
-				RETURNING j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id,
-				 e.trace_parent`,
-				[now, leaseToken, workerId, leaseExpiresAt],
-			);
-			const row = claimed.rows[0];
-			if (!row) return null;
-			const traceCarrier = extractDeliveryTraceCarrier(row.trace_parent);
-			await client.query(
+		const client = await this.pool.connect();
+		let transactionOpen = false;
+		let clientReleased = false;
+		try {
+			await withDetachedTraceContext(() => client.query("BEGIN"));
+			transactionOpen = true;
+			const candidate = await withDetachedTraceContext(() => client.query<JobRow>(
+				`SELECT j.*, e.kind, e.project_id, e.environment_id, e.organization_id, e.webhook_endpoint_id,
+				 e.trace_parent
+				 FROM ${this.tables.job} j JOIN ${this.tables.event} e ON e.id=j.event_id
+				 WHERE j.state IN ('queued','retry') AND j.available_at <= $1
+				   AND j.semantic_expires_at > $1 AND j.attempt_count < j.max_attempts
+				 ORDER BY j.available_at, j.id FOR UPDATE SKIP LOCKED LIMIT 1`,
+				[now],
+			));
+			const selected = candidate.rows[0];
+			if (!selected) {
+				await withDetachedTraceContext(() => client.query("COMMIT"));
+				transactionOpen = false;
+				return undefined;
+			}
+			const traceCarrier = extractDeliveryTraceCarrier(selected.trace_parent);
+			const updated = await withDetachedTraceContext(() => client.query<JobRow>(
+				`UPDATE ${this.tables.job} SET
+				 state='leased', lease_token=$2, lease_owner=$3, lease_expires_at=$4,
+				 attempt_count=attempt_count+1, updated_at=$1, cancel_requested=false,
+				 provider_accepted_at=NULL, provider_status=NULL, provider_request_id=NULL
+				 WHERE id=$5 AND state IN ('queued','retry')
+				 RETURNING *`,
+				[now, leaseToken, workerId, leaseExpiresAt, selected.id],
+			));
+			const row = updated.rows[0];
+			if (!row) throw new StaleDeliveryLeaseError();
+			await withDetachedTraceContext(() => client.query(
 				`INSERT INTO ${this.tables.attempt}
 				 (id, job_id, attempt_number, lease_token, phase, worker_id, created_at)
 				 VALUES ($1,$2,$3,$4,'claimed',$5,$6)`,
 				[randomUUID(), row.id, row.attempt_count, leaseToken, workerId, now],
-			);
-			return {
-				...jobRecord(row),
+			));
+			await withDetachedTraceContext(() => client.query("COMMIT"));
+			transactionOpen = false;
+			const leased: LeasedDeliveryJob = {
+				...jobRecord({ ...selected, ...row }),
 				leaseToken,
 				leaseOwner: workerId,
 				leaseExpiresAt: leaseExpiresAt.toISOString(),
 				...(traceCarrier === undefined ? {} : { traceCarrier }),
 			};
-		});
+			client.release();
+			clientReleased = true;
+			return leased;
+		} catch (error) {
+			if (transactionOpen) {
+				try {
+					await withDetachedTraceContext(() => client.query("ROLLBACK"));
+				} catch (rollbackError) {
+					throw new AggregateError([error, rollbackError], "Delivery claim and rollback both failed");
+				}
+			}
+			throw error;
+		} finally {
+			if (!clientReleased) client.release();
+		}
 	}
 
 	async readLeasedPayload<T>(input: {
