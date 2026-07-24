@@ -3177,13 +3177,63 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	};
 }
 
+export type AuthoritativeOverviewResourceCounts = Readonly<{
+	projects: number;
+	environments: number;
+	principals: number;
+	organizations: number;
+	memberships: number;
+	identityConnections: number;
+	directoryConnections: number;
+	roles: number;
+	setupLinks: number;
+	events: number | null;
+	traces: number;
+	migrations: number;
+	sessions: number;
+	apiKeys: number;
+}>;
+
 export type AuthoritativeOverviewStats = Omit<
 	ReturnType<typeof overviewStats>,
 	"resourceCounts"
 > & {
 	/** Only authority-unavailable resources are nullable. */
-	resourceCounts: Record<string, number | null>;
+	resourceCounts: AuthoritativeOverviewResourceCounts;
 };
+
+function authoritativeOverviewResourceCounts(
+	counts: Record<string, number>,
+): AuthoritativeOverviewResourceCounts {
+	const required = (key: string): number => {
+		const value = counts[key];
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+			throw new ClearanceError({
+				code: "OVERVIEW_RESOURCE_COUNTS_INVALID",
+				message: `Overview resource count ${key} is unavailable or invalid`,
+				stage: "overview",
+				status: 500,
+			});
+		}
+		return value;
+	};
+	return {
+		projects: required("projects"),
+		environments: required("environments"),
+		principals: required("principals"),
+		organizations: required("organizations"),
+		memberships: required("memberships"),
+		identityConnections: required("identityConnections"),
+		directoryConnections: required("directoryConnections"),
+		roles: required("roles"),
+		setupLinks: required("setupLinks"),
+		events: required("events"),
+		traces: required("traces"),
+		migrations: required("migrations"),
+		sessions: required("sessions"),
+		apiKeys: required("apiKeys"),
+	};
+}
 
 export async function overviewStatsAuthoritative(
 	store: ManagementStore,
@@ -3193,7 +3243,11 @@ export async function overviewStatsAuthoritative(
 	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
 	const eventsAuthoritative = store.storeV2Events?.authoritative === true;
 	if (!principalsAuthoritative && !topologyAuthoritative && !eventsAuthoritative) {
-		return overviewStats(store, scope);
+		const overview = overviewStats(store, scope);
+		return {
+			...overview,
+			resourceCounts: authoritativeOverviewResourceCounts(overview.resourceCounts),
+		};
 	}
 	const resolvedScope = scope ?? resolveOperatorScope(store);
 	const principalCounts = principalsAuthoritative
@@ -3243,7 +3297,7 @@ export async function overviewStatsAuthoritative(
 				limit: 10,
 			})).events
 		: listEvents(store, { limit: 10, scope: resolvedScope });
-	const resourceCounts = store.resourceCounts();
+	const resourceCounts = authoritativeOverviewResourceCounts(store.resourceCounts());
 	return {
 		totalUsers: counts.total,
 		activeUsers: counts.active,
