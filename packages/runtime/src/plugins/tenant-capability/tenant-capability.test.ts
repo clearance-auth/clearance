@@ -63,7 +63,7 @@ describe("tenant capability kernel", () => {
 			async authenticateServiceAccountCredential() {
 				throw new Error("not used by tenant capability");
 			},
-			async initializeOrganizationOwner() {},
+			async initializeOrganizationOwner() { return "1"; },
 		});
 
 		const signedIn = await instance.signInWithTestUser();

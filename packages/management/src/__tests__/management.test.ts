@@ -30,6 +30,7 @@ import {
 	verifyBackup,
 	verifyMigration,
 } from "../index.js";
+import { getLatestReadiness } from "../services/readiness.js";
 
 const dirs: string[] = [];
 
@@ -208,6 +209,24 @@ describe("enterprise SSO/SCIM + readiness", () => {
 		expect(blob).not.toContain("super-secret-client-value");
 		const snap = JSON.stringify(store.snapshot);
 		expect(snap).not.toContain("super-secret-client-value");
+	});
+
+	it("marks a stored report stale after an enabled enterprise connection changes", () => {
+		const store = tempStore();
+		initProject(store, { name: "Readiness freshness" });
+		const org = createOrganization(store, { name: "Enterprise" });
+		const scim = createScimConnection(store, { organizationId: org.id, provider: "okta" });
+		runReadinessCheck(store, org.id);
+		store.mutate((data) => {
+			const connection = data.directoryConnections.find((candidate) => candidate.id === scim.id)!;
+			connection.status = "disabled";
+			connection.updatedAt = new Date(Date.now() + 1).toISOString();
+		});
+		expect(getLatestReadiness(store, org.id)).toMatchObject({
+			state: "stale",
+			overall: "blocked",
+			conformance: { liveCertified: false },
+		});
 	});
 });
 

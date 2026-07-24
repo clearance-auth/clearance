@@ -90,7 +90,12 @@ import {
 	readStoreV2TopologyState,
 	type StoreV2TopologyState,
 } from "./store-v2-topology.js";
-import { registerInternalCoordinatedExecutor } from "./coordinated-internal.js";
+import {
+	registerInternalCoordinatedExecutor,
+	registerInternalExternalCoordinatedExecutor,
+	type InternalExistingTransaction,
+} from "./coordinated-internal.js";
+import { ProductPresentationRepository } from "./product-presentation-authority.js";
 import {
 	appendAuditEvent,
 	buildAuditEvent,
@@ -176,6 +181,7 @@ export class PgStore implements ManagementStore {
 	readonly storeV2OrganizationAuthority?: Readonly<{ schema: string; table: string }>;
 	readonly deliveryControl?: ManagementDeliveryControlReader;
 	readonly webhookEndpoints?: ManagementWebhookEndpointCapability;
+	readonly productPresentation?: import("./product-presentation-authority.js").ProductPresentationAuthorityReader;
 	private data: DataStoreSnapshot;
 	private revision = 0;
 	private pool: pg.Pool;
@@ -183,6 +189,7 @@ export class PgStore implements ManagementStore {
 	private emailUniqueTable: string;
 	private slugUniqueTable: string;
 	private idempotencyTable: string;
+	readonly scimOperationReplayTable: string;
 	private deliveryKeyring?: DeliveryKeyring;
 	private deliverySchemaOptions?: DeliverySchemaOptions;
 	private deliveryQuotaPolicy: DeliveryQuotaPolicy = DEFAULT_DELIVERY_QUOTA_POLICY;
@@ -254,6 +261,7 @@ export class PgStore implements ManagementStore {
 		this.emailUniqueTable = safeTableName(`${this.table}_principal_email`);
 		this.slugUniqueTable = safeTableName(`${this.table}_organization_slug`);
 		this.idempotencyTable = safeTableName(`${this.table}_idempotency`);
+		this.scimOperationReplayTable = safeTableName(`${this.table}_scim_operation_replay`);
 		if (normalizedDelivery) {
 			this.deliveryKeyring = normalizedDelivery.keyring;
 			this.deliveryQuotaPolicy = normalizedDelivery.quota;
@@ -443,6 +451,23 @@ export class PgStore implements ManagementStore {
 				this.table,
 				normalizedPrefix,
 			);
+			const presentationReader = new ProductPresentationRepository(
+				async (sql, params) => {
+					const result = await this.pool.query(sql, params);
+					return {
+						rows: result.rows as Record<string, unknown>[],
+						rowCount: result.rowCount,
+					};
+				},
+				this.storeV2Shadow.tables,
+			);
+			this.productPresentation = Object.freeze({
+				getPresentation: (scope) => presentationReader.getPresentation(scope),
+				resolveActiveHostedDomain: (hostname) => presentationReader.resolveActiveHostedDomain(hostname),
+				getSender: (scope) => presentationReader.getSender(scope),
+				listDomains: (scope) => presentationReader.listDomains(scope),
+				getTemplate: (scope, kind) => presentationReader.getTemplate(scope, kind),
+			});
 			this.storeV2OrganizationAuthority = Object.freeze({
 				schema: "public",
 				table: this.storeV2Shadow.tables.organizations,
@@ -590,6 +615,9 @@ export class PgStore implements ManagementStore {
 		registerInternalCoordinatedExecutor(this, (fn) =>
 			this.queueCoordinated(fn),
 		);
+		registerInternalExternalCoordinatedExecutor(this, (transaction, fn) =>
+			this.transactCoordinated(fn, transaction),
+		);
 	}
 
 	/** Ensure schema + load snapshot. Call before first use. */
@@ -658,6 +686,31 @@ export class PgStore implements ManagementStore {
 				created_at timestamptz NOT NULL DEFAULT now(),
 				expires_at timestamptz NOT NULL,
 				PRIMARY KEY (scope_key, key)
+			)
+		`);
+		// SCIM bearer response-loss recovery is intentionally separate from the
+		// generic HTTP idempotency table: a persisted response body must never be
+		// used to retain a plaintext bearer token. This table keeps only a
+		// purpose-encrypted envelope bound to its immutable operation authority.
+		await this.pool.query(`
+			CREATE TABLE IF NOT EXISTS ${this.scimOperationReplayTable} (
+				project_id text NOT NULL,
+				environment_id text NOT NULL,
+				organization_id text NOT NULL,
+				operation_id text NOT NULL,
+				operation_kind text NOT NULL,
+				actor_id text NOT NULL,
+				source text NOT NULL,
+				provider text NOT NULL,
+				endpoint text NOT NULL,
+				connection_id text NOT NULL,
+				request_fingerprint text NOT NULL,
+				bearer_token_encrypted text NOT NULL,
+				bearer_token_fingerprint text NOT NULL,
+				bearer_token_key_id text NOT NULL,
+				connection_state_fingerprint text NOT NULL,
+				created_at timestamptz NOT NULL DEFAULT now(),
+				PRIMARY KEY (project_id, environment_id, organization_id, operation_id)
 			)
 		`);
 
@@ -852,7 +905,11 @@ export class PgStore implements ManagementStore {
 		fn: (ctx: ManagementCoordinatedMutationContext) => Promise<T> | T,
 	): Promise<T> {
 		return this.queueCoordinated(async (context) => {
-			const { query: _query, ...publicContext } = context;
+			const {
+				query: _query,
+				productPresentation: _productPresentation,
+				...publicContext
+			} = context;
 			return fn(publicContext);
 		});
 	}
@@ -1634,19 +1691,27 @@ export class PgStore implements ManagementStore {
 		fn: (
 			context: InternalManagementCoordinatedMutationContext,
 		) => Promise<T> | T,
+		existingTransaction?: InternalExistingTransaction,
 	): Promise<T> {
-		const client = await this.pool.connect();
+		const client = existingTransaction
+			? {
+					query: <Row extends Record<string, unknown> = Record<string, unknown>>(
+						text: string,
+						values?: readonly unknown[],
+					) => existingTransaction.rawTransactionQuery<Row>(text, values),
+				} as unknown as pg.PoolClient
+			: await this.pool.connect();
 		let committed = false;
 		let released = false;
 		const release = () => {
-			if (!released) {
+			if (!existingTransaction && !released) {
 				released = true;
 				client.release();
 			}
 		};
 		let committedValue!: T;
 		try {
-			await client.query("BEGIN");
+			if (!existingTransaction) await client.query("BEGIN");
 			if (this.storeV2Shadow) {
 				await this.storeV2Shadow.lockPrincipalAuthorityShared(client);
 			}
@@ -1902,12 +1967,16 @@ export class PgStore implements ManagementStore {
 			let callbackError: unknown;
 			let callbackFailed = false;
 			try {
+				const productPresentation = this.storeV2Shadow
+					? new ProductPresentationRepository(query, this.storeV2Shadow.tables)
+					: undefined;
 				value = await fn({
 					data: base,
 					...(principals ? { principals } : {}),
 					...(topology ? { topology } : {}),
 					appendAudit,
 					query,
+					...(productPresentation ? { productPresentation } : {}),
 					...(enqueueDelivery ? { enqueueDelivery } : {}),
 					...(controlDelivery ? { controlDelivery } : {}),
 					...(fanoutWebhookEndpoints ? { fanoutWebhookEndpoints } : {}),
@@ -1966,16 +2035,6 @@ export class PgStore implements ManagementStore {
 				sync?.authoritativeCollections ?? [],
 			);
 			const persisted = sync?.persistedSnapshot ?? base;
-			const materialized = await this.materializeStoreV2Candidate(
-				client,
-				base,
-				previousRevision,
-				sync,
-			);
-			const principalCount = await this.resolvePrincipalCount(
-				client,
-				sync?.authoritativeCollections ?? [],
-			);
 			await client.query(
 				`INSERT INTO ${this.table} (id, data, revision, updated_at)
          VALUES (1, $1::jsonb, $2, now())
@@ -1985,22 +2044,36 @@ export class PgStore implements ManagementStore {
              updated_at = now()`,
 				[JSON.stringify(persisted), revision],
 			);
-			await client.query("COMMIT");
-			committed = true;
-			release();
-			await this.publishCommittedStoreV2Snapshot({
-				snapshot: materialized,
-				principalCount,
-				revision,
-				phase: sync?.phase ?? phase,
-				authoritativeCollections: sync?.authoritativeCollections ?? [],
-				principalRevision: sync?.principalRevision ?? null,
-				topologyState: sync?.topologyState ?? null,
-			}).catch(() => undefined);
+			if (!existingTransaction) {
+				const materialized = await this.materializeStoreV2Candidate(
+					client,
+					base,
+					previousRevision,
+					sync,
+				);
+				const principalCount = await this.resolvePrincipalCount(
+					client,
+					sync?.authoritativeCollections ?? [],
+				);
+				await client.query("COMMIT");
+				committed = true;
+				release();
+				await this.publishCommittedStoreV2Snapshot({
+					snapshot: materialized,
+					principalCount,
+					revision,
+					phase: sync?.phase ?? phase,
+					authoritativeCollections: sync?.authoritativeCollections ?? [],
+					principalRevision: sync?.principalRevision ?? null,
+					topologyState: sync?.topologyState ?? null,
+				}).catch(() => undefined);
+			}
 			return value;
 		} catch (error) {
 			if (committed) return committedValue;
-			await client.query("ROLLBACK").catch(() => undefined);
+			if (!existingTransaction) {
+				await client.query("ROLLBACK").catch(() => undefined);
+			}
 			throw error;
 		} finally {
 			release();

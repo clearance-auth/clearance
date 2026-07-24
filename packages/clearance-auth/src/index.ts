@@ -9,7 +9,7 @@ export { getMigrations } from "../../runtime/src/db/get-migration.js";
 export { sso } from "@clearance/sso";
 export { scim } from "@clearance/scim";
 
-export {
+	export {
 	createClearanceAuth,
 	CLEARANCE_AUTH_VERSION,
 	RUNTIME_BASELINE,

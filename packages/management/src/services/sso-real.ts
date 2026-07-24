@@ -10,7 +10,11 @@ import {
 	DEFAULT_CLOCK_SKEW_MS,
 } from "@clearance/sso";
 import { createHash, X509Certificate } from "node:crypto";
-import type { ManagementStore } from "../store/types.js";
+import type { ClearanceKeyManagementFacade } from "@clearance/auth";
+import type {
+	ManagementCoordinatedQuery,
+	ManagementStore,
+} from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
 import {
@@ -30,7 +34,11 @@ import {
 	SSO_LOCAL_EVIDENCE_LABEL,
 	verifySsoOidcLocalProtocol,
 } from "./sso-local.js";
-import { decryptCredential, encryptCredential } from "./credentials.js";
+import {
+	decryptCredential,
+	encryptCredential,
+	type CredentialCipher,
+} from "./credentials.js";
 import { publicIdentityConnection } from "./redact.js";
 import type { ResourceScope } from "./scope.js";
 import { deriveSetupConnectionIds } from "./setup-links.js";
@@ -54,6 +62,78 @@ export const SSO_REAL_FIXTURE_MODE = "simulation" as const;
 /** Matrix fixtures (okta/entra JSON) are never tenant certification. */
 export const SSO_MATRIX_NOT_CERTIFIED = false as const;
 
+export type SsoRealMutationGuard = Readonly<{
+	authorizeMutation(input: {
+		organizationId: string;
+		query: ManagementCoordinatedQuery;
+	}): Promise<void>;
+	credentialCipher?: CredentialCipher;
+	runtimeKeyManagement?: ClearanceKeyManagementFacade;
+}>;
+
+function ssoCredentialIdentity(organizationId: string, connectionId: string): Readonly<Record<string, string>> {
+	return Object.freeze({ organizationId, connectionId });
+}
+
+async function openSsoCredential(
+	guard: SsoRealMutationGuard | undefined,
+	envelope: string,
+	organizationId: string,
+	connectionId: string,
+): Promise<string> {
+	return guard?.credentialCipher
+		? guard.credentialCipher.open(envelope, ssoCredentialIdentity(organizationId, connectionId))
+		: decryptCredential(envelope);
+}
+
+async function sealSsoCredential(
+	guard: SsoRealMutationGuard | undefined,
+	plaintext: string,
+	organizationId: string,
+	connectionId: string,
+) {
+	return guard?.credentialCipher
+		? guard.credentialCipher.seal(plaintext, ssoCredentialIdentity(organizationId, connectionId))
+		: encryptCredential(plaintext);
+}
+
+function ssoSettlementFingerprint(connection: IdentityConnection): string {
+	return JSON.stringify({
+		organizationId: connection.organizationId,
+		protocol: connection.protocol,
+		provider: connection.provider,
+		status: connection.status,
+		domains: [...connection.domains].sort(),
+		issuer: connection.issuer ?? null,
+		audience: connection.audience ?? null,
+		metadataUrl: connection.metadataUrl ?? null,
+		clientId: connection.clientId ?? null,
+		clientSecretFingerprint: connection.clientSecretFingerprint ?? null,
+		clientSecretKeyId: connection.clientSecretKeyId ?? null,
+		samlEntryPoint: connection.samlEntryPoint ?? null,
+		samlCertificateFingerprint: connection.samlCertificateFingerprint ?? null,
+		attributeMapping: connection.attributeMapping,
+	});
+}
+
+function assertSsoSettlementCurrent(
+	expected: IdentityConnection,
+	current: IdentityConnection | undefined,
+): asserts current is IdentityConnection {
+	if (
+		!current ||
+		current.status === "disabled" ||
+		ssoSettlementFingerprint(current) !== ssoSettlementFingerprint(expected)
+	) {
+		throw new ClearanceError({
+			code: "SSO_TEST_SETTLEMENT_CONFLICT",
+			message: "SSO connection changed or was disabled while its test was running",
+			stage: "sso.test.settle",
+			status: 409,
+		});
+	}
+}
+
 async function settleSsoTestSuccess(
 	store: ManagementStore,
 	input: {
@@ -64,6 +144,7 @@ async function settleSsoTestSuccess(
 		scope?: ResourceScope;
 		message: string;
 		metadata: Record<string, unknown>;
+		guard?: SsoRealMutationGuard;
 	},
 ): Promise<IdentityConnection> {
 	const expectedOrganization = await inspectOrganizationAuthoritative(
@@ -79,8 +160,13 @@ async function settleSsoTestSuccess(
 		return mutateCoordinatedWithRuntimeSql(store, async ({
 			data,
 			topology,
+			query,
 			appendAudit,
 		}) => {
+			await input.guard?.authorizeMutation({
+				organizationId: expectedOrganization.id,
+				query,
+			});
 			const organization = topology
 				? await topology.lockOrganization({ scope, id: expectedOrganization.id })
 				: data.organizations.find(
@@ -111,7 +197,8 @@ async function settleSsoTestSuccess(
 				});
 			}
 			const current = data.identityConnections[index]!;
-			const updated = { ...current, status: "testing" as const, updatedAt: nowIso() };
+			assertSsoSettlementCurrent(input.connection, current);
+			const updated = { ...current, status: "testing" as const, updatedAt: input.trace.createdAt };
 			data.identityConnections[index] = updated;
 			data.traces.unshift({ ...input.trace, mode: SSO_REAL_FIXTURE_MODE });
 			appendAudit({
@@ -136,13 +223,12 @@ async function settleSsoTestSuccess(
 		const index = data.identityConnections.findIndex(
 			(connection) => connection.id === input.connection.id,
 		);
-		if (index >= 0) {
-			data.identityConnections[index] = {
-				...data.identityConnections[index],
-				status: "testing",
-				updatedAt: nowIso(),
-			};
-		}
+		assertSsoSettlementCurrent(input.connection, data.identityConnections[index]);
+		data.identityConnections[index] = {
+			...data.identityConnections[index],
+			status: "testing",
+			updatedAt: input.trace.createdAt,
+		};
 		data.traces.unshift({ ...input.trace, mode: SSO_REAL_FIXTURE_MODE });
 	});
 	recordEvent(store, {
@@ -304,6 +390,7 @@ export async function createSsoConnectionReal(
 		 */
 		setupAttemptId?: string;
 	},
+	guard?: SsoRealMutationGuard,
 ): Promise<IdentityConnection> {
 	const org = await inspectOrganizationAuthoritative(
 		store,
@@ -391,6 +478,7 @@ export async function createSsoConnectionReal(
 			query,
 			appendAudit,
 		}) => {
+			await guard?.authorizeMutation({ organizationId: org.id, query });
 			const active = topology
 				? await topology.lockOrganization({
 					scope: {
@@ -431,7 +519,7 @@ export async function createSsoConnectionReal(
 				const reconciledClientSecret =
 					protocol === "oidc"
 						? prior.clientSecretEncrypted
-							? decryptCredential(prior.clientSecretEncrypted)
+							? await openSsoCredential(guard, prior.clientSecretEncrypted, active.id, prior.id)
 							: (() => {
 									throw new ClearanceError({
 										code: "SSO_CONNECTION_SECRET_MISSING",
@@ -460,7 +548,7 @@ export async function createSsoConnectionReal(
 								audience,
 							}
 							: undefined,
-				});
+				}, guard?.runtimeKeyManagement);
 				return publicIdentityConnection(prior) as IdentityConnection;
 			}
 
@@ -476,7 +564,7 @@ export async function createSsoConnectionReal(
 					protocol === "saml"
 						? { entryPoint: saml!.entryPoint, cert: saml!.certificate, audience }
 						: undefined,
-			});
+			}, guard?.runtimeKeyManagement);
 			const raced = data.identityConnections.find((connection) => connection.id === inserted.id);
 			if (raced) {
 				assertMatchingSsoConnection(raced, {
@@ -492,7 +580,9 @@ export async function createSsoConnectionReal(
 				return publicIdentityConnection(raced) as IdentityConnection;
 			}
 
-			const enc = clientSecret ? encryptCredential(clientSecret) : undefined;
+			const enc = clientSecret
+				? await sealSsoCredential(guard, clientSecret, active.id, inserted.id)
+				: undefined;
 			const now = nowIso();
 			const conn: IdentityConnection = {
 				id: inserted.id,
@@ -538,6 +628,15 @@ export async function createSsoConnectionReal(
 			return publicIdentityConnection(conn) as IdentityConnection;
 		});
 	}
+	if (guard) {
+		throw new ClearanceError({
+			code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+			message:
+				"Tenant enterprise mutation requires the coordinated PostgreSQL backend",
+			stage: "sso.create",
+			status: 500,
+		});
+	}
 
 	if (connectionId) {
 		const existing = store.snapshot.identityConnections.find((c) => c.id === connectionId);
@@ -555,7 +654,7 @@ export async function createSsoConnectionReal(
 			const reconciledClientSecret =
 				protocol === "oidc"
 					? existing.clientSecretEncrypted
-						? decryptCredential(existing.clientSecretEncrypted)
+						? await openSsoCredential(guard, existing.clientSecretEncrypted, org.id, existing.id)
 						: (() => {
 								throw new ClearanceError({
 									code: "SSO_CONNECTION_SECRET_MISSING",
@@ -632,7 +731,9 @@ export async function createSsoConnectionReal(
 		return publicIdentityConnection(prior) as IdentityConnection;
 	}
 
-	const enc = clientSecret ? encryptCredential(clientSecret) : undefined;
+	const enc = clientSecret
+		? await sealSsoCredential(guard, clientSecret, org.id, inserted.id)
+		: undefined;
 	const conn: IdentityConnection = {
 		id: inserted.id,
 		organizationId: org.id,
@@ -721,6 +822,7 @@ export async function testSsoConnectionReal(
 		/** Server-derived operator scope. */
 		scope?: ResourceScope;
 	} = {},
+	guard?: SsoRealMutationGuard,
 ): Promise<{
 	pass: boolean;
 	trace: DiagnosticTrace;
@@ -851,6 +953,7 @@ export async function testSsoConnectionReal(
 				evidence: SSO_LOCAL_EVIDENCE_LABEL,
 				certifiedExternalTenant: false,
 			},
+			...(guard ? { guard } : {}),
 		});
 		return {
 			pass: true,

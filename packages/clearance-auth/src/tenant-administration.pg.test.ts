@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { ClearanceAuthBundle } from "./public-types/index.js";
-import { createClearanceAuth } from "./create-auth.js";
+import type {
+	ClearanceAuthBundle,
+	TenantProductAdministrationFacade,
+} from "./public-types/index.js";
+import { createClearanceManagementAuth } from "./create-auth.js";
 
 const DATABASE_URL =
 	process.env.CLEARANCE_TEST_DATABASE_URL ??
@@ -41,6 +44,11 @@ describe.sequential.skipIf(!available)(
 		let organizationId: string;
 		let ownerId: string;
 		let targetId: string;
+		const productCalls: Array<{
+			operation: string;
+			organizationId: string;
+			actorId: string;
+		}> = [];
 
 		const tenantRequest = async (
 			path: string,
@@ -49,6 +57,7 @@ describe.sequential.skipIf(!available)(
 					requestId?: string;
 					authorization?: string;
 					headers?: Headers;
+					method?: "GET" | "POST";
 				},
 			) => {
 				const requestHeaders = new Headers(options?.headers ?? headers);
@@ -62,7 +71,7 @@ describe.sequential.skipIf(!available)(
 			}
 			return bundle.auth.handler(
 				new Request(`http://localhost:3300/api/auth${path}`, {
-					method: options?.body ? "POST" : "GET",
+					method: options?.method ?? (options?.body ? "POST" : "GET"),
 					headers: requestHeaders,
 					...(options?.body
 						? { body: JSON.stringify(options.body) }
@@ -76,7 +85,7 @@ describe.sequential.skipIf(!available)(
 			const scopedUrl = new URL(DATABASE_URL);
 			scopedUrl.searchParams.set("options", `-csearch_path=${schema}`);
 			pool = new pg.Pool({ connectionString: scopedUrl.toString() });
-			bundle = createClearanceAuth({
+			bundle = createClearanceManagementAuth({
 				baseURL: "http://localhost:3300",
 				secret,
 				databaseUrl: scopedUrl.toString(),
@@ -91,6 +100,152 @@ describe.sequential.skipIf(!available)(
 					twoFactor: { enabled: false },
 					breachedPassword: { enabled: false },
 				},
+				tenantProductAdministration: {
+					async listAudit(input) {
+						productCalls.push({ operation: "audit", ...input });
+						return { events: [], nextCursor: null };
+					},
+					async listSso() {
+						return [];
+					},
+					async inspectSso(input) {
+						return {
+							id: input.connectionId,
+							organizationId: input.organizationId,
+							protocol: "oidc",
+							provider: "okta",
+							status: "active",
+							domains: ["example.test"],
+							hasClientSecret: true,
+							attributeMapping: {},
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+						};
+					},
+					async createSso(input) {
+						throw Object.assign(new Error("unused"), { status: 503, input });
+					},
+					async testSso(input) {
+						productCalls.push({ operation: "sso.test", ...input });
+						return {
+							connection: {
+								id: `sso_${suffix}`,
+								organizationId: input.organizationId,
+								protocol: "oidc",
+								provider: "okta",
+								status: "testing",
+								domains: ["example.test"],
+								hasClientSecret: true,
+								attributeMapping: {},
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+							},
+							pass: true,
+							mode: "simulation",
+							liveCertified: false,
+						};
+					},
+					async replaceSsoSecret(input) {
+						productCalls.push({ operation: "sso.replace_secret", ...input });
+						return {
+							id: input.connectionId,
+							organizationId: input.organizationId,
+							protocol: "oidc",
+							provider: "okta",
+							status: "active",
+							domains: ["example.test"],
+							hasClientSecret: true,
+							attributeMapping: {},
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+						};
+					},
+					async configureSso(input) {
+						return this.inspectSso(input);
+					},
+					async disableSso(input) {
+						throw Object.assign(new Error("unused"), { status: 503, input });
+					},
+					async listScim() {
+						return [];
+					},
+					async inspectScim(input) {
+						return {
+							id: input.connectionId,
+							organizationId: input.organizationId,
+							provider: "okta",
+							status: "active",
+							endpoint: "/api/auth/scim/v2",
+							hasBearerToken: true,
+							deprovisioningPolicy: "disable",
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+						};
+					},
+					async createScim(input) {
+						productCalls.push({ operation: "scim.create", ...input });
+						return {
+							connection: {
+								id: `scim_${suffix}`,
+								organizationId: input.organizationId,
+								provider: input.provider,
+								status: "draft",
+								endpoint: input.endpoint ?? "/api/auth/scim/v2",
+								hasBearerToken: true,
+								deprovisioningPolicy: "disable",
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+							},
+							bearerTokenOnce: `scimtok_${suffix}`,
+						};
+					},
+					async testScim(input) {
+						productCalls.push({ operation: "scim.test", ...input });
+						return {
+							connection: {
+								id: input.connectionId,
+								organizationId: input.organizationId,
+								provider: "okta",
+								status: "testing",
+								endpoint: "/api/auth/scim/v2",
+								hasBearerToken: true,
+								deprovisioningPolicy: "disable",
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+							},
+							pass: true,
+							mode: "simulation",
+							liveCertified: false,
+						};
+					},
+					async rotateScim(input) {
+						productCalls.push({ operation: "scim.rotate", ...input });
+						return {
+							connection: {
+								id: input.connectionId,
+								organizationId: input.organizationId,
+								provider: "okta",
+								status: "active",
+								endpoint: "/api/auth/scim/v2",
+								hasBearerToken: true,
+								deprovisioningPolicy: "disable",
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+							},
+							bearerTokenOnce: `rotated_scimtok_${suffix}`,
+							replayed: false,
+						};
+					},
+					async configureScim(input) {
+						return this.inspectScim(input);
+					},
+					async disableScim(input) {
+						throw Object.assign(new Error("unused"), { status: 503, input });
+					},
+					async readiness(input) {
+						throw Object.assign(new Error("missing"), { status: 404, input });
+					},
+				} satisfies TenantProductAdministrationFacade,
 			});
 			await bundle.migrate();
 
@@ -236,6 +391,10 @@ describe.sequential.skipIf(!available)(
 					"SELECT pg_backend_pid() AS pid",
 				);
 				const lifecyclePid = lifecycleBackend.rows[0]!.pid;
+				await lifecycleClient.query(
+					"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+					[`${schema}:clearance:authorization-mutation-v1`],
+				);
 					await lifecycleClient.query(
 						`UPDATE "user" SET name = name
 						 WHERE id = $1`,
@@ -276,10 +435,6 @@ describe.sequential.skipIf(!available)(
 						 WHERE "organizationId" = $1 AND "userId" = $2`,
 						[organizationId, targetId],
 					);
-					await lifecycleClient.query(
-					"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-					[`${schema}:clearance:authorization-mutation-v1`],
-				);
 				await lifecycleClient.query("COMMIT");
 				const orderedResponse = await orderedTenantMutation;
 				expect(
@@ -547,12 +702,45 @@ describe.sequential.skipIf(!available)(
 			);
 			expect(accountAudits.rows[0]?.count).toBe(1);
 
+			const credentialPreview = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/service-accounts/${serviceAccountId}/credentials`,
+				{ body: { dryRun: true } },
+			);
+			expect(
+				credentialPreview.status,
+				await credentialPreview.clone().text(),
+			).toBe(200);
+			expect(await credentialPreview.json()).toEqual({
+				preview: true,
+				organizationId,
+				serviceAccountId,
+				expiresAt: null,
+				secretGenerated: false,
+			});
+
+			const credentialPreviewWithOperationId = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/service-accounts/${serviceAccountId}/credentials`,
+				{ body: { operationId: randomUUID(), dryRun: true } },
+			);
+			expect(credentialPreviewWithOperationId.status).toBe(400);
+
+			const uppercaseCredentialOperationId = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/service-accounts/${serviceAccountId}/credentials`,
+				{
+					body: {
+						operationId: randomUUID().toUpperCase(),
+						dryRun: false,
+					},
+				},
+			);
+			expect(uppercaseCredentialOperationId.status).toBe(400);
+
 			const credentialRequestId = `tenant-credential-${suffix}`;
 			const credentialResponse = await tenantRequest(
 				`/tenant/v1/organizations/${organizationId}/service-accounts/${serviceAccountId}/credentials`,
 				{
 					requestId: credentialRequestId,
-					body: { dryRun: false },
+					body: { operationId: randomUUID(), dryRun: false },
 				},
 			);
 			expect(credentialResponse.status).toBe(200);
@@ -585,6 +773,146 @@ describe.sequential.skipIf(!available)(
 			expect(credentialAudit.rows[0]?.serialized).not.toContain(
 				credentialBody.credential.credentialId,
 			);
+
+			const auditResponse = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/audit?limit=10`,
+			);
+			expect(auditResponse.status, await auditResponse.clone().text()).toBe(200);
+			expect(await auditResponse.json()).toEqual({
+				events: [],
+				nextCursor: null,
+			});
+			expect(productCalls.at(-1)).toMatchObject({
+				operation: "audit",
+				organizationId,
+				actorId: ownerId,
+			});
+
+			const headerCredentialResponse = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/audit`,
+				{ authorization: "Bearer must-not-authorize-tenant-product" },
+			);
+			expect(headerCredentialResponse.status).toBe(401);
+
+			const testedSso = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/sso/sso_${suffix}/test`,
+				{ body: { dryRun: false, confirm: true } },
+			);
+			expect(testedSso.status, await testedSso.clone().text()).toBe(200);
+			expect(await testedSso.json()).toMatchObject({
+				pass: true,
+				connection: { organizationId, status: "testing" },
+			});
+			expect(productCalls.at(-1)).toMatchObject({
+				operation: "sso.test",
+				organizationId,
+				actorId: ownerId,
+			});
+
+			const previewSsoRotate = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/sso/sso_${suffix}/replace-secret`,
+				{ body: { newClientSecret: "new-sso-secret", dryRun: true, confirm: false } },
+			);
+			expect(previewSsoRotate.status, await previewSsoRotate.clone().text()).toBe(200);
+			expect(productCalls.some((call) => call.operation === "sso.replace_secret")).toBe(false);
+
+			const rotatedSso = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/sso/sso_${suffix}/replace-secret`,
+				{ body: { operationId: randomUUID(), newClientSecret: "new-sso-secret", dryRun: false, confirm: true } },
+			);
+			expect(rotatedSso.status, await rotatedSso.clone().text()).toBe(200);
+			expect(rotatedSso.headers.get("cache-control")).toBe("no-store");
+			expect(await rotatedSso.json()).toMatchObject({
+				organizationId,
+				hasClientSecret: true,
+			});
+
+			const previewScim = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/scim`,
+				{
+					body: {
+						provider: "okta",
+						dryRun: true,
+						confirm: false,
+					},
+				},
+			);
+			expect(previewScim.status, await previewScim.clone().text()).toBe(200);
+			expect(await previewScim.json()).toMatchObject({
+				preview: true,
+				wouldChange: true,
+				proposed: { bearerTokenGenerated: false },
+			});
+			expect(
+				productCalls.filter((call) => call.operation === "scim.create"),
+			).toHaveLength(0);
+
+			const createdScim = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/scim`,
+				{
+					body: {
+						provider: "okta",
+						operationId: randomUUID(),
+						dryRun: false,
+						confirm: true,
+					},
+				},
+			);
+			expect(createdScim.status, await createdScim.clone().text()).toBe(200);
+			expect(createdScim.headers.get("cache-control")).toBe("no-store");
+			expect(createdScim.headers.get("pragma")).toBe("no-cache");
+			expect(await createdScim.json()).toMatchObject({
+				connection: {
+					organizationId,
+					provider: "okta",
+					hasBearerToken: true,
+				},
+				bearerTokenOnce: `scimtok_${suffix}`,
+			});
+			expect(productCalls.at(-1)).toMatchObject({
+				operation: "scim.create",
+				organizationId,
+				actorId: ownerId,
+			});
+
+			const testedScim = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/scim/scim_${suffix}/test`,
+				{ body: { dryRun: false, confirm: true } },
+			);
+			expect(testedScim.status, await testedScim.clone().text()).toBe(200);
+			expect(await testedScim.json()).toMatchObject({
+				pass: true,
+				connection: { organizationId, status: "testing" },
+			});
+			expect(productCalls.at(-1)).toMatchObject({
+				operation: "scim.test",
+				organizationId,
+				actorId: ownerId,
+			});
+
+			const previewScimRotate = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/scim/scim_${suffix}/rotate`,
+				{ body: { dryRun: true, confirm: false } },
+			);
+			expect(previewScimRotate.status, await previewScimRotate.clone().text()).toBe(200);
+			expect(productCalls.some((call) => call.operation === "scim.rotate")).toBe(false);
+
+			const rotatedScim = await tenantRequest(
+				`/tenant/v1/organizations/${organizationId}/enterprise/scim/scim_${suffix}/rotate`,
+				{ body: { operationId: randomUUID(), dryRun: false, confirm: true } },
+			);
+			expect(rotatedScim.status, await rotatedScim.clone().text()).toBe(200);
+			expect(rotatedScim.headers.get("cache-control")).toBe("no-store");
+			expect(await rotatedScim.json()).toMatchObject({
+				connection: { organizationId, hasBearerToken: true },
+				bearerTokenOnce: `rotated_scimtok_${suffix}`,
+				replayed: false,
+			});
+			expect(productCalls.at(-1)).toMatchObject({
+				operation: "scim.rotate",
+				organizationId,
+				actorId: ownerId,
+			});
 		});
 	},
 );

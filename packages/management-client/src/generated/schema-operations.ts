@@ -139,6 +139,7 @@ const keyManagementStatusSchema = z.object({
 		purposes: z.object({
 			"oidc-client-secret": keyProviderReadinessSchema,
 			"scim-bearer-token": keyProviderReadinessSchema,
+			"service-account-credential-replay": keyProviderReadinessSchema,
 			"access-token-signing-key": keyProviderReadinessSchema,
 		}).strict(),
 	}).strict(),

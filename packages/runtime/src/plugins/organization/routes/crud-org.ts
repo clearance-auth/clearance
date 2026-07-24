@@ -13,6 +13,7 @@ import { getSessionFromCtx, requestOnlySessionMiddleware } from "../../../api";
 import { rejectActiveTransactionEndpoint } from "../../../api/dispatch";
 import { deleteSessionCookie, setSessionCookie } from "../../../cookies";
 import { initializeInternalOrganizationOwner } from "../../../internal/authorization-authority";
+import { finalizeInternalManagedCreatedOrganization } from "../../../internal/organization-lifecycle-authority";
 import type { InferAdditionalFieldsFromPluginOptions } from "../../../db";
 import { toZodSchema } from "../../../db";
 import type { Session } from "../../../types";
@@ -227,8 +228,23 @@ async function revokeExactStaleOrganizationSession(
 	return true;
 }
 
+const organizationNameSchema = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine(
+		(value) =>
+			value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value),
+	);
+
+function requireOrganizationName(value: unknown): asserts value is string {
+	if (!organizationNameSchema.safeParse(value).success) {
+		throw APIError.fromStatus("BAD_REQUEST");
+	}
+}
+
 const baseOrganizationSchema = z.object({
-	name: z.string().min(1).meta({
+	name: organizationNameSchema.meta({
 		description: "The name of the organization",
 	}),
 	slug: z.string().min(1).meta({
@@ -390,6 +406,7 @@ export const createOrganization = <O extends OrganizationOptions>(
 					};
 				}
 			}
+			requireOrganizationName(orgData.name);
 
 			await requireOrganizationLifecycleTransaction(ctx.context);
 			const { organization, member } = await runWithTransaction(
@@ -436,7 +453,7 @@ export const createOrganization = <O extends OrganizationOptions>(
 						}
 					}
 					member = await adapter.createMember(data);
-					await initializeInternalOrganizationOwner(
+					const authorizationRevision = await initializeInternalOrganizationOwner(
 						ctx.context.internalAdapter,
 						{
 							organizationId: organization.id,
@@ -534,6 +551,27 @@ export const createOrganization = <O extends OrganizationOptions>(
 							if (selectedTeam && selectedTeamMember) activeSession = await adapter.setActiveTeam(activeSession.token, selectedTeam.id, ctx);
 						}
 					}
+					await finalizeInternalManagedCreatedOrganization(
+						ctx.context.internalAdapter,
+						{
+							organization: {
+								id: organization.id,
+								name: organization.name,
+								slug: organization.slug,
+								createdAt: organization.createdAt,
+							},
+							owner: {
+								id: user.id,
+								email: user.email,
+								name: user.name,
+								createdAt: user.createdAt,
+								updatedAt: user.updatedAt,
+							},
+							ownerMembershipId: member.id,
+							authorizationRevision,
+							transaction: await getCurrentAdapter(ctx.context.adapter),
+						},
+					);
 					if (options?.organizationHooks?.afterAddMember) await runAfterLifecycleCommit(ctx.context, () => options.organizationHooks!.afterAddMember!({ member, user, organization }));
 					if (defaultTeam && options?.organizationHooks?.afterCreateTeam) await runAfterLifecycleCommit(ctx.context, () => options.organizationHooks!.afterCreateTeam!({ team: defaultTeam!, user, organization }));
 					if (options?.organizationHooks?.afterCreateOrganization) await runAfterLifecycleCommit(ctx.context, () => options.organizationHooks!.afterCreateOrganization!({ organization, user, member }));

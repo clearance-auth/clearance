@@ -158,6 +158,35 @@ function optionalAuthorizationString(
 	});
 }
 
+const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Credential replay authority accepts a caller-chosen UUID only for live mutations. */
+function credentialOperationId(
+	body: Record<string, unknown>,
+	dryRun: boolean | undefined,
+	stage: string,
+): string | undefined {
+	const value = body.operationId;
+	if (dryRun === true) {
+		if (value === undefined) return undefined;
+		throw new ClearanceError({
+			code: "AUTHORIZATION_INPUT_INVALID",
+			message: "operationId must be omitted for a dry run",
+			stage,
+			status: 400,
+		});
+	}
+	if (typeof value !== "string" || !OPERATION_ID.test(value)) {
+		throw new ClearanceError({
+			code: "TENANT_OPERATION_ID_REQUIRED",
+			message: "A UUID operationId is required",
+			stage,
+			status: 400,
+		});
+	}
+	return value;
+}
+
 export function registerAccessRoutes({
 	storeForRequest,
 	scopeForRequest,
@@ -606,10 +635,8 @@ export function registerAccessRoutes({
 			const body = await readAuthorizationRequestBody(
 				c.req.json(),
 				"authorization.credentials.create",
-				["expiresAt", "dryRun"],
+				["expiresAt", "dryRun", "operationId"],
 			);
-			requireAuthorizationPostgres(store);
-			const scope = scopeForRequest(store, c);
 			const expiresAt = optionalAuthorizationString(
 				body,
 				"expiresAt",
@@ -620,10 +647,18 @@ export function registerAccessRoutes({
 				"dryRun",
 				"authorization.credentials.create",
 			);
+			const operationId = credentialOperationId(
+				body,
+				dryRun,
+				"authorization.credentials.create",
+			);
+			requireAuthorizationPostgres(store);
+			const scope = scopeForRequest(store, c);
 			const result = await createServiceAccountCredentialInAuth(store, {
 				organizationId: c.req.param("id"), serviceAccountId: c.req.param("accountId"),
 				...(expiresAt === undefined ? {} : { expiresAt }),
 				...(dryRun === undefined ? {} : { dryRun }),
+				...(operationId === undefined ? {} : { operationId }),
 				actor: requestActor(c), source: "api", scope,
 			});
 			const output = authorizationOperationResult(result as Record<string, unknown>, scope);
@@ -644,10 +679,8 @@ export function registerAccessRoutes({
 			const body = await readAuthorizationRequestBody(
 				c.req.json(),
 				"authorization.credentials.rotate",
-				["expiresAt", "dryRun"],
+				["expiresAt", "dryRun", "operationId"],
 			);
-			requireAuthorizationPostgres(store);
-			const scope = scopeForRequest(store, c);
 			const expiresAt = optionalAuthorizationString(
 				body,
 				"expiresAt",
@@ -658,10 +691,18 @@ export function registerAccessRoutes({
 				"dryRun",
 				"authorization.credentials.rotate",
 			);
+			const operationId = credentialOperationId(
+				body,
+				dryRun,
+				"authorization.credentials.rotate",
+			);
+			requireAuthorizationPostgres(store);
+			const scope = scopeForRequest(store, c);
 			const result = await rotateServiceAccountCredentialInAuth(store, {
 				organizationId: c.req.param("id"), serviceAccountId: c.req.param("accountId"), credentialId: c.req.param("credentialId"),
 				...(expiresAt === undefined ? {} : { expiresAt }),
 				...(dryRun === undefined ? {} : { dryRun }),
+				...(operationId === undefined ? {} : { operationId }),
 				actor: requestActor(c), source: "api", scope,
 			});
 			const output = authorizationOperationResult(result as Record<string, unknown>, scope);

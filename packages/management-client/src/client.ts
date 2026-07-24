@@ -205,7 +205,26 @@ function schemaShape(value: unknown, operationId: string): Record<string, unknow
 	const definition = isRecord(value.def) ? value.def : undefined;
 	if (definition?.type === "union" && Array.isArray(definition.options) && definition.options.length > 0) {
 		const shapes = definition.options.map((option) => schemaShape(option, operationId));
-		return Object.fromEntries(shapes.flatMap((shape) => Object.entries(shape)));
+		const fields = new Map<string, unknown[]>();
+		for (const shape of shapes) {
+			for (const [key, schema] of Object.entries(shape)) {
+				const variants = fields.get(key) ?? [];
+				variants.push(schema);
+				fields.set(key, variants);
+			}
+		}
+		return Object.fromEntries([...fields].map(([key, variants]) => [
+			key,
+			{
+				safeParse(input: unknown) {
+					for (const schema of variants) {
+						const parsed = schemaParseResult(schema, input);
+						if (parsed.success) return { success: true, data: parsed.data };
+					}
+					return { success: false };
+				},
+			},
+		]));
 	}
 	const catchall = definition && isRecord(definition.catchall) ? definition.catchall : undefined;
 	const catchallDefinition = catchall && isRecord(catchall.def) ? catchall.def : undefined;

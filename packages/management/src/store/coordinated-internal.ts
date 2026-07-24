@@ -9,9 +9,32 @@ export type InternalCoordinatedExecutor = <T>(
 	) => Promise<T> | T,
 ) => Promise<T>;
 
+/**
+ * A transaction capability borrowed from the runtime. It deliberately exposes
+ * only SQL execution: the management store must never begin, commit, roll
+ * back, or acquire a second connection around it.
+ */
+export type InternalExistingTransaction = Readonly<{
+	rawTransactionQuery<Row extends Record<string, unknown> = Record<string, unknown>>(
+		sql: string,
+		params?: readonly unknown[],
+	): Promise<{ rows: Row[]; rowCount: number | null }>;
+}>;
+
+export type InternalExternalCoordinatedExecutor = <T>(
+	transaction: InternalExistingTransaction,
+	fn: (
+		context: InternalManagementCoordinatedMutationContext,
+	) => Promise<T> | T,
+) => Promise<T>;
+
 const INTERNAL_COORDINATED_EXECUTORS = new WeakMap<
 	ManagementStore,
 	InternalCoordinatedExecutor
+>();
+const INTERNAL_EXTERNAL_COORDINATED_EXECUTORS = new WeakMap<
+	ManagementStore,
+	InternalExternalCoordinatedExecutor
 >();
 
 export function registerInternalCoordinatedExecutor(
@@ -19,6 +42,14 @@ export function registerInternalCoordinatedExecutor(
 	executor: InternalCoordinatedExecutor,
 ): void {
 	INTERNAL_COORDINATED_EXECUTORS.set(store, executor);
+}
+
+/** Register the Postgres-only shared-runtime-transaction path. */
+export function registerInternalExternalCoordinatedExecutor(
+	store: ManagementStore,
+	executor: InternalExternalCoordinatedExecutor,
+): void {
+	INTERNAL_EXTERNAL_COORDINATED_EXECUTORS.set(store, executor);
 }
 
 export function wrapInternalCoordinatedExecutor(
@@ -62,4 +93,25 @@ export function mutateCoordinatedWithRuntimeSql<T>(
 			Parameters<NonNullable<ManagementStore["mutateCoordinated"]>>[0]
 		>[0],
 	) => Promise<T> | T);
+}
+
+/**
+ * Run the full private coordinated-management draft against an already active
+ * runtime transaction. This is intentionally unavailable to public store
+ * callers so a pool-shaped object cannot be mistaken for a live transaction.
+ */
+export function mutateCoordinatedInExistingTransaction<T>(
+	store: ManagementStore,
+	transaction: InternalExistingTransaction,
+	fn: (
+		context: InternalManagementCoordinatedMutationContext,
+	) => Promise<T> | T,
+): Promise<T> {
+	const executor = INTERNAL_EXTERNAL_COORDINATED_EXECUTORS.get(store);
+	if (!executor) {
+		return Promise.reject(
+			new Error("External coordinated Postgres transaction unavailable"),
+		);
+	}
+	return executor(transaction, fn);
 }

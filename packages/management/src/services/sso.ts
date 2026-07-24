@@ -1,10 +1,19 @@
-import type { ManagementStore, StoreV2TopologyRepository } from "../store/types.js";
+import type {
+	ManagementCoordinatedQuery,
+	ManagementStore,
+	StoreV2TopologyRepository,
+} from "../store/types.js";
+import type { ClearanceKeyManagementFacade } from "@clearance/auth";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
-import { deleteSsoProviderById } from "../auth-bridge.js";
+import {
+	deleteSsoProviderById,
+	invalidateAuthBundles,
+	insertSsoProviderInTransaction,
+} from "../auth-bridge.js";
 import { appendAuditEvent, recordEvent } from "./audit.js";
-import { encryptCredential, rotateCredential } from "./credentials.js";
+import { encryptCredential, type CredentialCipher } from "./credentials.js";
 import { ClearanceError } from "./errors.js";
 import { inspectOrganization, inspectOrganizationAuthoritative } from "./core.js";
 import {
@@ -26,6 +35,29 @@ export interface SsoMutationOpts {
 	actor?: string;
 	source?: SsoActorSource;
 	scope?: ResourceScope;
+	/** OIDC client secret confirmed by the tenant for a replacement. */
+	newClientSecret?: string;
+	operationId?: string;
+}
+
+function requiredOperationId(value: string | undefined, stage: string): string {
+	if (!value || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+		throw new ClearanceError({ code: "TENANT_OPERATION_ID_REQUIRED", message: "A UUID operationId is required", stage, status: 400 });
+	}
+	return value;
+}
+
+export type SsoMutationGuard = Readonly<{
+	authorizeMutation(input: {
+		organizationId: string;
+		query: ManagementCoordinatedQuery;
+	}): Promise<void>;
+	credentialCipher?: CredentialCipher;
+	runtimeKeyManagement?: ClearanceKeyManagementFacade;
+}>;
+
+function ssoCredentialIdentity(organizationId: string, connectionId: string): Readonly<Record<string, string>> {
+	return Object.freeze({ organizationId, connectionId });
 }
 
 function topologyTransactionRequired(stage: string): ClearanceError {
@@ -432,93 +464,34 @@ export function listSsoConnections(
 }
 
 /**
- * Rotate stored SSO client secret envelope under the current credential key.
- * Plaintext is preserved; only AEAD key envelope / fingerprint metadata change.
- * Never returns encrypted material — fingerprints only.
+ * Tenant SSO replacement must update the runtime provider and management
+ * record together, so JSON-store envelope rewrites are deliberately rejected.
  */
-function rotateSsoCredentialResolved(
+export function rotateSsoCredential(
 	store: ManagementStore,
-	conn: IdentityConnection,
-	org: { id: string; projectId: string; environmentId: string },
+	id: string,
 	opts?: SsoMutationOpts,
-): IdentityConnection {
-	const stage = "sso.rotate";
-	if (!conn.clientSecretEncrypted) {
-		throw new ClearanceError({
-			code: "SSO_NO_SECRET",
-			message: "No encrypted client secret to rotate",
-			stage,
-			status: 400,
-			remediation:
-				"Configure a client secret with clearance sso configure --client-secret before rotating",
-		});
-	}
-	const rotated = rotateCredential(conn.clientSecretEncrypted);
-	const now = nowIso();
-	let result: IdentityConnection | undefined;
-	store.mutate((data) => {
-		const idx = data.identityConnections.findIndex((c) => c.id === conn.id);
-		if (idx < 0) {
-			throw new ClearanceError({
-				code: "SSO_NOT_FOUND",
-				message: `SSO connection ${conn.id} not found`,
-				stage,
-				status: 404,
-			});
-		}
-		const updated: IdentityConnection = {
-			...data.identityConnections[idx]!,
-			clientSecretEncrypted: rotated.ciphertext,
-			clientSecretKeyId: rotated.keyId,
-			clientSecretFingerprint: rotated.fingerprint,
-			updatedAt: now,
-		};
-		data.identityConnections[idx] = updated;
-		appendAuditEvent(data, {
-			actor: opts?.actor ?? "operator",
-			action: "sso.rotate",
-			subjectType: "identity_connection",
-			subjectId: conn.id,
-			outcome: "success",
-			source: (opts?.source as "cli") ?? "cli",
-			organizationId: org.id,
-			projectId: org.projectId,
-			environmentId: org.environmentId,
-			message: `Rotated SSO credential key envelope for ${conn.id}`,
-			metadata: {
-				keyId: rotated.keyId,
-				clientSecretFingerprint: rotated.fingerprint,
-				// never: plaintext or ciphertext
-			},
-		});
-		result = publicIdentityConnection(updated) as IdentityConnection;
+): never {
+	// Retain the scope-safe missing-resource contract before refusing the
+	// non-transactional backend.
+	resolveSsoConnection(store, id, { scope: opts?.scope, stage: "sso.rotate" });
+	throw new ClearanceError({
+		code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+		message: "SSO secret replacement requires the coordinated PostgreSQL runtime backend",
+		stage: "sso.rotate",
+		status: 500,
 	});
-	if (!result) {
-		throw new ClearanceError({
-			code: "SSO_NOT_FOUND",
-			message: `SSO connection ${conn.id} not found`,
-			stage,
-			status: 404,
-		});
-	}
-	return result;
-}
-
-export function rotateSsoCredential(store: ManagementStore, id: string, opts?: SsoMutationOpts): IdentityConnection {
-	const connection = resolveSsoConnection(store, id, { scope: opts?.scope, stage: "sso.rotate" });
-	const organization = inspectOrganization(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
-	return rotateSsoCredentialResolved(store, connection, organization, opts);
 }
 
 export async function rotateSsoCredentialAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: SsoMutationOpts,
+	guard?: SsoMutationGuard,
 ): Promise<IdentityConnection> {
-	if (!store.storeV2Topology?.authoritative) {
-		const connection = await resolveSsoConnectionAuthoritative(store, id, opts);
-		const organization = await inspectOrganizationAuthoritative(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
-		return rotateSsoCredentialResolved(store, connection, organization, opts);
+	const operationId = requiredOperationId(opts?.operationId, "sso.rotate");
+	if (store.backend !== "postgres") {
+		return rotateSsoCredential(store, id, opts);
 	}
 	if (!store.mutateCoordinated) throw topologyTransactionRequired("sso.rotate");
 	const connectionId = id.trim();
@@ -532,7 +505,12 @@ export async function rotateSsoCredentialAuthoritative(
 	}
 	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
 	const now = nowIso();
-	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+	const result = await mutateCoordinatedWithRuntimeSql(store, async ({
+		data,
+		topology,
+		appendAudit,
+		query,
+	}) => {
 		const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
 		if (index < 0) {
 			throw new ClearanceError({
@@ -543,28 +521,140 @@ export async function rotateSsoCredentialAuthoritative(
 			});
 		}
 		const row = data.identityConnections[index]!;
-		const organization = await requireScopedOrganizationInTransaction(
-			topology,
-			scope,
-			row.organizationId,
-			"sso.rotate",
-			"SSO_NOT_FOUND",
+		await guard?.authorizeMutation({
+			organizationId: row.organizationId,
+			query,
+		});
+		const prior = data.events.find((event) =>
+			event.action === "sso.rotate" && event.subjectId === connectionId &&
+			event.organizationId === row.organizationId &&
+			event.metadata?.operationId === operationId,
 		);
-		if (!row.clientSecretEncrypted) {
+		if (prior) return publicIdentityConnection(row) as IdentityConnection;
+		const organization = topology
+			? await requireScopedOrganizationInTransaction(
+				topology,
+				scope,
+				row.organizationId,
+				"sso.rotate",
+				"SSO_NOT_FOUND",
+			)
+			: data.organizations.find(
+				(organization) =>
+					organization.id === row.organizationId &&
+					organization.projectId === scope.projectId &&
+					organization.environmentId === scope.environmentId,
+			);
+		if (!organization || organization.status === "archived") {
 			throw new ClearanceError({
-				code: "SSO_NO_SECRET",
-				message: "No encrypted client secret to rotate",
+				code: "SSO_NOT_FOUND",
+				message: `SSO connection ${connectionId} not found`,
 				stage: "sso.rotate",
-				status: 400,
-				remediation: "Configure a client secret with clearance sso configure --client-secret before rotating",
+				status: 404,
 			});
 		}
-		const rotated = rotateCredential(row.clientSecretEncrypted);
+		if (row.protocol === "saml") {
+			throw new ClearanceError({
+				code: "SSO_SECRET_REPLACEMENT_UNSUPPORTED",
+				message: "SAML credentials are controlled by the identity provider and cannot be replaced here",
+				stage: "sso.rotate",
+				status: 422,
+				remediation: "Update the SAML signing certificate through the SSO configuration flow",
+			});
+		}
+		if (row.protocol !== "oidc") {
+			throw new ClearanceError({
+				code: "SSO_SECRET_REPLACEMENT_UNSUPPORTED",
+				message: "Only OIDC client secrets can be replaced",
+				stage: "sso.rotate",
+				status: 422,
+			});
+		}
+		const newClientSecret = opts?.newClientSecret;
+		if (!newClientSecret?.trim()) {
+			throw new ClearanceError({
+				code: "SSO_NEW_SECRET_REQUIRED",
+				message: "A confirmed replacement OIDC client secret is required",
+				stage: "sso.rotate",
+				status: 400,
+				remediation: "Supply the newly issued OIDC client secret to replace the current credential",
+			});
+		}
+		if (!row.clientId || !row.issuer) {
+			throw new ClearanceError({
+				code: "SSO_ROTATION_CONFLICT",
+				message: "OIDC connection is missing runtime client configuration",
+				stage: "sso.rotate",
+				status: 409,
+			});
+		}
+		const runtime = await query(
+			`select "providerId", "organizationId", issuer, domain, "oidcConfig" from "ssoProvider" where id = $1 for update`,
+			[connectionId],
+		);
+		const runtimeProvider = runtime.rows[0] as
+			| {
+				providerId?: unknown;
+				organizationId?: unknown;
+				issuer?: unknown;
+				domain?: unknown;
+				oidcConfig?: unknown;
+			}
+			| undefined;
+		let runtimeClientId: string | undefined;
+		try {
+			const oidc = typeof runtimeProvider?.oidcConfig === "string"
+				? JSON.parse(runtimeProvider.oidcConfig) as { clientId?: unknown }
+				: null;
+			runtimeClientId = typeof oidc?.clientId === "string" ? oidc.clientId : undefined;
+		} catch {
+			// The fail-closed conflict below keeps malformed runtime config from being replaced.
+		}
+		if (
+			runtime.rows.length !== 1 ||
+			typeof runtimeProvider?.providerId !== "string" ||
+			runtimeProvider.organizationId !== organization.id ||
+			runtimeProvider.issuer !== row.issuer ||
+			typeof runtimeProvider.domain !== "string" ||
+			!row.domains.includes(runtimeProvider.domain) ||
+			runtimeClientId !== row.clientId
+		) {
+			throw new ClearanceError({
+				code: "SSO_ROTATION_CONFLICT",
+				message: "Runtime OIDC provider does not match the requested connection",
+				stage: "sso.rotate",
+				status: 409,
+			});
+		}
+		await query(`delete from "ssoProvider" where id = $1`, [connectionId]);
+		const replacement = await insertSsoProviderInTransaction(query, {
+			id: connectionId,
+			providerId: runtimeProvider.providerId,
+			issuer: row.issuer,
+			domain: runtimeProvider.domain,
+			organizationId: organization.id,
+			protocol: "oidc",
+			oidc: { clientId: row.clientId, clientSecret: newClientSecret },
+		}, guard?.runtimeKeyManagement);
+		if (replacement.reused) {
+			throw new ClearanceError({
+				code: "SSO_ROTATION_CONFLICT",
+				message: "OIDC runtime provider changed while replacing its client secret",
+				stage: "sso.rotate",
+				status: 409,
+			});
+		}
+		const encrypted = guard?.credentialCipher
+			? await guard.credentialCipher.seal(
+				newClientSecret,
+				ssoCredentialIdentity(organization.id, connectionId),
+			)
+			: encryptCredential(newClientSecret);
 		const updated: IdentityConnection = {
 			...row,
-			clientSecretEncrypted: rotated.ciphertext,
-			clientSecretKeyId: rotated.keyId,
-			clientSecretFingerprint: rotated.fingerprint,
+			clientSecretEncrypted: encrypted.ciphertext,
+			clientSecretKeyId: encrypted.keyId,
+			clientSecretFingerprint: encrypted.fingerprint,
 			updatedAt: now,
 		};
 		data.identityConnections[index] = updated;
@@ -578,11 +668,21 @@ export async function rotateSsoCredentialAuthoritative(
 			organizationId: organization.id,
 			projectId: organization.projectId,
 			environmentId: organization.environmentId,
-			message: `Rotated SSO credential key envelope for ${connectionId}`,
-			metadata: { keyId: rotated.keyId, clientSecretFingerprint: rotated.fingerprint },
+			message: `Replaced OIDC client secret for ${connectionId}`,
+			metadata: {
+				operationId,
+				keyId: encrypted.keyId,
+				clientSecretFingerprint: encrypted.fingerprint,
+				replacement: true,
+			},
 		});
 		return publicIdentityConnection(updated) as IdentityConnection;
 	});
+	// Runtime provider configuration is cached by the auth bundle. Invalidate
+	// it after commit so subsequent OIDC requests use the confirmed secret,
+	// without waiting for a hosted request holding the prior runtime lease.
+	invalidateAuthBundles();
+	return result;
 }
 
 /**
@@ -691,6 +791,7 @@ export async function disableSsoConnectionReal(
 	store: ManagementStore,
 	id: string,
 	opts?: SsoMutationOpts,
+	guard?: SsoMutationGuard,
 ): Promise<{
 	connection: IdentityConnection;
 	idempotent: boolean;
@@ -707,6 +808,10 @@ export async function disableSsoConnectionReal(
 		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query, topology, appendAudit }) => {
 			const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
 			const connection = index >= 0 ? data.identityConnections[index] : undefined;
+			if (!connection) {
+				throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${connectionId} not found`, stage, status: 404 });
+			}
+			await guard?.authorizeMutation({ organizationId: connection.organizationId, query });
 			const organization = connection && topology
 				? await topology.lockOrganization({ scope, id: connection.organizationId })
 				: null;
@@ -741,6 +846,10 @@ export async function disableSsoConnectionReal(
 
 	if (typeof store.mutateCoordinated === "function") {
 		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query }) => {
+			await guard?.authorizeMutation({
+				organizationId: org.id,
+				query,
+			});
 			const deleted = await query(`delete from "ssoProvider" where id = $1`, [
 				conn.id,
 			]);
@@ -784,6 +893,15 @@ export async function disableSsoConnectionReal(
 				idempotent: alreadyDisabled && !runtimeRemoved,
 				runtimeRemoved,
 			};
+		});
+	}
+	if (guard) {
+		throw new ClearanceError({
+			code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+			message:
+				"Tenant enterprise mutation requires the coordinated PostgreSQL backend",
+			stage,
+			status: 500,
 		});
 	}
 

@@ -26,6 +26,7 @@ import {
 	type AuthorizationServiceAccount,
 	type AuthorizationSubject,
 } from "./authorization-authority.js";
+import type { TenantProductAdministrationFacade } from "./public-types/index.js";
 
 const identifier = z
 	.string()
@@ -34,6 +35,12 @@ const identifier = z
 	.refine(
 		(value) => value.trim() === value && !value.includes("\0"),
 		"Invalid identifier",
+	);
+const operationId = z
+	.string()
+	.regex(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		"operationId must be a canonical lowercase UUID",
 	);
 const revision = z.string().regex(/^[1-9]\d{0,18}$/);
 const roleIds = z
@@ -91,13 +98,58 @@ const confirmedPreviewBody = z
 	});
 const credentialCreateBody = z
 	.object({
+		operationId: operationId.optional(),
 		expiresAt: z.iso.datetime({ offset: true }).optional(),
 		dryRun: z.boolean(),
 	})
-	.strict();
+	.strict()
+	.superRefine((value, context) => {
+		if (value.dryRun && value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Preview credential creation must omit operationId" });
+		}
+		if (!value.dryRun && !value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Live credential creation requires a UUID operationId" });
+		}
+	});
 const credentialRotateBody = z
 	.object({
+		operationId: operationId.optional(),
 		expiresAt: z.iso.datetime({ offset: true }).optional(),
+		dryRun: z.boolean(),
+		confirm: z.boolean(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.dryRun && value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Preview credential rotation must omit operationId" });
+		}
+		if (value.dryRun === value.confirm) {
+			context.addIssue({
+				code: "custom",
+				message:
+					"Preview requires dryRun=true and confirm=false; live rotation requires dryRun=false and confirm=true",
+			});
+		}
+		if (!value.dryRun && !value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Live credential rotation requires a UUID operationId" });
+		}
+	});
+const productMutationConfirmation = z
+	.object({ dryRun: z.boolean(), confirm: z.boolean() })
+	.strict()
+	.superRefine((value, context) => {
+		if (value.dryRun === value.confirm) {
+			context.addIssue({
+				code: "custom",
+				message:
+					"Preview requires dryRun=true and confirm=false; live mutation requires dryRun=false and confirm=true",
+			});
+		}
+	});
+const ssoSecretReplacementBody = z
+	.object({
+		operationId: operationId.optional(),
+		newClientSecret: z.string().min(1).max(16_384),
 		dryRun: z.boolean(),
 		confirm: z.boolean(),
 	})
@@ -107,14 +159,97 @@ const credentialRotateBody = z
 			context.addIssue({
 				code: "custom",
 				message:
-					"Preview requires dryRun=true and confirm=false; live rotation requires dryRun=false and confirm=true",
+					"Preview requires dryRun=true and confirm=false; live replacement requires dryRun=false and confirm=true",
 			});
 		}
+		if (!value.dryRun && !value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Live replacement requires a UUID operationId" });
+		}
 	});
+const scimRotateBody = z
+	.object({
+		operationId: operationId.optional(),
+		dryRun: z.boolean(),
+		confirm: z.boolean(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.dryRun === value.confirm) {
+			context.addIssue({ code: "custom", message: "Preview requires dryRun=true and confirm=false; live rotation requires dryRun=false and confirm=true" });
+		}
+		if (!value.dryRun && !value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Live rotation requires a UUID operationId" });
+		}
+	});
+const ssoMutationGate = (
+	value: { dryRun: boolean; confirm: boolean },
+	context: z.RefinementCtx,
+) => {
+		if (value.dryRun === value.confirm) {
+			context.addIssue({
+				code: "custom",
+				message:
+					"Preview requires dryRun=true and confirm=false; live creation requires dryRun=false and confirm=true",
+			});
+		}
+	};
+const ssoCreateBody = z.discriminatedUnion("protocol", [
+	z.object({
+			protocol: z.literal("oidc"),
+			provider: z.string().min(1).max(128).refine((value) => value.trim() === value),
+			issuer: z.url(),
+			domain: z.string().min(1).max(253).refine((value) => value.trim() === value),
+			audience: z.string().min(1).max(512).optional(),
+			clientId: z.string().min(1).max(512),
+			clientSecret: z.string().min(1).max(16_384),
+			dryRun: z.boolean(),
+			confirm: z.boolean(),
+		}).strict().superRefine(ssoMutationGate),
+	z.object({
+			protocol: z.literal("saml"),
+			provider: z.string().min(1).max(128).refine((value) => value.trim() === value),
+			issuer: z.url(),
+			domain: z.string().min(1).max(253).refine((value) => value.trim() === value),
+			audience: z.string().min(1).max(512).optional(),
+			samlEntryPoint: z.url(),
+			samlCertificate: z.string().min(1).max(65_536),
+			dryRun: z.boolean(),
+			confirm: z.boolean(),
+		}).strict().superRefine(ssoMutationGate),
+]);
+const scimCreateBody = z
+	.object({
+		operationId: operationId.optional(),
+		provider: z.string().min(1).max(128).refine((value) => value.trim() === value),
+		endpoint: z.url().optional(),
+		dryRun: z.boolean(),
+		confirm: z.boolean(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.dryRun === value.confirm) {
+			context.addIssue({
+				code: "custom",
+				message:
+					"Preview requires dryRun=true and confirm=false; live creation requires dryRun=false and confirm=true",
+			});
+		}
+		if (!value.dryRun && !value.operationId) {
+			context.addIssue({ code: "custom", path: ["operationId"], message: "Live creation requires a UUID operationId" });
+		}
+	});
+const auditListQuery = z
+	.object({
+		limit: z.coerce.number().int().min(1).max(100).optional(),
+		cursor: z.string().min(1).max(4096).optional(),
+		action: z.string().min(1).max(256).optional(),
+	})
+	.strict();
 
 type TenantAdministrationOptions = Readonly<{
 	authorization: PostgresAuthorizationAuthority;
 	runtimeAudit: InternalRuntimeAuditBinding;
+	productAdministration?: TenantProductAdministrationFacade;
 }>;
 
 type TenantTransaction = DBTransactionAdapter;
@@ -210,6 +345,50 @@ function mapTenantError(error: unknown): never {
 		"SERVICE_UNAVAILABLE",
 		"TENANT_ADMINISTRATION_UNAVAILABLE",
 		"Tenant administration is unavailable",
+	);
+}
+
+function mapProductAdministrationError(error: unknown): never {
+	if (error instanceof APIError) throw error;
+	const status =
+		typeof error === "object" &&
+		error !== null &&
+		"status" in error &&
+		typeof error.status === "number"
+			? error.status
+			: undefined;
+	if (status === 400) {
+		return tenantError(
+			"BAD_REQUEST",
+			"TENANT_PRODUCT_INPUT_INVALID",
+			"Request is invalid",
+		);
+	}
+	if (status === 403) {
+		return tenantError(
+			"FORBIDDEN",
+			"TENANT_AUTHORIZATION_REQUIRED",
+			"Tenant authorization is required",
+		);
+	}
+	if (status === 404) {
+		return tenantError(
+			"NOT_FOUND",
+			"TENANT_ADMINISTRATION_RESOURCE_NOT_FOUND",
+			"Resource not found",
+		);
+	}
+	if (status === 409) {
+		return tenantError(
+			"CONFLICT",
+			"TENANT_PRODUCT_CONFLICT",
+			"Enterprise configuration changed; reload and retry",
+		);
+	}
+	return tenantError(
+		"SERVICE_UNAVAILABLE",
+		"TENANT_PRODUCT_ADMINISTRATION_UNAVAILABLE",
+		"Enterprise administration is unavailable",
 	);
 }
 
@@ -455,13 +634,42 @@ async function lockLivePrincipals(
 	actorId: string,
 	targetIds: readonly string[],
 ): Promise<void> {
-	const principalIds = [...new Set([actorId, ...targetIds])].sort();
-	for (const principalId of principalIds) {
+	/* Canonical lock order shared by tenant mutations: organization, actor,
+	 * then deterministic targets. The authorization advisory lock is acquired
+	 * by the caller before this function so membership/archive writers cannot
+	 * invert the order. */
+	await requireLiveOrganization(transaction, organizationId);
+	await requireLivePrincipal(transaction, organizationId, actorId, true);
+	for (const principalId of [...new Set(targetIds)].filter((id) => id !== actorId).sort()) {
 		await requireLivePrincipal(
 			transaction,
 			organizationId,
 			principalId,
-			principalId === actorId,
+			false,
+		);
+	}
+}
+
+async function requireLiveOrganization(
+	transaction: TenantTransaction,
+	organizationId: string,
+): Promise<void> {
+	if (typeof transaction.rawTransactionQuery !== "function") {
+		return tenantError(
+			"SERVICE_UNAVAILABLE",
+			"TENANT_ADMINISTRATION_TRANSACTION_REQUIRED",
+			"Tenant administration is unavailable",
+		);
+	}
+	const rows = await transaction.rawTransactionQuery<Record<string, unknown>>(
+		`SELECT id FROM organization WHERE id = $1 FOR UPDATE`,
+		[organizationId],
+	);
+	if (!rows.rows[0]) {
+		return tenantError(
+			"NOT_FOUND",
+			"TENANT_ADMINISTRATION_RESOURCE_NOT_FOUND",
+			"Resource not found",
 		);
 	}
 }
@@ -503,13 +711,13 @@ async function withMutation<Result>(
 							ctx.context.adapter,
 						);
 						const transaction = transactionAuthority(rawTransaction);
+						await options.authorization.acquireMutationLock(transaction);
 						await lockLivePrincipals(
 							transaction,
 							capability.organizationId,
 							capability.principalId,
 							input.principalTargetIds ?? [],
 						);
-						await options.authorization.acquireMutationLock(transaction);
 						const actorActions = await requireFreshActor(
 							options.authorization,
 							transaction,
@@ -571,6 +779,123 @@ async function withRead<Result>(
 	);
 }
 
+async function withProductMutation<Result>(
+	ctx: GenericEndpointContext,
+	options: TenantAdministrationOptions,
+	organizationId: string,
+	mutate: (
+		facade: TenantProductAdministrationFacade,
+		organizationId: string,
+		actorId: string,
+	) => Promise<Result>,
+): Promise<Result> {
+	const normalizedOrganizationId = routeIdentifier(organizationId);
+	const facade = options.productAdministration;
+	if (!facade) {
+		return tenantError(
+			"SERVICE_UNAVAILABLE",
+			"TENANT_PRODUCT_ADMINISTRATION_UNAVAILABLE",
+			"Enterprise administration is unavailable",
+		);
+	}
+	return withTenantCapability(
+		ctx,
+		{
+			organizationId: normalizedOrganizationId,
+			requiredActions: ["organization:update"],
+		},
+		async (capability) => {
+			try {
+				if (
+					typeof ctx.context.adapter.options?.adapterConfig.transaction !==
+					"function"
+				) {
+					return tenantError(
+						"SERVICE_UNAVAILABLE",
+						"TENANT_ADMINISTRATION_TRANSACTION_REQUIRED",
+						"Tenant administration is unavailable",
+					);
+				}
+				// Preview and commit each get a short, committed runtime preflight.
+				// Commit is then revalidated by the management facade inside its own
+				// coordinated transaction; retaining this transaction while calling the
+				// facade would deadlock on the same authorization advisory lock.
+				await runWithTransaction(ctx.context.adapter, async () => {
+					const transaction = transactionAuthority(
+						await getCurrentAdapter(ctx.context.adapter),
+					);
+					await options.authorization.acquireMutationLock(transaction);
+					await lockLivePrincipals(
+						transaction,
+						capability.organizationId,
+						capability.principalId,
+						[],
+					);
+					await requireFreshActor(
+						options.authorization,
+						transaction,
+						capability.organizationId,
+						capability.principalId,
+						"organization:update",
+					);
+				});
+				return await mutate(
+					facade,
+					capability.organizationId,
+					capability.principalId,
+				);
+			} catch (error) {
+				return mapProductAdministrationError(error);
+			}
+		},
+	);
+}
+
+async function withProductRead<Result>(
+	ctx: GenericEndpointContext,
+	options: TenantAdministrationOptions,
+	organizationId: string,
+	read: (
+		facade: TenantProductAdministrationFacade,
+		organizationId: string,
+		actorId: string,
+	) => Promise<Result>,
+): Promise<Result> {
+	const normalizedOrganizationId = routeIdentifier(organizationId);
+	const facade = options.productAdministration;
+	if (!facade) {
+		return tenantError(
+			"SERVICE_UNAVAILABLE",
+			"TENANT_PRODUCT_ADMINISTRATION_UNAVAILABLE",
+			"Enterprise administration is unavailable",
+		);
+	}
+	return withTenantCapability(
+		ctx,
+		{
+			organizationId: normalizedOrganizationId,
+			requiredActions: ["ac:read"],
+		},
+		async (capability) => {
+			try {
+				await requireLivePrincipal(
+					ctx.context.adapter,
+					capability.organizationId,
+					capability.principalId,
+					true,
+				);
+				return await read(
+					facade,
+					capability.organizationId,
+					capability.principalId,
+				);
+			} catch (error) {
+				return mapProductAdministrationError(error);
+			}
+		},
+	);
+}
+
 function assignmentView(
 	organizationId: string,
 	subject: AuthorizationSubject,
@@ -605,6 +930,447 @@ export function createTenantAdministrationPlugin(
 	return {
 		id: "clearance-tenant-administration",
 		endpoints: {
+			tenantProductAuditList: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/audit",
+				{
+					method: "GET",
+					requireHeaders: true,
+					query: auditListQuery,
+				},
+				async (ctx) =>
+					ctx.json(
+						await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.listAudit({
+									organizationId,
+									actorId,
+									...(ctx.query.limit === undefined
+										? {}
+										: { limit: ctx.query.limit }),
+									...(ctx.query.cursor
+										? { cursor: ctx.query.cursor }
+										: {}),
+									...(ctx.query.action
+										? { action: ctx.query.action }
+										: {}),
+								}),
+						),
+					),
+			),
+			tenantProductSsoList: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso",
+				{ method: "GET", requireHeaders: true },
+				async (ctx) =>
+					ctx.json({
+						connections: await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.listSso({ organizationId, actorId }),
+						),
+					}),
+			),
+			tenantProductSsoInspect: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso/:connectionId",
+				{ method: "GET", requireHeaders: true },
+				async (ctx) =>
+					ctx.json({
+						connection: await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.inspectSso({
+									organizationId,
+									actorId,
+									connectionId: routeIdentifier(
+										ctx.params.connectionId,
+									),
+								}),
+						),
+					}),
+			),
+			tenantProductSsoCreate: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: ssoCreateBody,
+				},
+				async (ctx) => {
+					const ssoInput = ctx.body;
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ssoInput.dryRun) {
+								const proposed = ssoInput.protocol === "oidc"
+									? {
+										organizationId, protocol: ssoInput.protocol,
+										provider: ssoInput.provider, issuer: ssoInput.issuer,
+										domain: ssoInput.domain, audience: ssoInput.audience ?? null,
+										clientId: ssoInput.clientId, hasClientSecret: true,
+									}
+									: {
+										organizationId, protocol: ssoInput.protocol,
+										provider: ssoInput.provider, issuer: ssoInput.issuer,
+										domain: ssoInput.domain, audience: ssoInput.audience ?? null,
+										samlEntryPoint: ssoInput.samlEntryPoint,
+										hasSamlCertificate: true,
+									};
+								return Object.freeze({
+									preview: true,
+									proposed: Object.freeze(proposed),
+									wouldChange: true,
+								});
+							}
+							const connection = await facade.createSso(ssoInput.protocol === "oidc" ? {
+								organizationId,
+								actorId,
+								protocol: ssoInput.protocol, provider: ssoInput.provider,
+								issuer: ssoInput.issuer, domain: ssoInput.domain,
+								...(ssoInput.audience
+									? { audience: ssoInput.audience }
+									: {}),
+								clientId: ssoInput.clientId, clientSecret: ssoInput.clientSecret,
+							} : {
+								organizationId, actorId, protocol: ssoInput.protocol,
+								provider: ssoInput.provider, issuer: ssoInput.issuer,
+								domain: ssoInput.domain,
+								...(ssoInput.audience ? { audience: ssoInput.audience } : {}),
+								samlEntryPoint: ssoInput.samlEntryPoint,
+								samlCertificate: ssoInput.samlCertificate,
+							});
+							return Object.freeze({ connection });
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductSsoDisable: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso/:connectionId/disable",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: productMutationConfirmation,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(
+						ctx.params.connectionId,
+					);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								const connection = await facade.inspectSso({
+									organizationId,
+									actorId,
+									connectionId,
+								});
+								return Object.freeze({
+									preview: true,
+									connection,
+									wouldChange:
+										connection.status !== "disabled",
+								});
+							}
+							return facade.disableSso({
+								organizationId,
+								actorId,
+								connectionId,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductSsoTest: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso/:connectionId/test",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: productMutationConfirmation,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(ctx.params.connectionId);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								return Object.freeze({
+									preview: true,
+									connection: await facade.inspectSso({
+										organizationId,
+										actorId,
+										connectionId,
+									}),
+									wouldChange: true,
+								});
+							}
+							return facade.testSso({
+								organizationId,
+								actorId,
+								connectionId,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductSsoReplaceSecret: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/sso/:connectionId/replace-secret",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: ssoSecretReplacementBody,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(ctx.params.connectionId);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								return Object.freeze({
+									preview: true,
+									connection: await facade.inspectSso({
+										organizationId,
+										actorId,
+										connectionId,
+									}),
+									wouldChange: true,
+								});
+							}
+							return facade.replaceSsoSecret({
+								organizationId,
+								actorId,
+								connectionId,
+								operationId: ctx.body.operationId!,
+								newClientSecret: ctx.body.newClientSecret,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductScimList: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim",
+				{ method: "GET", requireHeaders: true },
+				async (ctx) =>
+					ctx.json({
+						connections: await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.listScim({ organizationId, actorId }),
+						),
+					}),
+			),
+			tenantProductScimInspect: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim/:connectionId",
+				{ method: "GET", requireHeaders: true },
+				async (ctx) =>
+					ctx.json({
+						connection: await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.inspectScim({
+									organizationId,
+									actorId,
+									connectionId: routeIdentifier(
+										ctx.params.connectionId,
+									),
+								}),
+						),
+					}),
+			),
+			tenantProductScimCreate: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: scimCreateBody,
+				},
+				async (ctx) => {
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								return Object.freeze({
+									preview: true,
+									proposed: Object.freeze({
+										organizationId,
+										provider: ctx.body.provider,
+										endpoint: ctx.body.endpoint ?? null,
+										bearerTokenGenerated: false,
+									}),
+									wouldChange: true,
+								});
+							}
+							return facade.createScim({
+								organizationId,
+								actorId,
+								operationId: ctx.body.operationId!,
+								provider: ctx.body.provider,
+								...(ctx.body.endpoint
+									? { endpoint: ctx.body.endpoint }
+									: {}),
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductScimDisable: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim/:connectionId/disable",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: productMutationConfirmation,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(
+						ctx.params.connectionId,
+					);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								const connection = await facade.inspectScim({
+									organizationId,
+									actorId,
+									connectionId,
+								});
+								return Object.freeze({
+									preview: true,
+									connection,
+									wouldChange:
+										connection.status !== "disabled",
+								});
+							}
+							return facade.disableScim({
+								organizationId,
+								actorId,
+								connectionId,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductScimTest: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim/:connectionId/test",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: productMutationConfirmation,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(ctx.params.connectionId);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								return Object.freeze({
+									preview: true,
+									connection: await facade.inspectScim({
+										organizationId,
+										actorId,
+										connectionId,
+									}),
+									wouldChange: true,
+								});
+							}
+							return facade.testScim({
+								organizationId,
+								actorId,
+								connectionId,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductScimRotate: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/scim/:connectionId/rotate",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: scimRotateBody,
+				},
+				async (ctx) => {
+					const connectionId = routeIdentifier(ctx.params.connectionId);
+					const result = await withProductMutation(
+						ctx,
+						options,
+						ctx.params.organizationId,
+						async (facade, organizationId, actorId) => {
+							if (ctx.body.dryRun) {
+								return Object.freeze({
+									preview: true,
+									connection: await facade.inspectScim({
+										organizationId,
+										actorId,
+										connectionId,
+									}),
+									wouldChange: true,
+								});
+							}
+							return facade.rotateScim({
+								organizationId,
+								actorId,
+								connectionId,
+								operationId: ctx.body.operationId!,
+							});
+						},
+					);
+					noStore(ctx);
+					return ctx.json(result);
+				},
+			),
+			tenantProductReadiness: createAuthEndpoint(
+				"/tenant/v1/organizations/:organizationId/enterprise/readiness",
+				{ method: "GET", requireHeaders: true },
+				async (ctx) =>
+					ctx.json({
+						report: await withProductRead(
+							ctx,
+							options,
+							ctx.params.organizationId,
+							(facade, organizationId, actorId) =>
+								facade.readiness({
+									organizationId,
+									actorId,
+								}),
+						),
+					}),
+			),
 			tenantAuthorizationRoles: createAuthEndpoint(
 				"/tenant/v1/organizations/:organizationId/authorization/roles",
 				{ method: "GET", requireHeaders: true },
@@ -1087,13 +1853,16 @@ export function createTenantAdministrationPlugin(
 							const created =
 								await options.authorization.createServiceAccountCredential({
 									organizationId: mutation.organizationId,
+									actorId: mutation.actorId,
+									operationId:
+										ctx.body.operationId ?? randomUUID(),
 									serviceAccountId,
 									...(ctx.body.expiresAt
 										? { expiresAt: new Date(ctx.body.expiresAt) }
 										: {}),
 									transaction: mutation.transaction,
 								});
-							await appendTenantAudit(ctx, options.runtimeAudit, mutation, {
+							if (!created.replayed) await appendTenantAudit(ctx, options.runtimeAudit, mutation, {
 								action: "tenant.service_account_credentials.create",
 								subjectType: "service_account_credential",
 								subjectId: created.credential.credentialId,
@@ -1157,6 +1926,9 @@ export function createTenantAdministrationPlugin(
 							const rotated =
 								await options.authorization.rotateServiceAccountCredential({
 									organizationId: mutation.organizationId,
+									actorId: mutation.actorId,
+									operationId:
+										ctx.body.operationId ?? randomUUID(),
 									serviceAccountId,
 									credentialId,
 									...(ctx.body.expiresAt
@@ -1164,7 +1936,7 @@ export function createTenantAdministrationPlugin(
 										: {}),
 									transaction: mutation.transaction,
 								});
-							await appendTenantAudit(ctx, options.runtimeAudit, mutation, {
+							if (!rotated.replayed) await appendTenantAudit(ctx, options.runtimeAudit, mutation, {
 								action: "tenant.service_account_credentials.rotate",
 								subjectType: "service_account_credential",
 								subjectId: rotated.credential.credentialId,

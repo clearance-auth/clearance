@@ -32,6 +32,8 @@ export * from "./services/delivery-control.js";
 export * from "./services/webhook-endpoints.js";
 export * from "./services/authentication-policy.js";
 export * from "./services/key-management.js";
+export * from "./services/product-presentation.js";
+export * from "./store/product-presentation-authority.js";
 export * from "./services/store-v2.js";
 export * from "./services/sso.js";
 export * from "./services/scim.js";

@@ -7,6 +7,23 @@ export type SendResult = { requestId?: string; status: string };
 export type EmailSendContext = { jobId: string; eventId: string };
 export type EmailSender = { verify(): Promise<void>; send(payload: unknown, context: EmailSendContext): Promise<SendResult>; close(): void };
 
+export function classifyDeterministicEmailError(error: unknown): { retryable: boolean; errorClass: string } | undefined {
+	const code = typeof (error as { code?: unknown })?.code === "string"
+		? (error as { code: string }).code
+		: "";
+	if (["DELIVERY_DESTINATION_MISMATCH", "DELIVERY_PAYLOAD_AUTH_FAILED", "DELIVERY_PAYLOAD_TOO_LARGE"].includes(code)) {
+		return { retryable: false, errorClass: `delivery.${code.toLowerCase().replace(/^delivery_/, "")}` };
+	}
+	if (!(error instanceof Error)) return undefined;
+	if (error.message === "presentation_unavailable" || error.message === "presentation_required") {
+		return { retryable: true, errorClass: "presentation.unavailable" };
+	}
+	if (/^(?:invalid_|body_|presentation_)/.test(error.message)) {
+		return { retryable: false, errorClass: "payload.invalid" };
+	}
+	return undefined;
+}
+
 function header(value: unknown, name: string, max: number): string {
 	if (typeof value !== "string" || !value.trim() || value.length > max || /[\r\n]/.test(value)) throw new Error(`invalid_${name}`);
 	return value;
@@ -18,11 +35,31 @@ function mailbox(value: unknown, name: string): string {
 	return normalized;
 }
 
+function displayMailbox(value: unknown, name: string): string {
+	const normalized = header(value, name, 512).trim();
+	if (!/^"(?:[^"\\\r\n]|\\[\\"\\])*" <[^\s@<>,;]+@[^\s@<>,;]+>$/.test(normalized)) {
+		throw new Error(`invalid_${name}`);
+	}
+	return normalized;
+}
+
+/** Construct a header-safe display-name mailbox from independently validated values. */
+export function formatDisplayMailbox(displayName: unknown, address: unknown): string {
+	const display = header(displayName, "display_name", 128).trim();
+	if (/[\u0000-\u001f\u007f]/.test(display)) throw new Error("invalid_display_name");
+	const escapedDisplay = display.replace(/["\\]/g, "\\$&");
+	return `"${escapedDisplay}" <${mailbox(address, "from")}>`;
+}
+
 export function validateEmailPayload(value: unknown, maxBodyBytes: number): EmailPayload {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_payload");
 	const raw = value as Record<string, unknown>;
 	const payload: EmailPayload = {
-		to: mailbox(raw.to, "to"), from: mailbox(raw.from, "from"), subject: header(raw.subject, "subject", 998),
+		to: mailbox(raw.to, "to"),
+		from: typeof raw.from === "string" && raw.from.includes("<")
+			? displayMailbox(raw.from, "from")
+			: mailbox(raw.from, "from"),
+		subject: header(raw.subject, "subject", 998),
 		...(raw.replyTo === undefined ? {} : { replyTo: mailbox(raw.replyTo, "reply_to") }),
 		...(typeof raw.text === "string" ? { text: raw.text } : {}),
 		...(typeof raw.html === "string" ? { html: raw.html } : {}),
@@ -132,7 +169,7 @@ export function createSmtpSender(config: WorkerConfig): EmailSender {
 	return {
 		async verify() { await transport.verify(); },
 		async send(value, context) {
-			const payload = renderEmailPayload(value, config);
+			const payload = validateEmailPayload(value, config.maxBodyBytes);
 			const stableMessageId = createHash("sha256").update(context.jobId).digest("hex");
 			const result = await transport.sendMail({
 				...payload,
@@ -161,13 +198,8 @@ export function createSmtpSender(config: WorkerConfig): EmailSender {
 
 export function classifySmtpError(error: unknown): { retryable: boolean; errorClass: string; providerStatus?: string } {
 	const value = error as { code?: unknown; responseCode?: unknown; command?: unknown };
-	if (error instanceof Error && /^(?:invalid_|body_)/.test(error.message)) {
-		return { retryable: false, errorClass: "payload.invalid" };
-	}
-	const deliveryCode = typeof value?.code === "string" ? value.code : "";
-	if (["DELIVERY_DESTINATION_MISMATCH", "DELIVERY_PAYLOAD_AUTH_FAILED", "DELIVERY_PAYLOAD_TOO_LARGE"].includes(deliveryCode)) {
-		return { retryable: false, errorClass: `delivery.${deliveryCode.toLowerCase().replace(/^delivery_/, "")}` };
-	}
+	const deterministic = classifyDeterministicEmailError(error);
+	if (deterministic) return deterministic;
 	const responseCode = typeof value?.responseCode === "number" ? value.responseCode : undefined;
 	if (responseCode) {
 		return {

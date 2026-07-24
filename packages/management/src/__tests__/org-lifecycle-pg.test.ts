@@ -11,6 +11,7 @@
  */
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { parseKeyEnvelope } from "@clearance/key-management";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
 import {
@@ -30,21 +31,29 @@ import {
 import {
 	addMemberInAuth,
 	archiveOrganizationInAuth,
+	createServiceAccountCredentialInAuth,
+	createServiceAccountInAuth,
 	createOrgInAuth,
+	createManagedOrganizationLifecycleFacade,
+	createTenantProductAdministrationFacade,
 	createUserInAuth,
 	ensureAuthMigrated,
 	getAuthBundle,
 	provisionOrganizationInAuth,
 	resetAuthBundle,
+	rotateServiceAccountCredentialInAuth,
 	updateOrganizationInAuth,
 } from "../auth-bridge.js";
 import {
 	createScimConnectionReal,
 	testScimConnectionReal,
 } from "../services/scim-real.js";
+import { createScimOperationReplayCipher } from "../services/scim.js";
 import { createSetupLink } from "../services/setup-links.js";
 import { createSsoConnectionReal } from "../services/sso-real.js";
 import {
+	rotateScimCredentialAuthoritative,
+	rotateSsoCredentialAuthoritative,
 	initProject,
 	listEvents,
 	listEventsPageOperational,
@@ -52,6 +61,7 @@ import {
 	syncRuntimeOrganizationToManagementDurable,
 	} from "../index.js";
 import { PostgresAuthorizationAuthority } from "../../../clearance-auth/src/authorization-authority.js";
+import { createClearanceManagementAuth } from "@clearance/auth/management-internal";
 
 const DATABASE_URL =
 	process.env.CLEARANCE_ORG_TEST_DATABASE_URL ??
@@ -93,6 +103,13 @@ const createdRuntimeUserIds = new Set<string>();
 const createdRuntimeOrgIds = new Set<string>();
 const createdRuntimeMemberIds = new Set<string>();
 const createdRuntimeEmails = new Set<string>();
+
+function replayCipherGuard() {
+	return {
+		async authorizeMutation(): Promise<void> {},
+		replayCipher: createScimOperationReplayCipher(getAuthBundle().keyManagement),
+	};
+}
 
 
 function trackUser(user: { id: string; email?: string | null }): void {
@@ -272,6 +289,7 @@ describe.skipIf(!available)(
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_principal_email`);
 				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_organization_slug`);
+				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_scim_operation_replay`);
 				for (const table of [
 					`${STARTUP_ABSENT_PREFIX}events`,
 					`${STARTUP_ABSENT_PREFIX}principals`,
@@ -282,6 +300,7 @@ describe.skipIf(!available)(
 					`${STARTUP_ABSENT_TABLE}_principal_email`,
 					`${STARTUP_ABSENT_TABLE}_organization_slug`,
 					`${STARTUP_ABSENT_TABLE}_idempotency`,
+					`${STARTUP_ABSENT_TABLE}_scim_operation_replay`,
 					STARTUP_ABSENT_TABLE,
 					`${TOPOLOGY_PREFIX}events`,
 					`${TOPOLOGY_PREFIX}principals`,
@@ -292,6 +311,7 @@ describe.skipIf(!available)(
 					`${TOPOLOGY_TABLE}_principal_email`,
 					`${TOPOLOGY_TABLE}_organization_slug`,
 					`${TOPOLOGY_TABLE}_idempotency`,
+					`${TOPOLOGY_TABLE}_scim_operation_replay`,
 					TOPOLOGY_TABLE,
 				]) {
 					await pool.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
@@ -1045,6 +1065,8 @@ describe.skipIf(!available)(
 			});
 			const machineCredential = await authorization.createServiceAccountCredential({
 				organizationId: organization.id,
+				actorId: owner.id,
+				operationId: "a11c0001-0000-4000-8000-000000000001",
 				serviceAccountId: `svc-archive-${stamp}`,
 				credentialId: `cred-archive-${stamp}`,
 			});
@@ -1258,6 +1280,222 @@ describe.skipIf(!available)(
 			});
 		});
 
+		it("replaces tenant SCIM and OIDC credentials in the runtime/control transaction", async () => {
+			const store = await freshStore();
+			const { organization } = await seedOwnerAndOrg(store);
+			const scope = resolveOperatorScope(store);
+			const sso = await createSsoConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				protocol: "oidc",
+				issuer: "https://dev-example.okta.com/oauth2/default",
+				domain: `replace-${organization.slug}.example`,
+				clientId: "replace-client",
+				clientSecret: "old-oidc-client-secret",
+				scope,
+			});
+			const scim = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				scope,
+			});
+			const oldScimBearer = scim.bearerTokenOnce!;
+			const beforeSso = store.snapshot.identityConnections.find((row) => row.id === sso.id)!;
+			const beforeScim = store.snapshot.directoryConnections.find((row) => row.id === scim.id)!;
+			const runtimeBefore = await getAuthBundle().pool.query<{
+				id: string;
+				oidcConfig: string | null;
+				scimToken: string;
+			}>(
+				`select s.id, s."oidcConfig", c."scimToken"
+				 from "ssoProvider" s cross join "scimProvider" c
+				 where s.id = $1 and c.id = $2`,
+				[sso.id, scim.id],
+			);
+			expect(runtimeBefore.rows).toHaveLength(1);
+
+			const replacementSso = await rotateSsoCredentialAuthoritative(store, sso.id, {
+				scope,
+				operationId: "11111111-1111-4111-8111-111111111111",
+				newClientSecret: "new-oidc-client-secret",
+			});
+			const replacementScim = await rotateScimCredentialAuthoritative(store, scim.id, {
+				scope,
+				operationId: "22222222-2222-4222-8222-222222222222",
+			}, replayCipherGuard());
+			await store.refresh();
+			const afterSso = store.snapshot.identityConnections.find((row) => row.id === sso.id)!;
+			const afterScim = store.snapshot.directoryConnections.find((row) => row.id === scim.id)!;
+			expect(replacementSso.clientSecretFingerprint).not.toBe(beforeSso.clientSecretFingerprint);
+			expect(afterSso.clientSecretFingerprint).toBe(replacementSso.clientSecretFingerprint);
+			expect(replacementScim.bearerTokenOnce).not.toBe(oldScimBearer);
+			expect(afterScim.bearerTokenFingerprint).toBe(replacementScim.bearerTokenFingerprint);
+			expect(afterScim.bearerTokenFingerprint).not.toBe(beforeScim.bearerTokenFingerprint);
+			const runtimeAfter = await getAuthBundle().pool.query<{
+				oidcConfig: string | null;
+				scimToken: string;
+			}>(
+				`select s."oidcConfig", c."scimToken"
+				 from "ssoProvider" s cross join "scimProvider" c
+				 where s.id = $1 and c.id = $2`,
+				[sso.id, scim.id],
+			);
+			expect(runtimeAfter.rows[0]!.oidcConfig).not.toBe(runtimeBefore.rows[0]!.oidcConfig);
+			expect(runtimeAfter.rows[0]!.scimToken).not.toBe(runtimeBefore.rows[0]!.scimToken);
+
+			const oldProbe = await getAuthBundle().auth.handler(new Request(
+				"http://localhost:3300/api/auth/scim/v2/Users",
+				{ headers: { authorization: `Bearer ${oldScimBearer}`, origin: "http://localhost:3300" } },
+			));
+			const replacementProbe = await getAuthBundle().auth.handler(new Request(
+				"http://localhost:3300/api/auth/scim/v2/Users",
+				{ headers: { authorization: `Bearer ${replacementScim.bearerTokenOnce}`, origin: "http://localhost:3300" } },
+			));
+			expect(oldProbe.status).toBe(401);
+			expect(replacementProbe.ok).toBe(true);
+			const auditJson = JSON.stringify(listEvents(store, { limit: 100 }));
+			expect(auditJson).not.toContain(replacementScim.bearerTokenOnce);
+			expect(auditJson).not.toContain("new-oidc-client-secret");
+		});
+
+		it("replays committed tenant SCIM create and rotate bearers without duplicate settlement", async () => {
+			const store = await freshStore();
+			const { organization } = await seedOwnerAndOrg(store);
+			const scope = resolveOperatorScope(store);
+			const createOperationId = "33333333-3333-4333-8333-333333333333";
+			const rotateOperationId = "44444444-4444-4444-8444-444444444444";
+
+			const created = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				endpoint: "https://scim.example.test/v2",
+				scope,
+				actor: "service-account-replay",
+				source: "system",
+				operationId: createOperationId,
+			}, replayCipherGuard());
+			const recoveredCreate = await createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "okta",
+				endpoint: "https://scim.example.test/v2",
+				scope,
+				actor: "service-account-replay",
+				source: "system",
+				operationId: createOperationId,
+			}, replayCipherGuard());
+			expect(recoveredCreate.id).toBe(created.id);
+			expect(recoveredCreate.bearerTokenOnce).toBe(created.bearerTokenOnce);
+
+			await expect(createScimConnectionReal(store, {
+				organizationId: organization.id,
+				provider: "entra",
+				endpoint: "https://scim.example.test/v2",
+				scope,
+				actor: "service-account-replay",
+				source: "system",
+				operationId: createOperationId,
+			}, replayCipherGuard())).rejects.toMatchObject({ code: "SCIM_OPERATION_REPLAY_CONFLICT" });
+
+			const rotated = await rotateScimCredentialAuthoritative(store, created.id, {
+				scope,
+				actor: "service-account-replay",
+				source: "system",
+				operationId: rotateOperationId,
+			}, replayCipherGuard());
+			const recoveredRotate = await rotateScimCredentialAuthoritative(store, created.id, {
+				scope,
+				actor: "service-account-replay",
+				source: "system",
+				operationId: rotateOperationId,
+			}, replayCipherGuard());
+			expect(recoveredRotate.replayed).toBe(true);
+			expect(recoveredRotate.bearerTokenOnce).toBe(rotated.bearerTokenOnce);
+
+			await expect(rotateScimCredentialAuthoritative(store, created.id, {
+				scope,
+				actor: "other-service-account",
+				source: "system",
+				operationId: rotateOperationId,
+			}, replayCipherGuard())).rejects.toMatchObject({ code: "SCIM_OPERATION_REPLAY_CONFLICT" });
+
+			await store.refresh();
+			expect(store.snapshot.directoryConnections.filter(
+				(connection) => connection.organizationId === organization.id,
+			)).toHaveLength(1);
+			const audit = listEvents(store, { limit: 500 }).filter(
+				(event) => event.subjectId === created.id,
+			);
+			expect(audit.filter((event) => event.action === "scim.create")).toHaveLength(1);
+			expect(audit.filter((event) => event.action === "scim.rotate")).toHaveLength(1);
+			const runtime = await getAuthBundle().pool.query(
+				`select id from "scimProvider" where id = $1 and "organizationId" = $2`,
+				[created.id, organization.id],
+			);
+			expect(runtime.rows).toHaveLength(1);
+			const authority = await getAuthBundle().pool.query<{
+				operation_id: string;
+				bearer_token_encrypted: string;
+			}>(
+				`select operation_id, bearer_token_encrypted from ${store.scimOperationReplayTable!}
+				 where organization_id = $1 and operation_id = any($2::text[])`,
+				[organization.id, [createOperationId, rotateOperationId]],
+			);
+			expect(authority.rows).toHaveLength(2);
+			const replayEnvelopes = authority.rows.map((row) =>
+				parseKeyEnvelope(row.bearer_token_encrypted),
+			);
+			expect(replayEnvelopes).toHaveLength(2);
+			expect(replayEnvelopes.every((envelope) =>
+				envelope.purpose === "scim-bearer-token" &&
+				envelope.projectId === scope.projectId &&
+				envelope.environmentId === scope.environmentId,
+			)).toBe(true);
+			const serialized = JSON.stringify({ audit, authority: authority.rows });
+			expect(serialized).not.toContain(created.bearerTokenOnce);
+			expect(serialized).not.toContain(rotated.bearerTokenOnce);
+		});
+
+		it("does not append duplicate service-account credential audits on authority replay", async () => {
+			const store = await freshStore();
+			const { owner, organization, stamp } = await seedOwnerAndOrg(store);
+			const scope = resolveOperatorScope(store);
+			const account = await createServiceAccountInAuth(store, {
+				organizationId: organization.id,
+				serviceAccountId: `svc-replay-${stamp}`,
+				name: "Replay machine",
+				actor: owner.id,
+				source: "cli",
+				scope,
+			});
+			if ("preview" in account) throw new Error("service account unexpectedly previewed");
+			const createInput = {
+				organizationId: organization.id,
+				serviceAccountId: account.serviceAccount.serviceAccountId,
+				actor: owner.id,
+				source: "cli" as const,
+				scope,
+				operationId: "b11c0001-0000-4000-8000-000000000001",
+			};
+			const created = await createServiceAccountCredentialInAuth(store, createInput);
+			const replayedCreate = await createServiceAccountCredentialInAuth(store, createInput);
+			if ("preview" in created || "preview" in replayedCreate) throw new Error("credential unexpectedly previewed");
+			expect(replayedCreate.secret).toBe(created.secret);
+			const rotateInput = {
+				...createInput,
+				credentialId: created.credential.credentialId,
+				operationId: "b11c0002-0000-4000-8000-000000000002",
+			};
+			const rotated = await rotateServiceAccountCredentialInAuth(store, rotateInput);
+			const replayedRotate = await rotateServiceAccountCredentialInAuth(store, rotateInput);
+			if ("preview" in rotated || "preview" in replayedRotate) throw new Error("credential unexpectedly previewed");
+			expect(replayedRotate.secret).toBe(rotated.secret);
+			const audits = listEvents(store, { limit: 500 }).filter(
+				(event) => event.organizationId === organization.id,
+			);
+			expect(audits.filter((event) => event.action === "authorization.credentials.create")).toHaveLength(1);
+			expect(audits.filter((event) => event.action === "authorization.credentials.rotate")).toHaveLength(1);
+		});
+
 		it("cross-scope archive fails closed with no write", async () => {
 			const store = await freshStore();
 			const { organization } = await seedOwnerAndOrg(store);
@@ -1330,6 +1568,8 @@ describe.skipIf(!available)(
 			});
 			const machineCredential = await authorization.createServiceAccountCredential({
 				organizationId: organization.id,
+				actorId: owner.id,
+				operationId: "a11c0002-0000-4000-8000-000000000002",
 				serviceAccountId: `svc-rollback-${organization.id}`,
 				credentialId: `cred-rollback-${organization.id}`,
 			});
@@ -1700,6 +1940,96 @@ describe.skipIf(!available)(
 			expect(listEvents(store, { limit: 500 }).filter(
 				(event) => event.organizationId === runtimeOrg.id && event.action.startsWith("orgs."),
 			).length).toBe(auditCount);
+		});
+
+		it("commits runtime first-organization state and the scoped management projection together", async () => {
+			const { store, scope } = await freshTopologyStore();
+			await store.storeV2!.apply();
+			await store.storeV2!.cutoverEvents();
+			await store.storeV2!.cutoverPrincipals();
+			await store.storeV2!.cutoverTopology();
+			const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const lifecycle = createManagedOrganizationLifecycleFacade({ store, scope });
+			const runtime = createClearanceManagementAuth({
+				baseURL: "http://localhost:3300",
+				secret: "managed-org-transaction-test-secret!!",
+				databaseUrl: DATABASE_URL,
+				enableSso: false,
+				enableScim: false,
+				passkeys: false,
+				rateLimitEnabled: false,
+				authenticationPolicy: scope,
+				authorization: scope,
+				tenantProductAdministration: createTenantProductAdministrationFacade({ store, scope }),
+				managedOrganizationLifecycle: lifecycle,
+			});
+			try {
+				await runtime.migrate();
+				const email = `managed-create-${suffix}@org-lc.test`;
+				const signedUp = await runtime.auth.api.signUpEmail({
+					body: { email, password: "OrgLifecycle1!", name: "Managed Owner" },
+				});
+				trackUser(signedUp.user);
+				const signIn = await runtime.auth.handler(new Request(
+					"http://localhost:3300/api/auth/sign-in/email",
+					{ method: "POST", headers: { "content-type": "application/json", origin: "http://localhost:3300" }, body: JSON.stringify({ email, password: "OrgLifecycle1!" }) },
+				));
+				const cookie = signIn.headers.getSetCookie().find((value) => value.startsWith("clearance.session_token="))?.split(";", 1)[0];
+				expect(cookie).toBeTruthy();
+				const created = await runtime.auth.api.createOrganization({
+					body: { name: "Managed Transaction", slug: `managed-${suffix}` },
+					headers: new Headers({ cookie: cookie!, origin: "http://localhost:3300" }),
+					asResponse: true,
+				});
+				expect(created.status).toBe(200);
+				const organization = await created.json() as { id: string; members: Array<{ id: string }> };
+				trackOrg(organization);
+				trackMember(organization.members[0]!.id);
+				await store.refresh();
+				const normalized = await runtime.pool.query(
+					`select (select count(*)::int from ${TOPOLOGY_PREFIX}principals where id = $1) as principals,
+					        (select count(*)::int from ${TOPOLOGY_PREFIX}organizations where id = $2) as organizations,
+					        (select count(*)::int from ${TOPOLOGY_PREFIX}events where organization_id = $2 and action = 'orgs.create.runtime_managed') as audits`,
+					[signedUp.user.id, organization.id],
+				);
+				expect(normalized.rows[0]).toMatchObject({ principals: 1, organizations: 1, audits: 1 });
+				expect(store.snapshot.memberships.find((membership) => membership.id === organization.members[0]!.id)).toMatchObject({ organizationId: organization.id, principalId: signedUp.user.id, role: "owner", status: "active" });
+				expect(listEvents(store, { limit: 100 }).some((event) => event.organizationId === organization.id && event.action === "orgs.create.runtime_managed" && JSON.stringify(event.metadata).includes(email))).toBe(false);
+				expect((await runtime.authorization!.readEffective({ organizationId: organization.id, subject: { kind: "principal", id: signedUp.user.id } })).roleIds).toEqual(["role_builtin_owner"]);
+				const session = await runtime.pool.query(`select "activeOrganizationId" from session where "userId" = $1 order by "createdAt" desc limit 1`, [signedUp.user.id]);
+				expect(session.rows[0]?.activeOrganizationId).toBe(organization.id);
+
+				const failing = createClearanceManagementAuth({
+					baseURL: "http://localhost:3300", secret: "managed-org-transaction-test-secret!!", databaseUrl: DATABASE_URL,
+					enableSso: false, enableScim: false, passkeys: false, rateLimitEnabled: false, authenticationPolicy: scope, authorization: scope,
+					tenantProductAdministration: createTenantProductAdministrationFacade({ store, scope }),
+					managedOrganizationLifecycle: { ...lifecycle, async finalizeCreatedOrganization(input) { await lifecycle.finalizeCreatedOrganization(input); throw new Error("injected lifecycle failure"); } },
+				});
+				try {
+					const failedEmail = `managed-rollback-${suffix}@org-lc.test`;
+					const failedUser = await failing.auth.api.signUpEmail({ body: { email: failedEmail, password: "OrgLifecycle1!", name: "Rollback Owner" } });
+					trackUser(failedUser.user);
+					const failedSignIn = await failing.auth.handler(new Request("http://localhost:3300/api/auth/sign-in/email", { method: "POST", headers: { "content-type": "application/json", origin: "http://localhost:3300" }, body: JSON.stringify({ email: failedEmail, password: "OrgLifecycle1!" }) }));
+					const failedCookie = failedSignIn.headers.getSetCookie().find((value) => value.startsWith("clearance.session_token="))?.split(";", 1)[0];
+					const failedCreate = await failing.auth.handler(new Request(
+						"http://localhost:3300/api/auth/organization/create",
+						{ method: "POST", headers: { "content-type": "application/json", cookie: failedCookie!, origin: "http://localhost:3300" }, body: JSON.stringify({ name: "Rollback Transaction", slug: `rollback-${suffix}` }) },
+					));
+					expect(failedCreate.status).toBe(500);
+					expect(failedCreate.headers.get("set-cookie")).toBeNull();
+					expect((await failing.pool.query(`select id from organization where slug = $1`, [`rollback-${suffix}`])).rows).toHaveLength(0);
+					expect((await failing.pool.query(`select id from member where "userId" = $1`, [failedUser.user.id])).rows).toHaveLength(0);
+					expect((await failing.pool.query(`select 1 from clearance_authz_subject_role_assignments where "organizationId" = $1`, [`rollback-${suffix}`])).rows).toHaveLength(0);
+					const failedSession = await failing.pool.query(`select "activeOrganizationId" from session where "userId" = $1 order by "createdAt" desc limit 1`, [failedUser.user.id]);
+					expect(failedSession.rows[0]?.activeOrganizationId ?? null).toBeNull();
+					await store.refresh();
+					expect(store.snapshot.organizations.some((candidate) => candidate.slug === `rollback-${suffix}`)).toBe(false);
+					expect(store.snapshot.memberships.some((membership) => membership.principalId === failedUser.user.id)).toBe(false);
+					expect((await failing.pool.query(`select count(*)::int as count from ${TOPOLOGY_PREFIX}principals where id = $1`, [failedUser.user.id])).rows[0]?.count).toBe(0);
+					expect((await failing.pool.query(`select count(*)::int as count from ${TOPOLOGY_PREFIX}organizations where slug = $1`, [`rollback-${suffix}`])).rows[0]?.count).toBe(0);
+					expect((await failing.pool.query(`select count(*)::int as count from ${TOPOLOGY_PREFIX}events where organization_id = $1`, [`rollback-${suffix}`])).rows[0]?.count).toBe(0);
+				} finally { await failing.destroy(); }
+			} finally { await runtime.destroy(); }
 		});
 	},
 );

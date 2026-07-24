@@ -4,6 +4,7 @@ import { parseWorkerConfig } from "./config.js";
 import { createJsonLogger } from "./logger.js";
 import { classifySesError, createSesSender, SesDeliveryError } from "./ses.js";
 import { classifySmtpError, renderEmailPayload, validateEmailPayload } from "./smtp.js";
+import { probeProductPresentationAuthority, renderWorkerEmailPayload, workerHeartbeatState, type ProductPresentationLoader, type ProductPresentationSnapshot } from "./worker.js";
 import {
 	canonicalWebhookBytes,
 	classifyWebhookError,
@@ -45,6 +46,10 @@ describe("delivery worker boundaries", () => {
 		expect(config.smtp!.requireTls).toBe(true);
 		expect(config.emailTransport).toBe("smtp");
 		expect(config.allowHttpLinks).toBe(false);
+		expect(config.managementSchema).toBe("public");
+		expect(config.managementPrefix).toBe("mgmt_");
+		expect(config.allowLegacyPresentationFallback).toBe(true);
+		expect(parseWorkerConfig({ ...env(), NODE_ENV: "production" }).allowLegacyPresentationFallback).toBe(false);
 		expect(config.runtimeAudit).toMatchObject({ table: "clearance_runtime_audit_events" });
 		expect(parseWorkerConfig({
 			...env(),
@@ -141,6 +146,110 @@ describe("delivery worker boundaries", () => {
 		expect(concrete.from).toBe("support@example.test");
 	});
 
+	it("probes normalized presentation authority without a queued job or tenant scope", async () => {
+		const queries: Array<readonly unknown[]> = [];
+		await probeProductPresentationAuthority({
+			async query(...args: unknown[]) {
+				queries.push(args);
+				return { rows: [] };
+			},
+		} as never, parseWorkerConfig(env()));
+		expect(queries).toHaveLength(1);
+		expect(queries[0]).toHaveLength(1);
+		expect(String(queries[0]![0])).toContain('"public"."mgmt_product_email_senders"');
+		expect(String(queries[0]![0])).toContain("LIMIT 0");
+	});
+
+	it("never persists a ready heartbeat while presentation authority is unavailable", () => {
+		expect(workerHeartbeatState({
+			draining: false, emailHealthy: true, schemaHealthy: true, presentation: "unavailable",
+		})).toBe("failed");
+		expect(workerHeartbeatState({
+			draining: false, emailHealthy: true, schemaHealthy: true, presentation: "available",
+		})).toBe("ready");
+	});
+
+	it("uses only the leased scope's normalized sender and versioned auth template snapshot", async () => {
+		const config = parseWorkerConfig(env());
+		const snapshots = new Map<string, ProductPresentationSnapshot>();
+		const add = (kind: ProductPresentationSnapshot["template"]["kind"], version: number, subject: string, plainText: string, html: string) => {
+			const variables = [...new Set([...subject, ...plainText, ...html].join("").match(/\{\{([a-z_]+)\}\}/g)?.map((item) => item.slice(2, -2)) ?? [])].sort();
+			snapshots.set(`project-1:environment-1:${kind}`, {
+				productLabel: "Scoped Product",
+				sender: { displayName: "Product \"Mail\"", address: "hello@product.example.test", domain: "product.example.test", version: 7 },
+				template: { kind, subject, plainText, html, variables, version, hash: "a".repeat(64) },
+			});
+		};
+		add("verification", 11, "Verify {{product_name}} for {{user_name}} v11", "Open {{verification_url}}", "<p>{{verification_url}}</p>");
+		add("password-reset", 12, "Reset {{product_name}} for {{user_name}} v12", "Open {{reset_url}}", "<p>{{reset_url}}</p>");
+		add("invitation", 13, "{{inviter_name}} invited you as {{role}} v13", "Join {{organization_name}}: {{invitation_url}}", "<p>{{inviter_name}} {{organization_name}} {{invitation_url}}</p>");
+		add("email-change", 14, "Confirm {{product_name}} for {{user_name}} v14", "Open {{email_change_url}}", "<p>{{email_change_url}}</p>");
+		const calls: Array<{ projectId: string; environmentId: string; kind: string }> = [];
+		const loader: ProductPresentationLoader = {
+			async load(scope, kind) {
+				calls.push({ ...scope, kind });
+				return snapshots.get(`${scope.projectId}:${scope.environmentId}:${kind}`) ?? null;
+			},
+		};
+		const cases = [
+			["email-verification", { userName: "User", url: "https://app.example.test/verify?q=<inert>" }, "v11"],
+			["password-reset", { userName: "User", url: "https://app.example.test/reset?q=<inert>" }, "v12"],
+			["organization-invitation", { inviterName: "<Admin>", organizationName: "A & B", role: "admin", acceptanceUrl: "https://app.example.test/invite?q=<inert>" }, "v13"],
+			["email-change-confirmation", { userName: "User", url: "https://app.example.test/change?q=<inert>" }, "v14"],
+		] as const;
+		for (const [template, fields, marker] of cases) {
+			const rendered = await renderWorkerEmailPayload({ template, to: "to@example.test", ...fields }, {
+				projectId: "project-1", environmentId: "environment-1",
+			}, config, loader);
+			expect(rendered.presentation).toBe("ready");
+			expect(rendered.payload.from).toBe('"Product \\"Mail\\"" <hello@product.example.test>');
+			expect(rendered.payload.subject).toContain(marker);
+			if (template === "organization-invitation") expect(rendered.payload.subject).toContain("admin");
+			else expect(rendered.payload.subject).toContain("User");
+			if (template !== "organization-invitation") expect(rendered.payload.subject).toContain("Scoped Product");
+			expect(rendered.payload.html).toContain("&lt;inert&gt;");
+			expect(rendered.payload.html).not.toContain("<inert>");
+		}
+		const nameless = await renderWorkerEmailPayload({
+			template: "password-reset", to: "to@example.test", url: "https://app.example.test/reset",
+		}, { projectId: "project-1", environmentId: "environment-1" }, config, loader);
+		expect(nameless.presentation).toBe("ready");
+		expect(nameless.payload.subject).toBe("Reset Scoped Product for  v12");
+		const foreign = await renderWorkerEmailPayload({ template: "password-reset", to: "to@example.test", userName: "User", url: "https://app.example.test/reset" }, {
+			projectId: "other-project", environmentId: "environment-1",
+		}, config, loader);
+		expect(foreign.presentation).toBe("absent");
+		expect(foreign.payload.from).toBe("support@example.test");
+		expect(calls.at(-1)).toMatchObject({ projectId: "other-project", environmentId: "environment-1", kind: "password-reset" });
+		for (const reason of ["presentation_sender_domain_unverified", "presentation_sender_domain_invalid"]) {
+			const stale: ProductPresentationLoader = { async load() { throw new Error(reason); } };
+			await expect(renderWorkerEmailPayload({ template: "password-reset", to: "to@example.test", userName: "User", url: "https://app.example.test/reset" }, {
+				projectId: "project-1", environmentId: "environment-1",
+			}, config, stale)).rejects.toThrow(reason);
+		}
+		const unavailable: ProductPresentationLoader = { async load() { throw new Error("database unavailable"); } };
+		await expect(renderWorkerEmailPayload({ template: "password-reset", to: "to@example.test", userName: "User", url: "https://app.example.test/reset" }, {
+			projectId: "project-1", environmentId: "environment-1",
+		}, config, unavailable)).rejects.toThrow("presentation_unavailable");
+		const productionConfig = parseWorkerConfig({ ...env(), NODE_ENV: "production" });
+		const absent: ProductPresentationLoader = { async load() { return null; } };
+		await expect(renderWorkerEmailPayload({ template: "password-reset", to: "to@example.test", userName: "User", url: "https://app.example.test/reset" }, {
+			projectId: "project-1", environmentId: "environment-1",
+		}, productionConfig, absent)).rejects.toThrow("presentation_required");
+		const verificationWithCode: ProductPresentationLoader = {
+			async load() {
+				return {
+					productLabel: "Scoped Product",
+					sender: { displayName: "Product Mail", address: "hello@product.example.test", domain: "product.example.test", version: 7 },
+					template: { kind: "verification", subject: "Code {{code}}", plainText: "Open {{verification_url}}", html: "<p>{{verification_url}}</p>", variables: ["code", "verification_url"], version: 15, hash: "b".repeat(64) },
+				};
+			},
+		};
+		await expect(renderWorkerEmailPayload({ template: "email-verification", to: "to@example.test", userName: "User", url: "https://app.example.test/verify" }, {
+			projectId: "project-1", environmentId: "environment-1",
+		}, config, verificationWithCode)).rejects.toThrow("presentation_template_variables_invalid");
+	});
+
 	it("classifies retryable and terminal SMTP failures without response text", () => {
 		expect(classifySmtpError({ responseCode: 421 })).toEqual({ retryable: true, errorClass: "smtp.transient", providerStatus: "421" });
 		expect(classifySmtpError({ responseCode: 550 })).toEqual({ retryable: false, errorClass: "smtp.rejected", providerStatus: "550" });
@@ -148,6 +257,9 @@ describe("delivery worker boundaries", () => {
 		expect(classifySmtpError({ code: "ETLS" })).toEqual({ retryable: true, errorClass: "smtp.transport" });
 		expect(classifySmtpError({ responseCode: 250 })).toEqual({ retryable: false, errorClass: "smtp.protocol", providerStatus: "250" });
 		expect(classifySmtpError(new Error("body_too_large"))).toEqual({ retryable: false, errorClass: "payload.invalid" });
+		expect(classifySmtpError(new Error("presentation_unavailable"))).toEqual({ retryable: true, errorClass: "presentation.unavailable" });
+		expect(classifySesError(new Error("presentation_template_variables_invalid"))).toEqual({ retryable: false, errorClass: "payload.invalid" });
+		expect(classifySesError(new Error("presentation_unavailable"))).toEqual({ retryable: true, errorClass: "presentation.unavailable" });
 	});
 
 	it("sends through SES with SigV4, bounded provider identity, and a stable delivery header", async () => {

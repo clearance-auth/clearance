@@ -14,6 +14,7 @@ import { EVENTS_IDENTITY_OPERATION_SCHEMAS } from "./events-identity.js";
 import { OPERATION_METADATA } from "./operation-metadata.js";
 import { POLICY_CONFIG_OPERATION_SCHEMAS } from "./policy-config.js";
 import { PROJECT_OPERATION_SCHEMAS } from "./projects.js";
+import { PRODUCT_PRESENTATION_OPERATION_SCHEMAS } from "./product-presentation.js";
 import { MANAGEMENT_OPERATION_REGISTRY } from "./registry.js";
 import { RESOURCE_OPERATION_SCHEMAS } from "./resources.js";
 import { SCHEMA_OPERATION_SCHEMAS } from "./schema-operations.js";
@@ -59,8 +60,8 @@ function metadataWithoutTransportProjection() {
 
 describe("generated operation registry kernel", () => {
 	it("is a complete exact canonical snapshot and preserves alternate inspect paths", () => {
-		expect(OPERATION_METADATA).toHaveLength(127);
-		expect(new Set(OPERATION_METADATA.map((operation) => operation.id)).size).toBe(127);
+		expect(OPERATION_METADATA).toHaveLength(143);
+		expect(new Set(OPERATION_METADATA.map((operation) => operation.id)).size).toBe(143);
 		expect(metadataWithoutTransportProjection()).toEqual(canonicalMetadata());
 		expect(Object.keys(MANAGEMENT_OPERATION_REGISTRY).sort()).toEqual(
 			OPERATION_METADATA.map((operation) => operation.id).sort(),
@@ -80,6 +81,7 @@ describe("generated operation registry kernel", () => {
 		const domains = [
 			SYSTEM_OPERATION_SCHEMAS,
 			PROJECT_OPERATION_SCHEMAS,
+			PRODUCT_PRESENTATION_OPERATION_SCHEMAS,
 			ENVIRONMENT_OPERATION_SCHEMAS,
 			EVENTS_IDENTITY_OPERATION_SCHEMAS,
 			AUTHORIZATION_OPERATION_SCHEMAS,
@@ -90,7 +92,7 @@ describe("generated operation registry kernel", () => {
 			SCHEMA_OPERATION_SCHEMAS,
 			RESOURCE_OPERATION_SCHEMAS,
 		];
-		expect(new Set(domains.flatMap((domain) => Object.keys(domain))).size).toBe(127);
+		expect(new Set(domains.flatMap((domain) => Object.keys(domain))).size).toBe(143);
 
 		const requests: Array<{ url: string; init: RequestInit }> = [];
 		const browser = createBrowserManagementClient({
@@ -145,6 +147,65 @@ describe("generated operation registry kernel", () => {
 		await expect(browser.call("scim.test", { id: "connection_1", live: true, dryRun: false }))
 			.rejects.toMatchObject({ code: "MANAGEMENT_CLIENT_CONFIRMATION_REQUIRED" });
 		expect(requests).toHaveLength(3);
+	});
+
+	it("requires canonical operation IDs for live service-account credential mutations", () => {
+		const create = AUTHORIZATION_OPERATION_SCHEMAS["service-accounts.credentials.create"].input;
+		const rotate = AUTHORIZATION_OPERATION_SCHEMAS["service-accounts.credentials.rotate"].input;
+		const operationId = "11111111-1111-4111-8111-111111111111";
+
+		expect(create.safeParse({ organizationId: "org_1", accountId: "svc_1", dryRun: true }).success).toBe(true);
+		expect(rotate.safeParse({ organizationId: "org_1", accountId: "svc_1", credentialId: "cred_1", dryRun: true }).success).toBe(true);
+		expect(create.safeParse({ organizationId: "org_1", accountId: "svc_1" }).success).toBe(false);
+		expect(rotate.safeParse({ organizationId: "org_1", accountId: "svc_1", credentialId: "cred_1", operationId: "not-a-uuid" }).success).toBe(false);
+		expect(create.safeParse({ organizationId: "org_1", accountId: "svc_1", operationId }).success).toBe(true);
+		expect(rotate.safeParse({ organizationId: "org_1", accountId: "svc_1", credentialId: "cred_1", dryRun: false, operationId }).success).toBe(true);
+	});
+
+	it("accepts only full or explicitly redacted product-domain reissue responses", async () => {
+		const domain = {
+			origin: "https://auth.example.test",
+			hostname: "auth.example.test",
+			dnsName: "_clearance.auth.example.test",
+			state: "pending" as const,
+			version: 2,
+			verifiedAt: null,
+			updatedAt: "2026-07-24T00:00:00.000Z",
+		};
+		const scope = { projectId: "project_1", environmentId: "environment_1" };
+		const first = {
+			schemaVersion: "v1" as const,
+			scope,
+			domain,
+			dnsChallenge: { name: domain.dnsName, value: "clearance-domain-verification=one-time" },
+		};
+		const replay = {
+			schemaVersion: "v1" as const,
+			scope,
+			domain,
+			challengeAlreadyIssued: true as const,
+			oneTimeSecretsOmitted: ["dnsChallenge.value"] as ["dnsChallenge.value"],
+		};
+		const output = MANAGEMENT_OPERATION_REGISTRY["product_domains.reissue"]!.schemas.output;
+
+		expect(output.safeParse(first).success).toBe(true);
+		expect(output.safeParse(replay).success).toBe(true);
+		expect(output.safeParse({ ...replay, dnsChallenge: first.dnsChallenge }).success).toBe(false);
+		expect(output.safeParse({ ...replay, oneTimeSecretsOmitted: [] }).success).toBe(false);
+		const { challengeAlreadyIssued: _challengeAlreadyIssued, ...missingReplayMarker } = replay;
+		expect(output.safeParse(missingReplayMarker).success).toBe(false);
+		const { domain: _domain, ...missingRequiredField } = replay;
+		expect(output.safeParse(missingRequiredField).success).toBe(false);
+
+		const client = createBrowserManagementClient({
+			baseUrl: "/management",
+			registry: MANAGEMENT_OPERATION_REGISTRY,
+			fetch: async () => Response.json(replay),
+		});
+		await expect(client.call("product_domains.reissue", {
+			origin: domain.origin,
+			expectedVersion: 1,
+		})).resolves.toMatchObject({ data: replay });
 	});
 
 	it("maps semantic delivery filters and accepts only exact one-time-secret response branches", async () => {

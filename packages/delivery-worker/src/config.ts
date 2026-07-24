@@ -11,6 +11,11 @@ export type WorkerConfig = {
 	keyring: DeliveryKeyring;
 	schema: string;
 	prefix: string;
+	/** Read-only normalized product-presentation authority. */
+	managementSchema?: string;
+	managementPrefix?: string;
+	/** Development-only compatibility when normalized presentation rows are absent. */
+	allowLegacyPresentationFallback?: boolean;
 	legacyFingerprintKeyId?: string;
 	/** Product-owned append-only audit authority; omitted preserves legacy delivery behavior. */
 	runtimeAudit?: RuntimeAuditTable;
@@ -75,6 +80,13 @@ function boolean(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boole
 
 function identifier(value: string, name: string): string {
 	if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error(`${name} must be a valid Postgres identifier`);
+	return value;
+}
+
+function managementPrefix(value: string, name: string): string {
+	if (!/^[a-z_][a-z0-9_]{0,29}$/.test(value)) {
+		throw new Error(`${name} must be a safe PostgreSQL prefix of at most 30 characters`);
+	}
 	return value;
 }
 
@@ -212,6 +224,13 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env, mode: Wo
 		keyring: resolveDeliveryKeyring(env),
 		schema: identifier(env.CLEARANCE_DELIVERY_SCHEMA?.trim() || "public", "CLEARANCE_DELIVERY_SCHEMA"),
 		prefix: identifier(env.CLEARANCE_DELIVERY_PREFIX?.trim() || "delivery_", "CLEARANCE_DELIVERY_PREFIX"),
+		managementSchema: identifier(env.CLEARANCE_MANAGEMENT_SCHEMA?.trim() || "public", "CLEARANCE_MANAGEMENT_SCHEMA"),
+		managementPrefix: managementPrefix(env.CLEARANCE_MANAGEMENT_PREFIX?.trim() || "mgmt_", "CLEARANCE_MANAGEMENT_PREFIX"),
+		allowLegacyPresentationFallback: boolean(
+			env,
+			"CLEARANCE_DELIVERY_ALLOW_LEGACY_PRESENTATION_FALLBACK",
+			env.NODE_ENV !== "production",
+		),
 		...(env.CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID?.trim()
 			? {
 				legacyFingerprintKeyId: fingerprintKeyId(

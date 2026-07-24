@@ -1,6 +1,7 @@
 export const KEY_PURPOSES = Object.freeze([
 	"oidc-client-secret",
 	"scim-bearer-token",
+	"service-account-credential-replay",
 	"access-token-signing-key",
 ] as const);
 

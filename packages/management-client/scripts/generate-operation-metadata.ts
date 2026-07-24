@@ -92,10 +92,19 @@ function inputContractsByOperation(): ReadonlyMap<string, OperationInputContract
 		const operationType = checker.getTypeOfSymbolAtLocation(operation, operationDeclaration);
 		const inputType = checker.getTypeOfPropertyOfType(operationType, "input");
 		if (!inputType) throw new Error(`${id} is missing a semantic input type.`);
-		const properties = new Map(checker.getPropertiesOfType(inputType).map((property) => [
-			property.getName(),
-			checker.getTypeOfSymbolAtLocation(property, property.valueDeclaration ?? property.declarations?.[0] ?? operationDeclaration),
-		]));
+		const properties = new Map<string, ts.Type>();
+		for (const branch of inputType.isUnion() ? inputType.types : [inputType]) {
+			for (const property of checker.getPropertiesOfType(branch)) {
+				if (properties.has(property.getName())) continue;
+				properties.set(
+					property.getName(),
+					checker.getTypeOfSymbolAtLocation(
+						property,
+						property.valueDeclaration ?? property.declarations?.[0] ?? operationDeclaration,
+					),
+				);
+			}
+		}
 		result.set(id, { keys: new Set(properties.keys()), properties });
 	}
 	return result;
@@ -189,7 +198,7 @@ function semanticQueryParameters(
 }
 
 function assertMetadata(value: readonly OperationMetadata[]): void {
-	if (value.length !== 127) throw new Error(`Expected 127 canonical management operations, received ${value.length}.`);
+	if (value.length !== 143) throw new Error(`Expected 143 canonical management operations, received ${value.length}.`);
 	const ids = new Set(value.map((operation) => operation.id));
 	if (ids.size !== value.length) throw new Error("Canonical management operation ids must be unique.");
 	for (const operation of value) {

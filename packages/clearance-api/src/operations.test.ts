@@ -130,6 +130,49 @@ describe("authenticated operational API contracts", () => {
 		});
 	});
 
+	it("requires a canonical operation ID only for live credential create and rotate", async () => {
+		for (const [path, body] of [
+			["/v1/organizations/org_test/service-accounts/svc_test/credentials", {}],
+			["/v1/organizations/org_test/service-accounts/svc_test/credentials/cred_test/rotate", { operationId: "not-a-uuid" }],
+		] as const) {
+			const response = await app.request(path, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+			});
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "TENANT_OPERATION_ID_REQUIRED" },
+			});
+		}
+
+		const preview = await app.request(
+			"/v1/organizations/org_test/service-accounts/svc_test/credentials",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify({ dryRun: true }),
+			},
+		);
+		expect(preview.status).toBe(400);
+		expect(await preview.json()).toMatchObject({
+			error: { code: "AUTHORIZATION_POSTGRES_REQUIRED", stage: "authorization.api" },
+		});
+
+		const spoofedActor = await app.request(
+			"/v1/organizations/org_test/service-accounts/svc_test/credentials",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify({ operationId: "11111111-1111-4111-8111-111111111111", actor: "spoofed" }),
+			},
+		);
+		expect(spoofedActor.status).toBe(400);
+		expect(await spoofedActor.json()).toMatchObject({
+			error: { code: "AUTHORIZATION_INPUT_INVALID", stage: "authorization.credentials.create" },
+		});
+	});
+
 	it("rejects invalid key-management bodies before the PostgreSQL backend gate", async () => {
 		for (const [path, body] of [
 			["/v1/key-management/plan", "[]"],

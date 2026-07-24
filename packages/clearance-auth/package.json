@@ -1,6 +1,6 @@
 {
   "name": "@clearance/auth",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Clearance auth runtime with bundled, audited fork code and Clearance defaults",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,11 @@
     "./secret-policy": {
       "types": "./types/secret-policy.d.ts",
       "default": "./dist/secret-policy.mjs"
+    },
+    "./management-internal": {
+      "dev-source": "./src/management-internal.ts",
+      "types": "./types/management-internal.d.ts",
+      "default": "./dist/management-internal.mjs"
     }
   },
   "files": ["dist", "types"],

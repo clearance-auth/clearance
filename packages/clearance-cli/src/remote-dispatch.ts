@@ -15,6 +15,10 @@ import {
 	MIGRATION_OPERATIONS,
 	ORGANIZATION_OPERATIONS,
 	PROJECT_OPERATIONS,
+	PRODUCT_DOMAIN_OPERATIONS,
+	PRODUCT_PRESENTATION_OPERATIONS,
+	PRODUCT_SENDER_OPERATIONS,
+	PRODUCT_TEMPLATE_OPERATIONS,
 	READINESS_OPERATIONS,
 	ROLE_OPERATIONS,
 	SCHEMA_OPERATIONS,
@@ -39,6 +43,7 @@ import { dispatchKeyManagementCommand } from "./dispatch/key-management.js";
 import { dispatchMigrationCommand } from "./dispatch/migrations.js";
 import { dispatchOperationsCommand } from "./dispatch/operations.js";
 import { dispatchOrganizationCommand } from "./dispatch/organizations.js";
+import { dispatchProductPresentationCommand } from "./dispatch/product-presentation.js";
 import { dispatchStoreV2Command } from "./dispatch/store-v2.js";
 import { error } from "./dispatch/shared.js";
 import { dispatchUserCommand } from "./dispatch/users.js";
@@ -140,6 +145,23 @@ export async function dispatchRemoteCommand(
 		case KEY_MANAGEMENT_OPERATIONS.plan.cliPath:
 		case KEY_MANAGEMENT_OPERATIONS.apply.cliPath:
 			return dispatchKeyManagementCommand({ session, path, args, opts, global });
+		case PRODUCT_PRESENTATION_OPERATIONS.get.cliPath:
+		case PRODUCT_PRESENTATION_OPERATIONS.plan.cliPath:
+		case PRODUCT_PRESENTATION_OPERATIONS.apply.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.list.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.create.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.reissue.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.verify.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.activate.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.disable.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.get.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.plan.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.apply.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.readiness.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.get.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.plan.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.apply.cliPath:
+			return dispatchProductPresentationCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
 		case API_KEY_OPERATIONS.rotate.cliPath:

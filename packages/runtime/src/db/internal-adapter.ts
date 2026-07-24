@@ -76,6 +76,10 @@ import {
 	readInternalAuthorizationAuthority,
 } from "../internal/authorization-authority";
 import {
+	attachCapturedInternalManagedOrganizationLifecycleAuthority,
+	readInternalManagedOrganizationLifecycleAuthority,
+} from "../internal/organization-lifecycle-authority";
+import {
 	readInternalAuthenticationPolicy,
 	resolveRuntimeAuthenticationPolicy,
 } from "../internal/authentication-policy";
@@ -222,6 +226,8 @@ export const createInternalAdapter = (
 	const credentialAuthority = readInternalCredentialAuthority(options);
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
 	const authorizationAuthority = readInternalAuthorizationAuthority(options);
+	const managedOrganizationLifecycleAuthority =
+		readInternalManagedOrganizationLifecycleAuthority(options);
 	const legacyCredentialAuthority =
 		credentialAuthority?.generation === "legacy-v1";
 	const storesSessionsInDatabase =
@@ -6280,6 +6286,12 @@ export const createInternalAdapter = (
 		attachCapturedInternalAuthorizationAuthority(
 			internalAdapter,
 			authorizationAuthority,
+		);
+	}
+	if (managedOrganizationLifecycleAuthority) {
+		attachCapturedInternalManagedOrganizationLifecycleAuthority(
+			internalAdapter,
+			managedOrganizationLifecycleAuthority,
 		);
 	}
 	if (authenticationPolicy) {

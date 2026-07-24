@@ -52,6 +52,11 @@ import {
 	type InternalAuthorizationAuthority,
 } from "../internal/authorization-authority";
 import {
+	attachCapturedInternalManagedOrganizationLifecycleAuthority,
+	readInternalManagedOrganizationLifecycleAuthority,
+	type InternalManagedOrganizationLifecycleAuthority,
+} from "../internal/organization-lifecycle-authority";
+import {
 	attachCapturedInternalRuntimeAudit,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditBinding,
@@ -100,6 +105,26 @@ function assertCompatibleAuthorizationAuthorityTarget(
 	if (existing && existing !== binding) {
 		throw new ClearanceError(
 			"Authorization authority does not match the runtime options binding",
+		);
+	}
+}
+
+function assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	const existing = readInternalManagedOrganizationLifecycleAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Managed organization lifecycle authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Managed organization lifecycle authority does not match the runtime options binding",
 		);
 	}
 }
@@ -192,6 +217,8 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 	const credentialAuthority = readInternalCredentialAuthority(options);
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
 	const authorizationAuthority = readInternalAuthorizationAuthority(options);
+	const managedOrganizationLifecycleAuthority =
+		readInternalManagedOrganizationLifecycleAuthority(options);
 	const runtimeAudit = readInternalRuntimeAudit(options);
 	const initialPolicyTargets = [
 		adapter,
@@ -200,6 +227,10 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 	for (const target of new Set(initialPolicyTargets)) {
 		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
 		assertCompatibleAuthorizationAuthorityTarget(target, authorizationAuthority);
+		assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+			target,
+			managedOrganizationLifecycleAuthority,
+		);
 		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
 	}
 	if (authenticationPolicy) {
@@ -343,6 +374,10 @@ Most of the features of Clearance will not work correctly.`,
 	for (const target of authenticationPolicyTargets) {
 		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
 		assertCompatibleAuthorizationAuthorityTarget(target, authorizationAuthority);
+		assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+			target,
+			managedOrganizationLifecycleAuthority,
+		);
 		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
 	}
 	if (authenticationPolicy) {
@@ -353,6 +388,14 @@ Most of the features of Clearance will not work correctly.`,
 	if (authorizationAuthority) {
 		for (const target of authenticationPolicyTargets) {
 			attachCapturedInternalAuthorizationAuthority(target, authorizationAuthority);
+		}
+	}
+	if (managedOrganizationLifecycleAuthority) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalManagedOrganizationLifecycleAuthority(
+				target,
+				managedOrganizationLifecycleAuthority,
+			);
 		}
 	}
 	if (runtimeAudit) {

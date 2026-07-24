@@ -21,6 +21,10 @@ import type {
 } from "@clearance/delivery";
 import type { ManagementWebhookEndpointFanout } from "../application/delivery.js";
 import type { AuditEventInput } from "../services/audit.js";
+import type {
+	ProductPresentationAuthorityReader,
+	ProductPresentationRepository,
+} from "./product-presentation-authority.js";
 
 export const STORE_V2_COLLECTIONS = [
 	"projects",
@@ -339,6 +343,8 @@ export interface ManagementCoordinatedMutationContext {
 export interface InternalManagementCoordinatedMutationContext
 	extends ManagementCoordinatedMutationContext {
 	query: ManagementCoordinatedQuery;
+	/** Normalized product-presentation authority bound to this transaction. */
+	productPresentation?: ProductPresentationRepository;
 }
 
 /**
@@ -363,6 +369,11 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Local path used for file-backed stores and backup directory resolution */
 	readonly path: string;
 	readonly backend: "json" | "postgres";
+	/**
+	 * PostgreSQL-only durable SCIM response-loss replay authority table. The
+	 * identifier is constructed by PgStore, never caller supplied.
+	 */
+	readonly scimOperationReplayTable?: string;
 	/** Postgres-only, explicitly activated normalized shadow-store migration. */
 	readonly storeV2?: StoreV2MigrationControl;
 	readonly storeV2Events?: StoreV2EventReader;
@@ -390,6 +401,8 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	readonly deliveryControl?: ManagementDeliveryControlReader;
 	/** Audited customer-managed webhook endpoint lifecycle when delivery is configured. */
 	readonly webhookEndpoints?: import("../services/webhook-endpoints.js").ManagementWebhookEndpointCapability;
+	/** Read-only normalized product presentation authority. PostgreSQL store-v2 only. */
+	readonly productPresentation?: ProductPresentationAuthorityReader;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */

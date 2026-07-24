@@ -1,4 +1,5 @@
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import pg from "pg";
 import { describe, expect, it } from "vitest";
 import {
 	createKeyProviderRegistry,
@@ -14,6 +15,19 @@ import {
 
 const databaseUrl =
 	"postgres://clearance:clearance@127.0.0.1:5434/clearance";
+const authorizationDatabaseUrl =
+	process.env.CLEARANCE_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? databaseUrl;
+const authorizationDatabaseProbe = new pg.Pool({
+	connectionString: authorizationDatabaseUrl,
+	connectionTimeoutMillis: 500,
+});
+let authorizationDatabaseAvailable = false;
+try {
+	await authorizationDatabaseProbe.query("SELECT 1");
+	authorizationDatabaseAvailable = true;
+} finally {
+	await authorizationDatabaseProbe.end().catch(() => {});
+}
 const durableKeyring = {
 	currentKeyId: "current",
 	keys: { current: Buffer.alloc(32, 1).toString("base64") },
@@ -44,6 +58,12 @@ function testKeyManagement(
 				purpose: "scim-bearer-token",
 				currentKeyId: "v1",
 				keys: { v1: Buffer.alloc(32, 12) },
+			}),
+			"service-account-credential-replay": createLocalKeyProvider({
+				providerId: "test-service-account-credential-replay",
+				purpose: "service-account-credential-replay",
+				currentKeyId: "v1",
+				keys: { v1: Buffer.alloc(32, 14) },
 			}),
 			"access-token-signing-key": createLocalKeyProvider({
 				providerId: "test-jwt",
@@ -119,6 +139,22 @@ describe("@clearance/auth runtime wrapper", () => {
 			void bundle.destroy();
 		} finally {
 			process.env.NODE_ENV = prev;
+		}
+	});
+
+	it("never trusts forwarded proxy headers", async () => {
+		const bundle = createClearanceAuth({
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl,
+		});
+		try {
+			const options = (bundle.auth as unknown as {
+				options: { advanced?: { trustedProxyHeaders?: boolean } };
+			}).options;
+			expect(options.advanced?.trustedProxyHeaders).toBe(false);
+		} finally {
+			await bundle.destroy();
 		}
 	});
 
@@ -305,6 +341,53 @@ describe("@clearance/auth runtime wrapper", () => {
 			},
 		});
 		await boundary.destroy();
+	});
+
+	it.skipIf(!authorizationDatabaseAvailable)("wires the service-account credential replay cipher during authorization bootstrap", async () => {
+		const suffix = randomUUID().replaceAll("-", "").slice(0, 12);
+		const schema = `auth_replay_${suffix}`;
+		const projectId = `project_replay_${suffix}`;
+		const environmentId = `environment_replay_${suffix}`;
+		const admin = new pg.Pool({ connectionString: authorizationDatabaseUrl });
+		await admin.query(`CREATE SCHEMA "${schema}"`);
+		const bundle = createClearanceAuth({
+			baseURL: "http://localhost:3300",
+			secret: "unit-test-secret-value-not-default!!",
+			databaseUrl: authorizationDatabaseUrl,
+			keyManagement: testKeyManagement(projectId, environmentId),
+			authenticationPolicy: { projectId, environmentId },
+			authorization: { projectId, environmentId, schema, prefix: "r" },
+		});
+		try {
+			await bundle.migrate();
+			const authorization = bundle.authorization;
+			expect(authorization).toBeDefined();
+			await authorization!.initializeOrganization({ organizationId: "organization_replay" });
+			await authorization!.createServiceAccount({
+				organizationId: "organization_replay",
+				serviceAccountId: "service_account_replay",
+				name: "Replay test account",
+				roleIds: [],
+			});
+			const operationId = randomUUID();
+			const input = {
+				organizationId: "organization_replay",
+				actorId: "principal_replay",
+				operationId,
+				serviceAccountId: "service_account_replay",
+			};
+			const created = await authorization!.createServiceAccountCredential(input);
+			const replayed = await authorization!.createServiceAccountCredential(input);
+			expect(created).toMatchObject({
+				replayed: false,
+				secret: expect.stringMatching(/^clr_sac_v1_/),
+			});
+			expect(replayed).toEqual({ ...created, replayed: true });
+		} finally {
+			await bundle.destroy();
+			await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+			await admin.end();
+		}
 	});
 
 	it("enforces production-safe SAML and SCIM defaults", async () => {

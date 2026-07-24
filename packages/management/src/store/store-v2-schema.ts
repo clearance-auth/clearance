@@ -67,6 +67,10 @@ export interface StoreV2TableNames {
 	principals: string;
 	organizations: string;
 	events: string;
+	productPresentations: string;
+	productAuthDomains: string;
+	productEmailSenders: string;
+	productEmailTemplates: string;
 }
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
@@ -192,6 +196,10 @@ export function storeV2TableNames(prefix: string): StoreV2TableNames {
 		principals: safeIdentifier(`${safePrefix}principals`),
 		organizations: safeIdentifier(`${safePrefix}organizations`),
 		events: safeIdentifier(`${safePrefix}events`),
+		productPresentations: safeIdentifier(`${safePrefix}product_presentations`),
+		productAuthDomains: safeIdentifier(`${safePrefix}product_auth_domains`),
+		productEmailSenders: safeIdentifier(`${safePrefix}product_email_senders`),
+		productEmailTemplates: safeIdentifier(`${safePrefix}product_email_templates`),
 	};
 }
 
@@ -228,6 +236,15 @@ export function storeV2SchemaStatements(
 		`${tables.events}_organization_cursor`,
 	);
 	const eventActionCursorIndex = derivedIdentifier(`${tables.events}_action_cursor`);
+	const activeAuthDomainIndex = derivedIdentifier(
+		`${tables.productAuthDomains}_active_scope`,
+	);
+	const claimedAuthDomainIndex = derivedIdentifier(
+		`${tables.productAuthDomains}_claimed_hostname`,
+	);
+	const legacyOwnedAuthDomainIndex = derivedIdentifier(
+		`${tables.productAuthDomains}_owned_hostname`,
+	);
 
 	return [
 		`CREATE TABLE IF NOT EXISTS ${tables.meta} (
@@ -356,5 +373,72 @@ export function storeV2SchemaStatements(
 			ON ${tables.events} (organization_id, created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS ${eventActionCursorIndex}
 			ON ${tables.events} (action, created_at DESC, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS ${tables.productPresentations} (
+			project_id text NOT NULL,
+			environment_id text NOT NULL,
+			product_label text NOT NULL,
+			home_label text NOT NULL,
+			accent_color text NOT NULL CHECK (accent_color ~ '^#[0-9a-f]{6}$'),
+			logo_url text,
+			version bigint NOT NULL CHECK (version > 0),
+			updated_at timestamptz(3) NOT NULL,
+			PRIMARY KEY (project_id, environment_id),
+			FOREIGN KEY (project_id, environment_id)
+				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
+		)`,
+		`ALTER TABLE ${tables.productPresentations} ADD COLUMN IF NOT EXISTS logo_url text`,
+		`CREATE TABLE IF NOT EXISTS ${tables.productAuthDomains} (
+			project_id text NOT NULL,
+			environment_id text NOT NULL,
+			origin text NOT NULL,
+			hostname text NOT NULL,
+			dns_name text NOT NULL,
+			challenge_digest bytea NOT NULL CHECK (octet_length(challenge_digest) = 32),
+			state text NOT NULL CHECK (state IN ('pending', 'verified', 'active', 'disabled')),
+			version bigint NOT NULL CHECK (version > 0),
+			verified_at timestamptz(3),
+			updated_at timestamptz(3) NOT NULL,
+			PRIMARY KEY (project_id, environment_id, origin),
+			FOREIGN KEY (project_id, environment_id)
+				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ${activeAuthDomainIndex}
+			ON ${tables.productAuthDomains} (project_id, environment_id)
+			WHERE state = 'active'`,
+		`DROP INDEX IF EXISTS ${legacyOwnedAuthDomainIndex}`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ${claimedAuthDomainIndex}
+			ON ${tables.productAuthDomains} (hostname)
+			WHERE state <> 'disabled'`,
+		`CREATE TABLE IF NOT EXISTS ${tables.productEmailSenders} (
+			project_id text NOT NULL,
+			environment_id text NOT NULL,
+			display_name text NOT NULL,
+			address text NOT NULL,
+			domain text NOT NULL,
+			version bigint NOT NULL CHECK (version > 0),
+			updated_at timestamptz(3) NOT NULL,
+			PRIMARY KEY (project_id, environment_id),
+			CHECK (position('@' IN address) > 1),
+			CHECK (domain = lower(domain)),
+			FOREIGN KEY (project_id, environment_id)
+				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
+		)`,
+		`CREATE TABLE IF NOT EXISTS ${tables.productEmailTemplates} (
+			project_id text NOT NULL,
+			environment_id text NOT NULL,
+			kind text NOT NULL CHECK (kind IN ('verification', 'password-reset', 'invitation', 'email-change')),
+			subject text NOT NULL,
+			plain_text text NOT NULL DEFAULT '',
+			html text NOT NULL DEFAULT '',
+			variables jsonb NOT NULL CHECK (jsonb_typeof(variables) = 'array'),
+			version bigint NOT NULL CHECK (version > 0),
+			content_hash text NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+			updated_at timestamptz(3) NOT NULL,
+			PRIMARY KEY (project_id, environment_id, kind),
+			FOREIGN KEY (project_id, environment_id)
+				REFERENCES ${tables.environments}(project_id, id) ON DELETE RESTRICT
+		)`,
+		`ALTER TABLE ${tables.productEmailTemplates} ADD COLUMN IF NOT EXISTS plain_text text NOT NULL DEFAULT ''`,
+		`ALTER TABLE ${tables.productEmailTemplates} ADD COLUMN IF NOT EXISTS html text NOT NULL DEFAULT ''`,
 	];
 }

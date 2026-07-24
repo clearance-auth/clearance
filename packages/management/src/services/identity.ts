@@ -20,7 +20,11 @@ import { newId, nowIso } from "../store/json-store.js";
 import { advancingPrincipalUpdatedAt } from "../store/store-v2-principals.js";
 import { appendAuditEvent, type AuditEventInput } from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import { resolveOperatorScope, type ResourceScope } from "./scope.js";
+import {
+	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
+	type ResourceScope,
+} from "./scope.js";
 
 export type RuntimeUserIdentity = {
 	/** Canonical Clearance / runtime user id — becomes management principal id */
@@ -193,6 +197,19 @@ export async function syncRuntimeUserToManagementDurable(
 		source?: AuditEvent["source"];
 	},
 ): Promise<Principal> {
+	const authoritativeTopologyScope = store.storeV2Topology?.authoritative
+		? await resolveOperatorScopeAuthoritative(store, {
+			projectId: opts?.projectId,
+			environmentId: opts?.environmentId,
+		})
+		: undefined;
+	const resolvedOpts = authoritativeTopologyScope
+		? {
+			...opts,
+			projectId: authoritativeTopologyScope.projectId,
+			environmentId: authoritativeTopologyScope.environmentId,
+		}
+		: opts;
 	if (store.storeV2Principals?.authoritative) {
 		if (!runtimeUser.id?.trim()) {
 			throw new ClearanceError({
@@ -218,7 +235,7 @@ export async function syncRuntimeUserToManagementDurable(
 				status: 500,
 			});
 		}
-		const scope = resolveOperatorScope(store, {
+		const scope = authoritativeTopologyScope ?? resolveOperatorScope(store, {
 			projectId: opts?.projectId,
 			environmentId: opts?.environmentId,
 		});
@@ -292,7 +309,7 @@ export async function syncRuntimeUserToManagementDurable(
 			return principal;
 		});
 	}
-	const principal = syncRuntimeUserToManagement(store, runtimeUser, opts);
+	const principal = syncRuntimeUserToManagement(store, runtimeUser, resolvedOpts);
 	await store.ready();
 	const found = store.snapshot.principals.find((p) => p.id === principal.id);
 	if (!found || found.status === "deleted") {

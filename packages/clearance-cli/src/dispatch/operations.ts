@@ -41,6 +41,21 @@ function configCandidate(path: unknown): Record<string, string> {
 	return parseConfigJson(contents);
 }
 
+function restoreTarget(value: unknown): `clearance_restore_${string}` | undefined {
+	if (value === undefined) return undefined;
+	if (
+		typeof value !== "string" ||
+		!/^clearance_restore_[a-z0-9_]{0,45}$/.test(value)
+	) {
+		throw error(
+			"BACKUP_RESTORE_TARGET_INVALID",
+			"Backup restore target must be a valid isolated restore database name.",
+			"Use clearance_restore_ followed by at most 45 lowercase letters, digits, or underscores.",
+		);
+	}
+	return value as `clearance_restore_${string}`;
+}
+
 export async function dispatchOperationsCommand({
 	session,
 	path,
@@ -65,10 +80,10 @@ export async function dispatchOperationsCommand({
 		case BACKUP_OPERATIONS.restore.cliPath:
 			requireRemoteMutation(global, path);
 			requireConfirmation(global, "BACKUP_RESTORE_CONFIRM_REQUIRED", "Backup restore");
-			return callManagementOperation(session, "backups.restore", body({
-				id: String(opts.id),
-				target: opts.target,
-			}) as { id: string; target?: string }, managementCallOptions(global));
+				return callManagementOperation(session, "backups.restore", body({
+					id: String(opts.id),
+					target: restoreTarget(opts.target),
+				}) as Parameters<typeof callManagementOperation<"backups.restore">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.check.cliPath:
 			requireRemoteMutation(global, path);
 			return callManagementOperation(session, "upgrades.check", {});

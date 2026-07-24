@@ -1,6 +1,6 @@
 {
   "name": "@clearance/delivery",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Postgres-native transactional delivery storage and worker core for Clearance",
   "type": "module",
   "license": "MIT",

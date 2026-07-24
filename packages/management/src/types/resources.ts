@@ -245,6 +245,9 @@ export interface ReadinessReport {
 	};
 	remainingCustomerActions: string[];
 	signature: string;
+	/** Exact enterprise configuration, credential, membership, and test-state digest. */
+	stateFingerprint?: string;
+	state?: "current" | "stale" | "not_run";
 }
 
 export interface MigrationPlan {

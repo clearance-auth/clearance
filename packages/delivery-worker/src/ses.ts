@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import type { WorkerConfig } from "./config.js";
-import { renderEmailPayload, type EmailPayload, type EmailSender, type SendResult } from "./smtp.js";
+import { classifyDeterministicEmailError, validateEmailPayload, type EmailPayload, type EmailSender, type SendResult } from "./smtp.js";
 
 const SERVICE = "ses";
 const RESPONSE_LIMIT_BYTES = 64 * 1024;
@@ -142,6 +142,8 @@ function sendBody(payload: EmailPayload, jobId: string): string {
 }
 
 export function classifySesError(error: unknown): { retryable: boolean; errorClass: string; providerStatus?: string } {
+	const deterministic = classifyDeterministicEmailError(error);
+	if (deterministic) return deterministic;
 	if (!(error instanceof SesDeliveryError)) {
 		return { retryable: true, errorClass: "ses.transport" };
 	}
@@ -190,7 +192,7 @@ export function createSesSender(config: WorkerConfig, dependencies: SesDependenc
 			if (account.SendingEnabled !== true) throw new SesDeliveryError("SES_SENDING_DISABLED", false, 200);
 		},
 		async send(payload, context): Promise<SendResult> {
-			const body = sendBody(renderEmailPayload(payload, config), context.jobId);
+			const body = sendBody(validateEmailPayload(payload, config.maxBodyBytes), context.jobId);
 			const result = await request("POST", "/v2/email/outbound-emails", body);
 			const messageId = typeof result.MessageId === "string" && result.MessageId.length <= 512
 				? result.MessageId

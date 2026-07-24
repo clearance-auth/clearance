@@ -1,0 +1,53 @@
+{
+  "name": "@clearance/vault",
+  "version": "0.3.0",
+  "description": "Framework-neutral hosted authentication and tenant self-service for Clearance",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/clearance-auth/clearance",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/vault"
+  },
+  "keywords": [
+    "auth",
+    "customer-portal",
+    "rbac",
+    "typescript",
+    "web-components"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": [
+    "./dist/styles.css"
+  ],
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./styles.css": "./dist/styles.css"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.10.6",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

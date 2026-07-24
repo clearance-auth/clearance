@@ -90,6 +90,26 @@ import type {
 	KeyManagementStatusResult,
 } from "../services/key-management.js";
 import type {
+	ProductDomainControlResult,
+	ProductDomainCreateResult,
+	ProductDomainReissueResult,
+	ProductPresentationApplyResult,
+	ProductPresentationCandidate,
+	ProductPresentationPlan,
+	ProductEmailSenderApplyResult,
+	ProductEmailSenderCandidate,
+	ProductEmailSenderPlan,
+	ProductTemplateApplyResult,
+	ProductTemplateCandidate,
+	ProductTemplatePlan,
+	getProductPresentationForManagement,
+	getProductSenderForManagement,
+	getProductSenderReadinessForManagement,
+	getProductTemplateForManagement,
+	listProductDomainsForManagement,
+} from "../services/product-presentation.js";
+import type { ProductEmailTemplateKind } from "../store/product-presentation-authority.js";
+import type {
 	DeliveryControlAction,
 	DeliveryControlPreview,
 	DeliveryJobState,
@@ -730,6 +750,70 @@ export interface ManagementOperationServiceTypes {
 		input: AuthenticationUnlockInput & { dryRun?: boolean; confirm?: boolean };
 		output: AuthenticationUnlockControlResult;
 	};
+	"product_presentation.get": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof getProductPresentationForManagement>>;
+	};
+	"product_presentation.plan": {
+		input: ProductPresentationCandidate;
+		output: ProductPresentationPlan;
+	};
+	"product_presentation.apply": {
+		input: ProductPresentationCandidate & {
+			expectedVersion: number;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output: ProductPresentationApplyResult;
+	};
+	"product_domains.list": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof listProductDomainsForManagement>>;
+	};
+	"product_domains.create": {
+		input: { origin: string };
+		output: ProductDomainCreateResult;
+	};
+	"product_domains.reissue": {
+		input: { origin: string; expectedVersion: number };
+		output: ProductDomainReissueResult;
+	};
+	"product_domains.verify": {
+		input: { origin: string };
+		output: ProductDomainControlResult;
+	};
+	"product_domains.activate": {
+		input: { origin: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: ProductDomainControlResult;
+	};
+	"product_domains.disable": {
+		input: { origin: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: ProductDomainControlResult;
+	};
+	"product_sender.readiness": {
+		input: { staleAfterMs?: number };
+		output: Awaited<ReturnType<typeof getProductSenderReadinessForManagement>>;
+	};
+	"product_sender.get": { input: Record<string, never>; output: Awaited<ReturnType<typeof getProductSenderForManagement>>; };
+	"product_sender.plan": { input: ProductEmailSenderCandidate; output: ProductEmailSenderPlan; };
+	"product_sender.apply": { input: ProductEmailSenderCandidate & { expectedVersion: number; dryRun?: boolean; confirm?: boolean }; output: ProductEmailSenderApplyResult; };
+	"product_templates.get": {
+		input: { kind: ProductEmailTemplateKind };
+		output: Awaited<ReturnType<typeof getProductTemplateForManagement>>;
+	};
+	"product_templates.plan": {
+		input: { kind: ProductEmailTemplateKind } & ProductTemplateCandidate;
+		output: ProductTemplatePlan;
+	};
+	"product_templates.apply": {
+		input: {
+			kind: ProductEmailTemplateKind;
+			expectedVersion: number;
+			dryRun?: boolean;
+			confirm?: boolean;
+		} & ProductTemplateCandidate;
+		output: ProductTemplateApplyResult;
+	};
 	"config.get": {
 		input: { key?: string };
 		output: ReturnType<typeof publicConfig> & { scope: ResourceScope };
@@ -1110,13 +1194,17 @@ export interface ManagementOperationServiceTypes {
 			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
 	};
 	"service-accounts.credentials.create": {
-		input: { organizationId: string; accountId: string; expiresAt?: string; dryRun?: boolean };
+		input:
+			| { organizationId: string; accountId: string; expiresAt?: string; dryRun: true }
+			| { organizationId: string; accountId: string; expiresAt?: string; dryRun?: false; operationId: string };
 		output:
 			| { credential: ServiceAccountCredentialView; secret: string; previousRevision: string; revision: string; scope: ResourceScope }
 			| { dryRun: true; organizationId: string; serviceAccountId: string; expiresAt: string | null; secretGenerated: false; scope: ResourceScope };
 	};
 	"service-accounts.credentials.rotate": {
-		input: { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: boolean };
+		input:
+			| { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun: true }
+			| { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: false; operationId: string };
 		output:
 			| {
 					credential: ServiceAccountCredentialView;
@@ -1820,6 +1908,125 @@ export const AUTHENTICATION_POLICY_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const PRODUCT_PRESENTATION_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "product_presentation.get",
+		cliPath: "product presentation get",
+		http: { method: "GET", path: "/v1/product-presentation" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "product_presentation.plan",
+		cliPath: "product presentation plan",
+		http: { method: "POST", path: "/v1/product-presentation/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "product_presentation.apply",
+		cliPath: "product presentation apply",
+		http: { method: "PATCH", path: "/v1/product-presentation" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const PRODUCT_DOMAIN_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "product_domains.list",
+		cliPath: "product domains list",
+		http: { method: "GET", path: "/v1/product-presentation/domains" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "product_domains.create",
+		cliPath: "product domains create",
+		http: { method: "POST", path: "/v1/product-presentation/domains" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	reissue: defineOperation({
+		id: "product_domains.reissue",
+		cliPath: "product domains reissue",
+		http: { method: "POST", path: "/v1/product-presentation/domains/reissue" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	verify: defineOperation({
+		id: "product_domains.verify",
+		cliPath: "product domains verify",
+		http: { method: "POST", path: "/v1/product-presentation/domains/verify" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	activate: defineOperation({
+		id: "product_domains.activate",
+		cliPath: "product domains activate",
+		http: { method: "POST", path: "/v1/product-presentation/domains/activate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	disable: defineOperation({
+		id: "product_domains.disable",
+		cliPath: "product domains disable",
+		http: { method: "POST", path: "/v1/product-presentation/domains/disable" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const PRODUCT_SENDER_OPERATIONS = Object.freeze({
+	get: defineOperation({ id: "product_sender.get", cliPath: "product sender get", http: { method: "GET", path: "/v1/product-presentation/sender" }, mutation: false, supportsDryRun: false, confirmation: "none" }),
+	plan: defineOperation({ id: "product_sender.plan", cliPath: "product sender plan", http: { method: "POST", path: "/v1/product-presentation/sender/plan" }, mutation: false, supportsDryRun: false, confirmation: "none" }),
+	apply: defineOperation({ id: "product_sender.apply", cliPath: "product sender apply", http: { method: "PATCH", path: "/v1/product-presentation/sender" }, mutation: true, supportsDryRun: true, confirmation: "server-required" }),
+	readiness: defineOperation({
+		id: "product_sender.readiness",
+		cliPath: "product sender readiness",
+		http: { method: "GET", path: "/v1/product-presentation/sender-readiness" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+});
+
+export const PRODUCT_TEMPLATE_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "product_templates.get",
+		cliPath: "product templates get",
+		http: { method: "GET", path: "/v1/product-presentation/templates/:kind" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "product_templates.plan",
+		cliPath: "product templates plan",
+		http: { method: "POST", path: "/v1/product-presentation/templates/:kind/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "product_templates.apply",
+		cliPath: "product templates apply",
+		http: { method: "PATCH", path: "/v1/product-presentation/templates/:kind" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const CONFIG_OPERATIONS = Object.freeze({
 	get: defineOperation({
 		id: "config.get",
@@ -2309,6 +2516,10 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(DELIVERY_OPERATIONS),
 	...Object.values(WEBHOOK_ENDPOINT_OPERATIONS),
 	...Object.values(AUTHENTICATION_POLICY_OPERATIONS),
+	...Object.values(PRODUCT_PRESENTATION_OPERATIONS),
+	...Object.values(PRODUCT_DOMAIN_OPERATIONS),
+	...Object.values(PRODUCT_SENDER_OPERATIONS),
+	...Object.values(PRODUCT_TEMPLATE_OPERATIONS),
 	...Object.values(CONFIG_OPERATIONS),
 	...Object.values(IMPORT_OPERATIONS),
 	...Object.values(MIGRATION_OPERATIONS),

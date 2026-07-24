@@ -14,9 +14,11 @@ import {
 	updateMemberInAuth,
 	updateOrganizationInAuth,
 	updateUserInAuth,
+	registerTenantProductAdministrationFacade,
 } from "../auth-bridge.js";
 import type { AuthRuntimeGateway } from "../application/auth-runtime-gateway.js";
 import type { ManagementStore } from "../store/types.js";
+import { resolveOperatorScope } from "../services/scope.js";
 import {
 	validateManagementWebhookTargets,
 	type ManagementWebhookTarget,
@@ -30,6 +32,10 @@ export function createAuthBridgeRuntimeGateway(input: {
 	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
 		throw new Error("AuthBridgeRuntimeGateway requires a coordinated Postgres management store");
 	}
+	registerTenantProductAdministrationFacade({
+		store,
+		scope: resolveOperatorScope(store),
+	});
 	const webhookTargets = validateManagementWebhookTargets(
 		input.webhookTargets ?? [],
 	);

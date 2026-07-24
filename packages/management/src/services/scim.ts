@@ -1,8 +1,18 @@
-import type { ManagementStore } from "../store/types.js";
+import { createHash, randomBytes } from "node:crypto";
+import type { ClearanceKeyManagementFacade } from "@clearance/auth";
+import { parseKeyEnvelope } from "@clearance/key-management";
+import type {
+	ManagementCoordinatedQuery,
+	ManagementStore,
+} from "../store/types.js";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DiagnosticTrace, DirectoryConnection, Membership, Principal } from "../types/resources.js";
-import { deleteScimProviderById } from "../auth-bridge.js";
+import {
+	deleteScimProviderById,
+	invalidateAuthBundles,
+	insertScimProviderInTransaction,
+} from "../auth-bridge.js";
 import {
 	appendAuditEvent,
 	recordEvent,
@@ -11,7 +21,7 @@ import {
 import {
 	decryptCredential,
 	encryptCredential,
-	rotateCredential,
+	type CredentialCipher,
 } from "./credentials.js";
 import { ClearanceError } from "./errors.js";
 import {
@@ -36,6 +46,22 @@ export interface ScimMutationOpts {
 	actor?: string;
 	source?: ScimActorSource;
 	scope?: ResourceScope;
+	operationId?: string;
+}
+
+export type ScimMutationGuard = Readonly<{
+	authorizeMutation(input: {
+		organizationId: string;
+		query: ManagementCoordinatedQuery;
+	}): Promise<void>;
+	/** Exact-scope key-management capability injected by the runtime facade. */
+	replayCipher?: ScimOperationReplayCipher;
+	credentialCipher?: CredentialCipher;
+	runtimeKeyManagement?: ClearanceKeyManagementFacade;
+}>;
+
+function scimCredentialIdentity(organizationId: string, connectionId: string): Readonly<Record<string, string>> {
+	return Object.freeze({ organizationId, connectionId });
 }
 
 /**
@@ -215,90 +241,435 @@ export function listScimConnections(
 		.map((c) => publicDirectoryConnection(c) as DirectoryConnection);
 }
 
-/**
- * Rotate stored SCIM bearer envelope under the current credential key.
- * Plaintext token is preserved; only AEAD envelope / fingerprint metadata change.
- * Never returns encrypted material — fingerprints only.
- */
-function rotateScimCredentialResolved(
-	store: ManagementStore,
-	conn: DirectoryConnection,
-	org: { id: string; projectId: string; environmentId: string },
-	opts?: ScimMutationOpts,
-): DirectoryConnection {
-	const stage = "scim.rotate";
-	if (!conn.bearerTokenEncrypted) {
-		throw new ClearanceError({
-			code: "SCIM_NO_TOKEN",
-			message: "No encrypted bearer token to rotate",
-			stage,
-			status: 400,
-			remediation: "Recreate the SCIM connection to mint a bearer token",
-		});
+export type RotatedScimCredential = DirectoryConnection & Readonly<{
+	/** Returned exactly once to the tenant caller; never persisted in audit. */
+	bearerTokenOnce?: string;
+	replayed: boolean;
+}>;
+
+export type ScimOperationReplayKind = "create" | "rotate";
+
+export type ScimOperationReplayAuthority = Readonly<{
+	projectId: string;
+	environmentId: string;
+	organizationId: string;
+	operationId: string;
+	operationKind: ScimOperationReplayKind;
+	actorId: string;
+	source: ScimActorSource;
+	provider: string;
+	endpoint: string;
+	connectionId: string;
+	requestFingerprint: string;
+	bearerTokenEncrypted: string;
+	bearerTokenFingerprint: string;
+	bearerTokenKeyId: string;
+	connectionStateFingerprint: string;
+}>;
+
+export type ScimOperationReplayRequest = Omit<
+	ScimOperationReplayAuthority,
+	| "connectionId"
+	| "requestFingerprint"
+	| "bearerTokenEncrypted"
+	| "bearerTokenFingerprint"
+	| "bearerTokenKeyId"
+	| "connectionStateFingerprint"
+> & Readonly<{
+	connectionId?: string;
+}>;
+
+export function requiredScimOperationId(value: string | undefined, stage: string): string {
+	if (!value || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+		throw new ClearanceError({ code: "TENANT_OPERATION_ID_REQUIRED", message: "A UUID operationId is required", stage, status: 400 });
 	}
-	const rotated = rotateCredential(conn.bearerTokenEncrypted);
-	const now = nowIso();
-	let result: DirectoryConnection | undefined;
-	store.mutate((data) => {
-		const idx = data.directoryConnections.findIndex((c) => c.id === conn.id);
-		if (idx < 0) {
-			throw new ClearanceError({
-				code: "SCIM_NOT_FOUND",
-				message: `SCIM connection ${conn.id} not found`,
-				stage,
-				status: 404,
-			});
-		}
-		const updated: DirectoryConnection = {
-			...data.directoryConnections[idx]!,
-			bearerTokenEncrypted: rotated.ciphertext,
-			bearerTokenKeyId: rotated.keyId,
-			bearerTokenFingerprint: rotated.fingerprint,
-			updatedAt: now,
-		};
-		data.directoryConnections[idx] = updated;
-		appendAuditEvent(data, {
-			actor: opts?.actor ?? "operator",
-			action: "scim.rotate",
-			subjectType: "directory_connection",
-			subjectId: conn.id,
-			outcome: "success",
-			source: (opts?.source as "cli") ?? "cli",
-			organizationId: org.id,
-			projectId: org.projectId,
-			environmentId: org.environmentId,
-			message: `Rotated SCIM credential envelope for ${conn.id}`,
-			metadata: {
-				keyId: rotated.keyId,
-				bearerTokenFingerprint: rotated.fingerprint,
-				// never: token plaintext or ciphertext
-			},
-		});
-		result = publicDirectoryConnection(updated) as DirectoryConnection;
-	});
-	if (!result) {
-		throw new ClearanceError({
-			code: "SCIM_NOT_FOUND",
-			message: `SCIM connection ${conn.id} not found`,
-			stage,
-			status: 404,
-		});
-	}
-	return result;
+	return value;
 }
 
-export function rotateScimCredential(store: ManagementStore, id: string, opts?: ScimMutationOpts): DirectoryConnection {
-	const connection = resolveScimConnection(store, id, { scope: opts?.scope, stage: "scim.rotate" });
-	const organization = inspectOrganization(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
-	return rotateScimCredentialResolved(store, connection, organization, opts);
+function assertScimOperationReplayTable(table: string | undefined): asserts table is string {
+	if (!table || !/^[a-z_][a-z0-9_]*$/i.test(table)) {
+		throw new ClearanceError({
+			code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+			message: "SCIM credential response replay requires the coordinated PostgreSQL backend",
+			stage: "scim.operation-replay",
+			status: 500,
+		});
+	}
+}
+
+export function scimOperationReplayRequestFingerprint(
+	request: ScimOperationReplayRequest,
+): string {
+	return createHash("sha256").update(JSON.stringify({
+		projectId: request.projectId,
+		environmentId: request.environmentId,
+		organizationId: request.organizationId,
+		operationId: request.operationId,
+		operationKind: request.operationKind,
+		actorId: request.actorId,
+		source: request.source,
+		provider: request.provider,
+		endpoint: request.endpoint,
+		connectionId: request.connectionId ?? null,
+	}), "utf8").digest("hex");
+}
+
+export function scimOperationReplayConnectionStateFingerprint(
+	connection: DirectoryConnection,
+): string {
+	return createHash("sha256").update(JSON.stringify({
+		organizationId: connection.organizationId,
+		provider: connection.provider,
+		endpoint: connection.endpoint,
+		status: connection.status,
+		deprovisioningPolicy: connection.deprovisioningPolicy,
+		bearerTokenFingerprint: connection.bearerTokenFingerprint ?? null,
+	}), "utf8").digest("hex");
+}
+
+function replayConflict(stage: string): ClearanceError {
+	return new ClearanceError({
+		code: "SCIM_OPERATION_REPLAY_CONFLICT",
+		message: "SCIM operationId is already bound to a different request or connection state",
+		stage,
+		status: 409,
+	});
+}
+
+function replayCipherUnavailable(stage: string): ClearanceError {
+	return new ClearanceError({
+		code: "SCIM_OPERATION_REPLAY_UNAVAILABLE",
+		message: "SCIM credential response replay encryption is unavailable",
+		stage,
+		status: 503,
+		remediation: "Restore the configured SCIM bearer-token key provider and retry.",
+	});
+}
+
+function injectedScimOperationReplayCipher(
+	guard: ScimMutationGuard | undefined,
+	stage: string,
+): ScimOperationReplayCipher {
+	if (!guard?.replayCipher) throw replayCipherUnavailable(stage);
+	return guard.replayCipher;
+}
+
+export function assertScimOperationReplayMatches(
+	authority: ScimOperationReplayAuthority,
+	request: ScimOperationReplayRequest,
+	stage: string,
+): void {
+	if (
+		authority.projectId !== request.projectId ||
+		authority.environmentId !== request.environmentId ||
+		authority.organizationId !== request.organizationId ||
+		authority.operationId !== request.operationId ||
+		authority.operationKind !== request.operationKind ||
+		authority.actorId !== request.actorId ||
+		authority.source !== request.source ||
+		authority.provider !== request.provider ||
+		authority.endpoint !== request.endpoint ||
+		authority.requestFingerprint !== scimOperationReplayRequestFingerprint(request) ||
+		(request.connectionId !== undefined && authority.connectionId !== request.connectionId)
+	) {
+		throw replayConflict(stage);
+	}
+}
+
+export async function lockScimOperationReplayAuthority(
+	query: ManagementCoordinatedQuery,
+	table: string | undefined,
+	request: ScimOperationReplayRequest,
+): Promise<ScimOperationReplayAuthority | null> {
+	assertScimOperationReplayTable(table);
+	// The management snapshot lock serializes normal callers. This additional
+	// transaction advisory lock keeps the replay authority safe even if two
+	// independently configured management snapshots share one database.
+	const lockKey = `${table}:${request.projectId}:${request.environmentId}:${request.organizationId}:${request.operationId}`;
+	await query("select pg_advisory_xact_lock(hashtext($1))", [lockKey]);
+	const result = await query(
+		`select project_id, environment_id, organization_id, operation_id, operation_kind,
+			actor_id, source, provider, endpoint, connection_id, request_fingerprint,
+			bearer_token_encrypted, bearer_token_fingerprint, bearer_token_key_id, connection_state_fingerprint
+		 from ${table}
+		 where project_id = $1 and environment_id = $2 and organization_id = $3 and operation_id = $4
+		 for update`,
+		[request.projectId, request.environmentId, request.organizationId, request.operationId],
+	);
+	const row = result.rows[0];
+	if (!row) return null;
+	return {
+		projectId: String(row.project_id),
+		environmentId: String(row.environment_id),
+		organizationId: String(row.organization_id),
+		operationId: String(row.operation_id),
+		operationKind: row.operation_kind === "rotate" ? "rotate" : "create",
+		actorId: String(row.actor_id),
+		source: String(row.source) as ScimActorSource,
+		provider: String(row.provider),
+		endpoint: String(row.endpoint),
+		connectionId: String(row.connection_id),
+		requestFingerprint: String(row.request_fingerprint),
+		bearerTokenEncrypted: String(row.bearer_token_encrypted),
+		bearerTokenFingerprint: String(row.bearer_token_fingerprint),
+		bearerTokenKeyId: String(row.bearer_token_key_id),
+		connectionStateFingerprint: String(row.connection_state_fingerprint),
+	};
+}
+
+/**
+ * Immutable authority used as AAD for the one-time SCIM bearer response.
+ * Deliberately excludes mutable connection state and token fingerprints: those
+ * are independently checked before a stored response is opened.
+ */
+export type ScimOperationReplayTokenBinding = Readonly<{
+	projectId: string;
+	environmentId: string;
+	organizationId: string;
+	connectionId: string;
+	operationId: string;
+	operationKind: ScimOperationReplayKind;
+	actorId: string;
+	source: ScimActorSource;
+	provider: string;
+	endpoint: string;
+}>;
+
+export type ScimOperationReplayCipher = Readonly<{
+	seal(
+		plaintext: string,
+		binding: ScimOperationReplayTokenBinding,
+	): Promise<Readonly<{ envelope: string; keyId: string }>>;
+	open(envelope: string, binding: ScimOperationReplayTokenBinding): Promise<string>;
+}>;
+
+const SCIM_REPLAY_MAX_TEXT_BYTES = 16_384;
+const SCIM_REPLAY_MAX_ENDPOINT_BYTES = 4_096;
+const SCIM_REPLAY_BINDING_KEYS = [
+	"actorId",
+	"connectionId",
+	"endpoint",
+	"environmentId",
+	"operationId",
+	"operationKind",
+	"organizationId",
+	"projectId",
+	"provider",
+	"source",
+] as const;
+
+function canonicalScimOperationReplayText(
+	value: unknown,
+	label: string,
+	maximumBytes = 512,
+): string {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.trim() !== value ||
+		Buffer.byteLength(value, "utf8") > maximumBytes ||
+		/[\u0000-\u001f\u007f]/.test(value)
+	) {
+		throw new Error(`SCIM operation replay ${label} is invalid`);
+	}
+	return value;
+}
+
+function canonicalScimOperationReplayToken(
+	value: unknown,
+): string {
+	if (
+		typeof value !== "string" ||
+		Buffer.byteLength(value, "utf8") === 0 ||
+		Buffer.byteLength(value, "utf8") > SCIM_REPLAY_MAX_TEXT_BYTES ||
+		Buffer.from(value, "utf8").toString("utf8") !== value ||
+		/[\u0000-\u001f\u007f]/.test(value)
+	) {
+		throw new Error("SCIM operation replay token is invalid");
+	}
+	return value;
+}
+
+/** Returns the exact canonical AAD identity accepted by the replay cipher. */
+export function canonicalScimOperationReplayTokenBinding(
+	value: unknown,
+): ScimOperationReplayTokenBinding {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("SCIM operation replay binding is invalid");
+	}
+	const candidate = value as Record<string, unknown>;
+	if (
+		Object.keys(candidate).sort().join("\u0000") !==
+			[...SCIM_REPLAY_BINDING_KEYS].sort().join("\u0000")
+	) {
+		throw new Error("SCIM operation replay binding fields are invalid");
+	}
+	const binding = {
+		projectId: canonicalScimOperationReplayText(candidate.projectId, "projectId"),
+		environmentId: canonicalScimOperationReplayText(candidate.environmentId, "environmentId"),
+		organizationId: canonicalScimOperationReplayText(candidate.organizationId, "organizationId"),
+		connectionId: canonicalScimOperationReplayText(candidate.connectionId, "connectionId"),
+		operationId: canonicalScimOperationReplayText(candidate.operationId, "operationId"),
+		operationKind: candidate.operationKind,
+		actorId: canonicalScimOperationReplayText(candidate.actorId, "actorId"),
+		source: candidate.source,
+		provider: canonicalScimOperationReplayText(candidate.provider, "provider"),
+		endpoint: canonicalScimOperationReplayText(
+			candidate.endpoint,
+			"endpoint",
+			SCIM_REPLAY_MAX_ENDPOINT_BYTES,
+		),
+	};
+	if (
+		(binding.operationKind !== "create" && binding.operationKind !== "rotate") ||
+		(binding.source !== "cli" &&
+			binding.source !== "console" &&
+			binding.source !== "api" &&
+			binding.source !== "system")
+	) {
+		throw new Error("SCIM operation replay binding is invalid");
+	}
+	return Object.freeze(binding as ScimOperationReplayTokenBinding);
+}
+
+function scimOperationReplayTokenResourceId(
+	keyManagement: ClearanceKeyManagementFacade,
+	binding: ScimOperationReplayTokenBinding,
+): string {
+	if (
+		binding.projectId !== keyManagement.scope.projectId ||
+		binding.environmentId !== keyManagement.scope.environmentId
+	) {
+		throw new Error("SCIM operation replay key scope does not match the authority");
+	}
+	return keyManagement.resourceId("scim-bearer-token", {
+		operationReplayBinding: JSON.stringify(binding),
+	});
+}
+
+/**
+ * Creates the package-private replay cipher from the already-configured SCIM
+ * bearer-token provider. It purpose-binds the envelope and makes the complete
+ * immutable operation authority its resource/AAD identity.
+ */
+export function createScimOperationReplayCipher(
+	keyManagement: ClearanceKeyManagementFacade,
+): ScimOperationReplayCipher {
+	const seal = async (
+		plaintext: string,
+		input: ScimOperationReplayTokenBinding,
+	): Promise<Readonly<{ envelope: string; keyId: string }>> => {
+		const binding = canonicalScimOperationReplayTokenBinding(input);
+		const resourceId = scimOperationReplayTokenResourceId(keyManagement, binding);
+		const envelope = await keyManagement.sealText(
+			"scim-bearer-token",
+			resourceId,
+			canonicalScimOperationReplayToken(plaintext),
+		);
+		const parsed = parseKeyEnvelope(envelope);
+		if (
+			parsed.purpose !== "scim-bearer-token" ||
+			parsed.projectId !== binding.projectId ||
+			parsed.environmentId !== binding.environmentId ||
+			parsed.resourceId !== resourceId
+		) {
+			throw new Error("SCIM operation replay envelope is invalid");
+		}
+		return Object.freeze({ envelope, keyId: parsed.keyId });
+	};
+	const open = async (
+		envelope: string,
+		input: ScimOperationReplayTokenBinding,
+	): Promise<string> => {
+		const binding = canonicalScimOperationReplayTokenBinding(input);
+		const resourceId = scimOperationReplayTokenResourceId(keyManagement, binding);
+		const parsed = parseKeyEnvelope(envelope);
+		if (
+			parsed.purpose !== "scim-bearer-token" ||
+			parsed.projectId !== binding.projectId ||
+			parsed.environmentId !== binding.environmentId ||
+			parsed.resourceId !== resourceId
+		) {
+			throw new Error("SCIM operation replay envelope is invalid");
+		}
+		return canonicalScimOperationReplayToken(
+			await keyManagement.openText("scim-bearer-token", resourceId, envelope),
+		);
+	};
+	return Object.freeze({ seal, open });
+}
+
+export function scimOperationReplayTokenBinding(
+	authority: Pick<ScimOperationReplayAuthority, keyof ScimOperationReplayTokenBinding>,
+): ScimOperationReplayTokenBinding {
+	return canonicalScimOperationReplayTokenBinding({
+		projectId: authority.projectId,
+		environmentId: authority.environmentId,
+		organizationId: authority.organizationId,
+		connectionId: authority.connectionId,
+		operationId: authority.operationId,
+		operationKind: authority.operationKind,
+		actorId: authority.actorId,
+		source: authority.source,
+		provider: authority.provider,
+		endpoint: authority.endpoint,
+	});
+}
+
+export async function insertScimOperationReplayAuthority(
+	query: ManagementCoordinatedQuery,
+	table: string | undefined,
+	authority: ScimOperationReplayAuthority,
+): Promise<void> {
+	assertScimOperationReplayTable(table);
+	const result = await query(
+		`insert into ${table}
+			(project_id, environment_id, organization_id, operation_id, operation_kind, actor_id,
+			 source, provider, endpoint, connection_id, request_fingerprint,
+			 bearer_token_encrypted, bearer_token_fingerprint, bearer_token_key_id, connection_state_fingerprint)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		 on conflict do nothing`,
+		[
+			authority.projectId, authority.environmentId, authority.organizationId,
+			authority.operationId, authority.operationKind, authority.actorId,
+			authority.source, authority.provider, authority.endpoint, authority.connectionId,
+			authority.requestFingerprint, authority.bearerTokenEncrypted,
+			authority.bearerTokenFingerprint, authority.bearerTokenKeyId,
+			authority.connectionStateFingerprint,
+		],
+	);
+	if (result.rowCount !== 1) throw replayConflict(`scim.${authority.operationKind}`);
+}
+
+/**
+ * Tenant SCIM rotation replaces the bearer credential. It cannot be performed
+ * against the JSON store because the runtime provider and encrypted management
+ * record must change in one transaction.
+ */
+export function rotateScimCredential(
+	store: ManagementStore,
+	id: string,
+	opts?: ScimMutationOpts,
+): never {
+	// Retain the scope-safe missing-resource contract before refusing the
+	// non-transactional backend.
+	resolveScimConnection(store, id, { scope: opts?.scope, stage: "scim.rotate" });
+	throw new ClearanceError({
+		code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+		message: "SCIM credential replacement requires the coordinated PostgreSQL runtime backend",
+		stage: "scim.rotate",
+		status: 500,
+	});
 }
 
 export async function rotateScimCredentialAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: ScimMutationOpts,
-): Promise<DirectoryConnection> {
-	if (!store.storeV2Topology?.authoritative) {
+	guard?: ScimMutationGuard,
+): Promise<RotatedScimCredential> {
+	const operationId = requiredScimOperationId(opts?.operationId, "scim.rotate");
+	if (store.backend !== "postgres") {
 		return rotateScimCredential(store, id, opts);
 	}
 	if (!store.mutateCoordinated) {
@@ -319,11 +690,35 @@ export async function rotateScimCredentialAuthoritative(
 		});
 	}
 	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
-	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+	const actorId = opts?.actor ?? "operator";
+	const source: ScimActorSource = opts?.source ?? "cli";
+	const replayCipher = injectedScimOperationReplayCipher(guard, "scim.rotate");
+	const result = await mutateCoordinatedWithRuntimeSql(store, async ({
+		data,
+		topology,
+		appendAudit,
+		query,
+	}) => {
 		const index = data.directoryConnections.findIndex((connection) => connection.id === connectionId);
 		const connection = index >= 0 ? data.directoryConnections[index] : undefined;
-		const organization = connection && topology
-			? await topology.lockOrganization({ scope, id: connection.organizationId })
+		if (!connection) {
+			throw new ClearanceError({
+				code: "SCIM_NOT_FOUND",
+				message: `SCIM connection ${connectionId} not found`,
+				stage: "scim.rotate",
+				status: 404,
+			});
+		}
+		await guard?.authorizeMutation({ organizationId: connection.organizationId, query });
+		const organization = connection
+			? topology
+				? await topology.lockOrganization({ scope, id: connection.organizationId })
+				: data.organizations.find(
+					(organization) =>
+						organization.id === connection.organizationId &&
+						organization.projectId === scope.projectId &&
+						organization.environmentId === scope.environmentId,
+				)
 			: null;
 		if (!connection || !organization || organization.status === "archived") {
 			throw new ClearanceError({
@@ -333,39 +728,159 @@ export async function rotateScimCredentialAuthoritative(
 				status: 404,
 			});
 		}
-		if (!connection.bearerTokenEncrypted) {
+		const replayRequest: ScimOperationReplayRequest = {
+			projectId: organization.projectId,
+			environmentId: organization.environmentId,
+			organizationId: organization.id,
+			operationId,
+			operationKind: "rotate",
+			actorId,
+			source,
+			provider: connection.provider,
+			endpoint: connection.endpoint,
+			connectionId,
+		};
+		const replayAuthority = await lockScimOperationReplayAuthority(
+			query,
+			store.scimOperationReplayTable,
+			replayRequest,
+		);
+		if (replayAuthority) {
+			assertScimOperationReplayMatches(replayAuthority, replayRequest, "scim.rotate");
+			if (
+				connection.bearerTokenFingerprint !== replayAuthority.bearerTokenFingerprint ||
+				connection.organizationId !== replayAuthority.organizationId ||
+				connection.provider !== replayAuthority.provider ||
+				connection.endpoint !== replayAuthority.endpoint ||
+				scimOperationReplayConnectionStateFingerprint(connection) !== replayAuthority.connectionStateFingerprint
+			) {
+				throw replayConflict("scim.rotate");
+			}
+			const runtime = await query(
+				`select "organizationId" from "scimProvider" where id = $1 for update`,
+				[connectionId],
+			);
+			if (runtime.rows.length !== 1 || runtime.rows[0]?.organizationId !== organization.id) {
+				throw replayConflict("scim.rotate");
+			}
+			let bearerTokenOnce: string;
+			try {
+				bearerTokenOnce = await replayCipher.open(
+					replayAuthority.bearerTokenEncrypted,
+					scimOperationReplayTokenBinding(replayAuthority),
+				);
+			} catch {
+				throw replayConflict("scim.rotate");
+			}
+			return {
+				...(publicDirectoryConnection(connection) as DirectoryConnection),
+				bearerTokenOnce,
+				replayed: true,
+			};
+		}
+		const runtime = await query(
+			`select "providerId", "organizationId" from "scimProvider" where id = $1 for update`,
+			[connectionId],
+		);
+		const runtimeProvider = runtime.rows[0] as
+			| { providerId?: unknown; organizationId?: unknown }
+			| undefined;
+		if (
+			runtime.rows.length !== 1 ||
+			typeof runtimeProvider?.providerId !== "string" ||
+			runtimeProvider.organizationId !== organization.id
+		) {
 			throw new ClearanceError({
-				code: "SCIM_NO_TOKEN",
-				message: "No encrypted bearer token to rotate",
+				code: "SCIM_ROTATION_CONFLICT",
+				message: "Runtime SCIM provider does not match the requested connection",
 				stage: "scim.rotate",
-				status: 400,
-				remediation: "Recreate the SCIM connection to mint a bearer token",
+				status: 409,
 			});
 		}
-		const rotated = rotateCredential(connection.bearerTokenEncrypted);
+		// A freshly minted base token invalidates the prior bearer at commit.
+		const baseToken = `scimtok_${randomBytes(32).toString("base64url")}`;
+		await query(`delete from "scimProvider" where id = $1`, [connectionId]);
+		const replacement = await insertScimProviderInTransaction(query, {
+			id: connectionId,
+			providerId: runtimeProvider.providerId,
+			organizationId: organization.id,
+			token: baseToken,
+		}, guard?.runtimeKeyManagement);
+		if (replacement.reused) {
+			throw new ClearanceError({
+				code: "SCIM_ROTATION_CONFLICT",
+				message: "SCIM runtime provider changed while replacing its credential",
+				stage: "scim.rotate",
+				status: 409,
+			});
+		}
+		const encrypted = guard?.credentialCipher
+			? await guard.credentialCipher.seal(
+				replacement.token,
+				scimCredentialIdentity(organization.id, connectionId),
+			)
+			: encryptCredential(replacement.token);
 		const updated: DirectoryConnection = {
 			...connection,
-			bearerTokenEncrypted: rotated.ciphertext,
-			bearerTokenKeyId: rotated.keyId,
-			bearerTokenFingerprint: rotated.fingerprint,
+			bearerTokenEncrypted: encrypted.ciphertext,
+			bearerTokenKeyId: encrypted.keyId,
+			bearerTokenFingerprint: encrypted.fingerprint,
 			updatedAt: nowIso(),
 		};
 		data.directoryConnections[index] = updated;
+		const replayAuthorityToInsert: ScimOperationReplayAuthority = {
+			...replayRequest,
+			connectionId,
+			requestFingerprint: scimOperationReplayRequestFingerprint(replayRequest),
+			bearerTokenEncrypted: "",
+			bearerTokenFingerprint: encrypted.fingerprint,
+			bearerTokenKeyId: "",
+			connectionStateFingerprint: scimOperationReplayConnectionStateFingerprint(updated),
+		};
+		let replayEnvelope: Readonly<{ envelope: string; keyId: string }>;
+		try {
+			replayEnvelope = await replayCipher.seal(
+				replacement.token,
+				scimOperationReplayTokenBinding(replayAuthorityToInsert),
+			);
+		} catch {
+			throw replayCipherUnavailable("scim.rotate");
+		}
+		await insertScimOperationReplayAuthority(query, store.scimOperationReplayTable, {
+			...replayAuthorityToInsert,
+			bearerTokenEncrypted: replayEnvelope.envelope,
+			bearerTokenKeyId: replayEnvelope.keyId,
+		});
 		appendAudit({
-			actor: opts?.actor ?? "operator",
+			actor: actorId,
 			action: "scim.rotate",
 			subjectType: "directory_connection",
 			subjectId: connectionId,
 			outcome: "success",
-			source: opts?.source ?? "cli",
+			source,
 			organizationId: organization.id,
 			projectId: organization.projectId,
 			environmentId: organization.environmentId,
-			message: `Rotated SCIM credential envelope for ${connectionId}`,
-			metadata: { keyId: rotated.keyId, bearerTokenFingerprint: rotated.fingerprint },
+			message: `Replaced SCIM bearer credential for ${connectionId}`,
+			metadata: {
+				operationId,
+				keyId: encrypted.keyId,
+				bearerTokenFingerprint: encrypted.fingerprint,
+				replacement: true,
+			},
 		});
-		return publicDirectoryConnection(updated) as DirectoryConnection;
+		return {
+			...(publicDirectoryConnection(updated) as DirectoryConnection),
+			bearerTokenOnce: replacement.token,
+			replayed: false,
+		};
 	});
+	// The runtime bundle caches provider configuration. Invalidate only after
+	// the replacement transaction commits so the next request cannot accept the
+	// superseded bearer from an in-memory provider snapshot. This must not wait
+	// for a hosted request currently holding the prior runtime lease.
+	if (!result.replayed) invalidateAuthBundles();
+	return result;
 }
 
 /**
@@ -475,6 +990,7 @@ export async function disableScimConnectionReal(
 	store: ManagementStore,
 	id: string,
 	opts?: ScimMutationOpts,
+	guard?: ScimMutationGuard,
 ): Promise<{
 	connection: DirectoryConnection;
 	idempotent: boolean;
@@ -510,6 +1026,10 @@ export async function disableScimConnectionReal(
 				(connection) => connection.id === connectionId,
 			);
 			const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+			if (!connection) {
+				throw new ClearanceError({ code: "SCIM_NOT_FOUND", message: `SCIM connection ${connectionId} not found`, stage, status: 404 });
+			}
+			await guard?.authorizeMutation({ organizationId: connection.organizationId, query });
 			const organization = connection && topology
 				? await topology.lockOrganization({ scope, id: connection.organizationId })
 				: null;
@@ -567,6 +1087,10 @@ export async function disableScimConnectionReal(
 
 	if (typeof store.mutateCoordinated === "function") {
 		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query }) => {
+			await guard?.authorizeMutation({
+				organizationId: org.id,
+				query,
+			});
 			const deleted = await query(`delete from "scimProvider" where id = $1`, [
 				conn.id,
 			]);
@@ -610,6 +1134,15 @@ export async function disableScimConnectionReal(
 				idempotent: alreadyDisabled && !runtimeRemoved,
 				runtimeRemoved,
 			};
+		});
+	}
+	if (guard) {
+		throw new ClearanceError({
+			code: "TENANT_PRODUCT_TRANSACTION_REQUIRED",
+			message:
+				"Tenant enterprise mutation requires the coordinated PostgreSQL backend",
+			stage,
+			status: 500,
 		});
 	}
 

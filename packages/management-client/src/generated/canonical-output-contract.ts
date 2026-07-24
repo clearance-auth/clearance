@@ -1457,1102 +1457,1422 @@ type _CanonicalToOutput71 = AssertAssignable<
 	ManagementOperationTypes["authentication_policy.unlock"]["output"]
 >;
 
-/** config.get */
+/** product_presentation.get */
 type _InputToCanonical72 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.get"]["input"],
+	OperationInput<ManagementOperationRegistry["product_presentation.get"]>
+>;
+type _CanonicalToInput72 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_presentation.get"]>,
+	ManagementOperationTypes["product_presentation.get"]["input"]
+>;
+
+/** product_presentation.get */
+type _OutputToCanonical72 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.get"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_presentation.get"]>
+>;
+type _CanonicalToOutput72 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_presentation.get"]>,
+	ManagementOperationTypes["product_presentation.get"]["output"]
+>;
+
+/** product_presentation.plan */
+type _InputToCanonical73 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.plan"]["input"],
+	OperationInput<ManagementOperationRegistry["product_presentation.plan"]>
+>;
+type _CanonicalToInput73 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_presentation.plan"]>,
+	ManagementOperationTypes["product_presentation.plan"]["input"]
+>;
+
+/** product_presentation.plan */
+type _OutputToCanonical73 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.plan"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_presentation.plan"]>
+>;
+type _CanonicalToOutput73 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_presentation.plan"]>,
+	ManagementOperationTypes["product_presentation.plan"]["output"]
+>;
+
+/** product_presentation.apply */
+type _InputToCanonical74 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.apply"]["input"],
+	OperationInput<ManagementOperationRegistry["product_presentation.apply"]>
+>;
+type _CanonicalToInput74 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_presentation.apply"]>,
+	ManagementOperationTypes["product_presentation.apply"]["input"]
+>;
+
+/** product_presentation.apply */
+type _OutputToCanonical74 = AssertAssignable<
+	ManagementOperationTypes["product_presentation.apply"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_presentation.apply"]>
+>;
+type _CanonicalToOutput74 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_presentation.apply"]>,
+	ManagementOperationTypes["product_presentation.apply"]["output"]
+>;
+
+/** product_domains.list */
+type _InputToCanonical75 = AssertAssignable<
+	ManagementOperationTypes["product_domains.list"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.list"]>
+>;
+type _CanonicalToInput75 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.list"]>,
+	ManagementOperationTypes["product_domains.list"]["input"]
+>;
+
+/** product_domains.list */
+type _OutputToCanonical75 = AssertAssignable<
+	ManagementOperationTypes["product_domains.list"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.list"]>
+>;
+type _CanonicalToOutput75 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.list"]>,
+	ManagementOperationTypes["product_domains.list"]["output"]
+>;
+
+/** product_domains.create */
+type _InputToCanonical76 = AssertAssignable<
+	ManagementOperationTypes["product_domains.create"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.create"]>
+>;
+type _CanonicalToInput76 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.create"]>,
+	ManagementOperationTypes["product_domains.create"]["input"]
+>;
+
+/** product_domains.create */
+type _OutputToCanonical76 = AssertAssignable<
+	ManagementOperationTypes["product_domains.create"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.create"]>
+>;
+type _CanonicalToOutput76 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.create"]>,
+	ManagementOperationTypes["product_domains.create"]["output"]
+>;
+
+/** product_domains.reissue */
+type _InputToCanonical77 = AssertAssignable<
+	ManagementOperationTypes["product_domains.reissue"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.reissue"]>
+>;
+type _CanonicalToInput77 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.reissue"]>,
+	ManagementOperationTypes["product_domains.reissue"]["input"]
+>;
+
+/** product_domains.reissue */
+type _OutputToCanonical77 = AssertAssignable<
+	ManagementOperationTypes["product_domains.reissue"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.reissue"]>
+>;
+type _CanonicalToOutput77 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.reissue"]>,
+	ManagementOperationTypes["product_domains.reissue"]["output"]
+>;
+
+/** product_domains.verify */
+type _InputToCanonical78 = AssertAssignable<
+	ManagementOperationTypes["product_domains.verify"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.verify"]>
+>;
+type _CanonicalToInput78 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.verify"]>,
+	ManagementOperationTypes["product_domains.verify"]["input"]
+>;
+
+/** product_domains.verify */
+type _OutputToCanonical78 = AssertAssignable<
+	ManagementOperationTypes["product_domains.verify"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.verify"]>
+>;
+type _CanonicalToOutput78 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.verify"]>,
+	ManagementOperationTypes["product_domains.verify"]["output"]
+>;
+
+/** product_domains.activate */
+type _InputToCanonical79 = AssertAssignable<
+	ManagementOperationTypes["product_domains.activate"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.activate"]>
+>;
+type _CanonicalToInput79 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.activate"]>,
+	ManagementOperationTypes["product_domains.activate"]["input"]
+>;
+
+/** product_domains.activate */
+type _OutputToCanonical79 = AssertAssignable<
+	ManagementOperationTypes["product_domains.activate"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.activate"]>
+>;
+type _CanonicalToOutput79 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.activate"]>,
+	ManagementOperationTypes["product_domains.activate"]["output"]
+>;
+
+/** product_domains.disable */
+type _InputToCanonical80 = AssertAssignable<
+	ManagementOperationTypes["product_domains.disable"]["input"],
+	OperationInput<ManagementOperationRegistry["product_domains.disable"]>
+>;
+type _CanonicalToInput80 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_domains.disable"]>,
+	ManagementOperationTypes["product_domains.disable"]["input"]
+>;
+
+/** product_domains.disable */
+type _OutputToCanonical80 = AssertAssignable<
+	ManagementOperationTypes["product_domains.disable"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_domains.disable"]>
+>;
+type _CanonicalToOutput80 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_domains.disable"]>,
+	ManagementOperationTypes["product_domains.disable"]["output"]
+>;
+
+/** product_sender.get */
+type _InputToCanonical81 = AssertAssignable<
+	ManagementOperationTypes["product_sender.get"]["input"],
+	OperationInput<ManagementOperationRegistry["product_sender.get"]>
+>;
+type _CanonicalToInput81 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_sender.get"]>,
+	ManagementOperationTypes["product_sender.get"]["input"]
+>;
+
+/** product_sender.get */
+type _OutputToCanonical81 = AssertAssignable<
+	ManagementOperationTypes["product_sender.get"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_sender.get"]>
+>;
+type _CanonicalToOutput81 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_sender.get"]>,
+	ManagementOperationTypes["product_sender.get"]["output"]
+>;
+
+/** product_sender.plan */
+type _InputToCanonical82 = AssertAssignable<
+	ManagementOperationTypes["product_sender.plan"]["input"],
+	OperationInput<ManagementOperationRegistry["product_sender.plan"]>
+>;
+type _CanonicalToInput82 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_sender.plan"]>,
+	ManagementOperationTypes["product_sender.plan"]["input"]
+>;
+
+/** product_sender.plan */
+type _OutputToCanonical82 = AssertAssignable<
+	ManagementOperationTypes["product_sender.plan"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_sender.plan"]>
+>;
+type _CanonicalToOutput82 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_sender.plan"]>,
+	ManagementOperationTypes["product_sender.plan"]["output"]
+>;
+
+/** product_sender.apply */
+type _InputToCanonical83 = AssertAssignable<
+	ManagementOperationTypes["product_sender.apply"]["input"],
+	OperationInput<ManagementOperationRegistry["product_sender.apply"]>
+>;
+type _CanonicalToInput83 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_sender.apply"]>,
+	ManagementOperationTypes["product_sender.apply"]["input"]
+>;
+
+/** product_sender.apply */
+type _OutputToCanonical83 = AssertAssignable<
+	ManagementOperationTypes["product_sender.apply"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_sender.apply"]>
+>;
+type _CanonicalToOutput83 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_sender.apply"]>,
+	ManagementOperationTypes["product_sender.apply"]["output"]
+>;
+
+/** product_sender.readiness */
+type _InputToCanonical84 = AssertAssignable<
+	ManagementOperationTypes["product_sender.readiness"]["input"],
+	OperationInput<ManagementOperationRegistry["product_sender.readiness"]>
+>;
+type _CanonicalToInput84 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_sender.readiness"]>,
+	ManagementOperationTypes["product_sender.readiness"]["input"]
+>;
+
+/** product_sender.readiness */
+type _OutputToCanonical84 = AssertAssignable<
+	ManagementOperationTypes["product_sender.readiness"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_sender.readiness"]>
+>;
+type _CanonicalToOutput84 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_sender.readiness"]>,
+	ManagementOperationTypes["product_sender.readiness"]["output"]
+>;
+
+/** product_templates.get */
+type _InputToCanonical85 = AssertAssignable<
+	ManagementOperationTypes["product_templates.get"]["input"],
+	OperationInput<ManagementOperationRegistry["product_templates.get"]>
+>;
+type _CanonicalToInput85 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_templates.get"]>,
+	ManagementOperationTypes["product_templates.get"]["input"]
+>;
+
+/** product_templates.get */
+type _OutputToCanonical85 = AssertAssignable<
+	ManagementOperationTypes["product_templates.get"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_templates.get"]>
+>;
+type _CanonicalToOutput85 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_templates.get"]>,
+	ManagementOperationTypes["product_templates.get"]["output"]
+>;
+
+/** product_templates.plan */
+type _InputToCanonical86 = AssertAssignable<
+	ManagementOperationTypes["product_templates.plan"]["input"],
+	OperationInput<ManagementOperationRegistry["product_templates.plan"]>
+>;
+type _CanonicalToInput86 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_templates.plan"]>,
+	ManagementOperationTypes["product_templates.plan"]["input"]
+>;
+
+/** product_templates.plan */
+type _OutputToCanonical86 = AssertAssignable<
+	ManagementOperationTypes["product_templates.plan"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_templates.plan"]>
+>;
+type _CanonicalToOutput86 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_templates.plan"]>,
+	ManagementOperationTypes["product_templates.plan"]["output"]
+>;
+
+/** product_templates.apply */
+type _InputToCanonical87 = AssertAssignable<
+	ManagementOperationTypes["product_templates.apply"]["input"],
+	OperationInput<ManagementOperationRegistry["product_templates.apply"]>
+>;
+type _CanonicalToInput87 = AssertAssignable<
+	OperationInput<ManagementOperationRegistry["product_templates.apply"]>,
+	ManagementOperationTypes["product_templates.apply"]["input"]
+>;
+
+/** product_templates.apply */
+type _OutputToCanonical87 = AssertAssignable<
+	ManagementOperationTypes["product_templates.apply"]["output"],
+	OperationOutput<ManagementOperationRegistry["product_templates.apply"]>
+>;
+type _CanonicalToOutput87 = AssertAssignable<
+	OperationOutput<ManagementOperationRegistry["product_templates.apply"]>,
+	ManagementOperationTypes["product_templates.apply"]["output"]
+>;
+
+/** config.get */
+type _InputToCanonical88 = AssertAssignable<
 	ManagementOperationTypes["config.get"]["input"],
 	OperationInput<ManagementOperationRegistry["config.get"]>
 >;
-type _CanonicalToInput72 = AssertAssignable<
+type _CanonicalToInput88 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["config.get"]>,
 	ManagementOperationTypes["config.get"]["input"]
 >;
 
 /** config.get */
-type _OutputToCanonical72 = AssertAssignable<
+type _OutputToCanonical88 = AssertAssignable<
 	ManagementOperationTypes["config.get"]["output"],
 	OperationOutput<ManagementOperationRegistry["config.get"]>
 >;
-type _CanonicalToOutput72 = AssertAssignable<
+type _CanonicalToOutput88 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["config.get"]>,
 	ManagementOperationTypes["config.get"]["output"]
 >;
 
 /** config.set */
-type _InputToCanonical73 = AssertAssignable<
+type _InputToCanonical89 = AssertAssignable<
 	ManagementOperationTypes["config.set"]["input"],
 	OperationInput<ManagementOperationRegistry["config.set"]>
 >;
-type _CanonicalToInput73 = AssertAssignable<
+type _CanonicalToInput89 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["config.set"]>,
 	ManagementOperationTypes["config.set"]["input"]
 >;
 
 /** config.set */
-type _OutputToCanonical73 = AssertAssignable<
+type _OutputToCanonical89 = AssertAssignable<
 	ManagementOperationTypes["config.set"]["output"],
 	OperationOutput<ManagementOperationRegistry["config.set"]>
 >;
-type _CanonicalToOutput73 = AssertAssignable<
+type _CanonicalToOutput89 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["config.set"]>,
 	ManagementOperationTypes["config.set"]["output"]
 >;
 
 /** config.validate */
-type _InputToCanonical74 = AssertAssignable<
+type _InputToCanonical90 = AssertAssignable<
 	ManagementOperationTypes["config.validate"]["input"],
 	OperationInput<ManagementOperationRegistry["config.validate"]>
 >;
-type _CanonicalToInput74 = AssertAssignable<
+type _CanonicalToInput90 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["config.validate"]>,
 	ManagementOperationTypes["config.validate"]["input"]
 >;
 
 /** config.validate */
-type _OutputToCanonical74 = AssertAssignable<
+type _OutputToCanonical90 = AssertAssignable<
 	ManagementOperationTypes["config.validate"]["output"],
 	OperationOutput<ManagementOperationRegistry["config.validate"]>
 >;
-type _CanonicalToOutput74 = AssertAssignable<
+type _CanonicalToOutput90 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["config.validate"]>,
 	ManagementOperationTypes["config.validate"]["output"]
 >;
 
 /** config.diff */
-type _InputToCanonical75 = AssertAssignable<
+type _InputToCanonical91 = AssertAssignable<
 	ManagementOperationTypes["config.diff"]["input"],
 	OperationInput<ManagementOperationRegistry["config.diff"]>
 >;
-type _CanonicalToInput75 = AssertAssignable<
+type _CanonicalToInput91 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["config.diff"]>,
 	ManagementOperationTypes["config.diff"]["input"]
 >;
 
 /** config.diff */
-type _OutputToCanonical75 = AssertAssignable<
+type _OutputToCanonical91 = AssertAssignable<
 	ManagementOperationTypes["config.diff"]["output"],
 	OperationOutput<ManagementOperationRegistry["config.diff"]>
 >;
-type _CanonicalToOutput75 = AssertAssignable<
+type _CanonicalToOutput91 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["config.diff"]>,
 	ManagementOperationTypes["config.diff"]["output"]
 >;
 
 /** imports.legacy */
-type _InputToCanonical76 = AssertAssignable<
+type _InputToCanonical92 = AssertAssignable<
 	ManagementOperationTypes["imports.legacy"]["input"],
 	OperationInput<ManagementOperationRegistry["imports.legacy"]>
 >;
-type _CanonicalToInput76 = AssertAssignable<
+type _CanonicalToInput92 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["imports.legacy"]>,
 	ManagementOperationTypes["imports.legacy"]["input"]
 >;
 
 /** imports.legacy */
-type _OutputToCanonical76 = AssertAssignable<
+type _OutputToCanonical92 = AssertAssignable<
 	ManagementOperationTypes["imports.legacy"]["output"],
 	OperationOutput<ManagementOperationRegistry["imports.legacy"]>
 >;
-type _CanonicalToOutput76 = AssertAssignable<
+type _CanonicalToOutput92 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["imports.legacy"]>,
 	ManagementOperationTypes["imports.legacy"]["output"]
 >;
 
 /** migrations.plan */
-type _InputToCanonical77 = AssertAssignable<
+type _InputToCanonical93 = AssertAssignable<
 	ManagementOperationTypes["migrations.plan"]["input"],
 	OperationInput<ManagementOperationRegistry["migrations.plan"]>
 >;
-type _CanonicalToInput77 = AssertAssignable<
+type _CanonicalToInput93 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["migrations.plan"]>,
 	ManagementOperationTypes["migrations.plan"]["input"]
 >;
 
 /** migrations.plan */
-type _OutputToCanonical77 = AssertAssignable<
+type _OutputToCanonical93 = AssertAssignable<
 	ManagementOperationTypes["migrations.plan"]["output"],
 	OperationOutput<ManagementOperationRegistry["migrations.plan"]>
 >;
-type _CanonicalToOutput77 = AssertAssignable<
+type _CanonicalToOutput93 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["migrations.plan"]>,
 	ManagementOperationTypes["migrations.plan"]["output"]
 >;
 
 /** migrations.run */
-type _InputToCanonical78 = AssertAssignable<
+type _InputToCanonical94 = AssertAssignable<
 	ManagementOperationTypes["migrations.run"]["input"],
 	OperationInput<ManagementOperationRegistry["migrations.run"]>
 >;
-type _CanonicalToInput78 = AssertAssignable<
+type _CanonicalToInput94 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["migrations.run"]>,
 	ManagementOperationTypes["migrations.run"]["input"]
 >;
 
 /** migrations.run */
-type _OutputToCanonical78 = AssertAssignable<
+type _OutputToCanonical94 = AssertAssignable<
 	ManagementOperationTypes["migrations.run"]["output"],
 	OperationOutput<ManagementOperationRegistry["migrations.run"]>
 >;
-type _CanonicalToOutput78 = AssertAssignable<
+type _CanonicalToOutput94 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["migrations.run"]>,
 	ManagementOperationTypes["migrations.run"]["output"]
 >;
 
 /** migrations.verify */
-type _InputToCanonical79 = AssertAssignable<
+type _InputToCanonical95 = AssertAssignable<
 	ManagementOperationTypes["migrations.verify"]["input"],
 	OperationInput<ManagementOperationRegistry["migrations.verify"]>
 >;
-type _CanonicalToInput79 = AssertAssignable<
+type _CanonicalToInput95 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["migrations.verify"]>,
 	ManagementOperationTypes["migrations.verify"]["input"]
 >;
 
 /** migrations.verify */
-type _OutputToCanonical79 = AssertAssignable<
+type _OutputToCanonical95 = AssertAssignable<
 	ManagementOperationTypes["migrations.verify"]["output"],
 	OperationOutput<ManagementOperationRegistry["migrations.verify"]>
 >;
-type _CanonicalToOutput79 = AssertAssignable<
+type _CanonicalToOutput95 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["migrations.verify"]>,
 	ManagementOperationTypes["migrations.verify"]["output"]
 >;
 
 /** migrations.rollback */
-type _InputToCanonical80 = AssertAssignable<
+type _InputToCanonical96 = AssertAssignable<
 	ManagementOperationTypes["migrations.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["migrations.rollback"]>
 >;
-type _CanonicalToInput80 = AssertAssignable<
+type _CanonicalToInput96 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["migrations.rollback"]>,
 	ManagementOperationTypes["migrations.rollback"]["input"]
 >;
 
 /** migrations.rollback */
-type _OutputToCanonical80 = AssertAssignable<
+type _OutputToCanonical96 = AssertAssignable<
 	ManagementOperationTypes["migrations.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["migrations.rollback"]>
 >;
-type _CanonicalToOutput80 = AssertAssignable<
+type _CanonicalToOutput96 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["migrations.rollback"]>,
 	ManagementOperationTypes["migrations.rollback"]["output"]
 >;
 
 /** migrations.status */
-type _InputToCanonical81 = AssertAssignable<
+type _InputToCanonical97 = AssertAssignable<
 	ManagementOperationTypes["migrations.status"]["input"],
 	OperationInput<ManagementOperationRegistry["migrations.status"]>
 >;
-type _CanonicalToInput81 = AssertAssignable<
+type _CanonicalToInput97 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["migrations.status"]>,
 	ManagementOperationTypes["migrations.status"]["input"]
 >;
 
 /** migrations.status */
-type _OutputToCanonical81 = AssertAssignable<
+type _OutputToCanonical97 = AssertAssignable<
 	ManagementOperationTypes["migrations.status"]["output"],
 	OperationOutput<ManagementOperationRegistry["migrations.status"]>
 >;
-type _CanonicalToOutput81 = AssertAssignable<
+type _CanonicalToOutput97 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["migrations.status"]>,
 	ManagementOperationTypes["migrations.status"]["output"]
 >;
 
 /** backups.create */
-type _InputToCanonical82 = AssertAssignable<
+type _InputToCanonical98 = AssertAssignable<
 	ManagementOperationTypes["backups.create"]["input"],
 	OperationInput<ManagementOperationRegistry["backups.create"]>
 >;
-type _CanonicalToInput82 = AssertAssignable<
+type _CanonicalToInput98 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["backups.create"]>,
 	ManagementOperationTypes["backups.create"]["input"]
 >;
 
 /** backups.create */
-type _OutputToCanonical82 = AssertAssignable<
+type _OutputToCanonical98 = AssertAssignable<
 	ManagementOperationTypes["backups.create"]["output"],
 	OperationOutput<ManagementOperationRegistry["backups.create"]>
 >;
-type _CanonicalToOutput82 = AssertAssignable<
+type _CanonicalToOutput98 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["backups.create"]>,
 	ManagementOperationTypes["backups.create"]["output"]
 >;
 
 /** backups.verify */
-type _InputToCanonical83 = AssertAssignable<
+type _InputToCanonical99 = AssertAssignable<
 	ManagementOperationTypes["backups.verify"]["input"],
 	OperationInput<ManagementOperationRegistry["backups.verify"]>
 >;
-type _CanonicalToInput83 = AssertAssignable<
+type _CanonicalToInput99 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["backups.verify"]>,
 	ManagementOperationTypes["backups.verify"]["input"]
 >;
 
 /** backups.verify */
-type _OutputToCanonical83 = AssertAssignable<
+type _OutputToCanonical99 = AssertAssignable<
 	ManagementOperationTypes["backups.verify"]["output"],
 	OperationOutput<ManagementOperationRegistry["backups.verify"]>
 >;
-type _CanonicalToOutput83 = AssertAssignable<
+type _CanonicalToOutput99 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["backups.verify"]>,
 	ManagementOperationTypes["backups.verify"]["output"]
 >;
 
 /** backups.restore */
-type _InputToCanonical84 = AssertAssignable<
+type _InputToCanonical100 = AssertAssignable<
 	ManagementOperationTypes["backups.restore"]["input"],
 	OperationInput<ManagementOperationRegistry["backups.restore"]>
 >;
-type _CanonicalToInput84 = AssertAssignable<
+type _CanonicalToInput100 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["backups.restore"]>,
 	ManagementOperationTypes["backups.restore"]["input"]
 >;
 
 /** backups.restore */
-type _OutputToCanonical84 = AssertAssignable<
+type _OutputToCanonical100 = AssertAssignable<
 	ManagementOperationTypes["backups.restore"]["output"],
 	OperationOutput<ManagementOperationRegistry["backups.restore"]>
 >;
-type _CanonicalToOutput84 = AssertAssignable<
+type _CanonicalToOutput100 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["backups.restore"]>,
 	ManagementOperationTypes["backups.restore"]["output"]
 >;
 
 /** upgrades.check */
-type _InputToCanonical85 = AssertAssignable<
+type _InputToCanonical101 = AssertAssignable<
 	ManagementOperationTypes["upgrades.check"]["input"],
 	OperationInput<ManagementOperationRegistry["upgrades.check"]>
 >;
-type _CanonicalToInput85 = AssertAssignable<
+type _CanonicalToInput101 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["upgrades.check"]>,
 	ManagementOperationTypes["upgrades.check"]["input"]
 >;
 
 /** upgrades.check */
-type _OutputToCanonical85 = AssertAssignable<
+type _OutputToCanonical101 = AssertAssignable<
 	ManagementOperationTypes["upgrades.check"]["output"],
 	OperationOutput<ManagementOperationRegistry["upgrades.check"]>
 >;
-type _CanonicalToOutput85 = AssertAssignable<
+type _CanonicalToOutput101 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["upgrades.check"]>,
 	ManagementOperationTypes["upgrades.check"]["output"]
 >;
 
 /** upgrades.plan */
-type _InputToCanonical86 = AssertAssignable<
+type _InputToCanonical102 = AssertAssignable<
 	ManagementOperationTypes["upgrades.plan"]["input"],
 	OperationInput<ManagementOperationRegistry["upgrades.plan"]>
 >;
-type _CanonicalToInput86 = AssertAssignable<
+type _CanonicalToInput102 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["upgrades.plan"]>,
 	ManagementOperationTypes["upgrades.plan"]["input"]
 >;
 
 /** upgrades.plan */
-type _OutputToCanonical86 = AssertAssignable<
+type _OutputToCanonical102 = AssertAssignable<
 	ManagementOperationTypes["upgrades.plan"]["output"],
 	OperationOutput<ManagementOperationRegistry["upgrades.plan"]>
 >;
-type _CanonicalToOutput86 = AssertAssignable<
+type _CanonicalToOutput102 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["upgrades.plan"]>,
 	ManagementOperationTypes["upgrades.plan"]["output"]
 >;
 
 /** upgrades.apply */
-type _InputToCanonical87 = AssertAssignable<
+type _InputToCanonical103 = AssertAssignable<
 	ManagementOperationTypes["upgrades.apply"]["input"],
 	OperationInput<ManagementOperationRegistry["upgrades.apply"]>
 >;
-type _CanonicalToInput87 = AssertAssignable<
+type _CanonicalToInput103 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["upgrades.apply"]>,
 	ManagementOperationTypes["upgrades.apply"]["input"]
 >;
 
 /** upgrades.apply */
-type _OutputToCanonical87 = AssertAssignable<
+type _OutputToCanonical103 = AssertAssignable<
 	ManagementOperationTypes["upgrades.apply"]["output"],
 	OperationOutput<ManagementOperationRegistry["upgrades.apply"]>
 >;
-type _CanonicalToOutput87 = AssertAssignable<
+type _CanonicalToOutput103 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["upgrades.apply"]>,
 	ManagementOperationTypes["upgrades.apply"]["output"]
 >;
 
 /** upgrades.verify */
-type _InputToCanonical88 = AssertAssignable<
+type _InputToCanonical104 = AssertAssignable<
 	ManagementOperationTypes["upgrades.verify"]["input"],
 	OperationInput<ManagementOperationRegistry["upgrades.verify"]>
 >;
-type _CanonicalToInput88 = AssertAssignable<
+type _CanonicalToInput104 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["upgrades.verify"]>,
 	ManagementOperationTypes["upgrades.verify"]["input"]
 >;
 
 /** upgrades.verify */
-type _OutputToCanonical88 = AssertAssignable<
+type _OutputToCanonical104 = AssertAssignable<
 	ManagementOperationTypes["upgrades.verify"]["output"],
 	OperationOutput<ManagementOperationRegistry["upgrades.verify"]>
 >;
-type _CanonicalToOutput88 = AssertAssignable<
+type _CanonicalToOutput104 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["upgrades.verify"]>,
 	ManagementOperationTypes["upgrades.verify"]["output"]
 >;
 
 /** upgrades.rollback */
-type _InputToCanonical89 = AssertAssignable<
+type _InputToCanonical105 = AssertAssignable<
 	ManagementOperationTypes["upgrades.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["upgrades.rollback"]>
 >;
-type _CanonicalToInput89 = AssertAssignable<
+type _CanonicalToInput105 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["upgrades.rollback"]>,
 	ManagementOperationTypes["upgrades.rollback"]["input"]
 >;
 
 /** upgrades.rollback */
-type _OutputToCanonical89 = AssertAssignable<
+type _OutputToCanonical105 = AssertAssignable<
 	ManagementOperationTypes["upgrades.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["upgrades.rollback"]>
 >;
-type _CanonicalToOutput89 = AssertAssignable<
+type _CanonicalToOutput105 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["upgrades.rollback"]>,
 	ManagementOperationTypes["upgrades.rollback"]["output"]
 >;
 
 /** schema.status */
-type _InputToCanonical90 = AssertAssignable<
+type _InputToCanonical106 = AssertAssignable<
 	ManagementOperationTypes["schema.status"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.status"]>
 >;
-type _CanonicalToInput90 = AssertAssignable<
+type _CanonicalToInput106 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.status"]>,
 	ManagementOperationTypes["schema.status"]["input"]
 >;
 
 /** schema.status */
-type _OutputToCanonical90 = AssertAssignable<
+type _OutputToCanonical106 = AssertAssignable<
 	ManagementOperationTypes["schema.status"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.status"]>
 >;
-type _CanonicalToOutput90 = AssertAssignable<
+type _CanonicalToOutput106 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.status"]>,
 	ManagementOperationTypes["schema.status"]["output"]
 >;
 
 /** schema.generate */
-type _InputToCanonical91 = AssertAssignable<
+type _InputToCanonical107 = AssertAssignable<
 	ManagementOperationTypes["schema.generate"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.generate"]>
 >;
-type _CanonicalToInput91 = AssertAssignable<
+type _CanonicalToInput107 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.generate"]>,
 	ManagementOperationTypes["schema.generate"]["input"]
 >;
 
 /** schema.generate */
-type _OutputToCanonical91 = AssertAssignable<
+type _OutputToCanonical107 = AssertAssignable<
 	ManagementOperationTypes["schema.generate"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.generate"]>
 >;
-type _CanonicalToOutput91 = AssertAssignable<
+type _CanonicalToOutput107 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.generate"]>,
 	ManagementOperationTypes["schema.generate"]["output"]
 >;
 
 /** schema.migrate */
-type _InputToCanonical92 = AssertAssignable<
+type _InputToCanonical108 = AssertAssignable<
 	ManagementOperationTypes["schema.migrate"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.migrate"]>
 >;
-type _CanonicalToInput92 = AssertAssignable<
+type _CanonicalToInput108 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.migrate"]>,
 	ManagementOperationTypes["schema.migrate"]["input"]
 >;
 
 /** schema.migrate */
-type _OutputToCanonical92 = AssertAssignable<
+type _OutputToCanonical108 = AssertAssignable<
 	ManagementOperationTypes["schema.migrate"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.migrate"]>
 >;
-type _CanonicalToOutput92 = AssertAssignable<
+type _CanonicalToOutput108 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.migrate"]>,
 	ManagementOperationTypes["schema.migrate"]["output"]
 >;
 
 /** schema.credential-authority.status */
-type _InputToCanonical93 = AssertAssignable<
+type _InputToCanonical109 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.status"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.status"]>
 >;
-type _CanonicalToInput93 = AssertAssignable<
+type _CanonicalToInput109 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.status"]>,
 	ManagementOperationTypes["schema.credential-authority.status"]["input"]
 >;
 
 /** schema.credential-authority.status */
-type _OutputToCanonical93 = AssertAssignable<
+type _OutputToCanonical109 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.status"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.status"]>
 >;
-type _CanonicalToOutput93 = AssertAssignable<
+type _CanonicalToOutput109 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.status"]>,
 	ManagementOperationTypes["schema.credential-authority.status"]["output"]
 >;
 
 /** schema.credential-authority.arm */
-type _InputToCanonical94 = AssertAssignable<
+type _InputToCanonical110 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.arm"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.arm"]>
 >;
-type _CanonicalToInput94 = AssertAssignable<
+type _CanonicalToInput110 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.arm"]>,
 	ManagementOperationTypes["schema.credential-authority.arm"]["input"]
 >;
 
 /** schema.credential-authority.arm */
-type _OutputToCanonical94 = AssertAssignable<
+type _OutputToCanonical110 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.arm"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.arm"]>
 >;
-type _CanonicalToOutput94 = AssertAssignable<
+type _CanonicalToOutput110 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.arm"]>,
 	ManagementOperationTypes["schema.credential-authority.arm"]["output"]
 >;
 
 /** schema.credential-authority.drain */
-type _InputToCanonical95 = AssertAssignable<
+type _InputToCanonical111 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.drain"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.drain"]>
 >;
-type _CanonicalToInput95 = AssertAssignable<
+type _CanonicalToInput111 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.credential-authority.drain"]>,
 	ManagementOperationTypes["schema.credential-authority.drain"]["input"]
 >;
 
 /** schema.credential-authority.drain */
-type _OutputToCanonical95 = AssertAssignable<
+type _OutputToCanonical111 = AssertAssignable<
 	ManagementOperationTypes["schema.credential-authority.drain"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.drain"]>
 >;
-type _CanonicalToOutput95 = AssertAssignable<
+type _CanonicalToOutput111 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.credential-authority.drain"]>,
 	ManagementOperationTypes["schema.credential-authority.drain"]["output"]
 >;
 
 /** schema.store-v2.status */
-type _InputToCanonical96 = AssertAssignable<
+type _InputToCanonical112 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.status"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.status"]>
 >;
-type _CanonicalToInput96 = AssertAssignable<
+type _CanonicalToInput112 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.status"]>,
 	ManagementOperationTypes["schema.store-v2.status"]["input"]
 >;
 
 /** schema.store-v2.status */
-type _OutputToCanonical96 = AssertAssignable<
+type _OutputToCanonical112 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.status"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.status"]>
 >;
-type _CanonicalToOutput96 = AssertAssignable<
+type _CanonicalToOutput112 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.status"]>,
 	ManagementOperationTypes["schema.store-v2.status"]["output"]
 >;
 
 /** schema.store-v2.plan */
-type _InputToCanonical97 = AssertAssignable<
+type _InputToCanonical113 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.plan"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.plan"]>
 >;
-type _CanonicalToInput97 = AssertAssignable<
+type _CanonicalToInput113 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.plan"]>,
 	ManagementOperationTypes["schema.store-v2.plan"]["input"]
 >;
 
 /** schema.store-v2.plan */
-type _OutputToCanonical97 = AssertAssignable<
+type _OutputToCanonical113 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.plan"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.plan"]>
 >;
-type _CanonicalToOutput97 = AssertAssignable<
+type _CanonicalToOutput113 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.plan"]>,
 	ManagementOperationTypes["schema.store-v2.plan"]["output"]
 >;
 
 /** schema.store-v2.apply */
-type _InputToCanonical98 = AssertAssignable<
+type _InputToCanonical114 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.apply"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.apply"]>
 >;
-type _CanonicalToInput98 = AssertAssignable<
+type _CanonicalToInput114 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.apply"]>,
 	ManagementOperationTypes["schema.store-v2.apply"]["input"]
 >;
 
 /** schema.store-v2.apply */
-type _OutputToCanonical98 = AssertAssignable<
+type _OutputToCanonical114 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.apply"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.apply"]>
 >;
-type _CanonicalToOutput98 = AssertAssignable<
+type _CanonicalToOutput114 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.apply"]>,
 	ManagementOperationTypes["schema.store-v2.apply"]["output"]
 >;
 
 /** schema.store-v2.verify */
-type _InputToCanonical99 = AssertAssignable<
+type _InputToCanonical115 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.verify"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.verify"]>
 >;
-type _CanonicalToInput99 = AssertAssignable<
+type _CanonicalToInput115 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.verify"]>,
 	ManagementOperationTypes["schema.store-v2.verify"]["input"]
 >;
 
 /** schema.store-v2.verify */
-type _OutputToCanonical99 = AssertAssignable<
+type _OutputToCanonical115 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.verify"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.verify"]>
 >;
-type _CanonicalToOutput99 = AssertAssignable<
+type _CanonicalToOutput115 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.verify"]>,
 	ManagementOperationTypes["schema.store-v2.verify"]["output"]
 >;
 
 /** schema.store-v2.rollback */
-type _InputToCanonical100 = AssertAssignable<
+type _InputToCanonical116 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.rollback"]>
 >;
-type _CanonicalToInput100 = AssertAssignable<
+type _CanonicalToInput116 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.rollback"]["input"]
 >;
 
 /** schema.store-v2.rollback */
-type _OutputToCanonical100 = AssertAssignable<
+type _OutputToCanonical116 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.rollback"]>
 >;
-type _CanonicalToOutput100 = AssertAssignable<
+type _CanonicalToOutput116 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.rollback"]["output"]
 >;
 
 /** schema.store-v2.events.cutover */
-type _InputToCanonical101 = AssertAssignable<
+type _InputToCanonical117 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.events.cutover"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.events.cutover"]>
 >;
-type _CanonicalToInput101 = AssertAssignable<
+type _CanonicalToInput117 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.events.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.events.cutover"]["input"]
 >;
 
 /** schema.store-v2.events.cutover */
-type _OutputToCanonical101 = AssertAssignable<
+type _OutputToCanonical117 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.events.cutover"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.events.cutover"]>
 >;
-type _CanonicalToOutput101 = AssertAssignable<
+type _CanonicalToOutput117 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.events.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.events.cutover"]["output"]
 >;
 
 /** schema.store-v2.events.rollback */
-type _InputToCanonical102 = AssertAssignable<
+type _InputToCanonical118 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.events.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.events.rollback"]>
 >;
-type _CanonicalToInput102 = AssertAssignable<
+type _CanonicalToInput118 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.events.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.events.rollback"]["input"]
 >;
 
 /** schema.store-v2.events.rollback */
-type _OutputToCanonical102 = AssertAssignable<
+type _OutputToCanonical118 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.events.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.events.rollback"]>
 >;
-type _CanonicalToOutput102 = AssertAssignable<
+type _CanonicalToOutput118 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.events.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.events.rollback"]["output"]
 >;
 
 /** schema.store-v2.principals.cutover */
-type _InputToCanonical103 = AssertAssignable<
+type _InputToCanonical119 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.principals.cutover"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.principals.cutover"]>
 >;
-type _CanonicalToInput103 = AssertAssignable<
+type _CanonicalToInput119 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.principals.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.principals.cutover"]["input"]
 >;
 
 /** schema.store-v2.principals.cutover */
-type _OutputToCanonical103 = AssertAssignable<
+type _OutputToCanonical119 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.principals.cutover"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.principals.cutover"]>
 >;
-type _CanonicalToOutput103 = AssertAssignable<
+type _CanonicalToOutput119 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.principals.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.principals.cutover"]["output"]
 >;
 
 /** schema.store-v2.principals.rollback */
-type _InputToCanonical104 = AssertAssignable<
+type _InputToCanonical120 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.principals.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.principals.rollback"]>
 >;
-type _CanonicalToInput104 = AssertAssignable<
+type _CanonicalToInput120 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.principals.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.principals.rollback"]["input"]
 >;
 
 /** schema.store-v2.principals.rollback */
-type _OutputToCanonical104 = AssertAssignable<
+type _OutputToCanonical120 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.principals.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.principals.rollback"]>
 >;
-type _CanonicalToOutput104 = AssertAssignable<
+type _CanonicalToOutput120 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.principals.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.principals.rollback"]["output"]
 >;
 
 /** schema.store-v2.topology.cutover */
-type _InputToCanonical105 = AssertAssignable<
+type _InputToCanonical121 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.topology.cutover"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.topology.cutover"]>
 >;
-type _CanonicalToInput105 = AssertAssignable<
+type _CanonicalToInput121 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.topology.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.topology.cutover"]["input"]
 >;
 
 /** schema.store-v2.topology.cutover */
-type _OutputToCanonical105 = AssertAssignable<
+type _OutputToCanonical121 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.topology.cutover"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.topology.cutover"]>
 >;
-type _CanonicalToOutput105 = AssertAssignable<
+type _CanonicalToOutput121 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.topology.cutover"]>,
 	ManagementOperationTypes["schema.store-v2.topology.cutover"]["output"]
 >;
 
 /** schema.store-v2.topology.rollback */
-type _InputToCanonical106 = AssertAssignable<
+type _InputToCanonical122 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.topology.rollback"]["input"],
 	OperationInput<ManagementOperationRegistry["schema.store-v2.topology.rollback"]>
 >;
-type _CanonicalToInput106 = AssertAssignable<
+type _CanonicalToInput122 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["schema.store-v2.topology.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.topology.rollback"]["input"]
 >;
 
 /** schema.store-v2.topology.rollback */
-type _OutputToCanonical106 = AssertAssignable<
+type _OutputToCanonical122 = AssertAssignable<
 	ManagementOperationTypes["schema.store-v2.topology.rollback"]["output"],
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.topology.rollback"]>
 >;
-type _CanonicalToOutput106 = AssertAssignable<
+type _CanonicalToOutput122 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["schema.store-v2.topology.rollback"]>,
 	ManagementOperationTypes["schema.store-v2.topology.rollback"]["output"]
 >;
 
 /** key_management.status */
-type _InputToCanonical107 = AssertAssignable<
+type _InputToCanonical123 = AssertAssignable<
 	ManagementOperationTypes["key_management.status"]["input"],
 	OperationInput<ManagementOperationRegistry["key_management.status"]>
 >;
-type _CanonicalToInput107 = AssertAssignable<
+type _CanonicalToInput123 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["key_management.status"]>,
 	ManagementOperationTypes["key_management.status"]["input"]
 >;
 
 /** key_management.status */
-type _OutputToCanonical107 = AssertAssignable<
+type _OutputToCanonical123 = AssertAssignable<
 	ManagementOperationTypes["key_management.status"]["output"],
 	OperationOutput<ManagementOperationRegistry["key_management.status"]>
 >;
-type _CanonicalToOutput107 = AssertAssignable<
+type _CanonicalToOutput123 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["key_management.status"]>,
 	ManagementOperationTypes["key_management.status"]["output"]
 >;
 
 /** key_management.plan */
-type _InputToCanonical108 = AssertAssignable<
+type _InputToCanonical124 = AssertAssignable<
 	ManagementOperationTypes["key_management.plan"]["input"],
 	OperationInput<ManagementOperationRegistry["key_management.plan"]>
 >;
-type _CanonicalToInput108 = AssertAssignable<
+type _CanonicalToInput124 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["key_management.plan"]>,
 	ManagementOperationTypes["key_management.plan"]["input"]
 >;
 
 /** key_management.plan */
-type _OutputToCanonical108 = AssertAssignable<
+type _OutputToCanonical124 = AssertAssignable<
 	ManagementOperationTypes["key_management.plan"]["output"],
 	OperationOutput<ManagementOperationRegistry["key_management.plan"]>
 >;
-type _CanonicalToOutput108 = AssertAssignable<
+type _CanonicalToOutput124 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["key_management.plan"]>,
 	ManagementOperationTypes["key_management.plan"]["output"]
 >;
 
 /** key_management.apply */
-type _InputToCanonical109 = AssertAssignable<
+type _InputToCanonical125 = AssertAssignable<
 	ManagementOperationTypes["key_management.apply"]["input"],
 	OperationInput<ManagementOperationRegistry["key_management.apply"]>
 >;
-type _CanonicalToInput109 = AssertAssignable<
+type _CanonicalToInput125 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["key_management.apply"]>,
 	ManagementOperationTypes["key_management.apply"]["input"]
 >;
 
 /** key_management.apply */
-type _OutputToCanonical109 = AssertAssignable<
+type _OutputToCanonical125 = AssertAssignable<
 	ManagementOperationTypes["key_management.apply"]["output"],
 	OperationOutput<ManagementOperationRegistry["key_management.apply"]>
 >;
-type _CanonicalToOutput109 = AssertAssignable<
+type _CanonicalToOutput125 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["key_management.apply"]>,
 	ManagementOperationTypes["key_management.apply"]["output"]
 >;
 
 /** users.list */
-type _InputToCanonical110 = AssertAssignable<
+type _InputToCanonical126 = AssertAssignable<
 	ManagementOperationTypes["users.list"]["input"],
 	OperationInput<ManagementOperationRegistry["users.list"]>
 >;
-type _CanonicalToInput110 = AssertAssignable<
+type _CanonicalToInput126 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.list"]>,
 	ManagementOperationTypes["users.list"]["input"]
 >;
 
 /** users.list */
-type _OutputToCanonical110 = AssertAssignable<
+type _OutputToCanonical126 = AssertAssignable<
 	ManagementOperationTypes["users.list"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.list"]>
 >;
-type _CanonicalToOutput110 = AssertAssignable<
+type _CanonicalToOutput126 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.list"]>,
 	ManagementOperationTypes["users.list"]["output"]
 >;
 
 /** users.inspect */
-type _InputToCanonical111 = AssertAssignable<
+type _InputToCanonical127 = AssertAssignable<
 	ManagementOperationTypes["users.inspect"]["input"],
 	OperationInput<ManagementOperationRegistry["users.inspect"]>
 >;
-type _CanonicalToInput111 = AssertAssignable<
+type _CanonicalToInput127 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.inspect"]>,
 	ManagementOperationTypes["users.inspect"]["input"]
 >;
 
 /** users.inspect */
-type _OutputToCanonical111 = AssertAssignable<
+type _OutputToCanonical127 = AssertAssignable<
 	ManagementOperationTypes["users.inspect"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.inspect"]>
 >;
-type _CanonicalToOutput111 = AssertAssignable<
+type _CanonicalToOutput127 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.inspect"]>,
 	ManagementOperationTypes["users.inspect"]["output"]
 >;
 
 /** users.create */
-type _InputToCanonical112 = AssertAssignable<
+type _InputToCanonical128 = AssertAssignable<
 	ManagementOperationTypes["users.create"]["input"],
 	OperationInput<ManagementOperationRegistry["users.create"]>
 >;
-type _CanonicalToInput112 = AssertAssignable<
+type _CanonicalToInput128 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.create"]>,
 	ManagementOperationTypes["users.create"]["input"]
 >;
 
 /** users.create */
-type _OutputToCanonical112 = AssertAssignable<
+type _OutputToCanonical128 = AssertAssignable<
 	ManagementOperationTypes["users.create"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.create"]>
 >;
-type _CanonicalToOutput112 = AssertAssignable<
+type _CanonicalToOutput128 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.create"]>,
 	ManagementOperationTypes["users.create"]["output"]
 >;
 
 /** users.update */
-type _InputToCanonical113 = AssertAssignable<
+type _InputToCanonical129 = AssertAssignable<
 	ManagementOperationTypes["users.update"]["input"],
 	OperationInput<ManagementOperationRegistry["users.update"]>
 >;
-type _CanonicalToInput113 = AssertAssignable<
+type _CanonicalToInput129 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.update"]>,
 	ManagementOperationTypes["users.update"]["input"]
 >;
 
 /** users.update */
-type _OutputToCanonical113 = AssertAssignable<
+type _OutputToCanonical129 = AssertAssignable<
 	ManagementOperationTypes["users.update"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.update"]>
 >;
-type _CanonicalToOutput113 = AssertAssignable<
+type _CanonicalToOutput129 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.update"]>,
 	ManagementOperationTypes["users.update"]["output"]
 >;
 
 /** users.disable */
-type _InputToCanonical114 = AssertAssignable<
+type _InputToCanonical130 = AssertAssignable<
 	ManagementOperationTypes["users.disable"]["input"],
 	OperationInput<ManagementOperationRegistry["users.disable"]>
 >;
-type _CanonicalToInput114 = AssertAssignable<
+type _CanonicalToInput130 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.disable"]>,
 	ManagementOperationTypes["users.disable"]["input"]
 >;
 
 /** users.disable */
-type _OutputToCanonical114 = AssertAssignable<
+type _OutputToCanonical130 = AssertAssignable<
 	ManagementOperationTypes["users.disable"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.disable"]>
 >;
-type _CanonicalToOutput114 = AssertAssignable<
+type _CanonicalToOutput130 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.disable"]>,
 	ManagementOperationTypes["users.disable"]["output"]
 >;
 
 /** users.delete */
-type _InputToCanonical115 = AssertAssignable<
+type _InputToCanonical131 = AssertAssignable<
 	ManagementOperationTypes["users.delete"]["input"],
 	OperationInput<ManagementOperationRegistry["users.delete"]>
 >;
-type _CanonicalToInput115 = AssertAssignable<
+type _CanonicalToInput131 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.delete"]>,
 	ManagementOperationTypes["users.delete"]["input"]
 >;
 
 /** users.delete */
-type _OutputToCanonical115 = AssertAssignable<
+type _OutputToCanonical131 = AssertAssignable<
 	ManagementOperationTypes["users.delete"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.delete"]>
 >;
-type _CanonicalToOutput115 = AssertAssignable<
+type _CanonicalToOutput131 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.delete"]>,
 	ManagementOperationTypes["users.delete"]["output"]
 >;
 
 /** users.export */
-type _InputToCanonical116 = AssertAssignable<
+type _InputToCanonical132 = AssertAssignable<
 	ManagementOperationTypes["users.export"]["input"],
 	OperationInput<ManagementOperationRegistry["users.export"]>
 >;
-type _CanonicalToInput116 = AssertAssignable<
+type _CanonicalToInput132 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["users.export"]>,
 	ManagementOperationTypes["users.export"]["input"]
 >;
 
 /** users.export */
-type _OutputToCanonical116 = AssertAssignable<
+type _OutputToCanonical132 = AssertAssignable<
 	ManagementOperationTypes["users.export"]["output"],
 	OperationOutput<ManagementOperationRegistry["users.export"]>
 >;
-type _CanonicalToOutput116 = AssertAssignable<
+type _CanonicalToOutput132 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["users.export"]>,
 	ManagementOperationTypes["users.export"]["output"]
 >;
 
 /** organizations.list */
-type _InputToCanonical117 = AssertAssignable<
+type _InputToCanonical133 = AssertAssignable<
 	ManagementOperationTypes["organizations.list"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.list"]>
 >;
-type _CanonicalToInput117 = AssertAssignable<
+type _CanonicalToInput133 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.list"]>,
 	ManagementOperationTypes["organizations.list"]["input"]
 >;
 
 /** organizations.list */
-type _OutputToCanonical117 = AssertAssignable<
+type _OutputToCanonical133 = AssertAssignable<
 	ManagementOperationTypes["organizations.list"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.list"]>
 >;
-type _CanonicalToOutput117 = AssertAssignable<
+type _CanonicalToOutput133 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.list"]>,
 	ManagementOperationTypes["organizations.list"]["output"]
 >;
 
 /** organizations.inspect */
-type _InputToCanonical118 = AssertAssignable<
+type _InputToCanonical134 = AssertAssignable<
 	ManagementOperationTypes["organizations.inspect"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.inspect"]>
 >;
-type _CanonicalToInput118 = AssertAssignable<
+type _CanonicalToInput134 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.inspect"]>,
 	ManagementOperationTypes["organizations.inspect"]["input"]
 >;
 
 /** organizations.inspect */
-type _OutputToCanonical118 = AssertAssignable<
+type _OutputToCanonical134 = AssertAssignable<
 	ManagementOperationTypes["organizations.inspect"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.inspect"]>
 >;
-type _CanonicalToOutput118 = AssertAssignable<
+type _CanonicalToOutput134 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.inspect"]>,
 	ManagementOperationTypes["organizations.inspect"]["output"]
 >;
 
 /** organizations.create */
-type _InputToCanonical119 = AssertAssignable<
+type _InputToCanonical135 = AssertAssignable<
 	ManagementOperationTypes["organizations.create"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.create"]>
 >;
-type _CanonicalToInput119 = AssertAssignable<
+type _CanonicalToInput135 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.create"]>,
 	ManagementOperationTypes["organizations.create"]["input"]
 >;
 
 /** organizations.create */
-type _OutputToCanonical119 = AssertAssignable<
+type _OutputToCanonical135 = AssertAssignable<
 	ManagementOperationTypes["organizations.create"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.create"]>
 >;
-type _CanonicalToOutput119 = AssertAssignable<
+type _CanonicalToOutput135 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.create"]>,
 	ManagementOperationTypes["organizations.create"]["output"]
 >;
 
 /** organizations.update */
-type _InputToCanonical120 = AssertAssignable<
+type _InputToCanonical136 = AssertAssignable<
 	ManagementOperationTypes["organizations.update"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.update"]>
 >;
-type _CanonicalToInput120 = AssertAssignable<
+type _CanonicalToInput136 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.update"]>,
 	ManagementOperationTypes["organizations.update"]["input"]
 >;
 
 /** organizations.update */
-type _OutputToCanonical120 = AssertAssignable<
+type _OutputToCanonical136 = AssertAssignable<
 	ManagementOperationTypes["organizations.update"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.update"]>
 >;
-type _CanonicalToOutput120 = AssertAssignable<
+type _CanonicalToOutput136 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.update"]>,
 	ManagementOperationTypes["organizations.update"]["output"]
 >;
 
 /** organizations.archive */
-type _InputToCanonical121 = AssertAssignable<
+type _InputToCanonical137 = AssertAssignable<
 	ManagementOperationTypes["organizations.archive"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.archive"]>
 >;
-type _CanonicalToInput121 = AssertAssignable<
+type _CanonicalToInput137 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.archive"]>,
 	ManagementOperationTypes["organizations.archive"]["input"]
 >;
 
 /** organizations.archive */
-type _OutputToCanonical121 = AssertAssignable<
+type _OutputToCanonical137 = AssertAssignable<
 	ManagementOperationTypes["organizations.archive"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.archive"]>
 >;
-type _CanonicalToOutput121 = AssertAssignable<
+type _CanonicalToOutput137 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.archive"]>,
 	ManagementOperationTypes["organizations.archive"]["output"]
 >;
 
 /** organizations.members.list */
-type _InputToCanonical122 = AssertAssignable<
+type _InputToCanonical138 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.list"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.members.list"]>
 >;
-type _CanonicalToInput122 = AssertAssignable<
+type _CanonicalToInput138 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.members.list"]>,
 	ManagementOperationTypes["organizations.members.list"]["input"]
 >;
 
 /** organizations.members.list */
-type _OutputToCanonical122 = AssertAssignable<
+type _OutputToCanonical138 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.list"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.members.list"]>
 >;
-type _CanonicalToOutput122 = AssertAssignable<
+type _CanonicalToOutput138 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.members.list"]>,
 	ManagementOperationTypes["organizations.members.list"]["output"]
 >;
 
 /** organizations.members.add */
-type _InputToCanonical123 = AssertAssignable<
+type _InputToCanonical139 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.add"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.members.add"]>
 >;
-type _CanonicalToInput123 = AssertAssignable<
+type _CanonicalToInput139 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.members.add"]>,
 	ManagementOperationTypes["organizations.members.add"]["input"]
 >;
 
 /** organizations.members.add */
-type _OutputToCanonical123 = AssertAssignable<
+type _OutputToCanonical139 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.add"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.members.add"]>
 >;
-type _CanonicalToOutput123 = AssertAssignable<
+type _CanonicalToOutput139 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.members.add"]>,
 	ManagementOperationTypes["organizations.members.add"]["output"]
 >;
 
 /** organizations.members.update */
-type _InputToCanonical124 = AssertAssignable<
+type _InputToCanonical140 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.update"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.members.update"]>
 >;
-type _CanonicalToInput124 = AssertAssignable<
+type _CanonicalToInput140 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.members.update"]>,
 	ManagementOperationTypes["organizations.members.update"]["input"]
 >;
 
 /** organizations.members.update */
-type _OutputToCanonical124 = AssertAssignable<
+type _OutputToCanonical140 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.update"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.members.update"]>
 >;
-type _CanonicalToOutput124 = AssertAssignable<
+type _CanonicalToOutput140 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.members.update"]>,
 	ManagementOperationTypes["organizations.members.update"]["output"]
 >;
 
 /** organizations.members.remove */
-type _InputToCanonical125 = AssertAssignable<
+type _InputToCanonical141 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.remove"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.members.remove"]>
 >;
-type _CanonicalToInput125 = AssertAssignable<
+type _CanonicalToInput141 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.members.remove"]>,
 	ManagementOperationTypes["organizations.members.remove"]["input"]
 >;
 
 /** organizations.members.remove */
-type _OutputToCanonical125 = AssertAssignable<
+type _OutputToCanonical141 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.remove"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.members.remove"]>
 >;
-type _CanonicalToOutput125 = AssertAssignable<
+type _CanonicalToOutput141 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.members.remove"]>,
 	ManagementOperationTypes["organizations.members.remove"]["output"]
 >;
 
 /** organizations.members.import */
-type _InputToCanonical126 = AssertAssignable<
+type _InputToCanonical142 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.import"]["input"],
 	OperationInput<ManagementOperationRegistry["organizations.members.import"]>
 >;
-type _CanonicalToInput126 = AssertAssignable<
+type _CanonicalToInput142 = AssertAssignable<
 	OperationInput<ManagementOperationRegistry["organizations.members.import"]>,
 	ManagementOperationTypes["organizations.members.import"]["input"]
 >;
 
 /** organizations.members.import */
-type _OutputToCanonical126 = AssertAssignable<
+type _OutputToCanonical142 = AssertAssignable<
 	ManagementOperationTypes["organizations.members.import"]["output"],
 	OperationOutput<ManagementOperationRegistry["organizations.members.import"]>
 >;
-type _CanonicalToOutput126 = AssertAssignable<
+type _CanonicalToOutput142 = AssertAssignable<
 	OperationOutput<ManagementOperationRegistry["organizations.members.import"]>,
 	ManagementOperationTypes["organizations.members.import"]["output"]
 >;

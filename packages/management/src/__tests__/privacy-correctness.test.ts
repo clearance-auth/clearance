@@ -97,7 +97,7 @@ describe("credential AEAD storage", () => {
 		const pt = decryptCredential(raw.clientSecretEncrypted!);
 		expect(pt).toBe(secret);
 
-		// Rotation under new key id produces different stored bytes, still usable
+		// Tenant rotation is a runtime replacement, not a JSON-store envelope rewrite.
 		process.env.CLEARANCE_CREDENTIAL_PREVIOUS_KEY =
 			process.env.CLEARANCE_CREDENTIAL_KEY;
 		process.env.CLEARANCE_CREDENTIAL_PREVIOUS_KEY_ID = "k1";
@@ -106,13 +106,12 @@ describe("credential AEAD storage", () => {
 		process.env.CLEARANCE_CREDENTIAL_KEY_ID = "k2";
 
 		const before = raw.clientSecretEncrypted!;
-		const rotated = rotateSsoCredential(store, sso.id);
-		expect(
-			(rotated as { clientSecretEncrypted?: string }).clientSecretEncrypted,
-		).toBeUndefined();
+		expect(() => rotateSsoCredential(store, sso.id)).toThrow(
+			/coordinated PostgreSQL runtime backend/i,
+		);
 		const after = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
-		expect(after).not.toBe(before);
-		expect(after).toMatch(/^clr\$v1\$k2\$/);
+		expect(after).toBe(before);
+		expect(after).toMatch(/^clr\$v1\$k1\$/);
 		expect(after).not.toContain(secret);
 		expect(decryptCredential(after)).toBe(secret);
 		expect(JSON.stringify(store.snapshot)).not.toContain(secret);
@@ -134,11 +133,13 @@ describe("credential AEAD storage", () => {
 		expect(scimRaw.bearerTokenEncrypted).toMatch(/^clr\$v1\$/);
 		expect(JSON.stringify(store.snapshot)).not.toContain(scimSecret);
 		const scimBefore = scimRaw.bearerTokenEncrypted!;
-		rotateScimCredential(store, scim.id);
+		expect(() => rotateScimCredential(store, scim.id)).toThrow(
+			/coordinated PostgreSQL runtime backend/i,
+		);
 		const scimAfter = store.snapshot.directoryConnections.find(
 			(c) => c.id === scim.id,
 		)!.bearerTokenEncrypted!;
-		expect(scimAfter).not.toBe(scimBefore);
+		expect(scimAfter).toBe(scimBefore);
 		expect(decryptCredential(scimAfter)).toBe(scimSecret);
 	});
 

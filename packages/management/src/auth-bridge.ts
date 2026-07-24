@@ -19,11 +19,20 @@
  * remains management-only.
  */
 import {
-	createClearanceAuth,
 	decryptRuntimeCredential,
 	type ClearanceAuthBundle,
+	type ClearanceKeyManagementFacade,
+	type TenantProductAdministrationFacade,
+	type TenantProductAuditEvent,
+	type TenantProductReadiness,
+	type TenantProductScimConnection,
+	type TenantProductSsoConnection,
 } from "@clearance/auth";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import {
+	createClearanceManagementAuth,
+	type ManagedOrganizationLifecycleFacade,
+} from "@clearance/auth/management-internal";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type {
 	AuditEvent,
 	DataStoreSnapshot,
@@ -89,7 +98,10 @@ import type {
 	StoreV2TopologyReader,
 	StoreV2TopologyRepository,
 } from "./store/types.js";
-import { mutateCoordinatedWithRuntimeSql } from "./store/coordinated-internal.js";
+import {
+	mutateCoordinatedInExistingTransaction,
+	mutateCoordinatedWithRuntimeSql,
+} from "./store/coordinated-internal.js";
 import { advancingPrincipalUpdatedAt } from "./store/store-v2-principals.js";
 import type { OperationContext } from "./application/context.js";
 import type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
@@ -98,6 +110,34 @@ import {
 	type ValidatedManagementWebhookTarget,
 } from "./application/delivery.js";
 import { keyManagementRuntimeOptions } from "./key-management-env.js";
+import { listEventsPageOperational } from "./services/events.js";
+import {
+	createSsoConnectionReal,
+	testSsoConnectionReal,
+} from "./services/sso-real.js";
+import {
+	disableSsoConnectionReal,
+	rotateSsoCredentialAuthoritative,
+} from "./services/sso.js";
+import {
+	createScimConnectionReal,
+	testScimConnectionReal,
+} from "./services/scim-real.js";
+import {
+	disableScimConnectionReal,
+	createScimOperationReplayCipher,
+	rotateScimCredentialAuthoritative,
+	type ScimOperationReplayCipher,
+} from "./services/scim.js";
+import {
+	enterpriseReadinessStateFingerprint,
+	getLatestReadiness,
+} from "./services/readiness.js";
+import { redactRecord } from "./services/redact.js";
+import {
+	createKeyManagedCredentialCipher,
+	type CredentialCipher,
+} from "./services/credentials.js";
 
 export type { PasswordSetupGrant } from "./application/auth-runtime-gateway.js";
 
@@ -124,9 +164,60 @@ function managementSyncOptions(
 }
 
 let bundle: ClearanceAuthBundle | null = null;
+let tenantProductAdministration: TenantProductAdministrationFacade | undefined;
+let managedOrganizationLifecycle: ManagedOrganizationLifecycleFacade | undefined;
+
+export type HostedAuthBundleInput = Readonly<{
+	origin: string;
+	hostname: string;
+	scope: TenantProductScope;
+	productLabel: string;
+	store: ManagementStore;
+	presentationVersion: string | number;
+	domainVersion: string | number;
+}>;
+
+type HostedAuthBundleRecord = {
+	identity: string;
+	bundle: ClearanceAuthBundle;
+	leases: number;
+	retired: boolean;
+	destruction: Promise<void>;
+	resolveDestruction: () => void;
+	rejectDestruction: (error: unknown) => void;
+	destroyStarted: boolean;
+};
+
+/** A single auth-request claim on a hosted runtime. Release it exactly once. */
+export type HostedAuthBundleLease = Readonly<{
+	bundle: ClearanceAuthBundle;
+	release(): Promise<void>;
+}>;
+
+const MAX_HOSTED_AUTH_BUNDLES = 32;
+const hostedAuthBundles = new Map<string, HostedAuthBundleRecord>();
+const hostedAuthCreations = new Map<string, Promise<HostedAuthBundleRecord>>();
+const hostedAuthChains = new Map<string, Promise<void>>();
+// Hosted tenant facades close over their ManagementStore. Keep ownership in
+// process-local identity rather than deriving it from a store path or serializing
+// a store object, either of which could alias distinct authorities.
+const hostedAuthStoreOwners = new WeakMap<ManagementStore, number>();
+let nextHostedAuthStoreOwner = 0;
+const retiredHostedAuthBundles = new Set<HostedAuthBundleRecord>();
+let hostedAuthGeneration = 0;
+const retiringAuthBundles = new Set<Promise<void>>();
+
+function hostedAuthStoreOwner(store: ManagementStore): number {
+	const existing = hostedAuthStoreOwners.get(store);
+	if (existing !== undefined) return existing;
+	const owner = nextHostedAuthStoreOwner;
+	nextHostedAuthStoreOwner += 1;
+	hostedAuthStoreOwners.set(store, owner);
+	return owner;
+}
 
 function credentialAuthorityRuntimeOptions(): NonNullable<
-	Parameters<typeof createClearanceAuth>[0]["credentialAuthority"]
+	Parameters<typeof createClearanceManagementAuth>[0]["credentialAuthority"]
 > {
 	const production =
 		process.env.NODE_ENV === "production" ||
@@ -163,7 +254,7 @@ function credentialAuthorityRuntimeOptions(): NonNullable<
 function authenticationPolicyRuntimeOptions(
 	generation: "legacy-v1" | "digest-v1",
 ): Pick<
-	Parameters<typeof createClearanceAuth>[0],
+	Parameters<typeof createClearanceManagementAuth>[0],
 	"authenticationPolicy"
 > {
 	if (generation === "legacy-v1") return {};
@@ -175,6 +266,863 @@ function authenticationPolicyRuntimeOptions(
 		);
 	}
 	return { authenticationPolicy: projectEnv() };
+}
+
+export type TenantProductScope = Readonly<{
+	projectId: string;
+	environmentId: string;
+}>;
+
+function requireTenantProductScope(scope: TenantProductScope): TenantProductScope {
+	if (
+		typeof scope?.projectId !== "string" ||
+		!scope.projectId.trim() ||
+		typeof scope.environmentId !== "string" ||
+		!scope.environmentId.trim()
+	) {
+		throw new Error(
+			"Tenant product administration requires a fixed projectId and environmentId",
+		);
+	}
+	return Object.freeze({
+		projectId: scope.projectId.trim(),
+		environmentId: scope.environmentId.trim(),
+	});
+}
+
+const MANAGED_ORGANIZATION_STAGE = "runtime.organization.create";
+const MANAGED_ORGANIZATION_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
+
+function managedOrganizationInputError(code: string, message: string): never {
+	throw new ClearanceError({
+		code,
+		message,
+		stage: MANAGED_ORGANIZATION_STAGE,
+		status: 400,
+	});
+}
+
+function managedOrganizationIdentifier(value: unknown, label: string): string {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > 1_024 ||
+		value.trim() !== value ||
+		value.includes("\0")
+	) {
+		return managedOrganizationInputError(
+			"MANAGED_ORGANIZATION_INPUT_INVALID",
+			`${label} is invalid`,
+		);
+	}
+	return value;
+}
+
+function managedOrganizationDate(value: unknown, label: string): Date {
+	if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+		return managedOrganizationInputError(
+			"MANAGED_ORGANIZATION_INPUT_INVALID",
+			`${label} is invalid`,
+		);
+	}
+	return new Date(value.getTime());
+}
+
+function managedOrganizationRevision(value: unknown): string {
+	if (typeof value !== "string" || !/^[1-9]\d*$/.test(value)) {
+		return managedOrganizationInputError(
+			"MANAGED_ORGANIZATION_AUTHORIZATION_REVISION_INVALID",
+			"Authorization revision is invalid",
+		);
+	}
+	try {
+		if (BigInt(value) > POSTGRES_BIGINT_MAX) throw new Error();
+	} catch {
+		return managedOrganizationInputError(
+			"MANAGED_ORGANIZATION_AUTHORIZATION_REVISION_INVALID",
+			"Authorization revision is invalid",
+		);
+	}
+	return value;
+}
+
+/**
+ * Private bridge for the runtime's already-created first organization. Scope
+ * closes over server registration; callers supply no actor or project/env and
+ * cannot route their lifecycle write to another product.
+ */
+export function createManagedOrganizationLifecycleFacade(input: Readonly<{
+	store: ManagementStore;
+	scope: TenantProductScope;
+}>): ManagedOrganizationLifecycleFacade {
+	const scope = requireTenantProductScope(input.scope);
+	if (input.store.backend !== "postgres") {
+		throw new Error("Managed organization lifecycle requires the Postgres management store");
+	}
+	return Object.freeze({
+		async finalizeCreatedOrganization(lifecycle) {
+			const organizationId = managedOrganizationIdentifier(
+				lifecycle.organization.id,
+				"Organization id",
+			);
+			const ownerId = managedOrganizationIdentifier(lifecycle.owner.id, "Owner id");
+			const ownerMembershipId = managedOrganizationIdentifier(
+				lifecycle.ownerMembershipId,
+				"Owner membership id",
+			);
+			const name = lifecycle.organization.name;
+			if (
+			typeof name !== "string" ||
+				!name.trim() ||
+				name.trim() !== name ||
+				name.length > 256 ||
+				/[\u0000-\u001f\u007f]/.test(name)
+			) {
+				managedOrganizationInputError("MANAGED_ORGANIZATION_NAME_INVALID", "Organization name is invalid");
+			}
+			const slug = lifecycle.organization.slug;
+			if (
+				typeof slug !== "string" ||
+				slug.length === 0 ||
+				slug.length > 48 ||
+				slug.trim() !== slug ||
+				slug.includes("\0") ||
+				!MANAGED_ORGANIZATION_SLUG_RE.test(slug)
+			) {
+				managedOrganizationInputError("MANAGED_ORGANIZATION_SLUG_INVALID", "Organization slug is invalid");
+			}
+			const email = lifecycle.owner.email;
+			if (
+				typeof email !== "string" ||
+				email.length === 0 ||
+				email.length > 320 ||
+				email.trim() !== email ||
+				email.includes("\0") ||
+				!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+			) {
+				managedOrganizationInputError("MANAGED_ORGANIZATION_OWNER_EMAIL_INVALID", "Owner email is invalid");
+			}
+			const ownerName = lifecycle.owner.name;
+			if (
+				ownerName !== undefined &&
+				ownerName !== null &&
+				(typeof ownerName !== "string" ||
+					!ownerName.trim() ||
+					ownerName.trim() !== ownerName ||
+					ownerName.length > 256 ||
+					ownerName.includes("\0"))
+			) {
+				managedOrganizationInputError("MANAGED_ORGANIZATION_OWNER_NAME_INVALID", "Owner name is invalid");
+			}
+			const organizationCreatedAt = managedOrganizationDate(
+				lifecycle.organization.createdAt,
+				"Organization creation time",
+			);
+			const ownerCreatedAt = managedOrganizationDate(
+				lifecycle.owner.createdAt,
+				"Owner creation time",
+			);
+			const ownerUpdatedAt = managedOrganizationDate(
+				lifecycle.owner.updatedAt,
+				"Owner update time",
+			);
+			const authorizationRevision = managedOrganizationRevision(
+				lifecycle.authorizationRevision,
+			);
+			const owner: Principal = {
+				id: ownerId,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				email: email.toLowerCase(),
+				name: ownerName ?? email,
+				status: "active",
+				createdAt: ownerCreatedAt.toISOString(),
+				updatedAt: ownerUpdatedAt.toISOString(),
+			};
+			const organization: Organization = {
+				id: organizationId,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				name,
+				slug,
+				status: "active",
+				createdAt: organizationCreatedAt.toISOString(),
+				updatedAt: organizationCreatedAt.toISOString(),
+			};
+
+			await mutateCoordinatedInExistingTransaction(
+				input.store,
+				lifecycle.transaction,
+				async ({ data, principals, topology, appendAudit }) => {
+					let principal: Principal;
+					if (principals) {
+						const byEmail = await principals.findActiveByEmail({
+							scope,
+							email: owner.email,
+						});
+						if (byEmail && byEmail.id !== owner.id) {
+							throw new ClearanceError({ code: "IDENTITY_EMAIL_CONFLICT", message: "Owner email is already bound to another principal", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						const existing = await principals.getById({
+							scope,
+							id: owner.id,
+							includeDeleted: true,
+						});
+						if (existing) {
+							const updated = await principals.update(
+								{
+									...owner,
+									createdAt: existing.createdAt,
+									updatedAt: advancingPrincipalUpdatedAt(owner.updatedAt, existing.updatedAt),
+								},
+								{ expectedUpdatedAt: existing.updatedAt },
+							);
+							if (!updated) throw new ClearanceError({ code: "IDENTITY_CONFLICT", message: "Owner changed while creating organization", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+							principal = updated;
+						} else {
+							principal = await principals.insert(owner);
+						}
+					} else {
+						const existing = data.principals.find((candidate) => candidate.id === owner.id);
+						if (existing && (existing.projectId !== scope.projectId || existing.environmentId !== scope.environmentId)) {
+							throw new ClearanceError({ code: "IDENTITY_SCOPE_CONFLICT", message: "Owner id is already bound to another scope", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						const byEmail = data.principals.find((candidate) => candidate.status !== "deleted" && candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.email.toLowerCase() === owner.email);
+						if (byEmail && byEmail.id !== owner.id) {
+							throw new ClearanceError({ code: "IDENTITY_EMAIL_CONFLICT", message: "Owner email is already bound to another principal", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						if (existing) {
+							Object.assign(existing, { ...owner, createdAt: existing.createdAt });
+							principal = existing;
+						} else {
+							data.principals.push(owner);
+							principal = owner;
+						}
+					}
+
+					let managedOrganization: Organization;
+					if (topology) {
+						await requireTopologyScope(topology, scope, MANAGED_ORGANIZATION_STAGE);
+						const existing = await topology.lockOrganization({ scope, id: organization.id });
+						if (await topology.organizationIdExists(organization.id) && !existing) {
+							throw new ClearanceError({ code: "ORGANIZATION_SCOPE_CONFLICT", message: "Organization id is already bound to another scope", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						const slugConflict = await topology.getOrganizationBySlug({ scope, slug: organization.slug });
+						if (slugConflict && slugConflict.id !== organization.id) {
+							throw new ClearanceError({ code: "ORG_SLUG_EXISTS", message: "Organization slug is already in use", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						if (existing && (existing.name !== organization.name || existing.slug !== organization.slug || existing.status !== "active")) {
+							throw new ClearanceError({ code: "ORGANIZATION_CONFLICT", message: "Organization id is already bound to different values", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						managedOrganization = existing ?? await topology.upsertOrganization(organization);
+					} else {
+						const existing = data.organizations.find((candidate) => candidate.id === organization.id);
+						if (existing && (existing.projectId !== scope.projectId || existing.environmentId !== scope.environmentId || existing.name !== organization.name || existing.slug !== organization.slug || existing.status !== "active")) {
+							throw new ClearanceError({ code: "ORGANIZATION_CONFLICT", message: "Organization id is already bound to different values", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						}
+						const slugConflict = data.organizations.find((candidate) => candidate.id !== organization.id && candidate.status !== "archived" && candidate.projectId === scope.projectId && candidate.environmentId === scope.environmentId && candidate.slug === organization.slug);
+						if (slugConflict) throw new ClearanceError({ code: "ORG_SLUG_EXISTS", message: "Organization slug is already in use", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+						if (existing) managedOrganization = existing;
+						else {
+							data.organizations.push(organization);
+							managedOrganization = organization;
+						}
+					}
+
+					const byMembershipId = data.memberships.find((membership) => membership.id === ownerMembershipId);
+					if (byMembershipId && (byMembershipId.organizationId !== managedOrganization.id || byMembershipId.principalId !== principal.id)) {
+						throw new ClearanceError({ code: "MEMBERSHIP_ID_CONFLICT", message: "Owner membership id is already bound to another identity", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+					}
+					const activeMembership = data.memberships.find((membership) => membership.organizationId === managedOrganization.id && membership.principalId === principal.id && membership.status === "active");
+					if (activeMembership && activeMembership.id !== ownerMembershipId) {
+						throw new ClearanceError({ code: "MEMBERSHIP_ID_CONFLICT", message: "Owner membership id does not match the runtime membership", stage: MANAGED_ORGANIZATION_STAGE, status: 409 });
+					}
+					if (activeMembership) {
+						activeMembership.role = "owner";
+					} else if (byMembershipId) {
+						byMembershipId.status = "active";
+						byMembershipId.role = "owner";
+						byMembershipId.updatedAt = organization.updatedAt;
+					} else {
+						data.memberships.push({ id: ownerMembershipId, organizationId: managedOrganization.id, principalId: principal.id, role: "owner", status: "active", source: "manual", createdAt: organization.createdAt, updatedAt: organization.updatedAt });
+					}
+					appendAudit({
+						actor: principal.id,
+						action: "orgs.create.runtime_managed",
+						subjectType: "organization",
+						subjectId: managedOrganization.id,
+						outcome: "success",
+						source: "system",
+						organizationId: managedOrganization.id,
+						projectId: scope.projectId,
+						environmentId: scope.environmentId,
+						message: "Committed runtime-managed organization creation",
+						metadata: { ownerPrincipalId: principal.id, ownerMembershipId, authorizationRevision },
+					});
+				},
+			);
+		},
+		async refreshAfterCommit() {
+			await input.store.refresh();
+		},
+	});
+}
+
+function tenantSsoConnection(
+	connection: IdentityConnection,
+): TenantProductSsoConnection {
+	if (connection.protocol !== "saml" && connection.protocol !== "oidc") {
+		throw new ClearanceError({
+			code: "SSO_NOT_FOUND",
+			message: "SSO connection not found",
+			stage: "tenant.enterprise.sso.redact",
+			status: 404,
+		});
+	}
+	return Object.freeze({
+		id: connection.id,
+		organizationId: connection.organizationId,
+		protocol: connection.protocol,
+		provider: connection.provider,
+		status: connection.status,
+		domains: Object.freeze([...connection.domains]),
+		...(connection.issuer ? { issuer: connection.issuer } : {}),
+		...(connection.audience ? { audience: connection.audience } : {}),
+		...(connection.metadataUrl ? { metadataUrl: connection.metadataUrl } : {}),
+		...(connection.clientId ? { clientId: connection.clientId } : {}),
+		...(connection.clientSecretFingerprint
+			? { clientSecretFingerprint: connection.clientSecretFingerprint }
+			: {}),
+		hasClientSecret: Boolean(connection.clientSecretFingerprint),
+		...(connection.samlEntryPoint
+			? { samlEntryPoint: connection.samlEntryPoint }
+			: {}),
+		...(connection.samlCertificateFingerprint
+			? { samlCertificateFingerprint: connection.samlCertificateFingerprint }
+			: {}),
+		attributeMapping: Object.freeze({ ...connection.attributeMapping }),
+		createdAt: connection.createdAt,
+		updatedAt: connection.updatedAt,
+	});
+}
+
+function tenantScimConnection(
+	connection: DirectoryConnection,
+): TenantProductScimConnection {
+	return Object.freeze({
+		id: connection.id,
+		organizationId: connection.organizationId,
+		provider: connection.provider,
+		status: connection.status,
+		endpoint: connection.endpoint,
+		...(connection.bearerTokenFingerprint
+			? { bearerTokenFingerprint: connection.bearerTokenFingerprint }
+			: {}),
+		hasBearerToken: Boolean(connection.bearerTokenFingerprint),
+		deprovisioningPolicy: connection.deprovisioningPolicy,
+		createdAt: connection.createdAt,
+		updatedAt: connection.updatedAt,
+	});
+}
+
+function tenantAuditEvent(event: AuditEvent): TenantProductAuditEvent {
+	return Object.freeze({
+		id: event.id,
+		correlationId: event.correlationId,
+		organizationId: event.organizationId ?? "",
+		actor: event.actor,
+		action: event.action,
+		...(event.subjectType ? { subjectType: event.subjectType } : {}),
+		...(event.subjectId ? { subjectId: event.subjectId } : {}),
+		outcome: event.outcome,
+		source: event.source,
+		message: event.message,
+		metadata: Object.freeze(redactRecord(event.metadata) ?? {}),
+		createdAt: event.createdAt,
+	});
+}
+
+function tenantEnterpriseStateFingerprint(
+	store: ManagementStore,
+	organizationId: string,
+): string {
+	return enterpriseReadinessStateFingerprint(store.snapshot, organizationId);
+}
+
+function tenantMutationGuard(
+	scope: TenantProductScope,
+	actorId: string,
+	expectedOrganizationId: string,
+	replayCipher?: () => ScimOperationReplayCipher,
+	credentialCipher?: () => CredentialCipher,
+	keyManagement?: () => ClearanceKeyManagementFacade,
+	scimRuntime?: () => Readonly<{
+		origin: string;
+		handler(request: Request): Promise<Response>;
+	}>,
+) {
+	return Object.freeze({
+		...(replayCipher ? { replayCipher: replayCipher() } : {}),
+		...(credentialCipher ? { credentialCipher: credentialCipher() } : {}),
+		...(keyManagement ? { runtimeKeyManagement: keyManagement() } : {}),
+		...(scimRuntime ? { scimRuntime: scimRuntime() } : {}),
+		async authorizeMutation(input: {
+			organizationId: string;
+			query: ManagementCoordinatedQuery;
+		}) {
+			if (input.organizationId !== expectedOrganizationId) {
+				throw new ClearanceError({
+					code: "TENANT_ENTERPRISE_RESOURCE_NOT_FOUND",
+					message: "Enterprise connection not found",
+					stage: "tenant.enterprise.authorization",
+					status: 404,
+				});
+			}
+			const authorization = requireAuthorizationFacade(
+				scope,
+				"tenant.enterprise.authorization",
+			);
+			// Enterprise services call this guard before they lock topology/runtime
+			// state. Keep the tenant, membership, archive, and settlement order
+			// identical: normalized authorization advisory lock first.
+			await authorization.acquireMutationLock(
+				authorizationTransaction(input.query),
+			);
+			const effective = await authorization.readEffective({
+				organizationId: input.organizationId,
+				subject: { kind: "principal", id: actorId },
+				transaction: authorizationTransaction(input.query),
+			});
+			if (!effective.actions.includes("organization:update")) {
+				throw new ClearanceError({
+					code: "TENANT_AUTHORIZATION_REQUIRED",
+					message: "Tenant authorization is required",
+					stage: "tenant.enterprise.authorization",
+					status: 403,
+				});
+			}
+		},
+	});
+}
+
+/**
+ * Construct the server-only tenant facade against one immutable management
+ * product scope. It deliberately accepts no client-selected scope and returns
+ * only redacted projections. The browser-facing tenant plugin independently
+ * re-reads signed-session authorization immediately before invoking it.
+ */
+export function createTenantProductAdministrationFacade(input: Readonly<{
+	store: ManagementStore;
+	scope: TenantProductScope;
+	replayCipher?: () => ScimOperationReplayCipher;
+	keyManagement?: () => ClearanceKeyManagementFacade;
+	/** Exact hosted auth runtime for tenant SCIM connection checks. */
+	scimRuntime?: () => Readonly<{
+		origin: string;
+		handler(request: Request): Promise<Response>;
+	}>;
+}>): TenantProductAdministrationFacade {
+	const scope = requireTenantProductScope(input.scope);
+	const keyManagement = () => input.keyManagement?.() ?? getAuthBundle().keyManagement;
+	const replayCipher = input.replayCipher ?? (() =>
+		createScimOperationReplayCipher(keyManagement()));
+	const credentialCipher = () =>
+		createKeyManagedCredentialCipher(keyManagement(), "oidc-client-secret");
+	const scimCredentialCipher = () =>
+		createKeyManagedCredentialCipher(keyManagement(), "scim-bearer-token");
+	const organization = async (organizationId: string) => {
+		await input.store.refresh();
+		const current = input.store.storeV2Topology?.authoritative
+			? await input.store.storeV2Topology.getOrganization({
+				scope,
+				id: organizationId,
+			})
+			: input.store.snapshot.organizations.find(
+				(candidate) =>
+					candidate.id === organizationId &&
+					candidate.projectId === scope.projectId &&
+					candidate.environmentId === scope.environmentId,
+			);
+		if (!current || current.status === "archived") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "tenant.enterprise.scope",
+				status: 404,
+			});
+		}
+		return current;
+	};
+
+	const facade: TenantProductAdministrationFacade = {
+		async listAudit({ organizationId, limit, cursor, action }) {
+			await organization(organizationId);
+			const page = await listEventsPageOperational(input.store, {
+				scope,
+				organizationId,
+				...(limit === undefined ? {} : { limit }),
+				...(cursor === undefined ? {} : { cursor }),
+				...(action === undefined ? {} : { action }),
+			});
+			return Object.freeze({
+				events: Object.freeze(
+					page.events
+						.filter((event) => event.organizationId === organizationId)
+						.map(tenantAuditEvent),
+				),
+				nextCursor: page.nextCursor,
+			});
+		},
+		async listSso({ organizationId }) {
+			await organization(organizationId);
+			return Object.freeze(
+				input.store.snapshot.identityConnections
+					.filter((connection) => connection.organizationId === organizationId)
+					.map(tenantSsoConnection),
+			);
+		},
+		async inspectSso({ organizationId, connectionId }) {
+			await organization(organizationId);
+			const connection = input.store.snapshot.identityConnections.find(
+				(candidate) =>
+					candidate.id === connectionId &&
+					candidate.organizationId === organizationId,
+			);
+			if (!connection) {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: "SSO connection not found",
+					stage: "tenant.enterprise.sso.inspect",
+					status: 404,
+				});
+			}
+			return tenantSsoConnection(connection);
+		},
+		async createSso({ organizationId, actorId, ...connection }) {
+			await organization(organizationId);
+			return tenantSsoConnection(
+				await createSsoConnectionReal(input.store, {
+					organizationId,
+					actor: actorId,
+					source: "system",
+					scope,
+					...connection,
+			}, tenantMutationGuard(scope, actorId, organizationId, undefined, credentialCipher, keyManagement)),
+			);
+		},
+		async testSso({ organizationId, actorId, connectionId, mode }) {
+			if (mode && mode !== "simulation") {
+				throw new ClearanceError({ code: "TENANT_TEST_MODE_UNSUPPORTED", message: "Live tenant certification is not configured", stage: "tenant.enterprise.sso.test", status: 422 });
+			}
+			await organization(organizationId);
+			const result = await testSsoConnectionReal(
+				input.store,
+				connectionId,
+				{ actor: actorId, source: "system", scope },
+				tenantMutationGuard(scope, actorId, organizationId, undefined, credentialCipher, keyManagement),
+			);
+			if (result.connection.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: "SSO connection not found",
+					stage: "tenant.enterprise.sso.test",
+					status: 404,
+				});
+			}
+			return Object.freeze({
+				connection: tenantSsoConnection(result.connection),
+				pass: result.pass,
+				mode: result.mode,
+				liveCertified: false,
+				...(result.evidence ? { evidence: result.evidence } : {}),
+			});
+		},
+		async configureSso() {
+			throw new ClearanceError({ code: "TENANT_CONFIGURATION_UNSUPPORTED", message: "Use the protocol-specific enterprise configuration flow", stage: "tenant.enterprise.sso.configure", status: 422 });
+		},
+		async replaceSsoSecret({ organizationId, actorId, connectionId, operationId, newClientSecret }) {
+			await organization(organizationId);
+			const connection = await rotateSsoCredentialAuthoritative(
+				input.store,
+				connectionId,
+				{ actor: actorId, source: "system", scope, operationId, newClientSecret },
+				tenantMutationGuard(scope, actorId, organizationId, undefined, credentialCipher, keyManagement),
+			);
+			if (connection.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: "SSO connection not found",
+					stage: "tenant.enterprise.sso.replace_secret",
+					status: 404,
+				});
+			}
+			return tenantSsoConnection(connection);
+		},
+		async disableSso({ organizationId, actorId, connectionId }) {
+			await organization(organizationId);
+			const result = await disableSsoConnectionReal(
+				input.store,
+				connectionId,
+				{
+					actor: actorId,
+					source: "system",
+					scope,
+				},
+				tenantMutationGuard(scope, actorId, organizationId),
+			);
+			if (result.connection.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SSO_NOT_FOUND",
+					message: "SSO connection not found",
+					stage: "tenant.enterprise.sso.disable",
+					status: 404,
+				});
+			}
+			return Object.freeze({
+				connection: tenantSsoConnection(result.connection),
+				idempotent: result.idempotent,
+				runtimeRemoved: result.runtimeRemoved,
+			});
+		},
+		async listScim({ organizationId }) {
+			await organization(organizationId);
+			return Object.freeze(
+				input.store.snapshot.directoryConnections
+					.filter((connection) => connection.organizationId === organizationId)
+					.map(tenantScimConnection),
+			);
+		},
+		async inspectScim({ organizationId, connectionId }) {
+			await organization(organizationId);
+			const connection = input.store.snapshot.directoryConnections.find(
+				(candidate) =>
+					candidate.id === connectionId &&
+					candidate.organizationId === organizationId,
+			);
+			if (!connection) {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: "SCIM connection not found",
+					stage: "tenant.enterprise.scim.inspect",
+					status: 404,
+				});
+			}
+			return tenantScimConnection(connection);
+		},
+		async createScim({ organizationId, actorId, operationId, provider, endpoint }) {
+			await organization(organizationId);
+			const created = await createScimConnectionReal(
+				input.store,
+				{
+					organizationId,
+					actor: actorId,
+					source: "system",
+					scope,
+					operationId,
+					provider,
+					...(endpoint ? { endpoint } : {}),
+				},
+				tenantMutationGuard(scope, actorId, organizationId, replayCipher, scimCredentialCipher, keyManagement),
+			);
+			const { bearerTokenOnce, ...connection } = created;
+			if (!bearerTokenOnce) {
+				throw new ClearanceError({
+					code: "SCIM_CONNECTION_TOKEN_MISSING",
+					message: "SCIM credential was not issued",
+					stage: "tenant.enterprise.scim.create",
+					status: 500,
+				});
+			}
+			return Object.freeze({
+				connection: tenantScimConnection(connection),
+				bearerTokenOnce,
+			});
+		},
+		async testScim({ organizationId, actorId, connectionId, mode, scenario }) {
+			if (mode && mode !== "simulation") {
+				throw new ClearanceError({ code: "TENANT_TEST_MODE_UNSUPPORTED", message: "Live tenant certification is not configured", stage: "tenant.enterprise.scim.test", status: 422 });
+			}
+			await organization(organizationId);
+			const result = await testScimConnectionReal(
+				input.store,
+				connectionId,
+				{ actor: actorId, source: "system", scope, ...(scenario ? { scenario } : {}) },
+				tenantMutationGuard(scope, actorId, organizationId, undefined, scimCredentialCipher, keyManagement, input.scimRuntime),
+			);
+			if (result.connection.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: "SCIM connection not found",
+					stage: "tenant.enterprise.scim.test",
+					status: 404,
+				});
+			}
+			return Object.freeze({
+				connection: tenantScimConnection(result.connection),
+				pass: result.pass,
+				mode: result.mode,
+				liveCertified: result.externalProviderCertified,
+				...(result.evidence ? { evidence: result.evidence } : {}),
+			});
+		},
+		async configureScim() {
+			throw new ClearanceError({ code: "TENANT_CONFIGURATION_UNSUPPORTED", message: "Use the SCIM configuration flow", stage: "tenant.enterprise.scim.configure", status: 422 });
+		},
+		async rotateScim({ organizationId, actorId, connectionId, operationId }) {
+			await organization(organizationId);
+			const rotated = await rotateScimCredentialAuthoritative(
+				input.store,
+				connectionId,
+				{ actor: actorId, source: "system", scope, operationId },
+				tenantMutationGuard(scope, actorId, organizationId, replayCipher, scimCredentialCipher, keyManagement),
+			);
+			if (rotated.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: "SCIM connection not found",
+					stage: "tenant.enterprise.scim.rotate",
+					status: 404,
+				});
+			}
+			const { bearerTokenOnce, ...connection } = rotated;
+			return Object.freeze({
+				connection: tenantScimConnection(connection),
+				...(bearerTokenOnce ? { bearerTokenOnce } : {}),
+				replayed: rotated.replayed,
+			});
+		},
+		async disableScim({ organizationId, actorId, connectionId }) {
+			await organization(organizationId);
+			const result = await disableScimConnectionReal(
+				input.store,
+				connectionId,
+				{
+					actor: actorId,
+					source: "system",
+					scope,
+				},
+				tenantMutationGuard(scope, actorId, organizationId, undefined, scimCredentialCipher, keyManagement),
+			);
+			if (result.connection.organizationId !== organizationId) {
+				throw new ClearanceError({
+					code: "SCIM_NOT_FOUND",
+					message: "SCIM connection not found",
+					stage: "tenant.enterprise.scim.disable",
+					status: 404,
+				});
+			}
+			return Object.freeze({
+				connection: tenantScimConnection(result.connection),
+				idempotent: result.idempotent,
+				runtimeRemoved: result.runtimeRemoved,
+			});
+		},
+		async readiness({ organizationId }) {
+			await organization(organizationId);
+			const stateFingerprint = tenantEnterpriseStateFingerprint(
+				input.store,
+				organizationId,
+			);
+			try {
+				const report = getLatestReadiness(input.store, organizationId);
+				return Object.freeze({
+					...report,
+					stateFingerprint,
+				}) as TenantProductReadiness;
+			} catch (error) {
+				if (!(error instanceof ClearanceError) || error.code !== "READINESS_NOT_FOUND") {
+					throw error;
+				}
+				return Object.freeze({
+					id: `readiness_not_run_${organizationId}`,
+					organizationId,
+					generatedAt: new Date(0).toISOString(),
+					overall: "blocked" as const,
+					conformance: Object.freeze({
+						mode: "simulation" as const,
+						liveCertified: false,
+						note: "Enterprise readiness has not been run for the current state",
+					}),
+					checks: Object.freeze([Object.freeze({
+						id: "enterprise.readiness.not_run",
+						name: "Enterprise readiness",
+						status: "fail" as const,
+						detail: "Run an enterprise test after configuring SSO or SCIM",
+					})]),
+					remainingCustomerActions: Object.freeze([
+						"Run an enterprise connection test to establish current readiness",
+					]),
+					signature: stateFingerprint,
+					state: "not_run" as const,
+					stateFingerprint,
+				}) as TenantProductReadiness;
+			}
+		},
+	};
+	return Object.freeze(facade);
+}
+
+function unavailableTenantProductAdministrationFacade(): TenantProductAdministrationFacade {
+	const unavailable = async (): Promise<never> => {
+		throw new ClearanceError({
+			code: "TENANT_PRODUCT_ADMINISTRATION_UNAVAILABLE",
+			message: "Tenant product administration is unavailable until the canonical management store is registered",
+			stage: "tenant.enterprise.unavailable",
+			status: 503,
+		});
+	};
+	return Object.freeze({
+		listAudit: unavailable,
+		listSso: unavailable,
+		inspectSso: unavailable,
+		createSso: unavailable,
+		testSso: unavailable,
+		configureSso: unavailable,
+		replaceSsoSecret: unavailable,
+		disableSso: unavailable,
+		listScim: unavailable,
+		inspectScim: unavailable,
+		createScim: unavailable,
+		testScim: unavailable,
+		configureScim: unavailable,
+		rotateScim: unavailable,
+		disableScim: unavailable,
+		readiness: unavailable,
+	});
+}
+
+/**
+ * Register the only management facade that an auth bundle may embed. This is
+ * intentionally a startup operation: changing it after route construction
+ * would let a process mix two product scopes. Call before getAuthBundle().
+ */
+export function registerTenantProductAdministrationFacade(input: Readonly<{
+	store: ManagementStore;
+	scope: TenantProductScope;
+}>): void {
+	if (bundle) {
+		throw new Error(
+			"Tenant product administration must be registered before the auth bundle is created",
+		);
+	}
+	tenantProductAdministration = createTenantProductAdministrationFacade(input);
+	managedOrganizationLifecycle = createManagedOrganizationLifecycleFacade(input);
+}
+
+function unavailableManagedOrganizationLifecycleFacade(): ManagedOrganizationLifecycleFacade {
+	const unavailable = async (): Promise<never> => {
+		throw new ClearanceError({
+			code: "MANAGED_ORGANIZATION_LIFECYCLE_UNAVAILABLE",
+			message: "Managed organization lifecycle is unavailable until the canonical management store is registered",
+			stage: MANAGED_ORGANIZATION_STAGE,
+			status: 503,
+		});
+	};
+	return Object.freeze({
+		finalizeCreatedOrganization: unavailable,
+		refreshAfterCommit: async () => undefined,
+	});
 }
 
 export function getAuthBundle(): ClearanceAuthBundle {
@@ -200,7 +1148,11 @@ export function getAuthBundle(): ClearanceAuthBundle {
 	}
 	const baseURL = process.env.CLEARANCE_BASE_URL ?? "http://localhost:3300";
 	const credentialAuthority = credentialAuthorityRuntimeOptions();
-	bundle = createClearanceAuth({
+	const productAdministration =
+		tenantProductAdministration ?? unavailableTenantProductAdministrationFacade();
+	const organizationLifecycle =
+		managedOrganizationLifecycle ?? unavailableManagedOrganizationLifecycleFacade();
+	bundle = createClearanceManagementAuth({
 		baseURL,
 		secret,
 		databaseUrl,
@@ -213,21 +1165,425 @@ export function getAuthBundle(): ClearanceAuthBundle {
 			: {}),
 		...authenticationPolicyRuntimeOptions(credentialAuthority.generation),
 		...keyManagementRuntimeOptions(),
+		tenantProductAdministration: productAdministration,
+		managedOrganizationLifecycle: organizationLifecycle,
 	});
 	return bundle;
 }
 
-/** Test helper — reset singleton between suites */
-export function resetAuthBundle(): void {
+function hostedOrigin(input: Pick<HostedAuthBundleInput, "origin" | "hostname">): {
+	origin: string;
+	hostname: string;
+} {
+	if (typeof input.origin !== "string" || typeof input.hostname !== "string") {
+		throw new Error("Hosted auth origin and hostname must be strings");
+	}
+	if (!input.hostname || input.hostname !== input.hostname.toLowerCase()) {
+		throw new Error("Hosted auth hostname must be exact lowercase");
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(input.origin);
+	} catch {
+		throw new Error("Hosted auth origin must be an exact origin URL");
+	}
+	if (parsed.origin !== input.origin || parsed.hostname !== input.hostname) {
+		throw new Error("Hosted auth origin must exactly match the supplied lowercase hostname");
+	}
+	const loopback =
+		parsed.hostname === "localhost" ||
+		parsed.hostname === "127.0.0.1" ||
+		parsed.hostname === "[::1]";
+	if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+		throw new Error("Hosted auth origin must use HTTPS, except explicit loopback HTTP");
+	}
+	return Object.freeze({ origin: parsed.origin, hostname: parsed.hostname });
+}
+
+function hostedVersion(value: string | number, label: string): string | number {
+	if (typeof value === "string" && value.trim() === value && value.length > 0) {
+		return value;
+	}
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	throw new Error(`${label} must be a nonempty version`);
+}
+
+function hostedRuntimeConfiguration(): Readonly<{
+	databaseUrl: string;
+	secret: string;
+}> {
+	const databaseUrl = process.env.DATABASE_URL;
+	if (!databaseUrl) {
+		throw new Error("DATABASE_URL is required for hosted auth runtime");
+	}
+	const secret = process.env.CLEARANCE_SECRET;
+	assertProductionSecret(secret);
+	if (!secret || secret.length < 16) {
+		throw new Error("CLEARANCE_SECRET missing or too short for hosted auth runtime (min 16 chars)");
+	}
+	if (
+		(process.env.NODE_ENV === "production" || process.env.CLEARANCE_STRICT_SECRETS === "1") &&
+		isForbiddenDefaultSecret(secret)
+	) {
+		throw new Error("Refusing default CLEARANCE_SECRET for hosted auth runtime");
+	}
+	return Object.freeze({ databaseUrl, secret });
+}
+
+function hostedKeyManagementRuntimeOptions(
+	scope: TenantProductScope,
+): Pick<Parameters<typeof createClearanceManagementAuth>[0], "keyManagement"> {
+	const runtime = keyManagementRuntimeOptions();
+	if (!runtime.keyManagement) return {};
+	return {
+		keyManagement: {
+			...runtime.keyManagement,
+			projectId: scope.projectId,
+			environmentId: scope.environmentId,
+		},
+	};
+}
+
+function hostedAuthBundleRecord(
+	identity: string,
+	bundle: ClearanceAuthBundle,
+): HostedAuthBundleRecord {
+	let resolveDestruction: (() => void) | undefined;
+	let rejectDestruction: ((error: unknown) => void) | undefined;
+	const destruction = new Promise<void>((resolve, reject) => {
+		resolveDestruction = resolve;
+		rejectDestruction = reject;
+	});
+	// Destruction normally happens after the caller has finished. Attach a
+	// handler now so a teardown error is reported by the owning operation,
+	// rather than becoming an unhandled rejection in the interim.
+	void destruction.catch(() => undefined);
+	return {
+		identity,
+		bundle,
+		leases: 0,
+		retired: false,
+		destruction,
+		resolveDestruction: resolveDestruction!,
+		rejectDestruction: rejectDestruction!,
+		destroyStarted: false,
+	};
+}
+
+function destroyRetiredHostedBundle(record: HostedAuthBundleRecord): void {
+	if (!record.retired || record.leases !== 0 || record.destroyStarted) return;
+	record.destroyStarted = true;
+	void record.bundle.destroy().then(
+		() => {
+			retiredHostedAuthBundles.delete(record);
+			record.resolveDestruction();
+		},
+		(error: unknown) => {
+			// Keep a failed retirement visible until closeHostedAuthBundles has
+			// observed and reported it. Otherwise a request-release rejection can
+			// make a later shutdown incorrectly look clean.
+			record.rejectDestruction(error);
+		},
+	);
+}
+
+function retireHostedBundle(record: HostedAuthBundleRecord): void {
+	if (record.retired) return;
+	record.retired = true;
+	retiredHostedAuthBundles.add(record);
+	destroyRetiredHostedBundle(record);
+}
+
+function retireAuthBundle(current: ClearanceAuthBundle): void {
+	const destruction = current.destroy();
+	retiringAuthBundles.add(destruction);
+	void destruction.then(
+		() => retiringAuthBundles.delete(destruction),
+		() => {
+			// A failed singleton teardown is shutdown work, not a fire-and-forget
+			// diagnostic. Keep it tracked until closeAuthBundle reports it.
+		},
+	);
+	void destruction.catch(() => undefined);
+}
+
+function invalidateHostedAuthBundles(): void {
+	hostedAuthGeneration += 1;
+	const active = [...hostedAuthBundles.values()];
+	hostedAuthBundles.clear();
+	for (const record of active) retireHostedBundle(record);
+}
+
+function removeHostedBundlesForIdentity(identity: string): void {
+	const retired = [...hostedAuthBundles.entries()].filter(
+		([, record]) => record.identity === identity,
+	);
+	for (const [key] of retired) hostedAuthBundles.delete(key);
+	for (const [, record] of retired) retireHostedBundle(record);
+}
+
+function evictHostedBundles(): void {
+	while (hostedAuthBundles.size > MAX_HOSTED_AUTH_BUNDLES) {
+		const oldest = hostedAuthBundles.entries().next().value as
+			| [string, HostedAuthBundleRecord]
+			| undefined;
+		if (!oldest) return;
+		hostedAuthBundles.delete(oldest[0]);
+		retireHostedBundle(oldest[1]);
+	}
+}
+
+async function resolveHostedAuthBundle(
+	input: HostedAuthBundleInput,
+): Promise<HostedAuthBundleRecord> {
+	const host = hostedOrigin(input);
+	const scope = requireTenantProductScope(input.scope);
+	if (input.store.backend !== "postgres") {
+		throw new Error("Hosted auth requires a Postgres management store");
+	}
+	if (
+		typeof input.productLabel !== "string" ||
+		!input.productLabel.trim() ||
+		input.productLabel.trim() !== input.productLabel
+	) {
+		throw new Error("Hosted auth productLabel must be nonempty and trimmed");
+	}
+	const presentationVersion = hostedVersion(
+		input.presentationVersion,
+		"Hosted auth presentationVersion",
+	);
+	const domainVersion = hostedVersion(input.domainVersion, "Hosted auth domainVersion");
+	const storeOwner = hostedAuthStoreOwner(input.store);
+	const identity = JSON.stringify([
+		storeOwner,
+		host.origin,
+		scope.projectId,
+		scope.environmentId,
+	]);
+	const cacheKey = JSON.stringify([
+		storeOwner,
+		host.origin,
+		scope.projectId,
+		scope.environmentId,
+		domainVersion,
+		presentationVersion,
+	]);
+	const cached = hostedAuthBundles.get(cacheKey);
+	if (cached) {
+		hostedAuthBundles.delete(cacheKey);
+		hostedAuthBundles.set(cacheKey, cached);
+		return cached;
+	}
+	const concurrent = hostedAuthCreations.get(cacheKey);
+	if (concurrent) {
+		const record = await concurrent;
+		if (!record.retired) return record;
+		// Invalidation can retire a creation before its creator runs cleanup.
+		// Remove only this exact stale promise before retrying, so a replacement
+		// creation for the same identity remains serialized behind its chain.
+		if (hostedAuthCreations.get(cacheKey) === concurrent) {
+			hostedAuthCreations.delete(cacheKey);
+		}
+		return resolveHostedAuthBundle(input);
+	}
+
+	const generation = hostedAuthGeneration;
+	const previous = hostedAuthChains.get(identity) ?? Promise.resolve();
+	const creation = previous.catch(() => undefined).then(() => {
+		const ready = hostedAuthBundles.get(cacheKey);
+		if (ready) return ready;
+		removeHostedBundlesForIdentity(identity);
+		const { databaseUrl, secret } = hostedRuntimeConfiguration();
+		const credentialAuthority = credentialAuthorityRuntimeOptions();
+		let created!: ClearanceAuthBundle;
+		created = createClearanceManagementAuth({
+			baseURL: host.origin,
+			trustedOrigins: [host.origin],
+			passkeys: {
+				rpID: host.hostname,
+				rpName: input.productLabel,
+				origin: [host.origin],
+			},
+			secret,
+			databaseUrl,
+			enableSso: true,
+			enableScim: true,
+			credentialAuthority,
+			runtimeAudit: scope,
+			authenticationPolicy: scope,
+			authorization: scope,
+			...hostedKeyManagementRuntimeOptions(scope),
+				tenantProductAdministration: createTenantProductAdministrationFacade({
+				store: input.store,
+				scope,
+				keyManagement: () => created.keyManagement,
+				replayCipher: () =>
+					createScimOperationReplayCipher(created.keyManagement),
+				scimRuntime: () => Object.freeze({
+					origin: host.origin,
+					handler: (request: Request) => created.auth.handler(request),
+				}),
+				}),
+				managedOrganizationLifecycle: createManagedOrganizationLifecycleFacade({
+					store: input.store,
+					scope,
+				}),
+			});
+		const record = hostedAuthBundleRecord(identity, created);
+		if (generation !== hostedAuthGeneration) {
+			retireHostedBundle(record);
+			return record;
+		}
+		hostedAuthBundles.set(cacheKey, record);
+		evictHostedBundles();
+		return record;
+	});
+	const chain = creation.then(() => undefined, () => undefined);
+	hostedAuthCreations.set(cacheKey, creation);
+	hostedAuthChains.set(identity, chain);
+	let record: HostedAuthBundleRecord;
+	try {
+		record = await creation;
+	} finally {
+		if (hostedAuthCreations.get(cacheKey) === creation) {
+			hostedAuthCreations.delete(cacheKey);
+		}
+		if (hostedAuthChains.get(identity) === chain) {
+			hostedAuthChains.delete(identity);
+		}
+	}
+	return record!.retired ? resolveHostedAuthBundle(input) : record!;
+}
+
+/**
+ * Returns one process-local hosted runtime bound to an exact host and product
+ * scope. The host must bump a supplied domain or presentation version when its
+ * static auth presentation changes. Request dispatch should use
+ * acquireHostedAuthBundle so retirement can wait for active handlers.
+ */
+export async function getHostedAuthBundle(
+	input: HostedAuthBundleInput,
+): Promise<ClearanceAuthBundle> {
+	return (await resolveHostedAuthBundle(input)).bundle;
+}
+
+/**
+ * Acquires a hosted runtime for one request. A retired runtime is removed from
+ * lookup immediately, but its pool remains available until every lease ends.
+ */
+export async function acquireHostedAuthBundle(
+	input: HostedAuthBundleInput,
+): Promise<HostedAuthBundleLease> {
+	const record = await resolveHostedAuthBundle(input);
+	if (record.retired) return acquireHostedAuthBundle(input);
+	record.leases += 1;
+	let released = false;
+	return Object.freeze({
+		bundle: record.bundle,
+		release: async () => {
+			if (released) return;
+			released = true;
+			record.leases -= 1;
+			if (record.leases < 0) {
+				throw new Error("Hosted auth bundle lease released more than once");
+			}
+			if (record.retired && record.leases === 0) {
+				destroyRetiredHostedBundle(record);
+				await record.destruction;
+			}
+		},
+	});
+}
+
+/** Test-only lifecycle observation for bounded-cache regression coverage. */
+export function hostedAuthBundleCacheStateForTesting(): Readonly<{
+	cached: number;
+	serializations: number;
+	retired: number;
+}> {
+	return Object.freeze({
+		cached: hostedAuthBundles.size,
+		serializations: hostedAuthChains.size,
+		retired: retiredHostedAuthBundles.size,
+	});
+}
+
+/** Explicit startup-only migration/readiness gate for a canonical hosted bundle. */
+export async function prepareHostedAuthBundle(
+	hostedBundle: ClearanceAuthBundle,
+): Promise<void> {
+	if (credentialAuthorityRuntimeOptions().generation === "legacy-v1") {
+		await hostedBundle.prepareCredentialAuthorityRuntime();
+		return;
+	}
+	await hostedBundle.migrate();
+}
+
+/** Release every cached hosted runtime. Intended for host shutdown and tests. */
+export async function closeHostedAuthBundles(): Promise<void> {
+	await Promise.allSettled([...hostedAuthCreations.values()]);
+	const retired = [...hostedAuthBundles.values()];
+	hostedAuthBundles.clear();
+	hostedAuthChains.clear();
+	for (const record of retired) retireHostedBundle(record);
+	const settled = await Promise.allSettled(
+		[...retiredHostedAuthBundles].map((record) => record.destruction),
+	);
+	// Every observed retired record is now terminal. Clear it only after the
+	// settle result has been captured so a subsequent host close can retry.
+	for (const record of [...retiredHostedAuthBundles]) {
+		if (record.destroyStarted && record.leases === 0) {
+			retiredHostedAuthBundles.delete(record);
+		}
+	}
+	const failures = settled
+		.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+		.map((result) => result.reason);
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) {
+		throw new AggregateError(failures, "Hosted auth bundle teardown failed");
+	}
+}
+
+/**
+ * Internal runtime invalidation for post-commit configuration changes. It
+ * removes current runtimes from lookup immediately, while leased hosted
+ * bundles are destroyed only after their request handler releases them.
+ */
+export function invalidateAuthBundles(): void {
+	const current = bundle;
 	bundle = null;
+	if (current) retireAuthBundle(current);
+	invalidateHostedAuthBundles();
+}
+
+/** Test helper — reset singleton between suites, including every owned pool. */
+export async function resetAuthBundle(): Promise<void> {
+	await closeAuthBundle();
+	tenantProductAdministration = undefined;
+	managedOrganizationLifecycle = undefined;
 }
 
 /** Release the shared runtime pool for short-lived callers such as the CLI. */
 export async function closeAuthBundle(): Promise<void> {
-	if (!bundle) return;
 	const current = bundle;
 	bundle = null;
-	await current.destroy();
+	if (current) retireAuthBundle(current);
+	const retiring = [...retiringAuthBundles];
+	const settled = await Promise.allSettled([
+		...retiring,
+		closeHostedAuthBundles(),
+	]);
+	for (const destruction of retiring) retiringAuthBundles.delete(destruction);
+	const failures = settled
+		.filter(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		)
+		.map((result) => result.reason);
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) {
+		throw new AggregateError(failures, "Auth bridge teardown failed");
+	}
 }
 
 export async function ensureAuthMigrated(): Promise<void> {
@@ -578,6 +1934,28 @@ export async function ensureOperatorUser(): Promise<string> {
 	return user.id;
 }
 
+async function ensureOperatorUserInTransaction(
+	query: ManagementCoordinatedQuery,
+): Promise<string> {
+	const email = "operator@clearance.local";
+	const existing = await query(`select id from "user" where email = $1 limit 1`, [email]);
+	if (existing.rows[0]?.id) return existing.rows[0].id as string;
+	const id = newId("user");
+	const now = new Date();
+	try {
+		await query(
+			`insert into "user" (id, email, name, "emailVerified", image, "createdAt", "updatedAt") values ($1, $2, $3, false, null, $4, $4)`,
+			[id, email, "Clearance Operator", now],
+		);
+		return id;
+	} catch (error) {
+		if (!isUniqueViolation(error)) throw error;
+		const raced = await query(`select id from "user" where email = $1 limit 1`, [email]);
+		if (raced.rows[0]?.id) return raced.rows[0].id as string;
+		throw error;
+	}
+}
+
 function isUniqueViolation(err: unknown): boolean {
 	return (
 		typeof err === "object" &&
@@ -608,6 +1986,7 @@ async function assertSsoRowScope(
 		oidc?: { clientId: string; clientSecret: string };
 		saml?: { entryPoint: string; cert: string; audience?: string };
 	},
+	keyManagement: ClearanceKeyManagementFacade = getAuthBundle().keyManagement,
 ): Promise<void> {
 	const org = input.organizationId ?? null;
 	const rowOrg = row.organizationId ?? null;
@@ -658,12 +2037,11 @@ async function assertSsoRowScope(
 				status: 409,
 			});
 		}
-		const b = getAuthBundle();
 		const ciphertext = storedSecret.slice(prefix.length);
 		const decrypted = ciphertext.startsWith("clrkm$v1$")
-			? await b.keyManagement.openText(
+			? await keyManagement.openText(
 					"oidc-client-secret",
-					b.keyManagement.resourceId("oidc-client-secret", {
+					keyManagement.resourceId("oidc-client-secret", {
 						providerId: row.providerId,
 					}),
 					ciphertext,
@@ -733,9 +2111,12 @@ type SsoProviderInput = {
 export async function insertSsoProviderInTransaction(
 	query: ManagementCoordinatedQuery,
 	input: SsoProviderInput,
+	runtimeKeyManagement?: ClearanceKeyManagementFacade,
 ): Promise<{ id: string; clientSecretFingerprint?: string; reused?: boolean }> {
-	const b = getAuthBundle();
-	const userId = await ensureOperatorUser();
+	const keyManagement = runtimeKeyManagement ?? getAuthBundle().keyManagement;
+	const userId = runtimeKeyManagement
+		? await ensureOperatorUserInTransaction(query)
+		: await ensureOperatorUser();
 	const id = input.id ?? newId("sso").replace(/^sso_/, "sso");
 	const secretFp = input.oidc ? fingerprint(input.oidc.clientSecret) : undefined;
 
@@ -772,7 +2153,7 @@ export async function insertSsoProviderInTransaction(
 					status: 409,
 				});
 			}
-			await assertSsoRowScope(existing, input);
+			await assertSsoRowScope(existing, input, keyManagement);
 			return { id: existing.id, clientSecretFingerprint: secretFp, reused: true };
 		}
 	}
@@ -781,9 +2162,9 @@ export async function insertSsoProviderInTransaction(
 	if (input.oidc) {
 		oidcConfig = JSON.stringify({
 			clientId: input.oidc.clientId,
-			clientSecret: `clr-sso:v1:${await b.keyManagement.sealText(
+			clientSecret: `clr-sso:v1:${await keyManagement.sealText(
 				"oidc-client-secret",
-				b.keyManagement.resourceId("oidc-client-secret", {
+				keyManagement.resourceId("oidc-client-secret", {
 					providerId: input.providerId,
 				}),
 				input.oidc.clientSecret,
@@ -823,7 +2204,7 @@ export async function insertSsoProviderInTransaction(
 		const raced =
 			(await loadById(id)) ?? (await loadByProviderId(input.providerId));
 		if (!raced || raced.id !== id) throw err;
-		await assertSsoRowScope(raced, input);
+		await assertSsoRowScope(raced, input, keyManagement);
 		return { id: raced.id, clientSecretFingerprint: secretFp, reused: true };
 	}
 	return {
@@ -870,7 +2251,7 @@ type ScimProviderRow = {
 const SCIM_TOKEN_ENVELOPE_PREFIX = "clr-scim:v1:";
 
 async function openScimBaseToken(
-	b: ClearanceAuthBundle,
+	keyManagement: ClearanceKeyManagementFacade,
 	row: ScimProviderRow,
 ): Promise<string> {
 	const wrapped = row.scimToken.startsWith(SCIM_TOKEN_ENVELOPE_PREFIX);
@@ -881,9 +2262,9 @@ async function openScimBaseToken(
 		throw new Error("Stored SCIM token envelope is invalid");
 	}
 	return stored.startsWith("clrkm$v1$")
-		? b.keyManagement.openText(
+		? keyManagement.openText(
 				"scim-bearer-token",
-				b.keyManagement.resourceId("scim-bearer-token", {
+				keyManagement.resourceId("scim-bearer-token", {
 					providerId: row.providerId,
 					organizationId: row.organizationId,
 				}),
@@ -893,13 +2274,13 @@ async function openScimBaseToken(
 }
 
 async function sealScimBaseToken(
-	b: ClearanceAuthBundle,
+	keyManagement: ClearanceKeyManagementFacade,
 	input: { providerId: string; organizationId?: string },
 	baseToken: string,
 ): Promise<string> {
-	return `${SCIM_TOKEN_ENVELOPE_PREFIX}${await b.keyManagement.sealText(
+	return `${SCIM_TOKEN_ENVELOPE_PREFIX}${await keyManagement.sealText(
 		"scim-bearer-token",
-		b.keyManagement.resourceId("scim-bearer-token", {
+		keyManagement.resourceId("scim-bearer-token", {
 			providerId: input.providerId,
 			organizationId: input.organizationId ?? null,
 		}),
@@ -954,8 +2335,9 @@ type ScimProviderInput = {
 export async function insertScimProviderInTransaction(
 	query: ManagementCoordinatedQuery,
 	input: ScimProviderInput,
+	runtimeKeyManagement?: ClearanceKeyManagementFacade,
 ): Promise<{ id: string; token: string; reused?: boolean }> {
-	const b = getAuthBundle();
+	const keyManagement = runtimeKeyManagement ?? getAuthBundle().keyManagement;
 	const id = input.id ?? newId("scim").replace(/^scim_/, "scim");
 
 	const loadById = async (lookupId: string): Promise<ScimProviderRow | null> => {
@@ -993,7 +2375,7 @@ export async function insertScimProviderInTransaction(
 			}
 			assertScimRowScope(existing, input);
 			// Decrypt only in-memory for one-time handoff reconstruction.
-			const baseToken = await openScimBaseToken(b, existing);
+			const baseToken = await openScimBaseToken(keyManagement, existing);
 			const token = await scimBearerFromStoredBase(
 				baseToken,
 				existing.providerId,
@@ -1009,7 +2391,7 @@ export async function insertScimProviderInTransaction(
 		input.providerId,
 		input.organizationId,
 	);
-	const storedToken = await sealScimBaseToken(b, input, baseToken);
+	const storedToken = await sealScimBaseToken(keyManagement, input, baseToken);
 
 	try {
 		await query(
@@ -1025,7 +2407,7 @@ export async function insertScimProviderInTransaction(
 			(await loadById(id)) ?? (await loadByProviderId(input.providerId));
 		if (!raced || raced.id !== id) throw err;
 		assertScimRowScope(raced, input);
-		const base = await openScimBaseToken(b, raced);
+		const base = await openScimBaseToken(keyManagement, raced);
 		const recovered = await scimBearerFromStoredBase(
 			base,
 			raced.providerId,
@@ -1270,7 +2652,7 @@ export async function applyScimUsersInTransaction(input: {
 		});
 	}
 	const expectedBearer = await scimBearerFromStoredBase(
-		await openScimBaseToken(getAuthBundle(), provider),
+		await openScimBaseToken(getAuthBundle().keyManagement, provider),
 		provider.providerId,
 		provider.organizationId,
 	);
@@ -1956,6 +3338,7 @@ type NormalizedAuthorizationRole = Readonly<{
 
 type NormalizedAuthorizationFacade = Readonly<{
 	scope: Readonly<{ projectId: string; environmentId: string }>;
+	acquireMutationLock(transaction: AuthorizationTransaction): Promise<void>;
 	initializeOrganization(input: {
 		organizationId: string;
 		transaction?: AuthorizationTransaction;
@@ -2044,6 +3427,8 @@ type NormalizedAuthorizationFacade = Readonly<{
 	}): Promise<{ serviceAccount: NormalizedAuthorizationServiceAccount; previousRevision: string; revision: string }>;
 	createServiceAccountCredential(input: {
 		organizationId: string;
+		actorId: string;
+		operationId: string;
 		serviceAccountId: string;
 		credentialId?: string;
 		expiresAt?: Date;
@@ -2051,6 +3436,8 @@ type NormalizedAuthorizationFacade = Readonly<{
 	}): Promise<NormalizedAuthorizationCredentialMutation>;
 	rotateServiceAccountCredential(input: {
 		organizationId: string;
+		actorId: string;
+		operationId: string;
 		serviceAccountId: string;
 		credentialId: string;
 		expiresAt?: Date;
@@ -2084,6 +3471,7 @@ type NormalizedAuthorizationCredentialMutation = Readonly<{
 	secret: string;
 	previousRevision: string;
 	revision: string;
+	replayed: boolean;
 }>;
 
 function authorizationTransaction(query: CoordinatedQuery): AuthorizationTransaction {
@@ -2784,7 +4172,7 @@ async function requireRuntimeUser(
 }> {
 	const r = await query(
 		`select id, email, name, banned, "banReason", "createdAt", "updatedAt"
-     from "user" where id = $1 limit 1`,
+		 from "user" where id = $1 limit 1 for update`,
 		[id],
 	);
 	const row = r.rows[0];
@@ -3415,7 +4803,7 @@ async function requireRuntimeOrg(
 	stage: string,
 ): Promise<{ id: string; name: string; slug: string }> {
 	const r = await query(
-		`select id, name, slug from organization where id = $1 limit 1`,
+		`select id, name, slug from organization where id = $1 limit 1 for update`,
 		[id],
 	);
 	const row = r.rows[0];
@@ -3445,7 +4833,7 @@ async function loadRuntimeMember(
 	const r = await query(
 		`select id, role from member
      where "organizationId" = $1 and "userId" = $2
-     limit 1`,
+		 limit 1 for update`,
 		[organizationId, userId],
 	);
 	const row = r.rows[0];
@@ -3458,7 +4846,7 @@ async function loadRuntimeMemberById(
 	id: string,
 ): Promise<{ id: string; organizationId: string; userId: string; role: string } | null> {
 	const r = await query(
-		`select id, "organizationId", "userId", role from member where id = $1 limit 1`,
+		`select id, "organizationId", "userId", role from member where id = $1 limit 1 for update`,
 		[id],
 	);
 	const row = r.rows[0];
@@ -3507,6 +4895,8 @@ export async function addMemberInAuth(
 	});
 
 	return mutateCoordinated(async ({ data, principals, topology, query }) => {
+		const authorization = requireAuthorizationFacade(scope, stage);
+		await authorization.acquireMutationLock(authorizationTransaction(query));
 		const org = await findCoordinatedOrgInScope(
 			data,
 			topology,
@@ -3738,6 +5128,8 @@ export async function updateMemberInAuth(
 	const now = nowIso();
 
 	return mutateCoordinated(async ({ data, principals, topology, query }) => {
+		const authorization = requireAuthorizationFacade(scope, stage);
+		await authorization.acquireMutationLock(authorizationTransaction(query));
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			// Try runtime-only membership by id — fail closed (not auto-create on update)
@@ -3914,6 +5306,8 @@ export async function removeMemberInAuth(
 	const now = nowIso();
 
 	return mutateCoordinated(async ({ data, principals, topology, query }) => {
+		const authorization = requireAuthorizationFacade(scope, stage);
+		await authorization.acquireMutationLock(authorizationTransaction(query));
 		const row = data.memberships.find((m) => m.id === id && m.status === "active");
 		if (!row) {
 			const runtimeOnly = await loadRuntimeMemberById(query, id);
@@ -4603,6 +5997,16 @@ type AuthorizationMutationOptions = Readonly<{
 	scope?: ResourceScope;
 }>;
 
+type AuthorizationCredentialMutationOptions = Readonly<{
+	actor: string;
+	source?: "cli" | "console" | "api";
+	scope?: ResourceScope;
+}> &
+	(
+		| Readonly<{ dryRun: true; operationId?: never }>
+		| Readonly<{ dryRun?: false; operationId: string }>
+	);
+
 type AuthorizationPreview = Readonly<{ preview: true }>;
 
 class AuthorizationPreviewRollback<T> extends Error {
@@ -4647,6 +6051,24 @@ function authorizationInputId(value: unknown, label: string, stage: string): str
 		});
 	}
 	return normalized;
+}
+
+function authorizationOperationId(
+	value: unknown,
+	stage: string,
+): string {
+	if (
+		typeof value !== "string" ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+	) {
+		throw new ClearanceError({
+			code: "TENANT_OPERATION_ID_REQUIRED",
+			message: "A canonical UUID operationId is required",
+			stage,
+			status: 400,
+		});
+	}
+	return value;
 }
 
 function authorizationSubject(
@@ -4948,7 +6370,7 @@ export async function setServiceAccountStatusInAuth(
 
 async function mutateServiceAccountCredentialInAuth<Operation extends AuthorizationCredentialOperation>(
 	store: ManagementStore,
-	input: { organizationId: string; serviceAccountId: string; credentialId?: string; expiresAt?: string; dryRun?: boolean; actor?: string; source?: "cli" | "console" | "api"; scope?: ResourceScope },
+	input: { organizationId: string; serviceAccountId: string; credentialId?: string; expiresAt?: string; operationId?: string; dryRun?: boolean; actor?: string; source?: "cli" | "console" | "api"; scope?: ResourceScope },
 	operation: Operation,
 ): Promise<AuthorizationCredentialOperationResult<Operation>> {
 	await ensureAuthMigrated();
@@ -4958,7 +6380,27 @@ async function mutateServiceAccountCredentialInAuth<Operation extends Authorizat
 	const serviceAccountId = authorizationInputId(input.serviceAccountId, "serviceAccountId", stage);
 	const credentialId = input.credentialId === undefined ? undefined : authorizationInputId(input.credentialId, "credentialId", stage);
 	if ((operation === "rotate" || operation === "revoke") && !credentialId) throw new ClearanceError({ code: "AUTHORIZATION_CREDENTIAL_ID_REQUIRED", message: "credentialId is required", stage, status: 400 });
+	if (
+		operation !== "revoke" &&
+		input.dryRun === true &&
+		input.operationId !== undefined
+	) {
+		throw new ClearanceError({
+			code: "TENANT_OPERATION_ID_REQUIRED",
+			message: "Preview credential mutations must omit operationId",
+			stage,
+			status: 400,
+		});
+	}
 	const expiresAt = operation === "revoke" ? undefined : authorizationExpiry(input.expiresAt, stage);
+	const actorId = operation === "revoke"
+		? undefined
+		: authorizationInputId(input.actor, "actor", stage);
+	const operationId = operation === "revoke"
+		? undefined
+		: input.dryRun === true
+			? randomUUID()
+			: authorizationOperationId(input.operationId, stage);
 	const { mutateCoordinated } = requireCoordinatedStore(store, stage, "AUTHORIZATION_CREDENTIAL_BACKEND");
 	const execute = async ({ data, topology, query }: InternalManagementCoordinatedMutationContext) => {
 		const org = await findCoordinatedOrgInScope(
@@ -4976,9 +6418,9 @@ async function mutateServiceAccountCredentialInAuth<Operation extends Authorizat
 			return { organizationId: org.id, serviceAccountId, credentialId, previousRevision: result.previousRevision, revision: result.revision };
 		}
 		const result = operation === "create"
-			? await authorization.createServiceAccountCredential({ organizationId: org.id, serviceAccountId, ...(credentialId ? { credentialId } : {}), ...(expiresAt ? { expiresAt } : {}), transaction })
-			: await authorization.rotateServiceAccountCredential({ organizationId: org.id, serviceAccountId, credentialId: credentialId!, ...(expiresAt ? { expiresAt } : {}), transaction });
-		authorizationAudit(data, { action: `authorization.credentials.${operation}`, subjectType: "service_account_credential", subjectId: result.credential.credentialId, organization: org, actor: input.actor, source: input.source, message: `${operation === "create" ? "Created" : "Rotated"} service account credential`, metadata: { serviceAccountId, credentialId: result.credential.credentialId, credentialPrefix: result.credential.credentialPrefix, credentialFingerprint: result.credential.credentialFingerprint, previousRevision: result.previousRevision, revision: result.revision } });
+			? await authorization.createServiceAccountCredential({ organizationId: org.id, actorId: actorId!, operationId: operationId!, serviceAccountId, ...(credentialId ? { credentialId } : {}), ...(expiresAt ? { expiresAt } : {}), transaction })
+			: await authorization.rotateServiceAccountCredential({ organizationId: org.id, actorId: actorId!, operationId: operationId!, serviceAccountId, credentialId: credentialId!, ...(expiresAt ? { expiresAt } : {}), transaction });
+		if (!result.replayed) authorizationAudit(data, { action: `authorization.credentials.${operation}`, subjectType: "service_account_credential", subjectId: result.credential.credentialId, organization: org, actor: input.actor, source: input.source, message: `${operation === "create" ? "Created" : "Rotated"} service account credential`, metadata: { serviceAccountId, credentialId: result.credential.credentialId, credentialPrefix: result.credential.credentialPrefix, credentialFingerprint: result.credential.credentialFingerprint, previousRevision: result.previousRevision, revision: result.revision } });
 		return { credential: authorizationCredentialView(result.credential), secret: result.secret, previousRevision: result.previousRevision, revision: result.revision };
 	};
 	if (input.dryRun !== true) {
@@ -5016,14 +6458,24 @@ async function mutateServiceAccountCredentialInAuth<Operation extends Authorizat
 
 export function createServiceAccountCredentialInAuth(
 	store: ManagementStore,
-	input: { organizationId: string; serviceAccountId: string; credentialId?: string; expiresAt?: string } & AuthorizationMutationOptions,
+	input: {
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId?: string;
+		expiresAt?: string;
+	} & AuthorizationCredentialMutationOptions,
 ): Promise<AuthorizationCredentialCreateLiveResult | AuthorizationCredentialCreatePreview> {
 	return mutateServiceAccountCredentialInAuth(store, input, "create");
 }
 
 export function rotateServiceAccountCredentialInAuth(
 	store: ManagementStore,
-	input: { organizationId: string; serviceAccountId: string; credentialId: string; expiresAt?: string } & AuthorizationMutationOptions,
+	input: {
+		organizationId: string;
+		serviceAccountId: string;
+		credentialId: string;
+		expiresAt?: string;
+	} & AuthorizationCredentialMutationOptions,
 ): Promise<AuthorizationCredentialRotateLiveResult | AuthorizationCredentialRotatePreview> {
 	return mutateServiceAccountCredentialInAuth(store, input, "rotate");
 }
@@ -5398,6 +6850,10 @@ export async function archiveOrganizationInAuth(
 		enqueueDelivery,
 		fanoutWebhookEndpoints,
 	}) => {
+		const authorization = requireAuthorizationFacade(scope, "orgs.archive");
+		// Canonical lifecycle lock order: authorization advisory lock, management
+		// organization row, then the runtime organization and member rows.
+		await authorization.acquireMutationLock(authorizationTransaction(query));
 		const org = topology
 			? await (async () => {
 				await requireTopologyScope(topology, scope, "orgs.archive");
@@ -5449,10 +6905,7 @@ export async function archiveOrganizationInAuth(
 		// Always terminalize authorization, including a topology tombstone. This
 		// closes legacy rows and lets an idempotent re-archive heal any active
 		// service account or credential that survived a prior partial archive.
-		const authorizationArchive = await requireAuthorizationFacade(
-			scope,
-			"orgs.archive",
-		).archiveOrganization({
+		const authorizationArchive = await authorization.archiveOrganization({
 			organizationId: org.id,
 			transaction: authorizationTransaction(query),
 		});

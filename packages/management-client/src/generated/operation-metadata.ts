@@ -660,7 +660,8 @@ const OPERATION_METADATA_VALUES = [
 			"organizationId",
 			"accountId",
 			"expiresAt",
-			"dryRun"
+			"dryRun",
+			"operationId"
 		],
 		"pathParameters": {
 			"organizationId": "id",
@@ -682,7 +683,8 @@ const OPERATION_METADATA_VALUES = [
 			"accountId",
 			"credentialId",
 			"expiresAt",
-			"dryRun"
+			"dryRun",
+			"operationId"
 		],
 		"pathParameters": {
 			"organizationId": "id",
@@ -1347,6 +1349,278 @@ const OPERATION_METADATA_VALUES = [
 			"confirm"
 		],
 		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_presentation.get",
+		"http": {
+			"method": "GET",
+			"path": "/v1/product-presentation"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_presentation.plan",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/plan"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"productLabel",
+			"homeLabel",
+			"accentColor",
+			"logoUrl"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_presentation.apply",
+		"http": {
+			"method": "PATCH",
+			"path": "/v1/product-presentation"
+		},
+		"mutation": true,
+		"supportsDryRun": true,
+		"confirmation": "server-required",
+		"inputKeys": [
+			"productLabel",
+			"homeLabel",
+			"accentColor",
+			"logoUrl",
+			"expectedVersion",
+			"dryRun",
+			"confirm"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.list",
+		"http": {
+			"method": "GET",
+			"path": "/v1/product-presentation/domains"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.create",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/domains"
+		},
+		"mutation": true,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"origin"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.reissue",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/domains/reissue"
+		},
+		"mutation": true,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"origin",
+			"expectedVersion"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.verify",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/domains/verify"
+		},
+		"mutation": true,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"origin"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.activate",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/domains/activate"
+		},
+		"mutation": true,
+		"supportsDryRun": true,
+		"confirmation": "server-required",
+		"inputKeys": [
+			"origin",
+			"expectedVersion",
+			"dryRun",
+			"confirm"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_domains.disable",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/domains/disable"
+		},
+		"mutation": true,
+		"supportsDryRun": true,
+		"confirmation": "server-required",
+		"inputKeys": [
+			"origin",
+			"expectedVersion",
+			"dryRun",
+			"confirm"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_sender.get",
+		"http": {
+			"method": "GET",
+			"path": "/v1/product-presentation/sender"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_sender.plan",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/sender/plan"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"displayName",
+			"address"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_sender.apply",
+		"http": {
+			"method": "PATCH",
+			"path": "/v1/product-presentation/sender"
+		},
+		"mutation": true,
+		"supportsDryRun": true,
+		"confirmation": "server-required",
+		"inputKeys": [
+			"displayName",
+			"address",
+			"expectedVersion",
+			"dryRun",
+			"confirm"
+		],
+		"pathParameters": {},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_sender.readiness",
+		"http": {
+			"method": "GET",
+			"path": "/v1/product-presentation/sender-readiness"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"staleAfterMs"
+		],
+		"pathParameters": {},
+		"queryParameters": {
+			"staleAfterMs": "staleAfterMs"
+		}
+	},
+	{
+		"id": "product_templates.get",
+		"http": {
+			"method": "GET",
+			"path": "/v1/product-presentation/templates/:kind"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"kind"
+		],
+		"pathParameters": {
+			"kind": "kind"
+		},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_templates.plan",
+		"http": {
+			"method": "POST",
+			"path": "/v1/product-presentation/templates/:kind/plan"
+		},
+		"mutation": false,
+		"supportsDryRun": false,
+		"confirmation": "none",
+		"inputKeys": [
+			"kind",
+			"subject",
+			"plainText",
+			"html"
+		],
+		"pathParameters": {
+			"kind": "kind"
+		},
+		"queryParameters": {}
+	},
+	{
+		"id": "product_templates.apply",
+		"http": {
+			"method": "PATCH",
+			"path": "/v1/product-presentation/templates/:kind"
+		},
+		"mutation": true,
+		"supportsDryRun": true,
+		"confirmation": "server-required",
+		"inputKeys": [
+			"kind",
+			"expectedVersion",
+			"dryRun",
+			"confirm",
+			"subject",
+			"plainText",
+			"html"
+		],
+		"pathParameters": {
+			"kind": "kind"
+		},
 		"queryParameters": {}
 	},
 	{

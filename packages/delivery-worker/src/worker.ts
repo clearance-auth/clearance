@@ -1,4 +1,5 @@
 import http, { type Server } from "node:http";
+import { createHash } from "node:crypto";
 import pg from "pg";
 import { DELIVERY_SCHEMA_VERSION, DeliveryStore, qualifiedDeliveryTables, StaleDeliveryLeaseError } from "@clearance/delivery";
 import {
@@ -10,6 +11,7 @@ import { classifyEmailError, configuredEmailTransport, createEmailSender } from 
 import { createJsonLogger, type WorkerLogger } from "./logger.js";
 import { DeliveryWorkerMetrics, type DeliveryMetricOutcome } from "./metrics.js";
 import { renderEmailPayload, type EmailSender } from "./smtp.js";
+import { formatDisplayMailbox, validateEmailPayload, type EmailPayload } from "./smtp.js";
 import {
 	classifyWebhookError,
 	createWebhookSender,
@@ -17,8 +19,278 @@ import {
 	type WebhookSender,
 } from "./webhook.js";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type FirstPartyTemplateKind = "verification" | "password-reset" | "invitation" | "email-change";
+type PresentationAuthorityState = "unknown" | "available" | "unavailable";
+type RenderedPresentationState = "ready" | "absent";
+
+export type ProductPresentationSnapshot = Readonly<{
+	productLabel: string;
+	sender: Readonly<{ displayName: string; address: string; domain: string; version: number }>;
+	template: Readonly<{
+		kind: FirstPartyTemplateKind; subject: string; plainText: string; html: string;
+		variables: readonly string[]; version: number; hash: string;
+	}>;
+}>;
+
+export type ProductPresentationLoader = {
+	load(scope: { projectId: string; environmentId: string }, kind: FirstPartyTemplateKind): Promise<ProductPresentationSnapshot | null>;
+};
+
+const TEMPLATE_KIND_BY_JOB_TEMPLATE: Readonly<Record<string, FirstPartyTemplateKind>> = Object.freeze({
+	"email-verification": "verification",
+	"password-reset": "password-reset",
+	"organization-invitation": "invitation",
+	"email-change-confirmation": "email-change",
+	"email-change-verification": "email-change",
+});
+
+const TEMPLATE_VARIABLES: Readonly<Record<FirstPartyTemplateKind, readonly string[]>> = Object.freeze({
+	verification: ["product_name", "user_name", "verification_url"],
+	"password-reset": ["product_name", "reset_url", "user_name"],
+	invitation: ["invitation_url", "inviter_name", "organization_name", "product_name", "role"],
+	"email-change": ["email_change_url", "product_name", "user_name"],
+});
+
+function identifier(value: string): string {
+	if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error("presentation_identifier_invalid");
+	return `"${value}"`;
+}
+
+function number(value: unknown, field: string): number {
+	const parsed = typeof value === "number" ? value : Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`presentation_${field}_invalid`);
+	return parsed;
+}
+
+function text(value: unknown, field: string, max: number): string {
+	if (typeof value !== "string" || value.length < 1 || value.length > max || /[\u0000\u007f]/.test(value)) {
+		throw new Error(`presentation_${field}_invalid`);
+	}
+	return value;
+}
+
+function hash(value: unknown): string {
+	if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) throw new Error("presentation_template_hash_invalid");
+	return value;
+}
+
+function templateHash(subject: string, plainText: string, html: string): string {
+	return createHash("sha256").update(subject, "utf8").update("\0", "utf8")
+		.update(plainText, "utf8").update("\0", "utf8").update(html, "utf8").digest("hex");
+}
+
+function templateVariables(kind: FirstPartyTemplateKind, value: unknown): string[] {
+	if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) throw new Error("presentation_template_variables_invalid");
+	const variables = [...new Set(value)].sort();
+	if (variables.some((item) => !TEMPLATE_VARIABLES[kind].includes(item))) throw new Error("presentation_template_variables_invalid");
+	return variables;
+}
+
+/** Read normalized presentation records through one read-only, scope-bound statement. */
+export function createProductPresentationLoader(
+	pool: Pick<pg.Pool, "query">,
+	config: Pick<WorkerConfig, "managementSchema" | "managementPrefix">,
+): ProductPresentationLoader {
+	const schema = identifier(config.managementSchema ?? "public");
+	const prefix = config.managementPrefix ?? "mgmt_";
+	if (!/^[a-z_][a-z0-9_]{0,29}$/.test(prefix)) throw new Error("presentation_identifier_invalid");
+	const senderTable = `${schema}.${identifier(`${prefix}product_email_senders`)}`;
+	const templateTable = `${schema}.${identifier(`${prefix}product_email_templates`)}`;
+	const domainTable = `${schema}.${identifier(`${prefix}product_auth_domains`)}`;
+	const presentationTable = `${schema}.${identifier(`${prefix}product_presentations`)}`;
+	return {
+		async load(scope, kind) {
+			const result = await pool.query<Record<string, unknown>>(
+				`SELECT COALESCE(p.product_label, 'Clearance') AS product_label,
+				        s.display_name, s.address, s.domain, s.version AS sender_version,
+				        t.kind, t.subject, t.plain_text, t.html, t.variables, t.version AS template_version, t.content_hash,
+				        EXISTS(SELECT 1 FROM ${domainTable} d
+				               WHERE d.project_id = $1 AND d.environment_id = $2 AND d.hostname = s.domain
+				                 AND d.state IN ('verified', 'active')) AS sender_domain_ready
+				 FROM (SELECT 1) AS scoped
+				 LEFT JOIN LATERAL (
+					SELECT product_label FROM ${presentationTable}
+					WHERE project_id = $1 AND environment_id = $2
+				 ) p ON true
+				 LEFT JOIN LATERAL (
+					SELECT display_name, address, domain, version FROM ${senderTable}
+					WHERE project_id = $1 AND environment_id = $2
+				 ) s ON true
+				 LEFT JOIN LATERAL (
+					SELECT kind, subject, plain_text, html, variables, version, content_hash FROM ${templateTable}
+					WHERE project_id = $1 AND environment_id = $2 AND kind = $3
+				 ) t ON true`,
+				[scope.projectId, scope.environmentId, kind],
+			);
+			const row = result.rows[0];
+			if (row?.sender_version !== undefined && row.sender_version !== null && row.sender_domain_ready !== true) {
+				throw new Error("presentation_sender_domain_unverified");
+			}
+			if (!row?.display_name || !row.kind) return null;
+			if (row.kind !== kind) throw new Error("presentation_template_kind_invalid");
+			const senderAddress = text(row.address, "sender_address", 320);
+			const senderDomain = text(row.domain, "sender_domain", 253).toLowerCase();
+			if (senderAddress.slice(senderAddress.lastIndexOf("@") + 1).toLowerCase() !== senderDomain) {
+				throw new Error("presentation_sender_domain_invalid");
+			}
+			const sender = Object.freeze({
+				displayName: text(row.display_name, "sender_display_name", 128),
+				address: senderAddress,
+				domain: senderDomain,
+				version: number(row.sender_version, "sender_version"),
+			});
+			const templateSubject = text(row.subject, "template_subject", 998);
+			const templatePlainText = text(row.plain_text, "template_plain_text", 20_000);
+			const templateHtml = text(row.html, "template_html", 20_000);
+			const templateHashValue = hash(row.content_hash);
+			if (templateHash(templateSubject, templatePlainText, templateHtml) !== templateHashValue) {
+				throw new Error("presentation_template_hash_invalid");
+			}
+			const template = Object.freeze({
+				kind,
+				subject: templateSubject,
+				plainText: templatePlainText,
+				html: templateHtml,
+				variables: Object.freeze(templateVariables(kind, row.variables)),
+				version: number(row.template_version, "template_version"),
+				hash: templateHashValue,
+			});
+			return Object.freeze({ productLabel: text(row.product_label, "product_label", 64), sender, template });
+		},
+	};
+}
+
+/** Verify configured management presentation tables are readable without inventing a tenant scope. */
+export async function probeProductPresentationAuthority(
+	pool: Pick<pg.Pool, "query">,
+	config: Pick<WorkerConfig, "managementSchema" | "managementPrefix">,
+): Promise<void> {
+	const schema = identifier(config.managementSchema ?? "public");
+	const prefix = config.managementPrefix ?? "mgmt_";
+	if (!/^[a-z_][a-z0-9_]{0,29}$/.test(prefix)) throw new Error("presentation_identifier_invalid");
+	const table = (name: string) => `${schema}.${identifier(`${prefix}${name}`)}`;
+	await pool.query(
+		`SELECT 1
+		 FROM ${table("product_email_senders")} AS senders
+		 FULL JOIN ${table("product_email_templates")} AS templates ON FALSE
+		 FULL JOIN ${table("product_auth_domains")} AS domains ON FALSE
+		 FULL JOIN ${table("product_presentations")} AS presentation ON FALSE
+		 LIMIT 0`,
+	);
+}
+
+function firstPartyKind(value: unknown): FirstPartyTemplateKind | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const template = (value as Record<string, unknown>).template;
+	return typeof template === "string" ? TEMPLATE_KIND_BY_JOB_TEMPLATE[template] : undefined;
+}
+
+function allowsLegacyPresentationFallback(config: Pick<WorkerConfig, "allowLegacyPresentationFallback">): boolean {
+	return config.allowLegacyPresentationFallback ?? process.env.NODE_ENV !== "production";
+}
+
+function templateValue(value: unknown, field: string): string {
+	if (typeof value !== "string" || /[\r\n\u0000\u007f]/.test(value) || !value.trim()) throw new Error(`presentation_${field}_invalid`);
+	return value.trim();
+}
+
+function optionalUserName(value: unknown): string {
+	if (value === undefined || value === null || value === "" || (typeof value === "string" && value.trim() === "")) return "";
+	return templateValue(value, "user_name");
+}
+
+function placeholders(value: string): string[] {
+	const found = new Set<string>();
+	const matcher = /\{\{([a-z][a-z0-9_]*)\}\}/g;
+	let match: RegExpExecArray | null;
+	while ((match = matcher.exec(value)) !== null) found.add(match[1]!);
+	if (value.replace(matcher, "").includes("{{") || value.replace(matcher, "").includes("}}")) {
+		throw new Error("presentation_template_placeholder_invalid");
+	}
+	return [...found].sort();
+}
+
+function escapeHtml(value: string): string {
+	return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+}
+
+function interpolate(value: string, values: Readonly<Record<string, string>>, mode: "subject" | "text" | "html"): string {
+	for (const placeholder of placeholders(value)) {
+		if (!(placeholder in values)) throw new Error("presentation_template_unresolved_variable");
+	}
+	return value.replace(/\{\{([a-z][a-z0-9_]*)\}\}/g, (_match, variable: string) => {
+		const replacement = values[variable];
+		if (replacement === undefined) throw new Error("presentation_template_unresolved_variable");
+		return mode === "html" ? escapeHtml(replacement) : replacement;
+	});
+}
+
+function presentationValues(value: unknown, kind: FirstPartyTemplateKind, productLabel: string): Record<string, string> {
+	const raw = value as Record<string, unknown>;
+	const productName = templateValue(productLabel, "product_name");
+	if (kind === "invitation") return {
+		product_name: productName,
+		invitation_url: templateValue(raw.acceptanceUrl, "invitation_url"),
+		inviter_name: templateValue(raw.inviterName, "inviter_name"),
+		organization_name: templateValue(raw.organizationName, "organization_name"),
+		role: templateValue(raw.role, "role"),
+	};
+	const userName = optionalUserName(raw.userName);
+	const url = templateValue(raw.url, kind === "password-reset" ? "reset_url" : kind === "email-change" ? "email_change_url" : "verification_url");
+	return kind === "password-reset" ? { product_name: productName, reset_url: url, user_name: userName }
+		: kind === "email-change" ? { product_name: productName, email_change_url: url, user_name: userName }
+		: { product_name: productName, verification_url: url, user_name: userName };
+}
+
+/** Render a first-party job against a closed normalized snapshot after legacy validation. */
+export function renderNormalizedEmailPayload(value: unknown, config: WorkerConfig, snapshot: ProductPresentationSnapshot): EmailPayload {
+	const fallback = renderEmailPayload(value, config);
+	const kind = firstPartyKind(value);
+	if (!kind || kind !== snapshot.template.kind) throw new Error("presentation_template_kind_invalid");
+	const values = presentationValues(value, kind, snapshot.productLabel);
+	const extracted = [...new Set([
+		...placeholders(snapshot.template.subject),
+		...placeholders(snapshot.template.plainText),
+		...placeholders(snapshot.template.html),
+	])].sort();
+	if (extracted.length !== snapshot.template.variables.length || extracted.some((item, index) => item !== snapshot.template.variables[index])) {
+		throw new Error("presentation_template_variables_invalid");
+	}
+	if (extracted.some((item) => !TEMPLATE_VARIABLES[kind].includes(item))) throw new Error("presentation_template_variables_invalid");
+	return validateEmailPayload({
+		to: fallback.to,
+		from: formatDisplayMailbox(snapshot.sender.displayName, snapshot.sender.address),
+		subject: interpolate(snapshot.template.subject, values, "subject"),
+		text: interpolate(snapshot.template.plainText, values, "text"),
+		html: interpolate(snapshot.template.html, values, "html"),
+	}, config.maxBodyBytes);
+}
+
+/** The leased-job rendering boundary; the loader is injectable for isolated verification. */
+export async function renderWorkerEmailPayload(
+	payload: unknown,
+	scope: { projectId: string; environmentId: string },
+	config: WorkerConfig,
+	loader: ProductPresentationLoader,
+): Promise<Readonly<{ payload: EmailPayload; presentation: RenderedPresentationState }>> {
+	const kind = firstPartyKind(payload);
+	if (!kind) return { payload: renderEmailPayload(payload, config), presentation: "absent" };
+	let snapshot: ProductPresentationSnapshot | null;
+	try {
+		snapshot = await loader.load(scope, kind);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("presentation_")) throw error;
+		throw new Error("presentation_unavailable");
+	}
+	if (snapshot) return { payload: renderNormalizedEmailPayload(payload, config, snapshot), presentation: "ready" };
+	if (allowsLegacyPresentationFallback(config)) {
+		return { payload: renderEmailPayload(payload, config), presentation: "absent" };
+	}
+	throw new Error("presentation_required");
+}
 
 class ProviderAcceptedUnconfirmedError extends Error {
 	constructor(readonly cause: unknown) {
@@ -85,8 +357,22 @@ export type WorkerReadiness = {
 	emailTransport: "smtp" | "ses";
 	smtp: boolean;
 	ses: boolean;
+	presentation: PresentationAuthorityState;
+	presentationReason?: "normalized_presentation_unknown" | "normalized_presentation_unavailable";
 	workerId: string;
 };
+
+export function workerHeartbeatState(input: Readonly<{
+	draining: boolean;
+	emailHealthy: boolean;
+	schemaHealthy: boolean;
+	presentation: PresentationAuthorityState;
+}>): "ready" | "draining" | "failed" {
+	if (input.draining) return "draining";
+	return input.emailHealthy && input.schemaHealthy && input.presentation === "available"
+		? "ready"
+		: "failed";
+}
 
 export class DeliveryWorker {
 	readonly pool: pg.Pool;
@@ -94,6 +380,7 @@ export class DeliveryWorker {
 	readonly config: WorkerConfig;
 	private readonly sender: EmailSender;
 	private readonly webhookSender: WebhookSender;
+	private readonly presentationLoader: ProductPresentationLoader;
 	private readonly logger: WorkerLogger;
 	private stopping = false;
 	private stopped = false;
@@ -101,6 +388,7 @@ export class DeliveryWorker {
 	private initialized = false;
 	private schemaHealthy = false;
 	private emailHealthy = false;
+	private presentationState: PresentationAuthorityState = "unknown";
 	private lastHeartbeatAt = 0;
 	private inFlight = new Set<Promise<unknown>>();
 	private healthServer?: Server;
@@ -115,6 +403,7 @@ export class DeliveryWorker {
 		pool?: pg.Pool;
 		sender?: EmailSender;
 		webhookSender?: WebhookSender;
+		presentationLoader?: ProductPresentationLoader;
 		logger?: WorkerLogger;
 	} = {}) {
 		this.config = config;
@@ -132,7 +421,26 @@ export class DeliveryWorker {
 		});
 		this.sender = dependencies.sender ?? createEmailSender(config);
 		this.webhookSender = dependencies.webhookSender ?? createWebhookSender(config);
+		this.presentationLoader = dependencies.presentationLoader ?? createProductPresentationLoader(this.pool, config);
 		this.logger = dependencies.logger ?? createJsonLogger();
+	}
+
+	private async refreshPresentationAuthority(): Promise<void> {
+		try {
+			await probeProductPresentationAuthority(this.pool, this.config);
+			this.presentationState = "available";
+		} catch {
+			this.presentationState = "unavailable";
+		}
+	}
+
+	private durableHeartbeatState(): "ready" | "draining" | "failed" {
+		return workerHeartbeatState({
+			draining: this.draining,
+			emailHealthy: this.emailHealthy,
+			schemaHealthy: this.schemaHealthy,
+			presentation: this.presentationState,
+		});
 	}
 
 	async initialize(options: { verifyEmail?: boolean; verifySmtp?: boolean } = {}): Promise<void> {
@@ -142,6 +450,7 @@ export class DeliveryWorker {
 		await this.store.assertRuntimeAuditTableReady();
 		await this.store.assertFingerprintKeysAvailable(this.config.keyring);
 		this.schemaHealthy = result.version === DELIVERY_SCHEMA_VERSION;
+		await this.refreshPresentationAuthority();
 		const shouldVerifyEmail = options.verifyEmail ?? options.verifySmtp ?? true;
 		if (shouldVerifyEmail) {
 			try {
@@ -155,7 +464,7 @@ export class DeliveryWorker {
 		} else {
 			this.emailHealthy = false;
 		}
-		await this.writeHeartbeat(this.emailHealthy ? "ready" : "failed");
+		await this.writeHeartbeat(this.durableHeartbeatState());
 		this.initialized = true;
 		const transport = configuredEmailTransport(this.config);
 		this.logger.log(this.emailHealthy ? "info" : "warn", this.emailHealthy ? "worker.ready" : `worker.${transport}_unverified`, {
@@ -166,12 +475,16 @@ export class DeliveryWorker {
 	}
 
 	private async writeHeartbeat(state: "ready" | "draining" | "stopped" | "failed"): Promise<void> {
-		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state });
+		const durableState = state === "ready" && this.presentationState !== "available"
+			? "failed"
+			: state;
+		await this.store.heartbeat({ workerId: this.config.workerId, version: VERSION, state: durableState });
 		this.lastHeartbeatAt = Date.now();
 	}
 
 	async readiness(): Promise<WorkerReadiness> {
 		const transport = configuredEmailTransport(this.config);
+		await this.refreshPresentationAuthority();
 		let database = false;
 		let keyring = false;
 		let audit = !this.config.runtimeAudit;
@@ -215,8 +528,9 @@ export class DeliveryWorker {
 			this.schemaHealthy = false;
 		}
 		const heartbeat = this.lastHeartbeatAt > 0 && Date.now() - this.lastHeartbeatAt <= this.config.heartbeatMs * 3;
+		const presentationReady = this.presentationState === "available";
 		return {
-			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && audit && heartbeat && this.emailHealthy,
+			ready: this.initialized && !this.draining && database && this.schemaHealthy && keyring && audit && heartbeat && this.emailHealthy && presentationReady,
 			draining: this.draining,
 			database,
 			schema: this.schemaHealthy,
@@ -227,6 +541,9 @@ export class DeliveryWorker {
 			emailTransport: transport,
 			smtp: transport === "smtp" && this.emailHealthy,
 			ses: transport === "ses" && this.emailHealthy,
+			presentation: this.presentationState,
+			...(this.presentationState === "unknown" ? { presentationReason: "normalized_presentation_unknown" as const }
+				: this.presentationState === "unavailable" ? { presentationReason: "normalized_presentation_unavailable" as const } : {}),
 			workerId: this.config.workerId,
 		};
 	}
@@ -247,9 +564,23 @@ export class DeliveryWorker {
 						return true;
 					}
 					const payload = await this.store.readLeasedPayload<unknown>({ jobId: leased.id, leaseToken: leased.leaseToken, keyring: this.config.keyring });
-					const email = leased.channel === "email"
-						? renderEmailPayload(payload, this.config)
-						: undefined;
+					let email: EmailPayload | undefined;
+					if (leased.channel === "email") {
+						let rendered: Awaited<ReturnType<typeof renderWorkerEmailPayload>>;
+						try {
+							rendered = await renderWorkerEmailPayload(payload, {
+								projectId: leased.projectId,
+								environmentId: leased.environmentId,
+							}, this.config, this.presentationLoader);
+						} catch (error) {
+							if (!(error instanceof Error) || error.message !== "presentation_required") {
+								this.presentationState = "unavailable";
+							}
+							throw error;
+						}
+						email = rendered.payload;
+						this.presentationState = "available";
+					}
 					const destination = email?.to ??
 						webhookDestination(payload);
 					await this.store.assertLeasedDestination({
@@ -410,26 +741,16 @@ export class DeliveryWorker {
 			this.emailHealthy = false;
 			this.logger.log(wasHealthy ? "error" : "warn", `worker.${transport}_unavailable`, { error });
 		}
-		await this.writeHeartbeat(
-			this.draining
-				? "draining"
-				: this.emailHealthy && this.schemaHealthy
-					? "ready"
-					: "failed",
-		)
+		await this.refreshPresentationAuthority();
+		await this.writeHeartbeat(this.durableHeartbeatState())
 			.catch((error) => this.logger.log("error", "worker.heartbeat_failed", { error }));
 		this.maintenanceRunning = false;
 	}
 
 	private startTimers(): void {
 		this.heartbeatTimer = setInterval(() => {
-			void this.writeHeartbeat(
-				this.draining
-					? "draining"
-					: this.emailHealthy && this.schemaHealthy
-						? "ready"
-						: "failed",
-			)
+			void this.refreshPresentationAuthority()
+				.then(() => this.writeHeartbeat(this.durableHeartbeatState()))
 				.catch((error) => this.logger.log("error", "worker.heartbeat_failed", { error }));
 		}, this.config.heartbeatMs);
 		this.heartbeatTimer.unref();

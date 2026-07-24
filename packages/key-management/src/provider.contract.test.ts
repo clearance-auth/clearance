@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	DecryptCommand,
 	DescribeKeyCommand,
@@ -12,6 +12,7 @@ import { KeyManagementError } from "./error.js";
 import { createGcpKmsKeyProvider } from "./gcp.js";
 import { createLocalKeyProvider } from "./local.js";
 import { createKeyProviderRegistry } from "./registry.js";
+import type { KeyPurpose } from "./types.js";
 
 const context = Object.freeze({
 	projectId: "project_test",
@@ -21,7 +22,7 @@ const context = Object.freeze({
 
 function provider(
 	providerId: string,
-	purpose: "oidc-client-secret" | "scim-bearer-token" | "access-token-signing-key",
+	purpose: KeyPurpose,
 	currentKeyId: string,
 	keys: Record<string, Uint8Array>,
 ) {
@@ -46,6 +47,40 @@ describe("purpose-bound local key provider", () => {
 		).rejects.toMatchObject({ code: "KEY_CONTEXT_MISMATCH" });
 	});
 
+	it("binds service-account credential replays to their canonical resource identity", async () => {
+		const replay = provider(
+			"replay",
+			"service-account-credential-replay",
+			"one",
+			{ one: randomBytes(32) },
+		);
+		const binding = JSON.stringify({
+			projectId: context.projectId,
+			environmentId: context.environmentId,
+			organizationId: "organization_test",
+			actorId: "actor_test",
+			serviceAccountId: "service_account_test",
+			operationId: "operation_test",
+			operationKind: "service_account_credential.create",
+		});
+		const resourceIdFor = (value: string) =>
+			`service-account-credential-replay:${createHash("sha256")
+				.update(JSON.stringify({ binding: value }))
+				.digest("hex")}`;
+		const resourceId = resourceIdFor(binding);
+		const envelope = await replay.seal(Buffer.from('{"secret":"once"}'), {
+			...context,
+			resourceId,
+		});
+		expect(Buffer.from(await replay.open(envelope, { ...context, resourceId })).toString()).toBe('{"secret":"once"}');
+		await expect(
+			replay.open(envelope, {
+				...context,
+				resourceId: resourceIdFor(binding.replace("actor_test", "actor_changed")),
+			}),
+		).rejects.toMatchObject({ code: "KEY_CONTEXT_MISMATCH" });
+	});
+
 	it("rejects malformed and oversized envelopes", async () => {
 		const local = provider("oidc", "oidc-client-secret", "one", { one: randomBytes(32) });
 		await expect(local.open("clrkm$v1$***", context)).rejects.toBeInstanceOf(
@@ -62,6 +97,7 @@ describe("purpose-bound local key provider", () => {
 			createKeyProviderRegistry({
 				"oidc-client-secret": provider("oidc", "oidc-client-secret", "one", { one: reused }),
 				"scim-bearer-token": provider("scim", "scim-bearer-token", "one", { one: reused }),
+				"service-account-credential-replay": provider("replay", "service-account-credential-replay", "one", { one: randomBytes(32) }),
 				"access-token-signing-key": provider("jwt", "access-token-signing-key", "one", { one: randomBytes(32) }),
 			}),
 		).toThrowError(expect.objectContaining({ code: "KEY_PURPOSE_REUSE" }));
@@ -76,6 +112,12 @@ describe("purpose-bound local key provider", () => {
 				"scim-bearer-token": provider("scim", "scim-bearer-token", "one", {
 					one: randomBytes(32),
 				}),
+				"service-account-credential-replay": provider(
+					"replay",
+					"service-account-credential-replay",
+					"one",
+					{ one: randomBytes(32) },
+				),
 				"access-token-signing-key": provider(
 					"jwt",
 					"access-token-signing-key",

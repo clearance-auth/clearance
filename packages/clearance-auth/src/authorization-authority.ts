@@ -96,7 +96,14 @@ export type PostgresAuthorizationAuthorityOptions = AuthorizationAuthorityIdenti
 	Readonly<{
 		schema?: string;
 		prefix?: string;
+		oneTimeSecretReplayCipher?: AuthorizationOneTimeSecretReplayCipher;
 	}>;
+
+/** Encrypts recoverable response-loss replay material under caller-supplied AAD. */
+export type AuthorizationOneTimeSecretReplayCipher = Readonly<{
+	seal(plaintext: string, binding: string): Promise<string>;
+	open(envelope: string, binding: string): Promise<string>;
+}>;
 
 /**
  * Server-owned identity for the runtime organization authority. This is kept
@@ -254,6 +261,8 @@ export type AuthorizationServiceAccountCredentialMutation = Readonly<{
 	secret: string;
 	previousRevision: string;
 	revision: string;
+	/** Internal replay signal; tenant HTTP responses intentionally omit it. */
+	replayed: boolean;
 }>;
 
 export type AuthorizationCreateServiceAccountInput = Readonly<{
@@ -278,6 +287,8 @@ export type AuthorizationSetServiceAccountStatusInput = Readonly<{
 
 export type AuthorizationCreateServiceAccountCredentialInput = Readonly<{
 	organizationId: string;
+	actorId: string;
+	operationId: string;
 	serviceAccountId: string;
 	credentialId?: string;
 	expiresAt?: Date;
@@ -286,6 +297,8 @@ export type AuthorizationCreateServiceAccountCredentialInput = Readonly<{
 
 export type AuthorizationRotateServiceAccountCredentialInput = Readonly<{
 	organizationId: string;
+	actorId: string;
+	operationId: string;
 	serviceAccountId: string;
 	credentialId: string;
 	expiresAt?: Date;
@@ -346,6 +359,7 @@ type Names = Readonly<{
 	assignments: string;
 	serviceAccounts: string;
 	credentials: string;
+	oneTimeSecretReplays: string;
 	revisions: string;
 }>;
 
@@ -453,6 +467,7 @@ function namesFor(prefix: string): Names {
 		assignments: `${prefix}_authz_subject_role_assignments`,
 		serviceAccounts: `${prefix}_authz_service_accounts`,
 		credentials: `${prefix}_authz_service_account_credentials`,
+		oneTimeSecretReplays: `${prefix}_authz_one_time_secret_replays`,
 		revisions: `${prefix}_authz_revisions`,
 	});
 }
@@ -485,6 +500,7 @@ function columns(): Readonly<Record<keyof Names, readonly ExpectedColumn[]>> {
 		assignments: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "subjectKind", dataType: "text", nullable: false }, { name: "subjectId", dataType: "text", nullable: false }, { name: "roleId", dataType: "text", nullable: false }, created],
 		serviceAccounts: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "serviceAccountId", dataType: "text", nullable: false }, { name: "name", dataType: "text", nullable: false }, { name: "status", dataType: "text", nullable: false }, created, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
 		credentials: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "credentialId", dataType: "text", nullable: false }, { name: "serviceAccountId", dataType: "text", nullable: false }, { name: "credentialDigest", dataType: "text", nullable: false }, { name: "credentialPrefix", dataType: "text", nullable: false }, { name: "credentialFingerprint", dataType: "text", nullable: false }, { name: "status", dataType: "text", nullable: false }, { name: "expiresAt", dataType: "timestamp with time zone", nullable: true }, { name: "replacedCredentialId", dataType: "text", nullable: true }, { name: "version", dataType: "integer", nullable: false }, created, { name: "revokedAt", dataType: "timestamp with time zone", nullable: true }, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
+		oneTimeSecretReplays: [...scope, { name: "operationId", dataType: "text", nullable: false }, { name: "organizationId", dataType: "text", nullable: false }, { name: "actorId", dataType: "text", nullable: false }, { name: "serviceAccountId", dataType: "text", nullable: false }, { name: "operationKind", dataType: "text", nullable: false }, { name: "payloadDigest", dataType: "text", nullable: false }, { name: "resultEnvelope", dataType: "text", nullable: false }, created],
 		revisions: [...scope, { name: "organizationId", dataType: "text", nullable: false }, { name: "revision", dataType: "bigint", nullable: false }, { name: "terminal", dataType: "boolean", nullable: false, default: "false" }, { name: "updatedAt", dataType: "timestamp with time zone", nullable: false, default: "now" }],
 	};
 }
@@ -526,6 +542,12 @@ function constraints(names: Names): Readonly<Record<keyof Names, readonly Expect
 			fk("credentials_account_fk", names.serviceAccounts),
 			fk("credentials_replacement_fk", names.credentials),
 		],
+		oneTimeSecretReplays: [
+			{ name: c("one_time_secret_replays_pk"), type: "p" },
+			{ name: c("one_time_secret_replays_operation_ck"), type: "c", definitionIncludes: ["operationkind = any", "service_account_credential.create", "service_account_credential.rotate"] },
+			{ name: c("one_time_secret_replays_operation_id_ck"), type: "c", definitionIncludes: ["operationid ~"] },
+			{ name: c("one_time_secret_replays_payload_digest_ck"), type: "c", definitionIncludes: ["payloaddigest ~"] },
+		],
 		revisions: [
 			{ name: c("revisions_pk"), type: "p" },
 			{ name: c("revisions_positive_ck"), type: "c", definitionIncludes: ["revision > 0"] },
@@ -548,6 +570,7 @@ function indexes(names: Names): Readonly<Record<keyof Names, readonly ExpectedIn
 			{ name: c("credentials_account_idx"), definitionIncludes: ["projectid", "environmentid", "organizationid", "serviceaccountid"] },
 			{ name: c("credentials_account_version_uq"), definitionIncludes: ["unique index", "projectid", "environmentid", "organizationid", "serviceaccountid", "version"] },
 		],
+		oneTimeSecretReplays: [],
 		revisions: [],
 	};
 }
@@ -652,6 +675,16 @@ function createSql(schema: string, names: Names): string {
 			CONSTRAINT ${c("credentials_account_fk")} FOREIGN KEY ("projectId", "environmentId", "organizationId", "serviceAccountId") REFERENCES ${t(names.serviceAccounts)} ("projectId", "environmentId", "organizationId", "serviceAccountId") ON DELETE CASCADE,
 			CONSTRAINT ${c("credentials_replacement_fk")} FOREIGN KEY ("projectId", "environmentId", "organizationId", "replacedCredentialId") REFERENCES ${t(names.credentials)} ("projectId", "environmentId", "organizationId", "credentialId") ON DELETE RESTRICT
 		)`,
+		`CREATE TABLE IF NOT EXISTS ${t(names.oneTimeSecretReplays)} (
+			"projectId" text NOT NULL, "environmentId" text NOT NULL, "operationId" text NOT NULL,
+			"organizationId" text NOT NULL, "actorId" text NOT NULL, "serviceAccountId" text NOT NULL,
+			"operationKind" text NOT NULL, "payloadDigest" text NOT NULL, "resultEnvelope" text NOT NULL,
+			"createdAt" timestamptz NOT NULL DEFAULT now(),
+			CONSTRAINT ${c("one_time_secret_replays_pk")} PRIMARY KEY ("projectId", "environmentId", "operationId"),
+			CONSTRAINT ${c("one_time_secret_replays_operation_ck")} CHECK ("operationKind" IN ('service_account_credential.create', 'service_account_credential.rotate')),
+			CONSTRAINT ${c("one_time_secret_replays_operation_id_ck")} CHECK ("operationId" ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+			CONSTRAINT ${c("one_time_secret_replays_payload_digest_ck")} CHECK ("payloadDigest" ~ '^[a-f0-9]{64}$')
+		)`,
 		`CREATE TABLE IF NOT EXISTS ${t(names.revisions)} (
 			"projectId" text NOT NULL, "environmentId" text NOT NULL, "organizationId" text NOT NULL,
 			revision bigint NOT NULL, terminal boolean NOT NULL DEFAULT false, "updatedAt" timestamptz NOT NULL DEFAULT now(),
@@ -709,6 +742,21 @@ function terminalizationMigrationSql(schema: string, names: Names): string {
 
 function principalSubjectIndexMigrationSql(schema: string, names: Names): string {
 	return `CREATE INDEX IF NOT EXISTS ${quoted(shortName(names, "assignments_principal_subject_idx"))} ON ${qualified(schema, names.assignments)} ("projectId", "environmentId", "subjectKind", "subjectId")`;
+}
+
+function oneTimeSecretReplayMigrationSql(schema: string, names: Names): string {
+	const replay = names.oneTimeSecretReplays;
+	const c = (suffix: string) => quoted(shortName(names, suffix));
+	return `CREATE TABLE IF NOT EXISTS ${qualified(schema, replay)} (
+		"projectId" text NOT NULL, "environmentId" text NOT NULL, "operationId" text NOT NULL,
+		"organizationId" text NOT NULL, "actorId" text NOT NULL, "serviceAccountId" text NOT NULL,
+		"operationKind" text NOT NULL, "payloadDigest" text NOT NULL, "resultEnvelope" text NOT NULL,
+		"createdAt" timestamptz NOT NULL DEFAULT now(),
+		CONSTRAINT ${c("one_time_secret_replays_pk")} PRIMARY KEY ("projectId", "environmentId", "operationId"),
+		CONSTRAINT ${c("one_time_secret_replays_operation_ck")} CHECK ("operationKind" IN ('service_account_credential.create', 'service_account_credential.rotate')),
+		CONSTRAINT ${c("one_time_secret_replays_operation_id_ck")} CHECK ("operationId" ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+		CONSTRAINT ${c("one_time_secret_replays_payload_digest_ck")} CHECK ("payloadDigest" ~ '^[a-f0-9]{64}$')
+	)`;
 }
 
 function canonicalRevision(value: unknown): string {
@@ -809,17 +857,21 @@ type CatalogInspection = Readonly<{
 	installed: boolean;
 	terminalizationPending: boolean;
 	principalSubjectIndexPending: boolean;
+	oneTimeSecretReplaysPending: boolean;
 }>;
 
 async function inspectCatalog(queryable: Queryable, schema: string, names: Names): Promise<CatalogInspection> {
 	const tableNames = Object.values(names);
+	const legacyTableNames = tableNames.filter((name) => name !== names.oneTimeSecretReplays);
 	const tables = await queryable.query<TableRow>(`SELECT c.relname AS table_name, c.relkind, c.relpersistence AS persistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[])`, [schema, tableNames]);
-	if (tables.rows.length === 0) return Object.freeze({ installed: false, terminalizationPending: false, principalSubjectIndexPending: false });
-	if (tables.rows.length !== tableNames.length || tables.rows.some((row) => row.relkind !== "r" || row.persistence !== "p")) throw error("PostgreSQL authorization authority is partially installed or incompatible");
-	const actualColumns = await queryable.query<ColumnRow>(`SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = $1 AND table_name = ANY($2::text[]) ORDER BY table_name, ordinal_position`, [schema, tableNames]);
-	const actualConstraints = await queryable.query<ConstraintRow>(`SELECT c.relname AS table_name, con.conname AS constraint_name, con.contype AS constraint_type, con.convalidated AS validated, pg_get_constraintdef(con.oid, true) AS definition FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.contype = ANY(ARRAY['p', 'u', 'f', 'c']::"char"[]) ORDER BY c.relname, con.conname`, [schema, tableNames]);
-	const actualIndexes = await queryable.query<IndexRow>(`SELECT c.relname AS table_name, i.relname AS index_name, pg_get_indexdef(i.oid) AS definition FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_constraint con ON con.conindid = i.oid WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.oid IS NULL ORDER BY c.relname, i.relname`, [schema, tableNames]);
-	const actualTriggers = await queryable.query<TriggerRow>(`SELECT c.relname AS table_name, tg.tgname AS trigger_name, pg_get_triggerdef(tg.oid, true) AS definition, tg.tgenabled = 'O' AS enabled, function_namespace.nspname AS function_schema, function_record.proname AS function_name, format('%I.%I(%s)', function_namespace.nspname, function_record.proname, pg_get_function_identity_arguments(function_record.oid)) AS function_identity, function_record.prosrc AS function_source, language_record.lanname AS function_language, return_type.typname AS function_return_type, function_record.pronargs AS function_argument_count, function_record.prosecdef AS function_security_definer FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc function_record ON function_record.oid = tg.tgfoid JOIN pg_namespace function_namespace ON function_namespace.oid = function_record.pronamespace JOIN pg_language language_record ON language_record.oid = function_record.prolang JOIN pg_type return_type ON return_type.oid = function_record.prorettype WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND NOT tg.tgisinternal ORDER BY c.relname, tg.tgname`, [schema, tableNames]);
+	if (tables.rows.length === 0) return Object.freeze({ installed: false, terminalizationPending: false, principalSubjectIndexPending: false, oneTimeSecretReplaysPending: false });
+	const oneTimeSecretReplaysPending = !tables.rows.some((row) => row.table_name === names.oneTimeSecretReplays);
+	const inspectedTableNames = oneTimeSecretReplaysPending ? legacyTableNames : tableNames;
+	if (tables.rows.length !== inspectedTableNames.length || tables.rows.some((row) => row.relkind !== "r" || row.persistence !== "p")) throw error("PostgreSQL authorization authority is partially installed or incompatible");
+	const actualColumns = await queryable.query<ColumnRow>(`SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = $1 AND table_name = ANY($2::text[]) ORDER BY table_name, ordinal_position`, [schema, inspectedTableNames]);
+	const actualConstraints = await queryable.query<ConstraintRow>(`SELECT c.relname AS table_name, con.conname AS constraint_name, con.contype AS constraint_type, con.convalidated AS validated, pg_get_constraintdef(con.oid, true) AS definition FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.contype = ANY(ARRAY['p', 'u', 'f', 'c']::"char"[]) ORDER BY c.relname, con.conname`, [schema, inspectedTableNames]);
+	const actualIndexes = await queryable.query<IndexRow>(`SELECT c.relname AS table_name, i.relname AS index_name, pg_get_indexdef(i.oid) AS definition FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_constraint con ON con.conindid = i.oid WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND con.oid IS NULL ORDER BY c.relname, i.relname`, [schema, inspectedTableNames]);
+	const actualTriggers = await queryable.query<TriggerRow>(`SELECT c.relname AS table_name, tg.tgname AS trigger_name, pg_get_triggerdef(tg.oid, true) AS definition, tg.tgenabled = 'O' AS enabled, function_namespace.nspname AS function_schema, function_record.proname AS function_name, format('%I.%I(%s)', function_namespace.nspname, function_record.proname, pg_get_function_identity_arguments(function_record.oid)) AS function_identity, function_record.prosrc AS function_source, language_record.lanname AS function_language, return_type.typname AS function_return_type, function_record.pronargs AS function_argument_count, function_record.prosecdef AS function_security_definer FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc function_record ON function_record.oid = tg.tgfoid JOIN pg_namespace function_namespace ON function_namespace.oid = function_record.pronamespace JOIN pg_language language_record ON language_record.oid = function_record.prolang JOIN pg_type return_type ON return_type.oid = function_record.prorettype WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND NOT tg.tgisinternal ORDER BY c.relname, tg.tgname`, [schema, inspectedTableNames]);
 	const rollbackFencePresent = actualTriggers.rows.some((row) => row.trigger_name === "clearance_import_rollback_guard_v1");
 	if (rollbackFencePresent) {
 		const rollbackFenceTable = await queryable.query<RollbackFenceTableRow>(`SELECT c.relkind, c.relpersistence AS persistence, (SELECT count(*)::int FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attnum > 0 AND NOT attribute_record.attisdropped) AS column_count, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'kind' AND attribute_record.atttypid = 'text'::regtype AND attribute_record.attnotnull) AS has_kind, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'resource_id' AND attribute_record.atttypid = 'text'::regtype AND attribute_record.attnotnull) AS has_resource_id, EXISTS (SELECT 1 FROM pg_attribute attribute_record WHERE attribute_record.attrelid = c.oid AND attribute_record.attname = 'tombstoned_at' AND attribute_record.atttypid = 'timestamp with time zone'::regtype AND attribute_record.attnotnull) AS has_tombstoned_at, EXISTS (SELECT 1 FROM pg_constraint constraint_record WHERE constraint_record.conrelid = c.oid AND constraint_record.contype = 'p' AND pg_get_constraintdef(constraint_record.oid, true) = 'PRIMARY KEY (kind, resource_id)') AS has_primary_key FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2`, ["public", "clearance_import_rollback_tombstones"]);
@@ -849,14 +901,14 @@ async function inspectCatalog(queryable: Queryable, schema: string, names: Names
 	const compatibleIndexes = principalSubjectIndexPending
 		? Object.freeze({ ...expectedIndexes, assignments: expectedIndexes.assignments.filter((index) => index.name !== principalSubjectIndex) })
 		: expectedIndexes;
-	for (const key of Object.keys(names) as (keyof Names)[]) {
+	for (const key of Object.keys(names).filter((key) => !oneTimeSecretReplaysPending || key !== "oneTimeSecretReplays") as (keyof Names)[]) {
 		assertColumns(names[key], actualColumns.rows, compatibleColumns[key]);
 		assertConstraints(names[key], actualConstraints.rows, expectedConstraints[key]);
 		assertIndexes(names[key], actualIndexes.rows, compatibleIndexes[key]);
 	}
 	assertTriggers(actualTriggers.rows, names, authorizationTriggers(names));
 	assertFunctions(actualFunctions.rows, authorizationGuardFunctions(names));
-	return Object.freeze({ installed: true, terminalizationPending, principalSubjectIndexPending });
+	return Object.freeze({ installed: true, terminalizationPending, principalSubjectIndexPending, oneTimeSecretReplaysPending });
 }
 
 function transactionQueryable(value: AuthorizationAuthorityTransaction): Queryable {
@@ -913,6 +965,18 @@ function serviceAccountStatus(value: unknown, label: string): AuthorizationServi
 
 function credentialId(value: unknown, label: string): string {
 	return scopeString(value, label);
+}
+
+function canonicalOperationId(value: unknown): string {
+	const operationId = scopeString(value, "operationId");
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)) {
+		throw error("operationId is invalid", undefined, "AUTHORIZATION_OPERATION_ID_REQUIRED");
+	}
+	return operationId;
+}
+
+function oneTimeSecretPayloadDigest(value: Readonly<Record<string, unknown>>): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function optionalCredentialExpiry(value: unknown, label: string): Date | null {
@@ -1031,6 +1095,14 @@ type CredentialRow = {
 	version: unknown;
 };
 type CredentialAuthenticationRow = CredentialRow & { revision: unknown; role_ids: unknown; actions: unknown };
+type OneTimeSecretReplayRow = {
+	organization_id: unknown;
+	actor_id: unknown;
+	service_account_id: unknown;
+	operation_kind: unknown;
+	payload_digest: unknown;
+	result_envelope: unknown;
+};
 
 export class PostgresAuthorizationAuthority {
 	readonly identity: AuthorizationAuthorityIdentity;
@@ -1038,6 +1110,7 @@ export class PostgresAuthorizationAuthority {
 	readonly prefix: string;
 	readonly #database: Pick<pg.Pool, "query" | "connect">;
 	readonly #names: Names;
+	readonly #oneTimeSecretReplayCipher: AuthorizationOneTimeSecretReplayCipher | undefined;
 	readonly #runtimeOrganizationAuthority: AuthorizationRuntimeOrganizationAuthority | undefined;
 
 	constructor(
@@ -1051,6 +1124,7 @@ export class PostgresAuthorizationAuthority {
 		this.prefix = identifier(options.prefix ?? DEFAULT_PREFIX, "prefix", 24);
 		this.#database = database;
 		this.#names = namesFor(this.prefix);
+		this.#oneTimeSecretReplayCipher = options.oneTimeSecretReplayCipher;
 		this.#runtimeOrganizationAuthority = runtimeOrganizationAuthority === undefined
 			? undefined
 			: Object.freeze({
@@ -1075,10 +1149,11 @@ export class PostgresAuthorizationAuthority {
 			: [
 				...(inspection.terminalizationPending ? [terminalizationMigrationSql(this.schema, this.#names)] : []),
 				...(inspection.principalSubjectIndexPending ? [principalSubjectIndexMigrationSql(this.schema, this.#names)] : []),
+				...(inspection.oneTimeSecretReplaysPending ? [oneTimeSecretReplayMigrationSql(this.schema, this.#names)] : []),
 			].join(";\n");
 		return Object.freeze({
 			pendingTables: inspection.installed ? 0 : Object.keys(this.#names).length,
-			pendingFields: inspection.installed ? (inspection.terminalizationPending ? 1 : 0) : fieldCount,
+			pendingFields: inspection.installed ? (inspection.terminalizationPending ? 1 : 0) + (inspection.oneTimeSecretReplaysPending ? columns().oneTimeSecretReplays.length : 0) : fieldCount,
 			pendingSecurityMigrations: sql === "" ? Object.freeze([]) : Object.freeze([MIGRATION_ID]),
 			compileSql: async () => sql,
 			apply: async () => {
@@ -1091,9 +1166,10 @@ export class PostgresAuthorizationAuthority {
 					else {
 						if (current.terminalizationPending) await client.query(terminalizationMigrationSql(this.schema, this.#names));
 						if (current.principalSubjectIndexPending) await client.query(principalSubjectIndexMigrationSql(this.schema, this.#names));
+						if (current.oneTimeSecretReplaysPending) await client.query(oneTimeSecretReplayMigrationSql(this.schema, this.#names));
 					}
 					const verified = await inspectCatalog(client, this.schema, this.#names);
-					if (!verified.installed || verified.terminalizationPending || verified.principalSubjectIndexPending) {
+					if (!verified.installed || verified.terminalizationPending || verified.principalSubjectIndexPending || verified.oneTimeSecretReplaysPending) {
 						throw error("PostgreSQL authorization authority terminalization migration is incomplete");
 					}
 					await this.#seedBuiltInRoles(client);
@@ -1440,6 +1516,115 @@ export class PostgresAuthorizationAuthority {
 		return Object.freeze({ ...this.#credentialFromRow(row.rows[0]!), secret });
 	}
 
+	#oneTimeSecretReplayBinding(input: Readonly<{ operationId: string; organizationId: string; actorId: string; serviceAccountId: string; operationKind: "service_account_credential.create" | "service_account_credential.rotate" }>): string {
+		return JSON.stringify({
+			projectId: this.identity.projectId,
+			environmentId: this.identity.environmentId,
+			organizationId: input.organizationId,
+			actorId: input.actorId,
+			serviceAccountId: input.serviceAccountId,
+			operationId: input.operationId,
+			operationKind: input.operationKind,
+		});
+	}
+
+	async #oneTimeSecretReplayResult(envelope: unknown, binding: string): Promise<AuthorizationServiceAccountCredentialMutation> {
+		if (typeof envelope !== "string" || envelope.length === 0 || !this.#oneTimeSecretReplayCipher) throw error("One-time secret replay encryption is unavailable", undefined, "AUTHORIZATION_ONE_TIME_SECRET_REPLAY_UNAVAILABLE");
+		let value: unknown;
+		try {
+			value = JSON.parse(await this.#oneTimeSecretReplayCipher.open(envelope, binding));
+		} catch (cause) {
+			throw error("Stored one-time secret replay is invalid", cause);
+		}
+		if (!value || typeof value !== "object") throw error("Stored one-time secret replay is invalid");
+		const candidate = value as Record<string, unknown>;
+		if (!candidate.credential || typeof candidate.credential !== "object" || typeof candidate.secret !== "string") throw error("Stored one-time secret replay is invalid");
+		const credential = candidate.credential as Record<string, unknown>;
+		const expiresAt = credential.expiresAt === null
+			? null
+			: typeof credential.expiresAt === "string" ? new Date(credential.expiresAt) : undefined;
+		if (expiresAt !== null && (!(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()))) throw error("Stored one-time secret replay is invalid");
+		return Object.freeze({
+			credential: Object.freeze({
+				organizationId: scopeString(credential.organizationId, "stored replay organizationId"),
+				serviceAccountId: scopeString(credential.serviceAccountId, "stored replay serviceAccountId"),
+				credentialId: credentialId(credential.credentialId, "stored replay credentialId"),
+				credentialPrefix: scopeString(credential.credentialPrefix, "stored replay credentialPrefix"),
+				credentialFingerprint: scopeString(credential.credentialFingerprint, "stored replay credentialFingerprint"),
+				expiresAt,
+				version: credentialVersion(credential.version),
+			}),
+			secret: assertCredentialSecret(candidate.secret),
+			previousRevision: canonicalRevision(candidate.previousRevision),
+			revision: canonicalRevision(candidate.revision),
+			replayed: true,
+		});
+	}
+
+	async #findOneTimeSecretReplay(
+		queryable: Queryable,
+		input: Readonly<{ operationId: string; organizationId: string; actorId: string; serviceAccountId: string; operationKind: "service_account_credential.create" | "service_account_credential.rotate"; payloadDigest: string }>,
+	): Promise<AuthorizationServiceAccountCredentialMutation | undefined> {
+		const rows = await queryable.query<OneTimeSecretReplayRow>(`SELECT "organizationId" AS organization_id, "actorId" AS actor_id, "serviceAccountId" AS service_account_id, "operationKind" AS operation_kind, "payloadDigest" AS payload_digest, "resultEnvelope" AS result_envelope FROM ${this.#table(this.#names.oneTimeSecretReplays)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "operationId" = $3 FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, input.operationId]);
+		if (rows.rows.length === 0) return undefined;
+		if (rows.rows.length !== 1) throw error("One-time secret replay is unavailable");
+		const row = rows.rows[0]!;
+		if (
+			scopeString(row.organization_id, "stored replay organizationId") !== input.organizationId ||
+			scopeString(row.actor_id, "stored replay actorId") !== input.actorId ||
+			scopeString(row.service_account_id, "stored replay serviceAccountId") !== input.serviceAccountId ||
+			row.operation_kind !== input.operationKind ||
+			row.payload_digest !== input.payloadDigest
+		) {
+			throw error("operationId was already used for a different one-time secret mutation", undefined, "AUTHORIZATION_OPERATION_ID_CONFLICT");
+		}
+		const result = await this.#oneTimeSecretReplayResult(row.result_envelope, this.#oneTimeSecretReplayBinding(input));
+		if (
+			result.credential.organizationId !== input.organizationId ||
+			result.credential.serviceAccountId !== input.serviceAccountId
+		) {
+			throw error("Stored one-time secret replay is invalid");
+		}
+		await this.#requireServiceAccount(queryable, input.organizationId, input.serviceAccountId, true);
+		const credential = await queryable.query<CredentialRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, "credentialId" AS credential_id, "credentialDigest" AS credential_digest, "credentialPrefix" AS credential_prefix, "credentialFingerprint" AS credential_fingerprint, "expiresAt" AS expires_at, version FROM ${this.#table(this.#names.credentials)} credential WHERE credential."projectId" = $1 AND credential."environmentId" = $2 AND credential."organizationId" = $3 AND credential."serviceAccountId" = $4 AND credential."credentialId" = $5 AND credential.status = 'active' AND (credential."expiresAt" IS NULL OR credential."expiresAt" > clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM ${this.#table(this.#names.credentials)} replacement WHERE replacement."projectId" = credential."projectId" AND replacement."environmentId" = credential."environmentId" AND replacement."organizationId" = credential."organizationId" AND replacement."replacedCredentialId" = credential."credentialId") FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, input.organizationId, input.serviceAccountId, result.credential.credentialId]);
+		if (credential.rows.length !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
+		const current = this.#credentialFromRow(credential.rows[0]!);
+		if (
+			current.credentialPrefix !== result.credential.credentialPrefix ||
+			current.credentialFingerprint !== result.credential.credentialFingerprint ||
+			current.version !== result.credential.version ||
+			current.expiresAt?.getTime() !== result.credential.expiresAt?.getTime()
+		) {
+			throw error("Stored one-time secret replay is invalid");
+		}
+		return result;
+	}
+
+	async #storeOneTimeSecretReplay(
+		queryable: Queryable,
+		input: Readonly<{ operationId: string; organizationId: string; actorId: string; serviceAccountId: string; operationKind: "service_account_credential.create" | "service_account_credential.rotate"; payloadDigest: string; result: AuthorizationServiceAccountCredentialMutation }>,
+	): Promise<void> {
+		if (!this.#oneTimeSecretReplayCipher) throw error("One-time secret replay encryption is unavailable", undefined, "AUTHORIZATION_ONE_TIME_SECRET_REPLAY_UNAVAILABLE");
+		const result = {
+			credential: {
+				...input.result.credential,
+				expiresAt: input.result.credential.expiresAt?.toISOString() ?? null,
+			},
+			secret: input.result.secret,
+			previousRevision: input.result.previousRevision,
+			revision: input.result.revision,
+		};
+		try {
+			const envelope = await this.#oneTimeSecretReplayCipher.seal(JSON.stringify(result), this.#oneTimeSecretReplayBinding(input));
+			if (typeof envelope !== "string" || envelope.length === 0) throw error("One-time secret replay encryption is unavailable", undefined, "AUTHORIZATION_ONE_TIME_SECRET_REPLAY_UNAVAILABLE");
+			const inserted = await queryable.query(`INSERT INTO ${this.#table(this.#names.oneTimeSecretReplays)} ("projectId", "environmentId", "operationId", "organizationId", "actorId", "serviceAccountId", "operationKind", "payloadDigest", "resultEnvelope") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [this.identity.projectId, this.identity.environmentId, input.operationId, input.organizationId, input.actorId, input.serviceAccountId, input.operationKind, input.payloadDigest, envelope]);
+			if (inserted.rowCount !== 1) throw error("One-time secret replay is unavailable");
+		} catch (cause) {
+			if (postgresErrorCode(cause) === "23505") throw error("operationId was already used for a different one-time secret mutation", undefined, "AUTHORIZATION_OPERATION_ID_CONFLICT");
+			throw cause;
+		}
+	}
+
 	async upsertRole(input: AuthorizationAuthorityUpsertRoleInput): Promise<AuthorizationAuthorityUpsertRoleResult> {
 		const actions = sortedUnique(input.actions, "actions", canonicalActionName);
 		const role = authorizationRole(input.role, actions, "role");
@@ -1591,26 +1776,38 @@ export class PostgresAuthorizationAuthority {
 
 	async createServiceAccountCredential(input: AuthorizationCreateServiceAccountCredentialInput): Promise<AuthorizationServiceAccountCredentialMutation> {
 		const organizationId = scopeString(input.organizationId, "organizationId");
+		const actorId = scopeString(input.actorId, "actorId");
+		const operationId = canonicalOperationId(input.operationId);
 		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
 		const expiresAt = optionalCredentialExpiry(input.expiresAt, "expiresAt");
-		const requestedCredentialId = input.credentialId === undefined ? `credential_${randomUUID()}` : credentialId(input.credentialId, "credentialId");
+		const requestedCredentialId = input.credentialId === undefined ? undefined : credentialId(input.credentialId, "credentialId");
+		const replay = Object.freeze({ operationId, organizationId, actorId, serviceAccountId, operationKind: "service_account_credential.create" as const, payloadDigest: oneTimeSecretPayloadDigest(Object.freeze({ credentialId: requestedCredentialId ?? null, expiresAt: expiresAt?.toISOString() ?? null })) });
 		return this.#withMutation(input.transaction, async (queryable) => {
+			const prior = await this.#findOneTimeSecretReplay(queryable, replay);
+			if (prior) return prior;
 			await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, true);
 			const versionRows = await queryable.query<{ version: unknown }>(`SELECT COALESCE(max(version), 0)::text AS version FROM ${this.#table(this.#names.credentials)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId]);
 			const version = nextCredentialVersion(versionRows.rows[0]?.version ?? 0);
-			const created = await this.#insertServiceAccountCredential(queryable, { organizationId, serviceAccountId, credentialId: requestedCredentialId, expiresAt, version, replacedCredentialId: null });
+			const created = await this.#insertServiceAccountCredential(queryable, { organizationId, serviceAccountId, credentialId: requestedCredentialId ?? `credential_${randomUUID()}`, expiresAt, version, replacedCredentialId: null });
 			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
 			const { secret, ...credential } = created;
-			return Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision });
+			const result = Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision, replayed: false });
+			await this.#storeOneTimeSecretReplay(queryable, { ...replay, result });
+			return result;
 		});
 	}
 
 	async rotateServiceAccountCredential(input: AuthorizationRotateServiceAccountCredentialInput): Promise<AuthorizationServiceAccountCredentialMutation> {
 		const organizationId = scopeString(input.organizationId, "organizationId");
+		const actorId = scopeString(input.actorId, "actorId");
+		const operationId = canonicalOperationId(input.operationId);
 		const serviceAccountId = scopeString(input.serviceAccountId, "serviceAccountId");
 		const oldCredentialId = credentialId(input.credentialId, "credentialId");
 		const expiresAt = optionalCredentialExpiry(input.expiresAt, "expiresAt");
+		const replay = Object.freeze({ operationId, organizationId, actorId, serviceAccountId, operationKind: "service_account_credential.rotate" as const, payloadDigest: oneTimeSecretPayloadDigest(Object.freeze({ credentialId: oldCredentialId, expiresAt: expiresAt?.toISOString() ?? null })) });
 		return this.#withMutation(input.transaction, async (queryable) => {
+			const prior = await this.#findOneTimeSecretReplay(queryable, replay);
+			if (prior) return prior;
 			await this.#requireServiceAccount(queryable, organizationId, serviceAccountId, true);
 			const oldRows = await queryable.query<CredentialRow>(`SELECT "organizationId" AS organization_id, "serviceAccountId" AS service_account_id, "credentialId" AS credential_id, "credentialDigest" AS credential_digest, "credentialPrefix" AS credential_prefix, "credentialFingerprint" AS credential_fingerprint, "expiresAt" AS expires_at, version FROM ${this.#table(this.#names.credentials)} WHERE "projectId" = $1 AND "environmentId" = $2 AND "organizationId" = $3 AND "serviceAccountId" = $4 AND "credentialId" = $5 AND status = 'active' AND ("expiresAt" IS NULL OR "expiresAt" > clock_timestamp()) FOR UPDATE`, [this.identity.projectId, this.identity.environmentId, organizationId, serviceAccountId, oldCredentialId]);
 			if (oldRows.rows.length !== 1) throw error("Service account credential is invalid", undefined, "AUTHORIZATION_CREDENTIAL_INVALID");
@@ -1621,7 +1818,9 @@ export class PostgresAuthorizationAuthority {
 			if (revoked.rowCount !== 1) throw error("Service account credential is unavailable");
 			const advanced = (await this.#advanceAffectedRevisions(queryable, Object.freeze([organizationId])))[0]!;
 			const { secret, ...credential } = created;
-			return Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision });
+			const result = Object.freeze({ credential: Object.freeze(credential), secret, previousRevision: advanced.previousRevision, revision: advanced.revision, replayed: false });
+			await this.#storeOneTimeSecretReplay(queryable, { ...replay, result });
+			return result;
 		});
 	}
 

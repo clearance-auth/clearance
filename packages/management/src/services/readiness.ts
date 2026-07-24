@@ -12,6 +12,46 @@ function fp(obj: unknown): string {
 }
 
 /**
+ * Canonical state digest for a readiness report. Keep the full normalized
+ * enterprise configuration (including credential fingerprints and revisions)
+ * rather than a report's display-oriented check summary, so any mutation makes
+ * an earlier report provably stale.
+ */
+export function enterpriseReadinessStateFingerprint(
+	snapshot: DataStoreSnapshot,
+	organizationId: string,
+): string {
+	const ordered = <T extends { id: string }>(items: readonly T[]) =>
+		items.slice().sort((left, right) => left.id.localeCompare(right.id));
+	return createHash("sha256").update(JSON.stringify({
+		organizationId,
+		sso: ordered(snapshot.identityConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
+			id: connection.id, protocol: connection.protocol, provider: connection.provider,
+			status: connection.status, domains: [...connection.domains].sort(), issuer: connection.issuer ?? null,
+			audience: connection.audience ?? null, metadataUrl: connection.metadataUrl ?? null,
+			clientId: connection.clientId ?? null, clientSecretFingerprint: connection.clientSecretFingerprint ?? null,
+			clientSecretKeyId: connection.clientSecretKeyId ?? null, samlEntryPoint: connection.samlEntryPoint ?? null,
+			samlCertificateFingerprint: connection.samlCertificateFingerprint ?? null,
+			attributeMapping: connection.attributeMapping, updatedAt: connection.updatedAt,
+		})),
+		scim: ordered(snapshot.directoryConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
+			id: connection.id, provider: connection.provider, status: connection.status, endpoint: connection.endpoint,
+			bearerTokenFingerprint: connection.bearerTokenFingerprint ?? null,
+			bearerTokenKeyId: connection.bearerTokenKeyId ?? null,
+			deprovisioningPolicy: connection.deprovisioningPolicy, updatedAt: connection.updatedAt,
+		})),
+		memberships: ordered(snapshot.memberships.filter((membership) => membership.organizationId === organizationId)).map((membership) => ({
+			id: membership.id, principalId: membership.principalId, role: membership.role,
+			status: membership.status, updatedAt: membership.updatedAt,
+		})),
+		traces: ordered(snapshot.traces.filter((trace) => trace.organizationId === organizationId)).map((trace) => ({
+			id: trace.id, connectionId: trace.connectionId, subsystem: trace.subsystem, mode: trace.mode ?? "simulation",
+			stage: trace.stage, outcome: trace.outcome, createdAt: trace.createdAt,
+		})),
+	})).digest("hex");
+}
+
+/**
  * Enterprise readiness from control-plane state.
  * Fixture/synthetic SSO+SCIM tests are labeled simulation and never set liveCertified.
  */
@@ -69,11 +109,13 @@ function buildReadinessReport(
 	organizationId: string,
 	org: { id: string; name: string; slug: string },
 ): ReadinessReport {
+	const enabled = <T extends { status: string }>(connection: T) =>
+		connection.status === "active" || connection.status === "testing";
 	const sso = snapshot.identityConnections.filter(
-		(c) => c.organizationId === organizationId,
+		(c) => c.organizationId === organizationId && enabled(c),
 	);
 	const scim = snapshot.directoryConnections.filter(
-		(c) => c.organizationId === organizationId,
+		(c) => c.organizationId === organizationId && enabled(c),
 	);
 	const ssoTraces = snapshot.traces.filter(
 		(t) => t.organizationId === organizationId && t.subsystem === "sso",
@@ -113,11 +155,16 @@ function buildReadinessReport(
 				domains: primary.domains,
 			}),
 		});
-		const lastTrace = ssoTraces[0];
-		const lastSimPass = ssoTraces.find(
+		const currentTraces = ssoTraces.filter(
+			(trace) =>
+				trace.connectionId === primary.id &&
+				new Date(trace.createdAt).getTime() >= new Date(primary.updatedAt).getTime(),
+		);
+		const lastTrace = currentTraces[0];
+		const lastSimPass = currentTraces.find(
 			(t) => t.outcome === "pass" && (t.mode ?? "simulation") === "simulation",
 		);
-		const lastLivePass = ssoTraces.find(
+		const lastLivePass = currentTraces.find(
 			(t) => t.outcome === "pass" && t.mode === "live",
 		);
 		if (lastLivePass) {
@@ -169,11 +216,16 @@ function buildReadinessReport(
 				policy: primary.deprovisioningPolicy,
 			}),
 		});
-		const lastTrace = scimTraces[0];
-		const lastSimPass = scimTraces.find(
+		const currentTraces = scimTraces.filter(
+			(trace) =>
+				trace.connectionId === primary.id &&
+				new Date(trace.createdAt).getTime() >= new Date(primary.updatedAt).getTime(),
+		);
+		const lastTrace = currentTraces[0];
+		const lastSimPass = currentTraces.find(
 			(t) => t.outcome === "pass" && (t.mode ?? "simulation") === "simulation",
 		);
-		const lastLivePass = scimTraces.find(
+		const lastLivePass = currentTraces.find(
 			(t) => t.outcome === "pass" && t.mode === "live",
 		);
 		if (lastLivePass) {
@@ -259,6 +311,7 @@ function buildReadinessReport(
 		},
 		remainingCustomerActions,
 		signature: fp({ organizationId, checks, overall, liveCertified }),
+		stateFingerprint: enterpriseReadinessStateFingerprint(snapshot, organizationId),
 	};
 
 	return report;
@@ -299,12 +352,30 @@ export function getLatestReadiness(
 		(r) => r.organizationId === organizationId,
 	);
 	if (!report) {
-		throw new ClearanceError({
-			code: "READINESS_NOT_FOUND",
-			message: "No readiness report — run clearance readiness check",
-			stage: "readiness.report",
-			status: 404,
-		});
+		return {
+			id: `readiness_not_run_${organizationId}`,
+			organizationId,
+			generatedAt: new Date(0).toISOString(),
+			overall: "blocked",
+			conformance: { mode: "simulation", liveCertified: false, note: "Enterprise readiness has not been run for the current state" },
+			checks: [{ id: "enterprise.readiness.not_run", name: "Enterprise readiness", status: "fail", detail: "Run readiness after configuring an enabled SSO or SCIM connection" }],
+			remainingCustomerActions: ["Run an enterprise readiness check"],
+			signature: enterpriseReadinessStateFingerprint(store.snapshot, organizationId),
+			stateFingerprint: enterpriseReadinessStateFingerprint(store.snapshot, organizationId),
+			state: "not_run",
+		};
 	}
-	return report;
+	const current = enterpriseReadinessStateFingerprint(store.snapshot, organizationId);
+	return {
+		...report,
+		stateFingerprint: current,
+		state: report.stateFingerprint === current ? "current" : "stale",
+		...(report.stateFingerprint === current ? {} : {
+			overall: "blocked" as const,
+			remainingCustomerActions: [
+				...report.remainingCustomerActions,
+				"Run readiness again because enterprise state changed after this report",
+			],
+		}),
+	};
 }

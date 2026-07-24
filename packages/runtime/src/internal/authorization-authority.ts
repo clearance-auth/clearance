@@ -58,7 +58,7 @@ export type InternalAuthorizationAuthority = Readonly<{
 	): Promise<InternalServiceAccountCredentialAuthentication>;
 	initializeOrganizationOwner(
 		input: InternalAuthorizationOrganizationOwnerInput,
-	): Promise<void>;
+	): Promise<string>;
 }>;
 
 export class InvalidInternalAuthorizationAuthorityError extends Error {
@@ -338,9 +338,9 @@ export async function initializeInternalOrganizationOwner(
 		ownerPrincipalId: string;
 		transaction: DBTransactionAdapter;
 	}>,
-): Promise<boolean> {
+	): Promise<string | undefined> {
 	const authority = authorities.get(internalAdapter);
-	if (!authority) return false;
+	if (!authority) return undefined;
 	const organizationId = identifier(input.organizationId);
 	const ownerPrincipalId = identifier(input.ownerPrincipalId);
 	const transaction = input.transaction;
@@ -354,17 +354,18 @@ export async function initializeInternalOrganizationOwner(
 		);
 	}
 	try {
-		await authority.initializeOrganizationOwner(
+		const result = await authority.initializeOrganizationOwner(
 			Object.freeze({
 				organizationId,
 				ownerPrincipalId,
 				transaction: transaction as InternalAuthorizationActiveRawTransaction,
 			}),
 		);
+		return revision(result);
 	} catch (error) {
+		if (error instanceof InvalidInternalAuthorizationAuthorityError) throw error;
 		throw new InternalAuthorizationAuthorityUnavailableError(error);
 	}
-	return true;
 }
 
 /** Returns the attached reader so runtime-owned clones can preserve it. */

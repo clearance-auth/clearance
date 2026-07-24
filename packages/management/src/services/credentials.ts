@@ -6,6 +6,8 @@
  * Envelope format: clr$v1$<keyId>$<iv_b64url>$<tag_b64url>$<ct_b64url>
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import type { ClearanceKeyManagementFacade } from "@clearance/auth";
+import { parseKeyEnvelope, type KeyPurpose } from "@clearance/key-management";
 import { isForbiddenDefaultSecret } from "./secrets.js";
 
 const ENVELOPE_PREFIX = "clr$v1$";
@@ -26,6 +28,64 @@ export type EncryptedCredential = {
 	/** Short fingerprint of plaintext for comparison without disclosure */
 	fingerprint: string;
 };
+
+/**
+ * Server-only credential capability. Hosted tenant operations receive this
+ * from the exact auth bundle that owns their key-management scope; ordinary
+ * singleton management retains the environment-keyring fallback below.
+ */
+export type CredentialCipher = Readonly<{
+	seal(plaintext: string, identity: Readonly<Record<string, string>>): Promise<EncryptedCredential>;
+	open(envelope: string, identity: Readonly<Record<string, string>>): Promise<string>;
+}>;
+
+function canonicalCredentialIdentity(identity: Readonly<Record<string, string>>): string {
+	const entries = Object.entries(identity).sort(([left], [right]) => left.localeCompare(right));
+	if (!entries.length || entries.some(([key, value]) => !key || !value || /[\0\r\n]/.test(key) || /[\0\r\n]/.test(value))) {
+		throw new Error("Credential key identity is invalid");
+	}
+	return JSON.stringify(Object.fromEntries(entries));
+}
+
+/** Bind control-plane credential envelopes to the bundle's immutable scope. */
+export function createKeyManagedCredentialCipher(
+	keyManagement: ClearanceKeyManagementFacade,
+	purpose: Extract<KeyPurpose, "oidc-client-secret" | "scim-bearer-token">,
+): CredentialCipher {
+	const resourceIdFor = (identity: Readonly<Record<string, string>>) =>
+		keyManagement.resourceId(purpose, {
+			managementCredentialIdentity: canonicalCredentialIdentity(identity),
+		});
+	const assertEnvelope = (envelope: string, resourceId: string) => {
+		const parsed = parseKeyEnvelope(envelope);
+		if (
+			parsed.purpose !== purpose ||
+			parsed.projectId !== keyManagement.scope.projectId ||
+			parsed.environmentId !== keyManagement.scope.environmentId ||
+			parsed.resourceId !== resourceId
+		) {
+			throw new Error("Credential key envelope does not match the runtime scope");
+		}
+		return parsed;
+	};
+	return Object.freeze({
+		async seal(plaintext, identity) {
+			const resourceId = resourceIdFor(identity);
+			const ciphertext = await keyManagement.sealText(purpose, resourceId, plaintext);
+			const parsed = assertEnvelope(ciphertext, resourceId);
+			return Object.freeze({
+				ciphertext,
+				keyId: parsed.keyId,
+				fingerprint: fingerprintCredential(plaintext),
+			});
+		},
+		async open(envelope, identity) {
+			const resourceId = resourceIdFor(identity);
+			assertEnvelope(envelope, resourceId);
+			return keyManagement.openText(purpose, resourceId, envelope);
+		},
+	});
+}
 
 function b64url(buf: Buffer): string {
 	return buf

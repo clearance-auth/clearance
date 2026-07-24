@@ -55,7 +55,7 @@ afterEach(() => {
 });
 
 describe("SSO rotate / disable", () => {
-	it("rotates credential envelope, audits, and never returns secrets", () => {
+	it("rejects JSON-store credential rotation so tenant replacement cannot drift from runtime", () => {
 		const store = tempStore();
 		initProject(store, { name: "SsoRot" });
 		const org = createOrganization(store, { name: "Cust" });
@@ -69,27 +69,15 @@ describe("SSO rotate / disable", () => {
 		});
 
 		const before = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
-		const rotated = rotateSsoCredential(store, sso.id, {
+		expect(() => rotateSsoCredential(store, sso.id, {
 			actor: "test",
 			source: "cli",
-		});
-
-		expect((rotated as { clientSecretEncrypted?: string }).clientSecretEncrypted).toBeUndefined();
-		expect(rotated.clientSecretFingerprint).toBeTruthy();
+		})).toThrow(/coordinated PostgreSQL runtime backend/i);
 		const after = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
-		expect(after).not.toBe(before);
+		expect(after).toBe(before);
 		expect(decryptCredential(after)).toBe(secret);
-		expect(JSON.stringify(rotated)).not.toContain(secret);
 		expect(JSON.stringify(listEvents(store))).not.toContain(secret);
-
-		const audit = listEvents(store).find(
-			(e) => e.action === "sso.rotate" && e.subjectId === sso.id,
-		);
-		expect(audit?.source).toBe("cli");
-		expect(audit?.actor).toBe("test");
-		expect(audit?.projectId).toBe(org.projectId);
-		expect(audit?.environmentId).toBe(org.environmentId);
-		expect(JSON.stringify(audit?.metadata ?? {})).not.toMatch(/clr\$v1\$/);
+		expect(listEvents(store).some((event) => event.action === "sso.rotate")).toBe(false);
 	});
 
 	it("disables SSO connection idempotently with audit and scope fail-closed", () => {
@@ -161,7 +149,7 @@ describe("SSO rotate / disable", () => {
 		);
 	});
 
-	it("rotate fails closed when no client secret is stored", () => {
+	it("rejects a JSON-store replacement before inspecting legacy secret state", () => {
 		const store = tempStore();
 		initProject(store, { name: "NoSec" });
 		const org = createOrganization(store, { name: "Cust" });
@@ -172,13 +160,13 @@ describe("SSO rotate / disable", () => {
 			issuer: "https://idp.example/oauth2",
 		});
 		expect(() => rotateSsoCredential(store, sso.id)).toThrow(ClearanceError);
-		expect(() => rotateSsoCredential(store, sso.id)).toThrow(/no encrypted/i);
+		expect(() => rotateSsoCredential(store, sso.id)).toThrow(/coordinated PostgreSQL runtime backend/i);
 		expect(listEvents(store).some((e) => e.action === "sso.rotate")).toBe(false);
 	});
 });
 
 describe("SCIM rotate / disable / replay", () => {
-	it("rotates SCIM bearer envelope without leaking token", () => {
+	it("rejects JSON-store bearer rotation so runtime and management credentials remain atomic", () => {
 		const store = tempStore();
 		initProject(store, { name: "ScimRot" });
 		const org = createOrganization(store, { name: "Cust" });
@@ -190,21 +178,15 @@ describe("SCIM rotate / disable / replay", () => {
 			bearerToken: token,
 		});
 		const before = store.snapshot.directoryConnections[0]!.bearerTokenEncrypted!;
-		const rotated = rotateScimCredential(store, scim.id, {
+		expect(() => rotateScimCredential(store, scim.id, {
 			actor: "test",
 			source: "cli",
-		});
-		expect((rotated as { bearerTokenEncrypted?: string }).bearerTokenEncrypted).toBeUndefined();
+		})).toThrow(/coordinated PostgreSQL runtime backend/i);
 		const after = store.snapshot.directoryConnections[0]!.bearerTokenEncrypted!;
-		expect(after).not.toBe(before);
+		expect(after).toBe(before);
 		expect(decryptCredential(after)).toBe(token);
-		expect(JSON.stringify(rotated)).not.toContain(token);
 		expect(JSON.stringify(listEvents(store))).not.toContain(token);
-		expect(
-			listEvents(store).some(
-				(e) => e.action === "scim.rotate" && e.subjectId === scim.id,
-			),
-		).toBe(true);
+		expect(listEvents(store).some((event) => event.action === "scim.rotate")).toBe(false);
 	});
 
 	it("disables SCIM connection and rejects cross-scope ids", () => {

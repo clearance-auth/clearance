@@ -3,6 +3,10 @@ import { createAuthClient } from "../../../client";
 import { createAccessControl } from "../../access";
 import { getTestInstance } from "../../../test-utils/test-instance";
 import { attachInternalAuthorizationAuthority } from "../../../internal/authorization-authority";
+import {
+	attachInternalManagedOrganizationLifecycleAuthority,
+	type InternalManagedOrganizationLifecycleInput,
+} from "../../../internal/organization-lifecycle-authority";
 import { defaultStatements } from "../access";
 import { organizationClient } from "../client";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
@@ -492,7 +496,7 @@ describe("organization hooks", async () => {
 					),
 				),
 		});
-		const finalize = vi.fn(async () => {});
+		const finalize = vi.fn(async () => "7");
 		attachInternalAuthorizationAuthority(context.internalAdapter, {
 			async authenticateServiceAccountCredential() {
 				throw new Error("not used by this organization test");
@@ -507,6 +511,13 @@ describe("organization hooks", async () => {
 			},
 			initializeOrganizationOwner: finalize,
 		});
+		const finalizeLifecycle = vi.fn(
+			async (_input: InternalManagedOrganizationLifecycleInput) => {},
+		);
+		attachInternalManagedOrganizationLifecycleAuthority(
+			context.internalAdapter,
+			{ finalizeCreatedOrganization: finalizeLifecycle },
+		);
 		const { headers, user } = await signInWithTestUser();
 		const createdOrganization = await auth.api.createOrganization({
 			body: { name: "authorized", slug: "authorized" },
@@ -522,6 +533,25 @@ describe("organization hooks", async () => {
 				}),
 			}),
 		);
+		const lifecycleInput = finalizeLifecycle.mock.calls[0]![0]!;
+		expect(lifecycleInput.organization).toEqual({
+			id: createdOrganization.id,
+			name: "authorized",
+			slug: "authorized",
+			createdAt: createdOrganization.createdAt,
+		});
+		expect(lifecycleInput.owner).toEqual({
+			id: user.id,
+			email: user.email,
+			name: user.name,
+			createdAt: lifecycleInput.owner.createdAt,
+			updatedAt: lifecycleInput.owner.updatedAt,
+		});
+		expect(lifecycleInput.owner.createdAt).toBeInstanceOf(Date);
+		expect(lifecycleInput.owner.updatedAt).toBeInstanceOf(Date);
+		expect(lifecycleInput.ownerMembershipId).toEqual(expect.any(String));
+		expect(lifecycleInput.authorizationRevision).toBe("7");
+		expect(lifecycleInput.transaction.rawTransactionQuery).toEqual(expect.any(Function));
 	});
 
 	it("rolls back organization creation when authorization finalization fails", async () => {
@@ -552,19 +582,91 @@ describe("organization hooks", async () => {
 					actions: [],
 				};
 			},
-			async initializeOrganizationOwner() {
-				throw new Error("authorization finalization failed");
-			},
+			async initializeOrganizationOwner() { return "1"; },
 		});
+		attachInternalManagedOrganizationLifecycleAuthority(
+			context.internalAdapter,
+			{
+				async finalizeCreatedOrganization() {
+					throw new Error("managed lifecycle finalization failed");
+				},
+			},
+		);
 		const { headers } = await signInWithTestUser();
 		await expect(
 			auth.api.createOrganization({
 				body: { name: "rollback authorization", slug: "rollback-authorization" },
 				headers,
 			}),
-		).rejects.toThrow("Authorization authority is unavailable");
+		).rejects.toThrow("Managed organization lifecycle authority is unavailable");
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/organization/create", {
+				method: "POST",
+				headers: new Headers({
+					...Object.fromEntries(headers),
+					"content-type": "application/json",
+				}),
+				body: JSON.stringify({
+					name: "rollback lifecycle cookie",
+					slug: "rollback-lifecycle-cookie",
+				}),
+			}),
+		);
+		expect(response.status).toBe(500);
+		expect(response.headers.get("set-cookie")).toBeNull();
 		expect(await context.adapter.count({ model: "organization" })).toBe(0);
 		expect(await context.adapter.count({ model: "member" })).toBe(0);
+	});
+
+	it("rejects control-character names before organization lifecycle writes", async () => {
+		const { auth, signInWithTestUser } = await getTestInstance({
+			plugins: [organization()],
+		});
+		const context = await auth.$context;
+		const initializeOrganizationOwner = vi.fn(async () => "1");
+		const finalizeCreatedOrganization = vi.fn(async () => {});
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async authenticateServiceAccountCredential() {
+				throw new Error("not used by this organization test");
+			},
+			async readEffectiveAuthorization(input) {
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: "1",
+					actions: [],
+				};
+			},
+			initializeOrganizationOwner,
+		});
+		attachInternalManagedOrganizationLifecycleAuthority(
+			context.internalAdapter,
+			{ finalizeCreatedOrganization },
+		);
+		const { headers } = await signInWithTestUser();
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/organization/create", {
+				method: "POST",
+				headers: new Headers({
+					...Object.fromEntries(headers),
+					"content-type": "application/json",
+				}),
+				body: JSON.stringify({
+					name: "invalid\u0007organization",
+					slug: "invalid-control-character",
+				}),
+			}),
+		);
+
+		expect(response.status).toBe(400);
+		expect(response.headers.get("set-cookie")).toBeNull();
+		expect(await context.adapter.count({ model: "organization" })).toBe(0);
+		expect(await context.adapter.count({ model: "member" })).toBe(0);
+		expect(initializeOrganizationOwner).not.toHaveBeenCalled();
+		expect(finalizeCreatedOrganization).not.toHaveBeenCalled();
+		expect(await auth.api.getSession({ headers })).toMatchObject({
+			session: { activeOrganizationId: null },
+		});
 	});
 
 	it("serializes concurrent numeric organization-limit admission", async () => {

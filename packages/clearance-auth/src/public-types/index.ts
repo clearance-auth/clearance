@@ -93,6 +93,240 @@ export type ClearanceRuntimeSessionResponse = {
 	user: ClearanceRuntimeUser;
 };
 
+export type TenantProductSsoConnection = Readonly<{
+	id: string;
+	organizationId: string;
+	protocol: "saml" | "oidc";
+	provider: string;
+	status: "draft" | "testing" | "active" | "disabled";
+	domains: readonly string[];
+	issuer?: string;
+	audience?: string;
+	metadataUrl?: string;
+	clientId?: string;
+	clientSecretFingerprint?: string;
+	hasClientSecret: boolean;
+	samlEntryPoint?: string;
+	samlCertificateFingerprint?: string;
+	attributeMapping: Readonly<Record<string, string>>;
+	createdAt: string;
+	updatedAt: string;
+}>;
+
+export type TenantProductScimConnection = Readonly<{
+	id: string;
+	organizationId: string;
+	provider: string;
+	status: "draft" | "testing" | "active" | "disabled";
+	endpoint: string;
+	bearerTokenFingerprint?: string;
+	hasBearerToken: boolean;
+	deprovisioningPolicy: "disable" | "delete" | "suspend";
+	createdAt: string;
+	updatedAt: string;
+}>;
+
+export type TenantProductAuditEvent = Readonly<{
+	id: string;
+	correlationId: string;
+	organizationId: string;
+	actor: string;
+	action: string;
+	subjectType?: string;
+	subjectId?: string;
+	outcome: "success" | "failure" | "pending";
+	source:
+		| "cli"
+		| "console"
+		| "api"
+		| "system"
+		| "migration"
+		| "sso"
+		| "scim";
+	message: string;
+	metadata: Readonly<Record<string, unknown>>;
+	createdAt: string;
+}>;
+
+export type TenantProductReadiness = Readonly<{
+	id: string;
+	organizationId: string;
+	generatedAt: string;
+	overall: "ready" | "blocked" | "attention";
+	conformance: Readonly<{
+		mode: "simulation" | "live";
+		liveCertified: boolean;
+		note: string;
+	}>;
+	checks: readonly Readonly<{
+		id: string;
+		name: string;
+		status: "pass" | "fail" | "warn" | "skip";
+		detail: string;
+		fingerprint?: string;
+		simulation?: boolean;
+	}>[];
+	remainingCustomerActions: readonly string[];
+	signature: string;
+	/** Exact enterprise configuration fingerprint evaluated by this response. */
+	stateFingerprint?: string;
+	/** A stored report is never silently treated as current after a mutation. */
+	state?: "current" | "stale" | "not_run";
+}>;
+
+/**
+ * Server-only bridge for tenant enterprise administration. Implementations own
+ * product scope, management storage, normalized transaction authorization, and
+ * secret handling. Browser callers can supply only organization-scoped domain
+ * inputs through the authenticated tenant endpoints.
+ */
+export type TenantProductAdministrationFacade = Readonly<{
+	listAudit(input: {
+		organizationId: string;
+		actorId: string;
+		limit?: number;
+		cursor?: string;
+		action?: string;
+	}): Promise<Readonly<{
+		events: readonly TenantProductAuditEvent[];
+		nextCursor: string | null;
+	}>>;
+	listSso(input: {
+		organizationId: string;
+		actorId: string;
+	}): Promise<readonly TenantProductSsoConnection[]>;
+	inspectSso(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+	}): Promise<TenantProductSsoConnection>;
+	createSso(input: {
+		organizationId: string;
+		actorId: string;
+		protocol: "saml" | "oidc";
+		provider: string;
+		issuer: string;
+		domain: string;
+		audience?: string;
+		clientId?: string;
+		clientSecret?: string;
+		samlEntryPoint?: string;
+		samlCertificate?: string;
+	}): Promise<TenantProductSsoConnection>;
+	testSso(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		mode?: "simulation" | "live";
+	}): Promise<Readonly<{
+		connection: TenantProductSsoConnection;
+		pass: boolean;
+		mode: "simulation" | "live";
+		liveCertified: boolean;
+		evidence?: string;
+		authorizationUrl?: string;
+	}>>;
+	configureSso(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		issuer?: string;
+		audience?: string;
+		domain?: string;
+		clientId?: string;
+		samlEntryPoint?: string;
+		samlCertificate?: string;
+	}): Promise<TenantProductSsoConnection>;
+	replaceSsoSecret(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		operationId: string;
+		newClientSecret?: string;
+		newSamlEntryPoint?: string;
+		newSamlCertificate?: string;
+	}): Promise<TenantProductSsoConnection>;
+	disableSso(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+	}): Promise<Readonly<{
+		connection: TenantProductSsoConnection;
+		idempotent: boolean;
+		runtimeRemoved: boolean;
+	}>>;
+	listScim(input: {
+		organizationId: string;
+		actorId: string;
+	}): Promise<readonly TenantProductScimConnection[]>;
+	inspectScim(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+	}): Promise<TenantProductScimConnection>;
+	createScim(input: {
+		organizationId: string;
+		actorId: string;
+		operationId: string;
+		provider: string;
+		endpoint?: string;
+	}): Promise<Readonly<{
+		connection: TenantProductScimConnection;
+		bearerTokenOnce: string;
+	}>>;
+	testScim(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		mode?: "simulation" | "live";
+		scenario?: "users" | "group-lifecycle";
+	}): Promise<Readonly<{
+		connection: TenantProductScimConnection;
+		pass: boolean;
+		mode: "simulation" | "live";
+		liveCertified: boolean;
+		evidence?: string;
+		groupLifecycle?: Readonly<{
+			group: Readonly<{ id: string; status: "deleted" }>;
+			counts: Readonly<{
+				usersCreated: number;
+				membersCreated: number;
+				membersAfterPatch: number;
+			}>;
+		}>;
+	}>>;
+	configureScim(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		endpoint?: string;
+		deprovisioningPolicy?: "disable" | "delete" | "suspend";
+	}): Promise<TenantProductScimConnection>;
+	rotateScim(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+		operationId: string;
+	}): Promise<Readonly<{
+		connection: TenantProductScimConnection;
+		bearerTokenOnce?: string;
+		replayed: boolean;
+	}>>;
+	disableScim(input: {
+		organizationId: string;
+		actorId: string;
+		connectionId: string;
+	}): Promise<Readonly<{
+		connection: TenantProductScimConnection;
+		idempotent: boolean;
+		runtimeRemoved: boolean;
+	}>>;
+	readiness(input: {
+		organizationId: string;
+		actorId: string;
+	}): Promise<TenantProductReadiness>;
+}>;
+
 export type ClearancePublicPasskey = {
 	id: string;
 	name?: string | null;
@@ -504,6 +738,8 @@ export type ClearanceAuthorizationServiceAccountCredentialMutation = Readonly<{
 	secret: string;
 	previousRevision: string;
 	revision: string;
+	/** Internal replay signal; tenant HTTP responses intentionally omit it. */
+	replayed: boolean;
 }>;
 
 export type ClearanceAuthorizationServiceAccountAuthentication = Readonly<{
@@ -519,6 +755,8 @@ export type ClearanceAuthorizationServiceAccountAuthentication = Readonly<{
 
 export type ClearanceAuthorizationFacade = Readonly<{
 	readonly scope: Readonly<{ projectId: string; environmentId: string }>;
+	/** Internal lifecycle sequencing primitive for an existing transaction. */
+	acquireMutationLock(transaction: ClearanceTransactionQuery): Promise<void>;
 	/** Package-internal startup reconciliation; callers supply only server-owned table identities. */
 	reconcileRuntimeOrganizations(input: Readonly<{
 		management: Readonly<{ schema: string; table: string }>;
@@ -595,6 +833,8 @@ export type ClearanceAuthorizationFacade = Readonly<{
 	}>): Promise<ClearanceAuthorizationServiceAccountMutation>;
 	createServiceAccountCredential(input: Readonly<{
 		organizationId: string;
+		actorId: string;
+		operationId: string;
 		serviceAccountId: string;
 		credentialId?: string;
 		expiresAt?: Date;
@@ -602,6 +842,8 @@ export type ClearanceAuthorizationFacade = Readonly<{
 	}>): Promise<ClearanceAuthorizationServiceAccountCredentialMutation>;
 	rotateServiceAccountCredential(input: Readonly<{
 		organizationId: string;
+		actorId: string;
+		operationId: string;
 		serviceAccountId: string;
 		credentialId: string;
 		expiresAt?: Date;

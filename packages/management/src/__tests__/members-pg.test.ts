@@ -12,6 +12,7 @@ import { createPgStore, type PgStore } from "../store/pg-store.js";
 import {
 	addMemberInAuth,
 	createUserInAuth,
+	createTenantProductAdministrationFacade,
 	ensureAuthMigrated,
 	getAuthBundle,
 	inspectEffectiveAuthorizationInAuth,
@@ -48,6 +49,7 @@ const createdRuntimeUserIds = new Set<string>();
 const createdRuntimeOrgIds = new Set<string>();
 const createdRuntimeMemberIds = new Set<string>();
 const createdRuntimeEmails = new Set<string>();
+const createdSsoProviderIds = new Set<string>();
 
 
 function trackUser(user: { id: string; email?: string | null }): void {
@@ -66,6 +68,14 @@ function trackMember(id: string): void {
 async function cleanupTracked(): Promise<void> {
 	const pool = new pg.Pool({ connectionString: DATABASE_URL });
 	try {
+		const ssoProviderIds = [...createdSsoProviderIds];
+		if (ssoProviderIds.length > 0) {
+			await pool
+				.query(`delete from "ssoProvider" where id = any($1::text[])`, [
+					ssoProviderIds,
+				])
+				.catch(() => undefined);
+		}
 		const memberIds = [...createdRuntimeMemberIds];
 		if (memberIds.length > 0) {
 			await pool
@@ -148,6 +158,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		createdRuntimeOrgIds.clear();
 		createdRuntimeMemberIds.clear();
 		createdRuntimeEmails.clear();
+		createdSsoProviderIds.clear();
 		resetAuthBundle();
 	});
 
@@ -635,6 +646,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			organizationId: organization.id,
 			serviceAccountId: account.serviceAccount.serviceAccountId,
 			dryRun: true,
+			actor: "test",
 		});
 		expect(credentialPreview).toEqual({
 			preview: true,
@@ -648,10 +660,20 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(credentialPreview).not.toHaveProperty("credentialPrefix");
 		expect(credentialPreview).not.toHaveProperty("credentialFingerprint");
 		expect(credentialPreview).not.toHaveProperty("revision");
+		await expect(createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			dryRun: true,
+			actor: "test",
+			operationId: "33333333-3333-4333-8333-333333333333",
+		} as never)).rejects.toMatchObject({
+			code: "TENANT_OPERATION_ID_REQUIRED",
+		});
 		const credential = await createServiceAccountCredentialInAuth(store, {
 			organizationId: organization.id,
 			serviceAccountId: account.serviceAccount.serviceAccountId,
 			actor: "test",
+			operationId: "22222222-2222-4222-8222-222222222222",
 		});
 		if ("preview" in credential) throw new Error("live credential creation returned a preview");
 		expect(credential.secret).toMatch(/^clr_sac_v1_/);
@@ -725,6 +747,126 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			actor: "test",
 		});
 		expect(demoted.role).toBe("member");
+	});
+
+	it("tenant enterprise facade reauthorizes inside the coordinated disable transaction", async () => {
+		const store = await freshStore();
+		const { owner, organization, stamp } = await seedOwnerAndOrg(store);
+		const member = await createMemberUser(store, stamp, "tenant-enterprise");
+		const membership = await addMemberInAuth(store, {
+			organizationId: organization.id,
+			principalId: member.id,
+			role: "member",
+			actor: "test",
+		});
+		trackMember(membership.id);
+
+		const allowedConnectionId = `sso_tenant_allowed_${process.pid}_${Date.now()}`;
+		const deniedConnectionId = `sso_tenant_denied_${process.pid}_${Date.now()}`;
+		const revokedConnectionId = `sso_tenant_revoked_${process.pid}_${Date.now()}`;
+		const now = new Date().toISOString();
+		store.mutate((data) => {
+			for (const id of [allowedConnectionId, deniedConnectionId, revokedConnectionId]) {
+				data.identityConnections.push({
+					id,
+					organizationId: organization.id,
+					protocol: "oidc",
+					provider: "okta",
+					status: "active",
+					domains: ["example.test"],
+					issuer: "https://idp.example.test/oauth2/default",
+					attributeMapping: { email: "email", name: "name" },
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+		});
+		await store.ready();
+
+		const runtime = getAuthBundle();
+		for (const id of [allowedConnectionId, deniedConnectionId, revokedConnectionId]) {
+			await runtime.pool.query(
+				`insert into "ssoProvider" (
+					id, issuer, "oidcConfig", "samlConfig", "userId", "providerId",
+					"organizationId", domain
+				 ) values ($1, $2, null, null, $3, $4, $5, $6)`,
+				[
+					id,
+					"https://idp.example.test/oauth2/default",
+					owner.id,
+					`${id}_provider`,
+					organization.id,
+					"example.test",
+				],
+			);
+			createdSsoProviderIds.add(id);
+		}
+
+		const scope = resolveOperatorScope(store);
+		const facade = createTenantProductAdministrationFacade({ store, scope });
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: owner.id,
+				connectionId: allowedConnectionId,
+			}),
+		).resolves.toMatchObject({
+			connection: { id: allowedConnectionId, status: "disabled" },
+			runtimeRemoved: true,
+		});
+
+		const eventsBeforeDenied = store.snapshot.events.length;
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: member.id,
+				connectionId: deniedConnectionId,
+			}),
+		).rejects.toMatchObject({
+			code: "TENANT_AUTHORIZATION_REQUIRED",
+			status: 403,
+		});
+		expect(
+			store.snapshot.identityConnections.find(
+				(connection) => connection.id === deniedConnectionId,
+			)?.status,
+		).toBe("active");
+		await expect(
+			runtime.pool.query(
+				`select id from "ssoProvider" where id = $1`,
+				[deniedConnectionId],
+			),
+		).resolves.toMatchObject({
+			rows: [{ id: deniedConnectionId }],
+		});
+		expect(store.snapshot.events).toHaveLength(eventsBeforeDenied);
+
+		// This actor is first granted the exact update authority, then revoked
+		// through the live membership lifecycle. The real facade must re-read
+		// normalized authorization in its coordinated transaction; an endpoint
+		// capability captured before revocation would incorrectly delete this row.
+		await updateMemberInAuth(store, membership.id, { role: "owner", actor: "test" });
+		await removeMemberInAuth(store, membership.id, { actor: "test" });
+		const eventsBeforeRevoked = store.snapshot.events.length;
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: member.id,
+				connectionId: revokedConnectionId,
+			}),
+		).rejects.toMatchObject({
+			code: "TENANT_AUTHORIZATION_REQUIRED",
+			status: 403,
+		});
+		expect(
+			store.snapshot.identityConnections.find(
+				(connection) => connection.id === revokedConnectionId,
+			)?.status,
+		).toBe("active");
+		await expect(
+			runtime.pool.query(`select id from "ssoProvider" where id = $1`, [revokedConnectionId]),
+		).resolves.toMatchObject({ rows: [{ id: revokedConnectionId }] });
+		expect(store.snapshot.events).toHaveLength(eventsBeforeRevoked);
 	});
 
 	it("cross-scope add fails closed with no runtime write", async () => {

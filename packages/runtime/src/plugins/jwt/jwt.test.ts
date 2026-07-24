@@ -232,7 +232,7 @@ describe("jwt session derivative authority", async () => {
 					actions: authorization.actions,
 				};
 			},
-			async initializeOrganizationOwner() {},
+			async initializeOrganizationOwner() { return "1"; },
 			async authenticateServiceAccountCredential() {
 				throw new Error("not used");
 			},
@@ -375,7 +375,7 @@ describe("jwt session derivative authority", async () => {
 					expiresAt,
 				};
 			},
-			async initializeOrganizationOwner() {},
+			async initializeOrganizationOwner() { return "1"; },
 		});
 
 		const issued = await local.auth.api.issueServiceAccountJWT({
@@ -456,7 +456,7 @@ describe("jwt session derivative authority", async () => {
 						expiresAt: null,
 					};
 				},
-				async initializeOrganizationOwner() {},
+				async initializeOrganizationOwner() { return "1"; },
 			},
 		);
 		await expect(

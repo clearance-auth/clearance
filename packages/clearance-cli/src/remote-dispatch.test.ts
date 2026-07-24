@@ -17,6 +17,10 @@ vi.mock("@clearance/management", async (importOriginal) => {
 		SCHEMA_OPERATIONS: source.SCHEMA_OPERATIONS,
 		AUTHENTICATION_POLICY_OPERATIONS: source.AUTHENTICATION_POLICY_OPERATIONS,
 		AUTHORIZATION_OPERATIONS: source.AUTHORIZATION_OPERATIONS,
+		PRODUCT_DOMAIN_OPERATIONS: source.PRODUCT_DOMAIN_OPERATIONS,
+		PRODUCT_PRESENTATION_OPERATIONS: source.PRODUCT_PRESENTATION_OPERATIONS,
+		PRODUCT_SENDER_OPERATIONS: source.PRODUCT_SENDER_OPERATIONS,
+		PRODUCT_TEMPLATE_OPERATIONS: source.PRODUCT_TEMPLATE_OPERATIONS,
 		MANAGEMENT_OPERATIONS: source.MANAGEMENT_OPERATIONS,
 		SERVICE_ACCOUNT_OPERATIONS: source.SERVICE_ACCOUNT_OPERATIONS,
 	};
@@ -26,11 +30,16 @@ vi.mock("@clearance/management", async (importOriginal) => {
 // authority real while leaving response-schema conformance to management-client.
 vi.mock("@clearance/management-client", async (importOriginal) => {
 	const original = await importOriginal<typeof import("@clearance/management-client")>();
+	const source = await import("../../management-client/src/generated/registry.ts");
+	const client = await import("../../management-client/src/client.ts");
+	const errors = await import("../../management-client/src/error.ts");
 	const permissiveOutput = { safeParse: (data: unknown) => ({ success: true, data }) };
 	return {
 		...original,
+		...client,
+		...errors,
 		MANAGEMENT_OPERATION_REGISTRY: Object.fromEntries(
-			Object.entries(original.MANAGEMENT_OPERATION_REGISTRY).map(([id, operation]) => [
+			Object.entries(source.MANAGEMENT_OPERATION_REGISTRY).map(([id, operation]) => [
 				id,
 				{ ...operation, schemas: { ...operation.schemas, output: permissiveOutput } },
 			]),
@@ -45,6 +54,7 @@ import type { ApiSession } from "./api-client.js";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const entry = join(packageRoot, "dist", "index.js");
+const productSenderFixture = join(packageRoot, "src", "__fixtures__", "product-sender.json");
 const session: ApiSession = { apiUrl: "https://api.clearance.test", token: "operator-token-for-dispatch-tests", profile: "test", credentialSource: "saved" };
 
 afterEach(() => vi.unstubAllGlobals());
@@ -97,6 +107,26 @@ describe("CLI transport parity", () => {
 		expect(calls[1]?.[0]).toBe("https://api.clearance.test/v1/environments/current");
 		expect(calls[2]?.[0]).toBe("https://api.clearance.test/v1/scim/traces/trace_1/replay");
 		expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({ dryRun: false, confirm: true });
+	});
+
+	it("routes the complete product domain and sender surface through canonical metadata", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}));
+		await dispatchRemoteCommand(session, "product domains reissue", [], { origin: "https://auth.example.test", expectedVersion: "4" }, {});
+		await dispatchRemoteCommand(session, "product domains activate", [], { origin: "https://auth.example.test", expectedVersion: "5" }, { yes: true });
+		await dispatchRemoteCommand(session, "product sender get", [], {}, {});
+		await dispatchRemoteCommand(session, "product sender plan", [], { file: productSenderFixture }, {});
+		await dispatchRemoteCommand(session, "product sender apply", [], { file: productSenderFixture, expectedVersion: "2" }, { yes: true });
+		expect(calls.map(([url, init]) => [url, init.method, init.body ? JSON.parse(String(init.body)) : undefined])).toEqual([
+			["https://api.clearance.test/v1/product-presentation/domains/reissue", "POST", { origin: "https://auth.example.test", expectedVersion: 4 }],
+			["https://api.clearance.test/v1/product-presentation/domains/activate", "POST", { origin: "https://auth.example.test", expectedVersion: 5, dryRun: false, confirm: true }],
+			["https://api.clearance.test/v1/product-presentation/sender", "GET", undefined],
+			["https://api.clearance.test/v1/product-presentation/sender/plan", "POST", { displayName: "Clearance", address: "security@auth.example.test" }],
+			["https://api.clearance.test/v1/product-presentation/sender", "PATCH", { displayName: "Clearance", address: "security@auth.example.test", expectedVersion: 2, dryRun: false, confirm: true }],
+		]);
 	});
 
 	it("routes supported previews to the API without requiring --yes", async () => {
@@ -152,7 +182,7 @@ describe("CLI transport parity", () => {
 			.rejects.toMatchObject({ code: "SERVICE_ACCOUNT_DISABLE_CONFIRMATION_REQUIRED" });
 		await dispatchRemoteCommand(session, "orgs service-accounts disable", ["svc_1"], { org: "org_1" }, { yes: true, dryRun: false });
 		await dispatchRemoteCommand(session, "orgs service-accounts credentials create", ["svc_1"], {
-			org: "org_1", expiresAt: "2030-01-01T00:00:00Z",
+			org: "org_1", expiresAt: "2030-01-01T00:00:00Z", operationId: "11111111-1111-4111-8111-111111111111",
 		}, { dryRun: false });
 		await dispatchRemoteCommand(session, "orgs service-accounts credentials rotate", ["svc_1", "cred_1"], {
 			org: "org_1", expiresAt: "2031-01-01T00:00:00Z",
@@ -171,9 +201,46 @@ describe("CLI transport parity", () => {
 			roleIds: ["role_a", "role_b"], expectedRevision: "7", dryRun: false, confirm: true,
 		});
 		expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({ status: "disabled", dryRun: false });
-		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({ expiresAt: "2030-01-01T00:00:00Z", dryRun: false });
-		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({ expiresAt: "2031-01-01T00:00:00Z", dryRun: false });
+		expect(JSON.parse(String(calls[3]?.[1].body))).toEqual({
+			expiresAt: "2030-01-01T00:00:00Z", dryRun: false,
+			operationId: "11111111-1111-4111-8111-111111111111",
+		});
+		expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({
+			expiresAt: "2031-01-01T00:00:00Z", dryRun: false,
+			operationId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+		});
 		expect(JSON.parse(String(calls[5]?.[1].body))).toEqual({ dryRun: true });
+	});
+
+	it("omits credential operation IDs from dry-run previews", async () => {
+		const calls: Array<[string, RequestInit]> = [];
+		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+			calls.push([url, init]);
+			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
+		}));
+
+		await dispatchRemoteCommand(
+			session,
+			"orgs service-accounts credentials create",
+			["svc_1"],
+			{ org: "org_1" },
+			{ dryRun: true },
+		);
+		expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({ dryRun: true });
+		await expect(dispatchRemoteCommand(
+			session,
+			"orgs service-accounts credentials create",
+			["svc_1"],
+			{ org: "org_1", operationId: "11111111-1111-4111-8111-111111111111" },
+			{ dryRun: true },
+		)).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_DRY_RUN_INVALID" });
+		await expect(dispatchRemoteCommand(
+			session,
+			"orgs service-accounts credentials rotate",
+			["svc_1", "cred_1"],
+			{ org: "org_1", operationId: "not-a-uuid" },
+			{ yes: true, dryRun: false },
+		)).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_INVALID" });
 	});
 
 	it("routes store-v2 reads and gates apply, rollback, event, principal, and topology authority", async () => {

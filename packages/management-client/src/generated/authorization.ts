@@ -44,6 +44,11 @@ const serviceAccountCredentialSchema = z.object({
 	version: z.number(),
 }).strict();
 
+/** Canonical UUID accepted by tenant-scoped credential replay authority. */
+const operationIdSchema = z.string().regex(
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+);
+
 const assignmentFilterInputSchema = z.union([
 	z.object({
 		organizationId: z.string(),
@@ -216,12 +221,21 @@ export const AUTHORIZATION_OPERATION_SCHEMAS = {
 		]),
 	},
 	"service-accounts.credentials.create": {
-		input: z.object({
-			organizationId: z.string(),
-			accountId: z.string(),
-			expiresAt: z.string().optional(),
-			dryRun: z.boolean().optional(),
-		}).strict(),
+		input: z.union([
+			z.object({
+				organizationId: z.string(),
+				accountId: z.string(),
+				expiresAt: z.string().optional(),
+				dryRun: z.literal(true),
+			}).strict(),
+			z.object({
+				organizationId: z.string(),
+				accountId: z.string(),
+				expiresAt: z.string().optional(),
+				dryRun: z.literal(false).optional(),
+				operationId: operationIdSchema,
+			}).strict(),
+		]),
 		output: z.union([
 			z.object({
 				credential: serviceAccountCredentialSchema,
@@ -241,13 +255,23 @@ export const AUTHORIZATION_OPERATION_SCHEMAS = {
 		]),
 	},
 	"service-accounts.credentials.rotate": {
-		input: z.object({
-			organizationId: z.string(),
-			accountId: z.string(),
-			credentialId: z.string(),
-			expiresAt: z.string().optional(),
-			dryRun: z.boolean().optional(),
-		}).strict(),
+		input: z.union([
+			z.object({
+				organizationId: z.string(),
+				accountId: z.string(),
+				credentialId: z.string(),
+				expiresAt: z.string().optional(),
+				dryRun: z.literal(true),
+			}).strict(),
+			z.object({
+				organizationId: z.string(),
+				accountId: z.string(),
+				credentialId: z.string(),
+				expiresAt: z.string().optional(),
+				dryRun: z.literal(false).optional(),
+				operationId: operationIdSchema,
+			}).strict(),
+		]),
 		output: z.union([
 			z.object({
 				credential: serviceAccountCredentialSchema,

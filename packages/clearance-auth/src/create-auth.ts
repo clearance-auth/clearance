@@ -19,6 +19,7 @@ import {
 	createKeyProviderRegistry,
 	createLocalKeyProvider,
 	createLocalSigningProvider,
+	parseKeyEnvelope,
 	signJwtPayload,
 	type KeyProviderRegistry,
 	type KeyPurpose,
@@ -42,6 +43,8 @@ import {
 import { getMigrations } from "../../runtime/src/db/get-migration.js";
 import { attachInternalAuthenticationPolicy } from "../../runtime/src/internal/authentication-policy.js";
 import { attachInternalAuthorizationAuthority } from "../../runtime/src/internal/authorization-authority.js";
+import { attachInternalManagedOrganizationLifecycleAuthority } from "../../runtime/src/internal/organization-lifecycle-authority.js";
+import { queueAfterTransactionHook } from "../../core/src/context/index.js";
 import { attachInternalCredentialAuthority } from "../../runtime/src/internal/credential-authority.js";
 import { attachCapturedInternalRuntimeAudit } from "@clearance/runtime/internal/runtime-audit";
 import { createInternalVerificationChallengeAuthority } from "../../runtime/src/internal/verification-challenge-context.js";
@@ -104,9 +107,14 @@ import type {
 	ClearanceRuntimeUser,
 	CreateClearanceAuthOptions,
 	SocialProviderConfig,
+	TenantProductAdministrationFacade,
+	TenantProductAuditEvent,
+	TenantProductReadiness,
+	TenantProductScimConnection,
+	TenantProductSsoConnection,
 } from "./public-types/index.js";
 
-export const CLEARANCE_AUTH_VERSION = "0.2.1";
+export const CLEARANCE_AUTH_VERSION = "0.3.0";
 export const RUNTIME_BASELINE = {
 	package: "@clearance/runtime",
 	version: "1.6.23",
@@ -119,6 +127,8 @@ const DEVELOPMENT_KEY_MANAGEMENT_SALT = Buffer.from(
 const SCIM_TOKEN_ENVELOPE_PREFIX = "clr-scim:v1:";
 const RETIRED_JWK_PRIVATE_KEY = "clr-jwk:retired:v1";
 const KEY_MANAGEMENT_MIGRATION_BATCH_SIZE = 5;
+const ONE_TIME_SECRET_REPLAY_PURPOSE = "service-account-credential-replay" as const;
+const MAX_ONE_TIME_SECRET_REPLAY_PLAINTEXT_BYTES = 16_384;
 type KeyManagementMigrationDomain = "oidcClientSecrets" | "scimTokens" | "jwks";
 type MigrationSnapshot = Readonly<{
 	id: string;
@@ -225,10 +235,91 @@ function credentialResourceId(
 	return `${purpose}:${createHash("sha256").update(canonicalIdentity).digest("hex")}`;
 }
 
+function canonicalOneTimeSecretReplayResourceId(
+	binding: string,
+	scope: Readonly<{ projectId: string; environmentId: string }>,
+): string {
+	if (
+		typeof binding !== "string" ||
+		Buffer.byteLength(binding, "utf8") === 0 ||
+		Buffer.byteLength(binding, "utf8") > 4_096
+	) {
+		throw new Error("One-time secret replay binding is invalid");
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(binding);
+	} catch {
+		throw new Error("One-time secret replay binding is invalid");
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("One-time secret replay binding is invalid");
+	}
+	const candidate = parsed as Record<string, unknown>;
+	const keys = [
+		"actorId",
+		"environmentId",
+		"operationId",
+		"operationKind",
+		"organizationId",
+		"projectId",
+		"serviceAccountId",
+	];
+	const canonicalBinding = JSON.stringify({
+		projectId: candidate.projectId,
+		environmentId: candidate.environmentId,
+		organizationId: candidate.organizationId,
+		actorId: candidate.actorId,
+		serviceAccountId: candidate.serviceAccountId,
+		operationId: candidate.operationId,
+		operationKind: candidate.operationKind,
+	});
+	if (
+		Object.keys(candidate).sort().join("\u0000") !== keys.join("\u0000") ||
+		canonicalBinding !== binding ||
+		candidate.projectId !== scope.projectId ||
+		candidate.environmentId !== scope.environmentId ||
+		candidate.operationKind !== "service_account_credential.create" &&
+			candidate.operationKind !== "service_account_credential.rotate" ||
+		["organizationId", "actorId", "serviceAccountId", "operationId"].some(
+			(key) =>
+				typeof candidate[key] !== "string" ||
+				candidate[key].length === 0 ||
+				candidate[key].length > 255 ||
+				candidate[key].trim() !== candidate[key] ||
+				candidate[key].includes("\0"),
+		)
+	) {
+		throw new Error("One-time secret replay binding is invalid");
+	}
+	return credentialResourceId(ONE_TIME_SECRET_REPLAY_PURPOSE, { binding });
+}
+
+function canonicalOneTimeSecretReplayPlaintext(plaintext: string): Buffer {
+	if (typeof plaintext !== "string") {
+		throw new Error("One-time secret replay plaintext is invalid");
+	}
+	const bytes = Buffer.from(plaintext, "utf8");
+	if (bytes.length === 0 || bytes.length > MAX_ONE_TIME_SECRET_REPLAY_PLAINTEXT_BYTES) {
+		throw new Error("One-time secret replay plaintext is invalid");
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(plaintext);
+	} catch {
+		throw new Error("One-time secret replay plaintext is invalid");
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || JSON.stringify(parsed) !== plaintext) {
+		throw new Error("One-time secret replay plaintext is invalid");
+	}
+	return bytes;
+}
+
 function developmentKeyManagementRegistry(secret: string): KeyProviderRegistry {
 	const purposes = [
 		"oidc-client-secret",
 		"scim-bearer-token",
+		ONE_TIME_SECRET_REPLAY_PURPOSE,
 		"access-token-signing-key",
 	] as const satisfies readonly KeyPurpose[];
 	return createKeyProviderRegistry(
@@ -441,6 +532,11 @@ export type {
 	ClearanceAuthenticationUnlockResult,
 	ClearancePasskeyOptions,
 	SocialProviderConfig,
+	TenantProductAdministrationFacade,
+	TenantProductAuditEvent,
+	TenantProductReadiness,
+	TenantProductScimConnection,
+	TenantProductSsoConnection,
 } from "./public-types/index.js";
 
 function createLeaseBoundMigrationDatabase(client: pg.PoolClient): Kysely<unknown> {
@@ -876,12 +972,64 @@ function validateDurableDeliveryUrl(
  * Postgres is the data plane via Kysely.
  * Production (NODE_ENV=production) refuses default/weak secrets.
  */
+export type ClearanceManagementAuthOptions = CreateClearanceAuthOptions &
+	Readonly<{
+		tenantProductAdministration: TenantProductAdministrationFacade;
+		/**
+		 * Private server bootstrap for the management projection of a runtime
+		 * first-organization create. Product/browser configuration never receives
+		 * this capability or chooses its scope.
+		 */
+		managedOrganizationLifecycle: ManagedOrganizationLifecycleFacade;
+	}>;
+
+export type ManagedOrganizationLifecycleFacade = Readonly<{
+	finalizeCreatedOrganization(input: Readonly<{
+		organization: Readonly<{
+			id: string;
+			name: string;
+			slug: string;
+			createdAt: Date;
+		}>;
+		owner: Readonly<{
+			id: string;
+			email: string;
+			name?: string | null;
+			createdAt: Date;
+			updatedAt: Date;
+		}>;
+		ownerMembershipId: string;
+		authorizationRevision: string;
+		transaction: ClearanceTransactionQuery;
+	}>): Promise<void>;
+	/** Invoked only after the outer runtime transaction commits. */
+	refreshAfterCommit(): Promise<void>;
+}>;
+
 export function createClearanceAuth<
 	const Security extends ClearanceAuthenticationSecurityOptions | undefined =
 		undefined,
 	const Passkeys extends false | ClearancePasskeyOptions | undefined = undefined,
 >(
 	options: CreateClearanceAuthOptions<Security, Passkeys>,
+): ClearanceAuthBundle<Security, Passkeys> {
+	return createClearanceAuthWithTenantProductAdministration(options, undefined);
+}
+
+/**
+ * Management-only bootstrap. This symbol is deliberately omitted from the
+ * root package entrypoint: public product configuration cannot inject a
+ * tenant-administration facade or bypass its transactional guard.
+ */
+export function createClearanceAuthWithTenantProductAdministration<
+	const Security extends ClearanceAuthenticationSecurityOptions | undefined =
+		undefined,
+	const Passkeys extends false | ClearancePasskeyOptions | undefined = undefined,
+>(
+	options: CreateClearanceAuthOptions<Security, Passkeys>,
+	tenantProductAdministration: TenantProductAdministrationFacade | undefined,
+	managedOrganizationLifecycle: ManagedOrganizationLifecycleFacade | undefined =
+		undefined,
 ): ClearanceAuthBundle<Security, Passkeys> {
 	const nodeEnv = process.env.NODE_ENV ?? "development";
 	const strict =
@@ -942,6 +1090,57 @@ export function createClearanceAuth<
 		planMigration: () => keyManagementMigrationPlan(),
 		applyMigration: (input) => applyKeyManagementMigration(input),
 	});
+	const oneTimeSecretReplayCipher = Object.freeze({
+		async seal(plaintext: string, binding: string): Promise<string> {
+			const resourceId = canonicalOneTimeSecretReplayResourceId(
+				binding,
+				keyManagementFacade.scope,
+			);
+			const envelope = await keyManagement.registry
+				.providerFor(ONE_TIME_SECRET_REPLAY_PURPOSE)
+				.seal(canonicalOneTimeSecretReplayPlaintext(plaintext), {
+					...keyManagementFacade.scope,
+					resourceId,
+				});
+			const parsed = parseKeyEnvelope(envelope);
+			if (
+				parsed.purpose !== ONE_TIME_SECRET_REPLAY_PURPOSE ||
+				parsed.projectId !== keyManagementFacade.scope.projectId ||
+				parsed.environmentId !== keyManagementFacade.scope.environmentId ||
+				parsed.resourceId !== resourceId
+			) {
+				throw new Error("One-time secret replay envelope is invalid");
+			}
+			return envelope;
+		},
+		async open(envelope: string, binding: string): Promise<string> {
+			const resourceId = canonicalOneTimeSecretReplayResourceId(
+				binding,
+				keyManagementFacade.scope,
+			);
+			const parsed = parseKeyEnvelope(envelope);
+			if (
+				parsed.purpose !== ONE_TIME_SECRET_REPLAY_PURPOSE ||
+				parsed.projectId !== keyManagementFacade.scope.projectId ||
+				parsed.environmentId !== keyManagementFacade.scope.environmentId ||
+				parsed.resourceId !== resourceId
+			) {
+				throw new Error("One-time secret replay envelope is invalid");
+			}
+			const bytes = Buffer.from(
+				await keyManagement.registry.providerFor(ONE_TIME_SECRET_REPLAY_PURPOSE).open(
+					envelope,
+					{ ...keyManagementFacade.scope, resourceId },
+				),
+			);
+			const plaintext = bytes.toString("utf8");
+			if (!Buffer.from(plaintext, "utf8").equals(bytes)) {
+				throw new Error("One-time secret replay plaintext is invalid");
+			}
+			canonicalOneTimeSecretReplayPlaintext(plaintext);
+			return plaintext;
+		},
+	});
 	const openManagedOrLegacyText = async (
 		purpose: KeyPurpose,
 		resourceId: string,
@@ -992,7 +1191,10 @@ export function createClearanceAuth<
 		? createRuntimeAuditOutbox(pool, runtimeAuditScope)
 		: null;
 	const authorizationAuthority = options.authorization
-		? new PostgresAuthorizationAuthority(pool, options.authorization, {
+		? new PostgresAuthorizationAuthority(pool, {
+			...options.authorization,
+			oneTimeSecretReplayCipher,
+		}, {
 			// createClearanceAuth owns the runtime migration and its exact public
 			// organization authority; this is intentionally not caller-configurable.
 			schema: "public",
@@ -1156,7 +1358,7 @@ export function createClearanceAuth<
 						organizationId: input.organizationId,
 						transaction: input.transaction,
 					});
-					await authorizationAuthority.replaceSubjectRoles({
+					const owner = await authorizationAuthority.replaceSubjectRoles({
 						organizationId: input.organizationId,
 						subject: {
 							kind: "principal",
@@ -1166,6 +1368,21 @@ export function createClearanceAuth<
 						expectedRevision: revision.revision,
 						transaction: input.transaction,
 					});
+					return owner.revision;
+				},
+			});
+		}
+		if (managedOrganizationLifecycle) {
+			attachInternalManagedOrganizationLifecycleAuthority(target, {
+				async finalizeCreatedOrganization(input) {
+					await managedOrganizationLifecycle.finalizeCreatedOrganization(input);
+					await queueAfterTransactionHook(async () => {
+						// The database has committed regardless of a local cache refresh
+						// failure. Keep the next ordinary refresh as the recovery path.
+						await managedOrganizationLifecycle.refreshAfterCommit().catch(
+							() => undefined,
+						);
+					}, input.transaction);
 				},
 			});
 		}
@@ -1316,6 +1533,12 @@ export function createClearanceAuth<
 					createTenantAdministrationPlugin({
 						authorization: authorizationAuthority,
 						runtimeAudit: runtimeAuditOutbox.binding,
+						...(tenantProductAdministration
+							? {
+									productAdministration:
+										tenantProductAdministration,
+								}
+							: {}),
 					}),
 				]
 			: []),
@@ -1374,6 +1597,7 @@ export function createClearanceAuth<
 		rateLimit,
 		advanced: {
 			cookiePrefix: "clearance",
+			trustedProxyHeaders: false,
 		},
 		// Durable management identity bridge + disable/delete sign-in guard.
 		// Failures in onUserCreated must not be swallowed by the caller.
@@ -2422,6 +2646,7 @@ export function createClearanceAuth<
 		const encryption = ([
 			"oidc-client-secret",
 			"scim-bearer-token",
+			ONE_TIME_SECRET_REPLAY_PURPOSE,
 			"access-token-signing-key",
 		] as const).map((purpose) => {
 			const provider = keyManagement.registry.providerFor(purpose);
@@ -3047,6 +3272,8 @@ export function createClearanceAuth<
 		authorizationAuthority
 			? Object.freeze({
 					scope: authorizationAuthority.identity,
+					acquireMutationLock:
+						authorizationAuthority.acquireMutationLock.bind(authorizationAuthority),
 					reconcileRuntimeOrganizations:
 						authorizationAuthority.reconcileRuntimeOrganizations.bind(authorizationAuthority),
 					readEffective:
@@ -3228,8 +3455,40 @@ export function createClearanceAuth<
 			};
 		},
 		async destroy() {
-			await credentialAuthority.close();
-			await pool.end();
+			const settled = await Promise.allSettled([
+				credentialAuthority.close(),
+				pool.end(),
+			]);
+			const failures = settled
+				.filter(
+					(result): result is PromiseRejectedResult =>
+						result.status === "rejected",
+				)
+				.map((result) => result.reason);
+			if (failures.length === 1) throw failures[0];
+			if (failures.length > 1) {
+				throw new AggregateError(failures, "Clearance auth teardown failed");
+			}
 		},
 	};
+}
+
+/**
+ * Typed server-only bootstrap for the management package. Keeping the tenant
+ * facade on this entry point avoids weakening the normal product options while
+ * removing bootstrap casts across the package boundary.
+ */
+export function createClearanceManagementAuth(
+	options: ClearanceManagementAuthOptions,
+): ClearanceAuthBundle {
+	const {
+		tenantProductAdministration,
+		managedOrganizationLifecycle,
+		...publicOptions
+	} = options;
+	return createClearanceAuthWithTenantProductAdministration(
+		publicOptions,
+		tenantProductAdministration,
+		managedOrganizationLifecycle,
+	) as unknown as ClearanceAuthBundle;
 }

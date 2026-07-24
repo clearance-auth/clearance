@@ -22,6 +22,11 @@ import {
 	type InternalAuthorizationAuthority,
 } from "../internal/authorization-authority";
 import {
+	attachCapturedInternalManagedOrganizationLifecycleAuthority,
+	readInternalManagedOrganizationLifecycleAuthority,
+	type InternalManagedOrganizationLifecycleAuthority,
+} from "../internal/organization-lifecycle-authority";
+import {
 	attachCapturedInternalRuntimeAudit,
 	readInternalRuntimeAudit,
 	type InternalRuntimeAuditBinding,
@@ -93,6 +98,35 @@ function preserveAuthorizationAuthorityBinding(
 	attachCapturedInternalAuthorizationAuthority(target, binding);
 }
 
+function assertCompatibleManagedOrganizationLifecycleAuthorityBinding(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	const existing = readInternalManagedOrganizationLifecycleAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced managed organization lifecycle authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin managed organization lifecycle authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveManagedOrganizationLifecycleAuthorityBinding(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	assertCompatibleManagedOrganizationLifecycleAuthorityBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalManagedOrganizationLifecycleAuthority(target, binding);
+}
+
 function assertCompatibleRuntimeAuditBinding(
 	target: object,
 	binding: InternalRuntimeAuditBinding | undefined,
@@ -126,6 +160,8 @@ export async function runPluginInit(context: AuthContext) {
 	let options = context.options;
 	const authenticationPolicy = readInternalAuthenticationPolicy(options);
 	const authorizationAuthority = readInternalAuthorizationAuthority(options);
+	const managedOrganizationLifecycleAuthority =
+		readInternalManagedOrganizationLifecycleAuthority(options);
 	const runtimeAudit = readInternalRuntimeAudit(options);
 	const plugins = options.plugins || [];
 	const pluginTrustedOrigins: NonNullable<
@@ -155,6 +191,10 @@ export async function runPluginInit(context: AuthContext) {
 						result.options,
 						authorizationAuthority,
 					);
+					assertCompatibleManagedOrganizationLifecycleAuthorityBinding(
+						result.options,
+						managedOrganizationLifecycleAuthority,
+					);
 					assertCompatibleRuntimeAuditBinding(result.options, runtimeAudit);
 					const { databaseHooks, trustedOrigins, ...restOpts } = result.options;
 					if (databaseHooks) {
@@ -174,6 +214,10 @@ export async function runPluginInit(context: AuthContext) {
 					preserveAuthorizationAuthorityBinding(
 						normalizedOptions,
 						authorizationAuthority,
+					);
+					preserveManagedOrganizationLifecycleAuthorityBinding(
+						normalizedOptions,
+						managedOrganizationLifecycleAuthority,
 					);
 					preserveRuntimeAuditBinding(normalizedOptions, runtimeAudit);
 					options = normalizedOptions;
@@ -218,6 +262,10 @@ export async function runPluginInit(context: AuthContext) {
 	}
 	preserveAuthenticationPolicyBinding(options, authenticationPolicy);
 	preserveAuthorizationAuthorityBinding(options, authorizationAuthority);
+	preserveManagedOrganizationLifecycleAuthorityBinding(
+		options,
+		managedOrganizationLifecycleAuthority,
+	);
 	preserveRuntimeAuditBinding(options, runtimeAudit);
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {

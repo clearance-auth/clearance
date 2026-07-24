@@ -1,5 +1,6 @@
 export * from "./aws.js";
 export * from "./error.js";
+export { parseKeyEnvelope } from "./envelope.js";
 export * from "./gcp.js";
 export * from "./local.js";
 export * from "./registry.js";

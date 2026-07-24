@@ -2007,12 +2007,16 @@ async function renderServiceAccounts(params) {
     document.getElementById("sa-org").addEventListener("change", (event) => setRoute("service-accounts", { org: event.target.value }));
     const listHost = document.getElementById("sa-list");
     const detailHost = document.getElementById("sa-detail");
+    // A credential response can be lost after the upstream mutation commits.
+    // This state belongs only to this rendered service-account workflow.
+    let credentialReplay = null;
     const loadAccounts = async () => {
       try { const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts`); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; const accounts = Array.isArray(data.serviceAccounts) ? data.serviceAccounts : []; listHost.innerHTML = serviceAccountRows(accounts, mutable); wireAccountButtons(accounts); }
       catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) listHost.innerHTML = stateError(`Failed to load service accounts: ${formatApiError(error)}`); }
     };
     const renderDetail = async (accountId) => {
       if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return;
+      credentialReplay = null;
       detailHost.innerHTML = stateLoading("Loading service account…");
       try {
         const data = await api(`/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts/${encodeURIComponent(accountId)}`);
@@ -2049,9 +2053,23 @@ async function renderServiceAccounts(params) {
         if ((action === "rotate" || action === "revoke") && !confirmDestructive(`${action === "rotate" ? "Rotate" : "Revoke"} credential ${credentialId}?`)) return setFormMessage(message, `${action} cancelled`, "");
         const base = `/v1/organizations/${encodeURIComponent(selectedOrg)}/service-accounts/${encodeURIComponent(accountId)}/credentials`;
         const path = action === "create" ? base : `${base}/${encodeURIComponent(credentialId)}/${action}`;
-        const body = action === "revoke" ? {} : { ...(expiresAt ? { expiresAt } : {}) };
+        const replayKey = JSON.stringify({
+          action,
+          organizationId: selectedOrg,
+          accountId,
+          ...(action === "create" ? {} : { credentialId }),
+          ...(expiresAt ? { expiresAt } : {}),
+        });
+        const operationId = action === "revoke"
+          ? undefined
+          : credentialReplay?.key === replayKey
+            ? credentialReplay.operationId
+            : crypto.randomUUID().toLowerCase();
+        if (action === "revoke") credentialReplay = null;
+        else credentialReplay = { key: replayKey, operationId };
+        const body = action === "revoke" ? {} : { ...(expiresAt ? { expiresAt } : {}), operationId };
         button.disabled = true; setFormMessage(message, `${action[0].toUpperCase()}${action.slice(1)}ing credential…`, "");
-        try { const data = await api(path, { method: "POST", body: JSON.stringify(body) }); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; setFormMessage(message, action === "revoke" ? "Credential revoked" : "Credential ready — copy the one-time secret now.", "ok"); if (action !== "revoke") showOneTimeSecret(secretHost, data); }
+        try { const data = await api(path, { method: "POST", body: JSON.stringify(body) }); if (!isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) return; if (action !== "revoke" && credentialReplay?.key === replayKey) credentialReplay = null; setFormMessage(message, action === "revoke" ? "Credential revoked" : "Credential ready — copy the one-time secret now.", "ok"); if (action !== "revoke") showOneTimeSecret(secretHost, data); }
         catch (error) { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) setFormMessage(message, formatApiError(error), "err"); }
         finally { if (isScopedRouteCurrent("service-accounts", routeVersion, selectedOrg, "sa-org")) button.disabled = false; }
       }));

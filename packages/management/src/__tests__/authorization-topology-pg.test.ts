@@ -382,6 +382,8 @@ describe.skipIf(!available)("normalized authorization after topology cutover", (
 		const credential = await createServiceAccountCredentialInAuth(store, {
 			organizationId: organization.id,
 			serviceAccountId: account.serviceAccount.serviceAccountId,
+			actor: "topology-test",
+			operationId: "11111111-1111-4111-8111-111111111111",
 			scope,
 		});
 		if ("preview" in credential) throw new Error("expected a live credential");

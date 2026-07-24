@@ -42,6 +42,7 @@ import {
 import { registerAccessRoutes } from "./routes/access.js";
 import { registerAuthenticationPolicyRoutes } from "./routes/authentication-policy.js";
 import { registerKeyManagementRoutes } from "./routes/key-management.js";
+import { registerProductPresentationRoutes } from "./routes/product-presentation.js";
 import { registerConfigRoutes } from "./routes/config.js";
 import { registerDeliveryRoutes } from "./routes/delivery.js";
 import { registerWebhookEndpointRoutes } from "./routes/webhook-endpoints.js";
@@ -559,10 +560,14 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 	const serviceAccountCredentialSecretPath =
 		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials$/.test(path) ||
 		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials\/[^/]+\/rotate$/.test(path);
+	const productDomainSecretPath =
+		path === "/v1/product-presentation/domains" ||
+		path === "/v1/product-presentation/domains/reissue";
 	const sensitive =
 		path === "/v1/users" ||
 		apiKeySecretPath ||
 		serviceAccountCredentialSecretPath ||
+		productDomainSecretPath ||
 		path === "/v1/sso/setup-links" ||
 		path === "/v1/scim/setup-links" ||
 		path === "/v1/scim" ||
@@ -590,6 +595,19 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
 				delete (connection as Record<string, unknown>).bearerTokenOnce;
 				omitted.push("connection.bearerTokenOnce");
+			}
+		}
+		if (productDomainSecretPath) {
+			const dnsChallenge = parsed.dnsChallenge;
+			if (
+				dnsChallenge &&
+				typeof dnsChallenge === "object" &&
+				Object.hasOwn(dnsChallenge, "value")
+			) {
+				// biome-ignore lint/performance/noDelete: one-time DNS proof must not enter persistence.
+				delete parsed.dnsChallenge;
+				parsed.challengeAlreadyIssued = true;
+				omitted.push("dnsChallenge.value");
 			}
 		}
 		if (webhookEndpointSecretPath) {
@@ -659,6 +677,10 @@ app.use("/v1/*", async (c, next) => {
 			return c.newResponse(existing.body, existing.status as 200, {
 				"content-type": existing.contentType,
 				"Idempotency-Replayed": "true",
+				...(c.req.path === "/v1/product-presentation/domains" ||
+				c.req.path === "/v1/product-presentation/domains/reissue"
+					? { "cache-control": "no-store", pragma: "no-cache" }
+					: {}),
 			});
 		}
 		await next();
@@ -982,7 +1004,7 @@ app.get("/health", async (c) => {
 	return c.json({
 		ok: true,
 		service: "clearance-api",
-		version: "0.2.1",
+		version: "0.3.0",
 	});
 });
 
@@ -1049,6 +1071,11 @@ app.route(
 app.route(
 	"/",
 	registerKeyManagementRoutes({ storeForRequest, scopeForRequest, handleError }),
+);
+
+app.route(
+	"/",
+	registerProductPresentationRoutes({ storeForRequest, scopeForRequest, handleError }),
 );
 
 app.route(

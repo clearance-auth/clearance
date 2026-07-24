@@ -23,6 +23,7 @@ import { resolveApiSession } from "./api-client.js";
 import { registerDeliveryCommands } from "./delivery-command.js";
 import { registerAuthenticationPolicyCommands } from "./authentication-policy-command.js";
 import { registerKeyManagementCommands } from "./key-management-command.js";
+import { registerProductPresentationCommands } from "./product-presentation-command.js";
 import {
 	commandPath,
 	dispatchRemoteCommand,
@@ -372,6 +373,7 @@ async function main() {
 		.argument("<accountId>", "Service-account id")
 		.requiredOption("--org <id>", "Organization id")
 		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.option("--operation-id <uuid>", "Stable UUID for live retry recovery")
 		.action(remoteCommandAction);
 	serviceAccountCredentials
 		.command("rotate")
@@ -379,6 +381,7 @@ async function main() {
 		.argument("<credentialId>", "Credential id")
 		.requiredOption("--org <id>", "Organization id")
 		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.option("--operation-id <uuid>", "Stable UUID for live retry recovery")
 		.action(remoteCommandAction);
 	serviceAccountCredentials
 		.command("revoke")
@@ -434,6 +437,7 @@ async function main() {
 
 	registerDeliveryCommands(program, remoteCommandAction);
 	registerAuthenticationPolicyCommands(program, remoteCommandAction);
+	registerProductPresentationCommands(program, remoteCommandAction);
 	registerKeyManagementCommands(program, remoteCommandAction);
 
 	// keys — digest-only project/environment scoped API-key lifecycle
