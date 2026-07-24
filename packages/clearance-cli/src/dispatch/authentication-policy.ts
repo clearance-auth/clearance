@@ -1,7 +1,7 @@
 import {
 	AUTHENTICATION_POLICY_OPERATIONS,
 } from "@clearance/management";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import {
 	body,
 	type CliPathOf,
@@ -9,8 +9,7 @@ import {
 	error,
 	firstStringArgument,
 	localFile,
-	previewConfirmation,
-	query,
+	managementCallOptions,
 } from "./shared.js";
 
 type AuthenticationPolicyCommandPath = CliPathOf<
@@ -141,44 +140,41 @@ export async function dispatchAuthenticationPolicyCommand({
 	);
 	switch (path) {
 		case AUTHENTICATION_POLICY_OPERATIONS.get.cliPath:
-			return requestManagementApi(session, {
-				method: AUTHENTICATION_POLICY_OPERATIONS.get.http.method,
-				path: query(AUTHENTICATION_POLICY_OPERATIONS.get.http.path, {
-					organizationId,
-				}),
-			});
+			return callManagementOperation(session, "authentication_policy.get", body({ organizationId }));
 		case AUTHENTICATION_POLICY_OPERATIONS.plan.cliPath:
-			return requestManagementApi(session, {
-				method: AUTHENTICATION_POLICY_OPERATIONS.plan.http.method,
-				path: AUTHENTICATION_POLICY_OPERATIONS.plan.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"authentication_policy.plan",
+				body({
 					organizationId,
 					policy: policyDocument(opts, organizationId),
-				}),
-			});
+				}) as Parameters<typeof callManagementOperation<"authentication_policy.plan">>[2],
+			);
 		case AUTHENTICATION_POLICY_OPERATIONS.apply.cliPath:
-			return requestManagementApi(session, {
-				method: AUTHENTICATION_POLICY_OPERATIONS.apply.http.method,
-				path: AUTHENTICATION_POLICY_OPERATIONS.apply.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"authentication_policy.apply",
+				body({
 					organizationId,
 					policy: policyDocument(opts, organizationId),
 					expectedRevision: expectedRevision(opts.expectedRevision),
-					...previewConfirmation(global),
-				}),
-			});
+					dryRun: global.dryRun || !global.yes,
+				}) as Parameters<typeof callManagementOperation<"authentication_policy.apply">>[2],
+				managementCallOptions(global),
+			);
 		case AUTHENTICATION_POLICY_OPERATIONS.unlock.cliPath:
-			return requestManagementApi(session, {
-				method: AUTHENTICATION_POLICY_OPERATIONS.unlock.http.method,
-				path: AUTHENTICATION_POLICY_OPERATIONS.unlock.http.path,
-				body: {
+			return callManagementOperation(
+				session,
+				"authentication_policy.unlock",
+				{
 					userId: requiredIdentifier(
 						firstStringArgument(args),
 						"user-id",
 					),
 					kind: unlockKind(opts.kind),
-					...previewConfirmation(global),
+					dryRun: global.dryRun || !global.yes,
 				},
-			});
+				managementCallOptions(global),
+			);
 	}
 }
