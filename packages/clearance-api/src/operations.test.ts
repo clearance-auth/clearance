@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const dirs: string[] = [];
@@ -367,18 +367,31 @@ describe("authenticated operational API contracts", () => {
 		});
 		expect(verified.status).toBe(200);
 		const target = join(directory, "restored.json");
+		writeFileSync(target, "must-not-be-overwritten", "utf8");
 		const unconfirmed = await app.request(`/v1/backups/${backupId}/restore`, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ target }),
 		});
 		expect(unconfirmed.status).toBe(400);
-		const restored = await app.request(`/v1/backups/${backupId}/restore`, {
+		const clientTarget = await app.request(`/v1/backups/${backupId}/restore`, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ target, confirm: true }),
 		});
+		expect(clientTarget.status).toBe(400);
+		expect((await clientTarget.json()).error.code).toBe(
+			"BACKUP_RESTORE_TARGET_SERVER_MANAGED",
+		);
+		expect(readFileSync(target, "utf8")).toBe("must-not-be-overwritten");
+		const restored = await app.request(`/v1/backups/${backupId}/restore`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ confirm: true }),
+		});
 		expect(restored.status).toBe(200);
-		expect((await restored.json()).targetPath).toBe(target);
+		expect(dirname((await restored.json()).targetPath)).toBe(
+			join(directory, "backups", "restores"),
+		);
 	});
 });
