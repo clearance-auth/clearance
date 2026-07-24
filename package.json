@@ -8,28 +8,30 @@
   "scripts": {
     "build": "pnpm run build:runtime && pnpm run build:clearance",
     "build:runtime": "pnpm --filter @clearance/utils --filter @clearance/call --filter @clearance/runtime --filter @clearance/core --filter @clearance/telemetry --filter @clearance/memory-adapter --filter @clearance/kysely-adapter --filter @clearance/mongo-adapter --filter @clearance/drizzle-adapter --filter @clearance/prisma-adapter --filter @clearance/sso --filter @clearance/scim --filter @clearance/test-utils build",
-    "build:clearance": "pnpm --filter @clearance/auth --filter @clearance/management --filter @clearance/observability-node --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/cli --filter @clearance/api --filter @clearance/console --filter @clearance/sample-b2b build",
+    "build:clearance": "pnpm --filter @clearance/key-management --filter @clearance/auth --filter @clearance/management --filter @clearance/management-client --filter @clearance/observability-node --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/verification --filter @clearance/vault --filter @clearance/cli --filter @clearance/api --filter @clearance/console --filter @clearance/vault-host --filter @clearance/sample-b2b build",
     "typecheck": "pnpm run typecheck:runtime && pnpm run typecheck:clearance",
     "typecheck:runtime": "pnpm --filter @clearance/utils --filter @clearance/call --filter @clearance/core --filter @clearance/telemetry --filter @clearance/memory-adapter --filter @clearance/kysely-adapter --filter @clearance/mongo-adapter --filter @clearance/drizzle-adapter --filter @clearance/prisma-adapter typecheck",
     "typecheck:runtime:full": "pnpm --filter @clearance/utils --filter @clearance/call --filter @clearance/runtime --filter @clearance/core --filter @clearance/telemetry --filter @clearance/memory-adapter --filter @clearance/kysely-adapter --filter @clearance/mongo-adapter --filter @clearance/drizzle-adapter --filter @clearance/prisma-adapter --filter @clearance/sso --filter @clearance/scim typecheck",
-    "typecheck:clearance": "pnpm --filter @clearance/auth --filter @clearance/management --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/cli --filter @clearance/api typecheck",
+    "typecheck:clearance": "pnpm --filter @clearance/key-management --filter @clearance/auth --filter @clearance/management --filter @clearance/management-client --filter @clearance/observability-node --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/verification --filter @clearance/vault --filter @clearance/cli --filter @clearance/api --filter @clearance/vault-host --filter @clearance/framework-quickstarts typecheck",
     "test": "pnpm run build && pnpm run test:only",
     "test:only": "pnpm run test:runtime && pnpm run test:clearance",
     "test:runtime": "pnpm --filter @clearance/core --filter @clearance/sso --filter @clearance/scim --filter @clearance/kysely-adapter --filter @clearance/memory-adapter --filter @clearance/mongo-adapter --filter @clearance/drizzle-adapter --filter @clearance/prisma-adapter test -- --run && pnpm run test:runtime:clearance",
     "test:runtime:clearance": "bash scripts/test-runtime.sh",
-    "test:clearance": "pnpm --filter @clearance/auth --filter @clearance/management --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/cli --filter @clearance/api --filter @clearance/sample-b2b --filter @clearance/console test",
+    "test:clearance": "pnpm --filter @clearance/auth --filter @clearance/management --filter @clearance/management-client --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/verification --filter @clearance/vault --filter @clearance/cli --filter @clearance/api --filter @clearance/sample-b2b --filter @clearance/console test",
     "smoke": "bash scripts/local-smoke.sh",
     "smoke:import": "bash scripts/smoke-import.sh",
     "smoke:pack": "bash scripts/smoke-pack.sh",
     "clearance": "pnpm --filter @clearance/cli exec clearance",
     "dev:api": "pnpm --filter @clearance/api dev",
     "dev:console": "pnpm --filter @clearance/console dev",
+    "dev:vault": "pnpm --filter @clearance/vault build && pnpm --filter @clearance/vault-host dev",
     "dev:sample": "pnpm --filter @clearance/sample-b2b dev",
     "stack:up": "docker compose up -d --build",
     "stack:down": "docker compose down",
     "stack:destroy": "docker compose down -v",
     "stack:smoke": "bash scripts/compose-smoke.sh",
     "verify:plan": "bash scripts/verify-plan.sh",
+    "release:rehearse": "bash scripts/rehearse-release-assembly.sh",
     "verify:real": "bash scripts/verify-real.sh"
   },
   "devDependencies": {
@@ -37,7 +39,8 @@
     "@types/node": "^22.20.1",
     "typescript": "catalog:",
     "vitest": "catalog:",
-    "tsdown": "catalog:"
+    "tsdown": "catalog:",
+    "yaml": "2.9.0"
   },
   "dependencies": {
     "@clearance/auth": "workspace:*",

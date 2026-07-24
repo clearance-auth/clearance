@@ -36,6 +36,77 @@ Ingress is disabled until hosts and existing TLS Secret names are supplied.
 Enable `ingress.api` and `ingress.console` independently. TLS defaults on for
 either ingress and fails templating without `tls.secretName`.
 
+## Custom-domain edge contract
+
+Clearance does not render a catch-all Ingress and does not claim that a
+wildcard certificate can secure arbitrary customer domains. Set
+`productPresentation.customDomains.enabled=true` only when an operator-managed
+edge is already provisioned. The chart rejects the release unless all of these
+settings are supplied and schema-valid:
+
+- `edge.mode=operator-managed` and
+  `edge.tls.certificateLifecycle=operator-managed-per-domain`. The edge owns
+  issuance, renewal, revocation, and replacement of every customer-domain
+  certificate. It must select the certificate from the client's original SNI.
+- `edge.customerDnsTarget` is the canonical CNAME target shown to customers and
+  exactly equals `env.CLEARANCE_CUSTOM_DOMAIN_TARGET`. A customer's verified
+  domain must CNAME to this edge target; it must not point at the canonical
+  Vault hostname or at the Kubernetes Ingress directly.
+- `edge.upstream.type=vault-service`, `protocol=http`, and
+  `hostHeader=preserve-original-authority`. The edge must reach
+  `<release>-vault.<namespace>.svc.cluster.local:<vault.service.port>` through
+  private connectivity and send exactly one original customer `Host` authority.
+  Vault selects the tenant from that header. Client SNI terminates at the edge;
+  it is not forwarded to the HTTP Vault Service. Do not use the canonical
+  Kubernetes Ingress as this upstream: its exact-host rule would reject a
+  customer Host header.
+- `edge.upstream.sourcePeers` names both the private edge source and the
+  canonical Vault Ingress-controller source. Custom-domain mode requires
+  `networkPolicy.enabled=true` and renders those sources as the only Vault
+  ingress peers; broad `/0` CIDRs are rejected.
+- The canonical route remains a separate exact-host `ingress.vault` with TLS.
+  `vault.publicUrl` must exactly be `https://` plus `ingress.vault.host`, and
+  the canonical certificate Secret belongs to that hostname only. The Vault
+  Service remains `ClusterIP`.
+
+Example declaration (the external edge itself is provisioned outside this
+chart):
+
+```yaml
+env:
+  CLEARANCE_CUSTOM_DOMAIN_TARGET: tenant-edge.auth.example.net
+productPresentation:
+  customDomains:
+    enabled: true
+    edge:
+      mode: operator-managed
+      customerDnsTarget: tenant-edge.auth.example.net
+      tls:
+        certificateLifecycle: operator-managed-per-domain
+      upstream:
+        type: vault-service
+        protocol: http
+        hostHeader: preserve-original-authority
+        sourcePeers:
+          - namespaceSelector:
+              matchLabels: { kubernetes.io/metadata.name: edge-system }
+            podSelector:
+              matchLabels: { app.kubernetes.io/name: tenant-edge }
+          - namespaceSelector:
+              matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+            podSelector:
+              matchLabels: { app.kubernetes.io/name: ingress-nginx }
+vault:
+  enabled: true
+  publicUrl: https://vault.auth.example.com
+  service: { type: ClusterIP, port: 3400 }
+ingress:
+  vault:
+    enabled: true
+    host: vault.auth.example.com
+    tls: { enabled: true, secretName: vault-auth-example-com }
+```
+
 `CLEARANCE_TRUSTED_PROXY` defaults to `0`. Setting it to `1` is supported only
 for the chart's narrow console-proxy topology: NetworkPolicy enabled, API
 Service type `ClusterIP`, API Ingress disabled, console enabled, and the default

@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { assertCanonicalReleasePackageSequence } from "./release-packages.mjs";
 
 const [version, sourceCommit, auditPath, assetDirectory, outputPath, ...packages] = process.argv.slice(2);
 
@@ -21,6 +22,10 @@ if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za
 if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
 	throw new Error(`Expected a full lowercase Git commit, received ${sourceCommit}.`);
 }
+
+// A partial tag rerun is allowed to verify an ordered subset before skipping
+// those immutable versions. Recovery and final proof pass the complete list.
+assertCanonicalReleasePackageSequence(packages, { allowSubset: true });
 
 const repository = "https://github.com/clearance-auth/clearance";
 const certificateIssuer = "https://token.actions.githubusercontent.com";

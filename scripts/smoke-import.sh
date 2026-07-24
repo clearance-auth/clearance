@@ -26,19 +26,22 @@ fail() {
 }
 
 # Shipping Clearance product packages under acceptance.
-SHIPPING=(
-  "@clearance/auth"
-  "@clearance/management"
-  "@clearance/cli"
-  "@clearance/api"
-)
+mapfile -t SHIPPING < <(node scripts/release-packages.mjs names)
 
 required_dist_for() {
   case "$1" in
-    "@clearance/auth") echo "dist/index.mjs dist/client.mjs dist/node.mjs dist/secret-policy.mjs types/index.d.ts types/client.d.ts types/node.d.ts types/secret-policy.d.ts" ;;
+    "@clearance/auth") echo "dist/index.mjs dist/client.mjs dist/node.mjs dist/secret-policy.mjs dist/management-internal.mjs types/index.d.ts types/client.d.ts types/node.d.ts types/secret-policy.d.ts types/management-internal.d.ts" ;;
     "@clearance/management") echo "dist/index.mjs" ;;
+    "@clearance/management-client") echo "dist/index.js dist/index.d.ts" ;;
+    "@clearance/observability-node") echo "dist/index.mjs dist/index.d.mts dist/register.mjs dist/register.d.mts dist/preload.mjs dist/preload.d.mts" ;;
+    "@clearance/delivery") echo "dist/index.mjs dist/index.d.mts" ;;
+    "@clearance/delivery-worker") echo "dist/index.mjs dist/index.d.mts dist/cli.mjs dist/cli.d.mts dist/bin.mjs dist/bin.d.mts" ;;
+    "@clearance/key-management") echo "dist/index.mjs dist/index.d.mts" ;;
+    "@clearance/verification") echo "dist/index.js dist/index.d.ts README.md" ;;
+    "@clearance/vault") echo "dist/index.js dist/index.d.ts dist/styles.css" ;;
     "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
     "@clearance/api") echo "dist/server.js" ;;
+    "@clearance/console") echo "src/server.js public/index.html public/app.js public/setup.html public/setup.js public/styles.css" ;;
     *) return 1 ;;
   esac
 }
@@ -138,6 +141,7 @@ import { createClearanceAuth, type CreateClearanceAuthOptions } from "@clearance
 import { JsonStore, type ManagementStore } from "@clearance/management";
 import type {} from "@clearance/auth/client";
 import type {} from "@clearance/auth/node";
+import type {} from "@clearance/auth/management-internal";
 import { isForbiddenDefaultSecret } from "@clearance/auth/secret-policy";
 
 declare const options: CreateClearanceAuthOptions;
@@ -171,7 +175,7 @@ EOF
 assert_isolated_resolution() {
   cd "$CONSUMER"
   # Embed monorepo root so the consumer can detect accidental workspace leaks.
-  ROOT_FOR_CHECK="$ROOT" node --input-type=module <<'EOF' || exit 1
+  CLEARANCE_SMOKE_PACKAGES="$(node scripts/release-packages.mjs json)" ROOT_FOR_CHECK="$ROOT" node --input-type=module <<'EOF' || exit 1
 import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs";
@@ -181,6 +185,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 const consumerRoot = process.cwd();
 const monorepoRoot = process.env.ROOT_FOR_CHECK || "";
+const shipping = JSON.parse(process.env.CLEARANCE_SMOKE_PACKAGES || "[]").map(({ name }) => name);
 const require = createRequire(path.join(consumerRoot, "package.json"));
 const rootReal = fs.realpathSync(consumerRoot);
 const monoReal = monorepoRoot ? fs.realpathSync(monorepoRoot) : "";
@@ -236,13 +241,15 @@ function packageJsonPath(name) {
   throw new Error("package.json not found for " + name);
 }
 
-const mustResolve = ["@clearance/auth", "@clearance/management", "@clearance/cli", "@clearance/api"];
-for (const id of mustResolve) {
-  const resolved = require.resolve(id);
-  assertUnderConsumer(id, resolved);
+for (const id of shipping) {
   const pj = packageJsonPath(id);
   assertUnderConsumer(id + "/package.json", pj);
-  console.log("resolved", id, "->", path.relative(consumerRoot, resolved));
+  const manifest = JSON.parse(fs.readFileSync(pj, "utf8"));
+  if (manifest.main || manifest.exports) {
+    const resolved = require.resolve(id);
+    assertUnderConsumer(id, resolved);
+    console.log("resolved", id, "->", path.relative(consumerRoot, resolved));
+  }
 }
 
 for (const forbidden of ["clearance", "@clearance/sso", "@clearance/scim", "@clearance/core"]) {
@@ -268,9 +275,18 @@ const {
 const management = await import("@clearance/management");
 const { JsonStore } = management;
 
+const managementClient = await import("@clearance/management-client");
+const observability = await import("@clearance/observability-node");
+const delivery = await import("@clearance/delivery");
+const deliveryWorker = await import("@clearance/delivery-worker");
+const keyManagement = await import("@clearance/key-management");
+const verification = await import("@clearance/verification");
+const vault = await import("@clearance/vault");
+
 const client = await import("@clearance/auth/client");
 const node = await import("@clearance/auth/node");
 const secretPolicy = await import("@clearance/auth/secret-policy");
+const managementInternal = await import("@clearance/auth/management-internal");
 
 const apiPort = await new Promise((resolve, reject) => {
   const probe = net.createServer();
@@ -306,9 +322,17 @@ const checks = [
   ["withClearanceDefaults", typeof withClearanceDefaults === "function"],
   ["CLEARANCE_AUTH_VERSION", typeof CLEARANCE_AUTH_VERSION === "string"],
   ["JsonStore", typeof JsonStore === "function"],
+  ["management-client", typeof managementClient.createServerManagementClient === "function"],
+  ["observability-node", typeof observability.parseObservabilityConfig === "function"],
+  ["delivery", typeof delivery.enqueueDelivery === "function"],
+  ["delivery-worker", typeof deliveryWorker.DeliveryWorker === "function"],
+  ["key-management", typeof keyManagement.createLocalKeyProvider === "function"],
+  ["verification", typeof verification.verifyWithJwks === "function"],
+  ["vault", typeof vault.createVaultClient === "function"],
   ["auth/client", client != null && typeof client === "object"],
   ["auth/node", node != null && typeof node === "object"],
   ["auth/secret-policy", typeof secretPolicy.isForbiddenDefaultSecret === "function"],
+  ["auth/management-internal", managementInternal != null && typeof managementInternal === "object"],
   ["auth/secret-policy rejects default", secretPolicy.isForbiddenDefaultSecret("clearance-secret")],
   ["auth/secret-policy accepts strong value", !secretPolicy.isForbiddenDefaultSecret("nF9vQ2mL8xT4sR7pK3wZ6cY1")],
   ["api.start", typeof api.start === "function"],
@@ -477,7 +501,7 @@ fs.rmSync(packedApiDir, { recursive: true, force: true });
 fs.rmSync(upgradeDir, { recursive: true, force: true });
 
 // Prove installed package.json has no workspace leftovers.
-for (const name of ["@clearance/auth", "@clearance/management", "@clearance/cli", "@clearance/api"]) {
+for (const name of shipping) {
   const pjPath = packageJsonPath(name);
   assertUnderConsumer(name + "/package.json", pjPath);
   const text = fs.readFileSync(pjPath, "utf8");

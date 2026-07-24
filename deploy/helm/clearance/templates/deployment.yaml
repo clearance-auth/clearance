@@ -5,6 +5,28 @@
 {{- fail "credentialAuthority.phase must be bootstrap, bridge, drain, migrate, or serve" }}
 {{- end }}
 {{- $deploymentId := required "credentialAuthority.deploymentId is required" .Values.credentialAuthority.deploymentId }}
+{{- $product := .Values.productPresentation }}
+{{- $customDomains := $product.customDomains }}
+{{- if $customDomains.enabled }}
+{{- $edge := $customDomains.edge }}
+{{- if ne $edge.mode "operator-managed" }}{{ fail "productPresentation.customDomains.edge.mode must be operator-managed when custom domains are enabled" }}{{- end }}
+{{- if empty $edge.customerDnsTarget }}{{ fail "productPresentation.customDomains.edge.customerDnsTarget is required when custom domains are enabled" }}{{- end }}
+{{- if ne .Values.env.CLEARANCE_CUSTOM_DOMAIN_TARGET $edge.customerDnsTarget }}{{ fail "env.CLEARANCE_CUSTOM_DOMAIN_TARGET must equal productPresentation.customDomains.edge.customerDnsTarget" }}{{- end }}
+{{- if ne $edge.tls.certificateLifecycle "operator-managed-per-domain" }}{{ fail "custom-domain TLS must be operator-managed-per-domain" }}{{- end }}
+{{- if ne $edge.upstream.type "vault-service" }}{{ fail "custom-domain edge upstream.type must be vault-service" }}{{- end }}
+{{- if ne $edge.upstream.protocol "http" }}{{ fail "custom-domain edge upstream.protocol must be http" }}{{- end }}
+{{- if ne $edge.upstream.hostHeader "preserve-original-authority" }}{{ fail "custom-domain edge must preserve the original Host authority to Vault" }}{{- end }}
+{{- if empty $edge.upstream.sourcePeers }}{{ fail "custom-domain edge upstream.sourcePeers must identify the private edge and canonical ingress sources" }}{{- end }}
+{{- if not .Values.vault.enabled }}{{ fail "productPresentation.customDomains.enabled requires vault.enabled=true" }}{{- end }}
+{{- if ne .Values.vault.service.type "ClusterIP" }}{{ fail "custom-domain edge requires vault.service.type=ClusterIP" }}{{- end }}
+{{- if not .Values.networkPolicy.enabled }}{{ fail "custom-domain edge requires networkPolicy.enabled=true" }}{{- end }}
+{{- if not .Values.ingress.vault.enabled }}{{ fail "custom-domain edge requires ingress.vault.enabled=true for the canonical host" }}{{- end }}
+{{- if not .Values.ingress.vault.tls.enabled }}{{ fail "custom-domain edge requires ingress.vault.tls.enabled=true for the canonical host" }}{{- end }}
+{{- if empty .Values.ingress.vault.tls.secretName }}{{ fail "custom-domain edge requires ingress.vault.tls.secretName for the canonical host" }}{{- end }}
+{{- if ne .Values.vault.publicUrl (printf "https://%s" .Values.ingress.vault.host) }}{{ fail "vault.publicUrl must exactly equal https://ingress.vault.host when custom domains are enabled" }}{{- end }}
+{{- end }}
+{{- if ne $product.managementSchema "public" }}{{ fail "productPresentation.managementSchema must remain public to match the API normalized authority" }}{{- end }}
+{{- if ne $product.managementPrefix "mgmt_" }}{{ fail "productPresentation.managementPrefix must remain mgmt_ to match the API normalized authority" }}{{- end }}
 {{- if and (eq $phase "bridge") (ne (int .Values.credentialAuthority.expectedRuntimeCount) (int .Values.replicaCount)) }}
 {{- fail "credentialAuthority.expectedRuntimeCount must equal replicaCount in bridge phase" }}
 {{- end }}
@@ -111,6 +133,17 @@ spec:
 {{- end }}
             - name: CLEARANCE_CORS_ORIGINS
               value: {{ required "env.CLEARANCE_CORS_ORIGINS is required" .Values.env.CLEARANCE_CORS_ORIGINS | quote }}
+{{- if $product.customDomains.enabled }}
+            - name: CLEARANCE_CUSTOM_DOMAIN_TARGET
+              value: {{ .Values.env.CLEARANCE_CUSTOM_DOMAIN_TARGET | quote }}
+{{- end }}
+{{- with $product.emailDomainRecords.existingSecret }}
+            - name: CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $product.emailDomainRecords.key }}
+{{- end }}
             - name: CLEARANCE_TRUSTED_PROXY
               value: {{ .Values.env.CLEARANCE_TRUSTED_PROXY | quote }}
             - name: CLEARANCE_SECRET

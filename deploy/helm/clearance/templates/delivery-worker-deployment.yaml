@@ -125,6 +125,8 @@ spec:
 {{- end }}
             - { name: CLEARANCE_DELIVERY_SCHEMA, value: {{ .Values.delivery.schema | quote }} }
             - { name: CLEARANCE_DELIVERY_PREFIX, value: {{ .Values.delivery.prefix | quote }} }
+            - { name: CLEARANCE_MANAGEMENT_SCHEMA, value: {{ .Values.productPresentation.managementSchema | quote }} }
+            - { name: CLEARANCE_MANAGEMENT_PREFIX, value: {{ .Values.productPresentation.managementPrefix | quote }} }
             - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE, value: {{ printf "%d" (int .Values.delivery.quota.maxActive) | quote }} }
             - { name: CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG, value: {{ printf "%d" (int .Values.delivery.quota.maxBacklog) | quote }} }
             - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW, value: {{ printf "%d" (int .Values.delivery.quota.maxEnqueuesPerWindow) | quote }} }

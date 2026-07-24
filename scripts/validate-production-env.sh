@@ -37,10 +37,17 @@ Required (strong secrets, no defaults):
   CLEARANCE_BASE_URL
   CLEARANCE_CONSOLE_URL
   CLEARANCE_CORS_ORIGINS
+  CLEARANCE_CUSTOM_DOMAIN_TARGET # public custom-domain CNAME hostname
+  CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE # protected file containing server-owned email DNS records
   CLEARANCE_API_PORT
   CLEARANCE_CONSOLE_PORT
   CLEARANCE_SAMPLE_PORT
   CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT
+  CLEARANCE_VAULT_PORT
+  CLEARANCE_VAULT_URL             # canonical public HTTPS origin
+  CLEARANCE_PROJECT_ID            # canonical key-management project scope
+  CLEARANCE_ENV_ID                # canonical key-management environment scope
+  CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON # every encryption purpose plus signing
   CLEARANCE_PG_VOLUME
   CLEARANCE_BACKUP_VOLUME
   CLEARANCE_IMAGE_REPOSITORY
@@ -120,6 +127,125 @@ check_https_url() {
   fi
 }
 
+# Vault is a public canonical authority rather than a redirect target. Keep
+# this narrower than the API/console URL validator: no local HTTP escape hatch,
+# credentials, path, query, fragment, non-default port, or URL normalization.
+check_canonical_https_origin() {
+  local label="$1"
+  local value="$2"
+  # This is a public Vault origin. Local HTTP is never an acceptable
+  # production value, including when the separate API/console test escape
+  # hatch is enabled.
+  if [[ ! "$value" =~ ^https:// ]]; then
+    fail "$label must be a canonical HTTPS origin without credentials, port, path, query, or fragment"
+    return
+  fi
+  check_https_url "$label" "$value"
+  if VAULT_URL="$value" node -e '
+    const raw=process.env.VAULT_URL;
+    let url;
+    try { url=new URL(raw); } catch { process.exit(1); }
+    if (url.protocol!=="https:" || !url.hostname || url.username || url.password ||
+        url.port || url.pathname!=="/" || url.search || url.hash || raw!==url.origin) process.exit(1);
+  ' 2>/dev/null; then
+    note "$label is a canonical HTTPS origin"
+  else
+    fail "$label must be a canonical HTTPS origin without credentials, port, path, query, or fragment"
+  fi
+}
+
+# Match the key-management context validator: scopes are bounded, non-empty,
+# trimmed identifiers with no control characters. Keep the value out of logs.
+check_key_management_identifier() {
+  local label="$1"
+  local value="$2"
+  if KEY_SCOPE_IDENTIFIER="$value" node -e '
+    const value=process.env.KEY_SCOPE_IDENTIFIER;
+    if (!value || value.length>512 || value.trim()!==value || /[\0-\x1f\x7f]/.test(value)) process.exit(1);
+  ' 2>/dev/null; then
+    note "$label is a canonical key-management identifier"
+  else
+    fail "$label must be a non-empty, trimmed key-management identifier no longer than 512 characters"
+  fi
+}
+
+# This is the fail-closed shape required by keyManagementRuntimeOptions(): one
+# provider for every encryption purpose plus a distinct access-token signer.
+# Provider material remains opaque here; the runtime performs provider-specific
+# cryptographic validation without this script ever printing configuration data.
+check_key_management_config() {
+  local value="$1"
+  if KEY_MANAGEMENT_CONFIG="$value" node -e '
+    const raw=process.env.KEY_MANAGEMENT_CONFIG;
+    const purposes=["oidc-client-secret","scim-bearer-token","service-account-credential-replay","access-token-signing-key"];
+    const exact=(value, keys) => value && typeof value==="object" && !Array.isArray(value) && Object.keys(value).sort().join("\0")===keys.slice().sort().join("\0");
+    const noExtras=(value, keys) => value && typeof value==="object" && !Array.isArray(value) && Object.keys(value).every((key)=>keys.includes(key));
+    const text=(value) => typeof value==="string" && value.length>0 && value.length<=512 && value.trim()===value && !/[\0-\x1f\x7f]/.test(value);
+    const optionalText=(value) => value===undefined || text(value);
+    const optionalInteger=(value) => value===undefined || Number.isInteger(value);
+    const optionalBoolean=(value) => value===undefined || typeof value==="boolean";
+    const rawAwsKey=/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/;
+    const awsKeyArn=/^arn:(?:aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b):kms:[a-z0-9-]{1,64}:[0-9]{12}:key\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/;
+    const gcpCryptoKey=/^projects\/[A-Za-z0-9._~-]{1,128}\/locations\/[A-Za-z0-9._~-]{1,128}\/keyRings\/[A-Za-z0-9._~-]{1,128}\/cryptoKeys\/[A-Za-z0-9._~-]{1,128}$/;
+    const gcpCryptoKeyVersion=/^projects\/[A-Za-z0-9._~-]{1,128}\/locations\/[A-Za-z0-9._~-]{1,128}\/keyRings\/[A-Za-z0-9._~-]{1,128}\/cryptoKeys\/[A-Za-z0-9._~-]{1,128}\/cryptoKeyVersions\/[1-9][0-9]*$/;
+    const awsKey=(value) => typeof value==="string" && (rawAwsKey.test(value)||awsKeyArn.test(value));
+    const gcpKey=(value) => typeof value==="string" && value.length<=1024 && value.trim()===value && gcpCryptoKey.test(value);
+    const gcpKeyVersion=(value) => typeof value==="string" && value.length<=1024 && value.trim()===value && gcpCryptoKeyVersion.test(value);
+    const retainedIds=(current, value, valid) => value===undefined || Array.isArray(value) && value.length<=64 && value.every(valid) && new Set([current,...value]).size===value.length+1;
+    const awsKeyIdentity=(value) => value.includes(":key/") ? value.slice(value.lastIndexOf(":key/")+5) : value;
+    const retainedSigningKeys=(current, value, valid, identity=(reference)=>reference) => value===undefined || Array.isArray(value) && value.length<=64 && value.every((entry)=>exact(entry,["keyReference","retiredAt"]) && valid(entry.keyReference) && typeof entry.retiredAt==="string" && Number.isFinite(Date.parse(entry.retiredAt)) && new Date(entry.retiredAt).toISOString()===entry.retiredAt && new Date(entry.retiredAt).getTime()<=Date.now()) && new Set([identity(current),...value.map((entry)=>identity(entry.keyReference))]).size===value.length+1;
+    const local=(value) => noExtras(value,["kind","providerId","currentKeyId","keys"]) && value.kind==="local" && text(value.providerId) && text(value.currentKeyId) && value.keys && typeof value.keys==="object" && !Array.isArray(value.keys) && Object.keys(value.keys).length>0 && Object.entries(value.keys).every(([id,key])=>text(id)&&typeof key==="string"&&key.trim()===key&&key.length>0) && Object.hasOwn(value.keys,value.currentKeyId);
+    const cloud=(value, kind) => {
+      const aws=kind==="aws-kms", valid=aws?awsKey:gcpKey;
+      return noExtras(value,aws?["kind","providerId","currentKeyId","retainedKeyIds","region","endpoint","allowInsecureLoopbackHttp","timeoutMs"]:["kind","providerId","currentKeyId","retainedKeyIds","timeoutMs"]) && value.kind===kind && text(value.providerId) && valid(value.currentKeyId) && retainedIds(value.currentKeyId,value.retainedKeyIds,valid) && optionalInteger(value.timeoutMs) && (!aws || text(value.region) && optionalText(value.endpoint) && optionalBoolean(value.allowInsecureLoopbackHttp));
+    };
+    const encryption=(value) => value?.kind==="local" ? local(value) : value?.kind==="aws-kms" ? cloud(value,"aws-kms") : value?.kind==="gcp-kms" ? cloud(value,"gcp-kms") : false;
+    const signer=(value) => {
+      if (!value || typeof value!=="object" || Array.isArray(value) || !text(value.providerId) || !text(value.currentKeyReference)) return false;
+      if (value.kind==="local") return noExtras(value,["kind","providerId","currentKeyReference","retainedKeys","keys"]) && retainedSigningKeys(value.currentKeyReference,value.retainedKeys,text) && value.keys && typeof value.keys==="object" && !Array.isArray(value.keys) && Object.keys(value.keys).length>0 && Object.entries(value.keys).every(([id,key])=>text(id)&&typeof key==="string"&&key.trim()===key&&key.length>0) && Object.hasOwn(value.keys,value.currentKeyReference);
+      if (value.kind==="aws-kms") return noExtras(value,["kind","providerId","currentKeyReference","retainedKeys","region","endpoint","allowInsecureLoopbackHttp","timeoutMs"]) && awsKey(value.currentKeyReference) && retainedSigningKeys(value.currentKeyReference,value.retainedKeys,awsKey,awsKeyIdentity) && text(value.region) && optionalText(value.endpoint) && optionalBoolean(value.allowInsecureLoopbackHttp) && optionalInteger(value.timeoutMs);
+      if (value.kind==="gcp-kms") return noExtras(value,["kind","providerId","currentKeyReference","retainedKeys","timeoutMs"]) && gcpKeyVersion(value.currentKeyReference) && retainedSigningKeys(value.currentKeyReference,value.retainedKeys,gcpKeyVersion) && optionalInteger(value.timeoutMs);
+      return false;
+    };
+    let config; try { config=JSON.parse(raw); } catch { process.exit(1); }
+    if (!exact(config,[...purposes,"access-token-signer"]) || !purposes.every((purpose)=>encryption(config[purpose])) || !signer(config["access-token-signer"])) process.exit(1);
+  ' 2>/dev/null; then
+    note "CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON configures every encryption purpose and the signing provider"
+  else
+    fail "CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON must configure every key purpose and access-token signer without logging key material"
+  fi
+}
+
+check_dns_hostname() {
+  local label="$1"
+  local value="$2"
+  if [[ ${#value} -le 253 ]] \
+    && [[ "$value" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+    note "$label is a valid DNS hostname"
+  else
+    fail "$label must be a lowercase DNS hostname without a scheme, port, or path"
+  fi
+}
+
+check_product_configuration_file() {
+  local file="$1"
+  if [[ ! -r "$file" || ! -f "$file" ]]; then
+    fail "CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE must be a readable regular file"
+    return
+  fi
+  if PRODUCT_CONFIG_FILE="$file" node -e '
+    const fs=require("fs");
+    const line=fs.readFileSync(process.env.PRODUCT_CONFIG_FILE,"utf8").split(/\r?\n/)
+      .find((entry)=>entry.startsWith("CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON="));
+    if(!line) process.exit(1);
+    JSON.parse(line.slice("CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON=".length));
+  ' 2>/dev/null; then
+    note "CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE supplies parseable server-owned email DNS records"
+  else
+    fail "CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE must supply parseable CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON without logging its contents"
+  fi
+}
+
 # Secrets / credentials
 check_secret CLEARANCE_OPERATOR_TOKEN "${CLEARANCE_OPERATOR_TOKEN-}"
 check_secret CLEARANCE_SECRET "${CLEARANCE_SECRET-}"
@@ -141,10 +267,17 @@ check_present CLEARANCE_DB_NAME "${CLEARANCE_DB_NAME-}"
 check_present CLEARANCE_BASE_URL "${CLEARANCE_BASE_URL-}"
 check_present CLEARANCE_CONSOLE_URL "${CLEARANCE_CONSOLE_URL-}"
 check_present CLEARANCE_CORS_ORIGINS "${CLEARANCE_CORS_ORIGINS-}"
+check_dns_hostname CLEARANCE_CUSTOM_DOMAIN_TARGET "${CLEARANCE_CUSTOM_DOMAIN_TARGET-}"
+check_product_configuration_file "${CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE-}"
 check_port CLEARANCE_API_PORT "${CLEARANCE_API_PORT-}"
 check_port CLEARANCE_CONSOLE_PORT "${CLEARANCE_CONSOLE_PORT-}"
 check_port CLEARANCE_SAMPLE_PORT "${CLEARANCE_SAMPLE_PORT-}"
 check_port CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT "${CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT-}"
+check_port CLEARANCE_VAULT_PORT "${CLEARANCE_VAULT_PORT-}"
+check_canonical_https_origin CLEARANCE_VAULT_URL "${CLEARANCE_VAULT_URL-}"
+check_key_management_identifier CLEARANCE_PROJECT_ID "${CLEARANCE_PROJECT_ID-}"
+check_key_management_identifier CLEARANCE_ENV_ID "${CLEARANCE_ENV_ID-}"
+check_key_management_config "${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON-}"
 check_present CLEARANCE_PG_VOLUME "${CLEARANCE_PG_VOLUME-}"
 check_present CLEARANCE_BACKUP_VOLUME "${CLEARANCE_BACKUP_VOLUME-}"
 check_present CLEARANCE_IMAGE_REPOSITORY "${CLEARANCE_IMAGE_REPOSITORY-}"

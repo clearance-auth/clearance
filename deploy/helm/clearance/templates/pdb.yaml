@@ -48,3 +48,20 @@ spec:
       app: clearance-console
       app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+{{- if and .Values.vault.enabled .Values.vault.podDisruptionBudget.enabled (eq .Values.credentialAuthority.phase "serve") }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-vault
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: vault
+spec:
+  minAvailable: {{ .Values.vault.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: clearance-vault
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
