@@ -31,6 +31,7 @@ import {
 	SYSTEM_OPERATIONS,
 	WEBHOOK_ENDPOINT_OPERATIONS,
 	type OperationOutput,
+	type ManagementOperationTypes,
 } from "./operations.js";
 
 describe("management operation contracts", () => {
@@ -279,7 +280,7 @@ describe("management operation contracts", () => {
 		expect(UPGRADE_OPERATIONS.rollback.confirmation).toBe("server-required");
 		expect(SCHEMA_OPERATIONS.generate).toMatchObject({
 			mutation: false,
-			supportsDryRun: true,
+			supportsDryRun: false,
 		});
 		expect(SCHEMA_OPERATIONS.migrate.confirmation).toBe("server-required");
 		expect(STORE_V2_OPERATIONS.apply).toMatchObject({
@@ -353,6 +354,10 @@ describe("management operation contracts", () => {
 		expect(SSO_OPERATIONS.setupLink.supportsDryRun).toBe(false);
 		expect(SCIM_OPERATIONS.setupLink.supportsDryRun).toBe(false);
 		expect(SCIM_OPERATIONS.replay.confirmation).toBe("server-required");
+		expectTypeOf<ManagementOperationTypes["scim.test"]["input"]["scenario"]>()
+			.toEqualTypeOf<"users" | "group-lifecycle" | undefined>();
+		expectTypeOf<ManagementOperationTypes["scim.test"]["input"]["users"]>()
+			.toEqualTypeOf<Array<{ userName: string; displayName?: string; active?: boolean }> | undefined>();
 	});
 
 	it("defines event, key, session, and role policies explicitly", () => {
