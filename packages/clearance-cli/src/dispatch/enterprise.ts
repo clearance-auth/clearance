@@ -1,12 +1,11 @@
 import {
 	READINESS_OPERATIONS,
-	resolveOperationPath,
 	SCIM_OPERATIONS,
 	SSO_OPERATIONS,
 } from "@clearance/management";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import type { GlobalOpts } from "../output.js";
 import {
 	body,
@@ -14,8 +13,7 @@ import {
 	type DispatchInput,
 	error,
 	firstStringArgument,
-	previewConfirmation,
-	query,
+	managementCallOptions,
 	requireConfirmation,
 	requireRemoteMutation,
 } from "./shared.js";
@@ -51,10 +49,10 @@ export async function dispatchEnterpriseCommand({
 	switch (path) {
 		case SSO_OPERATIONS.create.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.create.http.method,
-				path: SSO_OPERATIONS.create.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"sso.create",
+				body({
 					organizationId: opts.org,
 					provider: opts.provider,
 					protocol: opts.protocol,
@@ -65,58 +63,55 @@ export async function dispatchEnterpriseCommand({
 					samlCertificate: opts.certificate
 						? readFileSync(resolve(String(opts.certificate)), "utf8")
 						: undefined,
-				}),
-			});
+				}) as Parameters<typeof callManagementOperation<"sso.create">>[2],
+			);
 		case SSO_OPERATIONS.configure.cliPath:
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.configure.http.method,
-				path: resolveOperationPath(SSO_OPERATIONS.configure, { id: rawId }),
-				body: body({ issuer: opts.issuer, audience: opts.audience, domain: opts.domain, dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "sso.configure", body({
+				id: rawId,
+				issuer: opts.issuer,
+				audience: opts.audience,
+				domain: opts.domain,
+				dryRun: global.dryRun,
+			}) as Parameters<typeof callManagementOperation<"sso.configure">>[2], managementCallOptions(global));
 		case SSO_OPERATIONS.test.cliPath:
 			if (opts.live && opts.fixture) {
 				throw error("SSO_TEST_MODE_CONFLICT", "--live and --fixture are mutually exclusive.", "Use one SSO test mode.");
 			}
 			if (opts.live) requireLiveTestMode(global, "SSO_LIVE_CONFIRM_REQUIRED", "Live SSO conformance");
 			else requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.test.http.method,
-				path: resolveOperationPath(SSO_OPERATIONS.test, { id: rawId }),
-				body: body({ fixture: opts.fixture, live: opts.live }),
-			});
+			return callManagementOperation(session, "sso.test", body({
+				id: rawId,
+				fixture: opts.fixture,
+				live: opts.live,
+			}) as Parameters<typeof callManagementOperation<"sso.test">>[2], managementCallOptions(global));
 		case SSO_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.list.http.method,
-				path: query(SSO_OPERATIONS.list.http.path, { organizationId: opts.org }),
-			});
+			return callManagementOperation(session, "sso.list", body({
+				organizationId: opts.org,
+			}));
 		case SSO_OPERATIONS.setupLink.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.setupLink.http.method,
-				path: SSO_OPERATIONS.setupLink.http.path,
-				body: { organizationId: opts.org },
+			return callManagementOperation(session, "sso.setupLink.create", {
+				organizationId: String(opts.org),
 			});
 		case SSO_OPERATIONS.rotate.cliPath:
 			requireConfirmation(global, "SSO_CONFIRM_REQUIRED", "SSO credential rotation");
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.rotate.http.method,
-				path: resolveOperationPath(SSO_OPERATIONS.rotate, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "sso.rotate", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SSO_OPERATIONS.disable.cliPath:
 			requireConfirmation(global, "SSO_CONFIRM_REQUIRED", "SSO disable");
-			return requestManagementApi(session, {
-				method: SSO_OPERATIONS.disable.http.method,
-				path: resolveOperationPath(SSO_OPERATIONS.disable, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "sso.disable", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SCIM_OPERATIONS.create.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.create.http.method,
-				path: SCIM_OPERATIONS.create.http.path,
-				body: body({ organizationId: opts.org, provider: opts.provider, endpoint: opts.endpoint }),
-			});
+			return callManagementOperation(session, "scim.create", body({
+				organizationId: opts.org,
+				provider: opts.provider,
+				endpoint: opts.endpoint,
+			}) as Parameters<typeof callManagementOperation<"scim.create">>[2]);
 		case SCIM_OPERATIONS.test.cliPath:
 			if (opts.live && opts.fixture) {
 				throw error("SCIM_TEST_MODE_CONFLICT", "--live and --fixture are mutually exclusive.", "Use one SCIM test mode.");
@@ -128,54 +123,54 @@ export async function dispatchEnterpriseCommand({
 				throw error("SCIM_SCENARIO_LIVE_CONFLICT", "--scenario group-lifecycle cannot use --live.", "Remove --live to exercise the bundled runtime.");
 			}
 			if (opts.live) requireLiveTestMode(global, "SCIM_LIVE_CONFIRM_REQUIRED", "Live SCIM conformance");
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.test.http.method,
-				path: resolveOperationPath(SCIM_OPERATIONS.test, { id: rawId }),
-				body: body({ fixture: opts.fixture, live: opts.live, dryRun: global.dryRun || !opts.apply, scenario: opts.scenario ?? "users" }),
-			});
+			return callManagementOperation(
+				session,
+				"scim.test",
+				(opts.live
+					? { id: rawId, live: true, dryRun: false }
+					: body({
+						id: rawId,
+						fixture: opts.fixture,
+						live: false,
+						dryRun: global.dryRun || !opts.apply,
+						scenario: opts.scenario ?? "users",
+					})) as Parameters<typeof callManagementOperation<"scim.test">>[2],
+				managementCallOptions(global),
+			);
 		case SCIM_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.list.http.method,
-				path: query(SCIM_OPERATIONS.list.http.path, { organizationId: opts.org }),
-			});
+			return callManagementOperation(session, "scim.list", body({
+				organizationId: opts.org,
+			}));
 		case SCIM_OPERATIONS.setupLink.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.setupLink.http.method,
-				path: SCIM_OPERATIONS.setupLink.http.path,
-				body: { organizationId: opts.org },
+			return callManagementOperation(session, "scim.setupLink.create", {
+				organizationId: String(opts.org),
 			});
 		case SCIM_OPERATIONS.rotate.cliPath:
 			requireConfirmation(global, "SCIM_CONFIRM_REQUIRED", "SCIM credential rotation");
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.rotate.http.method,
-				path: resolveOperationPath(SCIM_OPERATIONS.rotate, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "scim.rotate", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SCIM_OPERATIONS.disable.cliPath:
 			requireConfirmation(global, "SCIM_DISABLE_CONFIRM_REQUIRED", "SCIM disable");
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.disable.http.method,
-				path: resolveOperationPath(SCIM_OPERATIONS.disable, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "scim.disable", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SCIM_OPERATIONS.replay.cliPath:
-			return requestManagementApi(session, {
-				method: SCIM_OPERATIONS.replay.http.method,
-				path: resolveOperationPath(SCIM_OPERATIONS.replay, { traceId: rawId }),
-				body: previewConfirmation(global),
-			});
+			return callManagementOperation(session, "scim.replay", {
+				traceId: rawId,
+				dryRun: global.dryRun || !global.yes,
+			}, managementCallOptions(global));
 		case READINESS_OPERATIONS.check.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: READINESS_OPERATIONS.check.http.method,
-				path: READINESS_OPERATIONS.check.http.path,
-				body: { organizationId: opts.org },
+			return callManagementOperation(session, "readiness.check", {
+				organizationId: String(opts.org),
 			});
 		case READINESS_OPERATIONS.report.cliPath:
-			return requestManagementApi(session, {
-				method: READINESS_OPERATIONS.report.http.method,
-				path: resolveOperationPath(READINESS_OPERATIONS.report, { orgId: String(opts.org) }),
+			return callManagementOperation(session, "readiness.report", {
+				organizationId: String(opts.org),
 			});
 	}
 }
