@@ -203,10 +203,14 @@ function schemaShape(value: unknown, operationId: string): Record<string, unknow
 		throw protocolError(`${operationId} input schema must expose safeParse.`);
 	}
 	const definition = isRecord(value.def) ? value.def : undefined;
+	if (definition?.type === "union" && Array.isArray(definition.options) && definition.options.length > 0) {
+		const shapes = definition.options.map((option) => schemaShape(option, operationId));
+		return Object.fromEntries(shapes.flatMap((shape) => Object.entries(shape)));
+	}
 	const catchall = definition && isRecord(definition.catchall) ? definition.catchall : undefined;
 	const catchallDefinition = catchall && isRecord(catchall.def) ? catchall.def : undefined;
 	if (definition?.type !== "object" || catchallDefinition?.type !== "never" || !isRecord(definition.shape)) {
-		throw protocolError(`${operationId} input schema must be a strict Zod object.`);
+		throw protocolError(`${operationId} input schema must be a strict Zod object or a union of strict Zod objects.`);
 	}
 	return definition.shape;
 }
@@ -222,6 +226,44 @@ function transportKeys(value: unknown, label: string): string[] {
 		throw protocolError(`${label} must be an array of logical input keys.`);
 	}
 	return value;
+}
+
+function pathProjection(value: unknown, label: string): Array<readonly [string, string]> {
+	if (Array.isArray(value)) {
+		if (value.some((key) => typeof key !== "string" || !TRANSPORT_KEY.test(key))) {
+			throw protocolError(`${label} must map semantic input keys to route placeholders.`);
+		}
+		return value.map((key) => [key, key] as const);
+	}
+	if (!isRecord(value)) throw protocolError(`${label} must map semantic input keys to route placeholders.`);
+	const entries = Object.entries(value);
+	if (entries.some(([semantic, placeholder]) => !TRANSPORT_KEY.test(semantic) ||
+		typeof placeholder !== "string" || !TRANSPORT_KEY.test(placeholder))) {
+		throw protocolError(`${label} must map semantic input keys to route placeholders.`);
+	}
+	if (new Set(entries.map(([, placeholder]) => placeholder)).size !== entries.length) {
+		throw protocolError(`${label} cannot map multiple semantic input keys to one route placeholder.`);
+	}
+	return entries as Array<readonly [string, string]>;
+}
+
+function queryProjection(value: unknown, label: string): Array<readonly [string, string]> {
+	if (Array.isArray(value)) {
+		if (value.some((key) => typeof key !== "string" || !TRANSPORT_KEY.test(key))) {
+			throw protocolError(`${label} must map semantic input keys to HTTP query keys.`);
+		}
+		return value.map((key) => [key, key] as const);
+	}
+	if (!isRecord(value)) throw protocolError(`${label} must map semantic input keys to HTTP query keys.`);
+	const entries = Object.entries(value);
+	if (entries.some(([semantic, wire]) => !TRANSPORT_KEY.test(semantic) ||
+		typeof wire !== "string" || !TRANSPORT_KEY.test(wire))) {
+		throw protocolError(`${label} must map semantic input keys to HTTP query keys.`);
+	}
+	if (new Set(entries.map(([, wire]) => wire)).size !== entries.length) {
+		throw protocolError(`${label} cannot map multiple semantic input keys to one HTTP query key.`);
+	}
+	return entries as Array<readonly [string, string]>;
 }
 
 function assertRegistry(registry: OperationRegistry): void {
@@ -254,15 +296,18 @@ function assertRegistry(registry: OperationRegistry): void {
 		assertOutputSchema(operation.schemas.output, operationId);
 		if (!isRecord(operation.transport)) throw protocolError(`${operationId} transport must be an object.`);
 		assertExactKeys(operation.transport, TRANSPORT_KEYS, `${operationId} transport`);
-		const pathKeys = transportKeys(operation.transport.path, `${operationId} transport.path`);
-		const queryKeys = transportKeys(operation.transport.query, `${operationId} transport.query`);
+		const pathProjectionEntries = pathProjection(operation.transport.path, `${operationId} transport.path`);
+		const pathKeys = pathProjectionEntries.map(([semantic]) => semantic);
+		const routePlaceholders = pathProjectionEntries.map(([, placeholder]) => placeholder);
+		const queryProjectionEntries = queryProjection(operation.transport.query, `${operationId} transport.query`);
+		const queryKeys = queryProjectionEntries.map(([semantic]) => semantic);
 		const bodyKeys = transportKeys(operation.transport.body, `${operationId} transport.body`);
 		const projections = [...pathKeys, ...queryKeys, ...bodyKeys];
 		if (new Set(projections).size !== projections.length || projections.length !== fields.size || projections.some((key) => !fields.has(key))) {
 			throw protocolError(`${operationId} must project every logical input key exactly once.`);
 		}
 		const routeParams = [...operation.http.path.matchAll(/:([A-Za-z][A-Za-z0-9_]*)/g)].map((match) => match[1]!);
-		if (new Set(routeParams).size !== routeParams.length || routeParams.length !== pathKeys.length || routeParams.some((key) => !pathKeys.includes(key))) {
+		if (new Set(routeParams).size !== routeParams.length || routeParams.length !== pathKeys.length || routeParams.some((key) => !routePlaceholders.includes(key))) {
 			throw protocolError(`${operationId} must project every route parameter exactly once into path.`);
 		}
 		if (operation.http.method === "GET" && (bodyKeys.length > 0 || operation.confirmation === "server-required")) {
@@ -320,22 +365,27 @@ function assertRegistry(registry: OperationRegistry): void {
 
 function snapshotRegistry<Registry extends OperationRegistry>(registry: Registry): Registry {
 	assertRegistry(registry);
-	return Object.freeze(Object.fromEntries(Object.entries(registry).map(([id, operation]) => [
-		id,
-		Object.freeze({
+	const snapshot = Object.create(null) as Record<string, AnyOperationSpec>;
+	for (const [id, operation] of Object.entries(registry)) {
+		snapshot[id] = Object.freeze({
 			...operation,
 			http: Object.freeze({ ...operation.http }),
 			schemas: Object.freeze({ ...operation.schemas }),
 			transport: Object.freeze({
-				path: Object.freeze([...operation.transport.path]),
-				query: Object.freeze([...operation.transport.query]),
+				path: Object.freeze(Array.isArray(operation.transport.path)
+					? [...operation.transport.path]
+					: { ...operation.transport.path }),
+				query: Object.freeze(Array.isArray(operation.transport.query)
+					? [...operation.transport.query]
+					: { ...operation.transport.query }),
 				body: Object.freeze([...operation.transport.body]),
 			}),
 			confirmationWhen: operation.confirmationWhen
 				? Object.freeze({ ...operation.confirmationWhen })
 				: undefined,
-		}),
-	]))) as Registry;
+		});
+	}
+	return Object.freeze(snapshot) as Registry;
 }
 
 function assertTransportHeaders(config: ManagementClientConfig<OperationRegistry>): void {
@@ -432,10 +482,20 @@ function parseInput(operation: AnyOperationSpec, input: OperationInput<AnyOperat
 	}
 	const logical = parsed.data as Record<string, unknown>;
 	const project = (keys: readonly string[]) => Object.fromEntries(keys.map((key) => [key, logical[key]]));
+	const projectQuery = (projection: AnyOperationSpec["transport"]["query"]) => Object.fromEntries(
+		(Array.isArray(projection) ? projection.map((key) => [key, key] as const) : Object.entries(projection))
+			.map(([semantic, wire]) => [wire, logical[semantic]]),
+	);
 	return {
 		logical,
-		path: project(operation.transport.path),
-		query: operation.transport.query.length > 0 ? project(operation.transport.query) : undefined,
+		path: project(Array.isArray(operation.transport.path)
+			? operation.transport.path
+			: Object.keys(operation.transport.path)),
+		query: (Array.isArray(operation.transport.query)
+			? operation.transport.query.length
+			: Object.keys(operation.transport.query).length) > 0
+			? projectQuery(operation.transport.query)
+			: undefined,
 		body: operation.transport.body.length > 0 ? project(operation.transport.body) : undefined,
 	};
 }
@@ -540,8 +600,8 @@ function createManagementClient<Registry extends OperationRegistry>(
 			input: OperationInput<Registry[Id]>,
 			options: ManagementCallOptions<Registry[Id]> = {},
 		) {
-			const operation = safeConfig.registry[id];
-			if (!operation) throw protocolError(`Unknown operation id ${id}.`);
+			if (!Object.hasOwn(safeConfig.registry, id)) throw protocolError(`Unknown operation id ${id}.`);
+			const operation = safeConfig.registry[id]!;
 			return callSpec(safeConfig, operation, input as OperationInput<AnyOperationSpec>, options as ManagementCallOptions<AnyOperationSpec>) as Promise<
 				ManagementResponse<OperationOutput<Registry[Id]>>
 			>;
