@@ -173,6 +173,29 @@ describe("authenticated operational API contracts", () => {
 		});
 	});
 
+	it("constructs credential mutations with mutually exclusive preview and live options", async () => {
+		const { credentialMutationOperation } = await import("./routes/access.js");
+		const operationId = "11111111-1111-4111-8111-111111111111";
+
+		expect(
+			credentialMutationOperation({}, true, "authorization.credentials.create"),
+		).toStrictEqual({ dryRun: true });
+		expect(
+			credentialMutationOperation(
+				{ operationId },
+				undefined,
+				"authorization.credentials.create",
+			),
+		).toStrictEqual({ operationId });
+		expect(
+			credentialMutationOperation(
+				{ operationId },
+				false,
+				"authorization.credentials.rotate",
+			),
+		).toStrictEqual({ operationId });
+	});
+
 	it("rejects invalid key-management bodies before the PostgreSQL backend gate", async () => {
 		for (const [path, body] of [
 			["/v1/key-management/plan", "[]"],

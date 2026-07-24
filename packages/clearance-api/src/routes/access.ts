@@ -163,6 +163,16 @@ const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 /** Credential replay authority accepts a caller-chosen UUID only for live mutations. */
 function credentialOperationId(
 	body: Record<string, unknown>,
+	dryRun: true,
+	stage: string,
+): undefined;
+function credentialOperationId(
+	body: Record<string, unknown>,
+	dryRun: false | undefined,
+	stage: string,
+): string;
+function credentialOperationId(
+	body: Record<string, unknown>,
 	dryRun: boolean | undefined,
 	stage: string,
 ): string | undefined {
@@ -185,6 +195,22 @@ function credentialOperationId(
 		});
 	}
 	return value;
+}
+
+type CredentialMutationOperation =
+	| Readonly<{ dryRun: true; operationId?: never }>
+	| Readonly<{ dryRun?: false; operationId: string }>;
+
+export function credentialMutationOperation(
+	body: Record<string, unknown>,
+	dryRun: boolean | undefined,
+	stage: string,
+): CredentialMutationOperation {
+	if (dryRun === true) {
+		credentialOperationId(body, dryRun, stage);
+		return { dryRun: true };
+	}
+	return { operationId: credentialOperationId(body, dryRun, stage) };
 }
 
 export function registerAccessRoutes({
@@ -647,7 +673,7 @@ export function registerAccessRoutes({
 				"dryRun",
 				"authorization.credentials.create",
 			);
-			const operationId = credentialOperationId(
+			const credentialOperation = credentialMutationOperation(
 				body,
 				dryRun,
 				"authorization.credentials.create",
@@ -657,8 +683,7 @@ export function registerAccessRoutes({
 			const result = await createServiceAccountCredentialInAuth(store, {
 				organizationId: c.req.param("id"), serviceAccountId: c.req.param("accountId"),
 				...(expiresAt === undefined ? {} : { expiresAt }),
-				...(dryRun === undefined ? {} : { dryRun }),
-				...(operationId === undefined ? {} : { operationId }),
+				...credentialOperation,
 				actor: requestActor(c), source: "api", scope,
 			});
 			const output = authorizationOperationResult(result as Record<string, unknown>, scope);
@@ -691,7 +716,7 @@ export function registerAccessRoutes({
 				"dryRun",
 				"authorization.credentials.rotate",
 			);
-			const operationId = credentialOperationId(
+			const credentialOperation = credentialMutationOperation(
 				body,
 				dryRun,
 				"authorization.credentials.rotate",
@@ -701,8 +726,7 @@ export function registerAccessRoutes({
 			const result = await rotateServiceAccountCredentialInAuth(store, {
 				organizationId: c.req.param("id"), serviceAccountId: c.req.param("accountId"), credentialId: c.req.param("credentialId"),
 				...(expiresAt === undefined ? {} : { expiresAt }),
-				...(dryRun === undefined ? {} : { dryRun }),
-				...(operationId === undefined ? {} : { operationId }),
+				...credentialOperation,
 				actor: requestActor(c), source: "api", scope,
 			});
 			const output = authorizationOperationResult(result as Record<string, unknown>, scope);
