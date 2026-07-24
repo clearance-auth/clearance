@@ -19,11 +19,12 @@ import type {
 	ReplayDiagnosticResult,
 } from "../services/events.js";
 import type { ResourceScope } from "../services/scope.js";
-import type { ArchiveOrganizationResult } from "../services/core.js";
 import type {
+	ArchiveOrganizationResult,
+	AuthoritativeOverviewStats,
 	EnvironmentInspectResult,
 	EnvironmentPromoteResult,
-	overviewStats,
+	UsersExportEnvelope,
 } from "../services/core.js";
 import type {
 	MemberImportPlan,
@@ -38,31 +39,12 @@ import type { RevokeSessionResult, SessionView } from "../services/sessions.js";
 import type { ConfigRecord, diffConfig, publicConfig } from "../services/config.js";
 import type { MigrationPreview, verifyMigration } from "../services/migration.js";
 import type {
-	applyUpgrade,
-	planUpgrade,
-	rollbackUpgrade,
-	verifyUpgrade,
-} from "../services/upgrade.js";
-import type {
-	armCredentialAuthority,
-	drainCredentialAuthority,
 	getCredentialAuthorityStatus,
 	getRuntimeSchemaStatus,
-	migrateRuntimeSchema,
 	planRuntimeSchema,
 } from "../services/runtime-schema.js";
 import type {
-	applyStoreV2,
-	cutoverStoreV2Events,
-	cutoverStoreV2Principals,
-	cutoverStoreV2Topology,
-	getStoreV2Status,
-	planStoreV2,
-	rollbackStoreV2,
-	rollbackStoreV2Events,
-	rollbackStoreV2Principals,
-	rollbackStoreV2Topology,
-	verifyStoreV2,
+	StoreV2CommandEnvelope,
 } from "../services/store-v2.js";
 import type { restoreBackup, upgradeCheck } from "../services/backup.js";
 import type {
@@ -86,8 +68,10 @@ import type {
 import type {
 	ScopedWebhookEndpoint,
 	ScopedWebhookEndpointPage,
+	WebhookEndpointDeletionResult,
 	WebhookEndpointControlResult,
 	WebhookEndpointCreateResult,
+	WebhookEndpointMutationPreview,
 	WebhookEndpointUpdateResult,
 } from "../services/webhook-endpoints.js";
 import type {
@@ -106,9 +90,14 @@ import type {
 	KeyManagementStatusResult,
 } from "../services/key-management.js";
 import type {
+	DeliveryControlAction,
+	DeliveryControlPreview,
 	DeliveryJobState,
 	DeliveryQuotaStatus,
 	DeliveryReadinessSummary,
+	EnqueuedDelivery,
+	PublicDeliveryJob,
+	PublicWebhookEndpoint,
 	WebhookEndpointStatus,
 	WebhookEventKind,
 } from "@clearance/delivery";
@@ -167,7 +156,263 @@ export interface ServiceAccountCredentialView {
 	version: number;
 }
 
-export interface ManagementOperationTypes {
+export type ManagementJsonPrimitive = string | number | boolean | null;
+export type ManagementJsonValue =
+	| ManagementJsonPrimitive
+	| ManagementJsonValue[]
+	| { [key: string]: ManagementJsonValue };
+
+/**
+ * The service layer may use Dates, readonly collections, or opaque metadata
+ * internally. Management operations describe the JSON representation that
+ * actually crosses the HTTP boundary.
+ */
+export type ManagementJsonWire<Value> =
+	unknown extends Value
+		? ManagementJsonValue
+		: Value extends Date
+			? string
+			: Value extends ManagementJsonPrimitive | undefined
+				? Value
+				: Value extends ManagementJsonValue
+					? Value
+				: Value extends readonly unknown[]
+					? { -readonly [Key in keyof Value]: ManagementJsonWire<Value[Key]> }
+					: Value extends object
+						? { -readonly [Key in keyof Value]: ManagementJsonWire<Value[Key]> }
+						: never;
+
+type PublicSsoIdentityConnection = Omit<PublicIdentityConnection, "protocol"> & {
+	protocol: "saml" | "oidc";
+};
+
+type WithPublicConnection<Value, Connection> =
+	Value extends { connection: unknown }
+		? Omit<Value, "connection"> & { connection: Connection }
+		: Value;
+
+type PublicScimTestResult<Value> =
+	Value extends { connection: unknown; proposed: unknown }
+		? Omit<Value, "connection" | "proposed"> & {
+				connection: PublicDirectoryConnection;
+				proposed: Array<{
+					action: "deprovision" | "upsert";
+					email: string;
+				}>;
+		  }
+		: WithPublicConnection<Value, PublicDirectoryConnection>;
+
+type SetupLinkWire =
+	| (ReturnType<typeof createSetupLink> & { scope: ResourceScope })
+	| (Omit<ReturnType<typeof createSetupLink>, "token" | "url"> & {
+			scope: ResourceScope;
+			oneTimeSecretsOmitted: ["token", "url"];
+	  });
+
+type DeliveryControlWire<Action extends DeliveryControlAction> =
+	Omit<DeliveryControlResult, "operation" | "preview" | "result"> & {
+		operation: `delivery.jobs.${Action}`;
+		preview: Omit<DeliveryControlPreview, "action"> & { action: Action };
+		result?: Action extends "replay" ? EnqueuedDelivery : PublicDeliveryJob;
+	};
+
+type WebhookEndpointCreateWire =
+	| WebhookEndpointCreateResult
+	| (Omit<WebhookEndpointCreateResult, "signingSecret"> & {
+			secretAlreadyIssued: true;
+			oneTimeSecretsOmitted: ["signingSecret"];
+	  });
+
+type WebhookEndpointControlBase<Action extends "rotate" | "delete" | "test"> =
+	Omit<WebhookEndpointControlResult, "operation" | "preview" | "result"> & {
+		operation: `delivery.webhook_endpoints.${Action}`;
+		preview: Extract<WebhookEndpointMutationPreview, { action: Action }>;
+	};
+
+type WebhookEndpointRotateWire =
+	| (WebhookEndpointControlBase<"rotate"> & { dryRun: true })
+	| (WebhookEndpointControlBase<"rotate"> & {
+			dryRun: false;
+			result: { endpoint: PublicWebhookEndpoint; signingSecret: string };
+	  })
+	| (WebhookEndpointControlBase<"rotate"> & {
+			dryRun: false;
+			result: { endpoint: PublicWebhookEndpoint };
+			secretAlreadyIssued: true;
+			oneTimeSecretsOmitted: ["result.signingSecret"];
+	  });
+
+type WebhookEndpointDeleteWire = WebhookEndpointControlBase<"delete"> & {
+	result?: WebhookEndpointDeletionResult;
+};
+
+type WebhookEndpointTestWire = WebhookEndpointControlBase<"test"> & {
+	result?: { endpoint: PublicWebhookEndpoint; delivery: EnqueuedDelivery };
+};
+
+type CredentialAuthorityStatusWire =
+	Omit<Awaited<ReturnType<typeof getCredentialAuthorityStatus>>, "protocolVersion"> & {
+		protocolVersion: 1;
+	};
+
+type StoreV2StatusWire<Operation extends StoreV2CommandEnvelope["operation"]> =
+	Omit<StoreV2CommandEnvelope, "operation" | "dryRun" | "status" | "plan"> & {
+		operation: Operation;
+		dryRun: false;
+		status: NonNullable<StoreV2CommandEnvelope["status"]>;
+	};
+
+type StoreV2PlanWire<Operation extends StoreV2CommandEnvelope["operation"]> =
+	Omit<StoreV2CommandEnvelope, "operation" | "dryRun" | "status" | "plan"> & {
+		operation: Operation;
+		dryRun: true;
+		plan: NonNullable<StoreV2CommandEnvelope["plan"]>;
+	};
+
+type UpgradePlanSummaryWire = {
+	id: string;
+	targetVersion: string;
+	status: string;
+};
+
+type UpgradePlanWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.plan";
+			dryRun: true;
+			plan: {
+				targetVersion: string;
+				currentVersion: string | null;
+				directory: string;
+				createsArtifacts: false;
+			};
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.plan";
+			dryRun: false;
+			plan: UpgradePlanSummaryWire & {
+				path: string;
+				currentVersion: string;
+			};
+	  };
+
+type UpgradeApplyWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.apply";
+			dryRun: true;
+			plan: UpgradePlanSummaryWire & {
+				path: string;
+				currentVersion: string;
+			};
+			wouldRun: ["preflight", "verified_backup", "version_hook"];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.apply";
+			dryRun: false;
+			plan: UpgradePlanSummaryWire & {
+				backupId: string | null;
+				rollbackReference: ManagementJsonValue;
+			};
+	  };
+
+type UpgradeVerifyWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.verify";
+			dryRun: true;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: Array<
+				"backup_reference_check" | "apply_marker_check" | "health_url_check"
+			>;
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.verify";
+			plan: UpgradePlanSummaryWire & {
+				updatedAt: string | null;
+				backupId: string | null;
+			};
+	  };
+
+type UpgradeRollbackWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: true;
+			mode: "isolated_verify_only";
+			activeDatabaseUntouched: true;
+			wouldModifyActiveDatabase: false;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: [
+				"backup_checksum_check",
+				"isolated_restore",
+				"reconciliation",
+				"rollback_receipt",
+			];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: true;
+			mode: "active_database_restore";
+			activeDatabaseUntouched: true;
+			wouldModifyActiveDatabase: true;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: [
+				"advisory_lock",
+				"safety_backup",
+				"staging_restore",
+				"database_swap",
+				"live_verification",
+				"rollback_receipt",
+			];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: false;
+			mode: "isolated_verify_only" | "active_database_restore";
+			activeDatabaseUntouched: boolean;
+			plan: UpgradePlanSummaryWire;
+			rollbackReceipt: string;
+			receipt: Record<string, ManagementJsonValue>;
+	  };
+
+type RuntimeSchemaMigrateWire =
+	| {
+			kind: "schema.migrate";
+			dryRun: true;
+			pendingTables: number;
+			pendingFields: number;
+			pendingSecurityMigrations: string[];
+	  }
+	| {
+			kind: "schema.migrate";
+			dryRun: false;
+			appliedTables: number;
+			appliedFields: number;
+	  };
+
+type MemberImportWireResult = Omit<MemberImportResult, "results"> & {
+	results: Array<
+		| {
+				row: number;
+				principalId: string;
+				status: "success" | "idempotent";
+		  }
+		| {
+				row: number;
+				principalId: string;
+				status: "failure";
+				error: { code: string; stage: string; retryable: boolean };
+		  }
+	>;
+};
+
+export interface ManagementOperationServiceTypes {
 	"system.init": {
 		input: { name?: string; environment?: string };
 		output: { project: Project; environment: Environment };
@@ -182,7 +427,7 @@ export interface ManagementOperationTypes {
 	};
 	"system.overview": {
 		input: Record<string, never>;
-		output: ReturnType<typeof overviewStats>;
+		output: AuthoritativeOverviewStats;
 	};
 	"projects.list": {
 		input: Record<string, never>;
@@ -190,7 +435,7 @@ export interface ManagementOperationTypes {
 	};
 	"projects.inspect": {
 		input: { id?: string };
-		output: { project: Project; overview: ReturnType<typeof overviewStats>; scope: ResourceScope };
+		output: { project: Project; overview: AuthoritativeOverviewStats; scope: ResourceScope };
 	};
 	"projects.create": {
 		input: { name: string; dryRun?: boolean };
@@ -199,8 +444,8 @@ export interface ManagementOperationTypes {
 			| { dryRun: true; project: Pick<Project, "name" | "slug"> };
 	};
 	"environments.list": {
-		input: Record<string, never>;
-		output: { environments: Environment[]; scope: ResourceScope };
+		input: { limit?: number; cursor?: string };
+		output: { environments: Environment[]; nextCursor?: string | null; scope: ResourceScope };
 	};
 	"environments.inspect": {
 		input: { id?: string };
@@ -225,7 +470,8 @@ export interface ManagementOperationTypes {
 		output: { events: AuditEvent[]; nextCursor: string | null; scope: ResourceScope };
 	};
 	"events.tail": {
-		input: { limit?: number; action?: string; organizationId?: string; pollInterval?: number; maxEvents?: number; once?: boolean };
+		/** One ordinary events-list poll; the CLI owns tail lifecycle controls. */
+		input: { limit?: number; action?: string; organizationId?: string };
 		output: { events: AuditEvent[]; nextCursor: string | null; scope: ResourceScope };
 	};
 	"events.inspect": {
@@ -294,7 +540,7 @@ export interface ManagementOperationTypes {
 	};
 	"sso.list": {
 		input: { organizationId?: string };
-		output: { connections: PublicIdentityConnection[]; scope: ResourceScope };
+		output: { connections: PublicSsoIdentityConnection[]; scope: ResourceScope };
 	};
 	"sso.create": {
 		input: {
@@ -307,36 +553,36 @@ export interface ManagementOperationTypes {
 			samlEntryPoint?: string;
 			samlCertificate?: string;
 		};
-		output: { connection: PublicIdentityConnection };
+		output: { connection: PublicSsoIdentityConnection };
 	};
 	"sso.configure": {
 		input: { id: string; issuer?: string; audience?: string; domain?: string; domains?: string[]; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
+			| { connection: PublicSsoIdentityConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoIdentityConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
 	};
 	"sso.test": {
 		input: { id: string; fixture?: string; live?: boolean };
 		output:
-			| Awaited<ReturnType<typeof testSsoConnection>>
-			| Awaited<ReturnType<typeof testSsoConnectionReal>>
-			| Awaited<ReturnType<typeof testSsoConnectionLive>>;
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnection>>, PublicSsoIdentityConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionReal>>, PublicSsoIdentityConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionLive>>, PublicSsoIdentityConnection>;
 	};
 	"sso.setupLink.create": {
 		input: { organizationId: string };
-		output: ReturnType<typeof createSetupLink> & { scope: ResourceScope };
+		output: SetupLinkWire;
 	};
 	"sso.rotate": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; wouldChange: true; scope: ResourceScope };
+			| { connection: PublicSsoIdentityConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoIdentityConnection; wouldChange: true; scope: ResourceScope };
 	};
 	"sso.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; wouldChange: boolean; scope: ResourceScope };
+			| { connection: PublicSsoIdentityConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoIdentityConnection; wouldChange: boolean; scope: ResourceScope };
 	};
 	"scim.list": {
 		input: { organizationId?: string };
@@ -344,18 +590,31 @@ export interface ManagementOperationTypes {
 	};
 	"scim.create": {
 		input: { organizationId: string; provider: string; endpoint?: string };
-		output: { connection: PublicDirectoryConnection & { bearerTokenOnce?: string } };
+		output:
+			| { connection: PublicDirectoryConnection & { bearerTokenOnce: string } }
+			| {
+					connection: PublicDirectoryConnection;
+					oneTimeSecretsOmitted: ["connection.bearerTokenOnce"];
+			  };
 	};
 	"scim.test": {
-		input: { id: string; fixture?: string; live?: boolean; dryRun?: boolean };
+		input: {
+			id: string;
+			fixture?: string;
+		live?: boolean;
+		dryRun?: boolean;
+		users?: Array<{ userName: string; displayName?: string; active?: boolean }>;
+			/** Closed, server-executed runtime conformance scenario. */
+			scenario?: "users" | "group-lifecycle";
+		};
 		output:
-			| Awaited<ReturnType<typeof testScimConnection>>
-			| Awaited<ReturnType<typeof testScimConnectionReal>>
-			| Awaited<ReturnType<typeof testScimConnectionLive>>;
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnection>>>
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnectionReal>>>
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnectionLive>>>;
 	};
 	"scim.setupLink.create": {
 		input: { organizationId: string };
-		output: ReturnType<typeof createSetupLink> & { scope: ResourceScope };
+		output: SetupLinkWire;
 	};
 	"scim.rotate": {
 		input: { id: string; dryRun?: boolean };
@@ -405,15 +664,15 @@ export interface ManagementOperationTypes {
 	};
 	"delivery.jobs.cancel": {
 		input: { id: string; dryRun?: boolean; confirm?: boolean };
-		output: DeliveryControlResult;
+		output: DeliveryControlWire<"cancel">;
 	};
 	"delivery.jobs.retry": {
 		input: { id: string; dryRun?: boolean; confirm?: boolean };
-		output: DeliveryControlResult;
+		output: DeliveryControlWire<"retry">;
 	};
 	"delivery.jobs.replay": {
 		input: { id: string; maxAttempts?: number; dryRun?: boolean; confirm?: boolean };
-		output: DeliveryControlResult;
+		output: DeliveryControlWire<"replay">;
 	};
 	"delivery.webhook_endpoints.list": {
 		input: {
@@ -430,7 +689,7 @@ export interface ManagementOperationTypes {
 	};
 	"delivery.webhook_endpoints.create": {
 		input: { name: string; url: string; eventKinds?: WebhookEventKind[] };
-		output: WebhookEndpointCreateResult;
+		output: WebhookEndpointCreateWire;
 	};
 	"delivery.webhook_endpoints.update": {
 		input: {
@@ -445,15 +704,15 @@ export interface ManagementOperationTypes {
 	};
 	"delivery.webhook_endpoints.rotate": {
 		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
-		output: WebhookEndpointControlResult;
+		output: WebhookEndpointRotateWire;
 	};
 	"delivery.webhook_endpoints.delete": {
 		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
-		output: WebhookEndpointControlResult;
+		output: WebhookEndpointDeleteWire;
 	};
 	"delivery.webhook_endpoints.test": {
 		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
-		output: WebhookEndpointControlResult;
+		output: WebhookEndpointTestWire;
 	};
 	"authentication_policy.get": {
 		input: { organizationId?: string };
@@ -532,7 +791,12 @@ export interface ManagementOperationTypes {
 		output: { backup: BackupRecord };
 	};
 	"backups.restore": {
-		input: { id: string; target?: string; confirm?: boolean };
+		input: {
+			id: string;
+			/** Isolated Postgres database name; JSON-store restore destinations are server-managed. */
+			target?: `clearance_restore_${string}`;
+			confirm?: boolean;
+		};
 		output:
 			| Awaited<ReturnType<typeof restoreBackup>>
 			| Awaited<ReturnType<typeof restorePostgresBackup>>;
@@ -545,15 +809,15 @@ export interface ManagementOperationTypes {
 	};
 	"upgrades.plan": {
 		input: { target: string; dir: string; current?: string; dryRun?: boolean };
-		output: Awaited<ReturnType<typeof planUpgrade>>;
+		output: UpgradePlanWire;
 	};
 	"upgrades.apply": {
 		input: { plan: string; dir: string; dryRun?: boolean; confirm?: boolean };
-		output: Awaited<ReturnType<typeof applyUpgrade>>;
+		output: UpgradeApplyWire;
 	};
 	"upgrades.verify": {
 		input: { plan: string; dir: string; healthUrl?: string; dryRun?: boolean };
-		output: Awaited<ReturnType<typeof verifyUpgrade>>;
+		output: UpgradeVerifyWire;
 	};
 	"upgrades.rollback": {
 		input: {
@@ -565,7 +829,7 @@ export interface ManagementOperationTypes {
 			activeDatabaseConfirmation?: string;
 			backupDir?: string;
 		};
-		output: Awaited<ReturnType<typeof rollbackUpgrade>>;
+		output: UpgradeRollbackWire;
 	};
 	"schema.status": {
 		input: Record<string, never>;
@@ -580,11 +844,11 @@ export interface ManagementOperationTypes {
 	};
 	"schema.migrate": {
 		input: { dryRun?: boolean; confirm?: boolean };
-		output: Awaited<ReturnType<typeof migrateRuntimeSchema>>;
+		output: RuntimeSchemaMigrateWire;
 	};
 	"schema.credential-authority.status": {
 		input: Record<string, never>;
-		output: Awaited<ReturnType<typeof getCredentialAuthorityStatus>>;
+		output: CredentialAuthorityStatusWire;
 	};
 	"schema.credential-authority.arm": {
 		input: {
@@ -592,11 +856,11 @@ export interface ManagementOperationTypes {
 			expectedRuntimeCount: number;
 			confirm?: boolean;
 		};
-		output: Awaited<ReturnType<typeof armCredentialAuthority>>;
+		output: CredentialAuthorityStatusWire;
 	};
 	"schema.credential-authority.drain": {
 		input: { deploymentId: string; drainId: string; confirm?: boolean };
-		output: Awaited<ReturnType<typeof drainCredentialAuthority>>;
+		output: CredentialAuthorityStatusWire;
 	};
 	"key_management.status": {
 		input: Record<string, never>;
@@ -612,47 +876,49 @@ export interface ManagementOperationTypes {
 	};
 	"schema.store-v2.status": {
 		input: Record<string, never>;
-		output: Awaited<ReturnType<typeof getStoreV2Status>>;
+		output: StoreV2StatusWire<"schema.store-v2.status">;
 	};
 	"schema.store-v2.plan": {
 		input: Record<string, never>;
-		output: Awaited<ReturnType<typeof planStoreV2>>;
+		output: StoreV2PlanWire<"schema.store-v2.plan">;
 	};
 	"schema.store-v2.apply": {
 		input: { dryRun?: boolean; confirm?: boolean };
-		output: Awaited<ReturnType<typeof applyStoreV2>>;
+		output:
+			| StoreV2PlanWire<"schema.store-v2.apply">
+			| StoreV2StatusWire<"schema.store-v2.apply">;
 	};
 	"schema.store-v2.verify": {
 		input: Record<string, never>;
-		output: Awaited<ReturnType<typeof verifyStoreV2>>;
+		output: StoreV2StatusWire<"schema.store-v2.verify">;
 	};
 	"schema.store-v2.rollback": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof rollbackStoreV2>>;
+		output: StoreV2StatusWire<"schema.store-v2.rollback">;
 	};
 	"schema.store-v2.events.cutover": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof cutoverStoreV2Events>>;
+		output: StoreV2StatusWire<"schema.store-v2.events.cutover">;
 	};
 	"schema.store-v2.events.rollback": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof rollbackStoreV2Events>>;
+		output: StoreV2StatusWire<"schema.store-v2.events.rollback">;
 	};
 	"schema.store-v2.principals.cutover": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof cutoverStoreV2Principals>>;
+		output: StoreV2StatusWire<"schema.store-v2.principals.cutover">;
 	};
 	"schema.store-v2.principals.rollback": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof rollbackStoreV2Principals>>;
+		output: StoreV2StatusWire<"schema.store-v2.principals.rollback">;
 	};
 	"schema.store-v2.topology.cutover": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof cutoverStoreV2Topology>>;
+		output: StoreV2StatusWire<"schema.store-v2.topology.cutover">;
 	};
 	"schema.store-v2.topology.rollback": {
 		input: { confirm?: boolean };
-		output: Awaited<ReturnType<typeof rollbackStoreV2Topology>>;
+		output: StoreV2StatusWire<"schema.store-v2.topology.rollback">;
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
@@ -670,11 +936,22 @@ export interface ManagementOperationTypes {
 	};
 	"users.update": {
 		input: { id: string; email?: string; name?: string; status?: string; dryRun?: boolean };
-		output: { user: Principal } | { dryRun: true; id: string };
+		output:
+			| { user: Principal; scope: ResourceScope }
+			| {
+					dryRun: true;
+					id: string;
+					email?: string;
+					name?: string;
+					status?: "active" | "disabled";
+					scope: ResourceScope;
+			  };
 	};
 	"users.disable": {
 		input: { id: string; dryRun?: boolean };
-		output: { user: Principal } | { dryRun: true; id: string };
+		output:
+			| { user: Principal; scope: ResourceScope }
+			| { dryRun: true; user: Principal; scope: ResourceScope };
 	};
 	"users.delete": {
 		input: { id: string };
@@ -682,7 +959,7 @@ export interface ManagementOperationTypes {
 	};
 	"users.export": {
 		input: { format?: "json" | "jsonl"; limit?: number; status?: string };
-		output: { users: Principal[]; scope: ResourceScope };
+		output: Omit<UsersExportEnvelope, "outputPath">;
 	};
 	"organizations.list": {
 		input: { limit?: number; cursor?: string };
@@ -732,7 +1009,7 @@ export interface ManagementOperationTypes {
 		input: { organizationId: string; content: string; format: "json" | "csv"; dryRun?: boolean; confirm?: boolean };
 		output:
 			| ({ dryRun: true; scope: ResourceScope } & MemberImportPlan)
-			| (MemberImportResult & { scope: ResourceScope });
+			| (MemberImportWireResult & { scope: ResourceScope });
 	};
 	"authorization.effective.inspect": {
 		input: {
@@ -879,6 +1156,13 @@ export interface ManagementOperationTypes {
 			  };
 	};
 }
+
+export type ManagementOperationTypes = {
+	[Id in keyof ManagementOperationServiceTypes]: {
+		input: ManagementOperationServiceTypes[Id]["input"];
+		output: ManagementJsonWire<ManagementOperationServiceTypes[Id]["output"]>;
+	};
+};
 
 export type ManagementOperationId = keyof ManagementOperationTypes;
 export type OperationInput<Id extends ManagementOperationId> =
@@ -1709,7 +1993,7 @@ export const SCHEMA_OPERATIONS = Object.freeze({
 		cliPath: "schema generate",
 		http: { method: "POST", path: "/v1/schema/generate" },
 		mutation: false,
-		supportsDryRun: true,
+		supportsDryRun: false,
 		confirmation: "none",
 	}),
 	migrate: defineOperation({
