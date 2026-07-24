@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveApiSession, requestManagementApi, type ApiSession } from "./api-client.js";
+import {
+	callManagementOperation,
+	resolveApiSession,
+	type ApiSession,
+} from "./api-client.js";
 import { environmentToken, readSavedCredential } from "./operator-auth.js";
 
 vi.mock("./operator-auth.js", async (importOriginal) => {
@@ -19,6 +23,7 @@ const session: ApiSession = {
 };
 
 afterEach(() => {
+	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	vi.clearAllMocks();
 });
@@ -82,43 +87,91 @@ describe("management API client contract", () => {
 		});
 	});
 
-	it("routes reads through the versioned API with bearer auth and no caller-controlled scope", async () => {
-		const fetchMock = vi.fn(async () => new Response(JSON.stringify({ users: [] }), { status: 200 }));
+	it("uses generated transport and unwraps typed management response data", async () => {
+		const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+			users: [],
+			nextCursor: null,
+			scope: { projectId: "prj_1", environmentId: "env_1" },
+		}), { status: 200 }));
 		vi.stubGlobal("fetch", fetchMock);
-		await requestManagementApi(session, { path: "/v1/users" });
+		await expect(callManagementOperation(session, "users.list", { limit: 10 })).resolves.toEqual({
+			users: [],
+			nextCursor: null,
+			scope: { projectId: "prj_1", environmentId: "env_1" },
+		});
 		const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-		expect(url).toBe("https://api.clearance.test/v1/users");
-		expect(init.method).toBe("GET");
-		expect(init.headers).toMatchObject({ authorization: `Bearer ${session.token}` });
-		expect(init.headers).not.toHaveProperty("x-clearance-project-id");
-		expect(init.headers).not.toHaveProperty("x-clearance-environment-id");
+		expect(url).toBe("https://api.clearance.test/v1/users?limit=10");
+		expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${session.token}`);
+		expect(new Headers(init.headers).has("x-clearance-project-id")).toBe(false);
+		expect(new Headers(init.headers).has("x-clearance-environment-id")).toBe(false);
 	});
 
-	it("sends mutations with JSON and a unique idempotency contract", async () => {
-		const fetchMock = vi.fn(async () => new Response(JSON.stringify({ user: { id: "usr_1" } }), { status: 201 }));
+	it("delegates mutation JSON and idempotency authority to the generated transport", async () => {
+		const fetchMock = vi.fn(async () => Response.json({
+			dryRun: true,
+			project: { name: "Preview", slug: "preview" },
+		}));
 		vi.stubGlobal("fetch", fetchMock);
-		await requestManagementApi(session, {
-			method: "POST",
-			path: "/v1/users",
-			body: { email: "beta@example.com", name: "Beta" },
-			idempotencyKey: "cli-test-idempotency-key",
-		});
+		await callManagementOperation(
+			session,
+			"projects.create",
+			{ name: "Preview", dryRun: true },
+			{ idempotencyKey: "cli-test-idempotency-key" },
+		);
 		const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-		expect(init.headers).toMatchObject({
-			authorization: `Bearer ${session.token}`,
-			"content-type": "application/json",
-			"idempotency-key": "cli-test-idempotency-key",
-		});
-		expect(JSON.parse(String(init.body))).toEqual({ email: "beta@example.com", name: "Beta" });
+		const headers = new Headers(init.headers);
+		expect(headers.get("authorization")).toBe(`Bearer ${session.token}`);
+		expect(headers.get("content-type")).toBe("application/json");
+		expect(headers.get("idempotency-key")).toBe("cli-test-idempotency-key");
+		expect(JSON.parse(String(init.body))).toEqual({ name: "Preview", dryRun: true });
 	});
 
-	it("preserves structured API errors without reflecting the credential", async () => {
-		vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-			error: { code: "SCOPE_MISMATCH", message: "Resource is outside the principal scope.", stage: "users.list", retryable: false },
-		}), { status: 404 })));
-		await expect(requestManagementApi(session, { path: "/v1/users" })).rejects.toMatchObject({
+	it("maps generated API failures to the CLI error shape without losing remote detail", async () => {
+		vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: {
+			code: "SCOPE_MISMATCH",
+			message: "Resource is outside the principal scope.",
+			stage: "users.list",
+			remediation: "Select the intended environment.",
+			retryable: false,
+		} }), { status: 404 })));
+		await expect(callManagementOperation(session, "users.list", {})).rejects.toMatchObject({
 			code: "SCOPE_MISMATCH",
 			stage: "users.list",
+			remediation: "Select the intended environment.",
+			status: 404,
 		});
+	});
+
+	it("maps generated transport aborts to the CLI unreachable contract", async () => {
+		const controller = new AbortController();
+		vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+			await new Promise<void>((_resolve, reject) => {
+				if (init.signal?.aborted) {
+					reject(new DOMException("Aborted", "AbortError"));
+					return;
+				}
+				init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+			});
+			throw new Error("unreachable");
+		}));
+		const pending = callManagementOperation(session, "users.list", {}, { signal: controller.signal });
+		controller.abort();
+		await expect(pending).rejects.toMatchObject({
+			code: "CLI_API_UNREACHABLE",
+		});
+	});
+
+	it("enforces the CLI's 15-second transport deadline", async () => {
+		vi.useFakeTimers();
+		vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+			await new Promise<void>((_resolve, reject) => {
+				init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+			});
+			throw new Error("unreachable");
+		}));
+		const pending = callManagementOperation(session, "users.list", {});
+		const rejection = expect(pending).rejects.toMatchObject({ code: "CLI_API_TIMEOUT" });
+		await vi.advanceTimersByTimeAsync(15_000);
+		await rejection;
 	});
 });
