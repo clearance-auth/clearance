@@ -2587,14 +2587,17 @@ export function createClearanceAuthWithTenantProductAdministration<
 					}
 				migratedJwks += 1;
 			}
-			if (setupOnly && tables.ssoProvider) {
-				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[0]);
-			}
-			if (setupOnly && tables.scimProvider) {
-				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[1]);
-			}
-			if (setupOnly && tables.jwks) {
-				await installKeyManagementTrigger(client, KEY_MANAGEMENT_TRIGGER_DEFINITIONS[2]);
+			if (setupOnly) {
+				const triggerTables = {
+					'"ssoProvider"': tables.ssoProvider,
+					'"scimProvider"': tables.scimProvider,
+					jwks: tables.jwks,
+				};
+				for (const definition of KEY_MANAGEMENT_TRIGGER_DEFINITIONS) {
+					if (triggerTables[definition.table]) {
+						await installKeyManagementTrigger(client, definition);
+					}
+				}
 			}
 			if (ownedClient) await client.query("COMMIT");
 		} catch (error) {

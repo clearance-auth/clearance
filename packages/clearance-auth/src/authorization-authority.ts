@@ -812,7 +812,8 @@ function assertTriggers(actual: readonly TriggerRow[], names: Names, expected: r
 	const rollbackFences = actual.filter((row) => row.trigger_name === "clearance_import_rollback_guard_v1");
 	if (rollbackFences.length > 1) throw error("Authorization rollback fence trigger is incompatible");
 	if (rollbackFences.length === 1) {
-		const [rollbackFence] = rollbackFences;
+		const rollbackFence = rollbackFences[0];
+		if (rollbackFence === undefined) throw error("Authorization rollback fence trigger is incompatible");
 		const definition = normalize(rollbackFence.definition);
 		const expectedArguments = "('organization', 'organizationId', '', '', 'principal', 'subjectId', 'subjectKind', 'principal')";
 		if (
