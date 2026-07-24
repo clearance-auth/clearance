@@ -1,20 +1,18 @@
 import {
 	API_KEY_OPERATIONS,
 	AUTHORIZATION_OPERATIONS,
-	resolveOperationPath,
 	ROLE_OPERATIONS,
 	SESSION_OPERATIONS,
 	SERVICE_ACCOUNT_OPERATIONS,
 } from "@clearance/management";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import {
 	body,
 	type CliPathOf,
 	type DispatchInput,
 	error,
 	firstStringArgument,
-	previewConfirmation,
-	query,
+	managementCallOptions,
 	requireConfirmation,
 } from "./shared.js";
 
@@ -83,185 +81,177 @@ export async function dispatchAccessCommand({
 	const rawId = firstStringArgument(args);
 	switch (path) {
 		case API_KEY_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: API_KEY_OPERATIONS.list.http.method,
-				path: query(API_KEY_OPERATIONS.list.http.path, { includeRevoked: opts.includeRevoked }),
-			});
+			return callManagementOperation(session, "keys.list", body({
+				includeRevoked: opts.includeRevoked,
+			}));
 		case API_KEY_OPERATIONS.create.cliPath:
-			return requestManagementApi(session, {
-				method: API_KEY_OPERATIONS.create.http.method,
-				path: API_KEY_OPERATIONS.create.http.path,
-					body: {
-						name: opts.name,
-						scopes: opts.scope,
-						expiresAt: opts.expiresAt,
-						dryRun: global.dryRun,
-					},
-			});
+			return callManagementOperation(session, "keys.create", body({
+				name: opts.name,
+				scopes: opts.scope,
+				expiresAt: opts.expiresAt,
+				dryRun: global.dryRun,
+			}) as { name: string; scopes?: string[]; expiresAt?: string; dryRun?: boolean }, managementCallOptions(global));
 		case API_KEY_OPERATIONS.rotate.cliPath:
 			requireConfirmation(global, "API_KEY_CONFIRMATION_REQUIRED", "API key rotation");
-			return requestManagementApi(session, {
-				method: API_KEY_OPERATIONS.rotate.http.method,
-				path: resolveOperationPath(API_KEY_OPERATIONS.rotate, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "keys.rotate", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case API_KEY_OPERATIONS.revoke.cliPath:
 			requireConfirmation(global, "API_KEY_CONFIRMATION_REQUIRED", "API key revocation");
-			return requestManagementApi(session, {
-				method: API_KEY_OPERATIONS.revoke.http.method,
-				path: resolveOperationPath(API_KEY_OPERATIONS.revoke, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "keys.revoke", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SESSION_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: SESSION_OPERATIONS.list.http.method,
-				path: query(SESSION_OPERATIONS.list.http.path, { limit: opts.limit, cursor: opts.cursor }),
-			});
+			return callManagementOperation(session, "sessions.list", body({
+				limit: opts.limit === undefined ? undefined : Number(opts.limit),
+				cursor: opts.cursor,
+			}));
 		case SESSION_OPERATIONS.revoke.cliPath:
 			requireConfirmation(global, "SESSION_CONFIRM_REQUIRED", "Session revocation");
-			return requestManagementApi(session, {
-				method: SESSION_OPERATIONS.revoke.http.method,
-				path: resolveOperationPath(SESSION_OPERATIONS.revoke, { id: rawId }),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "sessions.revoke", {
+				id: rawId,
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case ROLE_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: ROLE_OPERATIONS.list.http.method,
-				path: ROLE_OPERATIONS.list.http.path,
-			});
+			return callManagementOperation(session, "roles.list", {});
 		case ROLE_OPERATIONS.validate.cliPath:
-			return requestManagementApi(session, {
-				method: ROLE_OPERATIONS.validate.http.method,
-				path: ROLE_OPERATIONS.validate.http.path,
-				body: body({ name: opts.name, slug: opts.slug, permissions: opts.permission }),
-			});
+			return callManagementOperation(session, "roles.validate", body({
+				name: opts.name,
+				slug: opts.slug,
+				permissions: opts.permission,
+			}) as { name?: string; slug?: string; permissions?: string[] });
 		case ROLE_OPERATIONS.create.cliPath:
-			return requestManagementApi(session, {
-				method: ROLE_OPERATIONS.create.http.method,
-				path: ROLE_OPERATIONS.create.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"roles.create",
+				body({
 					name: opts.name,
 					slug: opts.slug,
 					description: opts.description,
 					permissions: opts.permission,
 					dryRun: global.dryRun,
-				}),
-			});
+				}) as { name: string; slug?: string; description?: string; permissions: string[]; dryRun?: boolean },
+				managementCallOptions(global),
+			);
 		case ROLE_OPERATIONS.update.cliPath:
-			return requestManagementApi(session, {
-				method: ROLE_OPERATIONS.update.http.method,
-				path: resolveOperationPath(ROLE_OPERATIONS.update, { id: rawId }),
-				body: body({
+			return callManagementOperation(
+				session,
+				"roles.update",
+				body({
+					id: rawId,
 					name: opts.name,
 					description: opts.description,
 					permissions: opts.permission,
 					dryRun: global.dryRun,
-				}),
-			});
+				}) as { id: string; name?: string; description?: string; permissions?: string[]; dryRun?: boolean },
+				managementCallOptions(global),
+			);
 		case AUTHORIZATION_OPERATIONS.effectiveInspect.cliPath: {
 			const subjectKind = authorizationSubjectKind(opts.subjectKind);
-			return requestManagementApi(session, {
-				method: AUTHORIZATION_OPERATIONS.effectiveInspect.http.method,
-				path: resolveOperationPath(AUTHORIZATION_OPERATIONS.effectiveInspect, {
-					id: String(opts.org),
-					subjectKind,
-					subjectId: String(opts.subject),
-				}),
+			return callManagementOperation(session, "authorization.effective.inspect", {
+				organizationId: String(opts.org),
+				subjectKind,
+				subjectId: String(opts.subject),
 			});
 		}
 		case AUTHORIZATION_OPERATIONS.assignmentsList.cliPath: {
 			const filter = assignmentFilter(opts);
-			return requestManagementApi(session, {
-				method: AUTHORIZATION_OPERATIONS.assignmentsList.http.method,
-				path: query(
-					resolveOperationPath(AUTHORIZATION_OPERATIONS.assignmentsList, { id: String(opts.org) }),
-					filter,
-				),
+			return callManagementOperation(session, "authorization.assignments.list", {
+				organizationId: String(opts.org),
+				...filter,
 			});
 		}
 		case AUTHORIZATION_OPERATIONS.assignmentsReplace.cliPath: {
 			const subjectKind = authorizationSubjectKind(opts.subjectKind);
 			const expectedRevision = optionalExpectedRevision(opts.expectedRevision);
-			return requestManagementApi(session, {
-				method: AUTHORIZATION_OPERATIONS.assignmentsReplace.http.method,
-				path: resolveOperationPath(AUTHORIZATION_OPERATIONS.assignmentsReplace, {
-					id: String(opts.org),
+			return callManagementOperation(
+				session,
+				"authorization.assignments.replace",
+				body({
+					organizationId: String(opts.org),
 					subjectKind,
 					subjectId: String(opts.subject),
-				}),
-				body: body({
 					roleIds: sortedRoleIds(opts.role),
 					expectedRevision,
-					...previewConfirmation(global),
-				}),
-			});
+					dryRun: global.dryRun || !global.yes,
+				}) as {
+					organizationId: string;
+					subjectKind: AuthorizationSubjectKind;
+					subjectId: string;
+					roleIds: string[];
+					expectedRevision?: string;
+					dryRun?: boolean;
+				},
+				managementCallOptions(global),
+			);
 		}
 		case AUTHORIZATION_OPERATIONS.reconcile.cliPath:
-			return requestManagementApi(session, {
-				method: AUTHORIZATION_OPERATIONS.reconcile.http.method,
-				path: resolveOperationPath(AUTHORIZATION_OPERATIONS.reconcile, { id: String(opts.org) }),
-				body: body(previewConfirmation(global)),
-			});
+			return callManagementOperation(session, "authorization.reconcile", {
+				organizationId: String(opts.org),
+				dryRun: global.dryRun || !global.yes,
+			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.list.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.list, { id: String(opts.org) }),
+			return callManagementOperation(session, "service-accounts.list", {
+				organizationId: String(opts.org),
 			});
 		case SERVICE_ACCOUNT_OPERATIONS.inspect.cliPath:
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.inspect.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.inspect, {
-					id: String(opts.org), accountId: rawId,
-				}),
+			return callManagementOperation(session, "service-accounts.inspect", {
+				organizationId: String(opts.org),
+				accountId: rawId,
 			});
 		case SERVICE_ACCOUNT_OPERATIONS.create.cliPath:
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.create.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.create, { id: String(opts.org) }),
-				body: body({ name: opts.name, roleIds: sortedRoleIds(opts.role), dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "service-accounts.create", {
+				organizationId: String(opts.org),
+				name: String(opts.name),
+				roleIds: sortedRoleIds(opts.role),
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.disable.cliPath:
 			requireConfirmation(global, "SERVICE_ACCOUNT_DISABLE_CONFIRMATION_REQUIRED", "Service-account disablement");
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.disable.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.disable, {
-					id: String(opts.org), accountId: rawId,
-				}),
-				body: { status: "disabled", dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "service-accounts.disable", {
+				organizationId: String(opts.org),
+				accountId: rawId,
+				status: "disabled",
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.enable.cliPath:
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.enable.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.enable, {
-					id: String(opts.org), accountId: rawId,
-				}),
-				body: { status: "active", dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "service-accounts.enable", {
+				organizationId: String(opts.org),
+				accountId: rawId,
+				status: "active",
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.credentialCreate.cliPath:
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.credentialCreate.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.credentialCreate, {
-					id: String(opts.org), accountId: rawId,
-				}),
-				body: body({ expiresAt: opts.expiresAt, dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "service-accounts.credentials.create", body({
+				organizationId: String(opts.org),
+				accountId: rawId,
+				expiresAt: opts.expiresAt,
+				dryRun: global.dryRun,
+			}) as { organizationId: string; accountId: string; expiresAt?: string; dryRun?: boolean }, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.credentialRotate.cliPath:
 			requireConfirmation(global, "SERVICE_ACCOUNT_CREDENTIAL_ROTATE_CONFIRMATION_REQUIRED", "Service-account credential rotation");
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.credentialRotate.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.credentialRotate, {
-					id: String(opts.org), accountId: rawId, credentialId: argumentAt(args, 1),
-				}),
-				body: body({ expiresAt: opts.expiresAt, dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "service-accounts.credentials.rotate", body({
+				organizationId: String(opts.org),
+				accountId: rawId,
+				credentialId: argumentAt(args, 1),
+				expiresAt: opts.expiresAt,
+				dryRun: global.dryRun,
+			}) as {
+				organizationId: string;
+				accountId: string;
+				credentialId: string;
+				expiresAt?: string;
+				dryRun?: boolean;
+			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.cliPath:
 			requireConfirmation(global, "SERVICE_ACCOUNT_CREDENTIAL_REVOKE_CONFIRMATION_REQUIRED", "Service-account credential revocation");
-			return requestManagementApi(session, {
-				method: SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.http.method,
-				path: resolveOperationPath(SERVICE_ACCOUNT_OPERATIONS.credentialRevoke, {
-					id: String(opts.org), accountId: rawId, credentialId: argumentAt(args, 1),
-				}),
-				body: { dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "service-accounts.credentials.revoke", {
+				organizationId: String(opts.org),
+				accountId: rawId,
+				credentialId: argumentAt(args, 1),
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 	}
 }
