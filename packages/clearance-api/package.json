@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@clearance/management": "workspace:*",
-    "hono": "^4.12.30"
+    "hono": "^4.12.34"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
