@@ -168,9 +168,9 @@
     "@opentelemetry/sdk-trace-node": "^1.30.0",
     "@clearance/call": "workspace:^",
     "@cloudflare/workers-types": "^4.20250121.0",
-    "jose": "^6.1.3",
+    "jose": "^6.2.7",
     "kysely": "catalog:",
-    "nanostores": "^1.1.1",
+    "nanostores": "^1.4.2",
     "tsdown": "catalog:"
   },
   "peerDependencies": {
