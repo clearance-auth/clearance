@@ -65,6 +65,29 @@ function getCookieValue(entry: string): string {
 	return eq > 0 ? firstSegment.slice(eq + 1) : "";
 }
 
+function createInMemoryRunExclusive() {
+	const leases = new Map<string, Promise<void>>();
+	return async <T>(
+		name: string,
+		operation: () => T | Promise<T>,
+	): Promise<T> => {
+		const previous = leases.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const next = previous.catch(() => {}).then(() => current);
+		leases.set(name, next);
+		await previous.catch(() => {});
+		try {
+			return await operation();
+		} finally {
+			release();
+			if (leases.get(name) === next) leases.delete(name);
+		}
+	};
+}
+
 describe("two-factor security: sign-in does not leak session cookies (cookieCache enabled)", async () => {
 	const TEST_USERNAME = "security_user";
 	const TEST_PHONE = "+15551230000";
@@ -632,6 +655,7 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 	it("fails closed before proof or trust mutation with secondary-authoritative sessions", async () => {
 		let otp = "";
 		const store = new Map<string, string>();
+		const runExclusive = createInMemoryRunExclusive();
 		let secondaryWrites = 0;
 		const secondaryStorage = {
 			async get(key: string) {
@@ -650,6 +674,7 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 				store.delete(key);
 				return value;
 			},
+			runExclusive,
 		};
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
 			secret: DEFAULT_SECRET,
@@ -740,6 +765,7 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 	it("refuses trusted-device bypass when secondary consume is process-local", async () => {
 		let otp = "";
 		const store = new Map<string, string>();
+		const runExclusive = createInMemoryRunExclusive();
 		const secondaryStorage = {
 			async get(key: string) {
 				return store.get(key) ?? null;
@@ -750,6 +776,12 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 			async delete(key: string) {
 				store.delete(key);
 			},
+			async getAndDelete(key: string) {
+				const value = store.get(key) ?? null;
+				store.delete(key);
+				return value;
+			},
+			runExclusive,
 		};
 		const { auth, signInWithTestUser, testUser } = await getTestInstance({
 			secret: DEFAULT_SECRET,
@@ -785,6 +817,10 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 		const trustCookie = parseSetCookieHeader(
 			trusted.headers.get("Set-Cookie") || "",
 		).get("clearance.trust_device")?.value;
+		// The proof is created through a provider that supports atomic challenge
+		// consumption. Simulate that guarantee becoming unavailable before the
+		// next sign-in: trusted-device bypass must then fail closed.
+		Reflect.deleteProperty(secondaryStorage, "getAndDelete");
 		const attemptedBypass = await auth.api.signInEmail({
 			body: { email: testUser.email, password: testUser.password },
 			headers: new Headers({
@@ -939,11 +975,11 @@ describe("two-factor security: OTP attempts are atomic under concurrency", async
 	// whose writes are instant. Without an atomic consume gate, every concurrent
 	// verification finishes its slow read of the same counter before any write
 	// lands, so they would all pass the budget check against a stale value. The
-	// fix consumes the row under a per-key lock, so the slow reads serialize and
-	// the budget holds. `getAndDelete` is intentionally absent so the consume
-	// path exercises that lock rather than a single storage primitive.
+	// provider-level consume operation, so every verification observes a
+	// single-use credential instead of a stale counter snapshot.
 	const store = new Map<string, { value: string; expiresAt: number }>();
 	const isOtpRow = (key: string) => key.includes("2fa-otp");
+	const runExclusive = createInMemoryRunExclusive();
 	const secondaryStorage = {
 		async get(key: string) {
 			if (isOtpRow(key)) {
@@ -966,6 +1002,13 @@ describe("two-factor security: OTP attempts are atomic under concurrency", async
 		async delete(key: string) {
 			store.delete(key);
 		},
+		async getAndDelete(key: string) {
+			const entry = store.get(key);
+			store.delete(key);
+			if (!entry || entry.expiresAt < Date.now()) return null;
+			return entry.value;
+		},
+		runExclusive,
 	};
 
 	const { auth, signInWithTestUser, testUser, db } = await getTestInstance({

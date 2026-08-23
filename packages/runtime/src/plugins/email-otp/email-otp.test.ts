@@ -30,6 +30,26 @@ async function managedEmailOTPTestRuntime(
 ) {
 	const database = new DatabaseSync(":memory:");
 	const secondaryStore = new Map<string, string>();
+	const secondaryLeases = new Map<string, Promise<void>>();
+	const runSecondaryExclusive = async <T>(
+		name: string,
+		operation: () => T | Promise<T>,
+	): Promise<T> => {
+		const previous = secondaryLeases.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const next = previous.catch(() => {}).then(() => current);
+		secondaryLeases.set(name, next);
+		await previous.catch(() => {});
+		try {
+			return await operation();
+		} finally {
+			release();
+			if (secondaryLeases.get(name) === next) secondaryLeases.delete(name);
+		}
+	};
 	let otp = "";
 	const identity = {
 		projectId: "email-otp-policy-project",
@@ -60,6 +80,7 @@ async function managedEmailOTPTestRuntime(
 						delete: async (key: string) => {
 							secondaryStore.delete(key);
 						},
+						runExclusive: runSecondaryExclusive,
 					},
 				}
 			: {}),
