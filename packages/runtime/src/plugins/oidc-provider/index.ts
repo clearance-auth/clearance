@@ -1002,8 +1002,8 @@ export async function createOAuthTokenPair(
 			`INSERT INTO ${quotedModel} (
 				id, "accessToken", "refreshToken", "accessTokenExpiresAt",
 				"refreshTokenExpiresAt", "clientId", "userId", scopes,
-				"sessionDerivativeAuthority", "organizationId", "createdAt", "updatedAt"
-			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+				"createdAt", "updatedAt"
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
 			 RETURNING *`,
 			[
 				id,
@@ -1014,8 +1014,6 @@ export async function createOAuthTokenPair(
 				input.clientId,
 				input.userId,
 				input.scopes,
-				input.sessionDerivativeAuthority ?? null,
-				input.organizationId ?? null,
 				now,
 			],
 		);
