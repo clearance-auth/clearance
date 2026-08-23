@@ -316,6 +316,7 @@ class DeliveryStopTimeoutError extends Error {
 function settleBeforeDeadline<T>(
 	operation: () => T | Promise<T>,
 	deadline: number,
+	timeoutError: () => Error = () => new DeliveryStopTimeoutError(),
 ): Promise<T> {
 	const pending = Promise.resolve().then(operation);
 	// The deadline race owns the outcome; retain the late rejection so a hung
@@ -326,7 +327,7 @@ function settleBeforeDeadline<T>(
 		const timeout = setTimeout(() => {
 			if (settled) return;
 			settled = true;
-			reject(new DeliveryStopTimeoutError());
+			reject(timeoutError());
 		}, Math.max(0, deadline - Date.now()));
 		pending.then(
 			(value) => {
@@ -822,35 +823,51 @@ export class DeliveryWorker {
 		const recordError = (error: unknown) => {
 			firstError ??= error;
 		};
-		const runCleanup = async (operation: () => unknown | Promise<unknown>) => {
-			try {
-				await settleBeforeDeadline(operation, deadline);
-			} catch (error) {
-				recordError(error);
-			}
-		};
 		try {
-			await settleBeforeDeadline(() => this.drain(deadline), deadline);
+			await settleBeforeDeadline(
+				() => this.drain(deadline),
+				deadline,
+				() => new DeliveryDrainTimeoutError(this.inFlight.size),
+			);
 		} catch (error) {
 			recordError(error);
 		}
 		this.stopping = true;
 		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
 		if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
-		await runCleanup(() => this.writeHeartbeat("stopped"));
+		const cleanup = this.finishStop([...this.inFlight]);
+		// A timed-out stop returns at the absolute deadline while cleanup retains
+		// the live pool until transport cancellation and captured work settle.
+		void cleanup.catch(() => undefined);
 		try {
-			if (this.healthServer) {
-				await runCleanup(
-					() => new Promise<void>((resolve) => this.healthServer!.close(() => resolve())),
-				);
-			}
-			await runCleanup(() => this.sender.close());
-			await runCleanup(() => this.pool.end());
-		} finally {
-			await runCleanup(() => this.observability?.shutdown());
+			await settleBeforeDeadline(() => cleanup, deadline);
+		} catch (error) {
+			recordError(error);
 		}
+		if (firstError) throw firstError;
+	}
+
+	private async finishStop(capturedInFlight: readonly Promise<unknown>[]): Promise<void> {
+		let firstError: unknown;
+		const runCleanup = async (operation: () => unknown | Promise<unknown>) => {
+			try {
+				await operation();
+			} catch (error) {
+				firstError ??= error;
+			}
+		};
+		await runCleanup(() => this.sender.close());
+		await Promise.allSettled(capturedInFlight);
+		await runCleanup(() => this.writeHeartbeat("stopped"));
+		if (this.healthServer) {
+			await runCleanup(
+				() => new Promise<void>((resolve) => this.healthServer!.close(() => resolve())),
+			);
+		}
+		await runCleanup(() => this.pool.end());
+		await runCleanup(() => this.observability?.shutdown());
+		if (firstError) throw firstError;
 		this.stopped = true;
 		this.logger.log("info", "worker.stopped", { workerId: this.config.workerId });
-		if (firstError) throw firstError;
 	}
 }

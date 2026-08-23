@@ -7,6 +7,7 @@ import {
 	createDeliveryKeyring,
 	createDeliveryTransactionAdapter,
 	createWebhookEndpoint,
+	DeliveryStore,
 	deliveryTableNames,
 	enqueueDelivery,
 	enqueueWebhookEndpointTestInExistingTransaction,
@@ -118,9 +119,36 @@ function rawTransaction(client: pg.PoolClient): DeliveryRawTransaction {
 	};
 }
 
+function presentationTableNames(prefix: string) {
+	return {
+		senders: `${prefix}product_email_senders`,
+		templates: `${prefix}product_email_templates`,
+		domains: `${prefix}product_auth_domains`,
+		presentations: `${prefix}product_presentations`,
+	};
+}
+
+async function createPresentationAuthorityFixture(pool: pg.Pool, prefix: string): Promise<void> {
+	const names = presentationTableNames(prefix);
+	await pool.query(`CREATE TABLE ${quoteIdentifier("public")}.${quoteIdentifier(names.senders)} (
+		project_id text, environment_id text, display_name text, address text, domain text, version integer
+	)`);
+	await pool.query(`CREATE TABLE ${quoteIdentifier("public")}.${quoteIdentifier(names.templates)} (
+		project_id text, environment_id text, kind text, subject text, plain_text text, html text,
+		variables text[], version integer, content_hash text
+	)`);
+	await pool.query(`CREATE TABLE ${quoteIdentifier("public")}.${quoteIdentifier(names.domains)} (
+		project_id text, environment_id text, hostname text, state text
+	)`);
+	await pool.query(`CREATE TABLE ${quoteIdentifier("public")}.${quoteIdentifier(names.presentations)} (
+		project_id text, environment_id text, product_label text
+	)`);
+}
+
 describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	const suffix = `${process.pid}_${randomUUID().slice(0, 8).replace(/-/g, "")}_`;
 	const prefix = `delivery_worker_${suffix}`;
+	const managementPrefix = `dw_mgmt_${suffix}`;
 	const pool = new pg.Pool({ connectionString: DATABASE_URL });
 	const keyring = createDeliveryKeyring({
 		currentKeyId: "current",
@@ -137,8 +165,10 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	beforeAll(async () => {
 		await smtp.start();
 		await webhooks.start();
+		await createPresentationAuthorityFixture(pool, managementPrefix);
 		config = {
 			mode: "once", databaseUrl: DATABASE_URL, workerId: `test-worker-${suffix}`, keyring, schema: "public", prefix,
+			managementSchema: "public", managementPrefix,
 			smtp: { host: "127.0.0.1", port: smtp.port, secure: false, requireTls: false, allowInsecureLoopback: true, from: "support@example.test", connectionTimeoutMs: 2_000, socketTimeoutMs: 2_000, greetingTimeoutMs: 2_000 },
 			concurrency: 2, pollMs: 25, leaseMs: 5_000, heartbeatMs: 1_000, maintenanceMs: 1_000,
 			drainTimeoutMs: 5_000, maxBodyBytes: 1024 * 1024, appName: "Clearance Test",
@@ -162,6 +192,9 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`).catch(() => undefined);
 		}
 		await pool.query(`DROP FUNCTION IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(names.rejectMutationFunction)}()`).catch(() => undefined);
+		for (const name of Object.values(presentationTableNames(managementPrefix))) {
+			await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier("public")}.${quoteIdentifier(name)} CASCADE`).catch(() => undefined);
+		}
 		await pool.end();
 	});
 
@@ -653,8 +686,12 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 	it("closes resources even when graceful drain times out", async () => {
 		let release!: () => void;
 		let started!: () => void;
+		let stopped!: () => void;
 		let senderClosed = false;
 		const didStart = new Promise<void>((resolve) => { started = resolve; });
+		const didStop = new Promise<void>((resolve) => { stopped = resolve; });
+		const unhandledRejections: unknown[] = [];
+		const captureUnhandledRejection = (reason: unknown) => { unhandledRejections.push(reason); };
 		const sender: EmailSender = {
 			async verify() {},
 			async send() { started(); await new Promise<void>((resolve) => { release = resolve; }); return { status: "250" }; },
@@ -664,16 +701,35 @@ describe.skipIf(!available)("delivery worker with Postgres and SMTP", () => {
 		const healthPort = await unusedPort();
 		const worker = new DeliveryWorker({
 			...config, workerId: `drain-timeout-${suffix}`, drainTimeoutMs: 25, healthPort,
-		}, { pool: workerPool, sender });
-		await worker.initialize();
-		await worker.startHealthServer();
-		await enqueue("event-drain-timeout", "job-drain-timeout", "source-drain-timeout", templatePayload("drain-timeout-secret"));
-		const processing = worker.processOnce(1);
-		await didStart;
-		await expect(worker.stop()).rejects.toBeInstanceOf(DeliveryDrainTimeoutError);
-		expect(senderClosed).toBe(true);
-		await processing;
-		await expect(fetch(`http://127.0.0.1:${healthPort}/live`)).rejects.toThrow();
-		await expect(workerPool.query("SELECT 1")).rejects.toThrow();
+		}, {
+			pool: workerPool,
+			sender,
+			logger: { log(_level, event) { if (event === "worker.stopped") stopped(); } },
+		});
+		process.on("unhandledRejection", captureUnhandledRejection);
+		try {
+			await worker.initialize();
+			await worker.startHealthServer();
+			await enqueue("event-drain-timeout", "job-drain-timeout", "source-drain-timeout", templatePayload("drain-timeout-secret"));
+			const processing = worker.processOnce(1);
+			await didStart;
+			await expect(worker.stop()).rejects.toBeInstanceOf(DeliveryDrainTimeoutError);
+			expect(senderClosed).toBe(true);
+			await processing;
+			await didStop;
+			const verifier = new DeliveryStore(pool, { schema: "public", prefix });
+			expect((await verifier.inspectJob("job-drain-timeout"))?.state).toBe("delivered");
+			expect(await verifier.reclaimExpired(new Date(Date.now() + 10_000))).toBe(0);
+			expect(await verifier.claimNext({
+				workerId: `timeout-reclaim-proof-${suffix}`,
+				now: new Date(Date.now() + 10_000),
+			})).toBeNull();
+			await expect(fetch(`http://127.0.0.1:${healthPort}/live`)).rejects.toThrow();
+			await expect(workerPool.query("SELECT 1")).rejects.toThrow();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", captureUnhandledRejection);
+		}
 	});
 });
