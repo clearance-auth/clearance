@@ -48,6 +48,7 @@ export {
 } from "./saml";
 
 import type { OIDCConfig, SAMLConfig, SSOOptions, SSOProvider } from "./types";
+import { hasXMLDoctype } from "./saml/parser";
 import { PACKAGE_VERSION } from "./version";
 
 export type { SAMLConfig, OIDCConfig, SSOOptions, SSOProvider };
@@ -81,6 +82,7 @@ export {
 
 const fastValidator = {
 	async validate(xml: string) {
+		if (hasXMLDoctype(xml)) throw "ERR_SAML_DOCTYPE_FORBIDDEN";
 		const isValid = XMLValidator.validate(xml, {
 			allowBooleanAttributes: true,
 		});

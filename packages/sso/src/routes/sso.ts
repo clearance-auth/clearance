@@ -22,6 +22,7 @@ import {
 import { deleteSessionCookie, setSessionCookie } from "@clearance/runtime/cookies";
 import { generateRandomString } from "@clearance/runtime/crypto";
 import { handleOAuthUserInfo } from "@clearance/runtime/oauth2";
+import { base64 } from "@clearance/utils/base64";
 import { decodeJwt } from "jose";
 import type { BindingContext } from "samlify/types/src/entity";
 import type { IdentityProvider } from "samlify/types/src/entity-idp";
@@ -40,6 +41,7 @@ import {
 } from "../oidc";
 import { validateConfigAlgorithms } from "../saml";
 import { SAML_ERROR_CODES } from "../saml/error-codes";
+import { hasXMLDoctype } from "../saml/parser";
 import { generateRelayState } from "../saml-state";
 import { saml } from "../samlify";
 import {
@@ -2278,6 +2280,23 @@ const sloSchema = z.object({
 	Signature: z.string().optional(),
 });
 
+function rejectSAMLPostDoctype(encodedSaml: string | undefined): void {
+	if (!encodedSaml) return;
+
+	let xml: string;
+	try {
+		xml = new TextDecoder().decode(
+			base64.decode(encodedSaml.replace(/\s+/g, "")),
+		);
+	} catch {
+		return;
+	}
+
+	if (hasXMLDoctype(xml)) {
+		throw new Error("SAML XML DOCTYPE declarations are forbidden");
+	}
+}
+
 export const sloEndpoint = (options?: SSOOptions) => {
 	return createAuthEndpoint(
 		"/sso/saml2/sp/slo/:providerId",
@@ -2362,6 +2381,9 @@ async function handleLogoutResponse(
 
 	let parsed: Awaited<ReturnType<typeof sp.parseLogoutResponse>> | undefined;
 	try {
+		if (binding === "post") {
+			rejectSAMLPostDoctype(ctx.body?.SAMLResponse);
+		}
 		parsed = await sp.parseLogoutResponse(idp, binding, {
 			body: ctx.body,
 			query: ctx.query,
@@ -2436,6 +2458,9 @@ async function handleLogoutRequest(
 
 	let parsed: Awaited<ReturnType<typeof sp.parseLogoutRequest>> | undefined;
 	try {
+		if (binding === "post") {
+			rejectSAMLPostDoctype(ctx.body?.SAMLRequest);
+		}
 		parsed = await sp.parseLogoutRequest(idp, binding, {
 			body: ctx.body,
 			query: ctx.query,

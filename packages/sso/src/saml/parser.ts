@@ -7,6 +7,20 @@ export const xmlParser = new XMLParser({
 	processEntities: false,
 });
 
+const DOCTYPE_PATTERN = /<\s*!\s*DOCTYPE\b/i;
+
+export function hasXMLDoctype(xml: string): boolean {
+	return DOCTYPE_PATTERN.test(xml);
+}
+
+export function parseSAMLXml(xml: string): unknown {
+	if (hasXMLDoctype(xml)) {
+		throw new Error("SAML XML DOCTYPE declarations are forbidden");
+	}
+
+	return xmlParser.parse(xml);
+}
+
 export function findNode(obj: unknown, nodeName: string): unknown {
 	if (!obj || typeof obj !== "object") return null;
 
