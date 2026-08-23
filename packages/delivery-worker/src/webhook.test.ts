@@ -12,7 +12,9 @@ import {
 	parseWebhookEndpointTestPayload,
 	parseWebhookPayload,
 	pinnedWebhookRequest,
+	verifyWebhookRequest,
 	verifyWebhookSignature,
+	verifyWebhookSignatureAuthenticity,
 	webhookSignature,
 	type PinnedWebhookRequest,
 } from "./webhook.js";
@@ -83,6 +85,110 @@ afterEach(async () => {
 		server.closeAllConnections();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
+});
+
+describe("replay-safe webhook verification", () => {
+	const now = 1_800_000_000_000;
+	const currentTimestamp = String(now / 1_000);
+	const body = Buffer.from('{"event":"original"}', "utf8");
+	const signature = (timestamp = currentTimestamp, value = body) => webhookSignature(
+		secret,
+		"event-verification-1",
+		timestamp,
+		value,
+	);
+	const verify = (overrides: Partial<Parameters<typeof verifyWebhookRequest>[0]> = {}) => verifyWebhookRequest({
+		secret,
+		eventId: "event-verification-1",
+		timestamp: currentTimestamp,
+		body,
+		signature: signature(),
+		consumeEventId: () => true,
+		now: () => now,
+		...overrides,
+	});
+
+	it("accepts fresh authentic raw bytes and reserves the event ID through the validity window", async () => {
+		const reservations: Array<{ eventId: string; expiresAt: number }> = [];
+		await expect(verify({ consumeEventId: (reservation) => {
+			reservations.push(reservation);
+			return true;
+		} })).resolves.toEqual({ valid: true });
+		expect(reservations).toEqual([{
+			eventId: "event-verification-1",
+			expiresAt: Number(currentTimestamp) + 301,
+		}]);
+		expect(verifyWebhookSignatureAuthenticity(
+			secret,
+			"event-verification-1",
+			currentTimestamp,
+			body,
+			signature(),
+		)).toBe(true);
+	});
+
+	it("rejects a stale signed request before reserving its event ID", async () => {
+		const timestamp = String(now / 1_000 - 301);
+		let consumed = false;
+		await expect(verify({
+			timestamp,
+			signature: signature(timestamp),
+			consumeEventId: () => { consumed = true; return true; },
+		})).resolves.toEqual({ valid: false, reason: "stale_timestamp" });
+		expect(consumed).toBe(false);
+		await expect(verify({
+			timestamp,
+			signature: signature(timestamp),
+			maxAgeSeconds: 301,
+		})).resolves.toEqual({ valid: true });
+	});
+
+	it("rejects a signed timestamp beyond the allowed future skew", async () => {
+		const timestamp = String(now / 1_000 + 31);
+		await expect(verify({
+			timestamp,
+			signature: signature(timestamp),
+		})).resolves.toEqual({ valid: false, reason: "future_timestamp" });
+		await expect(verify({
+			timestamp,
+			signature: signature(timestamp),
+			maxFutureSkewSeconds: 31,
+		})).resolves.toEqual({ valid: true });
+	});
+
+	it("rejects malformed timestamp syntax", async () => {
+		await expect(verify({ timestamp: "1800000000.0" })).resolves.toEqual({
+			valid: false,
+			reason: "malformed_timestamp",
+		});
+	});
+
+	it("rejects tampered raw bytes without reserving the event ID", async () => {
+		let consumed = false;
+		await expect(verify({
+			body: Buffer.from('{"event":"tampered"}', "utf8"),
+			consumeEventId: () => { consumed = true; return true; },
+		})).resolves.toEqual({ valid: false, reason: "invalid_signature" });
+		expect(consumed).toBe(false);
+	});
+
+	it("rejects a replay when the atomic event-ID reservation already exists", async () => {
+		const consumed = new Set<string>();
+		const consumeEventId = ({ eventId }: { eventId: string }) => {
+			if (consumed.has(eventId)) return false;
+			consumed.add(eventId);
+			return true;
+		};
+		await expect(verify({ consumeEventId })).resolves.toEqual({ valid: true });
+		await expect(verify({ consumeEventId })).resolves.toEqual({ valid: false, reason: "replayed_event" });
+	});
+
+	it("fails closed without exposing replay-store errors", async () => {
+		await expect(verify({ consumeEventId: () => { throw new Error(secret); } })).resolves.toEqual({
+			valid: false,
+			reason: "replay_check_failed",
+		});
+	});
 });
 
 describe("signed webhook transport", () => {

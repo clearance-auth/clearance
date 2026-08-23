@@ -58,9 +58,51 @@ export function canonicalWebhookBytes(
 	return bytes;
 }
 
-export function webhookSignature(secret: string, eventId: string, timestamp: string, body: Buffer): string {
-	return `v1,${createHmac("sha256", secret).update(eventId).update(".").update(timestamp).update(".").update(body).digest("base64")}`;
+function webhookSignatureDigest(secret: string, eventId: string, timestamp: string, body: Buffer): Buffer {
+	return createHmac("sha256", secret).update(eventId).update(".").update(timestamp).update(".").update(body).digest();
 }
+
+export function webhookSignature(secret: string, eventId: string, timestamp: string, body: Buffer): string {
+	return `v1,${webhookSignatureDigest(secret, eventId, timestamp, body).toString("base64")}`;
+}
+
+export type WebhookVerificationFailureReason =
+	| "malformed_timestamp"
+	| "stale_timestamp"
+	| "future_timestamp"
+	| "invalid_signature"
+	| "replayed_event"
+	| "replay_check_failed";
+
+export type WebhookVerificationResult =
+	| { valid: true }
+	| { valid: false; reason: WebhookVerificationFailureReason };
+
+export type ConsumeWebhookEventId = (input: {
+	/** The signed event ID to reserve atomically. */
+	eventId: string;
+	/** Unix time in seconds after which the reservation is no longer needed. */
+	expiresAt: number;
+}) => boolean | Promise<boolean>;
+
+export type VerifyWebhookRequestInput = {
+	secret: string;
+	eventId: string;
+	timestamp: string;
+	body: Buffer;
+	signature: string;
+	/** Must atomically return true only for the first reservation of an event ID. */
+	consumeEventId: ConsumeWebhookEventId;
+	/** Maximum accepted request age in seconds. Defaults to five minutes. */
+	maxAgeSeconds?: number;
+	/** Maximum accepted clock lead in seconds. Defaults to 30 seconds. */
+	maxFutureSkewSeconds?: number;
+	/** Injectable epoch-millisecond clock. Defaults to Date.now. */
+	now?: () => number;
+};
+
+const DEFAULT_WEBHOOK_MAX_AGE_SECONDS = 300;
+const DEFAULT_WEBHOOK_MAX_FUTURE_SKEW_SECONDS = 30;
 
 function normalizeAddress(address: string): { address: string; family: 4 | 6 } {
 	const raw = address.startsWith("[") && address.endsWith("]") ? address.slice(1, -1) : address;
@@ -244,8 +286,72 @@ export function classifyWebhookError(error: unknown): WebhookErrorInfo {
 	return { retryable: true, errorClass: "webhook.transport" };
 }
 
+/**
+ * Checks only that the signature authenticates the exact raw body bytes.
+ * It does not enforce freshness or prevent replay; receivers should normally use
+ * verifyWebhookRequest instead.
+ */
+export function verifyWebhookSignatureAuthenticity(
+	secret: string,
+	eventId: string,
+	timestamp: string,
+	body: Buffer,
+	signature: string,
+): boolean {
+	const encoded = signature.startsWith("v1,") ? signature.slice(3) : "";
+	const hasCanonicalEncoding = /^[A-Za-z0-9+/]{43}=$/.test(encoded);
+	const decoded = hasCanonicalEncoding ? Buffer.from(encoded, "base64") : Buffer.alloc(32);
+	const actual = decoded.length === 32 ? decoded : Buffer.alloc(32);
+	const matches = timingSafeEqual(webhookSignatureDigest(secret, eventId, timestamp, body), actual);
+	return hasCanonicalEncoding && decoded.length === 32 && matches;
+}
+
+/**
+ * Compatibility alias for the authenticity-only primitive. This does not
+ * validate timestamp freshness or consume the event ID.
+ */
 export function verifyWebhookSignature(secret: string, eventId: string, timestamp: string, body: Buffer, signature: string): boolean {
-	const expected = Buffer.from(webhookSignature(secret, eventId, timestamp, body));
-	const actual = Buffer.from(signature);
-	return expected.length === actual.length && timingSafeEqual(expected, actual);
+	return verifyWebhookSignatureAuthenticity(secret, eventId, timestamp, body, signature);
+}
+
+function verificationWindow(value: number | undefined, fallback: number, name: string): number {
+	const resolved = value ?? fallback;
+	if (!Number.isSafeInteger(resolved) || resolved < 0) {
+		throw new TypeError(`${name} must be a non-negative safe integer`);
+	}
+	return resolved;
+}
+
+/**
+ * Verifies webhook authenticity and freshness, then atomically reserves the
+ * signed event ID. Pass the request body before parsing or re-serializing it.
+ */
+export async function verifyWebhookRequest(input: VerifyWebhookRequestInput): Promise<WebhookVerificationResult> {
+	if (!/^(?:0|[1-9]\d{0,15})$/.test(input.timestamp)) {
+		return { valid: false, reason: "malformed_timestamp" };
+	}
+	const timestamp = Number(input.timestamp);
+	if (!Number.isSafeInteger(timestamp)) return { valid: false, reason: "malformed_timestamp" };
+
+	const maxAgeSeconds = verificationWindow(input.maxAgeSeconds, DEFAULT_WEBHOOK_MAX_AGE_SECONDS, "maxAgeSeconds");
+	const maxFutureSkewSeconds = verificationWindow(input.maxFutureSkewSeconds, DEFAULT_WEBHOOK_MAX_FUTURE_SKEW_SECONDS, "maxFutureSkewSeconds");
+	const nowMilliseconds = (input.now ?? Date.now)();
+	if (!Number.isFinite(nowMilliseconds) || nowMilliseconds < 0) {
+		throw new TypeError("now must return a non-negative epoch-millisecond value");
+	}
+	const nowSeconds = nowMilliseconds / 1_000;
+	if (nowSeconds - timestamp > maxAgeSeconds) return { valid: false, reason: "stale_timestamp" };
+	if (timestamp - nowSeconds > maxFutureSkewSeconds) return { valid: false, reason: "future_timestamp" };
+	if (!verifyWebhookSignatureAuthenticity(input.secret, input.eventId, input.timestamp, input.body, input.signature)) {
+		return { valid: false, reason: "invalid_signature" };
+	}
+
+	try {
+		// Add one second because the age boundary itself is accepted.
+		const consumed = await input.consumeEventId({ eventId: input.eventId, expiresAt: timestamp + maxAgeSeconds + 1 });
+		if (typeof consumed !== "boolean") return { valid: false, reason: "replay_check_failed" };
+		return consumed ? { valid: true } : { valid: false, reason: "replayed_event" };
+	} catch {
+		return { valid: false, reason: "replay_check_failed" };
+	}
 }
