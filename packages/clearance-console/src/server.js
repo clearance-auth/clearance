@@ -31,6 +31,13 @@ class RequestBodyTooLargeError extends Error {
 	}
 }
 
+class MalformedCookieError extends Error {
+	constructor() {
+		super("Malformed Cookie header");
+		this.name = "MalformedCookieError";
+	}
+}
+
 /** Hop-by-hop / browser-only headers that must never be forwarded upstream. */
 const STRIP_REQUEST_HEADERS = new Set([
 	"authorization",
@@ -286,7 +293,11 @@ function parseCookies(header) {
 		if (idx === -1) continue;
 		const k = part.slice(0, idx).trim();
 		const v = part.slice(idx + 1).trim();
-		out[k] = decodeURIComponent(v);
+		try {
+			out[k] = decodeURIComponent(v);
+		} catch {
+			throw new MalformedCookieError();
+		}
 	}
 	return out;
 }
@@ -927,55 +938,90 @@ function serveStatic(req, res, config, url) {
  */
 export function createHandler(overrides = {}) {
 	const config = resolveConfig(overrides);
-	return async function handler(req, res) {
-		const requestId = requestIdForHeader(req.headers["x-request-id"]);
-		// The normalized value is also what the management proxy forwards upstream.
-		req.headers["x-request-id"] = requestId;
-		res.setHeader("x-request-id", requestId);
-		const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
-		const started = performance.now();
-		try {
-			if (url.pathname === "/livez") {
-				json(res, 200, { ok: true, service: "clearance-console", state: "live" });
-				return;
-			}
-			if (url.pathname === "/readyz") {
-				if (consoleDraining) {
-					json(res, 503, { ok: false, service: "clearance-console", state: "draining" });
+	return function handler(req, res) {
+		// node:http does not consume a Promise returned by an async listener. Keep
+		// the listener synchronous and explicitly consume every request rejection.
+		const request = (async () => {
+			let requestId;
+			let url;
+			const started = performance.now();
+			try {
+				requestId = requestIdForHeader(req.headers["x-request-id"]);
+				// The normalized value is also what the management proxy forwards upstream.
+				req.headers["x-request-id"] = requestId;
+				res.setHeader("x-request-id", requestId);
+				url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+
+				if (url.pathname === "/livez") {
+					json(res, 200, { ok: true, service: "clearance-console", state: "live" });
 					return;
 				}
-				try {
-					const upstream = await fetch(`${config.apiBase}/readyz`, {
-						signal: AbortSignal.timeout(3_000),
-					});
-					json(res, upstream.ok ? 200 : 503, {
-						ok: upstream.ok,
-						service: "clearance-console",
-						state: upstream.ok ? "ready" : "dependency_unavailable",
-					});
-				} catch {
-					json(res, 503, { ok: false, service: "clearance-console", state: "dependency_unavailable" });
+				if (url.pathname === "/readyz") {
+					if (consoleDraining) {
+						json(res, 503, { ok: false, service: "clearance-console", state: "draining" });
+						return;
+					}
+					try {
+						const upstream = await fetch(`${config.apiBase}/readyz`, {
+							signal: AbortSignal.timeout(3_000),
+						});
+						json(res, upstream.ok ? 200 : 503, {
+							ok: upstream.ok,
+							service: "clearance-console",
+							state: upstream.ok ? "ready" : "dependency_unavailable",
+						});
+					} catch {
+						json(res, 503, { ok: false, service: "clearance-console", state: "dependency_unavailable" });
+					}
+					return;
 				}
-				return;
+				if (url.pathname.startsWith("/api/")) {
+					await handleProxy(req, res, config, url);
+					return;
+				}
+				serveStatic(req, res, config, url);
+			} catch (error) {
+				if (!res.headersSent) {
+					const malformedCookie = error instanceof MalformedCookieError;
+					json(res, malformedCookie ? 400 : 500, {
+						error: {
+							code: malformedCookie ? "MALFORMED_COOKIE" : "INTERNAL_SERVER_ERROR",
+							message: malformedCookie
+								? "Malformed Cookie header"
+								: "The console could not process the request",
+							stage: "console.request",
+							retryable: false,
+						},
+					});
+				} else if (!res.writableEnded) {
+					res.destroy();
+				}
+			} finally {
+				if (config.nodeEnv === "production" || process.env.CLEARANCE_REQUEST_LOG === "1") {
+					try {
+						console.log(JSON.stringify({
+							event: "http_request",
+							service: "clearance-console",
+							requestId,
+							method: req.method,
+							path: url?.pathname,
+							status: res.statusCode,
+							durationMs: Math.round(performance.now() - started),
+						}));
+					} catch {
+						// Logging must not turn a handled request failure into a rejection.
+					}
+				}
 			}
-			if (url.pathname.startsWith("/api/")) {
-				await handleProxy(req, res, config, url);
-				return;
+		})();
+		request.catch(() => {
+			// Fail closed if response construction or request logging itself fails.
+			try {
+				if (!res.destroyed) res.destroy();
+			} catch {
+				// The listener must never create another unhandled rejection.
 			}
-			serveStatic(req, res, config, url);
-		} finally {
-			if (config.nodeEnv === "production" || process.env.CLEARANCE_REQUEST_LOG === "1") {
-				console.log(JSON.stringify({
-					event: "http_request",
-					service: "clearance-console",
-					requestId,
-					method: req.method,
-					path: url.pathname,
-					status: res.statusCode,
-					durationMs: Math.round(performance.now() - started),
-				}));
-			}
-		}
+		});
 	};
 }
 

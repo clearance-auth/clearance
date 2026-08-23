@@ -552,6 +552,50 @@ describe("operator sessions, roles, CSRF", () => {
 		assert.equal(body.error?.code, "NOT_AUTHENTICATED");
 	});
 
+	it("rejects malformed cookie encoding without terminating the server", async () => {
+		const res = await fetch(`http://127.0.0.1:${consolePort}/api/v1/users`, {
+			headers: { cookie: "probe=%" },
+		});
+		assert.equal(res.status, 400);
+		assert.equal((await res.json()).error?.code, "MALFORMED_COOKIE");
+		assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+
+		const live = await fetch(`http://127.0.0.1:${consolePort}/livez`);
+		assert.equal(live.status, 200);
+	});
+
+	it("contains unexpected handler failures without leaking internal details", async () => {
+		const sessions = new Map();
+		sessions.get = () => {
+			throw new Error("sensitive internal failure detail");
+		};
+		const failing = createConsoleServer({
+			apiBase: consoleServer.clearanceConfig.apiBase,
+			operatorToken: OPERATOR,
+			port: 0,
+			nodeEnv: "development",
+			sessionSecret: "console-session-secret-32chars!!",
+			operators: [ADMIN],
+			sessions,
+		});
+		const port = await listen(failing);
+		try {
+			const res = await fetch(`http://127.0.0.1:${port}/api/v1/users`, {
+				headers: { cookie: `${SESSION_COOKIE}=syntactically-valid` },
+			});
+			assert.equal(res.status, 500);
+			const text = await res.text();
+			assert.equal(JSON.parse(text).error?.code, "INTERNAL_SERVER_ERROR");
+			assert.equal(text.includes("sensitive internal failure detail"), false);
+			assert.equal(res.headers.get("x-frame-options"), "DENY");
+
+			const live = await fetch(`http://127.0.0.1:${port}/livez`);
+			assert.equal(live.status, 200);
+		} finally {
+			await close(failing);
+		}
+	});
+
 	it("serves setup routes and proxies same-origin capability submissions without operator auth", async () => {
 		const origin = `http://127.0.0.1:${consolePort}`;
 		const page = await fetch(`${origin}/setup/scim?token=capability`);
