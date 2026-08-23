@@ -817,10 +817,10 @@ describe("two-factor security: trusted-device proof is single-use", () => {
 		const trustCookie = parseSetCookieHeader(
 			trusted.headers.get("Set-Cookie") || "",
 		).get("clearance.trust_device")?.value;
-		// The proof is created through a provider that supports atomic challenge
-		// consumption. Simulate that guarantee becoming unavailable before the
-		// next sign-in: trusted-device bypass must then fail closed.
-		Reflect.deleteProperty(secondaryStorage, "getAndDelete");
+		// getTestInstance normalizes secondary storage into auth.options. Simulate
+		// that the effective provider losing its atomic consume capability before
+		// the next sign-in: trusted-device bypass must then fail closed.
+		Reflect.deleteProperty(auth.options.secondaryStorage!, "getAndDelete");
 		const attemptedBypass = await auth.api.signInEmail({
 			body: { email: testUser.email, password: testUser.password },
 			headers: new Headers({

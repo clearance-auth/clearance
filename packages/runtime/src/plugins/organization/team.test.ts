@@ -2394,14 +2394,22 @@ describe.skipIf(!hasPostgres)(
 			const firstRelease = new Promise<void>((resolve) => {
 				releaseFirst = resolve;
 			});
+			let organizationLockAttempts = 0;
 			let teamLockAttempts = 0;
 			const originalTransaction = context.adapter.transaction.bind(context.adapter);
 			const transactionSpy = vi
 				.spyOn(context.adapter, "transaction")
-				.mockImplementation(async (callback: any) =>
-					originalTransaction(async (transaction: any) => {
+				.mockImplementation(async (callback: any) => {
+					return originalTransaction(async (transaction: any) => {
 						const update = transaction.update.bind(transaction);
 						transaction.update = async (input: any) => {
+							if (
+								input.model === "organization" &&
+								input.where?.[0]?.value === org.id
+							) {
+								organizationLockAttempts += 1;
+								if (organizationLockAttempts === 2) resolveSecondAttempt?.();
+							}
 							if (input.model !== "team" || input.where?.[0]?.value !== team.id) {
 								return update(input);
 							}
@@ -2412,12 +2420,11 @@ describe.skipIf(!hasPostgres)(
 								await firstRelease;
 								return locked;
 							}
-							resolveSecondAttempt?.();
 							return update(input);
 						};
 						return callback(transaction);
-					}),
-				);
+					});
+				});
 			try {
 				const first = auth.api.addTeamMember({
 					headers: owner.headers,
