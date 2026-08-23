@@ -40,6 +40,6 @@
   },
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1089.0",
-    "@google-cloud/kms": "^5.6.0"
+    "@google-cloud/kms": "^5.7.0"
   }
 }

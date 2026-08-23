@@ -13,7 +13,7 @@
     "@clearance/runtime": "workspace:*",
     "@clearance/verification": "workspace:*",
     "express": "^5.2.1",
-    "next": "^16.2.6",
+    "next": "^16.3.0",
     "react": "catalog:react19",
     "react-dom": "catalog:react19"
   },

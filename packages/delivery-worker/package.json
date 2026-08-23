@@ -20,7 +20,7 @@
   "dependencies": {
     "@clearance/delivery": "workspace:*",
     "@clearance/observability-node": "workspace:*",
-    "nodemailer": "^7.0.5",
+    "nodemailer": "^9.0.1",
     "pg": "^8.14.1"
   },
   "devDependencies": {
