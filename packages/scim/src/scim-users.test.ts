@@ -1042,6 +1042,31 @@ describe("SCIM", () => {
 				}),
 			);
 		});
+
+		it("returns a bounded 401 for malformed bearer tokens", async () => {
+			const { auth } = createTestInstance();
+
+			for (const token of [
+				"invalid%base64",
+				"/w==",
+				"bm90LWEtdG9rZW4=",
+				"dGhlLXNjaW0tdG9rZW46dGhlLXNjaW0tcHJvdmlkZXI=trailing",
+			]) {
+				const response = await auth.handler(
+					new Request("http://localhost:3000/api/auth/scim/v2/Users", {
+						method: "GET",
+						headers: { authorization: `Bearer ${token}` },
+					}),
+				);
+
+				expect(response.status).toBe(401);
+				await expect(response.json()).resolves.toEqual({
+					detail: "Invalid SCIM token",
+					schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"],
+					status: "401",
+				});
+			}
+		});
 	});
 });
 
