@@ -666,9 +666,6 @@ export const deleteUserCallback = createAuthEndpoint(
 			);
 		}
 		const beforeDelete = ctx.context.options.user.deleteUser?.beforeDelete;
-		if (beforeDelete) {
-			await beforeDelete(session.user, ctx.request);
-		}
 		const deletedUser = await runManagedAuthenticationTransaction(
 			ctx,
 			async () => {
@@ -695,6 +692,9 @@ export const deleteUserCallback = createAuthEndpoint(
 				);
 				if (!token || token.value !== authoritativeSession.user.id) {
 					throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.INVALID_TOKEN);
+				}
+				if (beforeDelete) {
+					await beforeDelete(authoritativeSession.user, ctx.request);
 				}
 				await ctx.context.internalAdapter.deleteUser(
 					authoritativeSession.user.id,
