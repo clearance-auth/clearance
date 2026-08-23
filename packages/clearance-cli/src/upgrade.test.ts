@@ -57,6 +57,21 @@ describe("upgrade script lane", () => {
 		expect(result).toMatchObject({ dryRun: true, plan: { status: "planned" }, wouldRun: ["backup_reference_check", "apply_marker_check"] });
 	});
 
+	it("retains explicit local directory and health URL flexibility", async () => {
+		const dir = directory();
+		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });
+		await expect(verifyUpgrade({
+			plan: planned.plan.id,
+			dir,
+			healthUrl: "http://127.0.0.1:65535/health",
+			dryRun: true,
+		})).resolves.toMatchObject({
+			operation: "upgrade.verify",
+			dryRun: true,
+			wouldRun: expect.arrayContaining(["health_url_check"]),
+		});
+	});
+
 	it("keeps rollback dry-run non-mutating and explicit about active database safety", async () => {
 		const dir = directory();
 		const planned = await planUpgrade({ target: "0.2.1", current: "0.1.4", dir });

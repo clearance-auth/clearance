@@ -224,18 +224,18 @@ export const DATA_OPERATION_SCHEMAS = {
 		]),
 	},
 	"upgrades.plan": {
-		input: z.object({ target: z.string(), dir: z.string(), current: z.string().optional(), dryRun: z.boolean().optional() }).strict(),
+		input: z.object({ target: z.string(), current: z.string().optional(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([upgradePlanDryRunSchema, upgradePlanResultSchema]),
 	},
 	"upgrades.apply": {
-		input: z.object({ plan: z.string(), dir: z.string(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }).strict(),
+		input: z.object({ plan: z.string(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }).strict(),
 		output: z.union([
 			upgradeApplyDryRunSchema,
 			z.object({ schemaVersion: z.literal("v1"), operation: z.literal("upgrade.apply"), dryRun: z.literal(false), plan: upgradeAppliedPlanSchema }).strict(),
 		]),
 	},
 	"upgrades.verify": {
-		input: z.object({ plan: z.string(), dir: z.string(), healthUrl: z.string().optional(), dryRun: z.boolean().optional() }).strict(),
+		input: z.object({ plan: z.string(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([
 			z.object({
 				schemaVersion: z.literal("v1"), operation: z.literal("upgrade.verify"), dryRun: z.literal(true), plan: upgradePlanSummarySchema,
@@ -249,8 +249,8 @@ export const DATA_OPERATION_SCHEMAS = {
 	},
 	"upgrades.rollback": {
 		input: z.object({
-			plan: z.string(), dir: z.string(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(),
-			restoreActive: z.boolean().optional(), activeDatabaseConfirmation: z.string().optional(), backupDir: z.string().optional(),
+			plan: z.string(), dryRun: z.boolean().optional(), confirm: z.boolean().optional(),
+			restoreActive: z.boolean().optional(), activeDatabaseConfirmation: z.string().optional(),
 		}).strict(),
 		output: z.union([
 			upgradeRollbackDryRunSchema,

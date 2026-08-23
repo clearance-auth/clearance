@@ -51,9 +51,15 @@ export interface BackupConfiguration {
 	production: boolean;
 }
 
+export interface UpgradeConfiguration {
+	configuredDirectory: string | undefined;
+	configuredHealthUrl: string | undefined;
+}
+
 export interface OperationRouteDependencies extends BaseRouteDependencies {
 	runtimeDatabaseConfigured(): boolean;
 	backupConfiguration(): BackupConfiguration;
+	upgradeConfiguration(): UpgradeConfiguration;
 }
 
 export function registerOperationRoutes({
@@ -61,8 +67,45 @@ export function registerOperationRoutes({
 	handleError,
 	runtimeDatabaseConfigured,
 	backupConfiguration,
+	upgradeConfiguration,
 }: OperationRouteDependencies) {
 	const routes = new Hono();
+
+	// Remote callers select logical plans only; network and filesystem sinks stay deployment-owned.
+	function serverUpgradeOptions(body: Record<string, unknown>, stage: string) {
+		if (body.dir !== undefined || body.backupDir !== undefined) {
+			throw new ClearanceError({
+				code: "UPGRADE_DIRECTORY_SERVER_MANAGED",
+				message: "Upgrade storage is configured by the API deployment",
+				stage,
+				status: 400,
+				remediation: "Omit filesystem directories; set CLEARANCE_UPGRADE_DIR on the API deployment.",
+			});
+		}
+		if (body.healthUrl !== undefined) {
+			throw new ClearanceError({
+				code: "UPGRADE_HEALTH_URL_SERVER_MANAGED",
+				message: "Upgrade health verification is configured by the API deployment",
+				stage,
+				status: 400,
+				remediation: "Omit healthUrl; set CLEARANCE_UPGRADE_HEALTH_URL on the API deployment.",
+			});
+		}
+		const configuration = upgradeConfiguration();
+		if (!configuration.configuredDirectory) {
+			throw new ClearanceError({
+				code: "UPGRADE_DIRECTORY_NOT_CONFIGURED",
+				message: "The API upgrade directory is not configured",
+				stage,
+				status: 503,
+				remediation: "Set CLEARANCE_UPGRADE_DIR and mount durable upgrade storage before retrying.",
+			});
+		}
+		return {
+			dir: configuration.configuredDirectory,
+			healthUrl: configuration.configuredHealthUrl,
+		};
+	}
 
 	routes.post(BACKUP_OPERATIONS.create.http.path, async (c) => {
 		try {
@@ -164,9 +207,10 @@ export function registerOperationRoutes({
 	routes.post(UPGRADE_OPERATIONS.plan.http.path, async (c) => {
 		try {
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			const upgrade = serverUpgradeOptions(body, "upgrade.plan");
 			return c.json(await planUpgrade({
 				target: typeof body.target === "string" ? body.target : undefined,
-				dir: typeof body.dir === "string" ? body.dir : undefined,
+				dir: upgrade.dir,
 				current: typeof body.current === "string" ? body.current : undefined,
 				dryRun: body.dryRun === true,
 			}));
@@ -178,9 +222,10 @@ export function registerOperationRoutes({
 	routes.post(UPGRADE_OPERATIONS.apply.http.path, async (c) => {
 		try {
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			const upgrade = serverUpgradeOptions(body, "upgrade.apply");
 			return c.json(await applyUpgrade({
 				plan: typeof body.plan === "string" ? body.plan : undefined,
-				dir: typeof body.dir === "string" ? body.dir : undefined,
+				dir: upgrade.dir,
 				dryRun: body.dryRun === true,
 				yes: body.confirm === true,
 			}));
@@ -192,10 +237,11 @@ export function registerOperationRoutes({
 	routes.post(UPGRADE_OPERATIONS.verify.http.path, async (c) => {
 		try {
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			const upgrade = serverUpgradeOptions(body, "upgrade.verify");
 			return c.json(await verifyUpgrade({
 				plan: typeof body.plan === "string" ? body.plan : undefined,
-				dir: typeof body.dir === "string" ? body.dir : undefined,
-				healthUrl: typeof body.healthUrl === "string" ? body.healthUrl : undefined,
+				dir: upgrade.dir,
+				healthUrl: upgrade.healthUrl,
 				dryRun: body.dryRun === true,
 			}));
 		} catch (e) {
@@ -206,16 +252,16 @@ export function registerOperationRoutes({
 	routes.post(UPGRADE_OPERATIONS.rollback.http.path, async (c) => {
 		try {
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+			const upgrade = serverUpgradeOptions(body, "upgrade.rollback");
 			return c.json(await rollbackUpgrade({
 				plan: typeof body.plan === "string" ? body.plan : undefined,
-				dir: typeof body.dir === "string" ? body.dir : undefined,
+				dir: upgrade.dir,
 				dryRun: body.dryRun === true,
 				yes: body.confirm === true,
 				restoreActive: body.restoreActive === true,
 				confirm: typeof body.activeDatabaseConfirmation === "string"
 					? body.activeDatabaseConfirmation
 					: undefined,
-				backupDir: typeof body.backupDir === "string" ? body.backupDir : undefined,
 			}));
 		} catch (e) {
 			return handleError(c, e);

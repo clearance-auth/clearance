@@ -146,6 +146,16 @@ function backupConfiguration(): {
 	};
 }
 
+function upgradeConfiguration(): {
+	configuredDirectory: string | undefined;
+	configuredHealthUrl: string | undefined;
+} {
+	return {
+		configuredDirectory: process.env.CLEARANCE_UPGRADE_DIR?.trim() || undefined,
+		configuredHealthUrl: process.env.CLEARANCE_UPGRADE_HEALTH_URL?.trim() || undefined,
+	};
+}
+
 /**
  * Long-lived API process: refresh so external CLI writes are visible before
  * serving. Flushes pending local mutations first.
@@ -1095,6 +1105,7 @@ app.route(
 		handleError,
 		runtimeDatabaseConfigured,
 		backupConfiguration,
+		upgradeConfiguration,
 	}),
 );
 

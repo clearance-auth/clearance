@@ -1868,7 +1868,6 @@ const OPERATION_METADATA_VALUES = [
 		"confirmation": "none",
 		"inputKeys": [
 			"target",
-			"dir",
 			"current",
 			"dryRun"
 		],
@@ -1886,7 +1885,6 @@ const OPERATION_METADATA_VALUES = [
 		"confirmation": "server-required",
 		"inputKeys": [
 			"plan",
-			"dir",
 			"dryRun",
 			"confirm"
 		],
@@ -1904,8 +1902,6 @@ const OPERATION_METADATA_VALUES = [
 		"confirmation": "none",
 		"inputKeys": [
 			"plan",
-			"dir",
-			"healthUrl",
 			"dryRun"
 		],
 		"pathParameters": {},
@@ -1922,12 +1918,10 @@ const OPERATION_METADATA_VALUES = [
 		"confirmation": "server-required",
 		"inputKeys": [
 			"plan",
-			"dir",
 			"dryRun",
 			"confirm",
 			"restoreActive",
-			"activeDatabaseConfirmation",
-			"backupDir"
+			"activeDatabaseConfirmation"
 		],
 		"pathParameters": {},
 		"queryParameters": {}

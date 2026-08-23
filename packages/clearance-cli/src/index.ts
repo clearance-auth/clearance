@@ -654,28 +654,22 @@ async function main() {
 	upgrade
 		.command("plan")
 		.requiredOption("--target <version>", "Target release version")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.option("--current <version>", "Current release version override")
 		.action(remoteCommandAction);
 	upgrade
 		.command("apply")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.action(remoteCommandAction);
 	upgrade
 		.command("verify")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
-		.option("--health-url <url>", "Optional credential-free HTTP(S) health endpoint")
 		.action(remoteCommandAction);
 	upgrade
 		.command("rollback")
 		.description("Verify a rollback in isolation, or explicitly restore the active database")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.option("--restore-active", "Restore the rollback backup into the active database", false)
 		.option("--confirm <token>", "Exact RESTORE_ACTIVE:<plan-id>:<database> confirmation")
-		.option("--backup-dir <path>", "Absolute directory for the pre-restore safety backup")
 		.action(remoteCommandAction);
 
 	// schema

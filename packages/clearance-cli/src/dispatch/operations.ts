@@ -90,7 +90,6 @@ export async function dispatchOperationsCommand({
 		case UPGRADE_OPERATIONS.plan.cliPath:
 			return callManagementOperation(session, "upgrades.plan", body({
 				target: opts.target,
-				dir: opts.dir,
 				current: opts.current,
 				dryRun: global.dryRun,
 			}) as Parameters<typeof callManagementOperation<"upgrades.plan">>[2], managementCallOptions(global));
@@ -98,14 +97,11 @@ export async function dispatchOperationsCommand({
 			requireConfirmation(global, "UPGRADE_APPLY_CONFIRMATION_REQUIRED", "Upgrade apply");
 			return callManagementOperation(session, "upgrades.apply", body({
 				plan: opts.plan,
-				dir: opts.dir,
 				dryRun: global.dryRun,
 			}) as Parameters<typeof callManagementOperation<"upgrades.apply">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.verify.cliPath:
 			return callManagementOperation(session, "upgrades.verify", body({
 				plan: opts.plan,
-				dir: opts.dir,
-				healthUrl: opts.healthUrl,
 				dryRun: global.dryRun,
 			}) as Parameters<typeof callManagementOperation<"upgrades.verify">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.rollback.cliPath:
@@ -115,11 +111,9 @@ export async function dispatchOperationsCommand({
 				"upgrades.rollback",
 				body({
 					plan: opts.plan,
-					dir: opts.dir,
 					dryRun: global.dryRun,
 					restoreActive: opts.restoreActive,
 					activeDatabaseConfirmation: opts.confirm,
-					backupDir: opts.backupDir,
 				}) as Parameters<typeof callManagementOperation<"upgrades.rollback">>[2],
 				managementCallOptions(global),
 			);

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +15,8 @@ afterEach(() => {
 	delete process.env.DATABASE_URL;
 	delete process.env.CLEARANCE_CORS_ORIGINS;
 	delete process.env.CLEARANCE_BACKUP_DIR;
+	delete process.env.CLEARANCE_UPGRADE_DIR;
+	delete process.env.CLEARANCE_UPGRADE_HEALTH_URL;
 	vi.resetModules();
 });
 
@@ -31,6 +33,7 @@ describe("authenticated operational API contracts", () => {
 		process.env.CLEARANCE_OPERATOR_TOKEN = OPERATOR;
 		process.env.CLEARANCE_CORS_ORIGINS = "http://localhost:3100";
 		process.env.CLEARANCE_BACKUP_DIR = join(directory, "backups");
+		process.env.CLEARANCE_UPGRADE_DIR = join(directory, "upgrades");
 		process.env.NODE_ENV = "development";
 		headers = {
 			authorization: `Bearer ${OPERATOR}`,
@@ -81,6 +84,72 @@ describe("authenticated operational API contracts", () => {
 			});
 			expect(response.status, `${method} ${path}`).toBe(401);
 		}
+	});
+
+	it("keeps remote upgrade directories server-managed", async () => {
+		const arbitraryDirectory = join(directory, "request-selected-upgrades");
+		for (const [path, body] of [
+			["/v1/upgrades/plan", { target: "0.2.1", dir: arbitraryDirectory, dryRun: true }],
+			["/v1/upgrades/apply", { plan: "upg_test", dir: arbitraryDirectory, dryRun: true }],
+			["/v1/upgrades/verify", { plan: "upg_test", dir: arbitraryDirectory, dryRun: true }],
+			["/v1/upgrades/rollback", { plan: "upg_test", dir: arbitraryDirectory, dryRun: true }],
+			["/v1/upgrades/rollback", { plan: "upg_test", backupDir: arbitraryDirectory, dryRun: true }],
+		] as const) {
+			const response = await app.request(path, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+			});
+			expect(response.status, path).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "UPGRADE_DIRECTORY_SERVER_MANAGED" },
+			});
+		}
+		expect(existsSync(arbitraryDirectory)).toBe(false);
+
+		const configured = await app.request("/v1/upgrades/plan", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ target: "0.2.1", current: "0.1.4", dryRun: true }),
+		});
+		expect(configured.status).toBe(200);
+		expect(await configured.json()).toMatchObject({
+			operation: "upgrade.plan",
+			dryRun: true,
+			plan: { directory: process.env.CLEARANCE_UPGRADE_DIR },
+		});
+	});
+
+	it("rejects every request-selected upgrade health URL before verification", async () => {
+		for (const healthUrl of [
+			"http://127.0.0.1:3000/health",
+			"http://169.254.169.254/latest/meta-data/",
+			"http://10.0.0.8/internal",
+			"https://arbitrary.example.test/health",
+		]) {
+			const response = await app.request("/v1/upgrades/verify", {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ plan: "upg_missing", healthUrl, dryRun: true }),
+			});
+			expect(response.status, healthUrl).toBe(400);
+			expect(await response.json()).toMatchObject({
+				error: { code: "UPGRADE_HEALTH_URL_SERVER_MANAGED" },
+			});
+		}
+	});
+
+	it("fails remote upgrades closed when server storage is unconfigured", async () => {
+		delete process.env.CLEARANCE_UPGRADE_DIR;
+		const response = await app.request("/v1/upgrades/plan", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ target: "0.2.1", dryRun: true }),
+		});
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: { code: "UPGRADE_DIRECTORY_NOT_CONFIGURED" },
+		});
 	});
 
 	it("rejects normalized authorization on the JSON backend before authority access", async () => {

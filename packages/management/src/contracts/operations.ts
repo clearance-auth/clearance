@@ -892,26 +892,24 @@ export interface ManagementOperationServiceTypes {
 			| Awaited<ReturnType<typeof upgradeCheckWithDb>>;
 	};
 	"upgrades.plan": {
-		input: { target: string; dir: string; current?: string; dryRun?: boolean };
+		input: { target: string; current?: string; dryRun?: boolean };
 		output: UpgradePlanWire;
 	};
 	"upgrades.apply": {
-		input: { plan: string; dir: string; dryRun?: boolean; confirm?: boolean };
+		input: { plan: string; dryRun?: boolean; confirm?: boolean };
 		output: UpgradeApplyWire;
 	};
 	"upgrades.verify": {
-		input: { plan: string; dir: string; healthUrl?: string; dryRun?: boolean };
+		input: { plan: string; dryRun?: boolean };
 		output: UpgradeVerifyWire;
 	};
 	"upgrades.rollback": {
 		input: {
 			plan: string;
-			dir: string;
 			dryRun?: boolean;
 			confirm?: boolean;
 			restoreActive?: boolean;
 			activeDatabaseConfirmation?: string;
-			backupDir?: string;
 		};
 		output: UpgradeRollbackWire;
 	};
