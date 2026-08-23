@@ -8,7 +8,7 @@ import type { User } from "@clearance/runtime";
 import { APIError } from "@clearance/runtime/api";
 import { setSessionCookie } from "@clearance/runtime/cookies";
 import { handleOAuthUserInfo } from "@clearance/runtime/oauth2";
-import { XMLParser } from "fast-xml-parser";
+import { base64 } from "@clearance/utils/base64";
 import type { FlowResult } from "samlify/types/src/flow";
 
 import * as constants from "../constants";
@@ -27,6 +27,7 @@ import {
 } from "../saml";
 import type { SAMLConditions } from "../saml/timestamp";
 import { validateSAMLTimestamp } from "../saml/timestamp";
+import { parseSAMLXml } from "../saml/parser";
 import { parseRelayState } from "../saml-state";
 import { saml } from "../samlify";
 import type {
@@ -207,12 +208,7 @@ async function getSAMLResponseBindingContent(
  */
 function extractAssertionId(samlContent: string): string | null {
 	try {
-		const parser = new XMLParser({
-			ignoreAttributes: false,
-			attributeNamePrefix: "@_",
-			removeNSPrefix: true,
-		});
-		const parsed = parser.parse(samlContent);
+		const parsed = parseSAMLXml(samlContent) as Record<string, any>;
 
 		const response = parsed.Response || parsed["samlp:Response"];
 		const rawAssertion =
@@ -373,9 +369,22 @@ export async function processSAMLResponse(
 
 	const { extract } = parsedResponse!;
 	const samlContent = parsedResponse.samlContent;
+	const originalSamlContent = new TextDecoder().decode(
+		base64.decode(SAMLResponse),
+	);
 
-	// 10. Algorithm validation
-	validateSAMLAlgorithms(parsedResponse, options?.saml?.algorithms);
+	// 10. Resolve the authenticated assertion content once. For encrypted
+	// signed assertions, samlify verifies only after decryption, so the declared
+	// XML-DSig algorithms must be read from this decrypted, verified document.
+	const samlBindingContent = await getSAMLResponseBindingContent(sp, samlContent);
+	validateSAMLAlgorithms(
+		{
+			sigAlg: parsedResponse.sigAlg,
+			samlContent: samlBindingContent,
+			encryptionContent: originalSamlContent,
+		},
+		options?.saml?.algorithms,
+	);
 
 	// 11. Timestamp validation
 	validateSAMLTimestamp((extract as SAMLAssertionExtract).conditions, {
@@ -399,9 +408,7 @@ export async function processSAMLResponse(
 		currentCallbackPath,
 		assertionConsumerServiceUrl,
 	);
-	let samlBindingContent: string;
 	try {
-		samlBindingContent = await getSAMLResponseBindingContent(sp, samlContent);
 		validateSAMLResponseBinding(samlBindingContent, {
 			expectedAudiences,
 			expectedRecipients,
