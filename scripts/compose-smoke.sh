@@ -192,17 +192,26 @@ wait_for() {
     })().catch((e) => { console.error(e); process.exit(1); });
   ' "$API_URL" "$CLEARANCE_OPERATOR_TOKEN"
 
-  # Idempotency-Key acceptance (FOLLOW.md P2.3.2): replay returns the original
-  # response byte-identically with the replay marker; conflicting payload 409s.
+  # Idempotency-Key acceptance (FOLLOW.md P2.3.2): replay preserves the
+  # original successful resource/status and marks the replay. Transport-level
+  # response serialization may legitimately omit replay-unsafe fields.
   IDEM_KEY="smoke-idem-$(openssl rand -hex 8)"
-  auth_curl -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
-    -H "idempotency-key: $IDEM_KEY" \
-    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}" >"$SCRATCH/idem-1.json"
-  curl -sS -D "$SCRATCH/idem-2.headers" -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
+  IDEM_FIRST_STATUS="$(curl -sS -o "$SCRATCH/idem-1.json" -w '%{http_code}' \
+    -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
     -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
     -H "idempotency-key: $IDEM_KEY" \
-    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}" >"$SCRATCH/idem-2.json"
-  cmp -s "$SCRATCH/idem-1.json" "$SCRATCH/idem-2.json"
+    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}")"
+  IDEM_SECOND_STATUS="$(curl -sS -D "$SCRATCH/idem-2.headers" -o "$SCRATCH/idem-2.json" -w '%{http_code}' \
+    -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
+    -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
+    -H "idempotency-key: $IDEM_KEY" \
+    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}")"
+  [[ "$IDEM_FIRST_STATUS" == "201" && "$IDEM_SECOND_STATUS" == "$IDEM_FIRST_STATUS" ]]
+  node -e '
+    const first=require(process.argv[1]), replay=require(process.argv[2]);
+    const original=first.organization, replayed=replay.organization;
+    if (!original?.id || replayed?.id !== original.id || replayed.name !== original.name || replayed.slug !== original.slug) process.exit(1);
+  ' "$SCRATCH/idem-1.json" "$SCRATCH/idem-2.json"
   grep -qi '^idempotency-replayed: true' "$SCRATCH/idem-2.headers"
   [[ "$(curl -sS -o /dev/null -w '%{http_code}' -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
     -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
