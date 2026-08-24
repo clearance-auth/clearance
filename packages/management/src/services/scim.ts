@@ -1496,6 +1496,7 @@ export function testScimConnection(
 		}
 	}
 
+	const successTimestamp = nowIso();
 	const trace: DiagnosticTrace = {
 		id: newId("tr"),
 		correlationId: corr,
@@ -1510,7 +1511,7 @@ export function testScimConnection(
 			: "Sync applied to local store (simulation — not live directory)",
 		causeConfidence: 1,
 		owner: "application",
-		createdAt: nowIso(),
+		createdAt: successTimestamp,
 		checks: [
 			{ name: "auth.bearer", pass: true },
 			{ name: "schema", pass: true },
@@ -1525,7 +1526,7 @@ export function testScimConnection(
 		d.scimConnections[idx] = {
 			...conn,
 			status: "testing",
-			updatedAt: nowIso(),
+			updatedAt: successTimestamp,
 		};
 	});
 	recordEvent(store, {
