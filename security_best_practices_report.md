@@ -1,153 +1,299 @@
-# Clearance security review
+# Clearance exploit-focused security audit
 
-Date: 2026-08-13
+Date: 2026-08-23
 
-Scope: the working tree reviewed before remediation, followed by verification of the remediated current working tree. Coverage includes the runtime authentication core, management API and CLI operations, SSO/SAML/OIDC, SCIM, delivery worker, operator console, vault and client packages, deployment assets, and production dependency graph. No deployed environment was tested.
+Commit audited: `dd339a032c805350515011613e391bae5fc29f31`
 
-Remediation status: **complete in the current working tree**. All six confirmed findings and both conditional risks described below have code, contract, test, or dependency remediations. The detailed finding sections preserve the original vulnerable-state evidence; the remediation record below is authoritative for the current tree.
+Scope: repository source, clean release builds, packaged artifacts, local databases and services, generated output, release workflow, container build, and authorized local runtime harnesses. No shared or deployed environment was attacked.
+
+## Remediation status — 2026-08-24
+
+All confirmed findings in this report are fixed in the current worktree:
+
+- SEC-001/002: the public Node adapter now uses a canonical origin, treats forwarded authority as an explicit proxy trust decision, rejects ambiguous forwarded lists, and enforces a streaming request-size ceiling even when handlers do not consume the body.
+- SEC-003/012: OIDC and management live-conformance egress resolve, validate, and pin public addresses; redirects and oversized responses fail closed.
+- SEC-004: Operation-Key claims now precede side effects, use durable pending/completed/failed state, renew long-running leases, and generation-fence completion/failure.
+- SEC-005/006: adapter debug output is centrally sanitized; email and two-factor OTP storage defaults to versioned, purpose-separated keyed verification.
+- SEC-007: setup reservations carry per-lease fencing tokens through commit, release, and compensation.
+- SEC-008/009: release bundles use keyless Sigstore verification and release/production container bases are digest-pinned.
+- SEC-010/011: SCIM PATCH work is bounded and iterative; CLI user creation accepts passwords only through bounded stdin or a no-echo prompt.
+
+The three highest-confidence suspects are also closed: first-publication tags must be reachable from `origin/master`, telemetry additional-field reporting emits allowlisted schema metadata without defaults/callbacks, and upgrade apply/rollback hold a store-level global lock for the complete side-effect window. Direct upgrade script invocation additionally requires `flock`.
+
+The test suite was reduced from 349 to 191 files and from approximately 4,931 to 2,822 declared cases. Removed coverage was dominated by source-string assertions, exact route/count inventories, duplicate backend matrices, generated-contract repetition, and CLI subprocess permutations. Retained coverage includes authentication and tenant isolation, session credentials, OIDC/SAML/SCIM, SSRF/body limits, OTP storage, Operation-Key fencing, setup leases, release verification, CLI password handling, console CSRF/XSS, and one complete sample application workflow.
+
+The remaining sections preserve the original audit-time findings and evidence. The remediation status above records the current worktree state.
 
 ## Executive summary
 
-The review found one high-severity vulnerability, three medium-severity vulnerabilities, two low-severity vulnerabilities, and two conditional risks. I found no critical-severity vulnerability and no confirmed authentication or tenant-isolation bypass in the core runtime.
+Overall risk is **High for direct Node integrations that omit a canonical origin or upstream request-size limit**, and **Medium for the hardened first-party hosted/API deployment**.
 
-The completed fixes add a bounded console request boundary, move remote upgrade filesystem and network targets into server configuration, enforce algorithms from verified SAML XML, reject SAML DTDs and disable entity processing, normalize malformed SCIM credentials to 401, add replay-aware webhook verification, and refresh the directly actionable dependency set.
+The two highest-impact confirmed defects are in the exported Node adapter:
 
-## Remediation record
+1. An attacker-controlled `Host`/`X-Forwarded-Proto` can enter password-reset and magic-link URLs when the application omits a canonical base URL. A local full-flow proof changed the victim password and created a session after the poisoned link was followed.
+2. The same adapter has no total request-body limit. Actual unauthenticated sign-in requests accepted 2.1 MB declared and chunked bodies, consumed up to 58.8 MB additional RSS in the observed run, and continued into password hashing. Arbitrarily larger or concurrent bodies can exhaust the process.
 
-- **SEC-001 resolved:** malformed cookie encoding returns `400 MALFORMED_COOKIE`; unexpected request failures return a generic 500 or close an already-started response without producing an unhandled rejection. Console tests also prove post-error liveness.
-- **SEC-002 and SEC-005 resolved:** remote upgrade routes reject caller-supplied `dir`, `backupDir`, and `healthUrl`. The API injects `CLEARANCE_UPGRADE_DIR` and optional `CLEARANCE_UPGRADE_HEALTH_URL`, fails closed when upgrade storage is absent, and the remote contracts, generated client metadata, and CLI no longer expose those inputs. Direct local management functions retain explicit local targets.
-- **SEC-003 resolved:** after samlify verifies the signature, Clearance validates every direct Response/Assertion signature candidate it may accept. Missing, duplicate, off-path, mixed, unknown, disallowed, and deprecated signature or digest methods fail closed; matching dual signatures and supported RSA-PSS remain valid. Encrypted assertion algorithm checks follow the direct encrypted data/key chain.
-- **SEC-004 resolved:** `fast-xml-parser` resolves to 5.10.1. Application XML parsing is centralized with `processEntities: false`, and inbound login/logout SAML rejects `DOCTYPE` before samlify parsing.
-- **SEC-006 resolved:** strict Base64 and fatal UTF-8 decoding failures, malformed token shapes, and invalid credentials produce the same bounded SCIM 401 response without credential disclosure.
-- **Webhook conditional risk resolved:** `verifyWebhookRequest` authenticates exact raw bytes, enforces a five-minute default age and bounded future skew, and requires an atomic caller-provided event-ID consumer. The legacy helper remains explicitly authenticity-only for source compatibility.
-- **Dependency conditional risk resolved:** Next.js resolves to 16.3.0, clearing the reported Next, Sharp, and PostCSS advisories. Directly actionable XML parser, Hono, Nodemailer, and Google Cloud KMS dependency findings were also refreshed without blanket overrides.
+The most serious hosted-path defect is OIDC DNS-rebinding SSRF. Any signed-in user can register an orgless provider; policy DNS and the connection resolve separately, allowing the production token exchange to reach loopback after the preflight accepted a public address. A separate operator-only SSO live-conformance probe accepts private and link-local HTTPS destinations without DNS pinning.
 
-## Verification record
+Other confirmed primitives include duplicate live setup capabilities from non-atomic idempotency, stale setup-request compensation deleting a newly committed SSO/SCIM connection, session tokens entering adapter debug logs, optional email-OTP codes stored recoverably, authenticated SCIM stack exhaustion, a detached release signature with a co-distributed trust key, mutable release base images, and CLI passwords entering argv/history.
 
-- Frozen install, root build, and root typecheck passed on Node 22.23.2 and Node 24.18.0.
-- On Node 24.18.0, remediation-focused suites passed: console 62, upgrade API 16, upgrade CLI 11, webhook 15, SCIM 30, and focused SAML 79 tests (213 total). The complete SAML package suite separately passed 449 tests with 2 existing todo cases.
-- The Node 22 root suite reached 3,210 passing tests, 9 skipped, and 1 todo before two failures in pre-existing, user-owned runtime work: a trusted-device assertion in `two-factor.security.test.ts` and a PostgreSQL team-concurrency timeout. Those files were preserved and are outside this report's remediation diff.
-- `git diff --check` passed.
-- `pnpm audit --prod` improved from 35 advisories (15 high, 18 moderate, 2 low) to 6 (2 high, 4 moderate, 0 low, 0 critical). The remaining paths are Prisma development/local tooling (`fast-uri`, `@hono/node-server`, `valibot`) and Drizzle development tooling (`esbuild`); no reviewed application runtime or quickstart imports those affected development servers or utilities.
+The first-party Vault host and management API already strip forwarded headers, enforce canonical hosted origins, and bound bodies near 1 MiB. Those protections do not cover consumers that use the public `toNodeHandler()` integration directly.
 
-## Confirmed findings (resolved; vulnerable-state evidence retained)
+No confirmed cross-tenant read/write, generic SQL or command injection, arbitrary file read/write, sandbox escape, or unauthenticated authorization bypass was found.
 
-### SEC-001 — High — Malformed cookie terminates the operator console — Resolved
+## Ranked findings
 
-**CWE:** CWE-248 (Uncaught Exception), CWE-400 (Uncontrolled Resource Consumption)
+| ID | Severity | Confidence | Bug class | Exploitability | Affected surface | File and line range | Trigger/evidence | Impact | Preconditions | Fix direction |
+|---|---|---|---|---|---|---|---|---|---|---|
+| SEC-001 | High | Confirmed | Host-header poisoning / account takeover | Remote, victim or scanner follows link | Public Node auth adapter; reset and magic link | `packages/call/src/adapters/node/index.ts:6-13`; `packages/runtime/src/auth/base.ts:57-74`; `packages/runtime/src/api/routes/password.ts:138-171`; `packages/runtime/src/plugins/magic-link/index.ts:249-290,391-455` | Forged Host/XFP produced attacker-origin links; captured tokens changed password and minted a session | Persistent account takeover | Direct Node adapter; no canonical base URL; hostile Host reaches app; reset/magic flow enabled | Require canonical/allowlisted origin; explicit trusted-proxy configuration; ignore XFP by default |
+| SEC-002 | High | Confirmed | Unbounded request-body resource exhaustion | Remote, unauthenticated | Public Node auth adapter | `packages/call/src/adapters/node/index.ts:6-13`; `packages/call/src/adapters/node/request.ts:98-166`; `packages/call/src/utils.ts:5-52` | 2,097,198-byte declared and chunked sign-in bodies reached route logic; no 413; observed RSS delta up to 58.8 MB | Process OOM/CPU exhaustion and reliable availability loss | Direct Node adapter without strict upstream limit | Secure default byte limit; count actual stream bytes; deterministic 413 and connection close |
+| SEC-003 | Medium | Confirmed | SSRF through DNS rebinding | Remote, authenticated user plus controlled DNS | OIDC self-registration/callback | `packages/sso/src/routes/sso.ts:688-710,826-895,1286-1428,1693-1743`; `packages/sso/src/oidc/discovery.ts:219-265` | Preflight accepted `93.184.216.34`; production token POST connected to `127.0.0.1` for the same hostname | Private-network request primitive; internal service probing; possible data influence through OIDC parsers | Signed-in user; attacker DNS; callback completion; reachable internal service | Resolve all records, reject mixed/private answers, pin connection address, fail closed on DNS errors; separate browser origins from egress allowlist |
+| SEC-012 | Medium | Confirmed | Operator-only SSRF | Remote with bootstrap operator credential | SSO live-conformance probe | `packages/management/src/services/live-conformance.ts:95-104,197-214,311`; `packages/clearance-api/src/routes/enterprise.ts:167-190` | `https://10.0.0.1`, `https://169.254.169.254`, and `https://192.168.1.1` pass validation and reach the fetch sink | Internal HTTPS GET probing with status, timing, and JSON-shape feedback | Bootstrap operator token and persisted OIDC issuer; redirects stay disabled | Share public-address validation and address-pinned connector with SCIM; validate every discovered endpoint |
+| SEC-004 | Medium | Confirmed | Race / broken idempotency | Remote, authorized management caller; concurrency or retry | All mutable `/v1/*` routes; strongest on setup/SCIM/SSO issuance | `packages/clearance-api/src/server.ts:656-710`; `packages/management/src/services/idempotency.ts:150-204`; `packages/management/src/store/pg-store.ts:674-690,1145-1207` | Same key/body produced two 201 SSO setup links with distinct live tokens; API-key test produced distinct durable credentials | Duplicate bearer authorities, unrecoverable extra secrets, duplicate connections, poisoned canonical replay | Caller has operation permission and overlaps requests | Atomic pending claim with fingerprint, owner, lease generation; transact claim with side effect; operation IDs for secret issuers |
+| SEC-005 | Medium | Confirmed, configuration-dependent | Secret disclosure to logs | Local/log-reader after remote activity | Database adapters with `debugLogs` and legacy credential authority | `packages/core/src/db/adapter/factory.ts:94-159,904-953,1240-1277`; `packages/runtime/src/db/internal-adapter.ts:2954-3017,3929-3936` | Runtime sentinel in a legacy session row appeared verbatim in debug output | Legacy session takeover; persistence of password hashes and other secret-bearing rows in logs | Debug logging; `legacy-v1` session authority/raw-token acceptance; lower-trust log reader | Log operation/model/field names and counts only; centrally redact all values and predicates |
+| SEC-006 | Medium | Confirmed, optional plugin | Recoverable OTP at rest | Live read-only DB reader plus active challenge | Generic email-OTP plugin | `packages/runtime/src/plugins/email-otp/index.ts:36-45`; `otp-token.ts:23-45`; `routes.ts:47-85,686-830,834-913,1036-1111` | Default stores six-digit code as plaintext; public reset endpoint accepts it; unkeyed SHA-256 mode was brute-forced in 391 ms | Targeted password reset or session creation during five-minute window | Operator adds email-OTP plugin; live unexpired challenge; DB read access | Default to encryption or keyed HMAC with key outside DB; explicit unsafe opt-in for plaintext; expire legacy rows |
+| SEC-007 | Medium | Confirmed | Lease ABA / stale compensation | Remote with setup capability and timed delay | Public `/setup/sso` and `/setup/scim` | `packages/management/src/services/setup-links.ts:21-35,476-485,535-645`; `packages/clearance-api/src/server.ts:718-940`; `packages/management/src/auth-bridge.ts:2566-2616` | Replacement returned 201; stale request returned 403; reused reservation ID let stale compensation delete replacement connection | Successful SSO/SCIM setup disappears after commit; consumed capability requires recovery | Valid setup token; request A delayed beyond 120-second lease; request B completes | Unique per-lease fencing token; CAS through commit/release/compensation; block stale cleanup after adoption/redemption |
+| SEC-008 | Medium | Confirmed, scoped | Release artifact substitution | Supply chain / mirror | Detached release bundle verifier | `scripts/sign-release.sh:43-70,139-146`; `.github/workflows/release-sign.yml:603-617` | Arbitrary generated key signed replacement bundle and co-published key verified `OK`; no pinned release key/fingerprint exists | Replacement bundle/assets can pass bespoke detached verification | Attacker can replace mirror/release asset set or signing output | Pin trust root independently or use keyless signature with fixed workflow identity and issuer |
+| SEC-009 | Medium | Confirmed supply-chain exposure | Mutable build/deployment dependencies | Upstream tag compromise or unauthorized retag | Release Dockerfile and production Compose database | `Dockerfile:5,20,39,41,56`; `docker-compose.yml:14-20`; `deploy/compose/docker-compose.production.yml:17-34`; `.github/workflows/release-sign.yml:322-394` | Release consumes unpinned Node/Postgres tags, then signs resulting image digest; production Compose rendered `postgres:16-alpine` | Compromised build output or database runtime becomes a valid signed Clearance release/deployment | Upstream registry/account/tag compromise or mutable-tag change before pull/build | Pin every base and production service to reviewed multi-arch digest; verify provenance materials against allowlist |
+| SEC-010 | Medium | Confirmed | Recursive parser resource exhaustion | Remote with SCIM bearer | SCIM user PATCH | `packages/scim/src/routes.ts:1342-1406`; `packages/scim/src/patch-operations.ts:119-153` | 17,934-byte, depth-2,971 request caused `RangeError` and HTTP 500 through actual handler | Request stack exhaustion, CPU and log amplification; repeated availability degradation | Valid SCIM token and existing provider-linked user | Bound operation count, depth, node count and strings; use iterative traversal; return SCIM 400 |
+| SEC-011 | Low | Confirmed | Secret in process arguments/history | Local observer or history reader | CLI `users create` | `packages/clearance-cli/src/index.ts:213-217`; `packages/clearance-cli/src/dispatch/users.ts:32-38` | `ps -ww` and isolated zsh history contained the password sentinel | Initial user password disclosure | Operator chooses `--password`; local argv/history visibility | Remove/deprecate value flag; bounded `--password-stdin` and no-echo prompt |
 
-**Evidence:** `packages/clearance-console/src/server.js:268-290`, `packages/clearance-console/src/server.js:690-727`, `packages/clearance-console/src/server.js:928-979`, `packages/clearance-console/src/server.js:985-995`.
+## Confirmed-finding detail
 
-`parseCookies` applies `decodeURIComponent` to every cookie value without handling malformed percent escapes. Any non-public `/api/*` path calls `getSessionFromRequest` before authentication succeeds. The async HTTP listener has a `try/finally` and no `catch`, and `createServer` does not consume the returned promise.
+### SEC-001 — Host-derived reset and magic links enable account takeover
 
-**Exploit:** send a request such as `GET /api/v1/users` with `Cookie: probe=%`. No session or operator credential is required.
+**Execution path.** `toNodeHandler()` constructs the Fetch request origin from raw `X-Forwarded-Proto` and `Host`. With no canonical URL in options or supported environment variables, runtime adopts that request origin as `ctx.context.baseURL`. Password reset and magic-link handlers place their bearer credentials in URLs rooted at that base.
 
-**Impact:** one request terminates the console process under Node 22, taking the administrative UI and management proxy offline until a supervisor restarts it.
+**Minimal reproducer.** A real `http.createServer(toNodeHandler(auth))` received requests equivalent to:
 
-**Validation:** a live ephemeral console server on Node v22.23.2 exited with status 1 and an uncaught `URIError: URI malformed` originating at `server.js:289`.
+```http
+POST /api/auth/request-password-reset HTTP/1.1
+Host: capture.attacker.test
+X-Forwarded-Proto: https
+Content-Type: application/json
 
-**Remediation:** parse each cookie defensively. Catch URI decoding failures and either retain the raw value or reject the request with 400. Add a top-level request error boundary that always converts handler failures to a bounded 4xx/5xx response and never lets an async listener rejection escape.
+{"email":"victim@example.test"}
+```
 
-### SEC-002 — Medium — Operator-only SSRF through upgrade health verification — Resolved
+and:
 
-**CWE:** CWE-918 (Server-Side Request Forgery)
+```http
+POST /api/auth/sign-in/magic-link HTTP/1.1
+Host: capture.attacker.test
+X-Forwarded-Proto: https
+Content-Type: application/json
 
-**Evidence:** `packages/clearance-api/src/routes/operations.ts:192-200`, `packages/clearance-api/src/request-auth.ts:81-92`, `packages/management/src/services/upgrade.ts:83-91`, `packages/management/src/services/upgrade.ts:233-248`, `scripts/upgrade-verify.sh:69-74`.
+{"email":"victim@example.test"}
+```
 
-The remote `/v1/upgrades/verify` endpoint accepts `healthUrl`. Validation checks only that it is credential-free HTTP(S) without a query or fragment. The server then invokes `curl` against the supplied URL. Loopback, link-local, private, IPv6-local, and internal DNS destinations are accepted.
+The captured delivery URLs used `https://capture.attacker.test`. Consuming the reset token returned 200, replaced the password, and allowed sign-in. Consuming the magic token returned 200 and set a session cookie.
 
-**Exploit prerequisite:** the bootstrap operator bearer token and a valid upgrade plan state.
+**Affected configurations.** Generic/direct Node deployments with no static/dynamic `baseURL` or supported URL environment variable. A hostile Host must reach the adapter. Reset/magic delivery must be enabled, and the victim or a mail scanner must follow the link. Static `baseURL`, `CLEARANCE_URL`, strict dynamic `allowedHosts`, and the first-party Vault authority boundary block the proof.
 
-**Impact:** an operator-token holder can make the API host issue GET requests to internal services and cloud metadata addresses. The response is blind beyond success/failure, though it still permits internal service discovery and GET side effects.
+**Discovery.** Manual trust-boundary tracing followed by two independent actual-handler harnesses.
 
-**Remediation:** remove the arbitrary URL from the remote API and derive the health endpoint from server configuration. If arbitrary endpoints remain necessary, enforce an origin allowlist, reject non-public IP ranges after every DNS resolution, pin the resolved address, and keep redirects disabled.
+**Regression test.** Start the exported Node handler on an ephemeral port and exercise omitted, static, environment, dynamic-auto, dynamic-HTTPS, and rejected-host configurations. Assert both emitted origin and token usability. Verify forwarded headers affect origin only when a configured immediate proxy is trusted.
 
-### SEC-003 — Medium — SAML POST signatures bypass the configured algorithm policy — Resolved
+### SEC-002 — Exported Node adapter accepts unbounded bodies
 
-**CWE:** CWE-327 (Use of a Broken or Risky Cryptographic Algorithm)
+**Execution path.** The public wrapper cannot receive a `bodySizeLimit`. Without one, declared length becomes the ceiling regardless of magnitude. Chunked requests produce `NaN`, making the stream comparison ineffective. `request.json()` then buffers the whole body before schema validation.
 
-**Evidence:** `packages/sso/src/routes/saml-pipeline.ts:345-378`, `packages/sso/src/saml/algorithms.ts:172-207`, `packages/sso/src/saml/algorithms.ts:256-265`, `packages/sso/src/saml/algorithms.test.ts:138-156`.
+**Minimal reproducer/observed result.** Two 2,097,198-byte JSON requests were sent to `/api/auth/sign-in/email` through the built public handler:
 
-`validateSAMLAlgorithms` validates only `response.sigAlg`. In the installed `samlify` POST-binding flow, the parse result contains `samlContent` and `extract`; `sigAlg` is populated for detached SimpleSign/redirect parameters, not for an embedded XML Digital Signature. Ordinary SAML POST responses therefore reach the policy check with `sigAlg` undefined, and the validator deliberately returns early. `allowedDigestAlgorithms` is not applied to the response XML at all.
+- declared `Content-Length`: HTTP 401 after full parse and password path; 673 ms; observed peak RSS increase 58,753,024 bytes;
+- chunked: HTTP 401 after full parse; 396 ms; warm-process RSS increase 15,515,648 bytes.
 
-Cryptographic signature verification still occurs. The defect is a policy bypass: a response signed by the configured IdP certificate can use an XML `SignatureMethod` or `DigestMethod` that Clearance's default or custom policy intends to reject, including SHA-1.
+No 413 occurred. Larger and concurrent streams remain unconstrained. The management API and Vault bridge have separate streaming limits and are excluded from this finding.
 
-**Impact:** deployments cannot reliably enforce their declared SAML cryptographic baseline. Continued acceptance of SHA-1 increases exposure to weaknesses in deprecated algorithms and creates a compliance gap.
+**Discovery.** Manual source tracing plus actual public-export harness on Node 22.
 
-**Remediation:** after cryptographic verification, extract `SignatureMethod/@Algorithm` and every signed `Reference/DigestMethod/@Algorithm` from the verified signed subtree. Apply `allowedSignatureAlgorithms`, `allowedDigestAlgorithms`, and the deprecated-algorithm behavior to those exact values. Reject missing, mixed, or unknown methods.
+**Regression test.** For declared, chunked, and already-parsed Express bodies, assert `limit + 1` returns 413 before handler invocation, exactly `limit` succeeds, buffering stays bounded, and concurrent oversized requests do not grow without bound.
 
-### SEC-004 — Medium — Vulnerable XML entity expansion remains enabled in one signed-SAML parser — Resolved
+### SEC-003 — OIDC DNS validation is detached from the connection
 
-**CWE:** CWE-776 (Improper Restriction of Recursive Entity References in DTDs)
+**Execution path.** A normal signed-in user may register up to ten orgless providers and provide `skipDiscovery` endpoints. `assertEndpointResolvesPublic()` resolves once, accepts the public result, and later fetches through the global connector, which resolves again. DNS lookup failure also fails open. A trusted-origin wildcard bypasses DNS checks entirely.
 
-**Evidence:** `packages/sso/package.json:67-72`, `pnpm-lock.yaml:3681-3683`, `packages/sso/src/saml/parser.ts:3-8`, `packages/sso/src/routes/saml-pipeline.ts:208-215`, `packages/sso/src/routes/saml-pipeline.ts:274-280`, `packages/sso/src/routes/saml-pipeline.ts:517-523`.
+**Minimal reproducer/observed result.** The actual policy lookup returned `93.184.216.34`; the connector lookup for the same hostname returned `127.0.0.1`. Production authorization-code validation sent:
 
-The lockfile resolves `fast-xml-parser` 5.9.3, which is affected by [GHSA-8r6m-32jq-jx6q](https://github.com/advisories/GHSA-8r6m-32jq-jx6q); 5.10.1 is the patched release. The shared parser correctly disables entity processing, while `extractAssertionId` constructs a separate parser with the vulnerable default enabled.
+```text
+POST /token
+Authorization: Basic <attacker-provider-client-credentials>
+grant_type=authorization_code&code=attacker-code&redirect_uri=...
+```
 
-The vulnerable parser runs after `samlify` verifies the response signature, so exploitation requires control of a configured IdP signing key or another way to obtain a valid signature over the crafted XML. The 256 KiB response limit reduces raw input size and does not stop recursive entity expansion.
+to the loopback server and accepted its token JSON. Redirects remained blocked. Generic arbitrary response-body disclosure was not demonstrated.
 
-**Impact:** a malicious or compromised configured IdP can submit a compact signed SAML response that consumes excessive CPU or memory and may terminate the application process.
+**Regression test.** An injected resolver changes from public to loopback between policy and connection; assert no request reaches loopback. Add DNS failure, mixed A/AAAA, broad trusted-origin, explicit internal egress exception, token, userinfo, JWKS, and discovery cases.
 
-**Validation:** a bounded local probe against the locked 5.9.3 package showed that repeated `DOCTYPE` declarations are accepted and entities are processed with the `extractAssertionId` options; the same probe left both entities literal with `processEntities: false`.
+### SEC-012 — SSO live-conformance accepts private HTTPS endpoints
 
-**Remediation:** upgrade to `fast-xml-parser` 5.10.1 or later and set `processEntities: false` on every SAML parser. Reject any `DOCTYPE` in inbound SAML as defense in depth.
+**Execution path.** A bootstrap operator can persist an OIDC issuer and invoke the live-conformance route. `assertLiveEndpoint()` requires HTTPS and rejects textual loopback names, while private, link-local, reserved, DNS-to-private, and rebinding destinations receive no equivalent address validation. The probe fetches the accepted URL with redirects disabled and returns status/timing/JSON-shape information.
 
-### SEC-005 — Low — Remote upgrade planning accepts an arbitrary server directory — Resolved
+**Minimal reproducer/observed result.** Direct policy calls accepted `https://10.0.0.1`, `https://169.254.169.254`, and `https://192.168.1.1`. CodeQL's file-to-HTTP flow led to the source trace. The SCIM probe was checked separately and pins validated public addresses, so it is excluded.
 
-**CWE:** CWE-73 (External Control of File Name or Path)
+**Constraints.** Scoped management API keys cannot invoke this route; the bootstrap operator credential is required. Requests are HTTPS GETs, carry no application credential, and cannot follow redirects. These constraints keep severity at Medium.
 
-**Evidence:** `packages/clearance-api/src/routes/operations.ts:164-176`, `packages/clearance-api/src/request-auth.ts:81-92`, `packages/management/src/services/upgrade.ts:69-74`, `packages/management/src/services/upgrade.ts:203-220`, `scripts/upgrade-plan.sh:18-40`, `scripts/upgrade-plan.sh:104-123`.
+**Regression test.** Reject literal private/link-local/reserved addresses, DNS names with any non-public answer, IPv4-mapped forms, DNS lookup failures, and a public-to-private rebind. Assert the actual connection uses the validated address and preserves Host/SNI.
 
-The operator-only `/v1/upgrades/plan` endpoint accepts any absolute `dir`. The server passes it to a script that creates the directory recursively and writes randomly named plan and state artifacts there. Symlinks and non-directories are rejected at the final path, and existing plan files are not overwritten.
+### SEC-004 — Idempotency records are claimed after side effects
 
-**Impact:** an operator-token holder can create directories and place operational JSON artifacts anywhere writable by the API process. This can consume disk space or pollute locations consumed by other workflows. The current filenames and contents do not provide a direct arbitrary-file overwrite primitive.
+**Execution path.** Middleware reads the idempotency response, invokes the route, then inserts the completed response. PostgreSQL uniqueness applies only to the late response row. It cannot prevent both business operations.
 
-**Remediation:** ignore client-supplied directories on remote requests. Use a server-configured upgrade root and enforce realpath containment beneath it. Retain `--dir` only for the local CLI if that flexibility is required.
+**Minimal reproducer/observed result.** Two concurrent, identical `POST /v1/sso/setup-links` calls returned 201, lacked `Idempotency-Replayed`, and returned distinct capability IDs/tokens. A third replay returned the first stored response with its token deliberately omitted. A separate ten-pair API-key run created 20 durable keys.
 
-### SEC-006 — Low — Malformed SCIM bearer tokens escape as internal errors — Resolved
+**Affected paths.** Confirmed setup-link and API-key issuance; strong source-backed paths include SSO create and SCIM create without operation ID. Webhook destination uniqueness prevents duplicate rows, while a conflict response can still become canonical. Service-account credential operations have a separate operation authority and are excluded.
 
-**CWE:** CWE-248 (Uncaught Exception)
+**Regression test.** Use a barrier before handler entry with two app instances/two PostgreSQL pools. Assert one handler invocation, one side effect, deterministic response replay, different-fingerprint conflict before execution, crash-safe lease takeover, and stale-owner fencing.
 
-**Evidence:** `packages/scim/src/middlewares.ts:13-35`, `packages/utils/src/base64.ts:41-65`.
+### SEC-005 — Legacy debug adapters log credentials
 
-The SCIM authentication middleware decodes the bearer token before entering an error boundary that maps bad credentials to `SCIMAPIError`. A character outside the accepted Base64 alphabet throws a generic error from the decoder.
+The adapter factory emits complete inputs, predicates, rows, and transformed results. A memory-adapter proof with `debugLogs:true` created a session containing a sentinel and observed `debug_log_contains_secret_sentinel=true`. Legacy-v1 session lookup queries on the presented live bearer token. Current `@clearance/auth` defaults to digest-v1, which persists a non-secret session handle and hashes the live credential before lookup. Configuration defaults to false, so session takeover requires explicit debugging, legacy-v1/raw-token acceptance, and a lower-trust log reader. Secret-bearing custom/OAuth rows may expand scope, though the concrete proof covered the legacy session path.
 
-**Impact:** unauthenticated clients can turn malformed Authorization headers into 500 responses and exception logs. This is a request-level availability and observability issue; I did not find a process-level crash or authentication bypass from this path.
+Regression tests should run every adapter operation with nested credential sentinels and object-form filters, then assert the serialized log contains no value or predicate sentinel.
 
-**Remediation:** catch decoder and UTF-8/shape failures and return the same bounded 401 response used for invalid SCIM credentials. Rate-limit repeated failures without logging the token.
+### SEC-006 — Optional email OTP stores a password-reset credential recoverably
 
-## Conditional risks and dependency observations (resolved)
+The generic plugin defaults to six digits, five-minute expiry, and plaintext storage. A live DB reader can read `forget-password-otp-<email>` plus `<code>:<attempts>` and submit the exact code to `/email-otp/reset-password`. “Hashed” mode is unkeyed SHA-256 over one million possibilities; a bounded exhaustive proof recovered a sentinel in 391 ms.
 
-### Webhook verification helper permits indefinite replay — Resolved
+The product wrapper does not enable email OTP by default. Default 2FA installs OTP routes without a sender, so issuance stops before row creation. Backup-only theft must race the short expiry, and a live DB already contains legacy bearer sessions. These constraints keep severity at Medium and configuration-dependent.
 
-`packages/delivery-worker/src/webhook.ts:247-250` binds the timestamp into the HMAC and returns `true` for a valid signature of any age. There is no in-repository webhook receiver using this helper, so this is not a demonstrated first-party replay vulnerability. As a public integration primitive, it is easy for consumers to treat the boolean result as complete verification. Add a higher-level verifier that parses the timestamp, enforces a short skew window, and atomically consumes the event ID; document the existing helper as authenticity-only.
+Regression tests should prove the product defaults create no email-OTP route/challenge, optional plugin defaults persist neither plaintext nor a brute-forceable digest, encrypted/HMAC modes preserve one-time behavior, and dumps contain no recoverable active code.
 
-### The private Next.js quickstart is locked to an advisory-affected release — Resolved
+### SEC-007 — Reused setup lease identity lets stale cleanup delete a committed connection
 
-`apps/framework-quickstarts/package.json:1-18` depends on Next.js and `pnpm-lock.yaml:4229-4232` resolves 16.2.10. [GHSA-6gpp-xcg3-4w24](https://github.com/advisories/GHSA-6gpp-xcg3-4w24) affects versions before 16.2.11 under specific middleware/proxy, Turbopack, and locale conditions. The current private quickstart has no middleware/proxy or locale configuration, so I did not confirm that authorization bypass. Upgrade to 16.2.11 or later before users copy the example into a real application.
+The 120-second reservation ID is derived from the stable capability digest. Request B therefore receives the same ID after request A expires. Commit, release, and compensation cannot distinguish the lease generations.
 
-## Dependency-audit triage (post-remediation)
+An in-process HTTP proof forced A past expiry, allowed B to adopt and return 201, then resumed A. A received 403 and its stale `provisionedIsNew` state invoked compensation. The replacement connection existed after B committed and was absent after A finished, while the capability was consumed.
 
-The original `pnpm audit --prod` result was 0 critical, 15 high, 18 moderate, and 2 low advisories. Dependency refreshes reduced the current result to 0 critical, 2 high, 4 moderate, and 0 low:
+Regression testing must cover SSO and SCIM with an injected clock and PostgreSQL: A and B receive distinct fence tokens; B commits; stale A cannot commit, release, or compensate; B's runtime and management rows survive.
 
-- `fast-xml-parser` 5.10.1, Next.js 16.3.0, Hono 4.12.34, Nodemailer 9.0.5, and Google Cloud KMS 5.7.0 clear the directly actionable findings identified in this review;
-- the two remaining high findings are `fast-uri` paths nested beneath Prisma's local streams tooling;
-- three remaining moderate findings are `@hono/node-server` and `valibot` paths beneath Prisma development/local tooling;
-- the final moderate finding is `esbuild` beneath Drizzle Kit's development-server tooling.
+### SEC-008 — Detached signature authenticates against a key shipped with the signature
 
-These residual advisories are tracked dependency risk. They do not provide an application-runtime exploit path in the reviewed source, and no safe direct package refresh or blanket override was introduced solely to manipulate the audit total.
+The signing script exports `release-public.pem` next to `release-bundle.txt` and its signature. The workflow verifier reads that same key. A temp proof generated an unrelated RSA key, replaced bundle/signature/key, and `openssl dgst -verify` returned `Verified OK` with matching arbitrary-key fingerprints.
 
-## Areas reviewed without a confirmed vulnerability
+The scope is the bespoke detached bundle. npm Sigstore provenance and keyless Cosign workflow identity retain independent trust. A regression should reject an arbitrary replacement key and accept only a separately pinned fingerprint or exact keyless issuer/workflow identity.
 
-- Core session creation, rotation, revocation, cookie defaults, OAuth token authority, password reset and email-change flows, two-factor recovery, passkeys, and organization membership checks.
-- Management API bearer-token comparison, API-key expiry/revocation, scope enforcement, operator-only route gates, request body limits, idempotency handling, backup/restore validation, and CLI credential permissions.
-- OIDC discovery and callback validation, SAML signature wrapping defenses, response correlation, timestamp/audience/recipient checks, and atomic assertion replay reservation.
-- Delivery payload validation, SMTP header handling, webhook destination DNS/IP pinning, redirect refusal, log redaction, key-management providers, vault origin checks, and client request construction.
+### SEC-009 — Mutable bases enter signed release output
 
-## Completed remediation order
+The build uses `node:22-bookworm-slim` and `postgres:16-bookworm` without digests. Node `/usr/local` and the full built `/app` enter the final image; Postgres is the app/backup runtime base. The release then signs the resulting image digest, so an upstream retag present at build time becomes a valid Clearance-signed artifact. Production Compose independently renders mutable `postgres:16-alpine`.
 
-1. Fixed SEC-001 and verified malformed cookies produce a bounded response under both supported Node versions.
-2. Removed remote control over `healthUrl` and upgrade directories.
-3. Enforced SAML signature and digest algorithms from verified XML, rejected DTDs, disabled entity processing, and upgraded `fast-xml-parser`.
-4. Normalized malformed SCIM credentials to 401 responses.
-5. Added replay-aware webhook verification and refreshed the direct dependency set.
+Regression should fail any production/release `FROM` or rendered service image without `@sha256:` and compare build provenance materials to the reviewed base-digest allowlist.
+
+### SEC-010 — SCIM PATCH recursively walks attacker JSON
+
+A pathless `replace` operation accepts `z.any()` and recursively descends each object. Through the real handler on Node 26.7.0, depth 2,970 (17,928 bytes) returned a bounded 400; depth 2,971 (17,934 bytes) logged `RangeError: Maximum call stack size exceeded` and returned 500. The framework survived. The token requirement and request-scoped result constrain impact.
+
+Regression should assert maximum depth/node/operation sizes succeed, maximum+1 returns a bounded SCIM 400, query count remains bounded, and a later normal request stays healthy.
+
+### SEC-011 — CLI password flag leaks locally
+
+`users create --password` is visible in process argv and persists in normal shell history. A safe sentinel was observed by `ps -ww` and an isolated zsh history file. Password omission already creates an expiring setup token, reducing exposure. Add bounded stdin and hidden-prompt modes and test that a blocked invocation's argv contains no password sentinel.
+
+## Highest-confidence suspects at audit time
+
+All three suspects below were resolved in the current worktree as described in the remediation status.
+
+| Suspect | Confidence | Missing runtime fact | Evidence and next test |
+|---|---|---|---|
+| Privileged release on any `v*` tag commit | Medium | Live GitHub tag rules and `npm-release` environment reviewer policy | `.github/workflows/release-sign.yml:16-18,143-162,213-235` accepts a tag outside `master` in a temp-clone proof. Export live rulesets/environment policy; require `origin/master` ancestry and trusted tag authority before OIDC/publish. |
+| Telemetry includes `additionalFields.defaultValue` | High code confidence; configuration-dependent impact | Whether deployments embed secrets in additional-field defaults while telemetry is enabled | `packages/telemetry/src/detectors/detect-auth-config.ts:67-82` copies full definitions. A loopback collector received a server-only sentinel. Project allowlisted schema metadata only. |
+| Upgrade apply lacks a global execution fence | High code confidence; Medium impact uncertainty | Production supervisor/proxy concurrency and hook side effects | `packages/management/src/services/upgrade.ts:152-230` and `scripts/upgrade-apply.sh:57-162` permit concurrent backup/state/marker/hook execution. Add global lock and applying-generation state; run two processes with failure injection. |
+
+The management-client redirect behavior, SCIM list complexity, terminal-control output, backup encryption, and source-map candidates were excluded from findings after reachability review. Their demonstrated prerequisites were a malicious configured API, raised global limits, local/operator authority, pre-existing filesystem read access, or no secret-bearing content.
+
+## Architecture and trust boundaries
+
+- TypeScript ESM pnpm monorepo; supported Node 22.23.2 and 24.18.0; raw Node HTTP, Hono management API, React console, Express/Next/React quickstarts, PostgreSQL and JSON development store.
+- Public boundaries: auth handler and plugin routes, management `/v1/*`, public setup capabilities, SCIM bearer API, SAML/OIDC callbacks, console proxy, Vault host, delivery worker, webhooks, CLI/management client, and release artifacts.
+- Privileged state: users/accounts/sessions/credentials, organizations/projects/environments, SSO/SCIM connections, API keys/setup links, delivery events, KMS envelopes, upgrade/backup state, signing identities, and container registry artifacts.
+- Egress: OIDC discovery/token/userinfo/JWKS, SAML IdP, SMTP/SES, webhooks, SCIM probes, cloud KMS, registry/npm/GitHub release services.
+- Trusted enforcement: server-side session/API-key checks, management scope checks, fresh transaction reauthorization, organization/tenant predicates, Vault authority resolution, PostgreSQL locks/constraints, webhook DNS pinning/no-redirect policy, and signed release identities.
+
+## Route, authorization, tenant, and framework coverage
+
+- Reviewed 143 management operations (141 unique method/path pairs) across 13 Hono route modules, 26 conditional tenant-administration endpoints, 30 product-organization network paths, 32 core-auth endpoints, SSO's 15 method/path pairs, SCIM's 21 pairs, setup handlers, delivery replay/control, health/upgrade/backup, all 143 CLI remote mappings, three delivery-worker modes, and eight production Compose services/consumers.
+- Management authentication runs before `/v1/*` idempotency. Management and tenant mutations generally reauthorize against current state inside coordinated transactions. No object-level or cross-tenant bypass was reproduced.
+- Hosted sessions bind assurance to project/environment; the suspected cross-host cookie replay failed closed and was excluded.
+- Console middleware, CSRF/origin checks, header stripping, cache/error behavior, client/server exports, browser bundles, and static output were reviewed. No shared-cache tenant leak or DOM-XSS path was confirmed.
+- First-party Vault validates the active host/domain and removes forwarded authority headers before auth dispatch. The public adapter lacks equivalent defaults, producing SEC-001 and SEC-002.
+
+## Clients, CLI, parsers, storage, and protocol coverage
+
+- CLI token storage, config precedence, redirects, response parsing, terminal output, argv/history, retries, update/upgrade state, and downloaded artifacts were inspected. SEC-011 is the only retained CLI finding.
+- Node 22 and 24 fetch redirect matrices were exercised. Cross-origin redirects strip Authorization/Cookie; same-origin retains bearer; 307/308 preserve method/body. Current server routes do not issue these redirects, so no standalone exploit was retained.
+- Fuzzed session cookies, JWT/JWE, OAuth state, SCIM bearer, SAML XML/algorithms/binding, webhooks, OIDC responses, SCIM PATCH, and setup-lease concurrency.
+- Upload/archive/plugin/native extraction surfaces are minimal in this repository; release tarball construction, filesystem backup/upgrade scripts, temp files, symlinks, and package contents were reviewed. No traversal, archive escape, or arbitrary overwrite was confirmed.
+- SQL uses parameterized query APIs in reviewed paths. Subprocess calls use fixed executables/arguments or validated server configuration. No SQL, shell, template, or dynamic-code injection survived reachability validation.
+
+## Fuzzing and runtime validation
+
+Deterministic parser corpus: 95 adversarial cases across cookies/JWT/JWE (39), SCIM bearer (14), SAML (22), OAuth/OIDC state (7), and webhooks (13). Empty, duplicate, malformed encoding/UTF-8, truncation, oversized values, `alg:none`, expired state, DTDs, SHA-1, deep nesting, stale/future timestamps, and replay were included. No auth bypass or parser process crash was found.
+
+Focused suites passed:
+
+- JWT/bearer 126; OAuth state 7; SCIM 32; SAML structural/algorithm/binding 92; SAML forged/tampered/replay/logout 11; SAML timestamps 26; OIDC 35; webhook 15.
+- OIDC redirect refusal 5 and OIDC discovery policy 89.
+- Key management 11; delivery-worker 29 passed/13 skipped; email-OTP focused 6.
+
+Confirmed failure inputs were minimized to the SCIM depth boundary, public Node body modes, OIDC two-resolution sequence, concurrent idempotency pairs, and setup lease A/B schedule. No coverage-guided native fuzzer was available; the transformation boundaries are TypeScript and were exercised through actual exported handlers plus deterministic/property-style harnesses.
+
+## Build, test, static, dependency, and artifact record
+
+Clean source archive: `/tmp/clearance-auth-audit.Gm57Wc`, created from audited `HEAD` before dependency installation.
+
+Completed successfully:
+
+```text
+volta run --node 22.23.2 -- pnpm install --frozen-lockfile
+volta run --node 22.23.2 -- pnpm build
+volta run --node 24.18.0 -- pnpm build
+volta run --node 22.23.2 -- pnpm typecheck
+volta run --node 24.18.0 -- pnpm typecheck
+codeql database create /tmp/clearance-codeql-db-20260823 --language=javascript-typescript --source-root=/tmp/clearance-auth-audit.Gm57Wc
+codeql database analyze /tmp/clearance-codeql-db-20260823 codeql/javascript-queries:codeql-suites/javascript-security-and-quality.qls --format=sarif-latest --output=/tmp/clearance-codeql-20260823.sarif --threads=0
+```
+
+Tool versions: Node 22.23.2 and 24.18.0; pnpm 11.1.1; CodeQL CLI 2.26.3; JavaScript query pack 2.4.3; Docker client 29.4.3/server 29.2.1; Docker Scout 1.21.0.
+
+CodeQL scanned 1,191/1,196 JS/TS files and all 16 GitHub Actions files with 203 security-and-quality queries. It emitted 139 results. Manual triage confirmed SEC-012. Test/generated-only reports, configuration regexes, bounded metadata paths, evenly distributed 32-character device codes, SCIM's pinned connector, and results dominated by existing controls were excluded. One generated logger module had a parse diagnostic; its TypeScript source was extracted.
+
+The first full Node 22 test attempt collided on port 8080 with an audit fixture and was invalid. The isolated rerun reached 3,196 passed, 9 skipped, 1 todo and 16 external-database concurrency failures across 9 files while CodeQL and the OCI build consumed the same local services. A fresh grouped rerun of all 15 DB-consuming files passed 13 files and 109/111 tests; the two residual schema-lifecycle files then passed singly and together (6/6). Every initially failing file passed in an isolated low-contention rerun. A final all-files serial attempt was abandoned before Vitest when disposable MySQL/MariaDB startup failed during unrelated host load.
+
+`pnpm audit --prod --json` reported 0 critical, 3 high, 4 moderate, 0 low across 628 production/optional dependencies. The highs and moderates are reachable only through optional Prisma/Drizzle local CLI/development internals in the reviewed graph; no application request path was demonstrated, so they are not findings.
+
+Semgrep, gitleaks, Trivy, OSV-Scanner, Syft, Grype, and govulncheck were unavailable. A redacted custom provider-pattern scan covered 4,827 unique Git blobs and release payloads. Matches were examples, local/test URLs, parser constants, or test fixtures; no recognizable live credential was found. Unknown-format/high-entropy secret coverage remains incomplete.
+
+Packaging inspection covered 12 canonical release packages and 215 files. No raw TS/TSX/JSX, hidden files, absolute build paths, credential content, or privileged server import was present in those public payloads. A browser bundle sentinel test produced 0 secret hits. The bespoke CycloneDX file lists only 4 of 12 public packages and little dependency closure; this is an assurance defect, with no direct exploit path proven.
+
+## CI, release, deployment, and runtime hardening
+
+- GitHub Actions are commit-SHA pinned; npm provenance and Cosign verify fixed repository/workflow identities and immutable artifact digests.
+- SEC-008 applies only to the detached custom bundle. SEC-009 applies before immutable signing, when mutable bases enter the release build, and to production Compose's mutable Postgres pull.
+- Production Compose binds public services to loopback by default; Helm ingress defaults off and network policy defaults on. Secrets remain deployment inputs rather than checked-in values.
+- OCI coverage is incomplete. The first build failed with a registry-layer EOF and stopped Colima. After restart, the second build ran about 8m43s, ended without producing `clearance-auth-audit:dd339a0`, and Colima's socket/context disappeared again. Image history, actual layers/packages, effective contents, and Scout CVEs were therefore not inspected. Source review confirms non-root UID/GID 10001, no build-secret ARG/ENV, a full `/app` copy from the dev-dependency build tree, and mutable bases; actual layer inclusion remains unverified.
+- Runtime sanitizer tooling has no direct TypeScript/Node equivalent in this repository. Strict compilation, two Node runtimes, actual handler harnesses, database concurrency tests, and bounded memory observations supplied the runtime evidence. Native Go/Python/Rust verifier SDK execution remains a coverage gap.
+
+## Unexercised areas and next highest-value targets
+
+1. Live GitHub tag rules, protected environment reviewers, registry referrers, npm publication, and KMS signing identities were outside repository/local authority. Export and audit them before release.
+2. Live AWS/GCP KMS, external SAML/OIDC providers, SMTP/SES, webhook receivers, and cloud metadata networks were not contacted. Use dedicated test accounts and egress-captured environments.
+3. PostgreSQL idempotency exactly-once behavior was source-proven and JSON-handler reproduced; a two-process, two-pool PostgreSQL barrier test remains the highest-value regression.
+4. CodeQL missed 5 JS/TS files and diagnosed one generated parse error. Add the query pack to CI and scan source-only plus built output separately.
+5. Semgrep, dedicated secret scanner, container CVE scanner, and coverage-guided fuzzing were unavailable or pending. Add pinned tool versions and repository-specific queries for exported adapters, outbound URL policy, capability lease fencing, and one-time-secret persistence.
+6. Repeat the complete Node 24 test command under low contention. Its upstream suites passed, while the final parallel API/CLI stage timed out; both affected packages passed immediately afterward when run sequentially.
+
+## Remediation priority
+
+1. Fix SEC-001 and SEC-002 at the exported Node boundary; add secure defaults that direct consumers inherit.
+2. Pin OIDC connections to validated addresses and disable user self-registration where unused.
+3. Replace idempotency and setup reservations with durable, generation-fenced claims.
+4. Redact adapter debug logs and protect optional OTP material with keyed/encrypted storage.
+5. Anchor release verification to an independent identity and pin every release/deployment image digest.
+6. Bound SCIM nested work and remove CLI password values from argv.
+
+## Final verification addendum
+
+- CodeQL source triage confirmed SEC-012 and rejected the remaining requested-class alerts with source/runtime evidence: SCIM pins its validated address; the device-code alphabet has exactly 32 symbols and maps 256 bytes evenly; unexpected router errors return an empty 500; cookie `__proto__` assignment does not alter the request-object prototype; flagged slash regexes consume configuration only; runtime-audit strings are capped; and rate-limit alerts were sample/test routes.
+- All 15 external-database runtime test files passed in the grouped-plus-isolated audit verification. After remediation and pruning, the complete Node 22 test command passed. The complete Node 24 command passed its upstream suites and timed out in the final parallel API/CLI stage; sequential reruns passed 27/27 API tests and 34/34 CLI tests.
+- Both OCI attempts failed in the local Colima runtime, so no claim is made that container build, layer scan, Scout scan, or runtime launch passed.
+- `git diff --check -- security_best_practices_report.md` passed at final verification. Application source, tests, configuration, and user-owned concurrent edits were preserved.

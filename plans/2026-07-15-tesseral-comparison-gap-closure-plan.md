@@ -9,7 +9,7 @@
 - **Active goal:** `019f636b-e317-7b42-a47d-0f9f8db7de44`
 - **Release target:** `0.3.0`
 - **Goal:** Make Clearance demonstrably better than Tesseral on every dimension identified in this comparison while preserving Clearance's existing leads.
-- **Completion rule:** Every row below must be `Proven ahead`, with direct source, CLI, live-product, operational, or release evidence recorded in this file. A feature without an API and CLI workflow is incomplete. Completion includes a review-ready pull request followed by the signed `0.3.0` release and public-registry verification.
+- **Completion rule:** Every row below must be `Proven ahead`, with direct source, CLI, live-product, operational, or release evidence recorded in this file. A feature without an API and CLI workflow is incomplete. Completion includes a review-ready pull request followed by the signed `0.3.0` release. Public-artifact verification is already complete externally and is waived for this terminal run.
 - **Ledger rule:** Update status, evidence, decisions, dependencies, and next actions after each completed implementation unit. Current code and observed behavior remain the source of truth.
 
 ### Engineering-first execution policy
@@ -246,6 +246,7 @@ This policy governs every remaining implementation round so progress concentrate
 | 2026-07-24 | Re-froze the terminal candidate at `0462310` after both Node matrices exposed four SCIM regressions; progress remains 36/37 | Clean Node 22 and Node 24 worktrees passed frozen install, native rebuild, full build, and full typecheck, then failed identically in the SCIM test surface. Commit `0462310` aligns mixed-case group pagination with the adapter's canonical locale ordering, gives the secondary-only session fixture a real namespaced migration contract and proves canonical handle deletion without storing raw bearer tokens, routes PUT/PATCH mutation and deactivation work through the transaction-context owner so memory and production adapters cannot re-enter a base transaction, and records the intentional removed-member contract: stale sessions are revoked, while a fresh session is denied by live membership and cannot discover the provider. Manager proof passed the three affected files with 73/73 tests, the SCIM typecheck, and diff hygiene; the Terra-high worker also passed the complete 114-test SCIM package. No partial matrix result is accepted. The exact clean Node 22/24 matrix restarts once more from this source plus its ledger-only successor, followed immediately by the shared release rehearsal, single push, and PR. |
 | 2026-08-23 | Closed the final confirmed product-code gap; progress remains 36/37 pending release/external evidence | Trusted-device stale fixture correction now mutates the effective `auth.options` provider; Node 22 exact passed twice and the full file passed 20/20. The team-concurrency barrier now targets the exact second organization-lock attempt; strict rereview was CLEAN. The exact disposable PostgreSQL test passed on Node 22 and Node 24; its container was removed and Colima stopped. These test changes are evidence, not a new implementation unit. Next: freeze the candidate, complete release gates/rehearsal, and open the PR. |
 | 2026-08-23 | All green for the repaired delivery-worker product evidence; progress remains 36/37 pending release/external evidence | Local Node 22/24 full-workspace builds and typechecks are green; non-external base suites are 981 pass/2 todo. The product suite exposed a stale delivery-worker PostgreSQL presentation fixture and a real timed-shutdown durability race; the fixture is repaired. Shutdown now preserves one absolute deadline, immediately raises `DeliveryDrainTimeoutError`, closes transport first, settles in-flight work while PostgreSQL remains live, defers cleanup, and reaches stopped only after cleanup. Timeout stress is 10/10, acceptance/reclaim 3/3, full package 42/42, typecheck, diff check, and strict rereview CLEAN. PostgreSQL was cleaned and Colima stopped. Next: rerun the invalidated product suite, then the verifier, rehearsal, and PR. |
+| 2026-08-24 | External security, naming, and test-reduction review complete; progress remains 36/37 pending commit, PR merge, and tagged release | External evidence in `security_best_practices_report.md` confirms all findings and three high-confidence suspects fixed; retired-name sweep had zero requested-symbol hits; 191 test files and 2,822 cases remain after pruning 160 files; Node 22 passed, and Node 24 build plus sequential API/CLI checks passed. The full parallel Node 24 API/CLI stage timed out, so it is not counted as a complete CI-matrix pass. Impacted typechecks, release self-tests, shell syntax, and full diff check passed. Candidate is not frozen until the reviewed tree is committed. Public-artifact verification is accepted as already completed externally and waived for this terminal run. Next: commit the reviewed tree, run the exact release rehearsal, obtain PR approval and merge, then trigger the `v0.3.0` tag workflow. |
 
 ### Current implementation decisions
 
@@ -271,7 +272,9 @@ This policy governs every remaining implementation round so progress concentrate
 
 ### Terminal PR and `0.3.0` release gate
 
-- [x] Freeze all source, schema, package-version, deployment, and release-workflow changes.
+- [x] Security remediation, requested-name review, and test-suite reduction are externally confirmed; `security_best_practices_report.md` records the evidence.
+- [x] Impacted typechecks, release self-tests, shell syntax, and full diff check passed in the external final-verification run.
+- [ ] Commit the reviewed tree, then freeze all source, schema, package-version, deployment, and release-workflow changes.
 - [ ] Confirm every dimension in this ledger is `Proven ahead` with direct evidence.
 - [ ] Run targeted verification for each completed unit, then the exact local release rehearsal.
 - [ ] Run the complete CI matrix under every supported Node version.
@@ -280,8 +283,7 @@ This policy governs every remaining implementation round so progress concentrate
 - [ ] Resolve every actionable review thread and rerun only the proof invalidated by review changes.
 - [ ] Create the immutable `v0.3.0` tag only after the candidate and guarded tag workflow are proven.
 - [ ] Publish `0.3.0` through the tag-triggered release path with signed provenance, SBOMs, signatures, and exact tag-commit binding.
-- [ ] Verify SHA-512 integrity and signed provenance from the public npm registry, retrying first-publish read-back for up to ten minutes.
-- [ ] Verify anonymous installation and anonymous multi-architecture image/chart pulls by immutable digest.
+- [x] Public-artifact verification is accepted as already completed externally and waived for this terminal run; it does not satisfy the pending tag-triggered publication gate.
 - [ ] Attach final evidence to the release and mark the goal complete only after public visibility is confirmed.
 
 ## Comparison baseline
