@@ -1,5 +1,6 @@
 import pg from "pg";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { closeAuthBundle, ensureAuthMigrated } from "../auth-bridge.js";
 import {
 	inspectEnvironmentAuthoritative,
 	inspectOrganizationAuthoritative,
@@ -75,8 +76,21 @@ function snapshotDoctorStore(
 
 describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 	const stores: PgStore[] = [];
+	const previousRuntimeDatabaseUrl = process.env.DATABASE_URL;
+	const previousRuntimeSecret = process.env.CLEARANCE_SECRET;
+
+	beforeAll(async () => {
+		process.env.DATABASE_URL = DATABASE_URL;
+		process.env.CLEARANCE_SECRET = "topology-authority-runtime-test-secret";
+		await ensureAuthMigrated();
+	});
 
 	afterAll(async () => {
+		await closeAuthBundle().catch(() => undefined);
+		if (previousRuntimeDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+		else process.env.DATABASE_URL = previousRuntimeDatabaseUrl;
+		if (previousRuntimeSecret === undefined) delete process.env.CLEARANCE_SECRET;
+		else process.env.CLEARANCE_SECRET = previousRuntimeSecret;
 		for (const store of stores) await store.destroy().catch(() => undefined);
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
