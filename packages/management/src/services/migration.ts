@@ -286,15 +286,15 @@ function checkpointManagementState(
 	const membershipIds = new Set(created.memberships);
 	return {
 		management: {
-			users: store.snapshot.principals.filter((principal) => userIds.has(principal.id)).map((principal) => ({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), updatedAt: principal.updatedAt })),
-			organizations: store.snapshot.organizations.filter((organization) => organizationIds.has(organization.id)).map((organization) => ({ id: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, name: organization.name, slug: organization.slug, status: organization.status, ...(organization.externalId ? { externalId: organization.externalId } : {}), updatedAt: organization.updatedAt })),
-			memberships: store.snapshot.memberships.filter((membership) => membershipIds.has(membership.id)).map((membership) => ({ id: membership.id, organizationId: membership.organizationId, principalId: membership.principalId, role: membership.role, status: membership.status, source: membership.source, updatedAt: membership.updatedAt })),
+			users: store.snapshot.principals.filter((principal) => userIds.has(principal.id)).map((principal) => ({ id: principal.id, projectId: principal.projectId, environmentId: principal.environmentId, email: principal.email, name: principal.name, status: principal.status, ...(principal.externalId ? { externalId: principal.externalId } : {}), createdAt: principal.createdAt, updatedAt: principal.updatedAt })),
+			organizations: store.snapshot.organizations.filter((organization) => organizationIds.has(organization.id)).map((organization) => ({ id: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, name: organization.name, slug: organization.slug, status: organization.status, ...(organization.externalId ? { externalId: organization.externalId } : {}), createdAt: organization.createdAt, updatedAt: organization.updatedAt })),
+			memberships: store.snapshot.memberships.filter((membership) => membershipIds.has(membership.id)).map((membership) => ({ id: membership.id, organizationId: membership.organizationId, principalId: membership.principalId, role: membership.role, status: membership.status, source: membership.source, createdAt: membership.createdAt, updatedAt: membership.updatedAt })),
 		},
 		runtime: { users: [], organizations: [], memberships: [] },
 	};
 }
 
-export function runMigration(store: ManagementStore, planId: string, fixture: LegacyExportFixture, opts: { dryRun?: boolean } = {}): MigrationPlan {
+export function applyMigration(store: ManagementStore, planId: string, fixture: LegacyExportFixture, opts: { dryRun?: boolean } = {}): MigrationPlan {
 	const plan = migrationStatus(store, planId);
 	if (plan.source !== "legacy" || plan.fixtureChecksum !== fixtureChecksum(fixture)) throw new ClearanceError({ code: "CLEARANCE_IMPORT_CHECKPOINT_MISMATCH", message: "Fixture does not match this migration checkpoint", stage: "import.legacy.run", remediation: "Use the original fixture for this migration, or create a new import." });
 	assertMigrationRunnable(plan, "import.legacy.run");
@@ -405,7 +405,7 @@ export function rollbackMigration(store: ManagementStore, planId: string, fixtur
 		if (dependentMembership) rollbackStateConflict("membership", dependentMembership.id);
 		const dependentSession = data.sessions.find((session) => userIds.has(session.principalId));
 		if (dependentSession) rollbackStateConflict("user", dependentSession.principalId);
-		const dependentOrganizationId = data.identityConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.directoryConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.roles.find((role) => role.organizationId && organizationIds.has(role.organizationId))?.organizationId ?? data.setupLinks.find((link) => organizationIds.has(link.organizationId))?.organizationId;
+		const dependentOrganizationId = data.ssoConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.scimConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.roles.find((role) => role.organizationId && organizationIds.has(role.organizationId))?.organizationId ?? data.setupLinks.find((link) => organizationIds.has(link.organizationId))?.organizationId;
 		if (dependentOrganizationId) rollbackStateConflict("organization", dependentOrganizationId);
 		data.memberships = data.memberships.filter((membership) => !membershipIds.has(membership.id));
 		data.principals = data.principals.filter((principal) => !userIds.has(principal.id));

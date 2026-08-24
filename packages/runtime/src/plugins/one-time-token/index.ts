@@ -6,10 +6,15 @@ import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import * as z from "zod";
 import { sessionMiddleware } from "../../api";
-import { setSessionCookie } from "../../cookies";
+import { setSessionCookie, splitSetCookieHeader } from "../../cookies";
 import { generateRandomString } from "../../crypto";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import type { Session, User } from "../../types";
 import { PACKAGE_VERSION } from "../../version";
 import { defaultKeyHasher } from "./utils";
@@ -74,6 +79,42 @@ const verifyOneTimeTokenBodySchema = z.object({
 	}),
 });
 
+type CookieHeaderScope = GenericEndpointContext & {
+	responseHeaders?: Headers;
+};
+
+function responseCookieHeaders(ctx: GenericEndpointContext) {
+	const scoped = ctx as CookieHeaderScope;
+	const headers = new Set<Headers>();
+	if (scoped.responseHeaders) headers.add(scoped.responseHeaders);
+	if (scoped.context.responseHeaders) headers.add(scoped.context.responseHeaders);
+	return headers;
+}
+
+function snapshotResponseCookies(ctx: GenericEndpointContext) {
+	return new Map(
+		[...responseCookieHeaders(ctx)].map((headers) => [
+			headers,
+			typeof headers.getSetCookie === "function"
+				? headers.getSetCookie()
+				: splitSetCookieHeader(headers.get("set-cookie") || ""),
+		]),
+	);
+}
+
+function restoreResponseCookies(
+	ctx: GenericEndpointContext,
+	snapshot: Map<Headers, string[]>,
+) {
+	const headers = new Set([...snapshot.keys(), ...responseCookieHeaders(ctx)]);
+	for (const responseHeaders of headers) {
+		responseHeaders.delete("set-cookie");
+		for (const cookie of snapshot.get(responseHeaders) || []) {
+			responseHeaders.append("set-cookie", cookie);
+		}
+	}
+}
+
 export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 	const opts = {
 		storeToken: "plain",
@@ -107,11 +148,16 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 			: generateRandomString(32);
 		const expiresAt = new Date(Date.now() + (opts?.expiresIn ?? 3) * 60 * 1000);
 		const storedToken = await storeToken(c, token);
-		await c.context.internalAdapter.createVerificationValue({
-			value: session.session.token,
-			identifier: `one-time-token:${storedToken}`,
+		const identifier = `one-time-token:${storedToken}`;
+		await createInternalVerificationChallenge(
+			c.context.internalAdapter,
+			{ purpose: "one-time-token", subject: identifier },
+			{
+				value: session.session.token,
+				identifier,
 			expiresAt,
-		});
+			},
+		);
 		return token;
 	}
 
@@ -176,34 +222,68 @@ export const oneTimeToken = (options?: OneTimeTokenOptions | undefined) => {
 				async (c) => {
 					const { token } = c.body;
 					const storedToken = await storeToken(c, token);
-					// Atomically burn the single-use record before issuing a session,
-					// so two concurrent redemptions of the same token resolve to one
-					// success. A null return means missing or expired (already burned).
-					const verificationValue =
-						await c.context.internalAdapter.consumeVerificationValue(
-							`one-time-token:${storedToken}`,
-						);
-					if (!verificationValue) {
-						throw c.error("BAD_REQUEST", {
-							message: "Invalid token",
-						});
-					}
-					const session = await c.context.internalAdapter.findSession(
-						verificationValue.value,
+					const identifier = `one-time-token:${storedToken}`;
+					// Commit the challenge consumption independently from source-session
+					// authority. Throwing within this transaction would roll the challenge
+					// back when the source is no longer usable, making the token reusable.
+					const redemption = await runWithTransaction(
+						c.context.adapter,
+						async () => {
+							const verificationValue =
+								await consumeInternalVerificationChallenge(
+									c.context.internalAdapter,
+									{
+										purpose: "one-time-token",
+										subject: identifier,
+										identifier,
+									},
+								);
+							if (!verificationValue) {
+								return { kind: "invalid-token" } as const;
+							}
+							let found: Awaited<
+								ReturnType<typeof c.context.internalAdapter.findSession>
+							>;
+							try {
+								found = await c.context.internalAdapter.findSession(
+									verificationValue.value,
+								);
+							} catch (error) {
+								return { kind: "authority-error", error } as const;
+							}
+							if (!found) {
+								return { kind: "session-not-found" } as const;
+							}
+							if (found.session.expiresAt < new Date()) {
+								return { kind: "session-expired" } as const;
+							}
+							return { kind: "success", session: found } as const;
+						},
 					);
-					if (!session) {
-						throw c.error("BAD_REQUEST", {
-							message: "Session not found",
-						});
+					if (redemption.kind === "authority-error") {
+						throw redemption.error;
 					}
+					if (redemption.kind === "invalid-token") {
+						throw c.error("BAD_REQUEST", { message: "Invalid token" });
+					}
+					if (redemption.kind === "session-not-found") {
+						throw c.error("BAD_REQUEST", { message: "Session not found" });
+					}
+					if (redemption.kind === "session-expired") {
+						throw c.error("BAD_REQUEST", { message: "Session expired" });
+					}
+					const session = redemption.session;
 					if (!opts?.disableSetSessionCookie) {
-						await setSessionCookie(c, session);
-					}
-
-					if (session.session.expiresAt < new Date()) {
-						throw c.error("BAD_REQUEST", {
-							message: "Session expired",
-						});
+						// setSessionCookie publishes the credential before potentially fallible
+						// cache versioning and account-cookie work. Restore the prior cookies if
+						// that publication fails so an error response cannot carry credentials.
+						const cookieSnapshot = snapshotResponseCookies(c);
+						try {
+							await setSessionCookie(c, session);
+						} catch (error) {
+							restoreResponseCookies(c, cookieSnapshot);
+							throw error;
+						}
 					}
 
 					return c.json(session);

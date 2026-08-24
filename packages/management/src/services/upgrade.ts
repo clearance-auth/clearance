@@ -5,6 +5,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ClearanceError } from "./errors.js";
+import type { ManagementStore } from "../store/types.js";
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +41,7 @@ export interface UpgradeOptions {
 	restoreActive?: boolean;
 	confirm?: string;
 	backupDir?: string;
+	store?: ManagementStore;
 }
 
 interface UpgradePlan {
@@ -225,7 +227,10 @@ export async function applyUpgrade(opts: UpgradeOptions) {
 	const artifacts = await readArtifacts(opts.plan ?? "", dir, "upgrade.apply");
 	if (opts.dryRun) return { ...planResult(artifacts.plan, artifacts.state, artifacts.planPath, true), operation: "upgrade.apply", wouldRun: ["preflight", "verified_backup", "version_hook"] };
 	if (!opts.yes) throw upgradeError("UPGRADE_APPLY_CONFIRMATION_REQUIRED", "upgrade apply requires --yes.", "upgrade.apply", "Review the plan or run upgrade apply with --dry-run, then rerun with --yes to apply.");
-	await runScript("apply", ["--plan", artifacts.planPath, "--dir", dir], "upgrade.apply");
+	if (!opts.store) {
+		throw upgradeError("UPGRADE_LOCK_UNAVAILABLE", "Upgrade execution requires a management store lock.", "upgrade.apply", "Retry through a configured Clearance management API or CLI.");
+	}
+	await opts.store.withUpgradeLock(() => runScript("apply", ["--plan", artifacts.planPath, "--dir", dir], "upgrade.apply"));
 	const result = await readArtifacts(artifacts.planPath, dir, "upgrade.apply");
 	return { schemaVersion: "v1", operation: "upgrade.apply", dryRun: false, plan: { id: result.plan.planId, targetVersion: result.plan.targetVersion, status: result.state.status, backupId: result.state.backupId ?? null, rollbackReference: result.state.rollbackReference ?? null } };
 }
@@ -282,7 +287,10 @@ export async function rollbackUpgrade(opts: UpgradeOptions) {
 		scriptArgs.push("--restore-active", "--confirm", opts.confirm);
 		if (opts.backupDir) scriptArgs.push("--backup-dir", safeDirectory(opts.backupDir, "upgrade.rollback"));
 	}
-	await runScript("rollback", scriptArgs, "upgrade.rollback");
+	if (!opts.store) {
+		throw upgradeError("UPGRADE_LOCK_UNAVAILABLE", "Upgrade execution requires a management store lock.", "upgrade.rollback", "Retry through a configured Clearance management API or CLI.");
+	}
+	await opts.store.withUpgradeLock(() => runScript("rollback", scriptArgs, "upgrade.rollback"));
 	const result = await readArtifacts(artifacts.planPath, dir, "upgrade.rollback");
 	const receiptPath = opts.restoreActive
 		? result.state.rollbackReceipt

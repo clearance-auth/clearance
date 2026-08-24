@@ -1,4 +1,5 @@
 import type { ClearanceOptions } from "@clearance/core";
+import { getAuthTables } from "@clearance/core/db";
 import type {
 	AdapterFactoryCustomizeAdapterCreator,
 	AdapterFactoryOptions,
@@ -6,7 +7,11 @@ import type {
 	DBAdapterDebugLogOption,
 	Where,
 } from "@clearance/core/db/adapter";
-import { createAdapterFactory } from "@clearance/core/db/adapter";
+import {
+	createAdapterFactory,
+	initGetFieldName,
+	initGetModelName,
+} from "@clearance/core/db/adapter";
 import type { ClientSession, Db, MongoClient } from "mongodb";
 import { ObjectId, UUID } from "mongodb";
 import {
@@ -19,6 +24,171 @@ import {
 	insensitiveNotIn,
 	insensitiveStartsWith,
 } from "./query-builders";
+
+const CREDENTIAL_AUTHORITY_MODELS = new Set([
+	"securityMigration",
+	"sessionCredential",
+	"oauthAccessToken",
+]);
+
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
+
+function createIfAbsentAttemptMatches(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (left instanceof ObjectId && right instanceof ObjectId) {
+		return left.equals(right);
+	}
+	if (left instanceof UUID && right instanceof UUID) {
+		return left.toString() === right.toString();
+	}
+	return false;
+}
+
+const PASSKEY_AUTHORITY_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+	user: new Set(["passkeyUserHandle"]),
+	passkey: new Set(["credentialID"]),
+	passkeyChallenge: new Set(["digestId"]),
+};
+
+function isCredentialAuthorityUniqueField(
+	options: ClearanceOptions,
+	model: string,
+	field: string,
+): boolean {
+	if (CREDENTIAL_AUTHORITY_MODELS.has(model)) return true;
+	if (!options.plugins?.some((plugin) => plugin.id === "passkey")) return false;
+	return PASSKEY_AUTHORITY_FIELDS[model]?.has(field) === true;
+}
+
+function mongoPartialIndexType(
+	options: ClearanceOptions,
+	field: {
+		type: unknown;
+		references?: { field: string } | undefined;
+	},
+): string {
+	if (field.references?.field === "id") {
+		if (typeof options.advanced?.database?.generateId === "function") {
+			return "string";
+		}
+		return options.advanced?.database?.generateId === "uuid"
+			? "binData"
+			: "objectId";
+	}
+	if (field.type === "number") return "number";
+	if (field.type === "boolean") return "bool";
+	if (field.type === "date") return "date";
+	return "string";
+}
+
+function sameSingleFieldIndex(
+	key: Record<string, unknown> | undefined,
+	fieldName: string,
+): boolean {
+	if (!key) return false;
+	const entries = Object.entries(key);
+	return entries.length === 1 && entries[0]?.[0] === fieldName && entries[0][1] === 1;
+}
+
+async function ensureCredentialAuthorityIndexes(
+	db: Db,
+	options: ClearanceOptions,
+	usePlural: boolean,
+): Promise<void> {
+	const schema = getAuthTables(options);
+	const getModelName = initGetModelName({ schema, usePlural });
+	const getFieldName = initGetFieldName({ schema, usePlural });
+
+	for (const [model, table] of Object.entries(schema)) {
+		const collection = db.collection(getModelName(model));
+		for (const [field, attributes] of Object.entries(table.fields)) {
+			if (
+				attributes.unique !== true ||
+				!isCredentialAuthorityUniqueField(options, model, field)
+			) {
+				continue;
+			}
+			const fieldName = getFieldName({ model, field });
+			const name = `clearance_${model}_${field}_unique_v1`;
+			const partialFilterExpression =
+				attributes.required === false
+					? {
+							[fieldName]: {
+								$type: mongoPartialIndexType(options, attributes),
+							},
+						}
+					: undefined;
+
+			let existing: Array<{
+				name?: string | undefined;
+				key?: Record<string, unknown> | undefined;
+				unique?: boolean | undefined;
+				partialFilterExpression?: Record<string, unknown> | undefined;
+			}> = [];
+			try {
+				existing = await collection.listIndexes().toArray();
+			} catch (error) {
+				if (
+					!(error instanceof Error) ||
+					!("codeName" in error) ||
+					(error as Error & { codeName?: string }).codeName !==
+						"NamespaceNotFound"
+				) {
+					throw error;
+				}
+			}
+
+			const hasRequiredIndex = existing.some(
+				(index) =>
+					index.unique === true &&
+					sameSingleFieldIndex(index.key, fieldName) &&
+					JSON.stringify(index.partialFilterExpression) ===
+						JSON.stringify(partialFilterExpression),
+			);
+			if (hasRequiredIndex) continue;
+
+			const sameName = existing.find((index) => index.name === name);
+			if (sameName) await collection.dropIndex(name);
+
+			await collection.createIndex(
+				{ [fieldName]: 1 },
+				{
+					name,
+					unique: true,
+					...(partialFilterExpression ? { partialFilterExpression } : {}),
+				},
+			);
+
+			const installed = (await collection.listIndexes().toArray()).find(
+				(index) => index.name === name,
+			);
+			if (
+				!installed?.unique ||
+				!sameSingleFieldIndex(installed.key, fieldName) ||
+				JSON.stringify(installed.partialFilterExpression) !==
+					JSON.stringify(partialFilterExpression)
+			) {
+				throw new Error(
+					`MongoDB credential authority index ${name} was not installed with the required uniqueness contract`,
+				);
+			}
+			for (const index of existing) {
+				if (
+					index.name !== "_id_" &&
+					index.name !== name &&
+					sameSingleFieldIndex(index.key, fieldName)
+				) {
+					await collection.dropIndex(index.name!);
+				}
+			}
+		}
+	}
+}
 
 class MongoAdapterError extends Error {
 	constructor(
@@ -346,6 +516,31 @@ export const mongodbAdapter = (
 					const insertedData = { _id: res.insertedId.toString(), ...values };
 					return insertedData as any;
 				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data: values,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					const result = await db.collection(model).findOneAndUpdate(
+						{ [uniqueBy.field]: uniqueBy.value },
+						{ $setOnInsert: values },
+						{
+							session,
+							upsert: true,
+							returnDocument: "after",
+							includeResultMetadata: true,
+						},
+					);
+					const row = (result as any)?.value ?? null;
+					return row &&
+						createIfAbsentAttemptMatches(
+							row[attemptBy.field],
+							attemptBy.value,
+						)
+						? (row as T)
+						: null;
+				},
 				async findOne({ model, where, select, join }) {
 					const matchStage = where
 						? { $match: convertWhereClause({ where, model }) }
@@ -554,9 +749,13 @@ export const mongodbAdapter = (
 					}
 
 					if (sortBy) {
+						const sortField = getFieldName({
+							field: sortBy.field,
+							model,
+						});
 						pipeline.push({
 							$sort: {
-								[getFieldName({ field: sortBy.field, model })]:
+								[sortField === "id" ? "_id" : sortField]:
 									sortBy.direction === "desc" ? -1 : 1,
 							},
 						});
@@ -690,23 +889,21 @@ export const mongodbAdapter = (
 							const session = config.client.startSession();
 
 							try {
-								session.startTransaction();
+								// The driver owns retry semantics here. `withTransaction` retries
+								// the complete callback for TransientTransactionError and retries
+								// only commit for UnknownTransactionCommitResult. A hand-rolled
+								// start/commit pair leaks transient conflicts to callers.
+								return await session.withTransaction(async () => {
+									const adapter = createAdapterFactory({
+										config: {
+											...adapterOptions!.config,
+											transaction: false,
+										},
+										adapter: createCustomAdapter(db, session),
+									})(lazyOptions!);
 
-								const adapter = createAdapterFactory({
-									config: {
-										...adapterOptions!.config,
-										transaction: false,
-									},
-									adapter: createCustomAdapter(db, session),
-								})(lazyOptions!);
-
-								const result = await cb(adapter);
-
-								await session.commitTransaction();
-								return result;
-							} catch (err) {
-								await session.abortTransaction();
-								throw err;
+									return cb(adapter);
+								});
 							} finally {
 								await session.endSession();
 							}
@@ -800,6 +997,9 @@ export const mongodbAdapter = (
 
 	return (options: ClearanceOptions): DBAdapter<ClearanceOptions> => {
 		lazyOptions = options;
-		return lazyAdapter(options);
+		return Object.assign(lazyAdapter(options), {
+			ensureCredentialAuthorityIndexes: () =>
+				ensureCredentialAuthorityIndexes(db, options, config?.usePlural ?? false),
+		});
 	};
 };

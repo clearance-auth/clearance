@@ -8,8 +8,11 @@ import {
 	socialProvidersFromEnvironment,
 } from "@clearance/auth";
 import {
+	closeAuthBundle,
 	createManagementStore,
-	initProject,
+	initProjectAuthoritative,
+	keyManagementRuntimeOptions,
+	provisionOrganizationInAuth,
 	recordEvent,
 	syncRuntimeOrganizationToManagementDurable,
 	syncRuntimeUserToManagementDurable,
@@ -42,6 +45,38 @@ const databaseUrl =
 const socialProviders = socialProvidersFromEnvironment();
 const enabledSocialProviders = Object.keys(socialProviders);
 
+function credentialAuthorityOptions(): NonNullable<
+	Parameters<typeof createClearanceAuth>[0]["credentialAuthority"]
+> {
+	const production = process.env.NODE_ENV === "production";
+	const generation =
+		process.env.CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION ??
+		(production ? "" : "digest-v1");
+	if (generation !== "legacy-v1" && generation !== "digest-v1") {
+		throw new Error(
+			"CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION must be legacy-v1 or digest-v1",
+		);
+	}
+	const deploymentId =
+		process.env.CLEARANCE_DEPLOYMENT_ID ?? (production ? "" : "development");
+	const instanceId =
+		process.env.CLEARANCE_INSTANCE_ID ?? process.env.HOSTNAME ??
+		(production ? "" : `sample-${process.pid}`);
+	if (!deploymentId.trim() || !instanceId.trim()) {
+		throw new Error(
+			"CLEARANCE_DEPLOYMENT_ID and CLEARANCE_INSTANCE_ID are required in production",
+		);
+	}
+	return {
+		generation,
+		deploymentId,
+		instanceId,
+		...(process.env.CLEARANCE_CREDENTIAL_DRAIN_ID
+			? { migrationDrainId: process.env.CLEARANCE_CREDENTIAL_DRAIN_ID }
+			: {}),
+	};
+}
+
 let managementStorePromise: ReturnType<typeof createManagementStore> | undefined;
 
 function getManagementStore() {
@@ -49,10 +84,13 @@ function getManagementStore() {
 		backend: "postgres",
 		databaseUrl,
 	}).then(async (managementStore) => {
-		if (managementStore.snapshot.projects.length === 0) {
-			initProject(managementStore, { name: "sample-b2b", source: "api" });
-			await managementStore.ready();
-		}
+		const scope = await initProjectAuthoritative(managementStore, {
+			name: "sample-b2b",
+			source: "api",
+		});
+		process.env.CLEARANCE_PROJECT_ID = scope.project.id;
+		process.env.CLEARANCE_ENV_ID = scope.environment.id;
+		await managementStore.ready();
 		return managementStore;
 	});
 	return managementStorePromise;
@@ -64,6 +102,8 @@ const bundle = createClearanceAuth({
 	databaseUrl,
 	enableSso: true,
 	enableScim: true,
+	credentialAuthority: credentialAuthorityOptions(),
+	...keyManagementRuntimeOptions(),
 	trustedOrigins: [baseURL, "http://localhost:3100", "http://localhost:3200"],
 	socialProviders,
 	onUserCreated: async (user) => {
@@ -322,6 +362,14 @@ async function routeRequest(
 	const url = new URL(req.url ?? "/", baseURL);
 
 	if (url.pathname === "/health") {
+		try {
+			await bundle.credentialAuthority.assertRuntimeServing();
+		} catch {
+			res.statusCode = 503;
+			res.setHeader("content-type", "application/json");
+			res.end(JSON.stringify({ ok: false, state: "credential_authority_fenced" }));
+			return;
+		}
 		res.setHeader("content-type", "application/json");
 		res.end(
 			JSON.stringify({
@@ -451,6 +499,8 @@ async function routeRequest(
 			slug: string;
 			createdAt?: string | Date;
 		}> = [];
+		const managementStore = await getManagementStore();
+		let provisionedOrganizationId: string | undefined;
 		try {
 			const headers = new Headers({
 				cookie: req.headers.cookie ?? "",
@@ -465,26 +515,26 @@ async function routeRequest(
 					createdAt?: string | Date;
 				}>) ?? [];
 			if (orgs.length === 0) {
-				await bundle.auth.api.createOrganization({
-					body: {
-						name: `${user.name}'s Workspace`,
-						slug: `ws-${user.id.slice(0, 8).toLowerCase()}`,
-					},
-					headers,
+				const provisioned = await provisionOrganizationInAuth(managementStore, {
+					name: `${user.name}'s Workspace`,
+					slug: `ws-${user.id.slice(0, 8).toLowerCase()}`,
+					ownerUserId: user.id,
+					actor: user.email,
 				});
-				const again = await bundle.auth.api.listOrganizations({ headers });
-				runtimeOrganizations =
-					(again as typeof runtimeOrganizations) ?? [];
+				provisionedOrganizationId = provisioned.id;
+				runtimeOrganizations = [provisioned];
 			} else {
 				runtimeOrganizations = orgs;
 			}
 			orgNames = runtimeOrganizations.map((o) => o.name).join(", ");
-		} catch {
-			orgNames = "(org plugin)";
+		} catch (error) {
+			orgNames = process.env.NODE_ENV === "test"
+				? `(${error instanceof Error ? error.message : String(error)})`
+				: "(org plugin)";
 		}
 
-		const managementStore = await getManagementStore();
 		for (const organization of runtimeOrganizations) {
+			if (organization.id === provisionedOrganizationId) continue;
 			await syncRuntimeOrganizationToManagementDurable(
 				managementStore,
 				organization,
@@ -619,12 +669,42 @@ export function createSampleRequestHandler(
 const handler = createSampleRequestHandler();
 
 async function main() {
-	await Promise.all([bundle.migrate(), getManagementStore()]);
-	createServer(handler).listen(port, () => {
+	await Promise.all([
+		process.env.NODE_ENV === "production"
+			? bundle.credentialAuthority.assertRuntimeServing()
+			: bundle.migrate(),
+		getManagementStore(),
+	]);
+	const server = createServer(handler);
+	server.listen(port, () => {
 		console.log(
 			`sample-b2b http://localhost:${port} (postgres runtime @clearance/auth)`,
 		);
 	});
+	let shutdownPromise: Promise<void> | undefined;
+	const shutdown = () => {
+		shutdownPromise ??= new Promise<void>((resolve) => {
+			server.close(async () => {
+				try {
+					await closeAuthBundle();
+					await bundle.destroy();
+					const store = await managementStorePromise;
+					const destroy = (
+						store as Awaited<ReturnType<typeof getManagementStore>> & {
+							destroy?: () => Promise<void>;
+						}
+					)?.destroy;
+					if (destroy && store) await destroy.call(store);
+				} finally {
+					resolve();
+				}
+			});
+			server.closeIdleConnections?.();
+		});
+		return shutdownPromise;
+	};
+	process.once("SIGTERM", () => void shutdown());
+	process.once("SIGINT", () => void shutdown());
 }
 
 const isMain =
@@ -637,4 +717,4 @@ if (isMain) {
 	});
 }
 
-export { bundle, getManagementStore, getSession, handler, html };
+export { bundle, closeAuthBundle, getManagementStore, getSession, handler, html };

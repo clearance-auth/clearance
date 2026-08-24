@@ -127,3 +127,4 @@ export * from "./buffer";
 export * from "./jwt";
 export * from "./password";
 export * from "./random";
+export * from "./otp";

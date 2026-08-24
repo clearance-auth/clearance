@@ -20,10 +20,40 @@ vi.mock("@better-fetch/fetch", () => ({
 	betterFetch: vi.fn(),
 }));
 
-const { lookupMock } = vi.hoisted(() => ({ lookupMock: vi.fn() }));
+const { lookupMock, publicFetchMock } = vi.hoisted(() => ({
+	lookupMock: vi.fn(),
+	publicFetchMock: vi.fn(),
+}));
 vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
+vi.mock("@clearance/core/utils/public-egress", () => ({
+	fetchPinnedPublic: publicFetchMock,
+	fetchWithPublicEgressPolicy: (
+		url: string,
+		init: RequestInit,
+		transport: (input: string, init?: RequestInit) => Promise<Response>,
+	) => transport(url, { ...init, redirect: "manual" }),
+}));
 
 import { betterFetch } from "@better-fetch/fetch";
+
+beforeEach(() => {
+	publicFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+		const result = await betterFetch(url, init as never) as {
+			data?: unknown;
+			error?: { status?: number; statusText?: string } | null;
+		};
+		if (result.error) {
+			return new Response("", {
+				status: result.error.status ?? 500,
+				statusText: result.error.statusText,
+			});
+		}
+		const body = typeof result.data === "string"
+			? result.data
+			: result.data == null ? "" : JSON.stringify(result.data);
+		return new Response(body, { status: 200 });
+	});
+});
 
 /**
  * Mock OIDC Discovery Document
@@ -877,10 +907,7 @@ describe("OIDC Discovery", () => {
 			});
 
 			expect(result.discoveryEndpoint).toBe(customEndpoint);
-			expect(mockBetterFetch).toHaveBeenCalledWith(
-				customEndpoint,
-				expect.any(Object),
-			);
+			expect(String(mockBetterFetch.mock.calls[0]?.[0])).toBe(customEndpoint);
 		});
 
 		it("should use discovery endpoint from existing config", async () => {
@@ -899,10 +926,7 @@ describe("OIDC Discovery", () => {
 			});
 
 			expect(result.discoveryEndpoint).toBe(existingEndpoint);
-			expect(mockBetterFetch).toHaveBeenCalledWith(
-				existingEndpoint,
-				expect.any(Object),
-			);
+			expect(String(mockBetterFetch.mock.calls[0]?.[0])).toBe(existingEndpoint);
 		});
 
 		it("should throw on issuer mismatch", async () => {
@@ -1182,6 +1206,7 @@ describe("ensureRuntimeDiscovery", () => {
 	const mockDiscoveryDoc = createMockDiscoveryDocument();
 
 	beforeEach(() => {
+		lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
 		vi.mocked(betterFetch).mockResolvedValue({
 			data: mockDiscoveryDoc,
 			error: null,
@@ -1335,7 +1360,7 @@ describe("resolved-address guard", () => {
 			expect(lookupMock).not.toHaveBeenCalled();
 		});
 
-		it("does not throw when resolution itself fails (lets the fetch surface it)", async () => {
+		it("fails closed when DNS resolution fails", async () => {
 			lookupMock.mockRejectedValue(new Error("ENOTFOUND"));
 			await expect(
 				assertEndpointResolvesPublic(
@@ -1343,7 +1368,7 @@ describe("resolved-address guard", () => {
 					"https://idp.example.com/token",
 					notTrusted,
 				),
-			).resolves.toBeUndefined();
+			).rejects.toMatchObject({ code: "discovery_private_host" });
 		});
 	});
 
@@ -1388,6 +1413,16 @@ describe("resolved-address guard", () => {
 });
 
 describe("fetchDiscoveryDocument redirect handling", () => {
+	it("rejects invalid JSON without attempting to consume the body twice", async () => {
+		await expect(
+			fetchDiscoveryDocument(
+				"https://idp.example.com/.well-known/openid-configuration",
+				10_000,
+				async () => new Response("not json", { status: 200 }),
+			),
+		).rejects.toMatchObject({ code: "discovery_invalid_json" });
+	});
+
 	it("disables automatic redirect following", async () => {
 		vi.mocked(betterFetch).mockResolvedValueOnce({
 			data: createMockDiscoveryDocument(),
@@ -1398,7 +1433,7 @@ describe("fetchDiscoveryDocument redirect handling", () => {
 		);
 		expect(betterFetch).toHaveBeenCalledWith(
 			"https://idp.example.com/.well-known/openid-configuration",
-			expect.objectContaining({ redirect: "error" }),
+			expect.objectContaining({ redirect: "manual" }),
 		);
 	});
 });

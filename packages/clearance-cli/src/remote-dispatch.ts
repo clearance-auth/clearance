@@ -1,37 +1,52 @@
 import type { Command } from "commander";
 import {
 	API_KEY_OPERATIONS,
+	AUTHORIZATION_OPERATIONS,
+	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
+	DELIVERY_OPERATIONS,
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
+	KEY_MANAGEMENT_OPERATIONS,
 	MANAGEMENT_OPERATIONS,
 	MEMBER_OPERATIONS,
 	MIGRATION_OPERATIONS,
 	ORGANIZATION_OPERATIONS,
 	PROJECT_OPERATIONS,
+	PRODUCT_DOMAIN_OPERATIONS,
+	PRODUCT_PRESENTATION_OPERATIONS,
+	PRODUCT_SENDER_OPERATIONS,
+	PRODUCT_TEMPLATE_OPERATIONS,
 	READINESS_OPERATIONS,
 	ROLE_OPERATIONS,
 	SCHEMA_OPERATIONS,
+	STORE_V2_OPERATIONS,
 	SCIM_OPERATIONS,
 	SESSION_OPERATIONS,
+	SERVICE_ACCOUNT_OPERATIONS,
 	SSO_OPERATIONS,
 	SYSTEM_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	USER_OPERATIONS,
+	WEBHOOK_ENDPOINT_OPERATIONS,
 } from "@clearance/management";
-import type { ApiSession } from "./api-client.js";
 import { dispatchAccessCommand } from "./dispatch/access.js";
+import { dispatchAuthenticationPolicyCommand } from "./dispatch/authentication-policy.js";
 import { dispatchCoreCommand } from "./dispatch/core.js";
+import { dispatchDeliveryCommand } from "./dispatch/delivery.js";
 import { dispatchEnterpriseCommand } from "./dispatch/enterprise.js";
 import { dispatchEventCommand } from "./dispatch/events.js";
+import { dispatchKeyManagementCommand } from "./dispatch/key-management.js";
 import { dispatchMigrationCommand } from "./dispatch/migrations.js";
 import { dispatchOperationsCommand } from "./dispatch/operations.js";
 import { dispatchOrganizationCommand } from "./dispatch/organizations.js";
+import { dispatchProductPresentationCommand } from "./dispatch/product-presentation.js";
+import { dispatchStoreV2Command } from "./dispatch/store-v2.js";
 import { error } from "./dispatch/shared.js";
 import { dispatchUserCommand } from "./dispatch/users.js";
-import type { GlobalOpts } from "./output.js";
+import type { DispatchInput } from "./dispatch/shared.js";
 
 export {
 	EVENTS_TAIL_MAX_POLL_INTERVAL_MS,
@@ -60,13 +75,13 @@ export function commandPath(command: Command): string {
 	return names.join(" ");
 }
 
-export async function dispatchRemoteCommand(
-	session: ApiSession,
-	path: string,
-	args: unknown[],
-	opts: Record<string, unknown>,
-	global: GlobalOpts,
-): Promise<unknown> {
+export async function dispatchRemoteCommand({
+	session,
+	path,
+	args,
+	opts,
+	global,
+}: DispatchInput<string>): Promise<unknown> {
 	switch (path) {
 		case SYSTEM_OPERATIONS.init.cliPath:
 		case SYSTEM_OPERATIONS.doctor.cliPath:
@@ -105,6 +120,47 @@ export async function dispatchRemoteCommand(
 		case EVENT_OPERATIONS.export.cliPath:
 		case EVENT_OPERATIONS.replay.cliPath:
 			return dispatchEventCommand({ session, path, args, opts, global });
+		case DELIVERY_OPERATIONS.list.cliPath:
+		case DELIVERY_OPERATIONS.inspect.cliPath:
+		case DELIVERY_OPERATIONS.readiness.cliPath:
+		case DELIVERY_OPERATIONS.quotas.cliPath:
+		case DELIVERY_OPERATIONS.cancel.cliPath:
+		case DELIVERY_OPERATIONS.retry.cliPath:
+		case DELIVERY_OPERATIONS.replay.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.list.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.inspect.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.create.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.update.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.rotate.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath:
+		case WEBHOOK_ENDPOINT_OPERATIONS.test.cliPath:
+			return dispatchDeliveryCommand({ session, path, args, opts, global });
+		case AUTHENTICATION_POLICY_OPERATIONS.get.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.plan.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.apply.cliPath:
+		case AUTHENTICATION_POLICY_OPERATIONS.unlock.cliPath:
+			return dispatchAuthenticationPolicyCommand({ session, path, args, opts, global });
+		case KEY_MANAGEMENT_OPERATIONS.status.cliPath:
+		case KEY_MANAGEMENT_OPERATIONS.plan.cliPath:
+		case KEY_MANAGEMENT_OPERATIONS.apply.cliPath:
+			return dispatchKeyManagementCommand({ session, path, args, opts, global });
+		case PRODUCT_PRESENTATION_OPERATIONS.get.cliPath:
+		case PRODUCT_PRESENTATION_OPERATIONS.plan.cliPath:
+		case PRODUCT_PRESENTATION_OPERATIONS.apply.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.list.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.create.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.reissue.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.verify.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.activate.cliPath:
+		case PRODUCT_DOMAIN_OPERATIONS.disable.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.get.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.plan.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.apply.cliPath:
+		case PRODUCT_SENDER_OPERATIONS.readiness.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.get.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.plan.cliPath:
+		case PRODUCT_TEMPLATE_OPERATIONS.apply.cliPath:
+			return dispatchProductPresentationCommand({ session, path, args, opts, global });
 		case API_KEY_OPERATIONS.list.cliPath:
 		case API_KEY_OPERATIONS.create.cliPath:
 		case API_KEY_OPERATIONS.rotate.cliPath:
@@ -115,6 +171,18 @@ export async function dispatchRemoteCommand(
 		case ROLE_OPERATIONS.validate.cliPath:
 		case ROLE_OPERATIONS.create.cliPath:
 		case ROLE_OPERATIONS.update.cliPath:
+		case AUTHORIZATION_OPERATIONS.effectiveInspect.cliPath:
+		case AUTHORIZATION_OPERATIONS.assignmentsList.cliPath:
+		case AUTHORIZATION_OPERATIONS.assignmentsReplace.cliPath:
+		case AUTHORIZATION_OPERATIONS.reconcile.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.list.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.inspect.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.create.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.disable.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.enable.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialCreate.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialRotate.cliPath:
+		case SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.cliPath:
 			return dispatchAccessCommand({ session, path, args, opts, global });
 		case SSO_OPERATIONS.create.cliPath:
 		case SSO_OPERATIONS.configure.cliPath:
@@ -135,7 +203,7 @@ export async function dispatchRemoteCommand(
 			return dispatchEnterpriseCommand({ session, path, args, opts, global });
 		case IMPORT_OPERATIONS.legacy.cliPath:
 		case MIGRATION_OPERATIONS.plan.cliPath:
-		case MIGRATION_OPERATIONS.run.cliPath:
+		case MIGRATION_OPERATIONS.apply.cliPath:
 		case MIGRATION_OPERATIONS.verify.cliPath:
 		case MIGRATION_OPERATIONS.rollback.cliPath:
 		case MIGRATION_OPERATIONS.status.cliPath:
@@ -151,11 +219,26 @@ export async function dispatchRemoteCommand(
 		case SCHEMA_OPERATIONS.status.cliPath:
 		case SCHEMA_OPERATIONS.generate.cliPath:
 		case SCHEMA_OPERATIONS.migrate.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityStatus.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityArm.cliPath:
+		case SCHEMA_OPERATIONS.credentialAuthorityDrain.cliPath:
 		case CONFIG_OPERATIONS.get.cliPath:
 		case CONFIG_OPERATIONS.set.cliPath:
 		case CONFIG_OPERATIONS.validate.cliPath:
 		case CONFIG_OPERATIONS.diff.cliPath:
 			return dispatchOperationsCommand({ session, path, args, opts, global });
+		case STORE_V2_OPERATIONS.status.cliPath:
+		case STORE_V2_OPERATIONS.plan.cliPath:
+		case STORE_V2_OPERATIONS.apply.cliPath:
+		case STORE_V2_OPERATIONS.verify.cliPath:
+		case STORE_V2_OPERATIONS.rollback.cliPath:
+		case STORE_V2_OPERATIONS.eventsCutover.cliPath:
+		case STORE_V2_OPERATIONS.eventsRollback.cliPath:
+		case STORE_V2_OPERATIONS.principalsCutover.cliPath:
+		case STORE_V2_OPERATIONS.principalsRollback.cliPath:
+		case STORE_V2_OPERATIONS.topologyCutover.cliPath:
+		case STORE_V2_OPERATIONS.topologyRollback.cliPath:
+			return dispatchStoreV2Command({ session, path, args, opts, global });
 		default:
 			throw error(
 				"CLI_REMOTE_COMMAND_UNAVAILABLE",

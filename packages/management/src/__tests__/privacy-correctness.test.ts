@@ -9,11 +9,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	JsonStore,
 	assertCredentialKeyConfigured,
-	checkScimConnection,
+	probeScimConnection,
 	createLocalOidcIssuerFixture,
 	createLocalScimFixtureServer,
 	createOrganization,
 	createScimConnection,
+	createEnvironment,
 	commitSetupLink,
 	createSetupLink,
 	createSsoConnection,
@@ -32,6 +33,10 @@ import {
 	rotateCredential,
 	rotateScimCredential,
 	rotateSsoCredential,
+	testScimConnection,
+	testScimConnectionReal,
+	testSsoConnection,
+	testSsoConnectionReal,
 	verifySsoOidcLocalProtocol,
 } from "../index.js";
 
@@ -80,7 +85,7 @@ describe("credential AEAD storage", () => {
 		).toBeUndefined();
 
 		// Store holds envelope, not plaintext
-		const raw = store.snapshot.identityConnections[0]!;
+		const raw = store.snapshot.ssoConnections[0]!;
 		expect(raw.clientSecretEncrypted).toMatch(/^clr\$v1\$k1\$/);
 		expect(raw.clientSecretEncrypted).not.toContain(secret);
 		const snapJson = JSON.stringify(store.snapshot);
@@ -92,7 +97,7 @@ describe("credential AEAD storage", () => {
 		const pt = decryptCredential(raw.clientSecretEncrypted!);
 		expect(pt).toBe(secret);
 
-		// Rotation under new key id produces different stored bytes, still usable
+		// Tenant rotation is a runtime replacement, not a JSON-store envelope rewrite.
 		process.env.CLEARANCE_CREDENTIAL_PREVIOUS_KEY =
 			process.env.CLEARANCE_CREDENTIAL_KEY;
 		process.env.CLEARANCE_CREDENTIAL_PREVIOUS_KEY_ID = "k1";
@@ -101,13 +106,12 @@ describe("credential AEAD storage", () => {
 		process.env.CLEARANCE_CREDENTIAL_KEY_ID = "k2";
 
 		const before = raw.clientSecretEncrypted!;
-		const rotated = rotateSsoCredential(store, sso.id);
-		expect(
-			(rotated as { clientSecretEncrypted?: string }).clientSecretEncrypted,
-		).toBeUndefined();
-		const after = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
-		expect(after).not.toBe(before);
-		expect(after).toMatch(/^clr\$v1\$k2\$/);
+		expect(() => rotateSsoCredential(store, sso.id)).toThrow(
+			/coordinated PostgreSQL runtime backend/i,
+		);
+		const after = store.snapshot.ssoConnections[0]!.clientSecretEncrypted!;
+		expect(after).toBe(before);
+		expect(after).toMatch(/^clr\$v1\$k1\$/);
 		expect(after).not.toContain(secret);
 		expect(decryptCredential(after)).toBe(secret);
 		expect(JSON.stringify(store.snapshot)).not.toContain(secret);
@@ -123,17 +127,19 @@ describe("credential AEAD storage", () => {
 		expect(
 			(scim as { bearerTokenEncrypted?: string }).bearerTokenEncrypted,
 		).toBeUndefined();
-		const scimRaw = store.snapshot.directoryConnections.find(
+		const scimRaw = store.snapshot.scimConnections.find(
 			(c) => c.id === scim.id,
 		)!;
 		expect(scimRaw.bearerTokenEncrypted).toMatch(/^clr\$v1\$/);
 		expect(JSON.stringify(store.snapshot)).not.toContain(scimSecret);
 		const scimBefore = scimRaw.bearerTokenEncrypted!;
-		rotateScimCredential(store, scim.id);
-		const scimAfter = store.snapshot.directoryConnections.find(
+		expect(() => rotateScimCredential(store, scim.id)).toThrow(
+			/coordinated PostgreSQL runtime backend/i,
+		);
+		const scimAfter = store.snapshot.scimConnections.find(
 			(c) => c.id === scim.id,
 		)!.bearerTokenEncrypted!;
-		expect(scimAfter).not.toBe(scimBefore);
+		expect(scimAfter).toBe(scimBefore);
 		expect(decryptCredential(scimAfter)).toBe(scimSecret);
 	});
 
@@ -301,6 +307,7 @@ describe("setup capability links", () => {
 			token: created.token,
 			kind: "scim",
 			reservationId: reserved.reservationId,
+			reservationFencingToken: reserved.reservationFencingToken,
 		});
 		const afterRelease = store.snapshot.setupLinks.find((c) => c.id === created.capabilityId)!;
 		expect(afterRelease.reservationId).toBeFalsy();
@@ -318,6 +325,7 @@ describe("setup capability links", () => {
 			kind: "scim",
 			organizationId: org.id,
 			reservationId: again.reservationId,
+			reservationFencingToken: again.reservationFencingToken,
 		});
 		expect(committed.useCount).toBe(1);
 		expect(committed.redeemedAt).toBeTruthy();
@@ -335,6 +343,7 @@ describe("setup capability links", () => {
 				token: created.token,
 				kind: "scim",
 				reservationId: again.reservationId,
+				reservationFencingToken: again.reservationFencingToken,
 			}),
 		).rejects.toThrow(/already used|replay/i);
 
@@ -343,6 +352,7 @@ describe("setup capability links", () => {
 			token: created.token,
 			kind: "scim",
 			reservationId: again.reservationId,
+			reservationFencingToken: again.reservationFencingToken,
 		});
 		const still = store.snapshot.setupLinks.find((c) => c.id === created.capabilityId)!;
 		expect(still.useCount).toBe(1);
@@ -382,8 +392,9 @@ describe("SCIM local HTTP protocol verification", () => {
 				endpoint: baseUrl,
 				bearerToken: token,
 			});
-			const result = await checkScimConnection(store, conn.id, {
+			const result = await probeScimConnection(store, conn.id, {
 				bearerToken: token,
+				fetchImpl: fetch,
 			});
 			expect(result.pass).toBe(true);
 			expect(result.mode).toBe("simulation");
@@ -405,7 +416,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: "wrong",
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: "wrong" }),
+				probeScimConnection(store, conn.id, {
+					bearerToken: "wrong",
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/unauthor|reject|credential/i);
 		} finally {
 			await unauth.close();
@@ -421,7 +435,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: token,
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: token }),
+				probeScimConnection(store, conn.id, {
+					bearerToken: token,
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/malformed|json/i);
 		} finally {
 			await mal.close();
@@ -437,7 +454,10 @@ describe("SCIM local HTTP protocol verification", () => {
 				bearerToken: token,
 			});
 			await expect(
-				checkScimConnection(store, conn.id, { bearerToken: token }),
+				probeScimConnection(store, conn.id, {
+					bearerToken: token,
+					fetchImpl: fetch,
+				}),
 			).rejects.toThrow(/non-success|503|failed/i);
 		} finally {
 			await down.close();
@@ -451,7 +471,7 @@ describe("SCIM local HTTP protocol verification", () => {
 			bearerToken: token,
 		});
 		await expect(
-			checkScimConnection(store, connNet.id, {
+			probeScimConnection(store, connNet.id, {
 				bearerToken: token,
 				fetchImpl: async () => {
 					throw new Error("connect ECONNREFUSED");
@@ -469,6 +489,66 @@ describe("SCIM local HTTP protocol verification", () => {
 });
 
 describe("SSO local OIDC protocol verification", () => {
+	it("fails foreign-scope fixture, real, and local entrypoints before transport or mutation", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "Scope fence" });
+		const environmentB = createEnvironment(store, { projectId: initialized.project.id, name: "preview", kind: "preview" });
+		const foreign = createOrganization(store, { name: "Foreign", projectId: initialized.project.id, environmentId: environmentB.id });
+		const sso = createSsoConnection(store, { organizationId: foreign.id, protocol: "oidc", provider: "scope-test", issuer: "https://idp.example.test" });
+		const scim = createScimConnection(store, { organizationId: foreign.id, provider: "scope-test", endpoint: "https://directory.example.test", bearerToken: "must-not-send" });
+		const scope = { projectId: initialized.project.id, environmentId: initialized.environment.id };
+		const before = { traces: store.snapshot.traces.length, events: store.snapshot.events.length, sso: store.snapshot.ssoConnections[0]!.status, scim: store.snapshot.scimConnections[0]!.status };
+		let fetches = 0;
+		const fetchImpl: typeof fetch = async () => {
+			fetches += 1;
+			return new Response("unexpected", { status: 500 });
+		};
+		expect(() => testSsoConnection(store, sso.id, { scope })).toThrow(/not found/i);
+		expect(() => testScimConnection(store, scim.id, { scope })).toThrow(/not found/i);
+		await expect(testSsoConnectionReal(store, sso.id, { scope })).rejects.toMatchObject({ code: "SSO_NOT_FOUND" });
+		await expect(verifySsoOidcLocalProtocol(store, sso.id, { scope, fetchImpl })).rejects.toMatchObject({ code: "SSO_NOT_FOUND" });
+		await expect(testScimConnectionReal(store, scim.id, { scope, fetchImpl })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
+		expect(fetches).toBe(0);
+		expect({ traces: store.snapshot.traces.length, events: store.snapshot.events.length, sso: store.snapshot.ssoConnections[0]!.status, scim: store.snapshot.scimConnections[0]!.status }).toEqual(before);
+	});
+
+	it("refuses real SCIM apply on JsonStore before any user or control-plane mutation", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "SCIM atomic backend" });
+		const organization = createOrganization(store, { name: "Customer" });
+		const connection = createScimConnection(store, {
+			organizationId: organization.id,
+			provider: "fixture",
+			bearerToken: "scim-test-token",
+		});
+		const before = {
+			traces: store.snapshot.traces.length,
+			events: listEvents(store, { limit: 100 }).length,
+			memberships: store.snapshot.memberships.length,
+			status: store.snapshot.scimConnections.find((row) => row.id === connection.id)!.status,
+		};
+		await expect(
+			testScimConnectionReal(store, connection.id, {
+				dryRun: false,
+				bearerToken: "scim-test-token",
+				scope: {
+					projectId: initialized.project.id,
+					environmentId: initialized.environment.id,
+				},
+				users: [
+					{ userName: "first@example.test" },
+					{ userName: "second@example.test" },
+				],
+			}),
+		).rejects.toMatchObject({ code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED" });
+		expect({
+			traces: store.snapshot.traces.length,
+			events: listEvents(store, { limit: 100 }).length,
+			memberships: store.snapshot.memberships.length,
+			status: store.snapshot.scimConnections.find((row) => row.id === connection.id)!.status,
+		}).toEqual(before);
+	});
+
 	it("exercises authorize URL state/nonce/PKCE and callback validation", async () => {
 		const store = tempStore();
 		initProject(store, { name: "OidcLocal" });

@@ -1,6 +1,46 @@
 import type { ClearanceOptions } from "@clearance/core";
 import type { TelemetryContext } from "../types";
 
+type AdditionalFields =
+	| Record<
+			string,
+			{
+				type?: unknown;
+				required?: unknown;
+				input?: unknown;
+			}
+		>
+	| undefined;
+
+function fieldType(type: unknown) {
+	if (
+		type === "string" ||
+		type === "number" ||
+		type === "boolean" ||
+		type === "date" ||
+		type === "json" ||
+		type === "string[]" ||
+		type === "number[]"
+	) {
+		return type;
+	}
+	return Array.isArray(type) ? "enum" : "unknown";
+}
+
+function projectAdditionalFields(fields: AdditionalFields) {
+	if (!fields) return undefined;
+	return Object.fromEntries(
+		Object.entries(fields).map(([name, field]) => [
+			name,
+			{
+				type: fieldType(field.type),
+				required: field.required === true,
+				input: field.input !== false,
+			},
+		]),
+	);
+}
+
 export async function getTelemetryAuthConfig(
 	options: ClearanceOptions,
 	context?: TelemetryContext | undefined,
@@ -67,7 +107,7 @@ export async function getTelemetryAuthConfig(
 		user: {
 			modelName: options.user?.modelName,
 			fields: options.user?.fields,
-			additionalFields: options.user?.additionalFields,
+			additionalFields: projectAdditionalFields(options.user?.additionalFields),
 			changeEmail: {
 				enabled: options.user?.changeEmail?.enabled,
 				sendChangeEmailConfirmation:
@@ -78,10 +118,13 @@ export async function getTelemetryAuthConfig(
 			modelName: options.verification?.modelName,
 			disableCleanup: options.verification?.disableCleanup,
 			fields: options.verification?.fields,
+			additionalFields: projectAdditionalFields(
+				options.verification?.additionalFields,
+			),
 		},
 		session: {
 			modelName: options.session?.modelName,
-			additionalFields: options.session?.additionalFields,
+			additionalFields: projectAdditionalFields(options.session?.additionalFields),
 			cookieCache: {
 				enabled: options.session?.cookieCache?.enabled,
 				maxAge: options.session?.cookieCache?.maxAge,
@@ -98,6 +141,7 @@ export async function getTelemetryAuthConfig(
 		account: {
 			modelName: options.account?.modelName,
 			fields: options.account?.fields,
+			additionalFields: projectAdditionalFields(options.account?.additionalFields),
 			encryptOAuthTokens: options.account?.encryptOAuthTokens,
 			updateAccountOnSignIn: options.account?.updateAccountOnSignIn,
 			accountLinking: {

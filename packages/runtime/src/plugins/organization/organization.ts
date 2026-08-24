@@ -1,6 +1,6 @@
 import type { AuthContext, ClearancePlugin } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
-import type { ClearancePluginDBSchema } from "@clearance/core/db";
+import type { ClearancePluginDBSchema, DBFieldAttribute } from "@clearance/core/db";
 import { APIError } from "@clearance/core/error";
 import * as z from "zod";
 import { getSessionFromCtx } from "../../api";
@@ -115,6 +115,185 @@ export interface OrganizationCreator {
 
 export function parseRoles(roles: string | string[]): string {
 	return Array.isArray(roles) ? roles.join(",") : roles;
+}
+
+const organizationReservedAdditionalFields = [
+	"id",
+	"_id",
+	"name",
+	"slug",
+	"logo",
+	"createdAt",
+	"updatedAt",
+	"metadata",
+] as const;
+const memberReservedAdditionalFields = [
+	"id",
+	"_id",
+	"organizationId",
+	"userId",
+	"role",
+	"createdAt",
+] as const;
+const invitationReservedAdditionalFields = [
+	"id",
+	"_id",
+	"organizationId",
+	"email",
+	"role",
+	"teamId",
+	"status",
+	"expiresAt",
+	"createdAt",
+	"inviterId",
+] as const;
+const teamReservedAdditionalFields = [
+	"id",
+	"_id",
+	"name",
+	"organizationId",
+	"createdAt",
+	"updatedAt",
+] as const;
+const organizationRoleReservedAdditionalFields = [
+	"id",
+	"_id",
+	"organizationId",
+	"role",
+	"permission",
+	"createdAt",
+	"updatedAt",
+] as const;
+
+type SchemaModelWithAdditionalFields = {
+	fields?: Record<string, string | undefined>;
+	additionalFields?: Record<string, DBFieldAttribute>;
+};
+
+const sessionCoreFields = ["activeOrganizationId", "activeTeamId"] as const;
+const teamMemberCoreFields = ["id", "_id", "teamId", "userId", "createdAt"] as const;
+
+function physicalColumnName(
+	modelName: string,
+	source: "core" | "additional",
+	logicalField: string,
+	configuredFieldName: unknown,
+): string {
+	if (configuredFieldName === undefined) return logicalField;
+	if (
+		typeof configuredFieldName !== "string" ||
+		configuredFieldName.length === 0 ||
+		configuredFieldName.trim() !== configuredFieldName
+	) {
+		throw new Error(
+			`Organization plugin schema.${modelName} ${source} field "${logicalField}" must use a non-empty, whitespace-free physical column name`,
+		);
+	}
+	// The adapter falls back with `||`; validate the same effective-name rule.
+	return configuredFieldName || logicalField;
+}
+
+/**
+ * Build the physical namespace before any route or hook schema captures the
+ * options. Database identifiers are case-insensitive on supported engines.
+ */
+function assertUniquePhysicalColumns(
+	modelName: string,
+	model: SchemaModelWithAdditionalFields | undefined,
+	coreFields: readonly string[],
+): void {
+	for (const idAlias of ["id", "_id"] as const) {
+		if (
+			model?.fields &&
+			Object.prototype.hasOwnProperty.call(model.fields, idAlias)
+		) {
+			throw new Error(
+				`Organization plugin schema.${modelName} core field "${idAlias}" cannot be mapped`,
+			);
+		}
+	}
+	const registry = new Map<string, { source: "core" | "additional"; field: string; physical: string }>();
+	const register = (
+		source: "core" | "additional",
+		field: string,
+		configuredFieldName: unknown,
+	) => {
+		const physical = physicalColumnName(
+			modelName,
+			source,
+			field,
+			configuredFieldName,
+		);
+		const canonical = physical.toLowerCase();
+		const existing = registry.get(canonical);
+		if (existing) {
+			throw new Error(
+				`Organization plugin schema.${modelName} physical column "${physical}" is assigned to both ${existing.source} field "${existing.field}" and ${source} field "${field}"`,
+			);
+		}
+		registry.set(canonical, { source, field, physical });
+	};
+
+	for (const field of coreFields) {
+		register(
+			"core",
+			field,
+			field === "id" || field === "_id" ? undefined : model?.fields?.[field],
+		);
+	}
+	for (const [field, attribute] of Object.entries(model?.additionalFields ?? {})) {
+		register("additional", field, attribute.fieldName);
+	}
+}
+
+function additionalFieldsForSchema(
+	model: SchemaModelWithAdditionalFields | undefined,
+): Record<string, DBFieldAttribute> {
+	return model?.additionalFields ?? {};
+}
+
+function normalizeOrganizationOptions<O extends OrganizationOptions>(
+	options: O | undefined,
+): O {
+	if (!options?.schema) return (options ?? {}) as O;
+
+	assertUniquePhysicalColumns(
+		"organization",
+		options.schema.organization,
+		organizationReservedAdditionalFields,
+	);
+	assertUniquePhysicalColumns(
+		"member",
+		options.schema.member,
+		memberReservedAdditionalFields,
+	);
+	assertUniquePhysicalColumns(
+		"invitation",
+		options.schema.invitation,
+		invitationReservedAdditionalFields,
+	);
+	assertUniquePhysicalColumns(
+		"team",
+		options.schema.team,
+		teamReservedAdditionalFields,
+	);
+	assertUniquePhysicalColumns(
+		"organizationRole",
+		options.schema.organizationRole,
+		organizationRoleReservedAdditionalFields,
+	);
+	assertUniquePhysicalColumns(
+		"teamMember",
+		options.schema.teamMember,
+		teamMemberCoreFields,
+	);
+	assertUniquePhysicalColumns(
+		"session",
+		options.schema.session,
+		sessionCoreFields,
+	);
+
+	return options;
 }
 
 export type DynamicAccessControlEndpoints<O extends OrganizationOptions> = {
@@ -442,7 +621,7 @@ export function organization<O extends OrganizationOptions>(
 	options?: O | undefined,
 ): DefaultOrganizationPlugin<O>;
 export function organization<O extends OrganizationOptions>(options?: O) {
-	const opts = (options || {}) as O;
+	const opts = normalizeOrganizationOptions(options);
 	let endpoints = {
 		/**
 		 * ### Endpoint
@@ -943,6 +1122,7 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 				team: {
 					modelName: opts.schema?.team?.modelName,
 					fields: {
+						...additionalFieldsForSchema(opts.schema?.team),
 						name: {
 							type: "string",
 							required: true,
@@ -969,7 +1149,6 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 							fieldName: opts.schema?.team?.fields?.updatedAt,
 							onUpdate: () => new Date(),
 						},
-						...(opts.schema?.team?.additionalFields || {}),
 					},
 				},
 				teamMember: {
@@ -1009,6 +1188,7 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 		? ({
 				organizationRole: {
 					fields: {
+						...additionalFieldsForSchema(opts.schema?.organizationRole),
 						organizationId: {
 							type: "string",
 							required: true,
@@ -1042,7 +1222,6 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 							fieldName: opts.schema?.organizationRole?.fields?.updatedAt,
 							onUpdate: () => new Date(),
 						},
-						...(opts.schema?.organizationRole?.additionalFields || {}),
 					},
 					modelName: opts.schema?.organizationRole?.modelName,
 				},
@@ -1054,6 +1233,7 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 			organization: {
 				modelName: opts.schema?.organization?.modelName,
 				fields: {
+					...additionalFieldsForSchema(opts.schema?.organization),
 					name: {
 						type: "string",
 						required: true,
@@ -1083,7 +1263,15 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 						required: false,
 						fieldName: opts.schema?.organization?.fields?.metadata,
 					},
-					...(opts.schema?.organization?.additionalFields || {}),
+					// This timestamp is the lifecycle serialization lock. Keep it after
+					// additionalFields so user configuration cannot replace or expose it.
+					updatedAt: {
+						type: "date",
+						required: false,
+						fieldName: opts.schema?.organization?.fields?.updatedAt,
+						input: false,
+						returned: false,
+					},
 				},
 			},
 		} satisfies ClearancePluginDBSchema),
@@ -1093,6 +1281,7 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 			member: {
 				modelName: opts.schema?.member?.modelName,
 				fields: {
+					...additionalFieldsForSchema(opts.schema?.member),
 					organizationId: {
 						type: "string",
 						required: true,
@@ -1125,12 +1314,12 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 						required: true,
 						fieldName: opts.schema?.member?.fields?.createdAt,
 					},
-					...(opts.schema?.member?.additionalFields || {}),
 				},
 			},
 			invitation: {
 				modelName: opts.schema?.invitation?.modelName,
 				fields: {
+					...additionalFieldsForSchema(opts.schema?.invitation),
 					organizationId: {
 						type: "string",
 						required: true,
@@ -1191,7 +1380,6 @@ export function organization<O extends OrganizationOptions>(options?: O) {
 						fieldName: opts.schema?.invitation?.fields?.inviterId,
 						required: true,
 					},
-					...(opts.schema?.invitation?.additionalFields || {}),
 				},
 			},
 		} satisfies ClearancePluginDBSchema),

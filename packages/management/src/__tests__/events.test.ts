@@ -8,15 +8,24 @@ import {
 	createScimConnection,
 	createUser,
 	exportEvents,
+	exportEventsOperational,
 	initProject,
 	inspectEvent,
+	inspectEventOperational,
 	listEvents,
+	listEventsPageOperational,
 	replayDiagnosticTrace,
+	replayDiagnosticTraceOperational,
 	testScimConnection,
 	EVENTS_EXPORT_MAX_LIMIT,
 	beginEventsTail,
 	pollEventsTail,
 } from "../index.js";
+import type { AuditEvent } from "../types/resources.js";
+import type {
+	ManagementStore,
+	StoreV2TopologyRepository,
+} from "../store/types.js";
 
 const dirs: string[] = [];
 
@@ -33,6 +42,83 @@ afterEach(() => {
 });
 
 describe("events export", () => {
+	it("merges a bounded runtime authority into operational readers without snapshot import", async () => {
+		const store = tempStore();
+		const { project, environment } = initProject(store, { name: "Runtime Event Read" });
+		const scope = { projectId: project.id, environmentId: environment.id };
+		store.mutate((data) => {
+			data.events = [{
+				id: "evt_management", correlationId: "corr_management", ...scope,
+				actor: "operator", action: "users.create", subjectType: "user",
+				outcome: "success", source: "cli", message: "management",
+				createdAt: "2026-01-01T00:00:02.000Z",
+			}];
+		});
+		const runtimeEvents: AuditEvent[] = [{
+			id: "runtime_older", correlationId: "corr_runtime_older", ...scope,
+			actor: "runtime", action: "auth.login.failed", outcome: "failure",
+			source: "system", message: "anonymous failure",
+			metadata: { token: "Bearer eyJ.runtime.secret" },
+			createdAt: "2026-01-01T00:00:01.000Z",
+		}, {
+			id: "runtime_newer", correlationId: "corr_runtime_newer", ...scope,
+			organizationId: "org_runtime", actor: "runtime", action: "auth.login.succeeded",
+			subjectType: "user", subjectId: "user_runtime", outcome: "success",
+			source: "sso", message: "runtime success",
+			createdAt: "2026-01-01T00:00:03.000Z",
+		}];
+		const runtime = {
+			listPage: async (input: {
+				scope: typeof scope; limit: number; cursor?: { createdAt: string; id: string };
+				action?: string; organizationId?: string; before?: string;
+			}) => {
+				const matching = runtimeEvents.filter((event) =>
+					event.projectId === input.scope.projectId &&
+					event.environmentId === input.scope.environmentId &&
+					(!input.action || event.action === input.action) &&
+					(!input.organizationId || event.organizationId === input.organizationId) &&
+					(!input.before || event.createdAt < input.before) &&
+					(!input.cursor || event.createdAt < input.cursor.createdAt ||
+						(event.createdAt === input.cursor.createdAt && event.id < input.cursor.id)),
+				).sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+				return { events: matching.slice(0, input.limit), hasMore: matching.length > input.limit };
+			},
+			getById: async (input: { scope: typeof scope; id: string }) =>
+				input.scope.projectId === scope.projectId && input.scope.environmentId === scope.environmentId
+					? runtimeEvents.find((event) => event.id === input.id) ?? null
+					: null,
+		};
+		Object.assign(store as ManagementStore, { runtimeAuditEvents: runtime });
+
+		const first = await listEventsPageOperational(store, { scope, limit: 2 });
+		expect(first.events.map((event) => event.id)).toEqual([
+			"runtime_newer", "evt_management",
+		]);
+		expect(first.nextCursor).toBeTruthy();
+		const second = await listEventsPageOperational(store, {
+			scope,
+			limit: 2,
+			cursor: first.nextCursor!,
+		});
+		expect(second.events.map((event) => event.id)).toEqual(["runtime_older"]);
+
+		const exported = await exportEventsOperational(store, {
+			scope,
+			skipAudit: true,
+			before: "2026-01-01T00:00:02.000Z",
+		});
+		expect(exported.events.map((event) => event.id)).toEqual(["runtime_older"]);
+		expect(JSON.stringify(exported)).not.toContain("eyJ.runtime.secret");
+		expect(JSON.stringify(exported)).toContain("[redacted]");
+
+		const inspected = await inspectEventOperational(store, "runtime_newer", { scope });
+		expect(inspected).toMatchObject({
+			event: { correlationId: "corr_runtime_newer", source: "sso", subjectId: "user_runtime" },
+			replayable: false,
+		});
+		expect(store.snapshot.events.map((event) => event.id)).toEqual(["evt_management"]);
+	});
+
 	it("exports deterministically, redacts secrets, respects bounds and scope", () => {
 		const store = tempStore();
 		const { project, environment } = initProject(store, { name: "Export App" });
@@ -345,6 +431,101 @@ describe("events replay (SCIM diagnostic only)", () => {
 				scope: { projectId: "proj_wrong", environmentId: "env_wrong" },
 			}),
 		).toThrow(/not found/i);
+	});
+
+	it("replays through normalized topology after snapshot topology cutover", async () => {
+		const store = tempStore();
+		const initialized = initProject(store, { name: "Normalized Replay" });
+		const scope = {
+			projectId: initialized.project.id,
+			environmentId: initialized.environment.id,
+		};
+		const org = createOrganization(store, { name: "Normalized Customer" });
+		const scim = createScimConnection(store, {
+			organizationId: org.id,
+			provider: "okta",
+		});
+		const traceId = testScimConnection(store, scim.id, { dryRun: true }).trace.id;
+		let organizationReads = 0;
+		const topology = {
+			authoritative: true,
+			getProjectById: async (id: string) =>
+				id === initialized.project.id ? initialized.project : null,
+			findProjectConflict: async () => null,
+			getEnvironment: async ({ projectId, id }: { projectId: string; id: string }) =>
+				projectId === initialized.project.id && id === initialized.environment.id
+					? initialized.environment
+					: null,
+			getOrganization: async ({ scope: candidate, id }: { scope: typeof scope; id: string }) => {
+				organizationReads += 1;
+				return candidate.projectId === scope.projectId &&
+					candidate.environmentId === scope.environmentId && id === org.id
+					? org
+					: null;
+			},
+			lockOrganization: async ({ scope: candidate, id }: { scope: typeof scope; id: string }) => {
+				organizationReads += 1;
+				return candidate.projectId === scope.projectId &&
+					candidate.environmentId === scope.environmentId && id === org.id
+					? org
+					: null;
+			},
+			organizationIdExists: async () => false,
+			getOrganizationBySlug: async () => null,
+			countOrganizations: async () => 1,
+			listProjectsPage: async () => ({ projects: [initialized.project], hasMore: false }),
+			listEnvironmentsPage: async () => ({ environments: [initialized.environment], hasMore: false }),
+			listOrganizationsPage: async () => ({ organizations: [org], hasMore: false }),
+			upsertProject: async () => initialized.project,
+			upsertEnvironment: async () => initialized.environment,
+			upsertOrganization: async () => org,
+		} satisfies StoreV2TopologyRepository;
+		const authoritativeStore = store as unknown as ManagementStore;
+		Object.assign(authoritativeStore, {
+			storeV2Topology: topology,
+			mutateCoordinated: async (
+				fn: NonNullable<ManagementStore["mutateCoordinated"]> extends (
+					callback: infer Callback,
+				) => Promise<unknown> ? Callback : never,
+			) => fn({
+				data: authoritativeStore.snapshot,
+				topology,
+				appendAudit: (input) => {
+					const event = {
+						id: `evt_authoritative_${authoritativeStore.snapshot.events.length}`,
+						correlationId: "corr_authoritative",
+						createdAt: new Date().toISOString(),
+						...input,
+					};
+					authoritativeStore.snapshot.events.unshift(event);
+					return event;
+				},
+			}),
+		});
+		store.mutate((data) => {
+			data.projects = [];
+			data.environments = [];
+			data.organizations = [];
+		});
+
+		const dryRun = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			dryRun: true,
+		});
+		expect(dryRun.dryRun).toBe(true);
+		const applied = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			confirm: true,
+		});
+		expect(applied.trace.id).not.toBe(traceId);
+		const idempotent = await replayDiagnosticTraceOperational(authoritativeStore, traceId, {
+			scope,
+			confirm: true,
+		});
+		expect(idempotent.idempotent).toBe(true);
+		expect(idempotent.trace.id).toBe(applied.trace.id);
+		expect(organizationReads).toBeGreaterThanOrEqual(4);
+		expect(store.snapshot.organizations).toEqual([]);
 	});
 
 	it("inspect distinguishes audit events vs SCIM traces", () => {

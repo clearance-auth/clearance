@@ -9,6 +9,22 @@ export const schema = {
 				defaultValue: false,
 				input: false,
 			},
+			twoFactorSessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			},
+		},
+	},
+	session: {
+		fields: {
+			twoFactorSessionGeneration: {
+				type: "string",
+				required: false,
+				input: false,
+				returned: false,
+			},
 		},
 	},
 	twoFactor: {
@@ -24,6 +40,16 @@ export const schema = {
 				required: true,
 				returned: false,
 			},
+			pendingSecret: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
+			pendingBackupCodes: {
+				type: "string",
+				required: false,
+				returned: false,
+			},
 			userId: {
 				type: "string",
 				required: true,
@@ -32,7 +58,7 @@ export const schema = {
 					model: "user",
 					field: "id",
 				},
-				index: true,
+				unique: true,
 			},
 			verified: {
 				type: "boolean",
@@ -49,8 +75,28 @@ export const schema = {
 				input: false,
 				returned: false,
 			},
+			activeVerificationReservations: {
+				type: "string",
+				required: false,
+				defaultValue: "[]",
+				input: false,
+				returned: false,
+			},
 			lockedUntil: {
 				type: "date",
+				required: false,
+				input: false,
+				returned: false,
+			},
+			lastUsedTotpCounter: {
+				type: "number",
+				required: false,
+				defaultValue: -1,
+				input: false,
+				returned: false,
+			},
+			trustDeviceGeneration: {
+				type: "string",
 				required: false,
 				input: false,
 				returned: false,

@@ -1,5 +1,5 @@
 import { APIError } from "@clearance/runtime/api";
-import { countAllNodes, findNode, xmlParser } from "./parser";
+import { countAllNodes, findNode, parseSAMLXml } from "./parser";
 
 export const SAML_HTTP_POST_BINDING =
 	"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
@@ -50,7 +50,7 @@ function toStringSet(values: Array<string | undefined>): Set<string> {
 
 function parseSAMLContent(samlContent: string): XmlNode {
 	try {
-		const parsed = toNode(xmlParser.parse(samlContent));
+		const parsed = toNode(parseSAMLXml(samlContent));
 		if (parsed) {
 			return parsed;
 		}
@@ -71,7 +71,7 @@ export function getSAMLPostAssertionConsumerServiceUrls(
 	}
 
 	try {
-		const parsed = toNode(xmlParser.parse(metadata));
+		const parsed = toNode(parseSAMLXml(metadata));
 		const spDescriptors = toNodeArray(findNode(parsed, "SPSSODescriptor"));
 		const locations = spDescriptors.flatMap((descriptor) =>
 			toNodeArray(descriptor.AssertionConsumerService)
@@ -90,7 +90,7 @@ export function getSAMLPostAssertionConsumerServiceUrls(
 
 export function hasSAMLEncryptedAssertion(samlContent: string): boolean {
 	try {
-		const parsed = xmlParser.parse(samlContent);
+		const parsed = parseSAMLXml(samlContent);
 		return countAllNodes(parsed, "EncryptedAssertion") > 0;
 	} catch {
 		return false;

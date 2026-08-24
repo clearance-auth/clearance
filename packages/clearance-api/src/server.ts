@@ -2,15 +2,23 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Context, Next } from "hono";
 import {
+	startObservability,
+	type ObservabilityHandle,
+} from "@clearance/observability-node";
+import {
 	assertClientScopeHeaders,
 	assertProductionCredentialKey,
 	assertProductionSecret,
 	ClearanceError,
 	createManagementStore,
+	deliveryStoreOptionsFromEnvironment,
 	createManagementApplication,
 	createAuthBridgeRuntimeGateway,
+	closeAuthBundle,
+	getAuthBundle,
 	createScimConnectionReal,
 	createSsoConnectionReal,
+	KEY_MANAGEMENT_OPERATIONS,
 	isClearanceError,
 	isForbiddenDefaultSecret,
 	assertIdempotencyKeyValid,
@@ -21,17 +29,23 @@ import {
 	parseCorsOrigins,
 	requireOperatorToken,
 	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
 	reserveSetupLink,
 	commitSetupLink,
 	releaseSetupLink,
-	deleteSsoProviderById,
-	deleteScimProviderById,
+	compensateSetupConnection,
+	deriveSetupConnectionIds,
 	type ManagementStore,
 	type ManagementApplication,
 	type ResourceScope,
 } from "@clearance/management";
 import { registerAccessRoutes } from "./routes/access.js";
+import { registerAuthenticationPolicyRoutes } from "./routes/authentication-policy.js";
+import { registerKeyManagementRoutes } from "./routes/key-management.js";
+import { registerProductPresentationRoutes } from "./routes/product-presentation.js";
 import { registerConfigRoutes } from "./routes/config.js";
+import { registerDeliveryRoutes } from "./routes/delivery.js";
+import { registerWebhookEndpointRoutes } from "./routes/webhook-endpoints.js";
 import { registerEnterpriseRoutes } from "./routes/enterprise.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerOperationRoutes } from "./routes/operations.js";
@@ -40,6 +54,13 @@ import { registerPlatformRoutes } from "./routes/platform.js";
 import { registerUserRoutes } from "./routes/users.js";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import {
+	authenticateManagementApiKey,
+	apiKeyRouteIsOperatorOnly,
+	requiredApiKeyScope,
+	requestPrincipal,
+	setRequestPrincipal,
+} from "./request-auth.js";
 
 const port = Number(process.env.CLEARANCE_API_PORT ?? 3200);
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024;
@@ -48,7 +69,8 @@ export function resolveMaxRequestBodyBytes(
 	env: Record<string, string | undefined> = process.env,
 ): number {
 	const raw = env.CLEARANCE_API_MAX_BODY_BYTES;
-	if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_REQUEST_BODY_BYTES;
+	if (raw === undefined || raw.trim() === "")
+		return DEFAULT_MAX_REQUEST_BODY_BYTES;
 	const value = Number(raw);
 	if (!Number.isSafeInteger(value) || value < 1 || value > 64 * 1024 * 1024) {
 		throw new Error(
@@ -74,23 +96,30 @@ const strictStartup =
 	process.env.CLEARANCE_STRICT_SECRETS === "1";
 if (strictStartup) {
 	if (isForbiddenDefaultSecret(process.env.CLEARANCE_SECRET)) {
-		throw new Error("Clearance API refuses missing/default/weak CLEARANCE_SECRET");
+		throw new Error(
+			"Clearance API refuses missing/default/weak CLEARANCE_SECRET",
+		);
 	}
 	requireOperatorToken();
 	assertProductionCredentialKey(process.env);
 	if (!process.env.DATABASE_URL?.trim()) {
-		throw new Error("Clearance API requires DATABASE_URL in strict/production mode");
+		throw new Error(
+			"Clearance API requires DATABASE_URL in strict/production mode",
+		);
 	}
 }
 
 let storePromise: Promise<ManagementStore> | null = null;
 let managementApplication: ManagementApplication | null = null;
-function getStore(): Promise<ManagementStore> {
+const requestOperatorScopes = new WeakMap<Context, ResourceScope>();
+function sharedManagementStore(): Promise<ManagementStore> {
 	if (!storePromise) {
 		const url = process.env.DATABASE_URL?.trim();
+		const delivery = url ? deliveryStoreOptionsFromEnvironment() : undefined;
 		storePromise = createManagementStore({
 			dataPath: process.env.CLEARANCE_DATA_PATH,
 			databaseUrl: url || undefined,
+			...(delivery ? { delivery } : {}),
 		});
 	}
 	return storePromise;
@@ -122,12 +151,23 @@ function backupConfiguration(): {
 	};
 }
 
+function upgradeConfiguration(): {
+	configuredDirectory: string | undefined;
+	configuredHealthUrl: string | undefined;
+} {
+	return {
+		configuredDirectory: process.env.CLEARANCE_UPGRADE_DIR?.trim() || undefined,
+		configuredHealthUrl:
+			process.env.CLEARANCE_UPGRADE_HEALTH_URL?.trim() || undefined,
+	};
+}
+
 /**
  * Long-lived API process: refresh so external CLI writes are visible before
  * serving. Flushes pending local mutations first.
  */
 async function storeForRequest(): Promise<ManagementStore> {
-	const store = await getStore();
+	const store = await sharedManagementStore();
 	await store.refresh();
 	return store;
 }
@@ -188,7 +228,10 @@ function rateLimit(ip: string): { ok: boolean; remaining: number } {
 		rateBuckets.set(ip, bucket);
 	}
 	bucket.count += 1;
-	return { ok: bucket.count <= RATE_MAX, remaining: Math.max(0, RATE_MAX - bucket.count) };
+	return {
+		ok: bucket.count <= RATE_MAX,
+		remaining: Math.max(0, RATE_MAX - bucket.count),
+	};
 }
 
 function safeEqualToken(a: string, b: string): boolean {
@@ -212,49 +255,24 @@ function safeEqualToken(a: string, b: string): boolean {
  * Resource routes reject with SCOPE_REQUIRED when principal scope is absent.
  * Init and health remain usable without scope (bootstrapping).
  */
-function principalScope(store: ManagementStore): ResourceScope {
+
+function principalScope(store: ManagementStore, c?: Context): ResourceScope {
+	if (c) {
+		const principal = requestPrincipal(c);
+		if (principal.kind === "api_key") return principal.scope;
+		const resolved = requestOperatorScopes.get(c);
+		if (resolved) return resolved;
+	}
 	return resolveOperatorScope(store);
 }
 
 function scopeForRequest(store: ManagementStore, c: Context): ResourceScope {
-	const scope = principalScope(store);
+	const scope = principalScope(store, c);
 	assertClientScopeHeaders(
 		scope,
 		c.req.header("x-clearance-project-id"),
 		c.req.header("x-clearance-environment-id"),
 	);
-	return scope;
-}
-
-/** @deprecated Use principalScope — kept for tests that import scopeFromStore */
-function scopeFromStore(store: ManagementStore): {
-	projectId?: string;
-	environmentId?: string;
-} {
-	try {
-		return principalScope(store);
-	} catch {
-		return {
-			projectId:
-				process.env.CLEARANCE_PROJECT_ID ??
-				store.snapshot.meta.config.projectId ??
-				store.snapshot.projects[0]?.id,
-			environmentId:
-				process.env.CLEARANCE_ENV_ID ??
-				store.snapshot.meta.config.environmentId ??
-				store.snapshot.environments[0]?.id,
-		};
-	}
-}
-
-/** @deprecated Prefer scopeForRequest — header check only, never authority */
-function assertScope(
-	store: ManagementStore,
-	headerProject?: string | null,
-	headerEnv?: string | null,
-): ResourceScope {
-	const scope = principalScope(store);
-	assertClientScopeHeaders(scope, headerProject, headerEnv);
 	return scope;
 }
 
@@ -340,55 +358,174 @@ app.use("*", async (c, next) => {
 	return next();
 });
 
-async function requireOperator(c: Context, next: Next) {
-	// Health is public
-	if (c.req.path === "/health") return next();
-	let expected: string;
+async function requireManagementPrincipal(c: Context, next: Next) {
+	let expected: string | undefined;
 	try {
 		expected = requireOperatorToken();
-	} catch (e) {
+	} catch {
+		expected = undefined;
+	}
+	const auth = c.req.header("authorization") ?? "";
+	const match = /^Bearer\s+(.+)$/i.exec(auth);
+	if (match && expected && safeEqualToken(match[1]!, expected)) {
+		if (c.req.path !== "/v1/init") {
+			try {
+				requestOperatorScopes.set(
+					c,
+					await resolveOperatorScopeAuthoritative(await storeForRequest()),
+				);
+			} catch (error) {
+				// Init, doctor, and developer guidance remain usable before the
+				// first project exists. Scoped routes still fail below when they
+				// attempt to derive an absent cached scope.
+				if (isClearanceError(error) && error.code === "SCOPE_REQUIRED") {
+					setRequestPrincipal(c, { kind: "operator", id: "operator" });
+					return next();
+				}
+				return handleError(c, error);
+			}
+		}
+		setRequestPrincipal(c, { kind: "operator", id: "operator" });
+		return next();
+	}
+
+	if (match) {
+		const store = await storeForRequest();
+		const result = authenticateManagementApiKey(store, match[1]!);
+		if (result.ok) {
+			if (apiKeyRouteIsOperatorOnly(c.req.method, c.req.path)) {
+				return c.json(
+					{
+					error: {
+						code: "OPERATOR_REQUIRED",
+							message:
+								"This management operation requires the bootstrap operator credential",
+						stage: "api.auth",
+						retryable: false,
+					},
+					},
+					403,
+				);
+			}
+			const requiredScope = requiredApiKeyScope(c.req.method, c.req.path);
+			if (requiredScope && !result.apiKey.scopes.includes(requiredScope)) {
+				return c.json(
+					{
+					error: {
+						code: "API_KEY_SCOPE_FORBIDDEN",
+						message: `API key requires scope ${requiredScope}`,
+						stage: "api.auth",
+						retryable: false,
+						requiredScope,
+						apiKeyId: result.apiKey.id,
+					},
+					},
+					403,
+				);
+			}
+			setRequestPrincipal(c, {
+				kind: "api_key",
+				id: result.apiKey.id,
+				scope: result.scope,
+				scopes: result.apiKey.scopes,
+				apiKey: result.apiKey,
+			});
+			return next();
+		}
+	}
+
+	if (!expected) {
 		return c.json(
 			{
-				error: {
-					code: "OPERATOR_TOKEN_UNCONFIGURED",
-					message: e instanceof Error ? e.message : "Operator token required",
-					stage: "api.auth",
-					retryable: false,
-					remediation: "Set CLEARANCE_OPERATOR_TOKEN (≥16 chars)",
-				},
+			error: {
+				code: "OPERATOR_TOKEN_UNCONFIGURED",
+					message:
+						"CLEARANCE_OPERATOR_TOKEN (or CLEARANCE_API_TOKEN) required (≥16 chars) for management API",
+				stage: "api.auth",
+				retryable: false,
+				remediation: "Set CLEARANCE_OPERATOR_TOKEN (≥16 chars)",
+			},
 			},
 			503,
 		);
 	}
-	const auth = c.req.header("authorization") ?? "";
-	const match = /^Bearer\s+(.+)$/i.exec(auth);
-	if (!match || !safeEqualToken(match[1]!, expected)) {
+
+	{
 		return c.json(
 			{
 				error: {
 					code: "UNAUTHORIZED",
-					message: "Bearer operator token required",
+					message: "Valid bearer operator token or API key required",
 					stage: "api.auth",
 					retryable: false,
-					remediation: "Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN>",
+					remediation:
+						"Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN|API_KEY>",
 				},
 			},
 			401,
 		);
 	}
-	return next();
 }
 
-app.use("/v1/*", requireOperator);
+app.use("/v1/*", requireManagementPrincipal);
+
+app.use("/v1/*", async (c, next) => {
+	const keyManagementRead =
+		(c.req.method === KEY_MANAGEMENT_OPERATIONS.status.http.method &&
+			c.req.path === KEY_MANAGEMENT_OPERATIONS.status.http.path) ||
+		(c.req.method === KEY_MANAGEMENT_OPERATIONS.plan.http.method &&
+			c.req.path === KEY_MANAGEMENT_OPERATIONS.plan.http.path);
+	if (
+		!runtimeDatabaseConfigured() ||
+		c.req.path.startsWith("/v1/schema/") ||
+		keyManagementRead
+	) {
+		return next();
+	}
+	try {
+		await getAuthBundle().credentialAuthority.assertRuntimeServing();
+		return next();
+	} catch (error) {
+		return c.json(
+			{
+				error: {
+					code: "CREDENTIAL_AUTHORITY_FENCED",
+					message: "Credential authority generation cannot serve requests.",
+					stage: "api.credential-authority",
+					retryable: true,
+					remediation:
+						error instanceof Error
+							? error.message
+							: "Inspect schema credential-authority status.",
+				},
+			},
+			503,
+		);
+	}
+});
 
 app.use("/v1/*", async (c, next) => {
 	if (!["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) return next();
-	if (!(c.req.header("content-type") ?? "").toLowerCase().includes("application/json")) return next();
-	const request = await c.req.raw.clone().json().catch(() => undefined);
-	if (!request || typeof request !== "object" || Array.isArray(request)) return next();
+	if (c.req.path.startsWith("/v1/key-management/")) return next();
+	if (
+		!(c.req.header("content-type") ?? "")
+			.toLowerCase()
+			.includes("application/json")
+	)
+		return next();
+	const request = await c.req.raw
+		.clone()
+		.json()
+		.catch(() => undefined);
+	if (!request || typeof request !== "object" || Array.isArray(request))
+		return next();
 	for (const field of ["dryRun", "confirm"] as const) {
-		if (Object.hasOwn(request, field) && typeof (request as Record<string, unknown>)[field] !== "boolean") {
-			return c.json({
+		if (
+			Object.hasOwn(request, field) &&
+			typeof (request as Record<string, unknown>)[field] !== "boolean"
+		) {
+			return c.json(
+				{
 				error: {
 					code: "API_BOOLEAN_INVALID",
 					message: `${field} must be a JSON boolean.`,
@@ -396,14 +533,16 @@ app.use("/v1/*", async (c, next) => {
 					retryable: false,
 					remediation: `Send ${field} as true or false without quotes.`,
 				},
-			}, 400);
+				},
+				400,
+			);
 		}
 	}
 	return next();
 });
 
 /**
- * Idempotency-Key replay for /v1/* mutations (FOLLOW.md P2.3.2).
+ * Operation-Key replay for /v1/* mutations (FOLLOW.md P2.3.2).
  *
  * Keys are scoped per method+route; the request body is fingerprinted.
  * - Same key + same payload  → the ORIGINAL response body and status are
@@ -427,13 +566,30 @@ let idempotencyBackend: IdempotencyBackend | null = null;
  * returns the original resource and status while reporting the omitted secret.
  */
 function idempotencyReplayBody(path: string, body: string): string | null {
+	const webhookEndpointSecretPath =
+		path === "/v1/delivery/webhook-endpoints" ||
+		/^\/v1\/delivery\/webhook-endpoints\/[^/]+\/rotate$/.test(path);
+	const apiKeySecretPath =
+		path === "/v1/keys" || /^\/v1\/keys\/[^/]+\/rotate$/.test(path);
+	const serviceAccountCredentialSecretPath =
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials$/.test(
+			path,
+		) ||
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials\/[^/]+\/rotate$/.test(
+			path,
+		);
+	const productDomainSecretPath =
+		path === "/v1/product-presentation/domains" ||
+		path === "/v1/product-presentation/domains/reissue";
 	const sensitive =
 		path === "/v1/users" ||
-		path === "/v1/keys" ||
-		/^\/v1\/keys\/[^/]+\/rotate$/.test(path) ||
+		apiKeySecretPath ||
+		serviceAccountCredentialSecretPath ||
+		productDomainSecretPath ||
 		path === "/v1/sso/setup-links" ||
 		path === "/v1/scim/setup-links" ||
-		path === "/v1/scim";
+		path === "/v1/scim" ||
+		webhookEndpointSecretPath;
 	if (!sensitive) return body;
 	try {
 		const parsed = JSON.parse(body) as Record<string, unknown>;
@@ -442,7 +598,7 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 			? ["passwordSetupToken"]
 			: path.endsWith("/setup-links")
 				? ["token", "url"]
-				: path === "/v1/keys" || path.endsWith("/rotate")
+				: apiKeySecretPath || serviceAccountCredentialSecretPath
 					? ["secret"]
 					: []) {
 			if (Object.hasOwn(parsed, key)) {
@@ -453,11 +609,46 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 		}
 		if (path === "/v1/scim") {
 			const connection = parsed.connection;
-			if (connection && typeof connection === "object" && Object.hasOwn(connection, "bearerTokenOnce")) {
+			if (
+				connection &&
+				typeof connection === "object" &&
+				Object.hasOwn(connection, "bearerTokenOnce")
+			) {
 				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
 				delete (connection as Record<string, unknown>).bearerTokenOnce;
 				omitted.push("connection.bearerTokenOnce");
 			}
+		}
+		if (productDomainSecretPath) {
+			const dnsChallenge = parsed.dnsChallenge;
+			if (
+				dnsChallenge &&
+				typeof dnsChallenge === "object" &&
+				Object.hasOwn(dnsChallenge, "value")
+			) {
+				// biome-ignore lint/performance/noDelete: one-time DNS proof must not enter persistence.
+				delete parsed.dnsChallenge;
+				parsed.challengeAlreadyIssued = true;
+				omitted.push("dnsChallenge.value");
+			}
+		}
+		if (webhookEndpointSecretPath) {
+			if (Object.hasOwn(parsed, "signingSecret")) {
+				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
+				delete parsed.signingSecret;
+				omitted.push("signingSecret");
+			}
+			const result = parsed.result;
+			if (
+				typeof result === "object" &&
+				result !== null &&
+				"signingSecret" in result
+			) {
+				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
+				delete result.signingSecret;
+				omitted.push("result.signingSecret");
+			}
+			if (omitted.length > 0) parsed.secretAlreadyIssued = true;
 		}
 		if (omitted.length === 0) return body;
 		parsed.oneTimeSecretsOmitted = omitted;
@@ -469,22 +660,64 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 	}
 }
 
-function idempotencyBackendFor(
-	store: ManagementStore,
-): IdempotencyBackend {
+function idempotencyBackendFor(store: ManagementStore): IdempotencyBackend {
 	if (!idempotencyBackend) {
 		idempotencyBackend = createIdempotencyBackend(store);
 	}
 	return idempotencyBackend;
 }
 
+export function startIdempotencyHeartbeat(
+	backend: Pick<IdempotencyBackend, "renew">,
+	claim: {
+		scopeKey: string;
+		key: string;
+		fingerprint: string;
+		generation: number;
+	},
+	intervalMs = 60_000,
+): { stop(): Promise<boolean> } {
+	let leaseLost = false;
+	let renewal: Promise<void> | undefined;
+	let stopped = false;
+	const renew = () => {
+		if (stopped || renewal) return;
+		renewal = backend
+			.renew(claim)
+			.then((renewed) => {
+				if (!renewed) leaseLost = true;
+			})
+			.catch(() => {
+				leaseLost = true;
+			})
+			.finally(() => {
+				renewal = undefined;
+			});
+	};
+	const timer = setInterval(renew, intervalMs);
+	timer.unref();
+	return {
+		async stop(): Promise<boolean> {
+			stopped = true;
+			clearInterval(timer);
+			await renewal;
+			return !leaseLost;
+		},
+	};
+}
+
 app.use("/v1/*", async (c, next) => {
 	if (!IDEMPOTENT_METHODS.has(c.req.method)) return next();
-	const key = c.req.header("idempotency-key");
+	if (
+		c.req.method === KEY_MANAGEMENT_OPERATIONS.plan.http.method &&
+		c.req.path === KEY_MANAGEMENT_OPERATIONS.plan.http.path
+	)
+		return next();
+	const key = c.req.header("operation-key");
 	if (key === undefined) return next();
 	try {
 		assertIdempotencyKeyValid(key);
-		const store = await getStore();
+		const store = await sharedManagementStore();
 		const backend = idempotencyBackendFor(store);
 		// Scope includes the caller's credential fingerprint. The API is
 		// single-operator today (one bearer token), which would make this a
@@ -500,31 +733,99 @@ app.use("/v1/*", async (c, next) => {
 		// Clone the raw request so the route handler's body read is untouched.
 		const rawBody = await c.req.raw.clone().text();
 		const fingerprint = fingerprintIdempotentRequest(scopeKey, rawBody);
-		const existing = await backend.get(scopeKey, key);
-		if (existing) {
-			if (existing.fingerprint !== fingerprint) {
-				throw idempotencyConflictError(scopeKey);
-			}
+		let claim = await backend.claim({ scopeKey, key, fingerprint });
+		const deadline = Date.now() + 5_000;
+		while (claim.state === "pending" && Date.now() < deadline) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			claim = await backend.claim({ scopeKey, key, fingerprint });
+		}
+		if (claim.state === "conflict") throw idempotencyConflictError(scopeKey);
+		if (claim.state === "completed") {
+			const existing = claim.record;
 			return c.newResponse(existing.body, existing.status as 200, {
 				"content-type": existing.contentType,
 				"Idempotency-Replayed": "true",
+				...(c.req.path === "/v1/product-presentation/domains" ||
+				c.req.path === "/v1/product-presentation/domains/reissue"
+					? { "cache-control": "no-store", pragma: "no-cache" }
+					: {}),
 			});
 		}
+		if (claim.state === "pending") {
+			throw new ClearanceError({
+				code: "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+				message: "Operation-Key is still being processed",
+				stage: "api.idempotency",
+				status: 409,
+				retryable: true,
+				remediation: "Retry the same request with the same Operation-Key.",
+			});
+		}
+		const heartbeat = startIdempotencyHeartbeat(backend, {
+			scopeKey,
+			key,
+			fingerprint,
+			generation: claim.generation,
+		});
+		try {
 		await next();
+			if (!(await heartbeat.stop())) {
+				throw new ClearanceError({
+					code: "IDEMPOTENCY_LEASE_LOST",
+					message:
+						"Operation-Key lease was lost while the request was executing",
+					stage: "api.idempotency",
+					status: 503,
+					retryable: true,
+					remediation:
+						"Retry with the same Operation-Key to observe the durable operation result.",
+				});
+			}
 		const res = c.res;
 		if (res && res.status < 500) {
 			const responseBody = await res.clone().text();
 			const replayBody = idempotencyReplayBody(c.req.path, responseBody);
 			if (replayBody !== null) {
-				await backend.put({
+					const completed = await backend.complete({
 					scopeKey,
 					key,
 					fingerprint,
+						generation: claim.generation,
 					status: res.status,
 					contentType: res.headers.get("content-type") ?? "application/json",
 					body: replayBody,
 				});
+					if (!completed) {
+						throw new ClearanceError({
+							code: "IDEMPOTENCY_LEASE_LOST",
+							message:
+								"Operation-Key lease was lost before the response could be recorded",
+							stage: "api.idempotency",
+							status: 503,
+							retryable: true,
+							remediation:
+								"Retry with the same Operation-Key to observe the durable operation result.",
+						});
+					}
+				}
+			} else {
+				await backend.fail({
+					scopeKey,
+					key,
+					fingerprint,
+					generation: claim.generation,
+				});
 			}
+		} catch (error) {
+			await backend.fail({
+				scopeKey,
+				key,
+				fingerprint,
+				generation: claim.generation,
+			});
+			throw error;
+		} finally {
+			await heartbeat.stop();
 		}
 		return;
 	} catch (e) {
@@ -547,7 +848,10 @@ app.use("/v1/*", async (c, next) => {
 app.post("/setup/:kind", async (c) => {
 	const kindParam = c.req.param("kind");
 	if (kindParam !== "sso" && kindParam !== "scim") {
-		return c.json({ error: { code: "SETUP_KIND", message: "Unknown setup kind" } }, 404);
+		return c.json(
+			{ error: { code: "SETUP_KIND", message: "Unknown setup kind" } },
+			404,
+		);
 	}
 	const kind = kindParam;
 	let body: {
@@ -565,11 +869,19 @@ app.post("/setup/:kind", async (c) => {
 	try {
 		body = await c.req.json();
 	} catch {
-		return c.json({ error: { code: "SETUP_INPUT", message: "JSON body required" } }, 400);
+		return c.json(
+			{ error: { code: "SETUP_INPUT", message: "JSON body required" } },
+			400,
+		);
 	}
 	if (!body.token || !body.provider) {
 		return c.json(
-			{ error: { code: "SETUP_INPUT", message: "token and provider are required" } },
+			{
+				error: {
+					code: "SETUP_INPUT",
+					message: "token and provider are required",
+				},
+			},
 			400,
 		);
 	}
@@ -597,7 +909,8 @@ app.post("/setup/:kind", async (c) => {
 			{
 				error: {
 					code: "SETUP_INPUT",
-					message: "SAML issuer, entry point, and X.509 signing certificate are required",
+					message:
+						"SAML issuer, entry point, and X.509 signing certificate are required",
 				},
 			},
 			400,
@@ -609,7 +922,12 @@ app.post("/setup/:kind", async (c) => {
 	const organizationId = body.organizationId;
 
 	let reservationId: string | undefined;
+	let reservationFencingToken: string | undefined;
+	let capabilityId: string | undefined;
 	let provisionedConnectionId: string | undefined;
+	let provisionedRuntimeProviderId: string | undefined;
+	let provisionedScope: ResourceScope | undefined;
+	let provisionedOrganizationId: string | undefined;
 	/** True when this request inserted a new connection (not a crash-recovery reuse). */
 	let provisionedIsNew = false;
 
@@ -621,13 +939,21 @@ app.post("/setup/:kind", async (c) => {
 			actor: "customer-setup",
 		});
 		reservationId = reserved.reservationId;
+		reservationFencingToken = reserved.reservationFencingToken;
+		capabilityId = reserved.capability.id;
 		// Attempt id is stable across re-reserves of the same capability digest.
 		const setupAttemptId = reserved.reservationId;
+		const scope = {
+			projectId: reserved.capability.projectId,
+			environmentId: reserved.capability.environmentId,
+		};
+		const setupIds = deriveSetupConnectionIds(kind, setupAttemptId);
+		provisionedOrganizationId = reserved.capability.organizationId;
 
 		const beforeIds = new Set(
 			(kind === "sso"
-				? store.snapshot.identityConnections
-				: store.snapshot.directoryConnections
+				? store.snapshot.ssoConnections
+				: store.snapshot.scimConnections
 			).map((c) => c.id),
 		);
 
@@ -645,14 +971,18 @@ app.post("/setup/:kind", async (c) => {
 						samlCertificate: body.samlCertificate,
 						actor: "customer-setup",
 						setupAttemptId,
+						scope,
 					})
 				: await createScimConnectionReal(store, {
 						organizationId: reserved.capability.organizationId,
 						provider: body.provider,
 						actor: "customer-setup",
 						setupAttemptId,
+						scope,
 					});
 		provisionedConnectionId = connection.id;
+		provisionedRuntimeProviderId = setupIds.providerId;
+		provisionedScope = scope;
 		provisionedIsNew = !beforeIds.has(connection.id);
 
 		await commitSetupLink(store, {
@@ -660,6 +990,7 @@ app.post("/setup/:kind", async (c) => {
 			kind,
 			organizationId: reserved.capability.organizationId,
 			reservationId,
+			reservationFencingToken,
 			actor: "customer-setup",
 		});
 		await store.ready();
@@ -671,11 +1002,18 @@ app.post("/setup/:kind", async (c) => {
 				bearerTokenOnce?: string;
 			};
 			const bearerTokenOnce =
-				typeof scimConn.bearerTokenOnce === "string" ? scimConn.bearerTokenOnce : undefined;
-			const publicConn = { ...(connection as object) } as Record<string, unknown>;
+				typeof scimConn.bearerTokenOnce === "string"
+					? scimConn.bearerTokenOnce
+					: undefined;
+			const publicConn = { ...(connection as object) } as Record<
+				string,
+				unknown
+			>;
 			delete publicConn.bearerTokenOnce;
 			const absoluteEndpoint = absolutePublicUrl(
-				typeof scimConn.endpoint === "string" ? scimConn.endpoint : "/api/auth/scim/v2",
+				typeof scimConn.endpoint === "string"
+					? scimConn.endpoint
+					: "/api/auth/scim/v2",
 			);
 			const responseBody: Record<string, unknown> = {
 				ok: true,
@@ -703,17 +1041,48 @@ app.post("/setup/:kind", async (c) => {
 		// of the same setup capability (deterministic reuse) — leave it for the
 		// next retry after release. Keep the reservation held until cleanup
 		// completes so this capability cannot be re-reserved into the window.
-		if (provisionedConnectionId && provisionedIsNew) {
-			await compensateSetupConnection(store, {
-				kind,
-				connectionId: provisionedConnectionId,
-			}).catch(() => undefined);
+		if (
+			provisionedConnectionId &&
+			provisionedRuntimeProviderId &&
+			provisionedScope &&
+			provisionedOrganizationId &&
+			provisionedIsNew &&
+			reservationFencingToken &&
+			capabilityId
+		) {
+			try {
+				await compensateSetupConnection(store, {
+					kind,
+					connectionId: provisionedConnectionId,
+					runtimeProviderId: provisionedRuntimeProviderId,
+					organizationId: provisionedOrganizationId,
+					provider: body.provider,
+					capabilityId,
+					reservationFencingToken,
+					scope: provisionedScope,
+					actor: "customer-setup",
+				});
+			} catch {
+				// Keep the reservation held. A retry with the deterministic attempt id
+				// can recover it; releasing here could create a second live provider.
+				return handleError(
+					c,
+					new ClearanceError({
+					code: "SETUP_COMPENSATION_FAILED",
+						message:
+							"Setup cleanup did not complete; retry this setup link later",
+					stage: "setup.compensate",
+					status: 500,
+					}),
+				);
+			}
 		}
-		if (reservationId) {
+		if (reservationId && reservationFencingToken) {
 			await releaseSetupLink(store, {
 				token,
 				kind,
 				reservationId,
+				reservationFencingToken,
 				actor: "customer-setup",
 			}).catch(() => undefined);
 		}
@@ -732,37 +1101,6 @@ function absolutePublicUrl(pathOrUrl: string): string {
 	return `${base}${path}`;
 }
 
-/**
- * Remove the exact management + runtime connection returned to this setup
- * attempt when a later commit step fails. Best-effort runtime cleanup is
- * skipped when DATABASE_URL / bridge is unavailable.
- */
-async function compensateSetupConnection(
-	store: ManagementStore,
-	opts: {
-		kind: "sso" | "scim";
-		connectionId: string;
-	},
-): Promise<void> {
-	if (opts.kind === "sso") {
-		await store.mutateDurable((data) => {
-			data.identityConnections = data.identityConnections.filter(
-				(connection) => connection.id !== opts.connectionId,
-			);
-		});
-		await store.ready();
-		await deleteSsoProviderById(opts.connectionId).catch(() => undefined);
-		return;
-	}
-	await store.mutateDurable((data) => {
-		data.directoryConnections = data.directoryConnections.filter(
-			(connection) => connection.id !== opts.connectionId,
-		);
-	});
-	await store.ready();
-	await deleteScimProviderById(opts.connectionId).catch(() => undefined);
-}
-
 // --- Bootstrapping (no project scope required) ---
 
 // Liveness is process-only: dependency failures must never create a restart
@@ -773,11 +1111,17 @@ app.get("/livez", (c) =>
 
 app.get("/readyz", async (c) => {
 	if (draining) {
-		return c.json({ ok: false, service: "clearance-api", state: "draining" }, 503);
+		return c.json(
+			{ ok: false, service: "clearance-api", state: "draining" },
+			503,
+		);
 	}
 	try {
 		const store = await storeForRequest();
 		await store.ready();
+		if (runtimeDatabaseConfigured()) {
+			await getAuthBundle().credentialAuthority.assertRuntimeServing();
+		}
 		return c.json({
 			ok: true,
 			service: "clearance-api",
@@ -824,7 +1168,7 @@ app.get("/health", async (c) => {
 	return c.json({
 		ok: true,
 		service: "clearance-api",
-		version: "0.2.1",
+		version: "0.3.0",
 	});
 });
 
@@ -836,7 +1180,7 @@ app.route(
 	"/",
 	registerPlatformRoutes({
 		storeForRequest,
-		principalScope,
+		principalScope: (store, c) => principalScope(store, c),
 		scopeForRequest,
 		handleError,
 	}),
@@ -864,7 +1208,12 @@ app.route(
 
 app.route(
 	"/",
-	registerEventRoutes({ storeForRequest, scopeForRequest, handleError }),
+	registerEventRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+		applicationFor,
+	}),
 );
 
 app.route(
@@ -877,7 +1226,56 @@ app.route(
 	}),
 );
 
-app.route("/", registerConfigRoutes({ storeForRequest, scopeForRequest, handleError }));
+app.route(
+	"/",
+	registerConfigRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+		applicationFor,
+	}),
+);
+
+app.route(
+	"/",
+	registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }),
+);
+
+app.route(
+	"/",
+	registerWebhookEndpointRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerAuthenticationPolicyRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerKeyManagementRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerProductPresentationRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
 
 app.route(
 	"/",
@@ -896,6 +1294,7 @@ app.route(
 		handleError,
 		runtimeDatabaseConfigured,
 		backupConfiguration,
+		upgradeConfiguration,
 	}),
 );
 
@@ -907,13 +1306,16 @@ function handleError(
 		return c.json(e.toJSON(), e.status);
 	}
 	console.error("Unexpected Clearance API error", e);
-	return c.json({
+	return c.json(
+		{
 		error: {
 			code: "INTERNAL",
 			message: "An unexpected internal error occurred.",
 			stage: "api",
 		},
-	}, 500);
+		},
+		500,
+	);
 }
 
 async function readBoundedRequestBody(
@@ -923,7 +1325,10 @@ async function readBoundedRequestBody(
 	const rawContentLength = req.headers["content-length"];
 	if (typeof rawContentLength === "string") {
 		const contentLength = Number(rawContentLength);
-		if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
+		if (
+			Number.isFinite(contentLength) &&
+			contentLength > MAX_REQUEST_BODY_BYTES
+		) {
 			throw new RequestBodyTooLargeError();
 		}
 	}
@@ -1015,41 +1420,107 @@ function installGracefulShutdown(
 	server: Server,
 	store: ManagementStore,
 	options: { registerSignals?: boolean; timeoutMs?: number } = {},
+	observability?: ObservabilityHandle,
 ) {
 	let shutdownPromise: Promise<void> | null = null;
 	const shutdown = (signal: string): Promise<void> => {
 		if (shutdownPromise) return shutdownPromise;
 		draining = true;
-		console.log(JSON.stringify({ event: "shutdown_started", service: "clearance-api", signal }));
-		shutdownPromise = new Promise((resolve) => {
-			const timeout = setTimeout(() => {
-				console.error(JSON.stringify({ event: "shutdown_timeout", service: "clearance-api" }));
-				server.closeAllConnections?.();
-				process.exitCode = 1;
-				resolve();
-			}, options.timeoutMs ?? Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000));
-			timeout.unref();
-			server.close(async (error) => {
+		console.log(
+			JSON.stringify({
+				event: "shutdown_started",
+				service: "clearance-api",
+				signal,
+			}),
+		);
+		shutdownPromise = (async () => {
+			let firstError: unknown;
+			let cleanup: Promise<void> | undefined;
+			let timeout: NodeJS.Timeout | undefined;
+			let timedOut = false;
+			const recordError = (error: unknown) => {
+				firstError ??= error;
+			};
+			const startCleanup = () => {
+				cleanup ??= (async () => {
+					try {
+						await store.ready();
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						await closeAuthBundle();
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						const destroy = (
+							store as ManagementStore & { destroy?: () => Promise<void> }
+						).destroy;
+						if (destroy) await destroy.call(store);
+					} catch (error) {
+						recordError(error);
+					}
+					try {
+						await observability?.shutdown();
+					} catch (error) {
+						recordError(error);
+					}
+				})();
+				return cleanup;
+			};
+			const serverStopped = new Promise<void>((resolve) => {
 				try {
-					if (error) throw error;
-					await store.ready();
-					const destroy = (store as ManagementStore & { destroy?: () => Promise<void> }).destroy;
-					if (destroy) await destroy.call(store);
-					console.log(JSON.stringify({ event: "shutdown_completed", service: "clearance-api" }));
-				} catch (shutdownError) {
-					console.error(JSON.stringify({
-						event: "shutdown_failed",
-						service: "clearance-api",
-						message: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
-					}));
-					process.exitCode = 1;
-				} finally {
-					clearTimeout(timeout);
+					server.close((error) => {
+						if (error) recordError(error);
+						resolve();
+					});
+					server.closeIdleConnections?.();
+				} catch (error) {
+					recordError(error);
 					resolve();
 				}
 			});
-			server.closeIdleConnections?.();
-		});
+			const complete = serverStopped.then(startCleanup);
+			const deadline = new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(
+					() => {
+					timedOut = true;
+					server.closeAllConnections?.();
+					void startCleanup();
+					reject(new Error("Clearance API shutdown timed out"));
+					},
+					options.timeoutMs ??
+						Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000),
+				);
+				timeout.unref();
+			});
+			try {
+				await Promise.race([complete, deadline]);
+				if (firstError) throw firstError;
+				console.log(
+					JSON.stringify({
+						event: "shutdown_completed",
+						service: "clearance-api",
+					}),
+				);
+			} catch (error) {
+				console.error(
+					JSON.stringify({
+					event: timedOut ? "shutdown_timeout" : "shutdown_failed",
+					service: "clearance-api",
+						message: timedOut
+							? undefined
+							: error instanceof Error
+								? error.message
+								: String(error),
+					}),
+				);
+				process.exitCode = 1;
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		})();
 		return shutdownPromise;
 	};
 	if (options.registerSignals !== false) {
@@ -1060,9 +1531,16 @@ function installGracefulShutdown(
 }
 
 async function start() {
+	const observability = await startObservability();
 	// Eager store init so postgres schema exists before traffic
-	const store = await getStore();
+	const store = await sharedManagementStore();
 	await store.ready();
+	if (runtimeDatabaseConfigured()) {
+		// The gateway registers the tenant product facade consumed by the
+		// singleton auth bundle. Registration must precede the first bundle read.
+		applicationFor(store);
+		await getAuthBundle().credentialAuthority.assertRuntimeServing();
+	}
 
 	const { createServer } = await import("node:http");
 	const server = createServer(nodeRequestHandler);
@@ -1071,7 +1549,7 @@ async function start() {
 			`clearance-api listening on http://localhost:${port} (store=${store.backend}, cors=${corsOrigins.join(",")})`,
 		);
 	});
-	installGracefulShutdown(server, store);
+	installGracefulShutdown(server, store, undefined, observability);
 	return server;
 }
 
@@ -1088,11 +1566,9 @@ if (isDirectRun) {
 
 export {
 	app,
-	getStore,
+	sharedManagementStore,
 	storeForRequest,
 	start,
-	assertScope,
-	scopeFromStore,
 	principalScope,
 	scopeForRequest,
 	nodeRequestHandler,

@@ -1,5 +1,5 @@
-import { EVENT_OPERATIONS, resolveOperationPath } from "@clearance/management";
-import { requestManagementApi } from "../api-client.js";
+import { EVENT_OPERATIONS } from "@clearance/management";
+import { callManagementOperation } from "../api-client.js";
 import { CliExitError } from "../output.js";
 import { writeRemoteExport } from "./export-artifact.js";
 import {
@@ -8,8 +8,7 @@ import {
 	type DispatchInput,
 	error,
 	firstStringArgument,
-	previewConfirmation,
-	query,
+	managementCallOptions,
 } from "./shared.js";
 
 export const EVENTS_TAIL_MIN_POLL_INTERVAL_MS = 100;
@@ -56,17 +55,16 @@ export async function dispatchEventCommand({
 	const rawId = firstStringArgument(args);
 	switch (path) {
 		case EVENT_OPERATIONS.list.cliPath:
-			return requestManagementApi(session, {
-				method: EVENT_OPERATIONS.list.http.method,
-				path: query(EVENT_OPERATIONS.list.http.path, {
-					limit: opts.limit,
+			return callManagementOperation(session, "events.list", body({
+					limit: opts.limit === undefined ? undefined : Number(opts.limit),
 					cursor: opts.cursor,
 					action: opts.action,
 					organizationId: opts.org,
-				}),
-			});
+				}));
 		case EVENT_OPERATIONS.tail.cliPath: {
 			const limit = integerOption(opts.limit, 20, 1, 1000, "limit", "EVENTS_TAIL_OPTION_INVALID");
+			// These controls govern the local polling lifecycle and never belong to
+			// the generated one-request events.tail transport contract.
 			const pollInterval = integerOption(
 				opts.pollInterval,
 				1000,
@@ -83,16 +81,15 @@ export async function dispatchEventCommand({
 				"max-events",
 				"EVENTS_TAIL_OPTION_INVALID",
 			);
-			const tailPath = query(EVENT_OPERATIONS.tail.http.path, {
-				limit,
-				action: opts.action,
-				organizationId: opts.org,
-			});
 			const seen = new Set<string>();
 			let emitted = 0;
 			const poll = async () => {
-				const response = await requestManagementApi<{ events?: RemoteAuditEvent[] }>(session, { path: tailPath });
-				const fresh = (response.events ?? []).filter((event) => !seen.has(event.id)).reverse();
+				const response = await callManagementOperation(session, "events.tail", body({
+					limit,
+					action: opts.action,
+					organizationId: opts.org,
+				}));
+				const fresh = (response.events as RemoteAuditEvent[]).filter((event) => !seen.has(event.id)).reverse();
 				for (const event of fresh) {
 					seen.add(event.id);
 					if (maxEvents !== 0 && emitted >= maxEvents) break;
@@ -109,32 +106,27 @@ export async function dispatchEventCommand({
 			throw new CliExitError(0);
 		}
 		case EVENT_OPERATIONS.inspect.cliPath:
-			return requestManagementApi(session, {
-				method: EVENT_OPERATIONS.inspect.http.method,
-				path: resolveOperationPath(EVENT_OPERATIONS.inspect, { id: rawId }),
-			});
+			return callManagementOperation(session, "events.inspect", { id: rawId });
 		case EVENT_OPERATIONS.export.cliPath: {
-			const envelope = await requestManagementApi<Record<string, unknown>>(session, {
-				method: EVENT_OPERATIONS.export.http.method,
-				path: EVENT_OPERATIONS.export.http.path,
-				body: body({
+			const envelope = await callManagementOperation(session, "events.export", body({
 					format: opts.format,
-					limit: opts.limit,
+					limit: opts.limit === undefined ? undefined : Number(opts.limit),
 					action: opts.action,
 					organizationId: opts.org,
 					before: opts.before,
-				}),
-			});
+				}) as {
+					format?: "json" | "jsonl";
+					limit?: number;
+					action?: string;
+					organizationId?: string;
+					before?: string;
+				});
 			return writeRemoteExport(envelope, opts, "events");
 		}
 		case EVENT_OPERATIONS.replay.cliPath:
-			return requestManagementApi(session, {
-				method: EVENT_OPERATIONS.replay.http.method,
-				path: EVENT_OPERATIONS.replay.http.path,
-				body: {
-					id: args[0],
-					...previewConfirmation(global),
-				},
-			});
+			return callManagementOperation(session, "events.replay", {
+				id: String(args[0]),
+				dryRun: global.dryRun || !global.yes,
+			}, managementCallOptions(global));
 	}
 }

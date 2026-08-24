@@ -13,27 +13,99 @@ When the console is enabled, also supply `console-admin-user`,
 ```bash
 helm lint deploy/helm/clearance \
   --set image.repository=ghcr.io/owner/clearance/clearance \
-  --set-string image.digest=sha256:<signed-release-digest> \
+  --set-string image.digest=sha256:<immutable-release-digest> \
   --set secrets.existingSecret=clearance-secrets \
   --set console.secrets.existingSecret=clearance-secrets \
+  --set credentialAuthority.deploymentId=release-2026-07-16 \
   --set env.CLEARANCE_BASE_URL=https://auth.example.com \
   --set env.CLEARANCE_CORS_ORIGINS=https://console.example.com
 
 helm upgrade --install clearance deploy/helm/clearance \
   --namespace clearance --create-namespace -f production-values.yaml \
   --set image.repository=ghcr.io/owner/clearance/clearance \
-  --set-string image.digest=sha256:<signed-release-digest>
+  --set-string image.digest=sha256:<immutable-release-digest>
 ```
 
 `image.repository` and `image.digest` are required and have no placeholder
-defaults. Copy the `sha256:` digest from the signed release bundle and verify
-its keyless cosign identity before deployment. Workloads render
-`repository@sha256:...`; the console inherits the same immutable reference
-unless explicitly given another signed digest.
+defaults. The chart validates immutable `sha256:` reference syntax. The release
+gate separately verifies the bundle signature and keyless cosign identity
+before deployment. Workloads render `repository@sha256:...`; the console
+inherits the same immutable reference unless explicitly given another digest.
 
 Ingress is disabled until hosts and existing TLS Secret names are supplied.
 Enable `ingress.api` and `ingress.console` independently. TLS defaults on for
 either ingress and fails templating without `tls.secretName`.
+
+## Custom-domain edge contract
+
+Clearance does not render a catch-all Ingress and does not claim that a
+wildcard certificate can secure arbitrary customer domains. Set
+`productPresentation.customDomains.enabled=true` only when an operator-managed
+edge is already provisioned. The chart rejects the release unless all of these
+settings are supplied and schema-valid:
+
+- `edge.mode=operator-managed` and
+  `edge.tls.certificateLifecycle=operator-managed-per-domain`. The edge owns
+  issuance, renewal, revocation, and replacement of every customer-domain
+  certificate. It must select the certificate from the client's original SNI.
+- `edge.customerDnsTarget` is the canonical CNAME target shown to customers and
+  exactly equals `env.CLEARANCE_CUSTOM_DOMAIN_TARGET`. A customer's verified
+  domain must CNAME to this edge target; it must not point at the canonical
+  Vault hostname or at the Kubernetes Ingress directly.
+- `edge.upstream.type=vault-service`, `protocol=http`, and
+  `hostHeader=preserve-original-authority`. The edge must reach
+  `<release>-vault.<namespace>.svc.cluster.local:<vault.service.port>` through
+  private connectivity and send exactly one original customer `Host` authority.
+  Vault selects the tenant from that header. Client SNI terminates at the edge;
+  it is not forwarded to the HTTP Vault Service. Do not use the canonical
+  Kubernetes Ingress as this upstream: its exact-host rule would reject a
+  customer Host header.
+- `edge.upstream.sourcePeers` names both the private edge source and the
+  canonical Vault Ingress-controller source. Custom-domain mode requires
+  `networkPolicy.enabled=true` and renders those sources as the only Vault
+  ingress peers; broad `/0` CIDRs are rejected.
+- The canonical route remains a separate exact-host `ingress.vault` with TLS.
+  `vault.publicUrl` must exactly be `https://` plus `ingress.vault.host`, and
+  the canonical certificate Secret belongs to that hostname only. The Vault
+  Service remains `ClusterIP`.
+
+Example declaration (the external edge itself is provisioned outside this
+chart):
+
+```yaml
+env:
+  CLEARANCE_CUSTOM_DOMAIN_TARGET: tenant-edge.auth.example.net
+productPresentation:
+  customDomains:
+    enabled: true
+    edge:
+      mode: operator-managed
+      customerDnsTarget: tenant-edge.auth.example.net
+      tls:
+        certificateLifecycle: operator-managed-per-domain
+      upstream:
+        type: vault-service
+        protocol: http
+        hostHeader: preserve-original-authority
+        sourcePeers:
+          - namespaceSelector:
+              matchLabels: { kubernetes.io/metadata.name: edge-system }
+            podSelector:
+              matchLabels: { app.kubernetes.io/name: tenant-edge }
+          - namespaceSelector:
+              matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+            podSelector:
+              matchLabels: { app.kubernetes.io/name: ingress-nginx }
+vault:
+  enabled: true
+  publicUrl: https://vault.auth.example.com
+  service: { type: ClusterIP, port: 3400 }
+ingress:
+  vault:
+    enabled: true
+    host: vault.auth.example.com
+    tls: { enabled: true, secretName: vault-auth-example-com }
+```
 
 `CLEARANCE_TRUSTED_PROXY` defaults to `0`. Setting it to `1` is supported only
 for the chart's narrow console-proxy topology: NetworkPolicy enabled, API
@@ -58,10 +130,193 @@ Secret objects are external and Helm cannot hash their contents. Change
 controlled rollout. The checksum annotation also rolls pods when relevant
 non-secret chart configuration changes.
 
+Credential-authority upgrades use an explicit `bridge -> drain -> migrate ->
+serve` protocol. The database stores the durable phase and generation. Every
+serving API replica holds a shared PostgreSQL session advisory lease and checks
+the durable row on readiness and requests. The migrator requires the exclusive
+form of the same lease, so paused or still-running bridge processes block data
+mutation. PostgreSQL installs `NOT VALID` writer constraints before backfill;
+those constraints reject new plaintext authority immediately. The final
+validated constraints and durable `digest-live` generation reject later legacy
+rollbacks.
+
+For a fresh database, the chart defaults to `bootstrap`: it renders zero API
+replicas and one unexposed migration Job. Install with `--wait --wait-for-jobs`,
+verify that Job completed, then promote the same immutable image to `serve`:
+
+```bash
+helm install clearance deploy/helm/clearance --wait --wait-for-jobs \
+  --set-string image.repository="$IMAGE_REPOSITORY" \
+  --set-string image.digest="$DIGEST" \
+  --set-string secrets.existingSecret="$SECRET_NAME" \
+  --set-string credentialAuthority.deploymentId="$DEPLOYMENT_ID" \
+  --set-string credentialAuthority.migrationAttemptId="install-1" \
+  --set-string env.CLEARANCE_BASE_URL="$BASE_URL"
+kubectl wait --for=condition=complete \
+  -l app.kubernetes.io/component=credential-migrator --timeout=600s
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=serve
+kubectl rollout status deployment/clearance-api
+```
+
+Never use `bootstrap` for an existing database; use the bridge protocol below.
+
+Use one immutable image digest and deployment identity through the cutover:
+
+```bash
+# Roll the 0.3 candidate while it still understands legacy authority.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set-string image.digest="$DIGEST" \
+  --set credentialAuthority.phase=bridge \
+  --set-string credentialAuthority.deploymentId="$DEPLOYMENT_ID" \
+  --set credentialAuthority.expectedRuntimeCount=2
+kubectl rollout status deployment/clearance-api
+
+# Verify every pod imageID, then bind the exact shared-lease count to this rollout.
+clearance schema credential-authority arm \
+  --deployment-id "$DEPLOYMENT_ID" --expected-runtimes 2 --yes
+clearance schema credential-authority drain \
+  --deployment-id "$DEPLOYMENT_ID" --drain-id "$DRAIN_ID" --yes
+
+# Retire all credential-capable API processes and their shared leases.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=drain
+kubectl wait --for=delete pod \
+  -l app=clearance-api,app.kubernetes.io/instance=clearance --timeout=180s
+
+# Render one unexposed, no-retry migration Job with the exact candidate image.
+MIGRATION_ATTEMPT_ID="attempt-$(date -u +%Y%m%dT%H%M%SZ)"
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=migrate \
+  --set-string credentialAuthority.drainId="$DRAIN_ID" \
+  --set-string credentialAuthority.migrationAttemptId="$MIGRATION_ATTEMPT_ID"
+kubectl wait --for=condition=complete \
+  job/clearance-credential-migration-$(printf '%s:%s' "$DRAIN_ID" "$MIGRATION_ATTEMPT_ID" | sha256sum | cut -c1-12) \
+  --timeout=600s
+
+# Start digest-only runtimes after durable publication.
+helm upgrade clearance deploy/helm/clearance --reuse-values \
+  --set credentialAuthority.phase=serve
+kubectl rollout status deployment/clearance-api
+clearance schema credential-authority status --json
+```
+
+`drain` and `migrate` render the API Deployment at zero replicas, omit its
+PodDisruptionBudget, and set revision history to zero. The migration Job has no
+Service and uses the same `repository@digest`, database Secret, deployment ID,
+and drain ID. A failed or interrupted migration leaves the durable phase at
+`migrating`; rerun with the same drain ID and a new, unique migration attempt
+ID. The attempt ID creates a new immutable Job while the durable drain identity
+prevents an unrelated migration from resuming the cutover.
+
+## Transactional delivery worker
+
+Set `delivery.enabled=true` to deploy the separately scalable delivery worker.
+The API and worker then share the delivery schema, prefix, quotas, and keyring.
+The worker always reads `database-url` from `secrets.existingSecret`, the same
+database authority used by the API. Add the following keys to
+`delivery.existingSecret`, or to `secrets.existingSecret` when the
+delivery-specific name is empty:
+
+- `delivery-key-id` and `delivery-keys-json`
+- `delivery-fingerprint-key-id` and `delivery-fingerprint-keys-json`
+- `delivery-source-dedupe-key`
+
+The delivery-specific Secret may also contain provider credentials such as
+SMTP or SES keys. It does not become a second authority for `database-url`.
+
+Each encryption, fingerprint, and source-dedupe value must decode to 32 bytes,
+and every purpose must use different material. The JSON values map retained key
+IDs to hex or base64 material. Generate each key independently. Keep retired
+encryption and fingerprint keys in their rings until `clearance delivery
+readiness` reports that queued and leased jobs no longer reference them.
+
+SMTP requires `delivery.worker.email.from`, `smtp.host`, and an explicit
+destination-scoped rule in `delivery.worker.networkPolicy.smtpEgress`. Each
+rule must include at least one non-empty destination selector or CIDR and TCP
+ports exactly matching `smtp.port`; empty rules and IPv4 or IPv6 `/0` CIDRs are
+rejected.
+The SMTP port must not overlap the worker's DNS, database, or HTTPS egress
+ports, because such an overlap would bypass destination scoping. Put
+optional authenticated SMTP credentials in `smtp-user` and `smtp-password`;
+supplying only one makes worker startup fail. TLS or STARTTLS remains mandatory.
+
+```yaml
+delivery:
+  enabled: true
+  worker:
+    email:
+      transport: smtp
+      from: auth@example.com
+      smtp:
+        host: smtp.example.com
+        port: 587
+        secure: false
+        requireTls: true
+    networkPolicy:
+      dnsPeers:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      databasePeers:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: postgresql }
+      smtpEgress:
+        - to:
+            - ipBlock: { cidr: 203.0.113.0/24 }
+          ports:
+            - { protocol: TCP, port: 587 }
+```
+
+SES requires `ses-access-key-id` and `ses-secret-access-key` in the Secret;
+`ses-session-token` is optional. The worker currently reads explicit static or
+session credentials, so workload-identity-only pods are unsupported. SES uses
+the chart's HTTPS egress rule.
+
+```yaml
+delivery:
+  enabled: true
+  worker:
+    email:
+      transport: ses
+      from: auth@example.com
+      ses:
+        region: us-east-1
+    networkPolicy:
+      dnsPeers:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      databasePeers:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: postgresql }
+```
+
+The worker Service is ClusterIP-only and has no Ingress. It serves `/live`,
+`/ready`, and `/metrics` on the internal health port. Enabling its
+ServiceMonitor requires `networkPolicy.enabled=true` and exact Prometheus
+namespace and pod selectors under `delivery.worker.networkPolicy.metrics`.
+When the worker and NetworkPolicy are enabled, non-empty `dnsPeers` and
+`databasePeers` render as the `to` selectors for those egress rules. Set all
+four worker CPU/memory requests and limits to concrete Kubernetes quantities.
+Kubernetes probes remain node-local.
+The PodDisruptionBudget assumes the default two replicas, and the 45-second
+termination grace exceeds the default 30-second drain deadline.
+
+The worker owns delivery schema migration during startup. A custom
+`delivery.schema` must already exist, and the database role needs ownership or
+the DDL grants required to create and verify owned delivery assets. After an
+external Secret change, update both `restartToken` and
+`delivery.worker.restartToken` so API producers and workers roll onto the same
+ring. Rotate in two deployments: first add retained keys everywhere, then
+switch the current IDs everywhere.
+
 ## Scheduled off-host backup
 
 Enable `backup.enabled`, provide a writable `ReadWriteMany` PVC (or let the chart create one),
-set the published backup-runtime repository and signed digest in
+set the published backup-runtime repository and immutable digest in
 `backup.image.repository` and `backup.image.digest`, and put
 `database-url` plus `backup-copy-command` in `backup.existingSecret`.
 The copy command receives the four exact artifact paths through environment

@@ -1,7 +1,7 @@
 import type { DataStoreSnapshot } from "../types/resources.js";
 
 export const STORE_SCHEMA_VERSION = 1;
-export const CLEARANCE_RELEASE_VERSION = "0.2.1";
+export const CLEARANCE_RELEASE_VERSION = "0.3.0";
 
 export function emptySnapshot(
 	config: Record<string, string> = {},
@@ -14,8 +14,8 @@ export function emptySnapshot(
 		principals: [],
 		organizations: [],
 		memberships: [],
-		identityConnections: [],
-		directoryConnections: [],
+		ssoConnections: [],
+		scimConnections: [],
 		roles: [],
 		events: [],
 		traces: [],
@@ -45,6 +45,24 @@ export function cloneSnapshot(data: DataStoreSnapshot): DataStoreSnapshot {
 	return JSON.parse(JSON.stringify(data)) as DataStoreSnapshot;
 }
 
+function stableValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stableValue);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>)
+				.filter(([, child]) => child !== undefined)
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([key, child]) => [key, stableValue(child)]),
+		);
+	}
+	return value;
+}
+
+/** Stable across JSON text, JSONB, and relational materialization key order. */
+export function stableSnapshotJson(data: DataStoreSnapshot): string {
+	return JSON.stringify(stableValue(data));
+}
+
 export function snapshotResourceCounts(
 	data: DataStoreSnapshot,
 ): Record<string, number> {
@@ -54,8 +72,8 @@ export function snapshotResourceCounts(
 		principals: data.principals.length,
 		organizations: data.organizations.length,
 		memberships: data.memberships.length,
-		identityConnections: data.identityConnections.length,
-		directoryConnections: data.directoryConnections.length,
+		ssoConnections: data.ssoConnections.length,
+		scimConnections: data.scimConnections.length,
 		roles: data.roles.length,
 		setupLinks: data.setupLinks.length,
 		events: data.events.length,

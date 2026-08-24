@@ -6,11 +6,111 @@ import { __getClearanceGlobal } from "./global";
 
 type StoredAdapter = DBTransactionAdapter<ClearanceOptions>;
 
-type HookContext = {
-	adapter: StoredAdapter;
-	pendingHooks: Array<() => Promise<void>>;
-	isTransactionActive: boolean;
+type TransactionLifecycle = {
+	active: boolean;
 };
+
+type HookContext = {
+	rootAdapter: object;
+	adapter: StoredAdapter;
+	activeTransactions: ReadonlyMap<object, HookContext>;
+	pendingBeforeCommitHooks: Array<() => Promise<void>>;
+	pendingHooks: Array<() => Promise<void>>;
+	transactionLifecycle: TransactionLifecycle | null;
+	parent?: HookContext | undefined;
+};
+
+function contextHasActiveTransaction(store: HookContext): boolean {
+	return store.transactionLifecycle?.active === true;
+}
+
+function ownsAdapter(store: HookContext, adapter: object): boolean {
+	return store.rootAdapter === adapter || store.adapter === adapter;
+}
+
+function findAdapterContext(
+	store: HookContext | undefined,
+	adapter: object,
+): HookContext | undefined {
+	const active = store?.activeTransactions.get(adapter);
+	if (active && contextHasActiveTransaction(active)) return active;
+	for (let current = store; current; current = current.parent) {
+		if (!ownsAdapter(current, adapter)) continue;
+		if (
+			current.transactionLifecycle === null ||
+			contextHasActiveTransaction(current)
+		) {
+			return current;
+		}
+	}
+	return undefined;
+}
+
+function ownerView(owner: HookContext, current: HookContext): HookContext {
+	return {
+		rootAdapter: owner.rootAdapter,
+		adapter: owner.adapter,
+		activeTransactions: current.activeTransactions,
+		pendingBeforeCommitHooks: owner.pendingBeforeCommitHooks,
+		pendingHooks: owner.pendingHooks,
+		transactionLifecycle: owner.transactionLifecycle,
+		parent: current,
+	};
+}
+
+function runInOwnerContext<R>(
+	als: AsyncLocalStorage<HookContext>,
+	owner: HookContext,
+	current: HookContext | undefined,
+	fn: () => R,
+): R | Promise<Awaited<R>> {
+	if (owner === current || !current) return fn();
+	return als.run(ownerView(owner, current), fn);
+}
+
+function findActiveTransactionContext(
+	store: HookContext | undefined,
+	adapter: object,
+): HookContext | undefined {
+	const registered = store?.activeTransactions.get(adapter);
+	if (registered && contextHasActiveTransaction(registered)) return registered;
+	for (let current = store; current; current = current.parent) {
+		if (contextHasActiveTransaction(current) && ownsAdapter(current, adapter)) {
+			return current;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The database transaction committed, but one or more best-effort publication
+ * hooks failed afterward. Callers that retain the committed result may recover
+ * without confusing this boundary with a rollback or commit failure.
+ */
+export class AfterTransactionHookError extends Error {
+	readonly errors: readonly unknown[];
+
+	constructor(errors: readonly unknown[]) {
+		super("One or more after-transaction hooks failed", {
+			cause: errors[0],
+		});
+		this.name = "AfterTransactionHookError";
+		this.errors = errors;
+	}
+}
+
+/** A non-transactional operation completed, then one or more hooks failed. */
+export class AfterOperationHookError extends Error {
+	readonly errors: readonly unknown[];
+
+	constructor(errors: readonly unknown[]) {
+		super("One or more after-operation hooks failed", {
+			cause: errors[0],
+		});
+		this.name = "AfterOperationHookError";
+		this.errors = errors;
+	}
+}
 
 const ensureAsyncStorage = async () => {
 	const clearanceGlobal = __getClearanceGlobal();
@@ -31,6 +131,53 @@ export const getCurrentDBAdapterAsyncLocalStorage = async () => {
 	return ensureAsyncStorage();
 };
 
+export const isTransactionActive = async (
+	adapter?: object,
+): Promise<boolean> => {
+	try {
+		const store = (await ensureAsyncStorage()).getStore();
+		return adapter
+			? findActiveTransactionContext(store, adapter) !== undefined
+			: store ? contextHasActiveTransaction(store) : false;
+	} catch {
+		return false;
+	}
+};
+
+/** Return the exact active transaction adapter owned by `adapter`, if any. */
+export const getActiveTransactionAdapter = async <
+	Options extends ClearanceOptions = ClearanceOptions,
+>(adapter: object): Promise<DBTransactionAdapter<Options> | null> => {
+	try {
+		const store = (await ensureAsyncStorage()).getStore();
+		const owner = findActiveTransactionContext(store, adapter);
+		return owner
+			? (owner.adapter as DBTransactionAdapter<Options>)
+			: null;
+	} catch {
+		return null;
+	}
+};
+
+/** True only when `adapter` belongs to an active rollback-capable transaction. */
+export const isRollbackCapableTransactionActive = async (
+	adapter: object,
+): Promise<boolean> => {
+	try {
+		const store = (await ensureAsyncStorage()).getStore();
+		const owner = findActiveTransactionContext(store, adapter);
+		const rootAdapter = owner?.rootAdapter as
+			| DBTransactionAdapter<ClearanceOptions>
+			| undefined;
+		return (
+			owner !== undefined &&
+			typeof rootAdapter?.options?.adapterConfig.transaction === "function"
+		);
+	} catch {
+		return false;
+	}
+};
+
 export const getCurrentAdapter = async <
 	Options extends ClearanceOptions = ClearanceOptions,
 >(
@@ -38,7 +185,7 @@ export const getCurrentAdapter = async <
 ): Promise<DBTransactionAdapter<Options>> => {
 	return ensureAsyncStorage()
 		.then((als) => {
-			const store = als.getStore();
+			const store = findAdapterContext(als.getStore(), fallback);
 			return (
 				(store?.adapter as DBTransactionAdapter<Options> | undefined) ||
 				fallback
@@ -60,16 +207,35 @@ export const runWithAdapter = async <
 	return ensureAsyncStorage()
 		.then(async (als) => {
 			called = true;
+			const activeStore = als.getStore();
+			const matchingTransaction = findActiveTransactionContext(
+				activeStore,
+				adapter,
+			);
+			if (matchingTransaction) {
+				return runInOwnerContext(
+					als,
+					matchingTransaction,
+					activeStore,
+					fn,
+				);
+			}
 			const pendingHooks: Array<() => Promise<void>> = [];
+			const activeTransactions =
+				activeStore?.activeTransactions ?? new Map<object, HookContext>();
 			let result: Awaited<R>;
 			let error: unknown;
 			let hasError = false;
 			try {
 				result = await als.run(
 					{
+						rootAdapter: adapter,
 						adapter: adapter as unknown as StoredAdapter,
+						activeTransactions,
+						pendingBeforeCommitHooks: [],
 						pendingHooks,
-						isTransactionActive: false,
+						transactionLifecycle: null,
+						parent: activeStore,
 					},
 					fn,
 				);
@@ -77,12 +243,20 @@ export const runWithAdapter = async <
 				error = err;
 				hasError = true;
 			}
-			// Execute pending hooks after the function completes (even if it threw)
-			for (const hook of pendingHooks) {
-				await hook();
-			}
+			// Hooks describe successful work and run only after the operation returns.
 			if (hasError) {
 				throw error;
+			}
+			const hookErrors: unknown[] = [];
+			for (const hook of pendingHooks) {
+				try {
+					await hook();
+				} catch (error) {
+					hookErrors.push(error);
+				}
+			}
+			if (hookErrors.length > 0) {
+				throw new AfterOperationHookError(hookErrors);
 			}
 			return result!;
 		})
@@ -101,47 +275,109 @@ export const runWithTransaction = async <
 	adapter: DBAdapter<Options>,
 	fn: () => R,
 ): Promise<R> => {
-	let called = false;
 	return ensureAsyncStorage()
 		.then(async (als) => {
-			called = true;
 			const store = als.getStore();
-			if (store?.isTransactionActive) {
-				return fn();
+			const matchingTransaction = findActiveTransactionContext(store, adapter);
+			if (matchingTransaction) {
+				return runInOwnerContext(als, matchingTransaction, store, fn);
 			}
-			const pendingHooks: Array<() => Promise<void>> = [];
+			// An adapter may re-invoke its transaction callback as part of a
+			// whole-transaction retry. Keep each callback attempt's hooks local so
+			// hooks from an abandoned attempt cannot escape after the eventual
+			// commit. A successful callback replaces this reference; retrying
+			// adapters invoke callbacks serially and return the last committed result.
+			let committedPendingHooks: Array<() => Promise<void>> = [];
 			let result: Awaited<R>;
 			let error: unknown;
 			let hasError = false;
 			try {
 				result = await adapter.transaction(async (trx) => {
-					return als.run(
-						{
-							adapter: trx as unknown as StoredAdapter,
-							pendingHooks,
-							isTransactionActive: true,
-						},
-						fn,
+					const pendingBeforeCommitHooks: Array<() => Promise<void>> = [];
+					const pendingHooks: Array<() => Promise<void>> = [];
+					const transactionLifecycle: TransactionLifecycle = { active: true };
+					const activeTransactions = new Map(
+						store?.activeTransactions ?? [],
 					);
+					const transactionContext: HookContext = {
+						rootAdapter: adapter,
+						adapter: trx as unknown as StoredAdapter,
+						activeTransactions,
+						pendingBeforeCommitHooks,
+						pendingHooks,
+						transactionLifecycle,
+						parent: store,
+					};
+					activeTransactions.set(adapter, transactionContext);
+					activeTransactions.set(trx, transactionContext);
+					try {
+						const transactionResult = await als.run(
+							transactionContext,
+							async () => {
+								const transactionResult = await fn();
+								for (const hook of pendingBeforeCommitHooks) {
+									await hook();
+								}
+								return transactionResult;
+							},
+						);
+						committedPendingHooks = pendingHooks;
+						return transactionResult;
+					} finally {
+						transactionLifecycle.active = false;
+						activeTransactions.delete(adapter);
+						activeTransactions.delete(trx);
+					}
 				});
 			} catch (e) {
 				hasError = true;
 				error = e;
 			}
-			for (const hook of pendingHooks) {
-				await hook();
-			}
 			if (hasError) {
 				throw error;
 			}
-			return result!;
-		})
-		.catch((err) => {
-			if (!called) {
-				return fn();
+			const hookErrors: unknown[] = [];
+			for (const hook of committedPendingHooks) {
+				try {
+					await hook();
+				} catch (error) {
+					hookErrors.push(error);
+				}
 			}
-			throw err;
+			if (hookErrors.length > 0) {
+				throw new AfterTransactionHookError(hookErrors);
+			}
+			return result!;
 		});
+};
+
+/**
+ * Queue rollback-critical work after the transaction body succeeds and before
+ * the adapter commits. A hook failure rejects the transaction callback so the
+ * database rolls back. Outside a transaction the hook executes immediately.
+ */
+export const queueBeforeTransactionCommitHook = async (
+	hook: () => Promise<void>,
+	adapter?: object,
+): Promise<void> => {
+	let als: AsyncLocalStorage<HookContext>;
+	try {
+		als = await ensureAsyncStorage();
+	} catch {
+		return hook();
+	}
+
+	const store = als.getStore();
+	const owner = adapter
+		? findActiveTransactionContext(store, adapter)
+		: store && contextHasActiveTransaction(store)
+			? store
+			: undefined;
+	if (owner) {
+		owner.pendingBeforeCommitHooks.push(hook);
+		return;
+	}
+	await hook();
 };
 
 /**
@@ -150,20 +386,24 @@ export const runWithTransaction = async <
  */
 export const queueAfterTransactionHook = async (
 	hook: () => Promise<void>,
+	adapter?: object,
 ): Promise<void> => {
-	return ensureAsyncStorage()
-		.then((als) => {
-			const store = als.getStore();
-			if (store) {
-				// We're in a transaction context, queue the hook
-				store.pendingHooks.push(hook);
-			} else {
-				// Not in a transaction, execute immediately
-				return hook();
-			}
-		})
-		.catch(() => {
-			// No async storage available, execute immediately
-			return hook();
-		});
+	let als: AsyncLocalStorage<HookContext>;
+	try {
+		als = await ensureAsyncStorage();
+	} catch {
+		// No async storage available, execute immediately.
+		return hook();
+	}
+
+	const store = als.getStore();
+	const owner = adapter ? findAdapterContext(store, adapter) : store;
+	if (owner) {
+		// We're in a transaction context, queue the hook.
+		owner.pendingHooks.push(hook);
+		return;
+	}
+
+	// Not in a transaction, execute immediately. Hook failures propagate once.
+	await hook();
 };

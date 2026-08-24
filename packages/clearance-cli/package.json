@@ -1,6 +1,6 @@
 {
   "name": "@clearance/cli",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Clearance CLI — operate auth projects, enterprise connections, migrations, and deploys",
   "type": "module",
   "license": "MIT",
@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/management-client": "workspace:*",
     "@clearance/management": "workspace:*",
     "commander": "^14.0.3"
   },

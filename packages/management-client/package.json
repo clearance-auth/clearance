@@ -1,0 +1,48 @@
+{
+  "name": "@clearance/management-client",
+  "version": "0.3.0",
+  "description": "Browser-neutral typed transport foundation for the Clearance Management API",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/management-client"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm run generate:operation-metadata:check && tsdown",
+    "generate:operation-metadata": "tsx scripts/generate-operation-metadata.ts",
+    "generate:operation-metadata:check": "tsx scripts/generate-operation-metadata.ts --check",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsx scripts/check-canonical-contract.ts",
+    "prepack": "pnpm run generate:operation-metadata:check"
+  },
+  "devDependencies": {
+    "tsdown": "catalog:",
+    "tsx": "^4.23.1",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  }
+}

@@ -1,12 +1,611 @@
+import { DatabaseSync } from "node:sqlite";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearance } from "../../auth/full";
 import { createAuthClient } from "../../client";
 import { getCookieCache } from "../../cookies";
 import { parseSetCookieHeader } from "../../cookies/cookie-utils";
+import { getMigrations } from "../../db/get-migration";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { bearer } from "../bearer";
 import { emailOTP } from ".";
 import { emailOTPClient } from "./client";
-import { splitAtLastColon } from "./utils";
+import {
+	emailOTPChallenge,
+	splitAtLastColon,
+	toOTPIdentifier,
+} from "./utils";
+
+async function managedEmailOTPTestRuntime(
+	minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+	afterEmailVerification?: () => Promise<void>,
+	input: {
+		resendReuse?: boolean;
+		secondaryOnly?: boolean;
+		storeOTP?: "plain" | "encrypted";
+		explicitUndefinedStoreOTP?: boolean;
+	} = {},
+) {
+	const database = new DatabaseSync(":memory:");
+	const secondaryStore = new Map<string, string>();
+	const secondaryLeases = new Map<string, Promise<void>>();
+	const runSecondaryExclusive = async <T>(
+		name: string,
+		operation: () => T | Promise<T>,
+	): Promise<T> => {
+		const previous = secondaryLeases.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const next = previous.catch(() => {}).then(() => current);
+		secondaryLeases.set(name, next);
+		await previous.catch(() => {});
+		try {
+			return await operation();
+		} finally {
+			release();
+			if (secondaryLeases.get(name) === next) secondaryLeases.delete(name);
+		}
+	};
+	let otp = "";
+	const identity = {
+		projectId: "email-otp-policy-project",
+		environmentId: "email-otp-policy-environment",
+	} satisfies RuntimeAuthenticationPolicyIdentity;
+	const policy = {
+		passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+		minimumAssurance,
+		allowedFactors: { totp: true, passkey: true },
+		trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+		assuranceMaxAgeSeconds: 300,
+	} satisfies RuntimeAuthenticationPolicy;
+	const options = {
+		baseURL: "http://localhost:3000",
+		secret: "managed-email-otp-test-secret",
+		database,
+		...(input.secondaryOnly
+			? {
+					session: { storeSessionInDatabase: true },
+					verification: { storeInDatabase: false },
+					secondaryStorage: {
+						namespace: `managed-email-otp-${Date.now()}-${Math.random()}`,
+						get: async (key: string) => secondaryStore.get(key) ?? null,
+						set: async (key: string, value: string) => {
+							secondaryStore.set(key, value);
+						},
+						delete: async (key: string) => {
+							secondaryStore.delete(key);
+						},
+						runExclusive: runSecondaryExclusive,
+					},
+				}
+			: {}),
+		...(afterEmailVerification
+			? {
+					emailVerification: {
+						autoSignInAfterVerification: true,
+						afterEmailVerification,
+					},
+				}
+			: {}),
+		plugins: [
+			emailOTP({
+				async sendVerificationOTP(input) {
+					otp = input.otp;
+				},
+				changeEmail: { enabled: true },
+				...(input.resendReuse ? { resendStrategy: "reuse" as const } : {}),
+				...(input.explicitUndefinedStoreOTP
+					? { storeOTP: undefined }
+					: input.storeOTP
+						? { storeOTP: input.storeOTP }
+						: {}),
+			}),
+		],
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity,
+		reader: {
+			async readForSubject(input) {
+				return {
+					scope: identity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: policy,
+					organizationMembership: null,
+					organizationOverride: null,
+					effective: policy,
+				};
+			},
+		},
+	});
+	await (await getMigrations(options)).runMigrations();
+	return {
+		auth: clearance(options),
+		database,
+		options,
+		secondaryStore,
+		readOTP: () => otp,
+	};
+}
+
+describe("email OTP managed authentication transactions", () => {
+	it("uses secret-keyed storage by default across secondary stores", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor", undefined, {
+			secondaryOnly: true,
+			explicitUndefinedStoreOTP: true,
+		});
+		const email = "managed-keyed-otp@example.test";
+		const identifier = toOTPIdentifier("sign-in", email);
+		try {
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const firstOtp = runtime.readOTP();
+			const context = await runtime.auth.$context;
+			const first = await context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
+			expect(first?.value).not.toContain(firstOtp);
+			expect([...runtime.secondaryStore.values()].join("\n")).not.toContain(firstOtp);
+
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const secondOtp = runtime.readOTP();
+			expect(secondOtp).not.toBe(firstOtp);
+			await expect(
+				runtime.auth.api.signInEmailOTP({ body: { email, otp: firstOtp } }),
+			).rejects.toMatchObject({ status: "BAD_REQUEST" });
+			await expect(
+				runtime.auth.api.signInEmailOTP({ body: { email, otp: secondOtp } }),
+			).resolves.toMatchObject({ token: expect.any(String) });
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back OTP adoption and identity creation when policy rejects the method", async () => {
+		const runtime = await managedEmailOTPTestRuntime("multi_factor");
+		const email = "managed-email-otp-reject@example.test";
+		try {
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			await expect(
+				runtime.auth.api.signInEmailOTP({
+					body: { email, otp: runtime.readOTP() },
+				}),
+			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "account" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
+					toOTPIdentifier("sign-in", email),
+				),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("issues a managed session when single-factor policy allows email OTP", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const email = "managed-email-otp-allow@example.test";
+		try {
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const response = await runtime.auth.api.signInEmailOTP({
+				body: { email, otp: runtime.readOTP() },
+			});
+			expect(response.token).toEqual(expect.any(String));
+			const context = await runtime.auth.$context;
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(1);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("fails before consuming the OTP when managed transaction support disappears", async () => {
+		const runtime = await managedEmailOTPTestRuntime(
+			"single_factor",
+			undefined,
+			{ storeOTP: "plain" },
+		);
+		const email = "managed-email-otp-no-transaction@example.test";
+		try {
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const context = await runtime.auth.$context;
+			context.adapter.options!.adapterConfig.transaction = false;
+			await expect(
+				runtime.auth.api.signInEmailOTP({
+					body: { email, otp: runtime.readOTP() },
+				}),
+			).rejects.toThrow("rollback-capable database transactions");
+			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
+					toOTPIdentifier("sign-in", email),
+				),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("returns the committed session when the post-commit callback throws", async () => {
+		const callback = vi.fn(async () => {
+			throw new Error("callback failure");
+		});
+		const runtime = await managedEmailOTPTestRuntime("single_factor", callback);
+		const email = "managed-email-verification-callback@example.test";
+		try {
+			const context = await runtime.auth.$context;
+			await context.internalAdapter.createUser({
+				email,
+				emailVerified: false,
+				name: "Managed Callback User",
+			});
+			const logger = vi.spyOn(context.logger, "error").mockImplementation(() => {});
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			const response = await runtime.auth.api.verifyEmailOTP({
+				body: { email, otp: runtime.readOTP() },
+				asResponse: true,
+			});
+			expect(response.status).toBe(200);
+			expect(response.headers.get("set-cookie")).toContain("session_token");
+			await expect(response.json()).resolves.toMatchObject({
+				token: expect.any(String),
+			});
+			expect(callback).toHaveBeenCalledTimes(1);
+			expect(logger).toHaveBeenCalledWith(
+				"Managed email verification post-commit callback failed",
+			);
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back no-session email verification and allows one retry", async () => {
+		const runtime = await managedEmailOTPTestRuntime(
+			"single_factor",
+			undefined,
+			{ storeOTP: "plain" },
+		);
+		const email = "managed-no-session-verify@example.test";
+		const otp = "731944";
+		const identifier = toOTPIdentifier("email-verification", email);
+		try {
+			const context = await runtime.auth.$context;
+			await createInternalVerificationChallenge(
+				context.internalAdapter,
+				emailOTPChallenge("email-verification", email),
+				{
+					identifier,
+					value: `${otp}:0`,
+					expiresAt: new Date(Date.now() + 60_000),
+				},
+			);
+			await expect(
+				runtime.auth.api.verifyEmailOTP({ body: { email, otp } }),
+			).rejects.toMatchObject({ status: "BAD_REQUEST" });
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.not.toBeNull();
+
+			await context.internalAdapter.createUser({
+				email,
+				emailVerified: false,
+				name: "Managed no-session verify",
+			});
+			await expect(
+				runtime.auth.api.verifyEmailOTP({ body: { email, otp } }),
+			).resolves.toMatchObject({ status: true, token: null });
+			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("fails before consuming a no-session OTP when transactions disappear", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const email = "managed-no-session-no-transaction@example.test";
+		try {
+			const context = await runtime.auth.$context;
+			await context.internalAdapter.createUser({
+				email,
+				emailVerified: false,
+				name: "Managed no transaction",
+			});
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "email-verification" },
+			});
+			context.adapter.options!.adapterConfig.transaction = false;
+			await expect(
+				runtime.auth.api.verifyEmailOTP({
+					body: { email, otp: runtime.readOTP() },
+				}),
+			).rejects.toThrow("rollback-capable database transactions");
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
+					toOTPIdentifier("email-verification", email),
+				),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back email-OTP password reset validation and retries once", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const email = "managed-email-reset@example.test";
+		const identifier = toOTPIdentifier("forget-password", email);
+		try {
+			const context = await runtime.auth.$context;
+			await context.internalAdapter.createUser({
+				email,
+				emailVerified: false,
+				name: "Managed email reset",
+			});
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "forget-password" },
+			});
+			await expect(
+				runtime.auth.api.resetPasswordEmailOTP({
+					body: { email, otp: runtime.readOTP(), password: "short" },
+				}),
+			).rejects.toMatchObject({ status: "BAD_REQUEST" });
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.not.toBeNull();
+
+			await expect(
+				runtime.auth.api.resetPasswordEmailOTP({
+					body: {
+						email,
+						otp: runtime.readOTP(),
+						password: "managed-valid-password",
+					},
+				}),
+			).resolves.toMatchObject({ success: true });
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.toBeNull();
+			await expect(context.adapter.count({ model: "account" })).resolves.toBe(1);
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it("rolls back change-email mutation failure and preserves the OTP for retry", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const email = "managed-change-email@example.test";
+		const newEmail = "managed-change-email-new@example.test";
+		const identifier = toOTPIdentifier("change-email", `${email}-${newEmail}`);
+		try {
+			const context = await runtime.auth.$context;
+			await context.internalAdapter.createUser({
+				email,
+				emailVerified: true,
+				name: "Managed change email",
+			});
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const signedIn = await runtime.auth.api.signInEmailOTP({
+				body: { email, otp: runtime.readOTP() },
+				asResponse: true,
+			});
+			const cookie = signedIn.headers.get("set-cookie")?.split(";")[0];
+			expect(cookie).toBeTruthy();
+			const headers = new Headers({ cookie: cookie! });
+			await runtime.auth.api.requestEmailChangeEmailOTP({
+				headers,
+				body: { newEmail },
+			});
+			const changeOTP = runtime.readOTP();
+			const originalUpdateUser = context.internalAdapter.updateUser.bind(
+				context.internalAdapter,
+			);
+			const updateUser = vi
+				.spyOn(context.internalAdapter, "updateUser")
+				.mockRejectedValueOnce(new Error("forced email update failure"))
+				.mockImplementation(originalUpdateUser);
+			await expect(
+				runtime.auth.api.changeEmailEmailOTP({
+					headers,
+					body: { newEmail, otp: changeOTP },
+				}),
+			).rejects.toThrow("forced email update failure");
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.not.toBeNull();
+			updateUser.mockRestore();
+
+			await expect(
+				runtime.auth.api.changeEmailEmailOTP({
+					headers,
+					body: { newEmail, otp: changeOTP },
+				}),
+			).resolves.toMatchObject({ success: true });
+			await expect(
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+			).resolves.toBeNull();
+			await expect(
+				context.internalAdapter.findUserByEmail(newEmail),
+			).resolves.not.toBeNull();
+		} finally {
+			runtime.database.close();
+		}
+	});
+
+	it.each(["database", "secondary"] as const)(
+		"atomically reuses managed OTP expiry with %s verification storage",
+		async (storage) => {
+			const runtime = await managedEmailOTPTestRuntime(
+				"single_factor",
+				undefined,
+				{
+					resendReuse: true,
+					secondaryOnly: storage === "secondary",
+					storeOTP: "encrypted",
+				},
+			);
+			const email = `managed-reuse-${storage}@example.test`;
+			const identifier = toOTPIdentifier("email-verification", email);
+			try {
+				const context = await runtime.auth.$context;
+				await context.internalAdapter.createUser({
+					email,
+					emailVerified: false,
+					name: `Managed reuse ${storage}`,
+				});
+				await runtime.auth.api.sendVerificationOTP({
+					body: { email, type: "email-verification" },
+				});
+				const otp = runtime.readOTP();
+				const initial = await context.internalAdapter.findVerificationValueAndPruneExpired(
+					identifier,
+				);
+				expect(initial).not.toBeNull();
+				const initialMarkers = await context.adapter.findMany<
+					Record<string, unknown>
+				>({
+					model: "securityMigration",
+					where: [
+						{
+							field: "state",
+							value: "managed-verification-challenge-v2",
+						},
+					],
+				});
+				expect(initialMarkers).toHaveLength(1);
+
+				const createVerificationValue = vi
+					.spyOn(context.internalAdapter, "createVerificationValue")
+					.mockRejectedValueOnce(new Error("forced managed reuse rollback"));
+				await expect(
+					runtime.auth.api.sendVerificationOTP({
+						body: { email, type: "email-verification" },
+					}),
+				).rejects.toThrow("forced managed reuse rollback");
+				createVerificationValue.mockRestore();
+				await expect(
+					context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
+				).resolves.toMatchObject({
+					id: initial!.id,
+					expiresAt: initial!.expiresAt,
+				});
+				await expect(
+					context.adapter.findMany({
+						model: "securityMigration",
+						where: [
+							{ field: "key", value: String(initialMarkers[0]!.key) },
+						],
+					}),
+				).resolves.toHaveLength(1);
+
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				await runtime.auth.api.sendVerificationOTP({
+					body: { email, type: "email-verification" },
+				});
+				expect(runtime.readOTP()).toBe(otp);
+				const reused = await context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
+				expect(reused?.id).not.toBe(initial!.id);
+				expect(reused!.expiresAt.getTime()).toBeGreaterThan(
+					initial!.expiresAt.getTime(),
+				);
+				const reusedMarkers = await context.adapter.findMany<
+					Record<string, unknown>
+				>({
+					model: "securityMigration",
+					where: [
+						{
+							field: "state",
+							value: "managed-verification-challenge-v2",
+						},
+					],
+				});
+				expect(reusedMarkers).toHaveLength(1);
+				expect(reusedMarkers[0]!.key).not.toBe(initialMarkers[0]!.key);
+				expect(JSON.stringify(reusedMarkers[0])).not.toContain(email);
+				expect(JSON.stringify(reusedMarkers[0])).not.toContain(otp);
+				await expect(
+					context.adapter.findMany({
+						model: "securityMigration",
+						where: [
+							{ field: "key", value: String(initialMarkers[0]!.key) },
+						],
+					}),
+				).resolves.toHaveLength(0);
+
+				const originalFind = context.internalAdapter.findVerificationValueAndPruneExpired.bind(
+					context.internalAdapter,
+				);
+				const findVerificationValueAndPruneExpired = vi
+					.spyOn(context.internalAdapter, "findVerificationValueAndPruneExpired")
+					.mockResolvedValueOnce(initial)
+					.mockImplementation(originalFind);
+				await runtime.auth.api.sendVerificationOTP({
+					body: { email, type: "email-verification" },
+				});
+				findVerificationValueAndPruneExpired.mockRestore();
+				expect(runtime.readOTP()).toBe(otp);
+				await expect(
+					context.adapter.findMany({
+						model: "securityMigration",
+						where: [
+							{
+								field: "state",
+								value: "managed-verification-challenge-v2",
+							},
+						],
+					}),
+				).resolves.toHaveLength(1);
+
+				await expect(
+					runtime.auth.api.verifyEmailOTP({ body: { email, otp } }),
+				).resolves.toMatchObject({ status: true, token: null });
+				await expect(
+					runtime.auth.api.verifyEmailOTP({ body: { email, otp } }),
+				).rejects.toBeDefined();
+				await expect(
+					context.adapter.findMany({
+						model: "securityMigration",
+						where: [
+							{
+								field: "state",
+								value: "managed-verification-challenge-v2",
+							},
+						],
+					}),
+				).resolves.toHaveLength(0);
+			} finally {
+				runtime.database.close();
+			}
+		},
+	);
+});
 
 describe("email-otp", async () => {
 	const otpFn = vi.fn();
@@ -78,6 +677,69 @@ describe("email-otp", async () => {
 			},
 		);
 		expect(verifiedUser.data?.token).toBeDefined();
+	});
+
+	it("passes atomically consumed email-otp evidence to the real session boundary", async () => {
+		let issuedOTP = "";
+		const { auth, client: isolatedClient, testUser } = await getTestInstance(
+			{
+				plugins: [
+					emailOTP({
+						async sendVerificationOTP({ otp: sentOTP }) {
+							issuedOTP = sentOTP;
+						},
+					}),
+				],
+			},
+			{ clientOptions: { plugins: [emailOTPClient()] } },
+		);
+		const adapter = (await auth.$context).internalAdapter;
+		const authoritativeUser = await adapter.findUserByEmail(testUser.email);
+		expect(authoritativeUser).not.toBeNull();
+		const consumeVerificationValue = vi.spyOn(
+			adapter,
+			"consumeVerificationValue",
+		);
+		const createSession = vi.spyOn(adapter, "createSession");
+		const identifier = toOTPIdentifier("sign-in", testUser.email);
+
+		await isolatedClient.emailOtp.sendVerificationOtp({
+			email: testUser.email,
+			type: "sign-in",
+		});
+		const invalid = await isolatedClient.signIn.emailOtp({
+			email: testUser.email,
+			otp: "invalid-otp",
+		});
+		expect(invalid.error?.code).toBe("INVALID_OTP");
+		expect(createSession).not.toHaveBeenCalled();
+
+		const response = await isolatedClient.signIn.emailOtp({
+			email: testUser.email,
+			otp: issuedOTP,
+		});
+		expect(response.data?.token).toBeDefined();
+		expect(consumeVerificationValue).toHaveBeenCalledWith(identifier, {
+			purpose: "email-otp:sign-in",
+			subject: testUser.email,
+			identifier,
+		});
+		expect(await adapter.findVerificationValueAndPruneExpired(identifier)).toBeNull();
+		expect(createSession).toHaveBeenCalledTimes(1);
+		const [subjectId, dontRememberMe, override, overrideAll, issuanceContext] =
+			createSession.mock.calls[0]!;
+		expect([subjectId, dontRememberMe, override, overrideAll]).toEqual([
+			authoritativeUser!.user.id,
+			false,
+			undefined,
+			false,
+		]);
+		expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+			purpose: "interactive",
+			subjectId: authoritativeUser!.user.id,
+			evidence: [{ kind: "primary", primaryMethod: "email_otp" }],
+			targetOrganizationId: null,
+		});
 	});
 
 	it("should clear an unverified account's password when sign-in adopts it", async () => {
@@ -416,13 +1078,16 @@ describe("email-otp", async () => {
 		expect(otp.length).toBe(6);
 	});
 
-	it("should get verification otp on server", async () => {
-		await auth.api.getVerificationOTP({
+	it("does not retrieve the default secret-keyed OTP on the server", async () => {
+		await auth.api.sendVerificationOTP({
+			body: { email: "test@email.com", type: "sign-in" },
+		});
+		await expect(auth.api.getVerificationOTP({
 			query: {
 				email: "test@email.com",
 				type: "sign-in",
 			},
-		});
+		})).rejects.toMatchObject({ status: "BAD_REQUEST" });
 	});
 
 	it("should work with custom options", async () => {
@@ -1371,7 +2036,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 
@@ -1465,7 +2130,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 
@@ -1559,7 +2224,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 			const storedOtp = verificationValue?.value || "";
@@ -1649,7 +2314,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 			const storedOtp = verificationValue?.value || "";
@@ -1983,7 +2648,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.token).toBeDefined();
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2006,7 +2671,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.status).toBe(true);
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`email-verification-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2031,7 +2696,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.success).toBe(true);
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`forget-password-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2060,7 +2725,7 @@ describe("race condition protection", async () => {
 		expect(failures[0]!.error?.code).toBe("INVALID_OTP");
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2099,7 +2764,7 @@ describe("race condition protection", async () => {
 		});
 		expect(wrong.error?.code).toBe("INVALID_OTP");
 
-		const afterWrong = await authCtx.internalAdapter.findVerificationValue(
+		const afterWrong = await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 			`sign-in-otp-${email}`,
 		);
 		expect(afterWrong).not.toBeNull();
@@ -2127,7 +2792,7 @@ describe("race condition protection", async () => {
 		expect(lockedOut.error?.code).toBe("TOO_MANY_ATTEMPTS");
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2154,6 +2819,7 @@ describe("email-otp-resendStrategy", async () => {
 						otps.push(otp);
 					},
 					resendStrategy: "reuse",
+					storeOTP: "encrypted",
 				}),
 			],
 		},

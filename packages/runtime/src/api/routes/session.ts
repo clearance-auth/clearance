@@ -1,11 +1,5 @@
-import type {
-	ClearanceOptions,
-	GenericEndpointContext,
-} from "@clearance/core";
-import {
-	createAuthEndpoint,
-	createAuthMiddleware,
-} from "@clearance/core/api";
+import type { ClearanceOptions, GenericEndpointContext } from "@clearance/core";
+import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { base64Url } from "@clearance/utils/base64";
@@ -18,16 +12,30 @@ import {
 	deleteSessionCookie,
 	expireCookie,
 	getChunkedCookie,
+	setSessionCredentialResponseNoStore,
 	setCookieCache,
 	setSessionCookie,
 } from "../../cookies";
 import { getSessionQuerySchema } from "../../cookies/session-store";
 import { symmetricDecodeJWT, verifyJWT } from "../../crypto";
 import { parseSessionOutput, parseUserOutput } from "../../db";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import type { Prettify, Session, User } from "../../types";
 import { getDate } from "../../utils/date";
 import { isAPIError } from "../../utils/is-api-error";
+import {
+	CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+	parseCredentialOperationKey,
+} from "../../utils/operation-key";
 import { getShouldSkipSessionRefresh } from "../state/should-session-refresh";
+
+type PublicSession<Option extends ClearanceOptions> = Omit<
+	Session<Option["session"], Option["plugins"]>,
+	"token"
+> & {
+	/** @deprecated Stable, non-secret administrative handle. Prefer `id`. */
+	token: Session<Option["session"], Option["plugins"]>["id"];
+};
 
 export const getSession = <Option extends ClearanceOptions>() =>
 	createAuthEndpoint(
@@ -69,7 +77,7 @@ export const getSession = <Option extends ClearanceOptions>() =>
 		async (
 			ctx,
 		): Promise<{
-			session: Session<Option["session"], Option["plugins"]>;
+			session: PublicSession<Option>;
 			user: User<Option["user"], Option["plugins"]>;
 		} | null> => {
 			ctx.setHeader("cache-control", "no-store");
@@ -94,6 +102,48 @@ export const getSession = <Option extends ClearanceOptions>() =>
 
 				if (!sessionCookieToken) {
 					return null;
+				}
+				const managedAuthenticationPolicy = Boolean(
+					readInternalAuthenticationPolicy(ctx.context.options),
+				);
+				let authoritativeSession:
+					| {
+							session: Session & Record<string, any>;
+							user: User & Record<string, any>;
+					  }
+					| null
+					| undefined;
+				const rawOperationKey = ctx.headers?.get("idempotency-key");
+				const idempotencyKey = parseCredentialOperationKey(rawOperationKey);
+				if (rawOperationKey != null && !idempotencyKey) {
+					throw new APIError("BAD_REQUEST", {
+						message: CREDENTIAL_OPERATION_KEY_REQUIREMENT,
+					});
+				}
+				if (idempotencyKey) {
+					const recovered =
+						await ctx.context.internalAdapter.recoverSessionCredential(
+							sessionCookieToken,
+							idempotencyKey,
+						);
+					if (recovered) {
+						const recoveredSession = {
+							session: recovered.session,
+							user: recovered.user,
+						};
+						ctx.context.session = recoveredSession;
+						await setSessionCookie(ctx, recoveredSession);
+						return ctx.json({
+							session: parseSessionOutput(
+								ctx.context.options,
+								recovered.session,
+							),
+							user: parseUserOutput(ctx.context.options, recovered.user),
+						} as {
+							session: PublicSession<Option>;
+							user: User<Option["user"], Option["plugins"]>;
+						});
+					}
 				}
 
 				const sessionDataCookie = getChunkedCookie(
@@ -221,7 +271,37 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					ctx.context.options.session?.cookieCache?.enabled &&
 					!ctx.query?.disableCookieCache
 				) {
-					const session = sessionDataPayload.session;
+					const cachedSession = sessionDataPayload.session;
+					const hasSessionStore = hasServerSessionStore(ctx.context.options);
+					if (hasSessionStore) {
+						authoritativeSession =
+							await ctx.context.internalAdapter.findSession(sessionCookieToken);
+					}
+					const session =
+						managedAuthenticationPolicy && authoritativeSession
+							? {
+									...cachedSession,
+									session: authoritativeSession.session,
+									user: authoritativeSession.user,
+								}
+							: cachedSession;
+					const storedSessionIsCurrent =
+						!hasSessionStore || Boolean(authoritativeSession);
+					const hasAdminAuthority = ctx.context.options.plugins?.some(
+						(plugin) => plugin.id === "admin",
+					) === true;
+					const liveUser = hasAdminAuthority
+						? managedAuthenticationPolicy
+							? (authoritativeSession?.user ?? null)
+							: await ctx.context.internalAdapter.findUserById(session.user.id)
+						: null;
+					const cachedSessionIsCurrent =
+						storedSessionIsCurrent &&
+						(!hasAdminAuthority ||
+							Boolean(
+								liveUser &&
+									(liveUser as { banned?: boolean | null }).banned !== true,
+							));
 
 					const versionConfig =
 						ctx.context.options.session?.cookieCache?.version;
@@ -237,7 +317,9 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					}
 
 					const cookieVersion = session.version || "1";
-					if (cookieVersion !== expectedVersion) {
+					if (!cachedSessionIsCurrent) {
+						expireCookie(ctx, ctx.context.authCookies.sessionData);
+					} else if (cookieVersion !== expectedVersion) {
 						// Version mismatch - invalidate the cookie cache
 						expireCookie(ctx, ctx.context.authCookies.sessionData);
 					} else {
@@ -259,7 +341,6 @@ export const getSession = <Option extends ClearanceOptions>() =>
 
 							if (cookieRefreshCache === false) {
 								// If refreshCache is disabled, return the session from cookie as-is
-								ctx.context.session = session;
 								// Parse session and user to ensure additionalFields are included
 								// Rehydrate date fields from JSON strings before parsing
 								const parsedSession = parseSessionOutput(ctx.context.options, {
@@ -273,11 +354,15 @@ export const getSession = <Option extends ClearanceOptions>() =>
 									createdAt: new Date(session.user.createdAt),
 									updatedAt: new Date(session.user.updatedAt),
 								});
+								ctx.context.session = {
+									session: { ...parsedSession, token: sessionCookieToken },
+									user: parsedUser,
+								};
 								return ctx.json({
 									session: parsedSession,
 									user: parsedUser,
 								} as {
-									session: Session<Option["session"], Option["plugins"]>;
+									session: PublicSession<Option>;
 									user: User<Option["user"], Option["plugins"]>;
 								});
 							}
@@ -307,13 +392,14 @@ export const getSession = <Option extends ClearanceOptions>() =>
 									: ctx.context.sessionConfig.expiresIn;
 								await ctx.setSignedCookie(
 									ctx.context.authCookies.sessionToken.name,
-									session.session.token,
+									sessionCookieToken,
 									ctx.context.secret,
 									{
 										...sessionTokenOptions,
 										maxAge: sessionTokenMaxAge,
 									},
 								);
+								setSessionCredentialResponseNoStore(ctx);
 
 								// Parse session and user to ensure additionalFields are included
 								// Rehydrate date fields from JSON strings before parsing
@@ -335,14 +421,17 @@ export const getSession = <Option extends ClearanceOptions>() =>
 									},
 								);
 								ctx.context.session = {
-									session: parsedRefreshedSession,
+									session: {
+										...parsedRefreshedSession,
+										token: sessionCookieToken,
+									},
 									user: parsedRefreshedUser,
 								};
 								return ctx.json({
 									session: parsedRefreshedSession,
 									user: parsedRefreshedUser,
 								} as {
-									session: Session<Option["session"], Option["plugins"]>;
+									session: PublicSession<Option>;
 									user: User<Option["user"], Option["plugins"]>;
 								});
 							}
@@ -360,14 +449,14 @@ export const getSession = <Option extends ClearanceOptions>() =>
 								updatedAt: new Date(session.user.updatedAt),
 							});
 							ctx.context.session = {
-								session: parsedSession,
+								session: { ...parsedSession, token: sessionCookieToken },
 								user: parsedUser,
 							};
 							return ctx.json({
 								session: parsedSession,
 								user: parsedUser,
 							} as {
-								session: Session<Option["session"], Option["plugins"]>;
+									session: PublicSession<Option>;
 								user: User<Option["user"], Option["plugins"]>;
 							});
 						}
@@ -375,20 +464,23 @@ export const getSession = <Option extends ClearanceOptions>() =>
 				}
 
 				const session =
-					await ctx.context.internalAdapter.findSession(sessionCookieToken);
+					authoritativeSession !== undefined
+						? authoritativeSession
+						: await ctx.context.internalAdapter.findSession(sessionCookieToken);
 				ctx.context.session = session;
 				if (!session || session.session.expiresAt < new Date()) {
 					deleteSessionCookie(ctx);
-					if (session) {
-						/**
-						 * if session expired clean up the session
-						 * Only delete on POST when deferSessionRefresh is enabled
-						 */
-						if (!deferSessionRefresh || isPostRequest) {
-							await ctx.context.internalAdapter.deleteSession(
-								session.session.token,
-							);
-						}
+					/**
+					 * Clean up an expired credential on mutating validation. Calling delete
+					 * with an unknown credential is deliberately a fail-safe no-op.
+					 */
+					if (
+						!managedAuthenticationPolicy &&
+						(!deferSessionRefresh || isPostRequest)
+					) {
+						await ctx.context.internalAdapter.deleteSession(
+							session?.session.token ?? sessionCookieToken,
+						);
 					}
 					return ctx.json(null);
 				}
@@ -407,7 +499,7 @@ export const getSession = <Option extends ClearanceOptions>() =>
 						session: parsedSession,
 						user: parsedUser,
 					} as {
-						session: Session<Option["session"], Option["plugins"]>;
+								session: PublicSession<Option>;
 						user: User<Option["user"], Option["plugins"]>;
 					});
 				}
@@ -449,7 +541,7 @@ export const getSession = <Option extends ClearanceOptions>() =>
 						user: parsedUser,
 						needsRefresh,
 					} as unknown as {
-						session: Session<Option["session"], Option["plugins"]>;
+							session: PublicSession<Option>;
 						user: User<Option["user"], Option["plugins"]>;
 					});
 				}
@@ -496,7 +588,7 @@ export const getSession = <Option extends ClearanceOptions>() =>
 						session: parsedUpdatedSession,
 						user: parsedUser,
 					} as unknown as {
-						session: Session<Option["session"], Option["plugins"]>;
+								session: PublicSession<Option>;
 						user: User<Option["user"], Option["plugins"]>;
 					});
 				}
@@ -511,7 +603,7 @@ export const getSession = <Option extends ClearanceOptions>() =>
 					session: parsedSession,
 					user: parsedUser,
 				} as {
-					session: Session<Option["session"], Option["plugins"]>;
+								session: PublicSession<Option>;
 					user: User<Option["user"], Option["plugins"]>;
 				});
 			} catch (error) {
@@ -581,7 +673,7 @@ export const getSessionFromCtx = async <
 	}).catch(() => {
 		return null;
 	});
-	if (!session) {
+	if (!session?.response?.user) {
 		ctx.context.session = null;
 		return null;
 	}
@@ -602,8 +694,23 @@ export const getSessionFromCtx = async <
 			}
 		});
 	}
-	ctx.context.session = session.response;
-	return session.response as {
+	const presentedToken = await ctx.getSignedCookie(
+		ctx.context.authCookies.sessionToken.name,
+		ctx.context.secret,
+	);
+	if (!presentedToken) {
+		ctx.context.session = null;
+		return null;
+	}
+	const internalSession = {
+		...session.response,
+		session: {
+			...session.response.session,
+			token: presentedToken,
+		},
+	};
+	ctx.context.session = internalSession;
+	return internalSession as {
 		session: S & Session;
 		user: U & User;
 	} | null;
@@ -752,7 +859,7 @@ export const listSessions = <Option extends ClearanceOptions>() =>
 					activeSessions.map((session) =>
 						parseSessionOutput(ctx.context.options, session),
 					) as unknown as Prettify<
-						Session<Option["session"], Option["plugins"]>
+					PublicSession<Option>
 					>[],
 				);
 			} catch (e: any) {
@@ -769,11 +876,18 @@ export const revokeSession = createAuthEndpoint(
 	"/revoke-session",
 	{
 		method: "POST",
-		body: z.object({
-			token: z.string().meta({
-				description: "The token to revoke",
+		body: z
+			.object({
+				id: z.string().optional().meta({
+					description: "The stable session ID to revoke",
+				}),
+				token: z.string().optional().meta({
+					description: "Deprecated session refresh token compatibility alias",
+				}),
+			})
+			.refine((body) => Boolean(body.id) !== Boolean(body.token), {
+				message: "Provide exactly one of id or token",
 			}),
-		}),
 		use: [sensitiveSessionMiddleware],
 		requireHeaders: true,
 		metadata: {
@@ -782,16 +896,25 @@ export const revokeSession = createAuthEndpoint(
 				requestBody: {
 					content: {
 						"application/json": {
-							schema: {
-								type: "object",
-								properties: {
-									token: {
-										type: "string",
-										description: "The token to revoke",
+								schema: {
+									type: "object",
+									properties: {
+										id: {
+											type: "string",
+											description: "The stable session ID to revoke",
+										},
+										token: {
+											type: "string",
+											description:
+												"Deprecated session refresh token compatibility alias",
+											deprecated: true,
+										},
 									},
+									oneOf: [
+										{ required: ["id"] },
+										{ required: ["token"] },
+									],
 								},
-								required: ["token"],
-							},
 						},
 					},
 				},
@@ -819,12 +942,18 @@ export const revokeSession = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		const token = ctx.body.token;
-		const session = await ctx.context.internalAdapter.findSession(token);
+		const legacyHandleSession = ctx.body.token
+			? await ctx.context.internalAdapter.findSessionById(ctx.body.token)
+			: null;
+		const session = ctx.body.id
+			? await ctx.context.internalAdapter.findSessionById(ctx.body.id)
+			: legacyHandleSession ??
+				(await ctx.context.internalAdapter.findSession(ctx.body.token!));
+		const sessionId = session?.session.id;
 
-		if (session?.session.userId === ctx.context.session.user.id) {
+		if (sessionId && session?.session.userId === ctx.context.session.user.id) {
 			try {
-				await ctx.context.internalAdapter.deleteSession(token);
+				await ctx.context.internalAdapter.deleteSessionById(sessionId);
 			} catch (error) {
 				ctx.context.logger.error(
 					error && typeof error === "object" && "name" in error
@@ -949,11 +1078,11 @@ export const revokeOtherSessions = createAuthEndpoint(
 			return session.expiresAt > new Date();
 		});
 		const otherSessions = activeSessions.filter(
-			(session) => session.token !== ctx.context.session.session.token,
+			(session) => session.id !== ctx.context.session.session.id,
 		);
 		await Promise.all(
 			otherSessions.map((session) =>
-				ctx.context.internalAdapter.deleteSession(session.token),
+				ctx.context.internalAdapter.deleteSessionById(session.id),
 			),
 		);
 		return ctx.json({

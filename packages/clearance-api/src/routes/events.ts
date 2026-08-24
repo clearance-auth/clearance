@@ -1,14 +1,15 @@
 import {
 	EVENT_OPERATIONS,
-	exportEvents,
-	inspectEvent,
-	listEventsPage,
-	replayDiagnosticTrace,
+	exportEventsOperational,
+	inspectEventOperational,
+	listEventsPageOperational,
+	replayDiagnosticTraceOperational,
 } from "@clearance/management";
 import { Hono } from "hono";
-import type { ScopedRouteDependencies } from "./shared.js";
+import { requestActor } from "../request-auth.js";
+import type { ApplicationRouteDependencies } from "./shared.js";
 
-export interface EventRouteDependencies extends ScopedRouteDependencies {}
+export type EventRouteDependencies = ApplicationRouteDependencies;
 
 export function registerEventRoutes({
 	storeForRequest,
@@ -24,7 +25,7 @@ export function registerEventRoutes({
 				const cursor = c.req.query("cursor");
 				const action = c.req.query("action");
 				const organizationId = c.req.query("organizationId");
-				const page = listEventsPage(store, {
+				const page = await listEventsPageOperational(store, {
 					scope,
 					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
 					...(cursor !== undefined ? { cursor } : {}),
@@ -40,7 +41,7 @@ export function registerEventRoutes({
 			try {
 				const store = await storeForRequest();
 				const scope = scopeForRequest(store, c);
-				const result = inspectEvent(store, c.req.param("id"), { scope });
+				const result = await inspectEventOperational(store, c.req.param("id"), { scope });
 				return c.json(result);
 			} catch (error) {
 				return handleError(c, error);
@@ -75,14 +76,14 @@ export function registerEventRoutes({
 					typeof (body as { before?: unknown }).before === "string"
 						? (body as { before: string }).before
 						: undefined;
-				const envelope = exportEvents(store, {
+				const envelope = await exportEventsOperational(store, {
 					scope,
 					format,
 					limit,
 					...(action ? { action } : {}),
 					...(organizationId ? { organizationId } : {}),
 					...(before ? { before } : {}),
-					actor: "api",
+					actor: requestActor(c),
 					source: "api",
 				});
 				await store.ready();
@@ -105,11 +106,11 @@ export function registerEventRoutes({
 				const confirm =
 					body && typeof body === "object" && (body as { confirm?: unknown }).confirm === true;
 				const dryRun = bodyDryRun || !confirm;
-				const result = replayDiagnosticTrace(store, id, {
+				const result = await replayDiagnosticTraceOperational(store, id, {
 					scope,
 					dryRun,
 					confirm: confirm && !bodyDryRun,
-					actor: "api",
+					actor: requestActor(c),
 					source: "api",
 				});
 				if (!result.dryRun) {

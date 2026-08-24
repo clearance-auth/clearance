@@ -1,6 +1,10 @@
 import { base64 } from "@clearance/utils/base64";
 import { APIError } from "@clearance/runtime/api";
-import { countAllNodes, xmlParser } from "./parser";
+import {
+	countAllNodes,
+	hasXMLDoctype,
+	parseSAMLXml,
+} from "./parser";
 
 export interface AssertionCounts {
 	assertions: number;
@@ -11,7 +15,7 @@ export interface AssertionCounts {
 export function countAssertions(xml: string): AssertionCounts {
 	let parsed: unknown;
 	try {
-		parsed = xmlParser.parse(xml);
+		parsed = parseSAMLXml(xml);
 	} catch {
 		throw new APIError("BAD_REQUEST", {
 			message: "Failed to parse SAML response XML",
@@ -42,6 +46,13 @@ export function validateSingleAssertion(samlResponse: string): void {
 		throw new APIError("BAD_REQUEST", {
 			message: "Invalid base64-encoded SAML response",
 			code: "SAML_INVALID_ENCODING",
+		});
+	}
+
+	if (hasXMLDoctype(xml)) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML response must not contain a DOCTYPE declaration",
+			code: "SAML_DOCTYPE_FORBIDDEN",
 		});
 	}
 

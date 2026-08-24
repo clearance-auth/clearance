@@ -1,6 +1,6 @@
 {
   "name": "@clearance/auth",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Clearance auth runtime with bundled, audited fork code and Clearance defaults",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,11 @@
     "./secret-policy": {
       "types": "./types/secret-policy.d.ts",
       "default": "./dist/secret-policy.mjs"
+    },
+    "./management-internal": {
+      "dev-source": "./src/management-internal.ts",
+      "types": "./types/management-internal.d.ts",
+      "default": "./dist/management-internal.mjs"
     }
   },
   "files": ["dist", "types"],
@@ -32,10 +37,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@clearance/delivery": "workspace:*",
+    "@clearance/key-management": "workspace:*",
     "kysely": "catalog:",
-    "pg": "^8.14.1"
+    "pg": "^8.14.1",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@clearance/delivery-worker": "workspace:*",
     "@clearance/runtime": "workspace:*",
     "@clearance/sso": "workspace:*",
     "@clearance/scim": "workspace:*",

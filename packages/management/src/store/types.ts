@@ -1,8 +1,351 @@
-import type { DataStoreSnapshot } from "../types/resources.js";
+import type {
+	AuditEvent,
+	DataStoreSnapshot,
+	Environment,
+	Organization,
+	User,
+	Project,
+} from "../types/resources.js";
+import type { PageCursorKey } from "../services/pagination.js";
+import type { ResourceScope } from "../services/scope.js";
+import type { RuntimeAuditEventReader } from "./runtime-audit-events.js";
+import type {
+	DeliveryControlPreview,
+	DeliveryChannel,
+	DeliveryJobPage,
+	DeliveryJobState,
+	DeliveryQuotaStatus,
+	DeliveryReadinessSummary,
+	EnqueuedDelivery,
+	EnqueueDeliveryInput,
+	PublicDeliveryJob,
+} from "@clearance/delivery";
+import type { ManagementWebhookEndpointFanout } from "../application/delivery.js";
+import type { AuditEventInput } from "../services/audit.js";
+import type {
+	ProductPresentationAuthorityReader,
+	ProductPresentationRepository,
+} from "./product-presentation-authority.js";
+
+export const STORE_V2_COLLECTIONS = [
+	"projects",
+	"environments",
+	"principals",
+	"organizations",
+	"events",
+] as const;
+
+export type StoreV2Collection = (typeof STORE_V2_COLLECTIONS)[number];
+export type StoreV2Phase = "absent" | "shadow" | "hybrid" | "disabled";
+
+export interface StoreV2CollectionStatus {
+	snapshotCount: number;
+	relationalCount: number | null;
+	snapshotChecksum: string;
+	relationalChecksum: string | null;
+	consistent: boolean;
+	differingIds: string[];
+}
+
+export interface StoreV2Status {
+	schemaVersion: 2 | null;
+	phase: StoreV2Phase;
+	snapshotRevision: number;
+	relationalRevision: number | null;
+	/** Changes only when relational principal rows change or authority moves. */
+	principalRevision: number | null;
+	/** Changes only when relational topology rows change or authority moves. */
+	topologyRevision: number | null;
+	consistent: boolean;
+	authoritativeCollections: StoreV2Collection[];
+	collections: Record<StoreV2Collection, StoreV2CollectionStatus>;
+}
+
+export interface StoreV2PlanBlocker {
+	code: string;
+	collection: StoreV2Collection;
+	resourceIds: string[];
+}
+
+export interface StoreV2Plan {
+	schemaVersion: 2;
+	phase: StoreV2Phase;
+	snapshotRevision: number;
+	collections: readonly StoreV2Collection[];
+	rowCounts: Record<StoreV2Collection, number>;
+	blockerCount: number;
+	blockers: StoreV2PlanBlocker[];
+	canApply: boolean;
+}
+
+export interface StoreV2MigrationControl {
+	plan(): Promise<StoreV2Plan>;
+	status(): Promise<StoreV2Status>;
+	apply(): Promise<StoreV2Status>;
+	verify(): Promise<StoreV2Status>;
+	disable(): Promise<StoreV2Status>;
+	cutoverEvents(): Promise<StoreV2Status>;
+	rollbackEvents(): Promise<StoreV2Status>;
+	cutoverPrincipals(): Promise<StoreV2Status>;
+	rollbackPrincipals(): Promise<StoreV2Status>;
+	cutoverTopology(): Promise<StoreV2Status>;
+	rollbackTopology(): Promise<StoreV2Status>;
+}
+
+/** Postgres event reads once store-v2 events are relational-authoritative. */
+export interface StoreV2EventReader {
+	readonly authoritative: boolean;
+	listPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		action?: string;
+		organizationId?: string;
+		/** Strict archival upper bound for bounded exports. */
+		before?: string;
+	}): Promise<{ events: AuditEvent[]; hasMore: boolean }>;
+}
+
+/** PostgreSQL principal reads backed by normalized store-v2 rows. */
+export interface StoreV2PrincipalReader {
+	readonly authoritative: boolean;
+	getById(input: {
+		scope: ResourceScope;
+		id: string;
+		includeDeleted?: boolean;
+	}): Promise<User | null>;
+	findActiveByEmail(input: {
+		scope: ResourceScope;
+		email: string;
+	}): Promise<User | null>;
+	findActiveByExternalId(input: {
+		scope: ResourceScope;
+		externalId: string;
+	}): Promise<User | null>;
+	listPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		includeDeleted?: boolean;
+		status?: User["status"];
+	}): Promise<{ principals: User[]; hasMore: boolean }>;
+	/** Bounded relational join used by runtime session operator reads. */
+	listActiveSessionsPage?(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+	}): Promise<{
+		sessions: Array<{
+			id: string;
+			principal: User;
+			createdAt: string;
+			cursorCreatedAt: string;
+			expiresAt?: string;
+			ipAddress?: string;
+			userAgent?: string;
+		}>;
+		hasMore: boolean;
+	}>;
+	listForExport?(input: {
+		scope: ResourceScope;
+		limit: number;
+		status?: "active" | "disabled";
+	}): Promise<{ principals: User[]; hasMore: boolean }>;
+	countByScope?(input: { scope: ResourceScope }): Promise<{
+		total: number;
+		active: number;
+	}>;
+	countActiveSessions?(input: { scope: ResourceScope }): Promise<number>;
+}
+
+/** Transaction-bound normalized principal mutations. PostgreSQL only. */
+export interface StoreV2PrincipalRepository extends StoreV2PrincipalReader {
+	insert(principal: User): Promise<User>;
+	update(
+		principal: User,
+		input: { expectedUpdatedAt: string },
+	): Promise<User | null>;
+	disable(input: {
+		scope: ResourceScope;
+		id: string;
+		updatedAt: string;
+		expectedUpdatedAt: string;
+	}): Promise<User | null>;
+	delete(input: {
+		scope: ResourceScope;
+		id: string;
+		updatedAt: string;
+		expectedUpdatedAt: string;
+	}): Promise<User | null>;
+}
+
+/** Scoped relational topology reads; every cursor is deterministic and bounded. */
+export interface StoreV2TopologyReader {
+	readonly authoritative: boolean;
+	getProjectById(id: string): Promise<Project | null>;
+	findProjectConflict(input: {
+		name: string;
+		slug: string;
+		excludeId?: string;
+	}): Promise<Project | null>;
+	getEnvironment(input: { projectId: string; id: string }): Promise<Environment | null>;
+	/**
+	 * Indexed, project-scoped exact lookup for user-facing environment selectors.
+	 * This deliberately preserves the legacy id/name/slug selector contract
+	 * without materializing a project environment list after topology cutover.
+	 */
+	findEnvironmentByKey(input: {
+		projectId: string;
+		key: string;
+	}): Promise<Environment | null>;
+	getOrganization(input: { scope: ResourceScope; id: string }): Promise<Organization | null>;
+	organizationIdExists(id: string): Promise<boolean>;
+	getOrganizationBySlug(input: {
+		scope: ResourceScope;
+		slug: string;
+	}): Promise<Organization | null>;
+	getOrganizationByExternalId(input: {
+		scope: ResourceScope;
+		externalId: string;
+	}): Promise<Organization | null>;
+	countOrganizations(input: {
+		scope: ResourceScope;
+		includeArchived?: boolean;
+	}): Promise<number>;
+	listProjectsPage(input: { limit: number; cursor?: PageCursorKey }): Promise<{ projects: Project[]; hasMore: boolean }>;
+	listEnvironmentsPage(input: {
+		projectId: string;
+		limit: number;
+		cursor?: PageCursorKey;
+	}): Promise<{ environments: Environment[]; hasMore: boolean }>;
+	listOrganizationsPage(input: {
+		scope: ResourceScope;
+		limit: number;
+		cursor?: PageCursorKey;
+		includeArchived?: boolean;
+	}): Promise<{ organizations: Organization[]; hasMore: boolean }>;
+}
+
+/** Physical topology deletion is intentionally not a public capability. */
+export interface StoreV2TopologyRepository extends StoreV2TopologyReader {
+	/**
+	 * Transaction-only topology lock order: project, then environment, then
+	 * organization before dependent snapshot, runtime, or authorization writes.
+	 */
+	lockProject(input: { id: string }): Promise<Project | null>;
+	lockEnvironment(input: {
+		projectId: string;
+		id: string;
+	}): Promise<Environment | null>;
+	/**
+	 * Transaction-only organization lock. Acquire project and environment locks
+	 * first, then this row before dependent writes.
+	 */
+	lockOrganization(input: {
+		scope: ResourceScope;
+		id: string;
+	}): Promise<Organization | null>;
+	upsertProject(project: Project): Promise<Project>;
+	upsertEnvironment(environment: Environment): Promise<Environment>;
+	upsertOrganization(organization: Organization): Promise<Organization>;
+}
 
 /** Read-only view used by domain queries and validation. */
 export interface ManagementSnapshotReader {
 	readonly snapshot: DataStoreSnapshot;
+	readonly storeV2Principals?: StoreV2PrincipalReader;
+	/** Exact server-owned normalized organization table identity, when configured. */
+	readonly storeV2OrganizationAuthority?: Readonly<{ schema: string; table: string }>;
+	readonly storeV2Topology?: StoreV2TopologyReader;
+}
+
+export type DeliveryControlScope = {
+	projectId: string;
+	environmentId: string;
+};
+
+/** PostgreSQL-only, redacted delivery reads bound to the configured schema. */
+export interface ManagementDeliveryControlReader {
+	list(input: DeliveryControlScope & {
+		limit?: number;
+		cursor?: string;
+		states?: readonly DeliveryJobState[];
+		channel?: DeliveryChannel;
+		kind?: string;
+	}): Promise<DeliveryJobPage>;
+	inspect(input: DeliveryControlScope & { jobId: string }): Promise<PublicDeliveryJob | null>;
+	preview(input: DeliveryControlScope & {
+		jobId: string;
+		action: "cancel" | "retry" | "replay";
+		now?: Date;
+		maxAttempts?: number;
+	}): Promise<DeliveryControlPreview | null>;
+	readiness(input?: { now?: Date; staleAfterMs?: number }): Promise<DeliveryReadinessSummary>;
+	quota(input: DeliveryControlScope & { now?: Date }): Promise<DeliveryQuotaStatus>;
+}
+
+export type DeliveryControlAuditContext = {
+	actor: string;
+	source: AuditEvent["source"];
+	correlationId?: string;
+};
+
+export type DeliveryControlMutationInput = DeliveryControlScope &
+	DeliveryControlAuditContext & {
+		jobId: string;
+		now?: Date;
+	};
+
+export type DeliveryControlMutationOutcome<T> = {
+	preview: DeliveryControlPreview;
+	result: T;
+};
+
+/**
+ * Same-transaction delivery mutations. Implementations own the management
+ * audit append; callers cannot obtain the underlying unaudited SQL primitive.
+ */
+export interface ManagementDeliveryControlMutation {
+	cancel(
+		input: DeliveryControlMutationInput,
+	): Promise<DeliveryControlMutationOutcome<PublicDeliveryJob> | null>;
+	retry(
+		input: DeliveryControlMutationInput,
+	): Promise<DeliveryControlMutationOutcome<PublicDeliveryJob> | null>;
+	replay(
+		input: DeliveryControlMutationInput & { maxAttempts?: number },
+	): Promise<DeliveryControlMutationOutcome<EnqueuedDelivery> | null>;
+}
+
+export type ManagementCoordinatedQuery = (
+	sql: string,
+	params?: unknown[],
+) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+
+export interface ManagementCoordinatedMutationContext {
+	data: DataStoreSnapshot;
+	/** Present only when normalized principals are authoritative. */
+	principals?: StoreV2PrincipalRepository;
+	/** Present only when projects, environments, and organizations are relational-authoritative. */
+	topology?: StoreV2TopologyRepository;
+	/** Append a redacted audit event in this same transaction. */
+	appendAudit(input: AuditEventInput): AuditEvent;
+	/** Opaque same-transaction outbox capability when delivery is configured. */
+	enqueueDelivery?: (
+		input: EnqueueDeliveryInput,
+	) => Promise<EnqueuedDelivery>;
+	/** Audited same-transaction delivery controls when configured. */
+	controlDelivery?: ManagementDeliveryControlMutation;
+	/** Managed endpoint fanout in the same product transaction when configured. */
+	fanoutWebhookEndpoints?: ManagementWebhookEndpointFanout;
+}
+
+/** Package-internal runtime SQL seam; never exposed to public store callbacks. */
+export interface InternalManagementCoordinatedMutationContext
+	extends ManagementCoordinatedMutationContext {
+	query: ManagementCoordinatedQuery;
+	/** Normalized product-presentation authority bound to this transaction. */
+	productPresentation?: ProductPresentationRepository;
 }
 
 /**
@@ -27,10 +370,50 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Local path used for file-backed stores and backup directory resolution */
 	readonly path: string;
 	readonly backend: "json" | "postgres";
+	/**
+	 * PostgreSQL-only durable SCIM response-loss replay authority table. The
+	 * identifier is constructed by PgStore, never caller supplied.
+	 */
+	readonly scimOperationReplayTable?: string;
+	/** Postgres-only, explicitly activated normalized shadow-store migration. */
+	readonly storeV2?: StoreV2MigrationControl;
+	readonly storeV2Events?: StoreV2EventReader;
+	/** PostgreSQL runtime audit authority; absent on the local JSON backend. */
+	readonly runtimeAuditEvents?: RuntimeAuditEventReader;
+	readonly storeV2Principals?: StoreV2PrincipalReader;
+	/** Direct normalized transaction, available only after principal authority. */
+	mutateStoreV2Principals?<T>(
+		fn: (principals: StoreV2PrincipalRepository) => Promise<T> | T,
+	): Promise<T>;
+	mutateStoreV2Topology?<T>(
+		fn: (context: {
+			topology: StoreV2TopologyRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T>;
+	/** Relational-only identity transaction with append-only audit authority. */
+	mutateStoreV2Identity?<T>(
+		fn: (context: {
+			principals: StoreV2PrincipalRepository;
+			appendAudit(input: AuditEventInput): AuditEvent;
+		}) => Promise<T> | T,
+	): Promise<T>;
+	/** Present only when PostgreSQL delivery storage and keys are configured. */
+	readonly deliveryControl?: ManagementDeliveryControlReader;
+	/** Audited customer-managed webhook endpoint lifecycle when delivery is configured. */
+	readonly webhookEndpoints?: import("../services/webhook-endpoints.js").ManagementWebhookEndpointCapability;
+	/** Read-only normalized product presentation authority. PostgreSQL store-v2 only. */
+	readonly productPresentation?: ProductPresentationAuthorityReader;
 	load(): DataStoreSnapshot;
 	save(): void;
 	/** Flush pending durable writes (no-op for json; await for postgres) */
 	ready(): Promise<void>;
+	/**
+	 * Serialize one destructive upgrade across processes for the whole callback.
+	 * PostgreSQL implementations hold a session advisory lock; the JSON fallback
+	 * rejects a concurrent invocation in this process.
+	 */
+	withUpgradeLock<T>(fn: () => Promise<T>): Promise<T>;
 	/**
 	 * Reload from durable backend when another process may have written.
 	 * Json re-reads the file; Postgres compares revision and replaces local cache.
@@ -46,21 +429,24 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Execute against the latest durable draft and resolve only after commit. */
 	mutateDurable<T>(fn: (data: DataStoreSnapshot) => T): Promise<T>;
 	/**
-	 * Postgres only: one transaction covering management snapshot (+ uniqueness +
-	 * audit via the mutator) and arbitrary runtime SQL on the same connection.
+	 * Postgres only: one transaction covering management snapshot, normalized
+	 * principal mutations, uniqueness, audit, and opaque delivery capabilities.
 	 * JsonStore does not implement this — callers must use management-only paths.
 	 */
 	mutateCoordinated?<T>(
-		fn: (ctx: {
-			data: DataStoreSnapshot;
-			query: (
-				sql: string,
-				params?: unknown[],
-			) => Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
-		}) => Promise<T> | T,
+		fn: (ctx: ManagementCoordinatedMutationContext) => Promise<T> | T,
 	): Promise<T>;
 	checksum(): string;
 	resourceCounts(): Record<string, number>;
+}
+
+export type CoordinatedManagementStore = ManagementStore & {
+	backend: "postgres";
+	mutateCoordinated: NonNullable<ManagementStore["mutateCoordinated"]>;
+};
+
+export function isCoordinatedStore(store: ManagementStore): store is CoordinatedManagementStore {
+	return store.backend === "postgres" && typeof store.mutateCoordinated === "function";
 }
 
 export function isManagementStore(value: unknown): value is ManagementStore {
@@ -69,6 +455,7 @@ export function isManagementStore(value: unknown): value is ManagementStore {
 		value !== null &&
 		"snapshot" in value &&
 		"mutate" in value &&
-		"backend" in value
+		"backend" in value &&
+		"withUpgradeLock" in value
 	);
 }

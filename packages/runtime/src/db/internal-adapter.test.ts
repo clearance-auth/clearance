@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import type { GenericEndpointContext } from "@clearance/core";
+import { runWithTransaction } from "@clearance/core/context";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { clearance } from "../auth/full";
@@ -12,6 +13,39 @@ import type {
 	User,
 } from "../types";
 import { getMigrations } from "./get-migration";
+import { getSecondarySessionEpoch } from "./session-credential-migration";
+
+type SecondarySessionIndexEntry = {
+	sessionId: string;
+	credentialKey: string;
+	expiresAt: number;
+};
+
+const secondaryIndexKey = (namespace: string, userId: string) =>
+	`clearance:${namespace}:active-sessions:${userId}`;
+
+function getSecondaryIndex(
+	store: Map<string, string>,
+	userId: string,
+): SecondarySessionIndexEntry[] {
+	return safeJSONParse<SecondarySessionIndexEntry[]>(
+		Array.from(store.entries()).find(([key]) =>
+			key.endsWith(`:active-sessions:${userId}`),
+		)?.[1],
+	) ?? [];
+}
+
+function getSecondaryCredentialKey(
+	store: Map<string, string>,
+	userId: string,
+	sessionId: string,
+): string {
+	const key = getSecondaryIndex(store, userId).find(
+		(entry) => entry.sessionId === sessionId,
+	)?.credentialKey;
+	if (!key) throw new Error(`Missing secondary credential for ${sessionId}`);
+	return key;
+}
 
 describe("internal adapter test", async () => {
 	const map = new Map();
@@ -27,6 +61,7 @@ describe("internal adapter test", async () => {
 	const pluginHookUserCreateAfter = vi.fn();
 	const opts = {
 		database: new DatabaseSync(":memory:"),
+		secret: "internal-adapter-suite-secret-for-migration-binding",
 		user: {
 			fields: {
 				email: "email_address",
@@ -37,6 +72,11 @@ describe("internal adapter test", async () => {
 			storeInDatabase: true,
 		},
 		secondaryStorage: {
+			namespace: "internal-adapter-suite",
+			runExclusive<T>(_name: string, operation: () => T): T {
+				return operation();
+			},
+			assertNoLegacySessionWriters() {},
 			set(key, value, ttl) {
 				map.set(key, value);
 				expirationMap.set(key, ttl);
@@ -130,7 +170,7 @@ describe("internal adapter test", async () => {
 		],
 	} satisfies ClearanceOptions;
 	beforeAll(async () => {
-		(await getMigrations(opts)).runMigrations();
+		await (await getMigrations(opts)).runMigrations();
 	});
 	afterEach(async () => {
 		vi.clearAllMocks();
@@ -208,25 +248,25 @@ describe("internal adapter test", async () => {
 		expect(hookVerificationCreateBefore).toHaveBeenCalledOnce();
 		expect(hookVerificationCreateAfter).toHaveBeenCalledOnce();
 
-		const value = await internalAdapter.findVerificationValue("test-id-1");
+		const value = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value).toMatchObject({
 			identifier: "test-id-1",
 		});
 		expect(hookVerificationDeleteBefore).toHaveBeenCalledOnce();
 		expect(hookVerificationDeleteAfter).toHaveBeenCalledOnce();
 
-		const value2 = await internalAdapter.findVerificationValue("test-id-1");
+		const value2 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value2).toBeNull();
 		await internalAdapter.createVerificationValue({
 			identifier: `test-id-1`,
 			value: "test-id-1",
 			expiresAt: new Date(Date.now() + 1000),
 		});
-		const value3 = await internalAdapter.findVerificationValue("test-id-1");
+		const value3 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value3).toMatchObject({
 			identifier: "test-id-1",
 		});
-		const value4 = await internalAdapter.findVerificationValue("test-id-1");
+		const value4 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value4).toMatchObject({
 			identifier: "test-id-1",
 		});
@@ -293,7 +333,7 @@ describe("internal adapter test", async () => {
 				},
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(hashedOpts)).runMigrations();
+			await (await getMigrations(hashedOpts)).runMigrations();
 			const hashedCtx = await init(hashedOpts);
 			const hashedAdapter = hashedCtx.internalAdapter;
 
@@ -307,7 +347,7 @@ describe("internal adapter test", async () => {
 			expect(verification.identifier).not.toBe("reset-password:my-token-123");
 
 			// Should be able to find by original identifier
-			const found = await hashedAdapter.findVerificationValue(
+			const found = await hashedAdapter.findVerificationValueAndPruneExpired(
 				"reset-password:my-token-123",
 			);
 			expect(found).toBeDefined();
@@ -317,7 +357,7 @@ describe("internal adapter test", async () => {
 			await hashedAdapter.deleteVerificationByIdentifier(
 				"reset-password:my-token-123",
 			);
-			const deleted = await hashedAdapter.findVerificationValue(
+			const deleted = await hashedAdapter.findVerificationValueAndPruneExpired(
 				"reset-password:my-token-123",
 			);
 			expect(deleted).toBeNull();
@@ -336,7 +376,7 @@ describe("internal adapter test", async () => {
 				},
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(overrideOpts)).runMigrations();
+			await (await getMigrations(overrideOpts)).runMigrations();
 			const overrideCtx = await init(overrideOpts);
 			const overrideAdapter = overrideCtx.internalAdapter;
 
@@ -368,7 +408,7 @@ describe("internal adapter test", async () => {
 				verification: { storeIdentifier: "plain" as const },
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(plainOpts)).runMigrations();
+			await (await getMigrations(plainOpts)).runMigrations();
 			const plainCtx = await init(plainOpts);
 			await plainCtx.internalAdapter.createVerificationValue({
 				identifier: "old-token:abc123",
@@ -386,7 +426,7 @@ describe("internal adapter test", async () => {
 
 			// Should still find old plain token via fallback
 			const found =
-				await hashedCtx.internalAdapter.findVerificationValue(
+				await hashedCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					"old-token:abc123",
 				);
 			expect(found).toBeDefined();
@@ -462,6 +502,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number | undefined) {
 					if (ttl !== undefined) {
 						capturedTTLs.push(ttl);
@@ -481,7 +524,7 @@ describe("internal adapter test", async () => {
 		} satisfies ClearanceOptions;
 
 		// Run migrations for the new database
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		// Test the actual refreshUserSessions functionality from internal adapter
 		const testCtx = await init(testOpts);
@@ -515,17 +558,22 @@ describe("internal adapter test", async () => {
 		};
 
 		// Set up active sessions and session data for refresh test
+		const credentialKey = "session-credential:test-token-digest";
 		const activeSessions = [
-			{ token: session.token, expiresAt: expiresAt.getTime() },
+			{
+				sessionId: "test-session",
+				credentialKey,
+				expiresAt: expiresAt.getTime(),
+			},
 		];
 
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify(activeSessions),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			session.token,
+			credentialKey,
 			JSON.stringify({ session, user: testUser }),
 		);
 
@@ -533,6 +581,11 @@ describe("internal adapter test", async () => {
 		await ctx.context.internalAdapter.updateUser(testUser.id, {
 			name: "Updated Name",
 		});
+		expect(
+			safeJSONParse<{ session: Session }>(
+				mockStorage.get(credentialKey)?.value,
+			)?.session.token,
+		).toBeNull();
 
 		// The TTL should be properly rounded down
 		const lastTTL = capturedTTLs[capturedTTLs.length - 1];
@@ -547,18 +600,20 @@ describe("internal adapter test", async () => {
 			expiresAt: new Date(Date.now() + 500), // 0.5 seconds from now
 		};
 
+		const almostExpiredKey = "session-credential:almost-expired-digest";
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify([
 				{
-					token: almostExpiredSession.token,
+					sessionId: "almost-expired-session",
+					credentialKey: almostExpiredKey,
 					expiresAt: almostExpiredSession.expiresAt.getTime(),
 				},
 			]),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			almostExpiredSession.token,
+			almostExpiredKey,
 			JSON.stringify({ session: almostExpiredSession, user: testUser }),
 		);
 
@@ -577,18 +632,20 @@ describe("internal adapter test", async () => {
 			expiresAt: new Date(Date.now() + 7199999), // ~2 hours from now (7199.999 seconds)
 		};
 
+		const longCredentialKey = "session-credential:long-token-digest";
 		await testCtx.options.secondaryStorage?.set(
-			`active-sessions-${testUser.id}`,
+			secondaryIndexKey("internal-adapter-test-storage", testUser.id),
 			JSON.stringify([
 				{
-					token: longSession.token,
+					sessionId: "long-session",
+					credentialKey: longCredentialKey,
 					expiresAt: longSession.expiresAt.getTime(),
 				},
 			]),
 		);
 
 		await testCtx.options.secondaryStorage?.set(
-			longSession.token,
+			longCredentialKey,
 			JSON.stringify({ session: longSession, user: testUser }),
 		);
 
@@ -617,18 +674,20 @@ describe("internal adapter test", async () => {
 		expect(typeof session.id).toBe("string");
 		expect(session.id.length).toBeGreaterThan(0);
 
-		const storedSessions: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${user.id}`),
+		const storedSessions: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", user.id)),
 		);
-		const token = session.token;
+		const credentialKey = storedSessions[0]!.credentialKey;
 		// Check stored sessions
 		expect(storedSessions.length).toBe(1);
-		expect(storedSessions.at(0)?.token).toBe(session.token);
+		expect(storedSessions.at(0)?.sessionId).toBe(session.id);
 		// Check expiration time set is the last expiration set
 		const lastExpiration = storedSessions.reduce((prev, curr) =>
 			prev.expiresAt >= curr.expiresAt ? prev : curr,
 		);
-		const actualExp = expirationMap.get(`active-sessions-${user.id}`);
+		const actualExp = expirationMap.get(
+			secondaryIndexKey("internal-adapter-suite", user.id),
+		);
 		const expectedExp = Math.floor(
 			(lastExpiration.expiresAt - Date.now()) / 1000,
 		);
@@ -639,13 +698,14 @@ describe("internal adapter test", async () => {
 		const storedSession = safeJSONParse<{
 			session: Session;
 			user: User;
-		}>(map.get(token));
+		}>(map.get(credentialKey));
 		expect(storedSession?.user).toMatchObject(user);
 		expect(storedSession?.session).toMatchObject({
 			...session,
+			token: null,
 			activeOrganizationId: "1",
 		});
-		const actualTokenExp = expirationMap.get(token);
+		const actualTokenExp = expirationMap.get(credentialKey);
 		const expectedTokenExp = Math.floor(
 			(expiresAt.getTime() - Date.now()) / 1000,
 		);
@@ -655,53 +715,56 @@ describe("internal adapter test", async () => {
 	});
 
 	it("should delete on secondary storage", async () => {
-		// Create multiple sessions in past and future
+		// Create multiple live sessions with distinct bounded expirations.
 		const now = Date.now();
 		const userId = "test-user";
-		// 10 consecutive days (5 in past, 1 now, 4 in future)
-		for (let i = -5; i < 5; i++) {
+		const issuedSessions: Session[] = [];
+		for (let i = 1; i < 5; i++) {
 			const expiresIn = i * 60 * 60 * 24 * 1000;
 			const expiresAt = new Date(now + expiresIn);
-			await internalAdapter.createSession(
+			const issued = await internalAdapter.createSession(
 				userId,
 				undefined,
 				{
 					expiresAt,
+					__preserveSessionExpiresAt: true,
 				},
 				true,
 			);
-			if (i > 0) {
-				const actualExp = expirationMap.get(`active-sessions-${userId}`);
-				const expectedExp = Math.floor(
-					(expiresAt.getTime() - Date.now()) / 1000,
-				);
-				expect(actualExp - expectedExp).toBeLessThanOrEqual(1); // max 1s clock drift between check and set
-				expect(actualExp - expectedExp).toBeGreaterThanOrEqual(0); // max 1s clock drift between check and set
-			} else {
-				expect(expirationMap.get(`active-sessions-${userId}`)).toBeUndefined();
-			}
+			issuedSessions.push(issued);
+			const actualExp = expirationMap.get(
+				secondaryIndexKey("internal-adapter-suite", userId),
+			);
+			const expectedExp = Math.floor(
+				(expiresAt.getTime() - Date.now()) / 1000,
+			);
+			expect(actualExp - expectedExp).toBeLessThanOrEqual(1); // max 1s clock drift between check and set
+			expect(actualExp - expectedExp).toBeGreaterThanOrEqual(0); // max 1s clock drift between check and set
 		}
-		const storedSessions: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${userId}`),
+		const storedSessions: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", userId)),
 		);
 		expect(storedSessions.length).toBe(4);
-		const token = storedSessions.at(-1)?.token;
-		const tokenStored = map.get(token);
+		const target = issuedSessions.at(-1)!;
+		const credentialKey = storedSessions.at(-1)?.credentialKey;
+		const tokenStored = map.get(credentialKey);
 		expect(tokenStored).toBeDefined();
 
 		// Delete session should clean expiresAt and token
-		await internalAdapter.deleteSession(token!);
-		const afterDeleted: { token: string; expiresAt: number }[] = JSON.parse(
-			map.get(`active-sessions-${userId}`),
+		await internalAdapter.deleteSession(target.token);
+		const afterDeleted: SecondarySessionIndexEntry[] = JSON.parse(
+			map.get(secondaryIndexKey("internal-adapter-suite", userId)),
 		);
 		expect(afterDeleted.length).toBe(3);
-		const removedToken = map.get(token);
+		const removedToken = map.get(credentialKey);
 		expect(removedToken).toBeUndefined();
 		// Check expiration time set is the last expiration set
 		const lastExpiration = afterDeleted.reduce((prev, curr) =>
 			prev.expiresAt >= curr.expiresAt ? prev : curr,
 		);
-		const actualExp = expirationMap.get(`active-sessions-${userId}`);
+		const actualExp = expirationMap.get(
+			secondaryIndexKey("internal-adapter-suite", userId),
+		);
 		const expectedExp = Math.floor(
 			(lastExpiration.expiresAt - Date.now()) / 1000,
 		);
@@ -769,6 +832,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -781,7 +847,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -801,13 +867,13 @@ describe("internal adapter test", async () => {
 		expect(sessions.length).toBe(3);
 
 		// Delete session2 from storage (simulating missing/expired session)
-		testMap.delete(session2.token);
+		testMap.delete(getSecondaryCredentialKey(testMap, user.id, session2.id));
 
 		// listSessions should still return session1 and session3
 		sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -817,6 +883,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -829,7 +898,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -845,13 +914,16 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Set session2 to valid JSON but malformed structure (session is null, will throw on property access)
-		testMap.set(session2.token, JSON.stringify({ session: null, user: null }));
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			JSON.stringify({ session: null, user: null }),
+		);
 
 		// listSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -861,6 +933,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -873,7 +948,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -889,13 +964,16 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt session2 data
-		testMap.set(session2.token, "invalid-json{{{");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"invalid-json{{{",
+		);
 
 		// listSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.listSessions(user.id);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -904,6 +982,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -916,7 +997,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -931,8 +1012,14 @@ describe("internal adapter test", async () => {
 		const session2 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt both sessions
-		testMap.set(session1.token, "invalid-json");
-		testMap.set(session2.token, "also-invalid");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session1.id),
+			"invalid-json",
+		);
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"also-invalid",
+		);
 
 		// listSessions should return empty array
 		const sessions = await testInternalAdapter.listSessions(user.id);
@@ -945,6 +1032,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 				},
@@ -957,7 +1047,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -973,7 +1063,10 @@ describe("internal adapter test", async () => {
 		const session3 = await testInternalAdapter.createSession(user.id);
 
 		// Corrupt session2 data
-		testMap.set(session2.token, "invalid-json{{{");
+		testMap.set(
+			getSecondaryCredentialKey(testMap, user.id, session2.id),
+			"invalid-json{{{",
+		);
 
 		// findSessions should still return session1 and session3
 		const sessions = await testInternalAdapter.findSessions([
@@ -982,8 +1075,8 @@ describe("internal adapter test", async () => {
 			session3.token,
 		]);
 		expect(sessions.length).toBe(2);
-		expect(sessions.map((s) => s.session.token).sort()).toEqual(
-			[session1.token, session3.token].sort(),
+		expect(sessions.map((s) => s.session.id).sort()).toEqual(
+			[session1.id, session3.id].sort(),
 		);
 	});
 
@@ -994,6 +1087,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 					if (ttl !== undefined) {
@@ -1011,7 +1107,7 @@ describe("internal adapter test", async () => {
 		} satisfies ClearanceOptions;
 
 		// Run migrations for the new database
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 
 		const testCtx = await init(testOpts);
 		const testInternalAdapter = testCtx.internalAdapter;
@@ -1026,7 +1122,12 @@ describe("internal adapter test", async () => {
 		const session = await testInternalAdapter.createSession(user.id);
 
 		// Verify session is in secondary storage
-		const storedSessionStr = testMap.get(session.token);
+		const credentialKey = getSecondaryCredentialKey(
+			testMap,
+			user.id,
+			session.id,
+		);
+		const storedSessionStr = testMap.get(credentialKey);
 		expect(storedSessionStr).toBeDefined();
 
 		const storedSession = safeJSONParse<{
@@ -1037,9 +1138,11 @@ describe("internal adapter test", async () => {
 		expect(storedSession?.session.ipAddress).toBe("");
 
 		// Get initial active-sessions list
-		const initialListStr = testMap.get(`active-sessions-${user.id}`);
+		const initialListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		expect(initialListStr).toBeDefined();
-		const initialList = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const initialList = safeJSONParse<SecondarySessionIndexEntry[]>(
 			initialListStr!,
 		);
 		expect(initialList).toBeDefined();
@@ -1052,10 +1155,13 @@ describe("internal adapter test", async () => {
 		await testInternalAdapter.updateSession(session.token, {
 			ipAddress: updatedIpAddress,
 			expiresAt: newExpiresAt,
+			token: session.token,
+			id: "caller-controlled-session-id",
+			userId: "caller-controlled-user-id",
 		});
 
 		// Get the session from secondary storage again
-		const updatedStoredSessionStr = testMap.get(session.token);
+		const updatedStoredSessionStr = testMap.get(credentialKey);
 		expect(updatedStoredSessionStr).toBeDefined();
 
 		const updatedStoredSession = safeJSONParse<{
@@ -1065,25 +1171,33 @@ describe("internal adapter test", async () => {
 
 		// The session in secondary storage MUST have the updated data
 		expect(updatedStoredSession?.session.ipAddress).toBe(updatedIpAddress);
+		expect(updatedStoredSession?.session.token).toBeNull();
+		expect(updatedStoredSession?.session.id).toBe(session.id);
+		expect(updatedStoredSession?.session.userId).toBe(user.id);
 
 		// User should still be intact
 		expect(updatedStoredSession?.user.id).toBe(user.id);
 
 		// Get updated active-sessions list
-		const updatedListStr = testMap.get(`active-sessions-${user.id}`);
+		const updatedListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		expect(updatedListStr).toBeDefined();
-		const updatedList = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const updatedList = safeJSONParse<SecondarySessionIndexEntry[]>(
 			updatedListStr!,
 		);
 		expect(updatedList).toBeDefined();
 
 		// The expiresAt in active-sessions list should be updated
 		expect(updatedList!.length).toBe(1);
-		expect(updatedList![0]!.token).toBe(session.token);
+		expect(updatedList![0]!.sessionId).toBe(session.id);
+		expect(updatedList![0]!.credentialKey).toBe(credentialKey);
 		expect(updatedList![0]!.expiresAt).toBe(newExpiresAt.getTime());
 
 		// TTL should also be updated
-		const updatedTTL = testExpirationMap.get(`active-sessions-${user.id}`);
+		const updatedTTL = testExpirationMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
 		const expectedTTL = Math.floor(
 			(newExpiresAt.getTime() - Date.now()) / 1000,
 		);
@@ -1099,6 +1213,9 @@ describe("internal adapter test", async () => {
 		const testOpts = {
 			database: new DatabaseSync(":memory:"),
 			secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 				set(key: string, value: string, ttl?: number) {
 					testMap.set(key, value);
 					if (ttl !== undefined) {
@@ -1115,7 +1232,7 @@ describe("internal adapter test", async () => {
 			},
 		} satisfies ClearanceOptions;
 
-		(await getMigrations(testOpts)).runMigrations();
+		await (await getMigrations(testOpts)).runMigrations();
 		const testAuthContext = await init(testOpts);
 		const testInternalAdapter = testAuthContext.internalAdapter;
 
@@ -1128,23 +1245,25 @@ describe("internal adapter test", async () => {
 		// Create a session
 		const session = await testInternalAdapter.createSession(user.id);
 
-		// Manually corrupt the active-sessions list by adding duplicate tokens
-		const listStr = testMap.get(`active-sessions-${user.id}`);
-		const list = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		// Manually corrupt the active-sessions list by duplicating its safe index.
+		const listStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
+		const list = safeJSONParse<SecondarySessionIndexEntry[]>(
 			listStr!,
 		);
 
-		// Add duplicates of the same token
-		const corruptedList = [
-			...list!,
-			{ token: session.token, expiresAt: session.expiresAt.getTime() },
-			{ token: session.token, expiresAt: session.expiresAt.getTime() },
-		];
-		testMap.set(`active-sessions-${user.id}`, JSON.stringify(corruptedList));
+		const corruptedList = [...list!, list![0]!, list![0]!];
+		testMap.set(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+			JSON.stringify(corruptedList),
+		);
 
 		// Verify corruption
-		const corruptedListStr = testMap.get(`active-sessions-${user.id}`);
-		const parsed = safeJSONParse<{ token: string; expiresAt: number }[]>(
+		const corruptedListStr = testMap.get(
+			secondaryIndexKey("internal-adapter-test-storage", user.id),
+		);
+		const parsed = safeJSONParse<SecondarySessionIndexEntry[]>(
 			corruptedListStr!,
 		);
 		expect(parsed!.length).toBe(3); // 1 original + 2 duplicates
@@ -1158,10 +1277,42 @@ describe("internal adapter test", async () => {
 		function createMockStorage() {
 			const dataMap = new Map<string, string>();
 			const ttlMap = new Map<string, number>();
+			const legacyDeletesPerLease: number[] = [];
+			let exclusiveCalls = 0;
+			let afterExclusive:
+				| ((call: number) => void | Promise<void>)
+				| undefined;
 			return {
 				dataMap,
 				ttlMap,
+				legacyDeletesPerLease,
+				get exclusiveCalls() {
+					return exclusiveCalls;
+				},
+				setAfterExclusive(
+					hook: ((call: number) => void | Promise<void>) | undefined,
+				) {
+					afterExclusive = hook;
+				},
 				storage: {
+					namespace: "internal-adapter-tests",
+					async runExclusive<T>(
+						_name: string,
+						operation: () => T | Promise<T>,
+					): Promise<T> {
+						exclusiveCalls += 1;
+						const legacyBefore = [...dataMap.keys()].filter((key) =>
+							key.startsWith("active-sessions-"),
+						).length;
+						const result = await operation();
+						const legacyAfter = [...dataMap.keys()].filter((key) =>
+							key.startsWith("active-sessions-"),
+						).length;
+						legacyDeletesPerLease.push(legacyBefore - legacyAfter);
+						await afterExclusive?.(exclusiveCalls);
+						return result;
+					},
+					assertNoLegacySessionWriters() {},
 					set(key: string, value: string, ttl?: number) {
 						dataMap.set(key, value);
 						if (ttl) ttlMap.set(key, ttl);
@@ -1177,6 +1328,210 @@ describe("internal adapter test", async () => {
 			};
 		}
 
+		it("migrates indexed legacy raw sessions into the digest namespace", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Legacy secondary user",
+				email: "legacy-secondary@example.com",
+			});
+			const rawToken = "legacy-secondary-session-bearer-with-entropy";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const now = new Date();
+			const session = {
+				id: "legacy-secondary-session",
+				userId: user.id,
+				token: rawToken,
+				expiresAt,
+				createdAt: now,
+				updatedAt: now,
+			};
+			dataMap.set(rawToken, JSON.stringify({ session, user }));
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([{ token: rawToken, expiresAt: expiresAt.getTime() }]),
+			);
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			expect(dataMap.has(rawToken)).toBe(false);
+			const index = getSecondaryIndex(dataMap, user.id);
+			expect(index).toHaveLength(1);
+			expect(index[0]).toMatchObject({ sessionId: session.id });
+			expect(index[0]!.credentialKey).toMatch(
+				/^clearance:internal-adapter-tests:session-credential:v1:/,
+			);
+			expect(dataMap.get(index[0]!.credentialKey)).not.toContain(rawToken);
+			const epoch = await getSecondarySessionEpoch(secondaryOnlyOpts);
+			expect(dataMap.get(epoch.key)).toBe(JSON.stringify(epoch.value));
+			expect(await ctx.internalAdapter.findSession(rawToken)).toMatchObject({
+				session: { id: session.id, token: rawToken },
+				user: { id: user.id },
+			});
+		});
+
+		it("merges coexisting legacy and namespaced session indexes", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Coexisting secondary user",
+				email: "coexisting-secondary@example.com",
+			});
+			const current = await ctx.internalAdapter.createSession(user.id);
+			const rawToken = "coexisting-legacy-session-bearer-with-entropy";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const now = new Date();
+			const legacy = {
+				id: "coexisting-legacy-session",
+				userId: user.id,
+				token: rawToken,
+				expiresAt,
+				createdAt: now,
+				updatedAt: now,
+			};
+			dataMap.set(rawToken, JSON.stringify({ session: legacy, user }));
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([{ token: rawToken, expiresAt: expiresAt.getTime() }]),
+			);
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			const index = getSecondaryIndex(dataMap, user.id);
+			expect(index.map((entry) => entry.sessionId).sort()).toEqual(
+				[current.id, legacy.id].sort(),
+			);
+			expect(new Set(index.map((entry) => entry.sessionId))).toHaveLength(2);
+			expect(dataMap.has(rawToken)).toBe(false);
+			expect(dataMap.has(`active-sessions-${user.id}`)).toBe(false);
+		});
+
+		it("resumes durable one-user lease units after interruption", async () => {
+			const mock = createMockStorage();
+			const { dataMap, storage } = mock;
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			for (let index = 0; index < 3; index += 1) {
+				const user = await ctx.internalAdapter.createUser({
+					name: `Restartable secondary user ${index}`,
+					email: `restartable-secondary-${index}@example.com`,
+				});
+				const token = `restartable-secondary-bearer-${index}-with-entropy`;
+				const expiresAt = new Date(Date.now() + 60_000);
+				const now = new Date();
+				const session = {
+					id: `restartable-secondary-session-${index}`,
+					userId: user.id,
+					token,
+					expiresAt,
+					createdAt: now,
+					updatedAt: now,
+				};
+				dataMap.set(token, JSON.stringify({ session, user }));
+				dataMap.set(
+					`active-sessions-${user.id}`,
+					JSON.stringify([{ token, expiresAt: expiresAt.getTime() }]),
+				);
+			}
+			const callsBeforeRestart = mock.exclusiveCalls;
+			mock.setAfterExclusive((call) => {
+				if (call === callsBeforeRestart + 1) {
+					throw new Error("simulated migration interruption");
+				}
+			});
+
+			await expect(
+				(await getMigrations(secondaryOnlyOpts)).runMigrations(),
+			).rejects.toThrow("simulated migration interruption");
+			const progressKey =
+				"clearance:internal-adapter-tests:session-credential-migration-progress";
+			expect(dataMap.has(progressKey)).toBe(true);
+			expect(
+				[...dataMap.keys()].filter((key) =>
+					key.startsWith("active-sessions-"),
+				),
+			).toHaveLength(2);
+
+			mock.setAfterExclusive(undefined);
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+
+			expect(dataMap.has(progressKey)).toBe(false);
+			expect(
+				[...dataMap.keys()].filter((key) =>
+					key.startsWith("active-sessions-"),
+				),
+			).toHaveLength(0);
+			expect(
+				mock.legacyDeletesPerLease.every((deleted) => deleted <= 1),
+			).toBe(true);
+			expect(mock.legacyDeletesPerLease.filter((deleted) => deleted === 1)).toHaveLength(
+				3,
+			);
+		});
+
+		it("refuses oversized legacy user indexes before migration", async () => {
+			const { dataMap, storage } = createMockStorage();
+			const secondaryOnlyOpts = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: storage,
+			} satisfies ClearanceOptions;
+
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
+			const ctx = await init(secondaryOnlyOpts);
+			const user = await ctx.internalAdapter.createUser({
+				name: "Oversized secondary user",
+				email: "oversized-secondary@example.com",
+			});
+			dataMap.set(
+				`active-sessions-${user.id}`,
+				JSON.stringify([
+					{
+						token: "x".repeat(70 * 1024),
+						expiresAt: Date.now() + 60_000,
+					},
+				]),
+			);
+
+			await expect(
+				(await getMigrations(secondaryOnlyOpts)).runMigrations(),
+			).rejects.toThrow(/exceeds the 65536-byte migration bound/);
+		});
+
+		it("refuses to publish a secondary epoch without durable legacy-writer drain proof", async () => {
+			const { storage } = createMockStorage();
+			const {
+				assertNoLegacySessionWriters: _unsupported,
+				...unsafeStorage
+			} = storage;
+			const unsafeOptions = {
+				database: new DatabaseSync(":memory:"),
+				secondaryStorage: unsafeStorage,
+			} satisfies ClearanceOptions;
+
+			await expect(
+				(await getMigrations(unsafeOptions)).runMigrations(),
+			).rejects.toThrow(
+				"requires runExclusive and assertNoLegacySessionWriters provider guarantees",
+			);
+		});
+
 		it("should store verification in secondary storage by default", async () => {
 			const { dataMap, ttlMap, storage } = createMockStorage();
 
@@ -1185,7 +1540,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			const verification = await ctx.internalAdapter.createVerificationValue({
@@ -1206,7 +1561,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1216,7 +1571,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("find-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("find-test");
 			expect(found).not.toBeNull();
 			expect(found?.identifier).toBe("find-test");
 			expect(found?.value).toBe("find-value");
@@ -1230,7 +1585,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1242,7 +1597,7 @@ describe("internal adapter test", async () => {
 			expect(dataMap.has("verification:secondary-only-test")).toBe(true);
 
 			dataMap.clear();
-			const found = await ctx.internalAdapter.findVerificationValue(
+			const found = await ctx.internalAdapter.findVerificationValueAndPruneExpired(
 				"secondary-only-test",
 			);
 			expect(found).toBeNull(); // Proves DB was NOT used
@@ -1256,7 +1611,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1283,7 +1638,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(dualStorageOpts)).runMigrations();
+			await (await getMigrations(dualStorageOpts)).runMigrations();
 			const ctx = await init(dualStorageOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1296,7 +1651,7 @@ describe("internal adapter test", async () => {
 
 			dataMap.clear();
 			const found =
-				await ctx.internalAdapter.findVerificationValue("both-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("both-test");
 			expect(found).not.toBeNull();
 			expect(found?.value).toBe("both-value");
 		});
@@ -1312,7 +1667,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(dualStorageOpts)).runMigrations();
+			await (await getMigrations(dualStorageOpts)).runMigrations();
 			const ctx = await init(dualStorageOpts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1324,7 +1679,7 @@ describe("internal adapter test", async () => {
 			dataMap.clear();
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("fallback-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("fallback-test");
 			expect(found).not.toBeNull();
 			expect(found?.value).toBe("fallback-value");
 		});
@@ -1337,7 +1692,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(secondaryOnlyOpts)).runMigrations();
+			await (await getMigrations(secondaryOnlyOpts)).runMigrations();
 			const ctx = await init(secondaryOnlyOpts);
 
 			const expiresIn = 300000; // 5 minutes in ms
@@ -1369,6 +1724,11 @@ describe("internal adapter test", async () => {
 				dataMap,
 				ttlMap,
 				storage: {
+					namespace: "internal-adapter-preparsed-storage",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
 					set(key: string, value: string, ttl?: number) {
 						// Store as pre-parsed object (simulating Redis auto-parse)
 						dataMap.set(key, JSON.parse(value));
@@ -1385,7 +1745,7 @@ describe("internal adapter test", async () => {
 			};
 		}
 
-		it("should return Date objects from findVerificationValue when storage returns pre-parsed objects", async () => {
+		it("should return Date objects from findVerificationValueAndPruneExpired when storage returns pre-parsed objects", async () => {
 			const { storage } = createPreParsedStorage();
 
 			const opts = {
@@ -1393,7 +1753,7 @@ describe("internal adapter test", async () => {
 				secondaryStorage: storage,
 			} satisfies ClearanceOptions;
 
-			(await getMigrations(opts)).runMigrations();
+			await (await getMigrations(opts)).runMigrations();
 			const ctx = await init(opts);
 
 			await ctx.internalAdapter.createVerificationValue({
@@ -1403,7 +1763,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("date-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("date-test");
 			expect(found).not.toBeNull();
 			expect(found!.expiresAt).toBeInstanceOf(Date);
 			expect(found!.createdAt).toBeInstanceOf(Date);
@@ -1428,7 +1788,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("expiry-check");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("expiry-check");
 			expect(found).not.toBeNull();
 			// This comparison would silently fail if expiresAt were a string
 			// because string < Date coerces to NaN, making it always false
@@ -1456,7 +1816,7 @@ describe("internal adapter test", async () => {
 
 			// First read: safeJSONParse receives pre-parsed object from storage
 			const first =
-				await ctx.internalAdapter.findVerificationValue("multi-read-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("multi-read-test");
 			expect(first).not.toBeNull();
 			expect(first!.expiresAt).toBeInstanceOf(Date);
 			expect(first!.createdAt).toBeInstanceOf(Date);
@@ -1464,7 +1824,7 @@ describe("internal adapter test", async () => {
 
 			// Second read: verify consistency (the stored object wasn't mutated)
 			const second =
-				await ctx.internalAdapter.findVerificationValue("multi-read-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("multi-read-test");
 			expect(second).not.toBeNull();
 			expect(second!.expiresAt).toBeInstanceOf(Date);
 			expect(second!.expiresAt.getTime()).toBe(first!.expiresAt.getTime());
@@ -1488,7 +1848,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("string-field-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("string-field-test");
 			expect(found).not.toBeNull();
 			// Non-date strings must NOT be converted
 			expect(found!.identifier).toBe("string-field-test");
@@ -1506,9 +1866,33 @@ describe("internal adapter test", async () => {
 				database: new DatabaseSync(":memory:"),
 				...overrides,
 			} satisfies ClearanceOptions;
-			(await getMigrations(opts)).runMigrations();
+			await (await getMigrations(opts)).runMigrations();
 			const ctx = await init(opts);
 			return ctx.internalAdapter;
+		}
+
+		function makeAtomicSecondaryStorage(store: Map<string, string>) {
+			return {
+				namespace: "internal-adapter-consume-storage",
+				runExclusive<T>(_name: string, operation: () => T): T {
+					return operation();
+				},
+				assertNoLegacySessionWriters() {},
+				set(key: string, value: string) {
+					store.set(key, value);
+				},
+				get(key: string) {
+					return store.get(key) ?? null;
+				},
+				getAndDelete(key: string) {
+					const value = store.get(key) ?? null;
+					store.delete(key);
+					return value;
+				},
+				delete(key: string) {
+					store.delete(key);
+				},
+			};
 		}
 
 		it("returns the row to the first caller and null to subsequent reads", async () => {
@@ -1565,7 +1949,7 @@ describe("internal adapter test", async () => {
 
 			// The expired row must still be invalidated so a later replay cannot
 			// consume it after a cleanup pass.
-			const replay = await adapter.findVerificationValue("consume:expired");
+			const replay = await adapter.findVerificationValueAndPruneExpired("consume:expired");
 			expect(replay).toBeNull();
 		});
 
@@ -1590,7 +1974,7 @@ describe("internal adapter test", async () => {
 			expect(result).toBeNull();
 			expect(veto).toHaveBeenCalledTimes(1);
 
-			const stillThere = await adapter.findVerificationValue("consume:veto");
+			const stillThere = await adapter.findVerificationValueAndPruneExpired("consume:veto");
 			expect(stillThere).not.toBeNull();
 		});
 
@@ -1656,8 +2040,49 @@ describe("internal adapter test", async () => {
 			expect(consumed).not.toBeNull();
 			expect(consumed!.value).toBe("newer");
 
-			const leftover = await adapter.findVerificationValue("consume:multi");
+			const leftover = await adapter.findVerificationValueAndPruneExpired("consume:multi");
 			expect(leftover).toBeNull();
+		});
+
+		it("consumes hashed and legacy-plain database aliases as one credential", async () => {
+			const database = new DatabaseSync(":memory:");
+			const options = {
+				database,
+				verification: { storeIdentifier: "hashed" },
+			} satisfies ClearanceOptions;
+			await (await getMigrations(options)).runMigrations();
+			const [left, right] = await Promise.all([init(options), init(options)]);
+			const identifier = "consume:database-aliases";
+			const expiresAt = new Date(Date.now() + 60_000);
+			const hashed = await left.internalAdapter.createVerificationValue({
+				identifier,
+				value: "hashed-winner",
+				expiresAt,
+			});
+			await left.adapter.create({
+				model: "verification",
+				data: {
+					id: "legacy-plain-verification-row",
+					identifier,
+					value: "legacy-plain-row",
+					expiresAt,
+					createdAt: new Date(hashed.createdAt.getTime() - 1),
+					updatedAt: new Date(),
+				},
+			});
+
+			const results = await Promise.all([
+				left.internalAdapter.consumeVerificationValue(identifier),
+				right.internalAdapter.consumeVerificationValue(identifier),
+			]);
+
+			expect(results.filter((result) => result !== null)).toHaveLength(1);
+			expect(results.find((result) => result !== null)?.value).toBe(
+				"hashed-winner",
+			);
+			expect(
+				await left.adapter.findMany({ model: "verification" }),
+			).toHaveLength(0);
 		});
 
 		it("uses secondary storage getAndDelete when verification values are storage-only", async () => {
@@ -1670,6 +2095,9 @@ describe("internal adapter test", async () => {
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
 				secondaryStorage: {
+			namespace: "internal-adapter-test-storage",
+			runExclusive<T>(_name: string, operation: () => T): T { return operation(); },
+			assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -1701,21 +2129,50 @@ describe("internal adapter test", async () => {
 			expect(store.has("verification:consume:secondary")).toBe(false);
 		});
 
+		it("fails closed before reading or deleting when storage-only consume lacks getAndDelete", async () => {
+			const store = new Map<string, string>();
+			const get = vi.fn((key: string) => store.get(key) ?? null);
+			const remove = vi.fn((key: string) => {
+				store.delete(key);
+			});
+			const adapter = await makeAdapter({
+				verification: { storeInDatabase: false },
+				secondaryStorage: {
+					namespace: "internal-adapter-test-storage",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
+					set(key, value) {
+						store.set(key, value);
+					},
+					get,
+					delete: remove,
+				},
+			});
+			await adapter.createVerificationValue({
+				identifier: "consume:missing-get-and-delete",
+				value: "storage-only-user",
+				expiresAt: new Date(Date.now() + 60_000),
+			});
+			get.mockClear();
+			remove.mockClear();
+
+			await expect(
+				adapter.consumeVerificationValue("consume:missing-get-and-delete"),
+			).rejects.toThrow("requires `getAndDelete`");
+			expect(get).not.toHaveBeenCalled();
+			expect(remove).not.toHaveBeenCalled();
+			expect(store.has("verification:consume:missing-get-and-delete")).toBe(
+				true,
+			);
+		});
+
 		it("returns null when the secondary storage row has already expired", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 
 			// Bypass `createVerificationValue`'s TTL gate by writing directly
@@ -1746,17 +2203,7 @@ describe("internal adapter test", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 			await adapter.createVerificationValue({
 				identifier: "consume:secondary-hydrate",
@@ -1777,17 +2224,7 @@ describe("internal adapter test", async () => {
 			const store = new Map<string, string>();
 			const adapter = await makeAdapter({
 				verification: { storeInDatabase: false },
-				secondaryStorage: {
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				secondaryStorage: makeAtomicSecondaryStorage(store),
 			});
 
 			store.set(
@@ -1808,103 +2245,165 @@ describe("internal adapter test", async () => {
 			expect(result).toBeNull();
 		});
 
-		it("serializes the secondary storage compatibility fallback within one process", async () => {
+		it("consumes hashed identifier aliases under a shared provider lease", async () => {
 			const store = new Map<string, string>();
-			const adapter = await makeAdapter({
-				verification: { storeInDatabase: false },
-				secondaryStorage: {
-					set(key, value) {
-						store.set(key, value);
-					},
-					async get(key) {
-						await new Promise((resolve) => setTimeout(resolve, 5));
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+			const leases = new Map<string, Promise<void>>();
+			const storage = makeAtomicSecondaryStorage(store);
+			storage.runExclusive = (async (name, operation) => {
+				const previous = leases.get(name) ?? Promise.resolve();
+				let release!: () => void;
+				const current = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const next = previous.catch(() => {}).then(() => current);
+				leases.set(name, next);
+				await previous.catch(() => {});
+				try {
+					return await operation();
+				} finally {
+					release();
+					if (leases.get(name) === next) leases.delete(name);
+				}
+			}) as typeof storage.runExclusive;
+			const left = await makeAdapter({
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
 			});
-			await adapter.createVerificationValue({
-				identifier: "consume:secondary-fallback",
-				value: "fallback-user",
+			const right = await makeAdapter({
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
+			});
+			const created = await left.createVerificationValue({
+				identifier: "consume:secondary-aliases",
+				value: "alias-user",
 				expiresAt: new Date(Date.now() + 60_000),
 			});
+			store.set(
+				"verification:consume:secondary-aliases",
+				JSON.stringify({ ...created, identifier: "consume:secondary-aliases" }),
+			);
 
 			const results = await Promise.all([
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
-				adapter.consumeVerificationValue("consume:secondary-fallback"),
+				left.consumeVerificationValue("consume:secondary-aliases"),
+				right.consumeVerificationValue("consume:secondary-aliases"),
 			]);
 
 			expect(results.filter((r) => r !== null)).toHaveLength(1);
-			expect(results.find((r) => r !== null)?.value).toBe("fallback-user");
-			expect(store.has("verification:consume:secondary-fallback")).toBe(false);
+			expect(results.find((r) => r !== null)?.value).toBe("alias-user");
+			expect(
+				Array.from(store.keys()).filter((key) => key.startsWith("verification:")),
+			).toHaveLength(0);
 		});
 
-		it("warns once when secondary storage cannot consume atomically", async () => {
+		it("fails closed for hashed identifier aliases without a provider lease", async () => {
 			const store = new Map<string, string>();
-			const logs: { level: string; message: string }[] = [];
+			const storage = makeAtomicSecondaryStorage(store);
 			const adapter = await makeAdapter({
-				logger: {
-					log: (level, message) => {
-						logs.push({ level, message });
-					},
-				},
-				verification: { storeInDatabase: false },
-				secondaryStorage: {
-					set(key, value) {
-						store.set(key, value);
-					},
-					get(key) {
-						return store.get(key) ?? null;
-					},
-					delete(key) {
-						store.delete(key);
-					},
-				},
+				verification: { storeInDatabase: false, storeIdentifier: "hashed" },
+				secondaryStorage: storage,
 			});
+			await adapter.createVerificationValue({
+				identifier: "consume:aliases-without-lease",
+				value: "alias-user",
+				expiresAt: new Date(Date.now() + 60_000),
+			});
+			Reflect.deleteProperty(storage, "runExclusive");
 
-			for (const id of ["consume:warn-1", "consume:warn-2"]) {
-				await adapter.createVerificationValue({
-					identifier: id,
-					value: "user",
-					expiresAt: new Date(Date.now() + 60_000),
-				});
-				await adapter.consumeVerificationValue(id);
-			}
-
-			const warnings = logs.filter(
-				(l) => l.level === "warn" && l.message.includes("getAndDelete"),
-			);
-			expect(warnings).toHaveLength(1);
+			await expect(
+				adapter.consumeVerificationValue("consume:aliases-without-lease"),
+			).rejects.toThrow("requires `runExclusive`");
+			expect(
+				Array.from(store.keys()).filter((key) => key.startsWith("verification:")),
+			).toHaveLength(1);
 		});
 	});
 
 	describe("reserveVerificationValue", () => {
-		async function makeAdapter(overrides?: Partial<ClearanceOptions>) {
+		async function makeContext(overrides?: Partial<ClearanceOptions>) {
 			const opts = {
 				database: new DatabaseSync(":memory:"),
 				...overrides,
 			} satisfies ClearanceOptions;
-			(await getMigrations(opts)).runMigrations();
-			const ctx = await init(opts);
-			return ctx.internalAdapter;
+			await (await getMigrations(opts)).runMigrations();
+			return init(opts);
 		}
 
-		it("returns true the first time and the row is findable", async () => {
-			const adapter = await makeAdapter();
+		async function makeAdapter(overrides?: Partial<ClearanceOptions>) {
+			return (await makeContext(overrides)).internalAdapter;
+		}
 
-			const reserved = await adapter.reserveVerificationValue({
+		function makeSecondaryStorage(
+			store: Map<string, string>,
+			options: { failVerificationAccess?: boolean } = {},
+		) {
+			return {
+				namespace: "reserve-verification-test-storage",
+				runExclusive<T>(_name: string, operation: () => T): T {
+					return operation();
+				},
+				assertNoLegacySessionWriters() {},
+				set(key: string, value: string) {
+					if (
+						options.failVerificationAccess &&
+						key.startsWith("verification:")
+					) {
+						throw new Error("secondary verification storage unavailable");
+					}
+					store.set(key, value);
+				},
+				get(key: string) {
+					if (
+						options.failVerificationAccess &&
+						key.startsWith("verification:")
+					) {
+						throw new Error("secondary verification storage unavailable");
+					}
+					return store.get(key) ?? null;
+				},
+				delete(key: string) {
+					store.delete(key);
+				},
+			};
+		}
+
+		type ReservationTombstone = {
+			id: string;
+			key: string;
+			state: string;
+			phase: string;
+			cursor: string;
+			revision: number;
+			completedAt: Date;
+			updatedAt: Date;
+		};
+
+		async function findReservationTombstones(
+			context: Awaited<ReturnType<typeof makeContext>>,
+		) {
+			return context.adapter.findMany<ReservationTombstone>({
+				model: "securityMigration",
+				where: [
+					{
+						field: "state",
+						value: "verification-reservation-v1",
+					},
+				],
+			});
+		}
+
+		it("returns true the first time and persists only a digest tombstone", async () => {
+			const context = await makeContext();
+
+			const reserved = await context.internalAdapter.reserveVerificationValue({
 				identifier: "reserve:fresh",
 				value: "jti-1",
 				expiresAt: new Date(Date.now() + 60_000),
 			});
 			expect(reserved).toBe(true);
-
-			const found = await adapter.findVerificationValue("reserve:fresh");
-			expect(found).not.toBeNull();
-			expect(found!.value).toBe("jti-1");
+			const [tombstone] = await findReservationTombstones(context);
+			expect(tombstone).toBeDefined();
+			expect(JSON.stringify(tombstone)).not.toContain("reserve:fresh");
+			expect(JSON.stringify(tombstone)).not.toContain("jti-1");
 		});
 
 		it("returns false the second time for the same identifier", async () => {
@@ -1961,6 +2460,386 @@ describe("internal adapter test", async () => {
 
 			expect(first).toBe(true);
 			expect(second).toBe(true);
+		});
+
+		it("uses one primary tombstone winner in secondary-only mode", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+
+			const results = await Promise.all(
+				Array.from({ length: 8 }, (_, index) =>
+					context.internalAdapter.reserveVerificationValue({
+						identifier: "reserve:secondary-race",
+						value: `secondary-jti-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				),
+			);
+
+			expect(results.filter(Boolean)).toHaveLength(1);
+			expect(await findReservationTombstones(context)).toHaveLength(1);
+		});
+
+		it("rolls primary reservation authority back without secondary replay material", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+			const identifier = "reserve:transaction-rollback";
+			const markerKey = `verification:${identifier}`;
+
+			await expect(
+				runWithTransaction(context.adapter, async () => {
+					expect(
+						await context.internalAdapter.reserveVerificationValue({
+							identifier,
+							value: "transactional-winner",
+							expiresAt: new Date(Date.now() + 60_000),
+						}),
+					).toBe(true);
+					expect(store.has(markerKey)).toBe(false);
+					throw new Error("rollback reservation");
+				}),
+			).rejects.toThrow("rollback reservation");
+
+			expect(await findReservationTombstones(context)).toHaveLength(0);
+			expect(store.has(markerKey)).toBe(false);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier,
+					value: "replacement-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(store.has(markerKey)).toBe(false);
+		});
+
+		it("uses one raw-identifier gate across different storage transformations", async () => {
+			const storagePairs = [
+				["plain", "hashed"],
+				[
+					"hashed",
+					{
+						hash: async (identifier: string) =>
+							`custom-${identifier.length}`,
+					},
+				],
+				[
+					"plain",
+					{
+						hash: async (identifier: string) =>
+							`custom-${identifier.length}`,
+					},
+				],
+			] as const;
+
+			for (const [index, [leftStorage, rightStorage]] of storagePairs.entries()) {
+				const database = new DatabaseSync(":memory:");
+				const leftOptions = {
+					database,
+					verification: {
+						storeInDatabase: false,
+						storeIdentifier: leftStorage,
+					},
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				} satisfies ClearanceOptions;
+				const rightOptions = {
+					database,
+					verification: {
+						storeInDatabase: false,
+						storeIdentifier: rightStorage,
+					},
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				} satisfies ClearanceOptions;
+
+				await (await getMigrations(leftOptions)).runMigrations();
+				const [leftContext, rightContext] = await Promise.all([
+					init(leftOptions),
+					init(rightOptions),
+				]);
+				const identifier = `reserve:storage-transform-${index}`;
+				const results = await Promise.all([
+					leftContext.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: `left-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+					rightContext.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: `right-${index}`,
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				]);
+
+				expect(results.filter(Boolean)).toHaveLength(1);
+				expect(await findReservationTombstones(leftContext)).toHaveLength(1);
+			}
+		});
+
+		it.each(["serial", "uuid"] as const)(
+			"supports %s-generated tombstone ids for replay and expiry",
+			async (generateIdStrategy) => {
+				const context = await makeContext({
+					advanced: { database: { generateId: generateIdStrategy } },
+					verification: { storeInDatabase: false },
+					secondaryStorage: makeSecondaryStorage(new Map()),
+				});
+				const identifier = `reserve:${generateIdStrategy}-id`;
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "expired-generated-id-value",
+						expiresAt: new Date(Date.now() - 1_000),
+					}),
+				).toBe(true);
+				const [expired] = await findReservationTombstones(context);
+				expect(expired).toBeDefined();
+				if (generateIdStrategy === "serial") {
+					expect(expired!.id).toMatch(/^\d+$/);
+				} else {
+					expect(expired!.id).toMatch(
+						/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+					);
+				}
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "replacement-generated-id-value",
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				).toBe(true);
+				const [replacement] = await findReservationTombstones(context);
+				expect(replacement).toBeDefined();
+				expect(replacement!.cursor).not.toBe(expired!.cursor);
+				expect(replacement!.phase).not.toBe(expired!.phase);
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "generated-id-replay",
+						expiresAt: new Date(Date.now() + 120_000),
+					}),
+				).toBe(false);
+				expect(await findReservationTombstones(context)).toEqual([
+					replacement,
+				]);
+			},
+		);
+
+		it.each(["serial", "uuid"] as const)(
+			"uses the unique security ledger under default storage with %s ids",
+			async (generateIdStrategy) => {
+				const context = await makeContext({
+					advanced: { database: { generateId: generateIdStrategy } },
+				});
+				const identifier = `reserve:default-storage-${generateIdStrategy}`;
+
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "default-storage-winner",
+						expiresAt: new Date(Date.now() + 60_000),
+					}),
+				).toBe(true);
+				expect(
+					await context.internalAdapter.reserveVerificationValue({
+						identifier,
+						value: "default-storage-replay",
+						expiresAt: new Date(Date.now() + 120_000),
+					}),
+				).toBe(false);
+				expect(await findReservationTombstones(context)).toHaveLength(1);
+			},
+		);
+
+		it("uses the supplied digest id when automatic id generation is disabled", async () => {
+			const database = new DatabaseSync(":memory:");
+			const secondaryStorage = makeSecondaryStorage(new Map());
+			const migrationOptions = {
+				database,
+				verification: { storeInDatabase: false },
+				secondaryStorage,
+			} satisfies ClearanceOptions;
+			await (await getMigrations(migrationOptions)).runMigrations();
+			const context = await init({
+				...migrationOptions,
+				advanced: { database: { generateId: false } },
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:disabled-id-generation",
+					value: "disabled-id-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			const [tombstone] = await findReservationTombstones(context);
+			expect(tombstone).toBeDefined();
+			expect(tombstone!.key).toBe(
+				`verification-reservation-v1:${tombstone!.id}`,
+			);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:disabled-id-generation",
+					value: "disabled-id-replay",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(false);
+		});
+
+		it("keeps the primary tombstone authoritative without a secondary mirror", async () => {
+			const store = new Map<string, string>();
+			const context = await makeContext({
+				verification: {
+					storeInDatabase: false,
+					storeIdentifier: {
+						hash: async (identifier) => `stored-${identifier.length}`,
+					},
+				},
+				secondaryStorage: makeSecondaryStorage(store),
+			});
+			const rawIdentifier = "raw-reservation-bearer-identifier";
+			const winningValue = "raw-reservation-winning-value";
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: rawIdentifier,
+					value: winningValue,
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(store.has(`verification:stored-${rawIdentifier.length}`)).toBe(
+				false,
+			);
+			const [before] = await findReservationTombstones(context);
+			expect(before).toBeDefined();
+			expect(JSON.stringify(before)).not.toContain(rawIdentifier);
+			expect(JSON.stringify(before)).not.toContain(winningValue);
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: rawIdentifier,
+					value: "raw-reservation-losing-value",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(false);
+
+			const [after] = await findReservationTombstones(context);
+			expect(after).toEqual(before);
+			expect(store.has(`verification:stored-${rawIdentifier.length}`)).toBe(
+				false,
+			);
+		});
+
+		it("reclaims a bounded batch of unique expired reservations", async () => {
+			const context = await makeContext();
+			const expiredAt = new Date(Date.now() - 60_000);
+			for (let index = 0; index < 12; index += 1) {
+				const timestamp = new Date(Date.now() - 120_000 + index);
+				await context.adapter.create({
+					model: "securityMigration",
+					forceAllowId: true,
+					data: {
+						id: `expired-reservation-${index}`,
+						key: `verification-reservation-v1:expired-${index}`,
+						state: "verification-reservation-v1",
+						phase: `phase-${index}`,
+						cursor: `cursor-${index}`,
+						revision: 1,
+						completedAt: expiredAt,
+						createdAt: timestamp,
+						updatedAt: timestamp,
+					},
+				});
+			}
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:gc-trigger",
+					value: "gc-trigger-value",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+
+			const remaining = await findReservationTombstones(context);
+			expect(
+				remaining.filter((row) => row.completedAt <= new Date()),
+			).toHaveLength(4);
+			expect(
+				remaining.filter((row) => row.completedAt > new Date()),
+			).toHaveLength(1);
+		});
+
+		it("rejects replay when the secondary verification cache is unavailable", async () => {
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(new Map(), {
+					failVerificationAccess: true,
+				}),
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:cache-unavailable",
+					value: "cache-unavailable-winner",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:cache-unavailable",
+					value: "cache-unavailable-replay",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(false);
+			expect(await findReservationTombstones(context)).toHaveLength(1);
+		});
+
+		it("reclaims only an expired primary tombstone with a bounded retry", async () => {
+			const context = await makeContext({
+				verification: { storeInDatabase: false },
+				secondaryStorage: makeSecondaryStorage(new Map()),
+			});
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:expired-tombstone",
+					value: "expired-value",
+					expiresAt: new Date(Date.now() - 1_000),
+				}),
+			).toBe(true);
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:valid-neighbor",
+					value: "valid-neighbor-value",
+					expiresAt: new Date(Date.now() + 60_000),
+				}),
+			).toBe(true);
+			const before = await findReservationTombstones(context);
+			const validNeighbor = before.find((row) =>
+				row.completedAt.getTime() > Date.now(),
+			);
+
+			expect(
+				await context.internalAdapter.reserveVerificationValue({
+					identifier: "reserve:expired-tombstone",
+					value: "replacement-value",
+					expiresAt: new Date(Date.now() + 120_000),
+				}),
+			).toBe(true);
+
+			const after = await findReservationTombstones(context);
+			expect(after).toHaveLength(2);
+			expect(after).toContainEqual(validNeighbor);
+			expect(
+				after.some((row) => row.completedAt.getTime() > Date.now() + 60_000),
+			).toBe(true);
 		});
 	});
 });

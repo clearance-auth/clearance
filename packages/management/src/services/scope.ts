@@ -1,5 +1,5 @@
 /**
- * Principal-derived project/environment scope for the management plane.
+ * User-derived project/environment scope for the management plane.
  *
  * Authority is never taken from client request headers. Scope is resolved from
  * server-side operator configuration and the store's initialized project/env.
@@ -78,6 +78,78 @@ export function resolveOperatorScope(
 					"Align CLEARANCE_PROJECT_ID / CLEARANCE_ENV_ID with the initialized project, or re-init",
 			});
 		}
+	}
+
+	return { projectId, environmentId };
+}
+
+/**
+ * Resolve operator scope against normalized topology when it is authoritative.
+ *
+ * This intentionally leaves `resolveOperatorScope` synchronous for the JSON
+ * store and existing local callers. Relational authority must not depend on
+ * snapshot topology: cutover clears those arrays, and consulting them would
+ * let an invalid configured pair pass unchecked.
+ */
+export async function resolveOperatorScopeAuthoritative(
+	store: ManagementSnapshotReader,
+	opts?: Partial<ResourceScope>,
+): Promise<ResourceScope> {
+	const topology = store.storeV2Topology;
+	if (!topology?.authoritative) return resolveOperatorScope(store, opts);
+
+	let projectId =
+		opts?.projectId?.trim() ||
+		process.env.CLEARANCE_PROJECT_ID?.trim() ||
+		store.snapshot.meta.config.projectId;
+	let environmentId =
+		opts?.environmentId?.trim() ||
+		process.env.CLEARANCE_ENV_ID?.trim() ||
+		store.snapshot.meta.config.environmentId;
+
+	// Preserve the local single-project fallback without selecting an arbitrary
+	// relational record. The bounded page can only establish uniqueness.
+	if (!projectId) {
+		const page = await topology.listProjectsPage({ limit: 2 });
+		if (!page.hasMore && page.projects.length === 1) {
+			projectId = page.projects[0]!.id;
+		}
+	}
+	if (!environmentId && projectId) {
+		const page = await topology.listEnvironmentsPage({ projectId, limit: 2 });
+		if (!page.hasMore && page.environments.length === 1) {
+			environmentId = page.environments[0]!.id;
+		}
+	}
+
+	if (!projectId || !environmentId) {
+		throw new ClearanceError({
+			code: "SCOPE_REQUIRED",
+			message:
+				"Operator principal has no project/environment scope. Initialize a project or set CLEARANCE_PROJECT_ID and CLEARANCE_ENV_ID.",
+			stage: "scope.resolve",
+			status: 403,
+			remediation:
+				"Run clearance init, or set CLEARANCE_PROJECT_ID and CLEARANCE_ENV_ID to the operator's authorized scope",
+		});
+	}
+
+	const project = await topology.getProjectById(projectId);
+	const environment = project
+		? await topology.getEnvironment({
+			projectId,
+			id: environmentId,
+		})
+		: null;
+	if (!project || !environment) {
+		throw new ClearanceError({
+			code: "SCOPE_INVALID",
+			message: "Configured operator scope does not match store project/environment",
+			stage: "scope.resolve",
+			status: 403,
+			remediation:
+				"Align CLEARANCE_PROJECT_ID / CLEARANCE_ENV_ID with the initialized project, or re-init",
+		});
 	}
 
 	return { projectId, environmentId };

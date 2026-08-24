@@ -16,7 +16,7 @@ import type {
 	RawBuilder,
 	UpdateQueryBuilder,
 } from "kysely";
-import { sql } from "kysely";
+import { CompiledQuery, sql } from "kysely";
 import {
 	insensitiveEq,
 	insensitiveIlike,
@@ -65,6 +65,13 @@ interface KyselyAdapterConfig {
 	 */
 	transaction?: boolean | undefined;
 }
+
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
 
 export const kyselyAdapter = (
 	db: Kysely<any>,
@@ -564,6 +571,62 @@ export const kyselyAdapter = (
 					const returned = await withReturning(data, builder, model, []);
 					return returned;
 				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					const matchesAttempt = (row: any) =>
+						row != null && row[attemptBy.field] === attemptBy.value;
+
+					if (config?.type === "mysql") {
+						await db
+							.insertInto(model)
+							.values(data)
+							.onDuplicateKeyUpdate({
+								[uniqueBy.field]: sql.ref(uniqueBy.field),
+							})
+							.executeTakeFirst();
+						const row = await db
+							.selectFrom(model)
+							.selectAll()
+							.where(uniqueBy.field, "=", uniqueBy.value)
+							.limit(1)
+							.executeTakeFirst();
+						return matchesAttempt(row) ? (row as T) : null;
+					}
+
+					if (config?.type === "mssql") {
+						const claimFromTransaction = async (trx: any) => {
+							const existing = await sql<any>`SELECT TOP (1) * FROM ${sql.table(
+								model,
+							)} WITH (UPDLOCK, HOLDLOCK) WHERE ${sql.ref(
+								uniqueBy.field,
+							)} = ${uniqueBy.value}`.execute(trx);
+							if (existing.rows[0]) return null;
+							const inserted = await trx
+								.insertInto(model)
+								.values(data)
+								.outputAll("inserted")
+								.executeTakeFirst();
+							return matchesAttempt(inserted) ? (inserted as T) : null;
+						};
+						return inTransaction
+							? claimFromTransaction(db)
+							: db.transaction().execute(claimFromTransaction);
+					}
+
+					const inserted = await db
+						.insertInto(model)
+						.values(data)
+						.onConflict((conflict: any) =>
+							conflict.column(uniqueBy.field).doNothing(),
+						)
+						.returningAll()
+						.executeTakeFirst();
+					return matchesAttempt(inserted) ? (inserted as T) : null;
+				},
 				async findOne({ model, where, select, join }) {
 					const { and, or } = convertWhereClause(model, where);
 					let query: any = db
@@ -953,10 +1016,17 @@ export const kyselyAdapter = (
 					// `limit(1)`.
 					const targetIds =
 						config?.type === "mssql" ? selectIds.top(1) : selectIds.limit(1);
-					const updateQuery = db
-						.updateTable(model)
-						.set(assignments)
-						.where(`${model}.${idField}`, "in", targetIds);
+					// Keep the single-row selector and repeat the complete guard on the
+					// outer UPDATE. PostgreSQL may evaluate the subquery before waiting
+					// for a concurrent updater; after the wait, the outer guard must be
+					// rechecked against the committed row so only one claimant can win a
+					// state transition such as `active` -> `consumed`.
+					const updateQuery = applyWhere(
+						db
+							.updateTable(model)
+							.set(assignments)
+							.where(`${model}.${idField}`, "in", targetIds),
+					);
 					if (config?.type === "mssql") {
 						return (
 							(await updateQuery.outputAll("inserted").executeTakeFirst()) ??
@@ -965,8 +1035,26 @@ export const kyselyAdapter = (
 					}
 					return (await updateQuery.returningAll().executeTakeFirst()) ?? null;
 				},
-				options: config,
-			};
+			options: config,
+			...(inTransaction && config?.type === "postgres"
+				? {
+						rawTransactionQuery: async <
+							Row extends Record<string, unknown> = Record<string, unknown>,
+						>(text: string, values: readonly unknown[] = []) => {
+							const result = await db.executeQuery(
+								CompiledQuery.raw(text, [...values]),
+							);
+							return {
+								rows: result.rows as Row[],
+								rowCount:
+									result.numAffectedRows === undefined
+										? null
+										: Number(result.numAffectedRows),
+							};
+						},
+					}
+				: {}),
+		};
 		};
 	};
 	let adapterOptions: AdapterFactoryOptions | null = null;

@@ -1,6 +1,9 @@
 import type { IncomingHttpHeaders } from "node:http";
 import { toNodeHandler as toNode } from "@clearance/call/node";
+import type { NodeHandlerOptions } from "@clearance/call/node";
 import type { Auth } from "../types";
+
+export type { NodeHandlerOptions } from "@clearance/call/node";
 
 export const toNodeHandler = (
 	auth:
@@ -8,8 +11,9 @@ export const toNodeHandler = (
 				handler: Auth["handler"];
 		  }
 		| Auth["handler"],
+	options?: NodeHandlerOptions,
 ) => {
-	return "handler" in auth ? toNode(auth.handler) : toNode(auth);
+	return "handler" in auth ? toNode(auth.handler, options) : toNode(auth, options);
 };
 
 export function fromNodeHeaders(nodeHeaders: IncomingHttpHeaders): Headers {

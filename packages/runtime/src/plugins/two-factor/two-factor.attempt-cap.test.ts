@@ -155,7 +155,7 @@ describe("two-factor security: TOTP enforces a per-challenge attempt cap", async
 		await db.update({
 			model: "twoFactor",
 			where: [{ field: "userId", value: userId }],
-			update: { secret: validSecret },
+			update: { secret: validSecret, lastUsedTotpCounter: -1 },
 		});
 		const ok = await verifyTotp(
 			challengeHeaders,

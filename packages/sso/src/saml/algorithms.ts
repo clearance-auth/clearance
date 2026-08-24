@@ -1,11 +1,13 @@
 import { APIError } from "@clearance/runtime/api";
-import { findNode, xmlParser } from "./parser";
+import { countAllNodes, parseSAMLXml } from "./parser";
 
 export const SignatureAlgorithm = {
 	RSA_SHA1: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
 	RSA_SHA256: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
 	RSA_SHA384: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
 	RSA_SHA512: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+	RSA_PSS_SHA256:
+		"http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1",
 	ECDSA_SHA256: "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
 	ECDSA_SHA384: "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
 	ECDSA_SHA512: "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
@@ -46,12 +48,27 @@ const DEPRECATED_DATA_ENCRYPTION_ALGORITHMS: readonly string[] = [
 	DataEncryptionAlgorithm.TRIPLEDES_CBC,
 ];
 
+const SECURE_KEY_ENCRYPTION_ALGORITHMS: readonly string[] = [
+	KeyEncryptionAlgorithm.RSA_OAEP,
+	KeyEncryptionAlgorithm.RSA_OAEP_SHA256,
+];
+
+const SECURE_DATA_ENCRYPTION_ALGORITHMS: readonly string[] = [
+	DataEncryptionAlgorithm.AES_128_CBC,
+	DataEncryptionAlgorithm.AES_192_CBC,
+	DataEncryptionAlgorithm.AES_256_CBC,
+	DataEncryptionAlgorithm.AES_128_GCM,
+	DataEncryptionAlgorithm.AES_192_GCM,
+	DataEncryptionAlgorithm.AES_256_GCM,
+];
+
 const DEPRECATED_DIGEST_ALGORITHMS: readonly string[] = [DigestAlgorithm.SHA1];
 
 const SECURE_SIGNATURE_ALGORITHMS: readonly string[] = [
 	SignatureAlgorithm.RSA_SHA256,
 	SignatureAlgorithm.RSA_SHA384,
 	SignatureAlgorithm.RSA_SHA512,
+	SignatureAlgorithm.RSA_PSS_SHA256,
 	SignatureAlgorithm.ECDSA_SHA256,
 	SignatureAlgorithm.ECDSA_SHA384,
 	SignatureAlgorithm.ECDSA_SHA512,
@@ -72,6 +89,8 @@ const SHORT_FORM_SIGNATURE_TO_URI: Record<string, string> = {
 	"rsa-sha256": SignatureAlgorithm.RSA_SHA256,
 	"rsa-sha384": SignatureAlgorithm.RSA_SHA384,
 	"rsa-sha512": SignatureAlgorithm.RSA_SHA512,
+	"rsa-pss-sha256": SignatureAlgorithm.RSA_PSS_SHA256,
+	"sha256-rsa-mgf1": SignatureAlgorithm.RSA_PSS_SHA256,
 	"ecdsa-sha256": SignatureAlgorithm.ECDSA_SHA256,
 	"ecdsa-sha384": SignatureAlgorithm.ECDSA_SHA384,
 	"ecdsa-sha512": SignatureAlgorithm.ECDSA_SHA512,
@@ -107,44 +126,61 @@ function extractEncryptionAlgorithms(xml: string): {
 	dataEncryption: string | null;
 } {
 	try {
-		const parsed = xmlParser.parse(xml);
+		const parsed = toNode(parseSAMLXml(xml));
+		const response = toNode(parsed?.Response);
+		const encryptedAssertions = toNodeArray(response?.EncryptedAssertion);
+		if (encryptedAssertions.length !== 1) {
+			throw new Error("Expected one direct EncryptedAssertion");
+		}
 
-		const encryptedKey = findNode(parsed, "EncryptedKey") as Record<
-			string,
-			unknown
-		> | null;
-		const keyEncMethod = encryptedKey?.EncryptionMethod as Record<
-			string,
-			unknown
-		> | null;
-		const keyAlg = keyEncMethod?.["@_Algorithm"] as string | undefined;
+		const encryptedDataNodes = toNodeArray(
+			encryptedAssertions[0]!.EncryptedData,
+		);
+		if (encryptedDataNodes.length !== 1) {
+			throw new Error("Expected one direct EncryptedData");
+		}
+		const encryptedData = encryptedDataNodes[0]!;
+		const dataEncMethods = toNodeArray(encryptedData.EncryptionMethod);
+		const keyInfo = toNode(encryptedData.KeyInfo);
+		const encryptedKeys = toNodeArray(keyInfo?.EncryptedKey);
+		const keyEncMethods = toNodeArray(encryptedKeys[0]?.EncryptionMethod);
 
-		const encryptedData = findNode(parsed, "EncryptedData") as Record<
-			string,
-			unknown
-		> | null;
-		const dataEncMethod = encryptedData?.EncryptionMethod as Record<
-			string,
-			unknown
-		> | null;
-		const dataAlg = dataEncMethod?.["@_Algorithm"] as string | undefined;
+		if (
+			dataEncMethods.length !== 1 ||
+			encryptedKeys.length !== 1 ||
+			keyEncMethods.length !== 1
+		) {
+			throw new Error("Ambiguous encryption algorithms");
+		}
+
+		const dataAlg = dataEncMethods[0]?.["@_Algorithm"];
+		const keyAlg = keyEncMethods[0]?.["@_Algorithm"];
+		if (
+			typeof keyAlg !== "string" ||
+			!keyAlg ||
+			typeof dataAlg !== "string" ||
+			!dataAlg
+		) {
+			throw new Error("Missing encryption algorithm");
+		}
 
 		return {
-			keyEncryption: keyAlg || null,
-			dataEncryption: dataAlg || null,
+			keyEncryption: keyAlg,
+			dataEncryption: dataAlg,
 		};
 	} catch {
-		return {
-			keyEncryption: null,
-			dataEncryption: null,
-		};
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML encrypted assertion algorithm structure is invalid",
+			code: "SAML_ENCRYPTION_STRUCTURE_INVALID",
+		});
 	}
 }
 
 function hasEncryptedAssertion(xml: string): boolean {
 	try {
-		const parsed = xmlParser.parse(xml);
-		return findNode(parsed, "EncryptedAssertion") !== null;
+		const parsed = toNode(parseSAMLXml(xml));
+		const response = toNode(parsed?.Response);
+		return toNodeArray(response?.EncryptedAssertion).length > 0;
 	} catch {
 		return false;
 	}
@@ -179,8 +215,13 @@ function validateSignatureAlgorithm(
 
 	const { onDeprecated = "reject", allowedSignatureAlgorithms } = options;
 
+	const normalized = normalizeSignatureAlgorithm(algorithm);
+
 	if (allowedSignatureAlgorithms) {
-		if (!allowedSignatureAlgorithms.includes(algorithm)) {
+		const normalizedAllowList = allowedSignatureAlgorithms.map(
+			normalizeSignatureAlgorithm,
+		);
+		if (!normalizedAllowList.includes(normalized)) {
 			throw new APIError("BAD_REQUEST", {
 				message: `SAML signature algorithm not in allow-list: ${algorithm}`,
 				code: "SAML_ALGORITHM_NOT_ALLOWED",
@@ -189,7 +230,7 @@ function validateSignatureAlgorithm(
 		return;
 	}
 
-	if (DEPRECATED_SIGNATURE_ALGORITHMS.includes(algorithm)) {
+	if (DEPRECATED_SIGNATURE_ALGORITHMS.includes(normalized)) {
 		handleDeprecatedAlgorithm(
 			`SAML response uses deprecated signature algorithm: ${algorithm}. Please configure your IdP to use SHA-256 or stronger.`,
 			onDeprecated,
@@ -198,12 +239,202 @@ function validateSignatureAlgorithm(
 		return;
 	}
 
-	if (!SECURE_SIGNATURE_ALGORITHMS.includes(algorithm)) {
+	if (!SECURE_SIGNATURE_ALGORITHMS.includes(normalized)) {
 		throw new APIError("BAD_REQUEST", {
 			message: `SAML signature algorithm not recognized: ${algorithm}`,
 			code: "SAML_UNKNOWN_ALGORITHM",
 		});
 	}
+}
+
+function validateDigestAlgorithm(
+	algorithm: string,
+	options: AlgorithmValidationOptions = {},
+): void {
+	const { onDeprecated = "reject", allowedDigestAlgorithms } = options;
+	const normalized = normalizeDigestAlgorithm(algorithm);
+
+	if (allowedDigestAlgorithms) {
+		const normalizedAllowList = allowedDigestAlgorithms.map(
+			normalizeDigestAlgorithm,
+		);
+		if (!normalizedAllowList.includes(normalized)) {
+			throw new APIError("BAD_REQUEST", {
+				message: `SAML digest algorithm not in allow-list: ${algorithm}`,
+				code: "SAML_ALGORITHM_NOT_ALLOWED",
+			});
+		}
+		return;
+	}
+
+	if (DEPRECATED_DIGEST_ALGORITHMS.includes(normalized)) {
+		handleDeprecatedAlgorithm(
+			`SAML response uses deprecated digest algorithm: ${algorithm}. Please configure your IdP to use SHA-256 or stronger.`,
+			onDeprecated,
+			"SAML_DEPRECATED_ALGORITHM",
+		);
+		return;
+	}
+
+	if (!SECURE_DIGEST_ALGORITHMS.includes(normalized)) {
+		throw new APIError("BAD_REQUEST", {
+			message: `SAML digest algorithm not recognized: ${algorithm}`,
+			code: "SAML_UNKNOWN_ALGORITHM",
+		});
+	}
+}
+
+type XmlNode = Record<string, unknown>;
+
+function toNode(value: unknown): XmlNode | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return null;
+	}
+	return value as XmlNode;
+}
+
+function toNodeArray(value: unknown): XmlNode[] {
+	if (Array.isArray(value)) {
+		return value.map(toNode).filter((node): node is XmlNode => !!node);
+	}
+	const node = toNode(value);
+	return node ? [node] : [];
+}
+
+function requiredAlgorithm(
+	node: XmlNode | null,
+	type: "signature" | "digest",
+): string {
+	const algorithm = node?.["@_Algorithm"];
+	if (typeof algorithm === "string" && algorithm) {
+		return algorithm;
+	}
+
+	throw new APIError("BAD_REQUEST", {
+		message: `SAML XML signature is missing a ${type} algorithm`,
+		code:
+			type === "signature"
+				? "SAML_SIGNATURE_ALGORITHM_MISSING"
+				: "SAML_DIGEST_ALGORITHM_MISSING",
+	});
+}
+
+function extractSignedXMLAlgorithms(xml: string): {
+	signature: string;
+	digests: string[];
+} {
+	let parsed: XmlNode;
+	try {
+		const result = toNode(parseSAMLXml(xml));
+		if (!result) throw new Error("Missing XML root");
+		parsed = result;
+	} catch {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML signed XML could not be parsed",
+			code: "SAML_SIGNATURE_INVALID_XML",
+		});
+	}
+
+	const root = toNode(parsed.Response) ?? toNode(parsed.Assertion);
+	if (!root) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML signed XML is missing a Response or Assertion root",
+			code: "SAML_SIGNATURE_STRUCTURE_INVALID",
+		});
+	}
+
+	const rootSignatures = toNodeArray(root.Signature);
+	const assertions = toNodeArray(root.Assertion);
+	const assertionSignatures = assertions.flatMap((assertion) =>
+		toNodeArray(assertion.Signature),
+	);
+	const signatures = [...rootSignatures, ...assertionSignatures];
+	const totalSignatures = countAllNodes(parsed, "Signature");
+
+	// samlify verifies only these direct Response/Assertion signature locations.
+	// Applying the policy to every direct signature preserves valid dual-signed
+	// responses while preventing an off-path or mixed-algorithm signature from
+	// influencing which declaration belongs to the signature samlify accepted.
+	if (
+		signatures.length === 0 ||
+		totalSignatures !== signatures.length ||
+		rootSignatures.length > 1 ||
+		assertions.length > 1 ||
+		assertionSignatures.length > 1
+	) {
+		throw new APIError("BAD_REQUEST", {
+			message:
+				totalSignatures === 0
+					? "SAML response is missing an embedded XML signature"
+					: "SAML response contains ambiguous XML signatures",
+			code:
+				totalSignatures === 0
+					? "SAML_SIGNATURE_MISSING"
+					: "SAML_SIGNATURE_AMBIGUOUS",
+		});
+	}
+
+	const declaredAlgorithms = signatures.map((signature) => {
+		const signedInfo = toNode(signature.SignedInfo);
+		const signatureMethods = toNodeArray(signedInfo?.SignatureMethod);
+		if (!signedInfo || signatureMethods.length !== 1) {
+			throw new APIError("BAD_REQUEST", {
+				message:
+					"SAML XML signature must declare exactly one signature algorithm",
+				code: "SAML_SIGNATURE_ALGORITHM_MISSING",
+			});
+		}
+
+		const references = toNodeArray(signedInfo.Reference);
+		if (references.length === 0) {
+			throw new APIError("BAD_REQUEST", {
+				message: "SAML XML signature contains no signed references",
+				code: "SAML_DIGEST_ALGORITHM_MISSING",
+			});
+		}
+
+		return {
+			signature: requiredAlgorithm(signatureMethods[0]!, "signature"),
+			digests: references.map((reference) => {
+				const methods = toNodeArray(reference.DigestMethod);
+				if (methods.length !== 1) {
+					throw new APIError("BAD_REQUEST", {
+						message:
+							"Each SAML XML signature reference must declare exactly one digest algorithm",
+						code: "SAML_DIGEST_ALGORITHM_MISSING",
+					});
+				}
+				return requiredAlgorithm(methods[0]!, "digest");
+			}),
+		};
+	});
+	const signatureAlgorithms = declaredAlgorithms.map(
+		(declaration) => declaration.signature,
+	);
+	const digests = declaredAlgorithms.flatMap(
+		(declaration) => declaration.digests,
+	);
+
+	if (
+		new Set(signatureAlgorithms.map(normalizeSignatureAlgorithm)).size !== 1
+	) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML response uses mixed signature algorithms",
+			code: "SAML_MIXED_SIGNATURE_ALGORITHMS",
+		});
+	}
+
+	if (new Set(digests.map(normalizeDigestAlgorithm)).size !== 1) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML XML signature uses mixed digest algorithms",
+			code: "SAML_MIXED_DIGEST_ALGORITHMS",
+		});
+	}
+
+	return {
+		signature: signatureAlgorithms[0]!,
+		digests,
+	};
 }
 
 function validateEncryptionAlgorithms(
@@ -232,6 +463,11 @@ function validateEncryptionAlgorithms(
 				onDeprecated,
 				"SAML_DEPRECATED_ALGORITHM",
 			);
+		} else if (!SECURE_KEY_ENCRYPTION_ALGORITHMS.includes(keyEncryption)) {
+			throw new APIError("BAD_REQUEST", {
+				message: `SAML key encryption algorithm not recognized: ${keyEncryption}`,
+				code: "SAML_UNKNOWN_ALGORITHM",
+			});
 		}
 	}
 
@@ -249,18 +485,44 @@ function validateEncryptionAlgorithms(
 				onDeprecated,
 				"SAML_DEPRECATED_ALGORITHM",
 			);
+		} else if (!SECURE_DATA_ENCRYPTION_ALGORITHMS.includes(dataEncryption)) {
+			throw new APIError("BAD_REQUEST", {
+				message: `SAML data encryption algorithm not recognized: ${dataEncryption}`,
+				code: "SAML_UNKNOWN_ALGORITHM",
+			});
 		}
 	}
 }
 
 export function validateSAMLAlgorithms(
-	response: { sigAlg?: string | null; samlContent: string },
+	response: {
+		sigAlg?: string | null;
+		samlContent: string;
+		encryptionContent?: string;
+	},
 	options?: AlgorithmValidationOptions,
 ): void {
-	validateSignatureAlgorithm(response.sigAlg, options);
+	const signedAlgorithms = extractSignedXMLAlgorithms(response.samlContent);
 
-	if (hasEncryptedAssertion(response.samlContent)) {
-		const encAlgs = extractEncryptionAlgorithms(response.samlContent);
+	if (
+		response.sigAlg &&
+		normalizeSignatureAlgorithm(response.sigAlg) !==
+			normalizeSignatureAlgorithm(signedAlgorithms.signature)
+	) {
+		throw new APIError("BAD_REQUEST", {
+			message: "SAML response uses mixed signature algorithms",
+			code: "SAML_MIXED_SIGNATURE_ALGORITHMS",
+		});
+	}
+
+	validateSignatureAlgorithm(signedAlgorithms.signature, options);
+	for (const digest of signedAlgorithms.digests) {
+		validateDigestAlgorithm(digest, options);
+	}
+
+	const encryptionContent = response.encryptionContent ?? response.samlContent;
+	if (hasEncryptedAssertion(encryptionContent)) {
+		const encAlgs = extractEncryptionAlgorithms(encryptionContent);
 		validateEncryptionAlgorithms(encAlgs, options);
 	}
 }

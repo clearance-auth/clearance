@@ -4,9 +4,13 @@ import { memoryAdapter } from "@clearance/runtime/adapters/memory";
 import { createAuthClient } from "@clearance/runtime/client";
 import { setCookieToHeader } from "@clearance/runtime/cookies";
 import { bearer, organization } from "@clearance/runtime/plugins";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { scim } from ".";
 import { scimClient } from "./client";
+import {
+	assertUserPatchWithinLimits,
+	SCIM_USER_PATCH_LIMITS,
+} from "./patch-operations";
 import type { SCIMOptions } from "./types";
 
 const createTestInstance = (scimOptions?: SCIMOptions) => {
@@ -26,7 +30,12 @@ const createTestInstance = (scimOptions?: SCIMOptions) => {
 		organization: [],
 		member: [],
 	};
-	const memory = memoryAdapter(data);
+	const adapterFactory = memoryAdapter(data);
+	let adapter: ReturnType<typeof adapterFactory> | undefined;
+	const memory = (options: Parameters<typeof adapterFactory>[0]) => {
+		adapter = adapterFactory(options);
+		return adapter;
+	};
 
 	const auth = clearance({
 		database: memory,
@@ -97,6 +106,7 @@ const createTestInstance = (scimOptions?: SCIMOptions) => {
 	return {
 		auth,
 		authClient,
+		getAdapter: () => adapter!,
 		registerOrganization,
 		getSCIMToken,
 		getAuthCookieHeaders,
@@ -105,6 +115,98 @@ const createTestInstance = (scimOptions?: SCIMOptions) => {
 
 describe("SCIM", () => {
 	describe("PATCH /scim/v2/users", () => {
+		it("rejects max-plus-one operations before any user lookup or mutation", async () => {
+			const { auth, getAdapter, getSCIMToken } = createTestInstance();
+			const scimToken = await getSCIMToken();
+			const findOne = vi.spyOn(getAdapter(), "findOne");
+			const update = vi.spyOn(getAdapter(), "update");
+
+			await expect(auth.api.patchSCIMUser({
+				params: { userId: "never-looked-up" },
+				body: {
+					schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+					Operations: Array.from(
+						{ length: SCIM_USER_PATCH_LIMITS.maxOperations + 1 },
+						() => ({ op: "replace", path: "/userName", value: "blocked" }),
+					),
+				},
+				headers: { authorization: `Bearer ${scimToken}` },
+			})).rejects.toThrowError(expect.objectContaining({
+				body: expect.objectContaining({ code: "VALIDATION_ERROR" }),
+			}));
+
+			expect(findOne.mock.calls.filter(([input]) =>
+				input.model === "account" || input.model === "user",
+			)).toHaveLength(0);
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it("accepts PATCH complexity limits exactly and rejects each max-plus-one value", () => {
+			const { maxCollectionEntries, maxDepth, maxNodes, maxOperations, maxStringBytes } = SCIM_USER_PATCH_LIMITS;
+			const operation = { op: "replace" as const, path: "/externalId", value: "value" };
+
+			expect(() => assertUserPatchWithinLimits(Array.from({ length: maxOperations }, () => operation))).not.toThrow();
+			expect(() => assertUserPatchWithinLimits(Array.from({ length: maxOperations + 1 }, () => operation))).toThrow("SCIM PATCH request exceeds supported complexity limits");
+
+			let deepestAccepted: Record<string, unknown> | string = "value";
+			for (let index = 0; index < maxDepth; index += 1) deepestAccepted = { value: deepestAccepted };
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: deepestAccepted }])).not.toThrow();
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: { value: deepestAccepted } }])).toThrow("SCIM PATCH request exceeds supported complexity limits");
+
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: "a".repeat(maxStringBytes) }])).not.toThrow();
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: "a".repeat(maxStringBytes + 1) }])).toThrow("SCIM PATCH request exceeds supported complexity limits");
+
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: Array.from({ length: maxCollectionEntries }, () => "value") }])).not.toThrow();
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: Array.from({ length: maxCollectionEntries + 1 }, () => "value") }])).toThrow("SCIM PATCH request exceeds supported complexity limits");
+
+			const valueEntries = maxNodes - maxCollectionEntries - 2;
+			const entriesPerCollection = Math.floor(valueEntries / maxCollectionEntries);
+			const collectionsWithOneExtra = valueEntries % maxCollectionEntries;
+			const nodeBoundary = Array.from({ length: maxCollectionEntries }, (_, index) =>
+				Array.from({
+					length: entriesPerCollection + (index < collectionsWithOneExtra ? 1 : 0),
+				}, () => "value"),
+			);
+			expect(() => assertUserPatchWithinLimits([{ ...operation, value: nodeBoundary }])).not.toThrow();
+			expect(() => assertUserPatchWithinLimits([{
+				...operation,
+				value: [...nodeBoundary.slice(0, 99), [...nodeBoundary[99]!, "value"]],
+			}])).toThrow("SCIM PATCH request exceeds supported complexity limits");
+		});
+
+		it("rejects the former deeply nested PATCH payload through the handler without mutating the user", async () => {
+			const { auth, getSCIMToken } = createTestInstance();
+			const scimToken = await getSCIMToken();
+			const user = await auth.api.createSCIMUser({
+				body: { userName: "depth-limit-user" },
+				headers: { authorization: `Bearer ${scimToken}` },
+			});
+
+			let value: Record<string, unknown> | string = "x";
+			for (let index = 0; index < 3_000; index += 1) value = { x: value };
+			const response = await auth.handler(new Request(`http://localhost:3000/api/auth/scim/v2/Users/${user.id}`, {
+				method: "PATCH",
+				headers: {
+					authorization: `Bearer ${scimToken}`,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify({
+					schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+					Operations: [{ op: "replace", path: "/userName", value }],
+				}),
+			}));
+
+			expect(response.status).toBe(400);
+			await expect(response.json()).resolves.toMatchObject({
+				detail: "SCIM PATCH request exceeds supported complexity limits",
+			});
+			const unchanged = await auth.api.getSCIMUser({
+				params: { userId: user.id },
+				headers: { authorization: `Bearer ${scimToken}` },
+			});
+			expect(unchanged.userName).toBe("depth-limit-user");
+		});
+
 		it.for([
 			"replace",
 			"add",

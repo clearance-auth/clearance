@@ -7,6 +7,7 @@ import type {
 import { getAuthTables } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { filterOutputFields } from "@clearance/core/utils/db";
+import { stripReservedSessionAuthority } from "../security/session-assurance";
 import type { Account, Session, User } from "../types";
 
 type Mode = "input" | "output";
@@ -51,6 +52,23 @@ function getFields(
 				...schema,
 				...plugin.schema[modelName].fields,
 			};
+		}
+	}
+	// Factor lifecycle generations are shared authentication authority. Their
+	// base schema entry is deliberately restored after extension schemas so user
+	// additional fields and non-owning plugins cannot make either fence writable,
+	// public, required, or map it to another physical column. getAuthTables
+	// preserves the owning passkey/two-factor plugin's explicit fieldName.
+	if (modelName === "user" || modelName === "session") {
+		const factorFields = getAuthTables(options)[modelName]?.fields;
+		for (const field of [
+			"passkeySessionGeneration",
+			"twoFactorSessionGeneration",
+		] as const) {
+			const attributes = factorFields?.[field];
+			if (attributes) {
+				schema[field] = { ...attributes };
+			}
 		}
 	}
 	tableCache.set(cacheKey, schema);
@@ -117,7 +135,27 @@ export function parseSessionOutput<T extends Session>(
 	session: T,
 ) {
 	const schema = getFields(options, "session", "output");
-	return filterOutputFields(session, schema);
+	const parsed = stripReservedSessionAuthority(
+		filterOutputFields(session, schema),
+	);
+	return {
+		...parsed,
+		// Deprecated source-compatibility field. Public callers receive the stable,
+		// non-secret administrative handle; the refresh credential remains confined
+		// to the signed HttpOnly cookie and trusted internal session context.
+		token: session.id,
+	} as T;
+}
+
+/** Preserve the presented bearer only for trusted in-process session context. */
+export function parseInternalSessionOutput<T extends Session>(
+	options: ClearanceOptions,
+	session: T,
+) {
+	return {
+		...parseSessionOutput(options, session),
+		token: session.token,
+	} as T;
 }
 
 export function parseAccountOutput<T extends Account>(
@@ -260,7 +298,12 @@ export function parseSessionInput(
 	action?: "create" | "update",
 ) {
 	const schema = getFields(options, "session", "input");
-	return parseInputData(session, { fields: schema, action });
+	const safeInput = stripReservedSessionAuthority(
+		session as Record<string, unknown>,
+	);
+	return stripReservedSessionAuthority(
+		parseInputData(safeInput, { fields: schema, action }),
+	);
 }
 
 export function getSessionDefaultFields(options: ClearanceOptions) {
@@ -274,7 +317,7 @@ export function getSessionDefaultFields(options: ClearanceOptions) {
 					: fields[key]!.defaultValue;
 		}
 	}
-	return defaults;
+	return stripReservedSessionAuthority(defaults);
 }
 
 export function mergeSchema<S extends ClearancePluginDBSchema>(
@@ -294,21 +337,35 @@ export function mergeSchema<S extends ClearancePluginDBSchema>(
 		  }
 		| undefined,
 ) {
+	const mergedSchema = Object.fromEntries(
+		Object.entries(schema).map(([table, definition]) => [
+			table,
+			{
+				...definition,
+				fields: Object.fromEntries(
+					Object.entries(definition.fields).map(([field, attributes]) => [
+						field,
+						{ ...attributes },
+					]),
+				),
+			},
+		]),
+	) as S;
 	if (!newSchema) {
-		return schema;
+		return mergedSchema;
 	}
 	for (const table in newSchema) {
 		const newModelName = newSchema[table]?.modelName;
 		if (newModelName) {
-			schema[table]!.modelName = newModelName;
+			mergedSchema[table]!.modelName = newModelName;
 		}
-		for (const field in schema[table]!.fields) {
+		for (const field in mergedSchema[table]!.fields) {
 			const newField = newSchema[table]?.fields?.[field];
 			if (!newField) {
 				continue;
 			}
-			schema[table]!.fields[field]!.fieldName = newField;
+			mergedSchema[table]!.fields[field]!.fieldName = newField;
 		}
 	}
-	return schema;
+	return mergedSchema;
 }

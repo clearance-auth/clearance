@@ -3,36 +3,37 @@ import {
 	READINESS_OPERATIONS,
 	SCIM_OPERATIONS,
 	SSO_OPERATIONS,
-	configureSsoConnection,
-	createScimConnection,
+	configureSsoConnectionAuthoritative,
+	createScimConnectionAuthoritative,
 	createScimConnectionReal,
-	createSetupLink,
-	createSsoConnection,
+	createSetupLinkAuthoritative,
+	createSsoConnectionAuthoritative,
 	createSsoConnectionReal,
-	disableScimConnection,
+	disableScimConnectionAuthoritative,
 	disableScimConnectionReal,
-	disableSsoConnection,
+	disableSsoConnectionAuthoritative,
 	disableSsoConnectionReal,
 	getLatestReadiness,
-	inspectOrganization,
-	inspectScimConnection,
-	inspectSsoConnection,
-	listOrganizations,
+	inspectOrganizationAuthoritative,
+	inspectScimConnectionAuthoritative,
+	inspectSsoConnectionAuthoritative,
+	listOrganizationsPageAuthoritative,
 	listScimConnections,
 	listSsoConnections,
-	replayDiagnosticTrace,
-	rotateScimCredential,
-	rotateSsoCredential,
-	runReadinessCheck,
-	testScimConnection,
+	replayDiagnosticTraceOperational,
+	rotateScimCredentialAuthoritative,
+	rotateSsoCredentialAuthoritative,
+	runReadinessCheckAuthoritative,
+	testScimConnectionAuthoritative,
 	testScimConnectionLive,
 	testScimConnectionReal,
-	testSsoConnection,
+	testSsoConnectionAuthoritative,
 	testSsoConnectionLive,
 	testSsoConnectionReal,
 } from "@clearance/management";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Hono } from "hono";
+import { requestActor } from "../request-auth.js";
 import {
 	apiOperationContext,
 	type ScopedRouteDependencies,
@@ -40,6 +41,32 @@ import {
 
 export interface EnterpriseRouteDependencies extends ScopedRouteDependencies {
 	runtimeDatabaseConfigured(): boolean;
+}
+
+const ENTERPRISE_SCOPE_ORG_PAGE_SIZE = 1000;
+const ENTERPRISE_SCOPE_ORG_MAXIMUM = 50_000;
+
+async function scopedOrganizationIds(
+	store: Parameters<typeof listOrganizationsPageAuthoritative>[0],
+	scope: NonNullable<
+		Parameters<typeof listOrganizationsPageAuthoritative>[1]
+	>["scope"],
+): Promise<Set<string>> {
+	const ids = new Set<string>();
+	let cursor: string | undefined;
+	do {
+		const page = await listOrganizationsPageAuthoritative(store, {
+			scope,
+			limit: ENTERPRISE_SCOPE_ORG_PAGE_SIZE,
+			...(cursor ? { cursor } : {}),
+		});
+		for (const organization of page.organizations) ids.add(organization.id);
+		cursor = page.nextCursor ?? undefined;
+		if (cursor && ids.size >= ENTERPRISE_SCOPE_ORG_MAXIMUM) {
+			throw new ClearanceError({ code: "ORG_LIST_LIMIT_EXCEEDED", message: "Organization scope exceeds the enterprise list limit", stage: "enterprise.list", status: 400 });
+		}
+	} while (cursor);
+	return ids;
 }
 
 export function registerEnterpriseRoutes({
@@ -56,7 +83,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const scopedOrgIds = new Set(listOrganizations(store, { scope }).map((org) => org.id));
+			const scopedOrgIds = await scopedOrganizationIds(store, scope);
 			const connections = listSsoConnections(store, c.req.query("organizationId")).filter((connection) => scopedOrgIds.has(connection.organizationId));
 			return c.json({ connections, scope });
 		} catch (e) {
@@ -73,12 +100,15 @@ export function registerEnterpriseRoutes({
 				...body,
 				protocol: body.protocol ?? "oidc",
 				domains: body.domains ?? (body.domain ? [body.domain] : undefined),
+				actor: requestActor(c),
+				source: "api" as const,
+				scope,
 			};
 			// Fail closed if organizationId is outside principal scope
-			inspectOrganization(store, input.organizationId, scope);
+			await inspectOrganizationAuthoritative(store, input.organizationId, scope);
 			const connection = runtimeDatabaseConfigured()
 				? await createSsoConnectionReal(store, input)
-				: createSsoConnection(store, input);
+				: await createSsoConnectionAuthoritative(store, input);
 			await store.ready();
 			return c.json({ connection }, 201);
 		} catch (e) {
@@ -92,7 +122,7 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const request = await c.req.json().catch(() => ({}));
 			if (request.dryRun === true) {
-				const current = inspectSsoConnection(store, c.req.param("id"), { scope });
+				const current = await inspectSsoConnectionAuthoritative(store, c.req.param("id"), { scope });
 				return c.json({
 					dryRun: true,
 					connection: current,
@@ -104,11 +134,11 @@ export function registerEnterpriseRoutes({
 					scope,
 				});
 			}
-			const connection = configureSsoConnection(store, c.req.param("id"), {
+			const connection = await configureSsoConnectionAuthoritative(store, c.req.param("id"), {
 				issuer: request.issuer,
 				audience: request.audience,
 				domains: request.domain ? [request.domain] : request.domains,
-			}, apiOperationContext(scope));
+			}, apiOperationContext(scope, c));
 			await store.ready();
 			return c.json({ connection, scope });
 		} catch (e) {
@@ -121,8 +151,12 @@ export function registerEnterpriseRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const request = await c.req.json();
-			inspectOrganization(store, request.organizationId, scope);
-			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "sso", actor: "api" });
+			const link = await createSetupLinkAuthoritative(store, {
+				organizationId: request.organizationId,
+				kind: "sso",
+				actor: requestActor(c),
+				scope,
+			});
 			await store.ready();
 			return c.json({ ...link, scope }, 201);
 		} catch (e) {
@@ -134,7 +168,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const conn = store.snapshot.identityConnections.find(
+			const conn = store.snapshot.ssoConnections.find(
 				(x) => x.id === c.req.param("id"),
 			);
 			if (!conn) {
@@ -143,13 +177,19 @@ export function registerEnterpriseRoutes({
 					404,
 				);
 			}
-			inspectOrganization(store, conn.organizationId, scope);
+			await inspectOrganizationAuthoritative(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			const testInput = {
+				...body,
+				actor: requestActor(c),
+				source: "api" as const,
+				scope,
+			};
 			const result = body.live === true
-				? await testSsoConnectionLive(store, c.req.param("id"))
+				? await testSsoConnectionLive(store, c.req.param("id"), { scope })
 				: runtimeDatabaseConfigured()
-					? await testSsoConnectionReal(store, c.req.param("id"), body)
-					: testSsoConnection(store, c.req.param("id"), body);
+					? await testSsoConnectionReal(store, c.req.param("id"), testInput)
+					: await testSsoConnectionAuthoritative(store, c.req.param("id"), testInput);
 			await store.ready();
 			return c.json(result);
 		} catch (e) {
@@ -163,17 +203,18 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			// Validate scope before mutation (fail closed for missing/cross-scope).
-			const current = inspectSsoConnection(store, c.req.param("id"), { scope });
+			const current = await inspectSsoConnectionAuthoritative(store, c.req.param("id"), { scope });
 			if (body.dryRun === true) {
 				if (!(current as { hasClientSecret?: boolean }).hasClientSecret && !current.clientSecretFingerprint) {
 					throw new ClearanceError({ code: "SSO_NO_SECRET", message: "No encrypted client secret to rotate", stage: "sso.rotate", status: 400 });
 				}
 				return c.json({ dryRun: true, connection: current, wouldChange: true, scope });
 			}
-			const connection = rotateSsoCredential(store, c.req.param("id"), {
-				actor: "api",
+			const connection = await rotateSsoCredentialAuthoritative(store, c.req.param("id"), {
+				actor: requestActor(c),
 				source: "api",
 				scope,
+				operationId: randomUUID(),
 			});
 			await store.ready();
 			return c.json({ connection, scope });
@@ -188,17 +229,17 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			if (body.dryRun === true) {
-				const connection = inspectSsoConnection(store, c.req.param("id"), { scope });
+				const connection = await inspectSsoConnectionAuthoritative(store, c.req.param("id"), { scope });
 				return c.json({ dryRun: true, connection, wouldChange: connection.status !== "disabled", scope });
 			}
 			const result = runtimeDatabaseConfigured()
 				? await disableSsoConnectionReal(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					})
-				: disableSsoConnection(store, c.req.param("id"), {
-						actor: "api",
+				: await disableSsoConnectionAuthoritative(store, c.req.param("id"), {
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					});
@@ -214,14 +255,20 @@ export function registerEnterpriseRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
-			inspectOrganization(store, body.organizationId, scope);
+			await inspectOrganizationAuthoritative(store, body.organizationId, scope);
 			const developmentBearerToken = runtimeDatabaseConfigured()
 				? undefined
 				: `scimtok_${randomBytes(24).toString("base64url")}`;
+			const input = {
+				...body,
+				actor: requestActor(c),
+				source: "api" as const,
+				scope,
+			};
 			const connection = runtimeDatabaseConfigured()
-				? await createScimConnectionReal(store, body)
+				? await createScimConnectionReal(store, input)
 				: {
-						...createScimConnection(store, { ...body, bearerToken: developmentBearerToken }),
+						...(await createScimConnectionAuthoritative(store, { ...input, bearerToken: developmentBearerToken })),
 						bearerTokenOnce: developmentBearerToken,
 					};
 			await store.ready();
@@ -235,7 +282,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const scopedOrgIds = new Set(listOrganizations(store, { scope }).map((org) => org.id));
+			const scopedOrgIds = await scopedOrganizationIds(store, scope);
 			const connections = listScimConnections(store, c.req.query("organizationId")).filter((connection) => scopedOrgIds.has(connection.organizationId));
 			return c.json({ connections, scope });
 		} catch (e) {
@@ -248,8 +295,12 @@ export function registerEnterpriseRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const request = await c.req.json();
-			inspectOrganization(store, request.organizationId, scope);
-			const link = createSetupLink(store, { organizationId: request.organizationId, kind: "scim", actor: "api" });
+			const link = await createSetupLinkAuthoritative(store, {
+				organizationId: request.organizationId,
+				kind: "scim",
+				actor: requestActor(c),
+				scope,
+			});
 			await store.ready();
 			return c.json({ ...link, scope }, 201);
 		} catch (e) {
@@ -261,7 +312,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const conn = store.snapshot.directoryConnections.find(
+			const conn = store.snapshot.scimConnections.find(
 				(x) => x.id === c.req.param("id"),
 			);
 			if (!conn) {
@@ -276,13 +327,65 @@ export function registerEnterpriseRoutes({
 					404,
 				);
 			}
-			inspectOrganization(store, conn.organizationId, scope);
+			await inspectOrganizationAuthoritative(store, conn.organizationId, scope);
 			const body = await c.req.json().catch(() => ({}));
+			if (
+				body.live === true &&
+				(
+					body.dryRun !== false ||
+					body.fixture !== undefined ||
+					body.scenario !== undefined ||
+					body.users !== undefined
+				)
+			) {
+				return c.json({
+					error: {
+						code: "SCIM_LIVE_INPUT_INVALID",
+						message: "Live SCIM tests require dryRun false and cannot include simulation fields",
+						stage: "scim.test",
+					},
+				}, 400);
+			}
+			const scenario = body.scenario ?? "users";
+			if (scenario !== "users" && scenario !== "group-lifecycle") {
+				return c.json(
+					{
+						error: {
+							code: "SCIM_SCENARIO_INVALID",
+							message: "SCIM scenario must be users or group-lifecycle",
+							stage: "scim.test",
+						},
+					},
+					400,
+				);
+			}
+			if (scenario === "group-lifecycle" && body.live === true) {
+				return c.json({ error: { code: "SCIM_SCENARIO_LIVE_CONFLICT", message: "group-lifecycle runs only against the bundled runtime", stage: "scim.test" } }, 400);
+			}
+			if (scenario === "group-lifecycle" && !runtimeDatabaseConfigured()) {
+				return c.json({ error: { code: "SCIM_ATOMIC_APPLY_BACKEND_REQUIRED", message: "group-lifecycle requires the bundled PostgreSQL runtime", stage: "sync.apply" } }, 409);
+			}
+			const users = body.users;
+			if (scenario === "group-lifecycle" && users !== undefined) {
+				return c.json({ error: { code: "SCIM_SCENARIO_USERS_FORBIDDEN", message: "group-lifecycle owns its SCIM users", stage: "scim.test" } }, 400);
+			}
+			if (scenario === "users" && users !== undefined && (!Array.isArray(users) || users.some((user) => !user || typeof user !== "object" || typeof user.userName !== "string" || (user.displayName !== undefined && typeof user.displayName !== "string") || (user.active !== undefined && typeof user.active !== "boolean")))) {
+				return c.json({ error: { code: "SCIM_USERS_INVALID", message: "SCIM users must contain userName with optional displayName and active", stage: "scim.test" } }, 400);
+			}
+			const testInput = {
+				dryRun: body.dryRun !== false,
+				fixture: body.fixture,
+				scenario,
+				...(scenario === "users" ? { users } : {}),
+				actor: requestActor(c),
+				source: "api" as const,
+				scope,
+			};
 			const result = body.live === true
-				? await testScimConnectionLive(store, c.req.param("id"))
+				? await testScimConnectionLive(store, c.req.param("id"), { scope })
 				: runtimeDatabaseConfigured()
-					? await testScimConnectionReal(store, c.req.param("id"), body)
-					: testScimConnection(store, c.req.param("id"), body);
+					? await testScimConnectionReal(store, c.req.param("id"), testInput)
+					: await testScimConnectionAuthoritative(store, c.req.param("id"), testInput);
 			await store.ready();
 			return c.json(result);
 		} catch (e) {
@@ -295,17 +398,18 @@ export function registerEnterpriseRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
-			const current = inspectScimConnection(store, c.req.param("id"), { scope });
+			const current = await inspectScimConnectionAuthoritative(store, c.req.param("id"), { scope });
 			if (body.dryRun === true) {
 				if (!(current as { hasBearerToken?: boolean }).hasBearerToken && !current.bearerTokenFingerprint) {
 					throw new ClearanceError({ code: "SCIM_NO_TOKEN", message: "No encrypted bearer token to rotate", stage: "scim.rotate", status: 400 });
 				}
 				return c.json({ dryRun: true, connection: current, wouldChange: true, scope });
 			}
-			const connection = rotateScimCredential(store, c.req.param("id"), {
-				actor: "api",
+			const connection = await rotateScimCredentialAuthoritative(store, c.req.param("id"), {
+				actor: requestActor(c),
 				source: "api",
 				scope,
+				operationId: randomUUID(),
 			});
 			await store.ready();
 			return c.json({ connection, scope });
@@ -320,17 +424,17 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			if (body.dryRun === true) {
-				const connection = inspectScimConnection(store, c.req.param("id"), { scope });
+				const connection = await inspectScimConnectionAuthoritative(store, c.req.param("id"), { scope });
 				return c.json({ dryRun: true, connection, wouldChange: connection.status !== "disabled", scope });
 			}
 			const result = runtimeDatabaseConfigured()
 				? await disableScimConnectionReal(store, c.req.param("id"), {
-						actor: "api",
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					})
-				: disableScimConnection(store, c.req.param("id"), {
-						actor: "api",
+				: await disableScimConnectionAuthoritative(store, c.req.param("id"), {
+						actor: requestActor(c),
 						source: "api",
 						scope,
 					});
@@ -347,10 +451,10 @@ export function registerEnterpriseRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json().catch(() => ({}));
 			const dryRun = body.dryRun === true || body.confirm !== true;
-			const result = replayDiagnosticTrace(store, c.req.param("traceId"), {
+			const result = await replayDiagnosticTraceOperational(store, c.req.param("traceId"), {
 				dryRun,
 				confirm: body.confirm === true && !dryRun,
-				actor: "api",
+				actor: requestActor(c),
 				source: "api",
 				scope,
 			});
@@ -368,8 +472,7 @@ export function registerEnterpriseRoutes({
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
-			inspectOrganization(store, body.organizationId, scope);
-			const report = runReadinessCheck(store, body.organizationId);
+			const report = await runReadinessCheckAuthoritative(store, body.organizationId, scope);
 			await store.ready();
 			return c.json({ report });
 		} catch (e) {
@@ -381,7 +484,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			inspectOrganization(store, c.req.param("orgId"), scope);
+			await inspectOrganizationAuthoritative(store, c.req.param("orgId"), scope);
 			const report = getLatestReadiness(store, c.req.param("orgId"));
 			return c.json({ report });
 		} catch (e) {

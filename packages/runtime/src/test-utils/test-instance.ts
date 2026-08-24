@@ -7,13 +7,19 @@ import type {
 } from "@clearance/core";
 import type { SuccessContext } from "@better-fetch/fetch";
 import { sql } from "kysely";
+import type { Db, MongoClient } from "mongodb";
 import { afterAll } from "vitest";
 import { clearance } from "../auth/full";
 import { createAuthClient } from "../client";
 import { parseSetCookieHeader, setCookieToHeader } from "../cookies";
 import { getAdapter } from "../db/adapter-kysely";
+import { migrateCredentialAuthorities } from "../db/credential-authority-migration";
 import { getMigrations } from "../db/get-migration";
 import { bearer } from "../plugins";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+} from "../internal/authentication-policy";
 import type { Session, User } from "../types";
 import { getBaseURL, isDynamicBaseURLConfig } from "../utils/url";
 
@@ -51,6 +57,12 @@ export async function getTestInstance<
 		testWith === "postgres"
 			? `ba_test_${randomUUID().replaceAll("-", "_")}`
 			: undefined;
+	let mongoResource:
+		| {
+				client: MongoClient;
+				db: Db;
+		  }
+		| undefined;
 
 	const quotePostgresIdentifier = (identifier: string) =>
 		`"${identifier.replaceAll('"', '""')}"`;
@@ -61,6 +73,7 @@ export async function getTestInstance<
 		const pool = new Pool({
 			connectionString:
 				process.env.CLEARANCE_TEST_POSTGRES_URL ??
+				process.env.CLEARANCE_TEST_DATABASE_URL ??
 				"postgres://user:password@localhost:5432/clearance",
 			options: postgresSchema
 				? `-c search_path=${postgresSchema},public`
@@ -98,19 +111,28 @@ export async function getTestInstance<
 		});
 	}
 
-	async function mongodbClient() {
+	async function cleanupMongoResource() {
+		if (!mongoResource) return;
+		try {
+			await mongoResource.db.dropDatabase();
+		} finally {
+			await mongoResource.client.close();
+			mongoResource = undefined;
+		}
+	}
+
+	async function getMongo() {
+		if (mongoResource) return mongoResource;
 		const { MongoClient } = await import("mongodb");
-		const dbClient = async (connectionString: string, dbName: string) => {
-			const client = new MongoClient(connectionString);
-			await client.connect();
-			const db = client.db(dbName);
-			return db;
-		};
-			const db = await dbClient(
-				process.env.CLEARANCE_TEST_MONGODB_URL ?? "mongodb://127.0.0.1:27017",
-				"clearance",
-			);
-		return db;
+		const client = new MongoClient(
+			process.env.CLEARANCE_TEST_MONGODB_URL ??
+				"mongodb://127.0.0.1:27017/?replicaSet=clearance-rs",
+		);
+		await client.connect();
+		const db = client.db(`clearance_test_${randomUUID().replaceAll("-", "")}`);
+		mongoResource = { client, db };
+		cleanupSet.add(cleanupMongoResource);
+		return mongoResource;
 	}
 
 	const opts = {
@@ -127,14 +149,16 @@ export async function getTestInstance<
 		secret: "clearance-secret-that-is-long-enough-for-validation-test",
 		database:
 			testWith === "postgres"
-				? { db: await getPostgres(), type: "postgres" }
+				? { db: await getPostgres(), type: "postgres", transaction: true }
 				: testWith === "mongodb"
 					? await Promise.all([
-							mongodbClient(),
+							getMongo(),
 							await import("../adapters/mongodb-adapter"),
-						]).then(([db, { mongodbAdapter }]) => mongodbAdapter(db))
+						]).then(([mongo, { mongodbAdapter }]) =>
+							mongodbAdapter(mongo.db, { client: mongo.client }),
+						)
 					: testWith === "mysql"
-						? { db: await getMysql(), type: "mysql" }
+						? { db: await getMysql(), type: "mysql", transaction: true }
 						: await getSqlite(),
 		emailAndPassword: {
 			enabled: true,
@@ -149,13 +173,40 @@ export async function getTestInstance<
 			level: "debug",
 		},
 	} satisfies ClearanceOptions;
+	const testOptions = options?.secondaryStorage
+		? {
+				...options,
+				secondaryStorage: {
+					...options.secondaryStorage,
+					namespace:
+						options.secondaryStorage.namespace ??
+						`test-${randomUUID()}`,
+					runExclusive:
+						options.secondaryStorage.runExclusive ??
+						((_name, operation) => operation()),
+					assertNoLegacySessionWriters:
+						options.secondaryStorage.assertNoLegacySessionWriters ??
+						(() => {}),
+				},
+			}
+		: options;
 
-	const auth = clearance({
+	const authOptions = {
 		baseURL: "http://localhost:" + (config?.port || 3000),
 		...opts,
-		...options,
-		plugins: [bearer(), ...(options?.plugins || [])],
-	} as unknown as O);
+		...testOptions,
+		plugins: [bearer(), ...(testOptions?.plugins || [])],
+	} as unknown as O;
+	const authenticationPolicy = options
+		? readInternalAuthenticationPolicy(options)
+		: undefined;
+	if (authenticationPolicy) {
+		attachCapturedInternalAuthenticationPolicy(
+			authOptions,
+			authenticationPolicy,
+		);
+	}
+	const auth = clearance(authOptions);
 
 	const testUser = {
 		email: "test@test.com",
@@ -196,14 +247,19 @@ export async function getTestInstance<
 			database: opts.database,
 		});
 		await runMigrations();
+	} else {
+		// Mongo has no schema DDL, but it still has the same credential migration
+		// and traffic gates as relational databases. Each test owns a fresh,
+		// isolated database, so its local drain proof has no legacy processes.
+		const context = await auth.$context;
+		await migrateCredentialAuthorities(context.adapter, auth.options);
 	}
 
 	await createTestUser();
 
 	const cleanup = async () => {
 		if (testWith === "mongodb") {
-			const db = await mongodbClient();
-			await db.dropDatabase();
+			await cleanupMongoResource();
 			return;
 		}
 		if (testWith === "postgres") {
@@ -242,7 +298,7 @@ export async function getTestInstance<
 			return;
 		}
 	};
-	cleanupSet.add(cleanup);
+	if (testWith !== "mongodb") cleanupSet.add(cleanup);
 
 	const customFetchImpl = async (
 		url: string | URL | Request,
@@ -374,6 +430,7 @@ export async function getTestInstance<
 		cookieSetter: setCookieToHeader,
 		customFetchImpl,
 		sessionSetter,
+		mongo: mongoResource,
 		db: await getAdapter(auth.options),
 		runWithUser: async (
 			email: string,

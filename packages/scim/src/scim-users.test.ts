@@ -5,7 +5,9 @@ import { memoryAdapter } from "@clearance/runtime/adapters/memory";
 import { createAuthClient } from "@clearance/runtime/client";
 import { setCookieToHeader } from "@clearance/runtime/cookies";
 import { admin, bearer, organization } from "@clearance/runtime/plugins";
+import { base64Url } from "@clearance/utils/base64";
 import { describe, expect, it } from "vitest";
+import { migrateLegacySessionCredentials } from "../../runtime/src/db/session-credential-migration";
 import { scim } from ".";
 import { scimClient } from "./client";
 import type { SCIMOptions } from "./types";
@@ -685,6 +687,7 @@ describe("SCIM", () => {
 				scimProvider: [],
 				organization: [],
 				member: [],
+				securityMigration: [],
 			};
 			const memory = memoryAdapter(data);
 
@@ -694,6 +697,11 @@ describe("SCIM", () => {
 				emailAndPassword: { enabled: true },
 				plugins: [scim(), organization()],
 				secondaryStorage: {
+					namespace: "scim-delete-secondary-storage-test",
+					runExclusive<T>(_name: string, operation: () => T): T {
+						return operation();
+					},
+					assertNoLegacySessionWriters() {},
 					set(key, value) {
 						store.set(key, value);
 					},
@@ -705,6 +713,10 @@ describe("SCIM", () => {
 					},
 				},
 			});
+			await migrateLegacySessionCredentials(
+				(await auth.$context).adapter,
+				auth.options,
+			);
 
 			const authClient = createAuthClient({
 				baseURL: "http://localhost:3000",
@@ -738,14 +750,20 @@ describe("SCIM", () => {
 			const victimSession = await ctx.internalAdapter.createSession(
 				provisioned.id,
 			);
-			expect(store.has(victimSession.token)).toBe(true);
+			const sessionHandleKey = [...store.keys()].find((key) =>
+				key.endsWith(`:session-handle:${victimSession.id}`),
+			);
+			expect(sessionHandleKey).toBeDefined();
+			if (!sessionHandleKey) {
+				throw new Error("Missing secondary session handle");
+			}
 
 			await auth.api.deleteSCIMUser({
 				params: { userId: provisioned.id },
 				headers: { authorization: `Bearer ${scimToken}` },
 			});
 
-			expect(store.has(victimSession.token)).toBe(false);
+			expect(store.has(sessionHandleKey)).toBe(false);
 		});
 
 		it("should deprovision (not delete the global user) for an org-scoped DELETE", async () => {
@@ -994,6 +1012,29 @@ describe("SCIM", () => {
 			).resolves.toBe(undefined);
 		});
 
+		it("accepts canonical unpadded base64url SCIM tokens", async () => {
+			const { auth } = createTestInstance({
+				defaultSCIM: [
+					{ providerId: "pp", scimToken: "s" },
+					{ providerId: "ppp", scimToken: "s" },
+				],
+			});
+			const tokens = [
+				base64Url.encode("s:pp", { padding: false }),
+				base64Url.encode("s:ppp", { padding: false }),
+			];
+
+			expect(tokens.map((token) => token.length % 4)).toEqual([2, 3]);
+
+			for (const token of tokens) {
+				await expect(
+					auth.api.listSCIMUsers({
+						headers: { authorization: `Bearer ${token}` },
+					}),
+				).resolves.toMatchObject({ totalResults: 0 });
+			}
+		});
+
 		it("should reject invalid SCIM tokens", async () => {
 			const { auth } = createTestInstance({
 				defaultSCIM: [
@@ -1024,6 +1065,59 @@ describe("SCIM", () => {
 					},
 				}),
 			);
+		});
+
+		it("returns a bounded 401 for malformed bearer tokens", async () => {
+			const { auth } = createTestInstance({
+				defaultSCIM: [{ providerId: "pp", scimToken: "s" }],
+			});
+			const validUnpaddedToken = base64Url.encode("s:pp", {
+				padding: false,
+			});
+
+			for (const token of [
+				"invalid%base64",
+				"/w==",
+				"bm90LWEtdG9rZW4=",
+				"dGhlLXNjaW0tdG9rZW46dGhlLXNjaW0tcHJvdmlkZXI=trailing",
+				validUnpaddedToken.slice(0, -1),
+				`${validUnpaddedToken}=`,
+				`${validUnpaddedToken}===`,
+				`${validUnpaddedToken.slice(0, -1)}B`,
+				`${base64Url.encode("s:ppp", { padding: false }).slice(0, -1)}B`,
+			]) {
+				const response = await auth.handler(
+					new Request("http://localhost:3000/api/auth/scim/v2/Users", {
+						method: "GET",
+						headers: { authorization: `Bearer ${token}` },
+					}),
+				);
+
+				expect(response.status).toBe(401);
+				await expect(response.json()).resolves.toEqual({
+					detail: "Invalid SCIM token",
+					schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"],
+					status: "401",
+				});
+			}
+		});
+
+		it("requires the Bearer authentication scheme", async () => {
+			const { auth } = createTestInstance({
+				defaultSCIM: [{ providerId: "pp", scimToken: "s" }],
+			});
+			const token = base64Url.encode("s:pp", { padding: false });
+
+			for (const authorization of [token, `Basic ${token}`]) {
+				const response = await auth.handler(
+					new Request("http://localhost:3000/api/auth/scim/v2/Users", {
+						method: "GET",
+						headers: { authorization },
+					}),
+				);
+
+				expect(response.status).toBe(401);
+			}
 		});
 	});
 });

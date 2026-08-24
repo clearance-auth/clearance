@@ -1,8 +1,22 @@
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter } from "@clearance/core/context";
 import { APIError } from "@clearance/core/error";
 import * as z from "zod";
-import { getSessionFromCtx } from "../../api/routes/session";
+import {
+	getAuthoritativeSessionFromCtx,
+	getSessionFromCtx,
+} from "../../api/routes/session";
 import { generateRandomString } from "../../crypto";
+import {
+	runManagedAuthenticationTransaction,
+	usesManagedAuthenticationPolicy,
+} from "../../internal/managed-authentication-transaction";
+import { captureInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	captureInternalSessionDerivativeAuthority,
+	ManagedSessionDerivativeAuthorityError,
+	validateInternalSessionDerivativeAuthority,
+} from "../../internal/session-derivative-authority";
 import { ms } from "../../utils/time";
 import type { DeviceAuthorizationOptions } from ".";
 import { DEVICE_AUTHORIZATION_ERROR_CODES } from "./error-codes";
@@ -291,18 +305,7 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 				}
 			}
 
-			const deviceCodeRecord = await ctx.context.adapter.findOne<{
-				id: string;
-				deviceCode: string;
-				userCode: string;
-				userId?: string | undefined;
-				expiresAt: Date;
-				status: string;
-				lastPolledAt?: Date | undefined;
-				pollingInterval?: number | undefined;
-				clientId?: string | undefined;
-				scope?: string | undefined;
-			}>({
+			const deviceCodeRecord = await ctx.context.adapter.findOne<DeviceCode>({
 				model: "deviceCode",
 				where: [
 					{
@@ -345,19 +348,30 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 				}
 			}
 
-			// Update last polled time
-			await ctx.context.adapter.update({
+			// Claim this polling window against the exact timestamp observed above.
+			// Concurrent callers may read the same row, but only one may advance it.
+			const polledAt = new Date();
+			const claimedPollingWindow =
+				await ctx.context.adapter.incrementOne<DeviceCode>({
 				model: "deviceCode",
 				where: [
+					{ field: "id", value: deviceCodeRecord.id },
 					{
-						field: "id",
-						value: deviceCodeRecord.id,
+						field: "lastPolledAt",
+						operator: "eq",
+						value: deviceCodeRecord.lastPolledAt ?? null,
 					},
 				],
-				update: {
-					lastPolledAt: new Date(),
-				},
+				increment: {},
+				set: { lastPolledAt: polledAt },
 			});
+			if (!claimedPollingWindow) {
+				throw new APIError("BAD_REQUEST", {
+					error: "slow_down",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.POLLING_TOO_FREQUENTLY.message,
+				});
+			}
 
 			if (deviceCodeRecord.expiresAt < new Date()) {
 				await ctx.context.adapter.delete({
@@ -402,53 +416,102 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 			}
 
 			if (deviceCodeRecord.status === "approved" && deviceCodeRecord.userId) {
-				// Atomically claim the approved code as the single race gate:
-				// concurrent polls contend on this delete-and-return, and only the
-				// caller that removes the row may issue a session. Losers receive
-				// null and are rejected, so the code is redeemed at most once.
-				const claimedDeviceCode = await ctx.context.adapter.consumeOne<{
-					id: string;
-					userId?: string | undefined;
-					scope?: string | undefined;
-				}>({
-					model: "deviceCode",
-					where: [
-						{ field: "deviceCode", value: device_code },
-						{ field: "status", value: "approved" },
-					],
+				const issued = await runManagedAuthenticationTransaction(ctx, async () => {
+					const transaction = await getCurrentAdapter(ctx.context.adapter);
+					const claimTime = new Date();
+					// The claim and session issuance share the rollback boundary. Only
+					// the caller that removes the approved row can issue a session.
+					const claimedDeviceCode = await transaction.consumeOne<DeviceCode>({
+						model: "deviceCode",
+						where: [
+							{ field: "deviceCode", value: device_code },
+							{ field: "status", value: "approved" },
+							{ field: "expiresAt", operator: "gt", value: claimTime },
+						],
+					});
+
+					if (!claimedDeviceCode?.userId) {
+						throw new APIError("BAD_REQUEST", {
+							error: "invalid_grant",
+							error_description:
+								DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_DEVICE_CODE.message,
+						});
+					}
+					if (!(claimedDeviceCode.expiresAt > claimTime)) {
+						throw new APIError("BAD_REQUEST", {
+							error: "expired_token",
+							error_description:
+								DEVICE_AUTHORIZATION_ERROR_CODES.EXPIRED_DEVICE_CODE.message,
+						});
+					}
+					if (
+						claimedDeviceCode.clientId &&
+						claimedDeviceCode.clientId !== client_id
+					) {
+						throw new APIError("BAD_REQUEST", {
+							error: "invalid_grant",
+							error_description: "Client ID mismatch",
+						});
+					}
+
+					const managed = usesManagedAuthenticationPolicy(ctx);
+					if (managed && !claimedDeviceCode.sessionDerivativeAuthority) {
+						throw new ManagedSessionDerivativeAuthorityError("authority_missing");
+					}
+					const issuanceContext = claimedDeviceCode.sessionDerivativeAuthority
+						? await captureInternalSessionIssuanceContext(
+								ctx.context.internalAdapter,
+								{
+									purpose: "device",
+									subjectId: claimedDeviceCode.userId,
+									sourceSessionDerivativeAuthority:
+										claimedDeviceCode.sessionDerivativeAuthority,
+									targetOrganizationId:
+										claimedDeviceCode.organizationId ?? null,
+								},
+							)
+						: undefined;
+					if (managed && !issuanceContext) {
+						throw new ManagedSessionDerivativeAuthorityError("authority_missing");
+					}
+
+					const user = await ctx.context.internalAdapter.findUserById(
+						claimedDeviceCode.userId,
+					);
+					if (!user) {
+						throw new APIError("INTERNAL_SERVER_ERROR", {
+							error: "server_error",
+							error_description:
+								DEVICE_AUTHORIZATION_ERROR_CODES.USER_NOT_FOUND.message,
+						});
+					}
+
+					const session = await ctx.context.internalAdapter.createSession(
+						user.id,
+						false,
+						undefined,
+						false,
+						issuanceContext,
+					);
+					if (!session) {
+						throw new APIError("INTERNAL_SERVER_ERROR", {
+							error: "server_error",
+							error_description:
+								DEVICE_AUTHORIZATION_ERROR_CODES.FAILED_TO_CREATE_SESSION.message,
+						});
+					}
+					return { claimedDeviceCode, session, user };
+				}).catch((error) => {
+					if (error instanceof ManagedSessionDerivativeAuthorityError) {
+						throw new APIError("BAD_REQUEST", {
+							error: "invalid_grant",
+							error_description:
+								DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_DEVICE_CODE.message,
+						});
+					}
+					throw error;
 				});
-
-				if (!claimedDeviceCode?.userId) {
-					throw new APIError("BAD_REQUEST", {
-						error: "invalid_grant",
-						error_description:
-							DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_DEVICE_CODE.message,
-					});
-				}
-
-				const user = await ctx.context.internalAdapter.findUserById(
-					claimedDeviceCode.userId,
-				);
-
-				if (!user) {
-					throw new APIError("INTERNAL_SERVER_ERROR", {
-						error: "server_error",
-						error_description:
-							DEVICE_AUTHORIZATION_ERROR_CODES.USER_NOT_FOUND.message,
-					});
-				}
-
-				const session = await ctx.context.internalAdapter.createSession(
-					user.id,
-				);
-
-				if (!session) {
-					throw new APIError("INTERNAL_SERVER_ERROR", {
-						error: "server_error",
-						error_description:
-							DEVICE_AUTHORIZATION_ERROR_CODES.FAILED_TO_CREATE_SESSION.message,
-					});
-				}
+				const { claimedDeviceCode, session, user } = issued;
 
 				// Set new session context for hooks and plugins
 				// (matches setSessionCookie logic)
@@ -456,21 +519,6 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 					session,
 					user,
 				});
-
-				// If secondary storage is enabled, store the session data in the secondary storage
-				// (matches setSessionCookie logic)
-				if (ctx.context.options.secondaryStorage) {
-					await ctx.context.secondaryStorage?.set(
-						session.token,
-						JSON.stringify({
-							user,
-							session,
-						}),
-						Math.floor(
-							(new Date(session.expiresAt).getTime() - Date.now()) / 1000,
-						),
-					);
-				}
 
 				// Return OAuth 2.0 compliant token response
 				return ctx.json(
@@ -499,7 +547,7 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 		},
 	);
 
-export const deviceVerify = createAuthEndpoint(
+export const claimDeviceUserCode = createAuthEndpoint(
 	"/device",
 	{
 		method: "GET",
@@ -654,86 +702,116 @@ export const deviceApprove = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		const session = await getSessionFromCtx(ctx);
-		if (!session) {
-			throw new APIError("UNAUTHORIZED", {
-				error: "unauthorized",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.AUTHENTICATION_REQUIRED.message,
+		return runManagedAuthenticationTransaction(ctx, async () => {
+			const session = usesManagedAuthenticationPolicy(ctx)
+				? await getAuthoritativeSessionFromCtx(ctx)
+				: await getSessionFromCtx(ctx);
+			if (!session) {
+				throw new APIError("UNAUTHORIZED", {
+					error: "unauthorized",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.AUTHENTICATION_REQUIRED.message,
+				});
+			}
+
+			const { userCode } = ctx.body;
+			const cleanUserCode = userCode.replace(/-/g, "");
+			const transaction = await getCurrentAdapter(ctx.context.adapter);
+			const deviceCodeRecord = await transaction.findOne<DeviceCode>({
+				model: "deviceCode",
+				where: [{ field: "userCode", value: cleanUserCode }],
 			});
-		}
 
-		const { userCode } = ctx.body;
-		const cleanUserCode = userCode.replace(/-/g, "");
+			if (!deviceCodeRecord) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_USER_CODE.message,
+				});
+			}
 
-		const deviceCodeRecord = await ctx.context.adapter.findOne<DeviceCode>({
-			model: "deviceCode",
-			where: [
-				{
-					field: "userCode",
-					value: cleanUserCode,
+			if (deviceCodeRecord.expiresAt < new Date()) {
+				throw new APIError("BAD_REQUEST", {
+					error: "expired_token",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.EXPIRED_USER_CODE.message,
+				});
+			}
+
+			if (deviceCodeRecord.status !== "pending") {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
+							.message,
+				});
+			}
+
+			if (!deviceCodeRecord.userId) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_NOT_CLAIMED.message,
+				});
+			}
+
+			if (deviceCodeRecord.userId !== session.user.id) {
+				throw new APIError("FORBIDDEN", {
+					error: "access_denied",
+					error_description:
+						"You are not authorized to approve this device authorization",
+				});
+			}
+
+			const sessionDerivativeAuthority =
+				await captureInternalSessionDerivativeAuthority(
+					ctx.context.internalAdapter,
+					{
+						purpose: "device",
+						sourceSessionToken: session.session.token,
+					},
+				);
+			const sourceAuthority = sessionDerivativeAuthority
+				? await validateInternalSessionDerivativeAuthority(
+						ctx.context.internalAdapter,
+						sessionDerivativeAuthority,
+						{
+							purpose: "device",
+							subjectId: deviceCodeRecord.userId,
+						},
+					)
+				: undefined;
+			const approvingUserId =
+				sourceAuthority?.sourceSubjectId ?? session.user.id;
+			const approved = await transaction.incrementOne<DeviceCode>({
+				model: "deviceCode",
+				where: [
+					{ field: "id", value: deviceCodeRecord.id },
+					{ field: "status", value: "pending" },
+					{ field: "userId", value: approvingUserId },
+				],
+				increment: {},
+				set: {
+					status: "approved",
+					userId: approvingUserId,
+					...(sessionDerivativeAuthority && sourceAuthority
+						? {
+								organizationId: sourceAuthority.sourceOrganizationId,
+								sessionDerivativeAuthority,
+							}
+						: {}),
 				},
-			],
-		});
-
-		if (!deviceCodeRecord) {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_USER_CODE.message,
 			});
-		}
+			if (!approved) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
+							.message,
+				});
+			}
 
-		if (deviceCodeRecord.expiresAt < new Date()) {
-			throw new APIError("BAD_REQUEST", {
-				error: "expired_token",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.EXPIRED_USER_CODE.message,
-			});
-		}
-
-		if (deviceCodeRecord.status !== "pending") {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
-						.message,
-			});
-		}
-
-		if (!deviceCodeRecord.userId) {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_NOT_CLAIMED.message,
-			});
-		}
-
-		if (deviceCodeRecord.userId !== session.user.id) {
-			throw new APIError("FORBIDDEN", {
-				error: "access_denied",
-				error_description:
-					"You are not authorized to approve this device authorization",
-			});
-		}
-
-		// Update device code with approved status and user ID
-		await ctx.context.adapter.update({
-			model: "deviceCode",
-			where: [
-				{
-					field: "id",
-					value: deviceCodeRecord.id,
-				},
-			],
-			update: {
-				status: "approved",
-				userId: session.user.id,
-			},
-		});
-
-		return ctx.json({
-			success: true,
+			return ctx.json({ success: true });
 		});
 	},
 );
@@ -787,85 +865,81 @@ export const deviceDeny = createAuthEndpoint(
 		},
 	},
 	async (ctx) => {
-		const session = await getSessionFromCtx(ctx);
-		if (!session) {
-			throw new APIError("UNAUTHORIZED", {
-				error: "unauthorized",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.AUTHENTICATION_REQUIRED.message,
+		return runManagedAuthenticationTransaction(ctx, async () => {
+			const session = usesManagedAuthenticationPolicy(ctx)
+				? await getAuthoritativeSessionFromCtx(ctx)
+				: await getSessionFromCtx(ctx);
+			if (!session) {
+				throw new APIError("UNAUTHORIZED", {
+					error: "unauthorized",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.AUTHENTICATION_REQUIRED.message,
+				});
+			}
+
+			const cleanUserCode = ctx.body.userCode.replace(/-/g, "");
+			const transaction = await getCurrentAdapter(ctx.context.adapter);
+			const deviceCodeRecord = await transaction.findOne<DeviceCode>({
+				model: "deviceCode",
+				where: [{ field: "userCode", value: cleanUserCode }],
 			});
-		}
+			if (!deviceCodeRecord) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_USER_CODE.message,
+				});
+			}
+			if (deviceCodeRecord.expiresAt < new Date()) {
+				throw new APIError("BAD_REQUEST", {
+					error: "expired_token",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.EXPIRED_USER_CODE.message,
+				});
+			}
+			if (deviceCodeRecord.status !== "pending") {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
+							.message,
+				});
+			}
+			if (!deviceCodeRecord.userId) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_NOT_CLAIMED.message,
+				});
+			}
+			if (deviceCodeRecord.userId !== session.user.id) {
+				throw new APIError("FORBIDDEN", {
+					error: "access_denied",
+					error_description:
+						"You are not authorized to deny this device authorization",
+				});
+			}
 
-		const { userCode } = ctx.body;
-		const cleanUserCode = userCode.replace(/-/g, "");
-
-		const deviceCodeRecord = await ctx.context.adapter.findOne<DeviceCode>({
-			model: "deviceCode",
-			where: [
-				{
-					field: "userCode",
-					value: cleanUserCode,
-				},
-			],
-		});
-
-		if (!deviceCodeRecord) {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.INVALID_USER_CODE.message,
+			const denied = await transaction.incrementOne<DeviceCode>({
+				model: "deviceCode",
+				where: [
+					{ field: "id", value: deviceCodeRecord.id },
+					{ field: "status", value: "pending" },
+					{ field: "userId", value: session.user.id },
+				],
+				increment: {},
+				set: { status: "denied", userId: session.user.id },
 			});
-		}
+			if (!denied) {
+				throw new APIError("BAD_REQUEST", {
+					error: "invalid_request",
+					error_description:
+						DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
+							.message,
+				});
+			}
 
-		if (deviceCodeRecord.expiresAt < new Date()) {
-			throw new APIError("BAD_REQUEST", {
-				error: "expired_token",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.EXPIRED_USER_CODE.message,
-			});
-		}
-
-		if (deviceCodeRecord.status !== "pending") {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_ALREADY_PROCESSED
-						.message,
-			});
-		}
-
-		if (!deviceCodeRecord.userId) {
-			throw new APIError("BAD_REQUEST", {
-				error: "invalid_request",
-				error_description:
-					DEVICE_AUTHORIZATION_ERROR_CODES.DEVICE_CODE_NOT_CLAIMED.message,
-			});
-		}
-
-		if (deviceCodeRecord.userId !== session.user.id) {
-			throw new APIError("FORBIDDEN", {
-				error: "access_denied",
-				error_description:
-					"You are not authorized to deny this device authorization",
-			});
-		}
-
-		await ctx.context.adapter.update({
-			model: "deviceCode",
-			where: [
-				{
-					field: "id",
-					value: deviceCodeRecord.id,
-				},
-			],
-			update: {
-				status: "denied",
-				userId: session.user.id,
-			},
-		});
-
-		return ctx.json({
-			success: true,
+			return ctx.json({ success: true });
 		});
 	},
 );

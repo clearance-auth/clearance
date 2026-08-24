@@ -3,6 +3,8 @@ import type {
 	ManagementSnapshotReader,
 	ManagementStore,
 	ManagementUnitOfWork,
+	StoreV2TopologyReader,
+	StoreV2TopologyRepository,
 } from "../store/types.js";
 import {
 	CLEARANCE_RELEASE_VERSION,
@@ -15,7 +17,7 @@ import type {
 	AuditEvent,
 	Environment,
 	Organization,
-	Principal,
+	User,
 	Project,
 	SessionRecord,
 } from "../types/resources.js";
@@ -24,6 +26,7 @@ import { ClearanceError } from "./errors.js";
 import { writeExportArtifact } from "./export-artifact.js";
 import {
 	decodePageCursor,
+	encodePageCursor,
 	normalizePageLimit,
 	paginateByCreatedAt,
 } from "./pagination.js";
@@ -41,6 +44,35 @@ function slugify(name: string): string {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "")
 		.slice(0, 48);
+}
+
+function assertSnapshotPrincipalWriterDisabled(
+	store: ManagementUnitOfWork,
+	stage: string,
+): void {
+	const candidate = store as ManagementUnitOfWork &
+		Partial<Pick<ManagementStore, "storeV2Principals">>;
+	if (candidate.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPALS_TYPED_MUTATION_REQUIRED",
+			message: "Relational principal authority requires the coordinated principal writer.",
+			stage,
+			status: 409,
+			remediation: "Use the management application or auth-coordinated user workflow.",
+		});
+	}
+}
+
+function principalReadView(store: ManagementStore): readonly User[] {
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage: "principals.read",
+			status: 500,
+		});
+	}
+	return store.snapshot.principals;
 }
 
 const PROJECT_NAME_MAX_LENGTH = 120;
@@ -143,6 +175,116 @@ export function createProject(
 	return project;
 }
 
+function topologyLifecycleError(
+	error: unknown,
+	kind: "project" | "environment" | "organization-create" | "organization-update",
+	organizationSlug?: string,
+): never {
+	if (error instanceof ClearanceError) throw error;
+	const pg = error as { code?: unknown; constraint?: unknown } | null;
+	if (pg?.code === "23505") {
+		const constraint = typeof pg.constraint === "string" ? pg.constraint : "";
+		if (kind === "project") {
+			if (!constraint.endsWith("_projects_name_unique") && !constraint.endsWith("_projects_slug_unique")) throw error;
+			throw new ClearanceError({
+				code: "PROJECT_ALREADY_EXISTS", message: "A project with this name or slug already exists.",
+				stage: "project.create", status: 409, remediation: "Choose a unique project name.",
+			});
+		}
+		if (constraint.endsWith("_organizations_slug_unique")) {
+			throw new ClearanceError({
+				code: "ORG_SLUG_EXISTS",
+				message: `Organization slug ${organizationSlug} already exists in this environment`,
+				stage: kind === "organization-create" ? "orgs.create" : "orgs.update",
+				status: 409,
+			});
+		}
+		if (kind === "organization-update" || !constraint.endsWith("_organizations_pkey")) throw error;
+		throw new ClearanceError({
+			code: "ORG_EXISTS", message: "Organization id already exists", stage: "orgs.create", status: 409,
+		});
+	}
+	if (pg?.code === "23503") {
+		if (kind === "environment") {
+			throw new ClearanceError({ code: "PROJECT_NOT_FOUND", message: "Project not found", stage: "env.create" });
+		}
+		throw new ClearanceError({
+			code: "NOT_INITIALIZED", message: "No project/environment — run clearance init", stage: "orgs.create",
+		});
+	}
+	throw error;
+}
+
+function topologyMutationUnavailable(stage: string): never {
+	throw new ClearanceError({
+		code: "STORE_V2_TOPOLOGY_WRITER_REQUIRED",
+		message: "Relational topology authority requires its coordinated writer.",
+		stage,
+		status: 500,
+	});
+}
+
+/** Relational-authority-aware project creation for production callers. */
+export async function createProjectAuthoritative(
+	store: ManagementStore,
+	input: { name: string; actor?: string; source?: "cli" | "console" | "api" },
+): Promise<Project> {
+	if (!store.storeV2Topology?.authoritative) return createProject(store, input);
+	if (!store.mutateStoreV2Topology) topologyMutationUnavailable("project.create");
+	const candidate = planProjectCreate(input);
+	if (await store.storeV2Topology.findProjectConflict(candidate)) {
+		throw new ClearanceError({
+			code: "PROJECT_ALREADY_EXISTS",
+			message: "A project with this name or slug already exists.",
+			stage: "project.create",
+			status: 409,
+			remediation: "Choose a unique project name.",
+		});
+	}
+	const now = nowIso();
+	const project: Project = { id: newId("proj"), ...candidate, createdAt: now, updatedAt: now };
+	try {
+		return await store.mutateStoreV2Topology(async ({ topology, appendAudit }) => {
+			if (await topology.findProjectConflict(candidate)) {
+				throw new ClearanceError({
+					code: "PROJECT_ALREADY_EXISTS", message: "A project with this name or slug already exists.",
+					stage: "project.create", status: 409, remediation: "Choose a unique project name.",
+				});
+			}
+			const written = await topology.upsertProject(project);
+			appendAudit({
+				actor: input.actor ?? "operator", action: "project.create", subjectType: "project",
+				subjectId: written.id, outcome: "success", source: input.source ?? "cli",
+				projectId: written.id, message: "Created project",
+			});
+			return written;
+		});
+	} catch (error) {
+		return topologyLifecycleError(error, "project");
+	}
+}
+
+/** Relational-authority-aware project creation plan for production dry-runs. */
+export async function planProjectCreateAuthoritative(
+	store: ManagementStore,
+	input: { name: string },
+): Promise<Pick<Project, "name" | "slug">> {
+	const candidate = planProjectCreate(input);
+	if (store.storeV2Topology?.authoritative) {
+		const conflict = await store.storeV2Topology.findProjectConflict(candidate);
+		if (conflict) {
+			throw new ClearanceError({
+				code: "PROJECT_ALREADY_EXISTS",
+				message: "A project with this name or slug already exists.",
+				stage: "project.create",
+				status: 409,
+				remediation: "Choose a unique project name.",
+			});
+		}
+	}
+	return candidate;
+}
+
 function resolveCreateScope(
 	store: ManagementSnapshotReader,
 	input: { projectId?: string; environmentId?: string },
@@ -221,8 +363,202 @@ export function initProject(
 	return { project, environment };
 }
 
+function initScopeRequired(): never {
+	throw new ClearanceError({
+		code: "SCOPE_REQUIRED",
+		message:
+			"Normalized topology does not have one unambiguous operator project/environment scope.",
+		stage: "init",
+		status: 403,
+		remediation:
+			"Set CLEARANCE_PROJECT_ID and CLEARANCE_ENV_ID (or restore the exact meta.config pair) before running clearance init.",
+	});
+}
+
+function initScopeInvalid(): never {
+	throw new ClearanceError({
+		code: "SCOPE_INVALID",
+		message: "Configured operator scope does not match normalized topology.",
+		stage: "init",
+		status: 403,
+		remediation:
+			"Align meta.config projectId/environmentId (or CLEARANCE_PROJECT_ID/CLEARANCE_ENV_ID) with an existing project/environment pair.",
+	});
+}
+
+/**
+ * Resolve an existing normalized operator pair without selecting arbitrary
+ * rows. `null` means topology is empty and may be initialized by the caller.
+ */
+async function resolveExistingTopologyInitScope(
+	topology: StoreV2TopologyReader,
+	config: Record<string, string>,
+): Promise<{ project: Project; environment: Environment } | null> {
+	const projectId = config.projectId?.trim();
+	const environmentId = config.environmentId?.trim();
+	if (projectId || environmentId) {
+		if (!projectId || !environmentId) initScopeRequired();
+		const project = await topology.getProjectById(projectId);
+		const environment = project
+			? await topology.getEnvironment({ projectId, id: environmentId })
+			: null;
+		if (!project || !environment) initScopeInvalid();
+		return { project, environment };
+	}
+
+	const projects = await topology.listProjectsPage({ limit: 2 });
+	if (projects.projects.length === 0) return null;
+	if (projects.hasMore || projects.projects.length !== 1) initScopeRequired();
+	const project = projects.projects[0]!;
+	const environments = await topology.listEnvironmentsPage({
+		projectId: project.id,
+		limit: 2,
+	});
+	if (environments.hasMore || environments.environments.length !== 1) {
+		initScopeRequired();
+	}
+	return { project, environment: environments.environments[0]! };
+}
+
+async function lockExistingTopologyInitScope(
+	topology: StoreV2TopologyRepository,
+	resolved: { project: Project; environment: Environment },
+): Promise<{ project: Project; environment: Environment }> {
+	const project = await topology.lockProject({ id: resolved.project.id });
+	const environment = project
+		? await topology.lockEnvironment({
+			projectId: project.id,
+			id: resolved.environment.id,
+		})
+		: null;
+	if (!project || !environment) initScopeInvalid();
+	return { project, environment };
+}
+
+/**
+ * Initialize topology plus snapshot-only operator metadata in one transaction
+ * after relational topology cutover. The synchronous helper remains the JSON
+ * compatibility contract.
+ */
+export async function initProjectAuthoritative(
+	store: ManagementStore,
+	input: {
+		name: string;
+		environment?: string;
+		actor?: string;
+		source?: "cli" | "console" | "api";
+	},
+): Promise<{ project: Project; environment: Environment }> {
+	if (!store.storeV2Topology?.authoritative) return initProject(store, input);
+	const reader = store.storeV2Topology;
+	const existing = await resolveExistingTopologyInitScope(
+		reader,
+		store.snapshot.meta.config,
+	);
+	if (existing) {
+		if (
+			store.snapshot.meta.config.projectId === existing.project.id &&
+			store.snapshot.meta.config.environmentId === existing.environment.id
+		) {
+			return existing;
+		}
+		if (!store.mutateCoordinated) topologyMutationUnavailable("init");
+		return store.mutateCoordinated(async ({ data, topology }) => {
+			if (!topology) topologyMutationUnavailable("init");
+			const resolved = await resolveExistingTopologyInitScope(
+				topology,
+				data.meta.config,
+			);
+			if (!resolved) initScopeInvalid();
+			const locked = await lockExistingTopologyInitScope(topology, resolved);
+			if (
+				data.meta.config.projectId !== locked.project.id ||
+				data.meta.config.environmentId !== locked.environment.id
+			) {
+				data.meta.config = {
+					...data.meta.config,
+					projectId: locked.project.id,
+					environmentId: locked.environment.id,
+				};
+			}
+			return locked;
+		});
+	}
+	if (!store.mutateCoordinated) topologyMutationUnavailable("init");
+	const candidate = planProjectCreate(input);
+	const now = nowIso();
+	const project: Project = { id: newId("proj"), ...candidate, createdAt: now, updatedAt: now };
+	const environment: Environment = {
+		id: newId("env"), projectId: project.id, name: input.environment ?? "development",
+		slug: slugify(input.environment ?? "development"), kind: "development", createdAt: now, updatedAt: now,
+	};
+	try {
+		return await store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+			if (!topology) topologyMutationUnavailable("init");
+			const existing = await resolveExistingTopologyInitScope(
+				topology,
+				data.meta.config,
+			);
+			if (existing) {
+				const locked = await lockExistingTopologyInitScope(topology, existing);
+				if (
+					data.meta.config.projectId !== locked.project.id ||
+					data.meta.config.environmentId !== locked.environment.id
+				) {
+					data.meta.config = {
+						...data.meta.config,
+						projectId: locked.project.id,
+						environmentId: locked.environment.id,
+					};
+				}
+				return locked;
+			}
+			if (await topology.findProjectConflict(candidate)) {
+				throw new ClearanceError({ code: "PROJECT_ALREADY_EXISTS", message: "A project with this name or slug already exists.", stage: "project.create", status: 409, remediation: "Choose a unique project name." });
+			}
+			await topology.upsertProject(project);
+			await topology.upsertEnvironment(environment);
+			data.meta.initializedAt = now;
+			data.meta.config = { ...data.meta.config, projectId: project.id, environmentId: environment.id };
+			appendAudit({
+				actor: input.actor ?? "operator", action: "project.init", subjectType: "project",
+				subjectId: project.id, outcome: "success", source: input.source ?? "cli",
+				projectId: project.id, environmentId: environment.id,
+				message: `Initialized project ${project.name}`,
+			});
+			return { project, environment };
+		});
+	} catch (error) {
+		return topologyLifecycleError(error, "project");
+	}
+}
+
 export function listProjects(store: ManagementStore): Project[] {
 	return store.snapshot.projects;
+}
+
+/** Scope-safe authority-aware project point lookup. */
+export async function inspectProjectAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope: ResourceScope,
+): Promise<Project> {
+	const project = store.storeV2Topology?.authoritative
+		? id === scope.projectId
+			? await store.storeV2Topology.getProjectById(id)
+			: null
+		: store.snapshot.projects.find(
+			(candidate) => candidate.id === id && candidate.id === scope.projectId,
+		) ?? null;
+	if (!project) {
+		throw new ClearanceError({
+			code: "PROJECT_NOT_FOUND",
+			message: "Project not found",
+			stage: "projects.inspect",
+			status: 404,
+		});
+	}
+	return project;
 }
 
 export function createEnvironment(
@@ -259,6 +595,38 @@ export function createEnvironment(
 	return environment;
 }
 
+/** Relational-authority-aware environment creation for production callers. */
+export async function createEnvironmentAuthoritative(
+	store: ManagementStore,
+	input: { projectId: string; name: string; kind?: Environment["kind"]; actor?: string; source?: AuditEvent["source"] },
+): Promise<Environment> {
+	if (!store.storeV2Topology?.authoritative) return createEnvironment(store, input);
+	if (!store.mutateStoreV2Topology) topologyMutationUnavailable("env.create");
+	const project = await store.storeV2Topology.getProjectById(input.projectId);
+	if (!project) {
+		throw new ClearanceError({ code: "PROJECT_NOT_FOUND", message: `Project ${input.projectId} not found`, stage: "env.create" });
+	}
+	const candidate = planEnvironmentCreateFromProject(project, input);
+	const now = nowIso();
+	const environment: Environment = { id: newId("env"), ...candidate, createdAt: now, updatedAt: now };
+	try {
+		return await store.mutateStoreV2Topology(async ({ topology, appendAudit }) => {
+			if (!(await topology.lockProject({ id: input.projectId }))) {
+				throw new ClearanceError({ code: "PROJECT_NOT_FOUND", message: `Project ${input.projectId} not found`, stage: "env.create" });
+			}
+			const written = await topology.upsertEnvironment(environment);
+			appendAudit({
+				actor: input.actor ?? "operator", action: "env.create", subjectType: "environment",
+				subjectId: written.id, outcome: "success", source: input.source ?? "cli",
+				projectId: written.projectId, environmentId: written.id, message: `Created environment ${written.name}`,
+			});
+			return written;
+		});
+	} catch (error) {
+		return topologyLifecycleError(error, "environment");
+	}
+}
+
 /** Validate an environment creation request without mutating the store. */
 export function planEnvironmentCreate(
 	store: ManagementStore,
@@ -268,6 +636,40 @@ export function planEnvironmentCreate(
 		kind?: Environment["kind"];
 	},
 ): Pick<Environment, "projectId" | "name" | "slug" | "kind"> {
+	const project = store.snapshot.projects.find((p) => p.id === input.projectId);
+	if (!project) {
+		throw new ClearanceError({
+			code: "PROJECT_NOT_FOUND",
+			message: `Project ${input.projectId} not found`,
+			stage: "env.create",
+		});
+	}
+	return planEnvironmentCreateFromProject(project, input);
+}
+
+/** Relational-authority-aware environment creation plan for production dry-runs. */
+export async function planEnvironmentCreateAuthoritative(
+	store: ManagementStore,
+	input: { projectId?: string; name: string; kind?: Environment["kind"] },
+): Promise<Pick<Environment, "projectId" | "name" | "slug" | "kind">> {
+	if (!store.storeV2Topology?.authoritative) return planEnvironmentCreate(store, input);
+	const project = input.projectId
+		? await store.storeV2Topology.getProjectById(input.projectId)
+		: null;
+	if (!project) {
+		throw new ClearanceError({
+			code: "PROJECT_NOT_FOUND",
+			message: `Project ${input.projectId} not found`,
+			stage: "env.create",
+		});
+	}
+	return planEnvironmentCreateFromProject(project, input);
+}
+
+function planEnvironmentCreateFromProject(
+	project: Project,
+	input: { projectId?: string; name: string; kind?: Environment["kind"] },
+): Pick<Environment, "projectId" | "name" | "slug" | "kind"> {
 	const kind = input.kind ?? "development";
 	if (!ENVIRONMENT_KINDS.includes(kind)) {
 		throw new ClearanceError({
@@ -275,14 +677,6 @@ export function planEnvironmentCreate(
 			message: "Environment kind must be development, preview, or production.",
 			stage: "env.create",
 			remediation: "Pass --kind development, preview, or production.",
-		});
-	}
-	const project = store.snapshot.projects.find((p) => p.id === input.projectId);
-	if (!project) {
-		throw new ClearanceError({
-			code: "PROJECT_NOT_FOUND",
-			message: `Project ${input.projectId} not found`,
-			stage: "env.create",
 		});
 	}
 	return {
@@ -312,6 +706,53 @@ export function listEnvironments(
 			}
 			return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 		});
+}
+
+export const ENVIRONMENTS_LIST_DEFAULT_PAGE_LIMIT = 100;
+export const ENVIRONMENTS_LIST_MAX_PAGE_LIMIT = 1000;
+
+/**
+ * Authority-aware bounded environment listing. The legacy synchronous list is
+ * retained for JSON-backed callers; relational topology never reads its empty
+ * post-cutover snapshot projection.
+ */
+export async function listEnvironmentsPageAuthoritative(
+	store: ManagementStore,
+	opts?: { scope?: ResourceScope; limit?: number; cursor?: string },
+): Promise<{ environments: Environment[]; nextCursor: string | null }> {
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "envs.list",
+		code: "ENVIRONMENTS_LIST_LIMIT_INVALID",
+		defaultValue: ENVIRONMENTS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: ENVIRONMENTS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "environments", "envs.list");
+	if (!store.storeV2Topology?.authoritative) {
+		const page = paginateByCreatedAt(listEnvironments(store, { scope }), {
+			surface: "environments",
+			order: "asc",
+			limit,
+			cursor,
+		});
+		return { environments: page.items, nextCursor: page.nextCursor };
+	}
+	const page = await store.storeV2Topology.listEnvironmentsPage({
+		projectId: scope.projectId,
+		limit,
+		...(cursor ? { cursor } : {}),
+	});
+	const last = page.environments[page.environments.length - 1];
+	return {
+		environments: page.environments,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("environments", {
+					createdAt: last.createdAt,
+					id: last.id,
+				})
+				: null,
+	};
 }
 
 function findEnvironmentInProject(
@@ -346,6 +787,41 @@ function findEnvironmentInProject(
 	return env;
 }
 
+async function findEnvironmentInProjectAuthoritative(
+	store: ManagementStore,
+	idOrSlug: string,
+	projectId: string,
+	stage: string,
+): Promise<Environment> {
+	if (!store.storeV2Topology?.authoritative) {
+		return findEnvironmentInProject(store, idOrSlug, projectId, stage);
+	}
+	const key = idOrSlug?.trim();
+	if (!key) {
+		throw new ClearanceError({
+			code: "ENV_ID_REQUIRED",
+			message: "Environment id or slug is required",
+			stage,
+			status: 400,
+		});
+	}
+	const environment = await store.storeV2Topology.findEnvironmentByKey({
+		projectId,
+		key,
+	});
+	if (!environment) {
+		throw new ClearanceError({
+			code: "ENV_NOT_FOUND",
+			message: "Environment not found",
+			stage,
+			status: 404,
+			remediation:
+				"Pass an environment id/slug that belongs to the operator project",
+		});
+	}
+	return environment;
+}
+
 export type EnvironmentLocalStatus = {
 	/** Whether this environment is the operator's active principal environment */
 	active: boolean;
@@ -368,12 +844,16 @@ export type EnvironmentLocalStatus = {
 	resourceCounts: {
 		principals: number;
 		organizations: number;
-		memberships: number;
-		identityConnections: number;
-		directoryConnections: number;
+		/** Null when relational topology makes organization membership unavailable. */
+		memberships: number | null;
+		/** Null when relational topology makes organization connections unavailable. */
+		ssoConnections: number | null;
+		/** Null when relational topology makes organization connections unavailable. */
+		scimConnections: number | null;
 		roles: number;
 		sessions: number;
-		events: number;
+		/** Null when the authoritative event projection is relational. */
+		events: number | null;
 	};
 };
 
@@ -389,11 +869,20 @@ export type EnvironmentInspectResult = {
  * Inspect a canonical environment plus truthful local status (no secrets).
  * Default id is the operator principal environment. Cross-project ids fail closed.
  */
-export function inspectEnvironment(
+function inspectEnvironmentSnapshot(
 	store: ManagementStore,
 	id?: string,
 	opts?: { scope?: ResourceScope },
+	allowRelationalPlaceholder = false,
 ): EnvironmentInspectResult {
+	if (store.storeV2Principals?.authoritative && !allowRelationalPlaceholder) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+			message: "Relational environment inspection requires bounded counts.",
+			stage: "env.inspect",
+			status: 500,
+		});
+	}
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const key = id?.trim() || scope.environmentId;
 	const environment = findEnvironmentInProject(
@@ -407,7 +896,9 @@ export function inspectEnvironment(
 	const project =
 		store.snapshot.projects.find((p) => p.id === environment.projectId) ?? null;
 
-	const principals = store.snapshot.principals.filter(
+	const principals = (store.storeV2Principals?.authoritative
+		? []
+		: principalReadView(store)).filter(
 		(p) =>
 			p.projectId === environment.projectId &&
 			p.environmentId === environment.id &&
@@ -423,10 +914,10 @@ export function inspectEnvironment(
 	const memberships = store.snapshot.memberships.filter(
 		(m) => orgIds.has(m.organizationId) && m.status === "active",
 	);
-	const identityConnections = store.snapshot.identityConnections.filter((c) =>
+	const ssoConnections = store.snapshot.ssoConnections.filter((c) =>
 		orgIds.has(c.organizationId),
 	);
-	const directoryConnections = store.snapshot.directoryConnections.filter((c) =>
+	const scimConnections = store.snapshot.scimConnections.filter((c) =>
 		orgIds.has(c.organizationId),
 	);
 	const roles = store.snapshot.roles.filter(
@@ -470,8 +961,8 @@ export function inspectEnvironment(
 			principals: principals.length,
 			organizations: organizations.length,
 			memberships: memberships.length,
-			identityConnections: identityConnections.length,
-			directoryConnections: directoryConnections.length,
+			ssoConnections: ssoConnections.length,
+			scimConnections: scimConnections.length,
 			roles: roles.length,
 			sessions: sessions.length,
 			events: events.length,
@@ -483,6 +974,167 @@ export function inspectEnvironment(
 		project,
 		scope,
 		local,
+		correlationId: correlationId(),
+	};
+}
+
+export function inspectEnvironment(
+	store: ManagementStore,
+	id?: string,
+	opts?: { scope?: ResourceScope },
+): EnvironmentInspectResult {
+	return inspectEnvironmentSnapshot(store, id, opts);
+}
+
+export async function inspectEnvironmentAuthoritative(
+	store: ManagementStore,
+	id?: string,
+	opts?: { scope?: ResourceScope },
+): Promise<EnvironmentInspectResult> {
+	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
+	const principalsAuthoritative = store.storeV2Principals?.authoritative === true;
+	const eventsAuthoritative = store.storeV2Events?.authoritative === true;
+	if (!topologyAuthoritative && !principalsAuthoritative && !eventsAuthoritative) {
+		return inspectEnvironment(store, id, opts);
+	}
+	const operatorScope = opts?.scope ?? resolveOperatorScope(store);
+	const key = id?.trim() || operatorScope.environmentId;
+	const environment = topologyAuthoritative
+		? await store.storeV2Topology!.getEnvironment({
+			projectId: operatorScope.projectId,
+			id: key,
+		})
+		: findEnvironmentInProject(store, key, operatorScope.projectId, "env.inspect");
+	if (!environment) {
+		throw new ClearanceError({
+			code: "ENV_NOT_FOUND",
+			message: "Environment not found",
+			stage: "env.inspect",
+			status: 404,
+			remediation:
+				"Pass an environment id that belongs to the operator project",
+		});
+	}
+	const scope = {
+		projectId: environment.projectId,
+		environmentId: environment.id,
+	};
+	const project = topologyAuthoritative
+		? await store.storeV2Topology!.getProjectById(environment.projectId)
+		: store.snapshot.projects.find((candidate) => candidate.id === environment.projectId) ?? null;
+	const snapshotOrganizations = topologyAuthoritative
+		? []
+		: store.snapshot.organizations.filter(
+			(candidate) =>
+				candidate.projectId === scope.projectId &&
+				candidate.environmentId === scope.environmentId &&
+				candidate.status !== "archived",
+		);
+	const [principalCounts, activeSessions, organizationCount] = await Promise.all([
+		principalsAuthoritative
+			? (() => {
+				const countReader = store.storeV2Principals?.countByScope;
+				if (!countReader) {
+					throw new ClearanceError({
+						code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+						message: "Relational principal count reader is unavailable",
+						stage: "env.inspect",
+						status: 500,
+					});
+				}
+				return countReader({ scope });
+			})()
+			: Promise.resolve({
+				total: principalReadView(store).filter(
+					(principal) =>
+						principal.projectId === scope.projectId &&
+						principal.environmentId === scope.environmentId &&
+						principal.status !== "deleted",
+				).length,
+				active: 0,
+			}),
+		principalsAuthoritative
+			? store.storeV2Principals?.countActiveSessions?.({ scope }) ?? Promise.resolve(0)
+			: Promise.resolve(
+				store.snapshot.sessions.filter(
+					(session) =>
+						session.environmentId === scope.environmentId &&
+						session.status === "active",
+				).length,
+			),
+		topologyAuthoritative
+			? store.storeV2Topology!.countOrganizations({ scope })
+			: Promise.resolve(snapshotOrganizations.length),
+	]);
+	const auxiliaryOrganizationCounts = topologyAuthoritative
+		? {
+			memberships: null,
+			ssoConnections: null,
+			scimConnections: null,
+		}
+		: (() => {
+			const orgIds = new Set(
+				snapshotOrganizations.map((organization) => organization.id),
+			);
+			return {
+				memberships: store.snapshot.memberships.filter(
+					(membership) =>
+						orgIds.has(membership.organizationId) && membership.status === "active",
+				).length,
+				ssoConnections: store.snapshot.ssoConnections.filter((connection) =>
+					orgIds.has(connection.organizationId),
+				).length,
+				scimConnections: store.snapshot.scimConnections.filter((connection) =>
+					orgIds.has(connection.organizationId),
+				).length,
+			};
+		})();
+	return {
+		environment,
+		project,
+		scope: operatorScope,
+		local: {
+			active: environment.id === operatorScope.environmentId,
+			storeBackend: store.backend,
+			storePathPresent: existsSync(store.path),
+			schemaVersion: store.snapshot.meta.schemaVersion,
+			expectedSchemaVersion: STORE_SCHEMA_VERSION,
+			releaseVersion: store.snapshot.releaseVersion ?? CLEARANCE_RELEASE_VERSION,
+			initialized: Boolean(store.snapshot.meta.initializedAt),
+			config: {
+				hasClearanceSecret: Boolean(process.env.CLEARANCE_SECRET?.trim()),
+				hasDatabaseUrl: Boolean(process.env.DATABASE_URL?.trim()),
+				hasOperatorToken: Boolean(process.env.CLEARANCE_OPERATOR_TOKEN?.trim()),
+				hasCredentialKey: Boolean(process.env.CLEARANCE_CREDENTIAL_KEY?.trim()),
+				nodeEnv: process.env.NODE_ENV ?? "development",
+				operatorProjectIdConfigured: Boolean(
+					process.env.CLEARANCE_PROJECT_ID?.trim() ||
+						store.snapshot.meta.config.projectId,
+				),
+				operatorEnvironmentIdConfigured: Boolean(
+					process.env.CLEARANCE_ENV_ID?.trim() ||
+						store.snapshot.meta.config.environmentId,
+				),
+			},
+			resourceCounts: {
+				principals: principalCounts.total,
+				organizations: organizationCount,
+				...auxiliaryOrganizationCounts,
+				roles: store.snapshot.roles.filter(
+					(role) =>
+						role.projectId === scope.projectId &&
+						role.environmentId === scope.environmentId,
+				).length,
+				sessions: activeSessions,
+				events: eventsAuthoritative
+					? null
+					: store.snapshot.events.filter(
+						(event) =>
+							event.projectId === scope.projectId &&
+							event.environmentId === scope.environmentId,
+					).length,
+			},
+		},
 		correlationId: correlationId(),
 	};
 }
@@ -519,6 +1171,51 @@ export type EnvironmentPromoteResult = {
 	auditAction?: "env.promote";
 };
 
+export type EnvironmentPromoteInput = {
+	/** Target environment id or slug (required) */
+	to: string;
+	/** Source environment id or slug; defaults to operator principal environment */
+	from?: string;
+	/** Preview only — default when confirm is not true */
+	dryRun?: boolean;
+	/** Required for a confirmed attempt (CLI --yes). Never invents deploy apply. */
+	confirm?: boolean;
+	scope?: ResourceScope;
+	actor?: string;
+	source?: "cli" | "console" | "api" | "system";
+};
+
+function assertPromotionTarget(input: EnvironmentPromoteInput, stage: string): string {
+	const target = input.to?.trim();
+	if (!target) {
+		throw new ClearanceError({
+			code: "ENV_PROMOTE_TARGET_REQUIRED",
+			message: "Promotion target environment is required",
+			stage,
+			status: 400,
+			remediation: "Pass --to <environment-id-or-slug>",
+		});
+	}
+	return target;
+}
+
+function assertPromotionSource(
+	source: Environment,
+	scope: ResourceScope,
+	stage: string,
+): void {
+	if (source.id !== scope.environmentId) {
+		throw new ClearanceError({
+			code: "ENV_NOT_FOUND",
+			message: "Environment not found",
+			stage,
+			status: 404,
+			remediation:
+				"Promotion source must be the operator principal environment",
+		});
+	}
+}
+
 /**
  * Plan (and optionally attempt) environment promotion.
  *
@@ -530,59 +1227,79 @@ export type EnvironmentPromoteResult = {
  */
 export function promoteEnvironment(
 	store: ManagementStore,
-	input: {
-		/** Target environment id or slug (required) */
-		to: string;
-		/** Source environment id or slug; defaults to operator principal environment */
-		from?: string;
-		/** Preview only — default when confirm is not true */
-		dryRun?: boolean;
-		/** Required for a confirmed attempt (CLI --yes). Never invents deploy apply. */
-		confirm?: boolean;
-		scope?: ResourceScope;
-		actor?: string;
-		source?: "cli" | "console" | "api" | "system";
-	},
+	input: EnvironmentPromoteInput,
 ): EnvironmentPromoteResult {
 	const scope = input.scope ?? resolveOperatorScope(store);
-	const dryRun = input.dryRun === true || input.confirm !== true;
-	const corr = correlationId();
 	const stage = "env.promote";
-
-	const toKey = input.to?.trim();
-	if (!toKey) {
-		throw new ClearanceError({
-			code: "ENV_PROMOTE_TARGET_REQUIRED",
-			message: "Promotion target environment is required",
-			stage,
-			status: 400,
-			remediation: "Pass --to <environment-id-or-slug>",
-		});
-	}
-
+	const toKey = assertPromotionTarget(input, stage);
 	const source = findEnvironmentInProject(
 		store,
 		input.from?.trim() || scope.environmentId,
 		scope.projectId,
 		stage,
 	);
-	// Source must be the principal environment (exact environment scope for mutations)
-	if (source.id !== scope.environmentId) {
-		throw new ClearanceError({
-			code: "ENV_NOT_FOUND",
-			message: "Environment not found",
-			stage,
-			status: 404,
-			remediation:
-				"Promotion source must be the operator principal environment",
-		});
-	}
-
+	assertPromotionSource(source, scope, stage);
 	const target = findEnvironmentInProject(store, toKey, scope.projectId, stage);
-
 	const inspected = inspectEnvironment(store, source.id, { scope });
-	const resourceCounts = inspected.local.resourceCounts;
+	return promotionResult(
+		store,
+		input,
+		scope,
+		source,
+		target,
+		inspected.local.resourceCounts,
+	);
+}
 
+/**
+ * Authority-aware environment promotion planning. Relational topology resolves
+ * source and target through scoped indexed reads; JSON-backed stores retain the
+ * synchronous snapshot implementation above.
+ */
+export async function promoteEnvironmentAuthoritative(
+	store: ManagementStore,
+	input: EnvironmentPromoteInput,
+): Promise<EnvironmentPromoteResult> {
+	if (!store.storeV2Topology?.authoritative) {
+		return promoteEnvironment(store, input);
+	}
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const stage = "env.promote";
+	const toKey = assertPromotionTarget(input, stage);
+	const source = await findEnvironmentInProjectAuthoritative(
+		store,
+		input.from?.trim() || scope.environmentId,
+		scope.projectId,
+		stage,
+	);
+	assertPromotionSource(source, scope, stage);
+	const target = await findEnvironmentInProjectAuthoritative(
+		store,
+		toKey,
+		scope.projectId,
+		stage,
+	);
+	const inspected = await inspectEnvironmentAuthoritative(store, source.id, { scope });
+	return promotionResult(
+		store,
+		input,
+		scope,
+		source,
+		target,
+		inspected.local.resourceCounts,
+	);
+}
+
+function promotionResult(
+	store: ManagementStore,
+	input: EnvironmentPromoteInput,
+	scope: ResourceScope,
+	source: Environment,
+	target: Environment,
+	resourceCounts: EnvironmentLocalStatus["resourceCounts"],
+): EnvironmentPromoteResult {
+	const dryRun = input.dryRun === true || input.confirm !== true;
+	const corr = correlationId();
 	const same = source.id === target.id;
 	const blockers: EnvironmentPromoteBlocker[] = [];
 	if (!same) {
@@ -690,13 +1407,14 @@ export function createUser(
 		actor?: string;
 		source?: AuditEvent["source"] | "import";
 	},
-): Principal {
+): User {
+	assertSnapshotPrincipalWriterDisabled(store, "users.create");
 	const scope = resolveCreateScope(store, input);
 	const email = input.email.toLowerCase();
 	const principalId = input.id?.trim() || newId("user");
 	const now = nowIso();
 
-	const principal: Principal = {
+	const principal: User = {
 		id: principalId,
 		projectId: scope.projectId,
 		environmentId: scope.environmentId,
@@ -783,9 +1501,9 @@ export function listUsers(
 		/** When true (default for scoped callers), require full scope filter */
 		scope?: ResourceScope;
 	},
-): Principal[] {
+): User[] {
 	const inScope = filter?.scope ? scopeFilter(filter.scope) : null;
-	return store.snapshot.principals.filter((p) => {
+	return principalReadView(store).filter((p) => {
 		if (p.status === "deleted") return false;
 		if (inScope && !inScope(p)) return false;
 		if (filter?.projectId && p.projectId !== filter.projectId) return false;
@@ -815,7 +1533,7 @@ export function listUsersPage(
 		/** Opaque cursor from a previous page's nextCursor (fail-closed). */
 		cursor?: string;
 	},
-): { users: Principal[]; nextCursor: string | null } {
+): { users: User[]; nextCursor: string | null } {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const limit = normalizePageLimit(opts?.limit, {
 		stage: "users.list",
@@ -838,6 +1556,71 @@ export function listUsersPage(
 }
 
 /**
+ * Authority-aware bounded user listing. Relational authority never falls back
+ * to the snapshot projection, which is intentionally empty after cutover.
+ */
+export async function listUsersPageAuthoritative(
+	store: ManagementStore,
+	opts?: {
+		scope?: ResourceScope;
+		status?: User["status"];
+		limit?: number;
+		cursor?: string;
+	},
+): Promise<{ users: User[]; nextCursor: string | null }> {
+	if (!store.storeV2Principals?.authoritative) {
+		return listUsersPage(store, opts);
+	}
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "users.list",
+		code: "USERS_LIST_LIMIT_INVALID",
+		defaultValue: USERS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: USERS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "users", "users.list");
+	const page = await store.storeV2Principals.listPage({
+		scope,
+		limit,
+		...(cursor ? { cursor } : {}),
+		...(opts?.status ? { status: opts.status } : {}),
+	});
+	const last = page.principals[page.principals.length - 1];
+	return {
+		users: page.principals,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("users", { createdAt: last.createdAt, id: last.id })
+				: null,
+	};
+}
+
+/** Scope-safe authority-aware point lookup. */
+export async function inspectUserAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<User> {
+	if (!store.storeV2Principals?.authoritative) {
+		return inspectUser(store, id, scope);
+	}
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const user = await store.storeV2Principals.getById({
+		scope: resolvedScope,
+		id,
+	});
+	if (!user) {
+		throw new ClearanceError({
+			code: "USER_NOT_FOUND",
+			message: "User not found",
+			stage: "users.inspect",
+			status: 404,
+		});
+	}
+	return user;
+}
+
+/**
  * Lookup by id. When scope is provided, cross-scope ids fail closed as NOT_FOUND
  * without revealing that the foreign resource exists.
  */
@@ -845,8 +1628,8 @@ export function inspectUser(
 	store: ManagementStore,
 	id: string,
 	scope?: ResourceScope,
-): Principal {
-	const user = store.snapshot.principals.find((p) => p.id === id);
+): User {
+	const user = principalReadView(store).find((p) => p.id === id);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -899,7 +1682,8 @@ export function updateUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
+	assertSnapshotPrincipalWriterDisabled(store, "users.update");
 	const hasName = input.name !== undefined;
 	const hasEmail = input.email !== undefined;
 	// Validate status before any mutation (fail closed; never ignore invalid).
@@ -936,7 +1720,7 @@ export function updateUser(
 	const now = nowIso();
 	// Always bind mutations to operator scope (explicit or principal-derived).
 	const scope = input.scope ?? resolveOperatorScope(store);
-	let updated: Principal | undefined;
+	let updated: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -1022,10 +1806,11 @@ export function disableUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
+	assertSnapshotPrincipalWriterDisabled(store, "users.disable");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
-	let updated: Principal | undefined;
+	let updated: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -1099,10 +1884,11 @@ export function deleteUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
+	assertSnapshotPrincipalWriterDisabled(store, "users.delete");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
-	let deleted: Principal | undefined;
+	let deleted: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -1263,6 +2049,107 @@ export function createOrganization(
 	return org;
 }
 
+async function requireTopologyScope(
+	store: ManagementStore,
+	scope: ResourceScope,
+	stage: string,
+): Promise<void> {
+	const environment = await store.storeV2Topology!.getEnvironment({
+		projectId: scope.projectId,
+		id: scope.environmentId,
+	});
+	if (!environment) {
+		throw new ClearanceError({
+			code: "NOT_INITIALIZED",
+			message: "No project/environment — run clearance init",
+			stage,
+		});
+	}
+}
+
+async function lockTopologyScope(
+	topology: StoreV2TopologyRepository,
+	scope: ResourceScope,
+	stage: string,
+): Promise<void> {
+	const project = await topology.lockProject({ id: scope.projectId });
+	const environment = project
+		? await topology.lockEnvironment({
+			projectId: project.id,
+			id: scope.environmentId,
+		})
+		: null;
+	if (!project || !environment) {
+		throw new ClearanceError({
+			code: "NOT_INITIALIZED",
+			message: "No project/environment — run clearance init",
+			stage,
+		});
+	}
+}
+
+/** Relational-authority-aware management-only organization creation. */
+export async function createOrganizationAuthoritative(
+	store: ManagementStore,
+	input: {
+		name: string;
+		slug?: string;
+		id?: string;
+		projectId?: string;
+		environmentId?: string;
+		externalId?: string;
+		actor?: string;
+		source?: AuditEvent["source"] | "import";
+	},
+): Promise<Organization> {
+	if (!store.storeV2Topology?.authoritative) return createOrganization(store, input);
+	if (!store.mutateStoreV2Topology) topologyMutationUnavailable("orgs.create");
+	const scope = resolveCreateScope(store, input);
+	await requireTopologyScope(store, scope, "orgs.create");
+	const slug = input.slug ?? slugify(input.name);
+	const id = input.id?.trim() || newId("org");
+	if (await store.storeV2Topology.organizationIdExists(id)) {
+		throw new ClearanceError({
+			code: "ORG_EXISTS", message: `Organization id ${id} already exists`, stage: "orgs.create", status: 409,
+		});
+	}
+	if (await store.storeV2Topology.getOrganizationBySlug({ scope, slug })) {
+		throw new ClearanceError({
+			code: "ORG_SLUG_EXISTS",
+			message: `Organization slug ${slug} already exists in this environment`,
+			stage: "orgs.create",
+			status: 409,
+		});
+	}
+	const now = nowIso();
+	const organization: Organization = {
+		id, projectId: scope.projectId, environmentId: scope.environmentId,
+		name: input.name, slug, status: "active", externalId: input.externalId,
+		createdAt: now, updatedAt: now,
+	};
+	try {
+		return await store.mutateStoreV2Topology(async ({ topology, appendAudit }) => {
+			await lockTopologyScope(topology, scope, "orgs.create");
+			if (await topology.organizationIdExists(id)) {
+				throw new ClearanceError({ code: "ORG_EXISTS", message: `Organization id ${id} already exists`, stage: "orgs.create", status: 409 });
+			}
+			if (await topology.getOrganizationBySlug({ scope, slug })) {
+				throw new ClearanceError({ code: "ORG_SLUG_EXISTS", message: `Organization slug ${slug} already exists in this environment`, stage: "orgs.create", status: 409 });
+			}
+			const written = await topology.upsertOrganization(organization);
+			appendAudit({
+				actor: input.actor ?? "operator", action: "orgs.create", subjectType: "organization",
+				subjectId: written.id, outcome: "success", source: (input.source as AuditEvent["source"]) ?? "cli",
+				projectId: written.projectId, environmentId: written.environmentId, organizationId: written.id,
+				message: `Created organization ${written.name}`,
+			});
+			return written;
+		});
+	} catch (error) {
+		return topologyLifecycleError(error, "organization-create", slug);
+	}
+}
+
 export function listOrganizations(
 	store: ManagementStore,
 	filter?: {
@@ -1317,6 +2204,44 @@ export function listOrganizationsPage(
 	return { organizations: page.items, nextCursor: page.nextCursor };
 }
 
+/** Authority-aware bounded active-organization listing. */
+export async function listOrganizationsPageAuthoritative(
+	store: ManagementStore,
+	opts?: {
+		scope?: ResourceScope;
+		limit?: number;
+		cursor?: string;
+	},
+): Promise<{ organizations: Organization[]; nextCursor: string | null }> {
+	if (!store.storeV2Topology?.authoritative) {
+		return listOrganizationsPage(store, opts);
+	}
+	const scope = opts?.scope ?? resolveOperatorScope(store);
+	const limit = normalizePageLimit(opts?.limit, {
+		stage: "orgs.list",
+		code: "ORGS_LIST_LIMIT_INVALID",
+		defaultValue: ORGS_LIST_DEFAULT_PAGE_LIMIT,
+		maximum: ORGS_LIST_MAX_PAGE_LIMIT,
+	});
+	const cursor = decodePageCursor(opts?.cursor, "organizations", "orgs.list");
+	const page = await store.storeV2Topology.listOrganizationsPage({
+		scope,
+		limit,
+		...(cursor ? { cursor } : {}),
+	});
+	const last = page.organizations[page.organizations.length - 1];
+	return {
+		organizations: page.organizations,
+		nextCursor:
+			page.hasMore && last
+				? encodePageCursor("organizations", {
+					createdAt: last.createdAt,
+					id: last.id,
+				})
+				: null,
+	};
+}
+
 export function inspectOrganization(
 	store: ManagementStore,
 	id: string,
@@ -1339,6 +2264,31 @@ export function inspectOrganization(
 		});
 	}
 	return org;
+}
+
+/** Scope-safe authority-aware active-organization point lookup. */
+export async function inspectOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<Organization> {
+	if (!store.storeV2Topology?.authoritative) {
+		return inspectOrganization(store, id, scope);
+	}
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const organization = await store.storeV2Topology.getOrganization({
+		scope: resolvedScope,
+		id,
+	});
+	if (!organization || organization.status === "archived") {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage: "orgs.inspect",
+			status: 404,
+		});
+	}
+	return organization;
 }
 
 const ORG_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -1478,6 +2428,92 @@ export function updateOrganization(
 	return updated;
 }
 
+/** Relational-authority-aware management-only organization update. */
+export async function updateOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	input: {
+		name?: string;
+		slug?: string;
+		actor?: string;
+		source?: AuditEvent["source"] | "import";
+		scope?: ResourceScope;
+	},
+): Promise<Organization> {
+	if (!store.storeV2Topology?.authoritative) return updateOrganization(store, id, input);
+	if (!store.mutateStoreV2Topology) topologyMutationUnavailable("orgs.update");
+	const hasName = input.name !== undefined;
+	const hasSlug = input.slug !== undefined;
+	if (!hasName && !hasSlug) {
+		throw new ClearanceError({ code: "ORG_UPDATE_EMPTY", message: "At least one of name or slug is required", stage: "orgs.update", status: 400, remediation: "Pass --name and/or --slug" });
+	}
+	if (hasName && !String(input.name).trim()) {
+		throw new ClearanceError({ code: "ORG_NAME_REQUIRED", message: "Name must not be empty", stage: "orgs.update", status: 400 });
+	}
+	let nextSlug: string | undefined;
+	if (hasSlug) {
+		nextSlug = String(input.slug).trim().toLowerCase();
+		if (!nextSlug || !ORG_SLUG_RE.test(nextSlug) || nextSlug.length > 48) {
+			throw new ClearanceError({ code: "ORG_SLUG_INVALID", message: "Slug must be 1–48 chars of lowercase alphanumeric segments separated by single hyphens", stage: "orgs.update", status: 400, remediation: "Use a slug like acme-corp (lowercase, hyphens only)" });
+		}
+	}
+	const scope = input.scope ?? resolveOperatorScope(store);
+	const nextName = hasName ? String(input.name).trim() : undefined;
+	const current = await store.storeV2Topology.getOrganization({ scope, id });
+	if (!current || current.status === "archived") {
+		throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.update", status: 404 });
+	}
+	if (nextSlug && nextSlug !== current.slug) {
+		const conflict = await store.storeV2Topology.getOrganizationBySlug({
+			scope,
+			slug: nextSlug,
+		});
+		if (conflict && conflict.id !== current.id) {
+			throw new ClearanceError({
+				code: "ORG_SLUG_EXISTS",
+				message: `Organization slug ${nextSlug} already exists in this environment`,
+				stage: "orgs.update",
+				status: 409,
+			});
+		}
+	}
+	const now = nowIso();
+	try {
+		return await store.mutateStoreV2Topology(async ({ topology, appendAudit }) => {
+			await lockTopologyScope(topology, scope, "orgs.update");
+			const organization = await topology.lockOrganization({ scope, id });
+			if (!organization || organization.status === "archived") {
+				throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.update", status: 404 });
+			}
+			const fields: string[] = [];
+			const before = { name: organization.name, slug: organization.slug };
+			const updated = { ...organization };
+			if (nextSlug && nextSlug !== updated.slug) {
+				const conflict = await topology.getOrganizationBySlug({ scope, slug: nextSlug });
+				if (conflict && conflict.id !== updated.id) {
+					throw new ClearanceError({ code: "ORG_SLUG_EXISTS", message: `Organization slug ${nextSlug} already exists in this environment`, stage: "orgs.update", status: 409 });
+				}
+				updated.slug = nextSlug;
+				fields.push("slug");
+			}
+			if (nextName !== undefined && nextName !== updated.name) { updated.name = nextName; fields.push("name"); }
+			if (fields.length === 0) return updated;
+			updated.updatedAt = now;
+			const written = await topology.upsertOrganization(updated);
+			appendAudit({
+				actor: input.actor ?? "operator", action: "orgs.update", subjectType: "organization",
+				subjectId: written.id, outcome: "success", source: (input.source as AuditEvent["source"]) ?? "cli",
+				projectId: written.projectId, environmentId: written.environmentId, organizationId: written.id,
+				message: `Updated organization ${written.name}`,
+				metadata: { fields, before, after: { name: written.name, slug: written.slug } },
+			});
+			return written;
+		});
+	} catch (error) {
+		return topologyLifecycleError(error, "organization-update", nextSlug);
+	}
+}
+
 export type ArchiveOrganizationResult = {
 	organization: Organization;
 	dryRun: boolean;
@@ -1598,6 +2634,43 @@ export function archiveOrganization(
 	return result;
 }
 
+/** Relational-authority-aware management-only organization archive. */
+export async function archiveOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	input?: {
+		dryRun?: boolean;
+		confirm?: boolean;
+		actor?: string;
+		source?: AuditEvent["source"] | "import";
+		scope?: ResourceScope;
+	},
+): Promise<ArchiveOrganizationResult> {
+	if (!store.storeV2Topology?.authoritative) return archiveOrganization(store, id, input);
+	const scope = input?.scope ?? resolveOperatorScope(store);
+	const orgId = id?.trim();
+	if (!orgId) throw new ClearanceError({ code: "ORG_ID_REQUIRED", message: "Organization id is required", stage: "orgs.archive", status: 400 });
+	const dryRun = input?.dryRun === true || input?.confirm !== true;
+	const existing = await store.storeV2Topology.getOrganization({ scope, id: orgId });
+	if (!existing) throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.archive", status: 404 });
+	const alreadyArchived = existing.status === "archived";
+	if (dryRun) return { organization: existing, dryRun: true, idempotent: alreadyArchived, wouldChange: !alreadyArchived };
+	if (!store.mutateStoreV2Topology) topologyMutationUnavailable("orgs.archive");
+	return await store.mutateStoreV2Topology(async ({ topology, appendAudit }) => {
+		await lockTopologyScope(topology, scope, "orgs.archive");
+		const organization = await topology.lockOrganization({ scope, id: orgId });
+		if (!organization || organization.status === "archived") throw new ClearanceError({ code: "ORG_NOT_FOUND", message: "Organization not found", stage: "orgs.archive", status: 404 });
+		const written = await topology.upsertOrganization({ ...organization, status: "archived", updatedAt: nowIso() });
+		appendAudit({
+			actor: input?.actor ?? "operator", action: "orgs.archive", subjectType: "organization",
+			subjectId: written.id, outcome: "success", source: (input?.source as AuditEvent["source"]) ?? "cli",
+			projectId: written.projectId, environmentId: written.environmentId, organizationId: written.id,
+			message: `Archived organization ${written.name}`, metadata: { idempotent: false },
+		});
+		return { organization: written, dryRun: false, idempotent: false, wouldChange: true };
+	});
+}
+
 // --- Users export (bounded, scoped, redacted, deterministic) ---
 
 export const USERS_EXPORT_DEFAULT_LIMIT = 100;
@@ -1631,7 +2704,7 @@ export type UsersExportEnvelope = {
 	filters: {
 		status?: "active" | "disabled";
 	};
-	users: Principal[];
+	users: User[];
 	outputPath?: string;
 	correlationId: string;
 };
@@ -1681,7 +2754,7 @@ export function normalizeUsersExportStatus(
 }
 
 /** Stable sort: email asc, then id asc. */
-export function sortUsersDeterministic(users: Principal[]): Principal[] {
+export function sortUsersDeterministic(users: User[]): User[] {
 	return [...users].sort((a, b) => {
 		const ea = a.email.toLowerCase();
 		const eb = b.email.toLowerCase();
@@ -1692,8 +2765,8 @@ export function sortUsersDeterministic(users: Principal[]): Principal[] {
 }
 
 /** Public export view of a principal — no write-only secrets (none stored). */
-export function sanitizePrincipalForExport(user: Principal): Principal {
-	const base: Principal = {
+export function sanitizePrincipalForExport(user: User): User {
+	const base: User = {
 		id: user.id,
 		projectId: user.projectId,
 		environmentId: user.environmentId,
@@ -1721,8 +2794,8 @@ export function selectUsersForExport(
 		status?: "active" | "disabled";
 		scope: ResourceScope;
 	},
-): { users: Principal[]; truncated: boolean } {
-	let users = store.snapshot.principals.filter(
+): { users: User[]; truncated: boolean } {
+	let users = principalReadView(store).filter(
 		(p) =>
 			p.status !== "deleted" &&
 			p.projectId === filter.scope.projectId &&
@@ -1791,16 +2864,14 @@ export function exportUsers(
 
 	if (opts.outputPath) {
 		const body = serializeUsersExportBody(envelope, format);
-		const written = writeExportArtifact(
-			opts.outputPath,
+		const written = writeExportArtifact({
+			outputPath: opts.outputPath,
 			body,
-			Boolean(opts.force),
-			{
+			force: Boolean(opts.force),
 				stage: "users.export",
 				existsCode: "USERS_EXPORT_EXISTS",
 				writeFailedCode: "USERS_EXPORT_WRITE_FAILED",
-			},
-		);
+		});
 		envelope.outputPath = written;
 	}
 
@@ -1828,6 +2899,82 @@ export function exportUsers(
 		});
 	}
 
+	return envelope;
+}
+
+/** Bounded authority-aware export backed by the relational email-order index. */
+export async function exportUsersAuthoritative(
+	store: ManagementStore,
+	opts: UsersExportOptions = {},
+): Promise<UsersExportEnvelope> {
+	if (!store.storeV2Principals?.authoritative) return exportUsers(store, opts);
+	const reader = store.storeV2Principals.listForExport;
+	if (!reader) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_EXPORT_READER_REQUIRED",
+			message: "Relational principal export reader is unavailable",
+			stage: "users.export",
+			status: 500,
+		});
+	}
+	const scope = opts.scope ?? resolveOperatorScope(store);
+	const limit = normalizeUsersExportLimit(opts.limit);
+	const format = normalizeUsersExportFormat(opts.format);
+	const status = normalizeUsersExportStatus(opts.status as string | undefined);
+	const corr = correlationId();
+	const selected = await reader({
+		scope,
+		limit,
+		...(status ? { status } : {}),
+	});
+	const users = selected.principals.map(sanitizePrincipalForExport);
+	const envelope: UsersExportEnvelope = {
+		schemaVersion: 1,
+		kind: "users.export",
+		exportedAt: nowIso(),
+		format,
+		scope,
+		limit,
+		count: users.length,
+		truncated: selected.hasMore,
+		filters: { ...(status ? { status } : {}) },
+		users,
+		correlationId: corr,
+	};
+	if (opts.outputPath) {
+		const written = writeExportArtifact({
+			outputPath: opts.outputPath,
+			body: serializeUsersExportBody(envelope, format),
+			force: Boolean(opts.force),
+				stage: "users.export",
+				existsCode: "USERS_EXPORT_EXISTS",
+				writeFailedCode: "USERS_EXPORT_WRITE_FAILED",
+		});
+		envelope.outputPath = written;
+	}
+	if (!opts.skipAudit) {
+		store.mutate((data) => {
+			appendAuditEvent(data, {
+				actor: opts.actor ?? "operator",
+				action: "users.export",
+				subjectType: "user_export",
+				outcome: "success",
+				source: opts.source ?? "cli",
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				correlationId: corr,
+				message: `Exported ${users.length} user(s)`,
+				metadata: {
+					count: users.length,
+					limit,
+					truncated: selected.hasMore,
+					format,
+					wroteFile: Boolean(envelope.outputPath),
+					filters: envelope.filters,
+				},
+			});
+		});
+	}
 	return envelope;
 }
 
@@ -1918,6 +3065,14 @@ export function createSession(
 	input: { principalId: string; environmentId: string; scope?: ResourceScope },
 ): SessionRecord {
 	const principal = inspectUser(store, input.principalId, input.scope);
+	return createSessionForPrincipal(store, principal, input);
+}
+
+function createSessionForPrincipal(
+	store: ManagementUnitOfWork,
+	principal: User,
+	input: { principalId: string; environmentId: string; scope?: ResourceScope },
+): SessionRecord {
 	if (input.scope && principal.environmentId !== input.environmentId) {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -1951,6 +3106,46 @@ export function createSession(
 	return session;
 }
 
+/** Transaction-bound session seed for normalized principal authority. */
+export async function createSessionAuthoritative(
+	store: ManagementStore,
+	input: { principalId: string; environmentId: string; scope?: ResourceScope },
+): Promise<SessionRecord> {
+	if (!store.storeV2Principals?.authoritative) return createSession(store, input);
+	if (!input.scope || typeof store.mutateCoordinated !== "function") {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_MUTATION_REQUIRED",
+			message: "Relational session creation requires scoped coordinated storage.",
+			stage: "sessions.create",
+			status: 500,
+		});
+	}
+	return store.mutateCoordinated(async ({ data, principals }) => {
+		const principal = await principals?.getById({
+			scope: input.scope!,
+			id: input.principalId,
+		});
+		if (!principal) {
+			throw new ClearanceError({
+				code: "USER_NOT_FOUND",
+				message: "User not found",
+				stage: "sessions.create",
+				status: 404,
+			});
+		}
+		const draft: ManagementUnitOfWork = {
+			get snapshot() {
+				return data;
+			},
+			mutate(mutator) {
+				mutator(data);
+				return data;
+			},
+		};
+		return createSessionForPrincipal(draft, principal, input);
+	});
+}
+
 export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	const users = listUsers(store, scope ? { scope } : undefined);
 	const orgs = listOrganizations(store, scope ? { scope } : undefined);
@@ -1961,7 +3156,7 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 	const activeSessions = store.snapshot.sessions.filter((s) => {
 		if (s.status !== "active") return false;
 		if (!scope) return true;
-		const p = store.snapshot.principals.find((x) => x.id === s.principalId);
+		const p = principalReadView(store).find((x) => x.id === s.principalId);
 		return p
 			? p.projectId === scope.projectId && p.environmentId === scope.environmentId
 			: false;
@@ -1975,6 +3170,144 @@ export function overviewStats(store: ManagementStore, scope?: ResourceScope) {
 		releaseVersion: store.snapshot.releaseVersion,
 		schemaVersion: store.snapshot.meta.schemaVersion,
 		resourceCounts: store.resourceCounts(),
+	};
+}
+
+export type AuthoritativeOverviewResourceCounts = Readonly<{
+	projects: number;
+	environments: number;
+	principals: number;
+	organizations: number;
+	memberships: number;
+	ssoConnections: number;
+	scimConnections: number;
+	roles: number;
+	setupLinks: number;
+	events: number | null;
+	traces: number;
+	migrations: number;
+	sessions: number;
+	apiKeys: number;
+}>;
+
+export type AuthoritativeOverviewStats = Omit<
+	ReturnType<typeof overviewStats>,
+	"resourceCounts"
+> & {
+	/** Only authority-unavailable resources are nullable. */
+	resourceCounts: AuthoritativeOverviewResourceCounts;
+};
+
+function authoritativeOverviewResourceCounts(
+	counts: Record<string, number>,
+): AuthoritativeOverviewResourceCounts {
+	const required = (key: string): number => {
+		const value = counts[key];
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+			throw new ClearanceError({
+				code: "OVERVIEW_RESOURCE_COUNTS_INVALID",
+				message: `Overview resource count ${key} is unavailable or invalid`,
+				stage: "overview",
+				status: 500,
+			});
+		}
+		return value;
+	};
+	return {
+		projects: required("projects"),
+		environments: required("environments"),
+		principals: required("principals"),
+		organizations: required("organizations"),
+		memberships: required("memberships"),
+		ssoConnections: required("ssoConnections"),
+		scimConnections: required("scimConnections"),
+		roles: required("roles"),
+		setupLinks: required("setupLinks"),
+		events: required("events"),
+		traces: required("traces"),
+		migrations: required("migrations"),
+		sessions: required("sessions"),
+		apiKeys: required("apiKeys"),
+	};
+}
+
+export async function overviewStatsAuthoritative(
+	store: ManagementStore,
+	scope?: ResourceScope,
+): Promise<AuthoritativeOverviewStats> {
+	const principalsAuthoritative = store.storeV2Principals?.authoritative === true;
+	const topologyAuthoritative = store.storeV2Topology?.authoritative === true;
+	const eventsAuthoritative = store.storeV2Events?.authoritative === true;
+	if (!principalsAuthoritative && !topologyAuthoritative && !eventsAuthoritative) {
+		const overview = overviewStats(store, scope);
+		return {
+			...overview,
+			resourceCounts: authoritativeOverviewResourceCounts(overview.resourceCounts),
+		};
+	}
+	const resolvedScope = scope ?? resolveOperatorScope(store);
+	const principalCounts = principalsAuthoritative
+		? (() => {
+			const countReader = store.storeV2Principals?.countByScope;
+			if (!countReader) {
+				throw new ClearanceError({
+					code: "STORE_V2_PRINCIPAL_COUNT_READER_REQUIRED",
+					message: "Relational principal count reader is unavailable",
+					stage: "overview",
+					status: 500,
+				});
+			}
+			return countReader({ scope: resolvedScope });
+		})()
+		: Promise.resolve((() => {
+			const users = listUsers(store, { scope: resolvedScope });
+			return {
+				total: users.length,
+				active: users.filter((user) => user.status === "active").length,
+			};
+		})());
+	const activeSessions = principalsAuthoritative
+		? store.storeV2Principals?.countActiveSessions?.({ scope: resolvedScope }) ??
+			Promise.resolve(0)
+		: Promise.resolve(store.snapshot.sessions.filter((session) => {
+			if (session.status !== "active") return false;
+			const principal = principalReadView(store).find(
+				(candidate) => candidate.id === session.principalId,
+			);
+			return principal
+				? principal.projectId === resolvedScope.projectId &&
+					principal.environmentId === resolvedScope.environmentId
+				: false;
+		}).length);
+	const organizationCount = topologyAuthoritative
+		? store.storeV2Topology!.countOrganizations({ scope: resolvedScope })
+		: Promise.resolve(listOrganizations(store, { scope: resolvedScope }).length);
+	const [counts, sessions, organizations] = await Promise.all([
+		principalCounts,
+		activeSessions,
+		organizationCount,
+	]);
+	const recentEvents = eventsAuthoritative
+		? (await store.storeV2Events.listPage({
+				scope: resolvedScope,
+				limit: 10,
+			})).events
+		: listEvents(store, { limit: 10, scope: resolvedScope });
+	const resourceCounts = authoritativeOverviewResourceCounts(store.resourceCounts());
+	return {
+		totalUsers: counts.total,
+		activeUsers: counts.active,
+		organizations,
+		activeSessions: sessions,
+		recentEvents,
+		releaseVersion: store.snapshot.releaseVersion,
+		schemaVersion: store.snapshot.meta.schemaVersion,
+		resourceCounts: {
+			...resourceCounts,
+			principals: counts.total,
+			sessions,
+			events: eventsAuthoritative ? null : resourceCounts.events,
+		},
 	};
 }
 

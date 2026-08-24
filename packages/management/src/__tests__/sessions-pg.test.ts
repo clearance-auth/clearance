@@ -3,6 +3,7 @@
  * confirm DB cleanup + management tombstone + audit, clean fixtures.
  */
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { createHash, randomUUID } from "node:crypto";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
@@ -28,7 +29,13 @@ const TEST_TABLE = `clearance_mgmt_sessions_${process.pid}`;
 const createdRuntimeUserIds = new Set<string>();
 const createdRuntimeEmails = new Set<string>();
 const createdSessionIds = new Set<string>();
+const createdCredentialIds = new Set<string>();
 
+function sessionCredentialDigest(token: string): string {
+	return `v1:${createHash("sha256")
+		.update(`clearance:session-refresh:v1:${token}`)
+		.digest("base64url")}`;
+}
 
 function trackRuntimeUser(user: { id: string; email?: string | null }): void {
 	createdRuntimeUserIds.add(user.id);
@@ -38,6 +45,14 @@ function trackRuntimeUser(user: { id: string; email?: string | null }): void {
 async function cleanupFixtures(): Promise<void> {
 	const pool = new pg.Pool({ connectionString: DATABASE_URL });
 	try {
+		const credentialIds = [...createdCredentialIds];
+		if (credentialIds.length > 0) {
+			await pool
+				.query(`delete from "sessionCredential" where id = any($1::text[])`, [
+					credentialIds,
+				])
+				.catch(() => undefined);
+		}
 		const sessionIds = [...createdSessionIds];
 		if (sessionIds.length > 0) {
 			await pool
@@ -97,6 +112,7 @@ describe.skipIf(!available)("sessions Postgres runtime list / revoke", () => {
 	afterEach(async () => {
 		await cleanupFixtures().catch(() => undefined);
 		createdSessionIds.clear();
+		createdCredentialIds.clear();
 		createdRuntimeUserIds.clear();
 		createdRuntimeEmails.clear();
 		resetAuthBundle();
@@ -140,20 +156,35 @@ describe.skipIf(!available)("sessions Postgres runtime list / revoke", () => {
 	async function insertRuntimeSession(
 		userId: string,
 		opts?: { id?: string; token?: string; expiresAt?: Date },
-	): Promise<{ id: string; token: string }> {
+	): Promise<{ id: string; token: string; credentialId: string }> {
 		const b = getAuthBundle();
 		const id = opts?.id ?? `sess_test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		const token =
-			opts?.token ??
-			`tok_secret_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+		const credentialId = randomUUID();
+		const token = opts?.token ??
+			`clr_rt_${credentialId}~${randomUUID().replaceAll("-", "")}`;
 		const expires = opts?.expiresAt ?? new Date(Date.now() + 60 * 60 * 1000);
 		await b.pool.query(
 			`insert into session (id, token, "userId", "expiresAt", "createdAt", "updatedAt", "ipAddress", "userAgent")
        values ($1, $2, $3, $4, now(), now(), $5, $6)`,
-			[id, token, userId, expires, "127.0.0.1", "sessions-pg-test"],
+			[id, `clr_sid_${id}`, userId, expires, "127.0.0.1", "sessions-pg-test"],
+		);
+		await b.pool.query(
+			`insert into "sessionCredential" (
+				id, selector, "sessionId", "familyId", "secretDigest",
+				"digestVersion", status, "rotationCounter", "expiresAt",
+				"createdAt", "updatedAt"
+			) values ($1, $1, $2, $3, $4, 1, 'active', 0, $5, now(), now())`,
+			[
+				credentialId,
+				id,
+				randomUUID(),
+				sessionCredentialDigest(token),
+				expires,
+			],
 		);
 		createdSessionIds.add(id);
-		return { id, token };
+		createdCredentialIds.add(credentialId);
+		return { id, token, credentialId };
 	}
 
 	it("lists runtime session without token, revokes with DB delete + audit, idempotent re-revoke", async () => {
@@ -170,7 +201,7 @@ describe.skipIf(!available)("sessions Postgres runtime list / revoke", () => {
 		trackRuntimeUser(user);
 
 		const secretToken = `never-expose-this-token-${Date.now()}`;
-		const { id: sessionId } = await insertRuntimeSession(user.id, {
+		const { id: sessionId, credentialId } = await insertRuntimeSession(user.id, {
 			token: secretToken,
 		});
 
@@ -186,14 +217,52 @@ describe.skipIf(!available)("sessions Postgres runtime list / revoke", () => {
 		expect(listedJson).not.toMatch(/"token"/);
 		expect(hit).not.toHaveProperty("token");
 
-		// Prove token still only in DB, not in operator view
+		// Prove persistence retains only a stable handle and one-way digest.
 		const b = getAuthBundle();
 		const before = await b.pool.query(
-			`select id, token from session where id = $1`,
+			`select session.id, session.token, credential."secretDigest"
+			 from session
+			 join "sessionCredential" credential on credential."sessionId" = session.id
+			 where session.id = $1`,
 			[sessionId],
 		);
 		expect(before.rows).toHaveLength(1);
-		expect(before.rows[0]?.token).toBe(secretToken);
+		expect(before.rows[0]?.token).toBe(`clr_sid_${sessionId}`);
+		expect(before.rows[0]?.secretDigest).toBe(
+			sessionCredentialDigest(secretToken),
+		);
+		expect(JSON.stringify(before.rows[0])).not.toContain(secretToken);
+
+		const preservedReuseDetectedAt = new Date("2026-07-01T12:00:00.000Z");
+		await b.pool.query(
+			`update "sessionCredential"
+			 set "reuseDetectedAt" = $2,
+			     "rotationNonceDigest" = 'rotation-nonce-digest-to-scrub',
+			     "recoverySecretCiphertext" = 'recovery-ciphertext-to-scrub',
+			     "recoveryExpiresAt" = now() + interval '5 minutes'
+			 where id = $1`,
+			[credentialId, preservedReuseDetectedAt],
+		);
+		const siblingCredentialId = randomUUID();
+		createdCredentialIds.add(siblingCredentialId);
+		await b.pool.query(
+			`insert into "sessionCredential" (
+				id, selector, "sessionId", "familyId", "secretDigest",
+				"digestVersion", status, "rotationCounter", "expiresAt",
+				"rotationNonceDigest", "recoverySecretCiphertext", "recoveryExpiresAt",
+				"createdAt", "updatedAt"
+			) values (
+				$1, $1, $2, $3, $4, 1, 'consumed', 1, now() + interval '1 hour',
+				'other-rotation-nonce-digest', 'other-recovery-ciphertext',
+				now() + interval '5 minutes', now(), now()
+			)`,
+			[
+				siblingCredentialId,
+				sessionId,
+				randomUUID(),
+				sessionCredentialDigest(`${secretToken}-sibling`),
+			],
+		);
 
 		const first = await revokeSessionInAuth(store, sessionId, {
 			actor: "test",
@@ -209,6 +278,34 @@ describe.skipIf(!available)("sessions Postgres runtime list / revoke", () => {
 			sessionId,
 		]);
 		expect(after.rows).toHaveLength(0);
+		const credentialTombstones = await b.pool.query(
+			`select id, "sessionId", status, "revokedAt", "updatedAt",
+			        "reuseDetectedAt", "rotationNonceDigest",
+			        "recoverySecretCiphertext", "recoveryExpiresAt"
+			 from "sessionCredential"
+			 where id = any($1::text[])
+			 order by id`,
+			[[credentialId, siblingCredentialId]],
+		);
+		expect(credentialTombstones.rows).toHaveLength(2);
+		for (const row of credentialTombstones.rows) {
+			expect(row.sessionId).toBeNull();
+			expect(row.status).toBe("revoked");
+			expect(row.revokedAt).toBeInstanceOf(Date);
+			expect(row.updatedAt).toBeInstanceOf(Date);
+			expect(row.updatedAt).toEqual(row.revokedAt);
+			expect(row.rotationNonceDigest).toBeNull();
+			expect(row.recoverySecretCiphertext).toBeNull();
+			expect(row.recoveryExpiresAt).toBeNull();
+		}
+		const preserved = credentialTombstones.rows.find(
+			(row) => row.id === credentialId,
+		);
+		expect(preserved?.reuseDetectedAt).toEqual(preservedReuseDetectedAt);
+		const sibling = credentialTombstones.rows.find(
+			(row) => row.id === siblingCredentialId,
+		);
+		expect(sibling?.reuseDetectedAt).toBeNull();
 
 		// Management tombstone present for idempotent contract
 		const tombstone = store.snapshot.sessions.find((s) => s.id === sessionId);

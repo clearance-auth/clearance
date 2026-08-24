@@ -1,5 +1,6 @@
 import type { User } from "@clearance/runtime";
 import { getUserFullName } from "./mappings";
+import { SCIMAPIError } from "./scim-error";
 
 type Operation = {
 	op: "add" | "remove" | "replace";
@@ -17,6 +18,24 @@ type Resources = {
 	user: Record<string, any>;
 	account: Record<string, any>;
 };
+
+/**
+ * Limits PATCH request complexity before any persistence work begins. These
+ * are deliberately exported so deployments and tests can share the exact
+ * contract rather than duplicating magic numbers.
+ */
+export const SCIM_USER_PATCH_LIMITS = {
+	maxOperations: 100,
+	maxDepth: 32,
+	maxNodes: 1_000,
+	maxStringBytes: 8 * 1024,
+	maxCollectionEntries: 100,
+} as const;
+
+const invalidPatchRequest = () =>
+	new SCIMAPIError("BAD_REQUEST", {
+		detail: "SCIM PATCH request exceeds supported complexity limits",
+	});
 
 const identity = (user: User, op: Operation, resources: Resources) => {
 	return op.value;
@@ -123,13 +142,77 @@ const applyPatchValue = (
 	op: "add" | "replace",
 	path?: string | undefined,
 ) => {
-	if (isNestedObject(value)) {
-		for (const [key, nestedValue] of Object.entries(value)) {
-			const nestedPath = path ? `${path}.${key}` : key;
-			applyPatchValue(user, resources, nestedValue, op, nestedPath);
+	const pending: Array<{ value: unknown; path?: string }> = [{ value, path }];
+
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if (!current) break;
+
+		if (isNestedObject(current.value)) {
+			for (const [key, nestedValue] of Object.entries(current.value)) {
+				pending.push({
+					value: nestedValue,
+					path: current.path ? `${current.path}.${key}` : key,
+				});
+			}
+		} else if (current.path) {
+			applyMapping(user, resources, current.path, current.value, op);
 		}
-	} else if (path) {
-		applyMapping(user, resources, path, value, op);
+	}
+};
+
+/** Validate arbitrary PATCH values iteratively, avoiding stack exhaustion. */
+export const assertUserPatchWithinLimits = (operations: Operation[]) => {
+	if (operations.length > SCIM_USER_PATCH_LIMITS.maxOperations) {
+		throw invalidPatchRequest();
+	}
+
+	let nodes = 0;
+	const seen = new WeakSet<object>();
+	const pending: Array<{ value: unknown; depth: number }> = [];
+
+	for (const operation of operations) {
+		pending.push({ value: operation.path, depth: 0 });
+		pending.push({ value: operation.value, depth: 0 });
+	}
+
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if (!current) break;
+		nodes += 1;
+		if (nodes > SCIM_USER_PATCH_LIMITS.maxNodes) throw invalidPatchRequest();
+
+		if (typeof current.value === "string") {
+			if (new TextEncoder().encode(current.value).byteLength > SCIM_USER_PATCH_LIMITS.maxStringBytes) {
+				throw invalidPatchRequest();
+			}
+			continue;
+		}
+
+		if (!current.value || typeof current.value !== "object") continue;
+		if (current.depth >= SCIM_USER_PATCH_LIMITS.maxDepth || seen.has(current.value)) {
+			throw invalidPatchRequest();
+		}
+		seen.add(current.value);
+
+		if (Array.isArray(current.value)) {
+			if (current.value.length > SCIM_USER_PATCH_LIMITS.maxCollectionEntries) {
+				throw invalidPatchRequest();
+			}
+			for (const entry of current.value) {
+				pending.push({ value: entry, depth: current.depth + 1 });
+			}
+			continue;
+		}
+
+		const entries = Object.entries(current.value);
+		if (entries.length > SCIM_USER_PATCH_LIMITS.maxCollectionEntries) {
+			throw invalidPatchRequest();
+		}
+		for (const [key, entry] of entries) {
+			pending.push({ value: key, depth: current.depth + 1 });
+			pending.push({ value: entry, depth: current.depth + 1 });
+		}
 	}
 };
 

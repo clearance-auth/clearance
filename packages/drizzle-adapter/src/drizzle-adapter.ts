@@ -41,6 +41,13 @@ export interface DB {
 	[key: string]: any;
 }
 
+type CreateIfAbsentInput<T extends Record<string, any>> = {
+	model: string;
+	data: T;
+	uniqueBy: { field: string; value: any };
+	attemptBy: { field: string; value: unknown };
+};
+
 /**
  * Derive the number of affected rows from a Drizzle write result.
  *
@@ -486,6 +493,47 @@ export const drizzleAdapter = (db: DB, config: DrizzleAdapterConfig) => {
 					const returned = await withReturning(model, builder, values);
 					return returned;
 				},
+				async createIfAbsent<T extends Record<string, any>>({
+					model,
+					data: values,
+					uniqueBy,
+					attemptBy,
+				}: CreateIfAbsentInput<T>): Promise<T | null> {
+					const schemaModel = getSchema(model);
+					checkMissingFields(schemaModel, model, values);
+					const uniqueColumn = schemaModel[uniqueBy.field];
+					if (!uniqueColumn) {
+						throw new ClearanceError(
+							`The field "${uniqueBy.field}" does not exist in the schema for the model "${model}".`,
+						);
+					}
+					if (config.provider === "mysql") {
+						await db
+							.insert(schemaModel)
+							.values(values)
+							.onDuplicateKeyUpdate({
+								set: { [uniqueBy.field]: sql`${uniqueColumn}` },
+							});
+						const rows = await db
+							.select()
+							.from(schemaModel)
+							.where(eq(uniqueColumn, uniqueBy.value))
+							.limit(1);
+						const row = rows[0] as any;
+						return row && row[attemptBy.field] === attemptBy.value
+							? (row as T)
+							: null;
+					}
+					const inserted = await db
+						.insert(schemaModel)
+						.values(values)
+						.onConflictDoNothing({ target: uniqueColumn })
+						.returning();
+					const row = inserted[0] as any;
+					return row && row[attemptBy.field] === attemptBy.value
+						? (row as T)
+						: null;
+				},
 				async findOne({ model, where, select, join }) {
 					const schemaModel = getSchema(model);
 					const clause = convertWhereClause(where, model);
@@ -859,7 +907,7 @@ export const drizzleAdapter = (db: DB, config: DrizzleAdapterConfig) => {
 					const updated = await db
 						.update(schemaModel)
 						.set(assignments)
-						.where(inArray(idColumn, targetIds))
+						.where(and(inArray(idColumn, targetIds), ...clause))
 						.returning();
 					return (updated[0] as any) ?? null;
 				},

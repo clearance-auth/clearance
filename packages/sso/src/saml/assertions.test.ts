@@ -56,6 +56,28 @@ describe("validateSingleAssertion", () => {
 		});
 	});
 
+	describe("XML entity defenses", () => {
+		it("should reject a DOCTYPE before parsing inbound SAML", () => {
+			const xml = `
+				<!DOCTYPE Response [<!ENTITY user "user@example.com">]>
+				<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+					xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+					<saml:Assertion ID="123">
+						<saml:Subject><saml:NameID>&user;</saml:NameID></saml:Subject>
+					</saml:Assertion>
+				</samlp:Response>
+			`;
+
+			expect(() => validateSingleAssertion(encode(xml))).toThrow(
+				expect.objectContaining({
+					body: expect.objectContaining({
+						code: "SAML_DOCTYPE_FORBIDDEN",
+					}),
+				}),
+			);
+		});
+	});
+
 	describe("no assertions", () => {
 		it("should reject response with no assertions", () => {
 			const xml = `

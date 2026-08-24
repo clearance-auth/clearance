@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	JsonStore,
@@ -22,7 +22,7 @@ import {
 	restoreBackup,
 	rollbackMigration,
 	runDoctor,
-	runMigration,
+	applyMigration,
 	runReadinessCheck,
 	testScimConnection,
 	testSsoConnection,
@@ -30,6 +30,7 @@ import {
 	verifyBackup,
 	verifyMigration,
 } from "../index.js";
+import { getLatestReadiness } from "../services/readiness.js";
 
 const dirs: string[] = [];
 
@@ -169,7 +170,7 @@ describe("enterprise SSO/SCIM + readiness", () => {
 
 		const report = runReadinessCheck(store, org.id);
 		expect(report.checks.length).toBeGreaterThan(3);
-		expect(report.signature).toMatch(/^[a-f0-9]{16}$/);
+		expect(report.reportDigest).toMatch(/^[a-f0-9]{16}$/);
 		expect(["ready", "attention", "blocked"]).toContain(report.overall);
 		// Fixture passes are simulation — never liveCertified
 		expect(report.conformance.liveCertified).toBe(false);
@@ -209,6 +210,24 @@ describe("enterprise SSO/SCIM + readiness", () => {
 		const snap = JSON.stringify(store.snapshot);
 		expect(snap).not.toContain("super-secret-client-value");
 	});
+
+	it("marks a stored report stale after an enabled enterprise connection changes", () => {
+		const store = tempStore();
+		initProject(store, { name: "Readiness freshness" });
+		const org = createOrganization(store, { name: "Enterprise" });
+		const scim = createScimConnection(store, { organizationId: org.id, provider: "okta" });
+		runReadinessCheck(store, org.id);
+		store.mutate((data) => {
+			const connection = data.scimConnections.find((candidate) => candidate.id === scim.id)!;
+			connection.status = "disabled";
+			connection.updatedAt = new Date(Date.now() + 1).toISOString();
+		});
+		expect(getLatestReadiness(store, org.id)).toMatchObject({
+			state: "stale",
+			overall: "blocked",
+			conformance: { liveCertified: false },
+		});
+	});
 });
 
 describe("migration", () => {
@@ -232,13 +251,13 @@ describe("migration", () => {
 		writeFileSync(fixturePath, JSON.stringify(fixture));
 		const loaded = loadLegacyFixture(fixturePath);
 		const plan = planMigration(store, loaded);
-		runMigration(store, plan.id, loaded, { dryRun: true });
-		runMigration(store, plan.id, loaded, { dryRun: false });
+		applyMigration(store, plan.id, loaded, { dryRun: true });
+		applyMigration(store, plan.id, loaded, { dryRun: false });
 		const verified = verifyMigration(store, plan.id, loaded);
 		expect(verified.reconciled).toBe(true);
 		expect(verified.actual.users).toBe(2);
 		expect(verified.plan.checkpoint.phase).toBe("verified");
-		expect(() => runMigration(store, plan.id, loaded)).toThrowError(
+		expect(() => applyMigration(store, plan.id, loaded)).toThrowError(
 			expect.objectContaining({ code: "CLEARANCE_IMPORT_PLAN_STATE_INVALID" }),
 		);
 
@@ -255,7 +274,7 @@ describe("migration", () => {
 		expect(() => verifyMigration(store, plan.id, loaded)).toThrow(
 			/reconcil|mismatch/i,
 		);
-		expect(() => runMigration(store, plan.id, loaded)).toThrowError(
+		expect(() => applyMigration(store, plan.id, loaded)).toThrowError(
 			expect.objectContaining({ code: "CLEARANCE_IMPORT_PLAN_STATE_INVALID" }),
 		);
 
@@ -318,7 +337,7 @@ describe("migration", () => {
 		};
 
 		const plan = planMigration(store, fixture);
-		runMigration(store, plan.id, fixture);
+		applyMigration(store, plan.id, fixture);
 		expect(verifyMigration(store, plan.id, fixture).reconciled).toBe(true);
 		expect(store.snapshot.migrations[0].createdResourceIds).toEqual({
 			users: [],
@@ -327,7 +346,7 @@ describe("migration", () => {
 		});
 
 		rollbackMigration(store, plan.id, fixture);
-		expect(() => runMigration(store, plan.id, fixture)).toThrowError(
+		expect(() => applyMigration(store, plan.id, fixture)).toThrowError(
 			expect.objectContaining({ code: "CLEARANCE_IMPORT_PLAN_STATE_INVALID" }),
 		);
 		expect(store.snapshot.principals.some((candidate) => candidate.id === user.id)).toBe(true);
@@ -350,7 +369,7 @@ describe("migration", () => {
 		try {
 			for (const operation of [
 				() => migrationStatus(store, plan.id),
-				() => runMigration(store, plan.id, fixture),
+				() => applyMigration(store, plan.id, fixture),
 				() => verifyMigration(store, plan.id, fixture),
 				() => rollbackMigration(store, plan.id, fixture),
 			]) {
@@ -388,12 +407,12 @@ describe("migration", () => {
 		store.mutate((data) => {
 			data.memberships[data.memberships.findIndex((candidate) => candidate.id === membership.id)]!.role = "admin";
 		});
-		expect(() => runMigration(store, plan.id, fixture)).toThrowError(expect.objectContaining({ code: "CLEARANCE_IMPORT_MEMBERSHIP_ROLE_CONFLICT" }));
+		expect(() => applyMigration(store, plan.id, fixture)).toThrowError(expect.objectContaining({ code: "CLEARANCE_IMPORT_MEMBERSHIP_ROLE_CONFLICT" }));
 
 		store.mutate((data) => {
 			data.memberships[data.memberships.findIndex((candidate) => candidate.id === membership.id)]!.role = "member";
 		});
-		runMigration(store, plan.id, fixture);
+		applyMigration(store, plan.id, fixture);
 		store.mutate((data) => {
 			data.memberships[data.memberships.findIndex((candidate) => candidate.id === membership.id)]!.role = "admin";
 		});
@@ -410,9 +429,9 @@ describe("migration", () => {
 			members: [{ userId: "ba_user", organizationId: "ba_org", role: "member" }],
 		};
 		const plan = planMigration(store, fixture);
-		const imported = runMigration(store, plan.id, fixture);
+		const imported = applyMigration(store, plan.id, fixture);
 		const originalLedger = JSON.parse(JSON.stringify(imported.rollbackResourceState));
-		expect(() => runMigration(store, plan.id, fixture)).toThrowError(expect.objectContaining({ code: "CLEARANCE_IMPORT_PLAN_STATE_INVALID" }));
+		expect(() => applyMigration(store, plan.id, fixture)).toThrowError(expect.objectContaining({ code: "CLEARANCE_IMPORT_PLAN_STATE_INVALID" }));
 		expect(migrationStatus(store, plan.id).rollbackResourceState).toEqual(originalLedger);
 
 		store.mutate((data) => {
@@ -452,10 +471,10 @@ describe("backup and upgrade", () => {
 		const verified = verifyBackup(store, bak.id);
 		expect(verified.verified).toBe(true);
 
-		const isolated = join(dirs[dirs.length - 1], "isolated-restore.json");
-		const restored = restoreBackup(store, bak.id, isolated);
+		const restored = restoreBackup(store, bak.id);
 		expect(restored.counts.projects).toBe(1);
 		expect(restored.checksum).toBe(bak.checksum);
+		expect(dirname(restored.targetPath)).toBe(join(dirname(bak.path), "restores"));
 
 		const upgrade = upgradeCheck(store);
 		expect(upgrade.current).toBeTruthy();

@@ -1,12 +1,12 @@
 import {
 	createUserInAuth,
 	createUserWithPasswordSetupInAuth,
-	createOrgInAuth,
 	addMemberInAuth,
 	archiveOrganizationInAuth,
 	deleteUserInAuth,
 	disableUserInAuth,
 	ensureAuthMigrated,
+	provisionOrganizationInAuth,
 	inspectSessionInAuth,
 	listSessionsPageInAuth,
 	removeMemberInAuth,
@@ -14,18 +14,31 @@ import {
 	updateMemberInAuth,
 	updateOrganizationInAuth,
 	updateUserInAuth,
+	registerTenantProductAdministrationFacade,
 } from "../auth-bridge.js";
-import { syncRuntimeOrganizationToManagementDurable } from "../services/identity.js";
 import type { AuthRuntimeGateway } from "../application/auth-runtime-gateway.js";
 import type { ManagementStore } from "../store/types.js";
+import { resolveOperatorScope } from "../services/scope.js";
+import {
+	validateManagementWebhookTargets,
+	type ManagementWebhookTarget,
+} from "../application/delivery.js";
 
 export function createAuthBridgeRuntimeGateway(input: {
 	store: ManagementStore;
+	webhookTargets?: readonly ManagementWebhookTarget[];
 }): AuthRuntimeGateway {
 	const { store } = input;
 	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
 		throw new Error("AuthBridgeRuntimeGateway requires a coordinated Postgres management store");
 	}
+	registerTenantProductAdministrationFacade({
+		store,
+		scope: resolveOperatorScope(store),
+	});
+	const webhookTargets = validateManagementWebhookTargets(
+		input.webhookTargets ?? [],
+	);
 
 	return {
 		users: {
@@ -86,23 +99,13 @@ export function createAuthBridgeRuntimeGateway(input: {
 		},
 		organizations: {
 			async provision(context, provisionInput) {
-				await ensureAuthMigrated();
-				const runtimeOrganization = await createOrgInAuth({
+				return provisionOrganizationInAuth(store, {
 					name: provisionInput.name,
 					...(provisionInput.slug !== undefined ? { slug: provisionInput.slug } : {}),
-					userId: provisionInput.ownerUserId,
+					ownerUserId: provisionInput.ownerUserId,
+					scope: context.scope,
+					actor: context.actor,
 				});
-				return syncRuntimeOrganizationToManagementDurable(
-					store,
-					runtimeOrganization,
-					provisionInput.ownerUserId,
-					{
-						projectId: context.scope.projectId,
-						environmentId: context.scope.environmentId,
-						actor: context.actor,
-						role: "owner",
-					},
-				);
 			},
 			updateCoordinated: (context, id, updateInput) =>
 				updateOrganizationInAuth(store, id, {
@@ -110,6 +113,10 @@ export function createAuthBridgeRuntimeGateway(input: {
 					actor: context.actor,
 					source: context.source,
 					scope: context.scope,
+					...(context.correlationId
+						? { correlationId: context.correlationId }
+						: {}),
+					webhookTargets,
 				}),
 			archiveCoordinated: (context, id, archiveInput) =>
 				archiveOrganizationInAuth(store, id, {
@@ -117,6 +124,10 @@ export function createAuthBridgeRuntimeGateway(input: {
 					actor: context.actor,
 					source: context.source,
 					scope: context.scope,
+					...(context.correlationId
+						? { correlationId: context.correlationId }
+						: {}),
+					webhookTargets,
 				}),
 		},
 		members: {

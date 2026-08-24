@@ -1,5 +1,10 @@
 import type { GenericEndpointContext } from "@clearance/core";
-import { createAuthEndpoint } from "@clearance/core/api";
+import { createAuthEndpoint, createAuthMiddleware } from "@clearance/core/api";
+import {
+	AfterTransactionHookError,
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@clearance/core/context";
 import type { Account } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import type { OAuth2Tokens } from "@clearance/core/oauth2";
@@ -8,21 +13,88 @@ import { SocialProviderListEnum } from "@clearance/core/social-providers";
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
 import { shouldBindAccountCookieToSessionUser } from "../../context/store-capabilities";
+import { setSessionCookie } from "../../cookies";
 import {
 	getAccountCookie,
 	setAccountCookie,
 } from "../../cookies/session-store";
+import { generateRandomString } from "../../crypto/random";
+import {
+	PASSKEY_SESSION_GENERATION_FIELD,
+	rotatePasskeySessionGeneration,
+} from "../../db/passkey-session-generation";
 import { parseAccountOutput } from "../../db/schema";
+import {
+	rotateTwoFactorSessionGeneration,
+	TWO_FACTOR_SESSION_GENERATION_FIELD,
+} from "../../db/two-factor-session-generation";
+import { lockAndReadUser } from "../../db/user-authority";
+import {
+	captureInternalSessionIssuanceContext,
+} from "../../internal/session-issuance-context";
 import { missingEmailLogMessage } from "../../oauth2/errors";
 import { applyUpdateUserInfoOnLink } from "../../oauth2/link-account";
 import { generateState } from "../../oauth2/state";
 import { decryptOAuthToken, setTokenUtil } from "../../oauth2/utils";
+import type { Session, User } from "../../types";
 import {
-	freshSessionMiddleware,
+	getAuthoritativeSessionFromCtx,
 	getSessionFromCtx,
 	isStateful,
 	sessionMiddleware,
 } from "./session";
+
+const freshAuthoritativeSessionMiddleware = createAuthMiddleware(async (ctx) => {
+	const session = await getAuthoritativeSessionFromCtx(ctx);
+	if (!session?.session) {
+		throw APIError.from("UNAUTHORIZED", {
+			message: "Unauthorized",
+			code: "UNAUTHORIZED",
+		});
+	}
+	if (ctx.context.sessionConfig.freshAge !== 0) {
+		const createdAt = new Date(session.session.createdAt).getTime();
+		const freshAge = ctx.context.sessionConfig.freshAge * 1000;
+		if (Date.now() - createdAt >= freshAge) {
+			throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.SESSION_NOT_FRESH);
+		}
+	}
+	return { session };
+});
+
+function assertCredentialFactorLifecycleConfiguration(
+	ctx: GenericEndpointContext,
+): void {
+	if (
+		typeof ctx.context.adapter.options?.adapterConfig.transaction !== "function" ||
+		(ctx.context.options.secondaryStorage !== undefined &&
+			ctx.context.options.session?.storeSessionInDatabase !== true)
+	) {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			BASE_ERROR_CODES.FACTOR_LIFECYCLE_CONFIGURATION_ERROR,
+		);
+	}
+}
+
+function lastFactorProtected(): never {
+	throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.LAST_FACTOR_PROTECTED);
+}
+
+function factorLifecycleConflict(): never {
+	throw APIError.from("CONFLICT", BASE_ERROR_CODES.FACTOR_LIFECYCLE_CONFLICT);
+}
+
+function logFactorLifecycleFailure(
+	ctx: GenericEndpointContext,
+	label: string,
+	error: unknown,
+): void {
+	ctx.context.logger.debug(
+		`[account] ${label}`,
+		error instanceof Error ? error.name : "unknown error",
+	);
+}
 
 export const listUserAccounts = createAuthEndpoint(
 	"/list-accounts",
@@ -329,9 +401,15 @@ export const linkSocialAccount = createAuthEndpoint(
 					userId: session.user.id,
 					providerId: provider.id,
 					accountId: linkingUserId,
-					accessToken: c.body.idToken.accessToken,
-					idToken: token,
-					refreshToken: c.body.idToken.refreshToken,
+					accessToken: await setTokenUtil(
+						c.body.idToken.accessToken,
+						c.context,
+					),
+					idToken: await setTokenUtil(token, c.context),
+					refreshToken: await setTokenUtil(
+						c.body.idToken.refreshToken,
+						c.context,
+					),
 					scope: c.body.idToken.scopes?.join(","),
 				});
 			} catch (_e: any) {
@@ -385,7 +463,7 @@ export const unlinkAccount = createAuthEndpoint(
 			providerId: z.string(),
 			accountId: z.string().optional(),
 		}),
-		use: [freshSessionMiddleware],
+		use: [freshAuthoritativeSessionMiddleware],
 		metadata: {
 			openapi: {
 				description: "Unlink an account",
@@ -411,8 +489,9 @@ export const unlinkAccount = createAuthEndpoint(
 	},
 	async (ctx) => {
 		const { providerId, accountId } = ctx.body;
+		const userId = ctx.context.session.user.id;
 		const accounts = await ctx.context.internalAdapter.findAccounts(
-			ctx.context.session.user.id,
+			userId,
 		);
 		if (
 			accounts.length === 1 &&
@@ -431,7 +510,245 @@ export const unlinkAccount = createAuthEndpoint(
 		if (!accountExist) {
 			throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.ACCOUNT_NOT_FOUND);
 		}
-		await ctx.context.internalAdapter.deleteAccount(accountExist.id);
+		const isCredentialFactor =
+			accountExist.providerId === "credential" &&
+			typeof accountExist.password === "string" &&
+			accountExist.password.length > 0;
+		if (!isCredentialFactor) {
+			await ctx.context.internalAdapter.deleteAccount(accountExist.id);
+			return ctx.json({ status: true });
+		}
+
+		assertCredentialFactorLifecycleConfiguration(ctx);
+		const originalExpiresAt = new Date(ctx.context.session.session.expiresAt);
+		const originalExpiresAtMs = originalExpiresAt.getTime();
+		if (
+			!Number.isFinite(originalExpiresAtMs) ||
+			originalExpiresAtMs <= Date.now()
+		) {
+			factorLifecycleConflict();
+		}
+
+		const passkeyLifecycle =
+			ctx.context.options.plugins?.some((plugin) => plugin.id === "passkey") ===
+			true;
+		const twoFactorPlugin = ctx.context.getPlugin("two-factor");
+		const twoFactorLifecycle = twoFactorPlugin != null;
+		const twoFactorTable =
+			(
+				twoFactorPlugin?.options as
+					| { twoFactorTable?: string | undefined }
+					| undefined
+			)?.twoFactorTable ?? "twoFactor";
+
+		type LifecycleResult = {
+			replacementSession: Session;
+			replacementUser: User & Record<string, unknown>;
+		};
+		let lifecycle: LifecycleResult | undefined;
+		let committedLifecycle: LifecycleResult | undefined;
+		try {
+			lifecycle = await runWithTransaction(ctx.context.adapter, async () => {
+				const adapter = await getCurrentAdapter(ctx.context.adapter);
+				const authoritativeUser = (await lockAndReadUser(
+					adapter,
+					userId,
+				)) as (User & Record<string, unknown>) | null;
+				if (!authoritativeUser) factorLifecycleConflict();
+
+				const presentedSession = await ctx.context.internalAdapter.findSession(
+					ctx.context.session.session.token,
+				);
+				if (
+					!presentedSession ||
+					presentedSession.session.id !== ctx.context.session.session.id ||
+					presentedSession.session.userId !== userId ||
+					presentedSession.user.id !== userId ||
+					new Date(presentedSession.session.expiresAt).getTime() !==
+						originalExpiresAtMs
+				) {
+					factorLifecycleConflict();
+				}
+				const authoritativeSession = await adapter.findOne<
+					Session & Record<string, unknown>
+				>({
+					model: "session",
+					where: [
+						{ field: "id", value: ctx.context.session.session.id },
+						{ field: "userId", value: userId },
+						{ field: "expiresAt", value: originalExpiresAt },
+					],
+				});
+				if (!authoritativeSession) factorLifecycleConflict();
+				const replacementIssuanceContext =
+					await captureInternalSessionIssuanceContext(
+						ctx.context.internalAdapter,
+						{
+							purpose: "replacement",
+							sourceSessionToken: ctx.context.session.session.token,
+						},
+					);
+
+				const currentAccounts = await adapter.findMany<Account>({
+					model: "account",
+					where: [{ field: "userId", value: userId }],
+				});
+				if (
+					currentAccounts.length === 1 &&
+					!ctx.context.options.account?.accountLinking?.allowUnlinkingAll
+				) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						BASE_ERROR_CODES.FAILED_TO_UNLINK_LAST_ACCOUNT,
+					);
+				}
+				const currentTarget = currentAccounts.find(
+					(account) =>
+						account.id === accountExist.id &&
+						account.providerId === providerId &&
+						(accountId === undefined || account.accountId === accountId),
+				);
+				if (!currentTarget) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						BASE_ERROR_CODES.ACCOUNT_NOT_FOUND,
+					);
+				}
+				if (
+					currentTarget.providerId !== "credential" ||
+					typeof currentTarget.password !== "string" ||
+					currentTarget.password.length === 0
+				) {
+					factorLifecycleConflict();
+				}
+
+				const hasOtherPassword = currentAccounts.some(
+					(account) =>
+						account.id !== currentTarget.id &&
+						account.providerId === "credential" &&
+						typeof account.password === "string" &&
+						account.password.length > 0,
+				);
+				const verifiedTwoFactor = twoFactorLifecycle
+					? await adapter.findOne<Record<string, unknown>>({
+							model: twoFactorTable,
+							where: [
+								{ field: "userId", value: userId },
+								{ field: "verified", value: true },
+							],
+						})
+					: null;
+				const passkeyCount = passkeyLifecycle
+					? await adapter.count({
+							model: "passkey",
+							where: [{ field: "userId", value: userId }],
+						})
+					: 0;
+				const hasVerifiedTwoFactor =
+					authoritativeUser.twoFactorEnabled === true &&
+					verifiedTwoFactor !== null;
+				if (!hasOtherPassword && !hasVerifiedTwoFactor && passkeyCount === 0) {
+					lastFactorProtected();
+				}
+
+				let replacementUser: User & Record<string, unknown> = authoritativeUser;
+				if (passkeyLifecycle) {
+					const userGeneration =
+						authoritativeUser[PASSKEY_SESSION_GENERATION_FIELD];
+					const sessionGeneration =
+						authoritativeSession[PASSKEY_SESSION_GENERATION_FIELD];
+					if (typeof userGeneration !== "string" || userGeneration.length === 0)
+						factorLifecycleConflict();
+					if (
+						typeof sessionGeneration !== "string" ||
+						sessionGeneration.length === 0
+					)
+						factorLifecycleConflict();
+					if (sessionGeneration !== userGeneration)
+						factorLifecycleConflict();
+					const rotatedUser = await rotatePasskeySessionGeneration(
+						adapter,
+						userId,
+						userGeneration,
+						generateRandomString(32),
+					);
+					if (!rotatedUser) factorLifecycleConflict();
+					replacementUser = rotatedUser;
+				} else if (twoFactorLifecycle) {
+					const userGeneration =
+						authoritativeUser[TWO_FACTOR_SESSION_GENERATION_FIELD];
+					const sessionGeneration =
+						authoritativeSession[TWO_FACTOR_SESSION_GENERATION_FIELD];
+					if (
+						typeof userGeneration !== "string" ||
+						userGeneration.length === 0 ||
+						typeof sessionGeneration !== "string" ||
+						sessionGeneration.length === 0 ||
+						sessionGeneration !== userGeneration
+					) {
+						factorLifecycleConflict();
+					}
+					const rotatedUser = await rotateTwoFactorSessionGeneration(
+						adapter,
+						userId,
+						userGeneration,
+						generateRandomString(32),
+					);
+					if (!rotatedUser) factorLifecycleConflict();
+					replacementUser = rotatedUser;
+				}
+
+				const deletedTarget = await adapter.consumeOne<Account>({
+					model: "account",
+					where: [
+						{ field: "id", value: currentTarget.id },
+						{ field: "userId", value: userId },
+						{ field: "providerId", value: "credential" },
+						{ field: "accountId", value: currentTarget.accountId },
+						{ field: "password", value: currentTarget.password },
+					],
+				});
+				if (!deletedTarget) factorLifecycleConflict();
+
+				await ctx.context.internalAdapter.deleteUserSessions(userId);
+				const replacementSession =
+					await ctx.context.internalAdapter.createSession(
+						userId,
+						false,
+						{
+							expiresAt: originalExpiresAt,
+							__preserveSessionExpiresAt: true,
+						},
+						undefined,
+						replacementIssuanceContext,
+					);
+				if (
+					new Date(replacementSession.expiresAt).getTime() !==
+					originalExpiresAtMs
+				) {
+					factorLifecycleConflict();
+				}
+				committedLifecycle = { replacementSession, replacementUser };
+				return committedLifecycle;
+			});
+		} catch (error) {
+			if (error instanceof AfterTransactionHookError && committedLifecycle) {
+				logFactorLifecycleFailure(
+					ctx,
+					"credential unlink post-commit publication failed",
+					error,
+				);
+				lifecycle = committedLifecycle;
+			} else {
+				throw error;
+			}
+		}
+		if (!lifecycle) factorLifecycleConflict();
+
+		await setSessionCookie(ctx, {
+			session: lifecycle.replacementSession,
+			user: lifecycle.replacementUser as User,
+		});
 		return ctx.json({
 			status: true,
 		});
@@ -581,7 +898,9 @@ async function getValidAccessToken(
 					: account.refreshToken,
 				refreshTokenExpiresAt:
 					newTokens?.refreshTokenExpiresAt ?? account.refreshTokenExpiresAt,
-				idToken: newTokens?.idToken || account.idToken,
+				idToken: newTokens?.idToken
+					? await setTokenUtil(newTokens.idToken, ctx.context)
+					: account.idToken,
 			};
 			let updatedAccount: Record<string, any> | null = null;
 			if (account.id) {
@@ -620,7 +939,11 @@ async function getValidAccessToken(
 				(await decryptOAuthToken(account.accessToken ?? "", ctx.context)),
 			accessTokenExpiresAt,
 			scopes: account.scope?.split(",") ?? [],
-			idToken: newTokens?.idToken ?? account.idToken ?? undefined,
+			idToken:
+				newTokens?.idToken ??
+				(account.idToken
+					? await decryptOAuthToken(account.idToken, ctx.context)
+					: undefined),
 		};
 	} catch (_error) {
 		throw APIError.from("BAD_REQUEST", {
@@ -839,7 +1162,9 @@ export const refreshToken = createAuthEndpoint(
 					accessTokenExpiresAt: tokens.accessTokenExpiresAt,
 					refreshTokenExpiresAt: resolvedRefreshTokenExpiresAt,
 					scope: tokens.scopes?.join(",") || account.scope,
-					idToken: tokens.idToken || account.idToken,
+					idToken: tokens.idToken
+						? await setTokenUtil(tokens.idToken, ctx.context)
+						: account.idToken,
 				};
 				await ctx.context.internalAdapter.updateAccount(account.id, updateData);
 			}
@@ -855,7 +1180,9 @@ export const refreshToken = createAuthEndpoint(
 					accessTokenExpiresAt: tokens.accessTokenExpiresAt,
 					refreshTokenExpiresAt: resolvedRefreshTokenExpiresAt,
 					scope: tokens.scopes?.join(",") || accountData.scope,
-					idToken: tokens.idToken || accountData.idToken,
+					idToken: tokens.idToken
+						? await setTokenUtil(tokens.idToken, ctx.context)
+						: accountData.idToken,
 				};
 				await setAccountCookie(ctx, updateData);
 			}
@@ -865,7 +1192,11 @@ export const refreshToken = createAuthEndpoint(
 				accessTokenExpiresAt: tokens.accessTokenExpiresAt,
 				refreshTokenExpiresAt: resolvedRefreshTokenExpiresAt,
 				scope: tokens.scopes?.join(",") || account.scope,
-				idToken: tokens.idToken || account.idToken,
+				idToken:
+					tokens.idToken ||
+					(account.idToken
+						? await decryptOAuthToken(account.idToken, ctx.context)
+						: undefined),
 				providerId: account.providerId,
 				accountId: account.accountId,
 			});

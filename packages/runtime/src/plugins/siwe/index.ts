@@ -1,9 +1,16 @@
 import type { ClearancePlugin } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import * as z from "zod";
 import { APIError } from "../../api";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import type { InferOptionSchema, User } from "../../types";
 import { toChecksumAddress } from "../../utils/hashing";
 import { isAPIError } from "../../utils/is-api-error";
@@ -54,6 +61,7 @@ const getSiweNonceBodySchema = z
 	});
 
 export const siwe = (options: SIWEPluginOptions) => {
+	const challengePurpose = "siwe:sign-in";
 	const createSiweNonceEndpoint = (path: "/siwe/nonce" | "/siwe/get-nonce") =>
 		createAuthEndpoint(
 			path,
@@ -72,13 +80,18 @@ export const siwe = (options: SIWEPluginOptions) => {
 				const { chainId } = ctx.body;
 				const walletAddress = toChecksumAddress(rawWalletAddress);
 				const nonce = await options.getNonce();
+				const identifier = `siwe:${walletAddress}:${chainId}`;
 
 				// Store nonce with wallet address and chain ID context
-				await ctx.context.internalAdapter.createVerificationValue({
-					identifier: `siwe:${walletAddress}:${chainId}`,
-					value: nonce,
-					expiresAt: new Date(Date.now() + 15 * 60 * 1000),
-				});
+				await createInternalVerificationChallenge(
+					ctx.context.internalAdapter,
+					{ purpose: challengePurpose, subject: identifier },
+					{
+						identifier,
+						value: nonce,
+						expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+					},
+				);
 
 				return ctx.json({ nonce });
 			},
@@ -123,6 +136,20 @@ export const siwe = (options: SIWEPluginOptions) => {
 					} = ctx.body;
 					const walletAddress = toChecksumAddress(rawWalletAddress);
 					const isAnon = options.anonymous ?? true;
+					const managedPolicy = readInternalAuthenticationPolicy(
+						ctx.context.options,
+					);
+					if (
+						managedPolicy &&
+						typeof ctx.context.adapter.options?.adapterConfig.transaction !==
+							"function"
+					) {
+						throw APIError.fromStatus("INTERNAL_SERVER_ERROR", {
+							message:
+								"Managed SIWE authentication requires rollback-capable database transactions",
+							status: 500,
+						});
+					}
 
 					if (!isAnon && !email) {
 						throw APIError.fromStatus("BAD_REQUEST", {
@@ -132,15 +159,24 @@ export const siwe = (options: SIWEPluginOptions) => {
 					}
 
 					try {
-						// Atomically consume the single-use nonce before any signature
-						// work or state mutation. The first concurrent request wins; every
-						// racer gets null, so the same nonce can never replay a login.
-						// Consuming here (not after verification) also burns the record on
-						// a failed attempt and applies the built-in expiry gate.
-						const verification =
-							await ctx.context.internalAdapter.consumeVerificationValue(
-								`siwe:${walletAddress}:${chainId}`,
-							);
+						const nonceIdentifier = `siwe:${walletAddress}:${chainId}`;
+						// Unmanaged SIWE retains its historical burn-before-verification
+						// behavior. Managed issuance first reads the server nonce without
+						// consuming it, then compare-and-consumes that exact row inside the
+						// identity/session transaction below. A policy or persistence failure
+						// therefore rolls the proof back with every derived mutation.
+						const verification = managedPolicy
+							? await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
+									nonceIdentifier,
+								)
+							: await consumeInternalVerificationChallenge(
+									ctx.context.internalAdapter,
+									{
+										purpose: challengePurpose,
+										subject: nonceIdentifier,
+										identifier: nonceIdentifier,
+									},
+								);
 
 						if (!verification) {
 							throw APIError.fromStatus("UNAUTHORIZED", {
@@ -234,44 +270,61 @@ export const siwe = (options: SIWEPluginOptions) => {
 							});
 						}
 
-						// Look for existing user by their wallet addresses
-						let user: User | null = null;
-
-						// Check if there's a wallet address record for this exact address+chainId combination
-						const existingWalletAddress: WalletAddress | null =
-							await ctx.context.adapter.findOne({
+						let preparedEnsIdentity: ENSLookupResult | undefined;
+						if (managedPolicy && options.ensLookup) {
+							const existingAddress = await ctx.context.adapter.findOne({
 								model: "walletAddress",
 								where: [
 									{ field: "address", operator: "eq", value: walletAddress },
-									{ field: "chainId", operator: "eq", value: chainId },
 								],
 							});
+							if (!existingAddress) {
+								preparedEnsIdentity = await options.ensLookup({ walletAddress });
+							}
+						}
 
-						if (existingWalletAddress) {
-							// Get the user associated with this wallet address
-							user = await ctx.context.adapter.findOne({
-								model: "user",
-								where: [
+						const persistIdentityAndSession = async () => {
+							if (managedPolicy) {
+								const consumed = await consumeInternalVerificationChallenge(
+									ctx.context.internalAdapter,
 									{
-										field: "id",
-										operator: "eq",
-										value: existingWalletAddress.userId,
+										purpose: challengePurpose,
+										subject: nonceIdentifier,
+										identifier: nonceIdentifier,
 									},
-								],
-							});
-						} else {
-							// No exact match found, check if this address exists on any other chain
+								);
+								if (
+									!consumed ||
+									consumed.id !== verification.id ||
+									consumed.value !== verification.value
+								) {
+									throw APIError.fromStatus("UNAUTHORIZED", {
+										message: "Unauthorized: Invalid or expired nonce",
+										status: 401,
+										code: "UNAUTHORIZED_INVALID_OR_EXPIRED_NONCE",
+									});
+								}
+							}
+							const transaction = await getCurrentAdapter(ctx.context.adapter);
+							let user: User | null = null;
+							const existingWalletAddress: WalletAddress | null =
+								await transaction.findOne({
+									model: "walletAddress",
+									where: [
+										{ field: "address", operator: "eq", value: walletAddress },
+										{ field: "chainId", operator: "eq", value: chainId },
+									],
+								});
 							const anyWalletAddress: WalletAddress | null =
-								await ctx.context.adapter.findOne({
+								existingWalletAddress ??
+								(await transaction.findOne({
 									model: "walletAddress",
 									where: [
 										{ field: "address", operator: "eq", value: walletAddress },
 									],
-								});
-
+								}));
 							if (anyWalletAddress) {
-								// Same address exists on different chain, get that user
-								user = await ctx.context.adapter.findOne({
+								user = await transaction.findOne({
 									model: "user",
 									where: [
 										{
@@ -282,74 +335,55 @@ export const siwe = (options: SIWEPluginOptions) => {
 									],
 								});
 							}
-						}
 
-						// Create new user if none exists
-						if (!user) {
-							const domain =
-								options.emailDomainName ?? getOrigin(ctx.context.baseURL);
-							const normalizedEmail = email?.toLowerCase();
-							// SIWE proves wallet control, not email ownership: bind the caller
-							// email only when unclaimed, else keep the wallet-derived address.
-							// Silent fallback (no distinct error) avoids an enumeration oracle.
-							// FIXME(siwe-contact-ownership): non-breaking floor; the durable fix
-							// drops the `email` body field and attaches a verified email via a
-							// separate authenticated link flow. Land on `next` after master->next sync.
-							let userEmail = `${walletAddress}@${domain}`;
-							if (!isAnon && normalizedEmail) {
-								const existingUser =
-									await ctx.context.internalAdapter.findUserByEmail(
-										normalizedEmail,
-									);
-								if (!existingUser) {
-									userEmail = normalizedEmail;
+							if (!user) {
+								const domain =
+									options.emailDomainName ?? getOrigin(ctx.context.baseURL);
+								const normalizedEmail = email?.toLowerCase();
+								let userEmail = `${walletAddress}@${domain}`;
+								if (!isAnon && normalizedEmail) {
+									const existingUser =
+										await ctx.context.internalAdapter.findUserByEmail(
+											normalizedEmail,
+										);
+									if (!existingUser) userEmail = normalizedEmail;
 								}
-							}
-							const { name, avatar } =
-								(await options.ensLookup?.({ walletAddress })) ?? {};
-
-							user = await ctx.context.internalAdapter.createUser({
-								name: name ?? walletAddress,
-								email: userEmail,
-								image: avatar ?? "",
-							});
-
-							// Create wallet address record
-							await ctx.context.adapter.create({
-								model: "walletAddress",
-								data: {
-									userId: user.id,
-									address: walletAddress,
-									chainId,
-									isPrimary: true, // First address is primary
-									createdAt: new Date(),
-								},
-							});
-
-							// Create account record for wallet authentication
-							await ctx.context.internalAdapter.createAccount({
-								userId: user.id,
-								providerId: "siwe",
-								accountId: `${walletAddress}:${chainId}`,
-								createdAt: new Date(),
-								updatedAt: new Date(),
-							});
-						} else {
-							// User exists, but check if this specific address/chain combo exists
-							if (!existingWalletAddress) {
-								// Add this new chainId to existing user's addresses
-								await ctx.context.adapter.create({
+								const { name, avatar } = managedPolicy
+									? (preparedEnsIdentity ?? {})
+									: ((await options.ensLookup?.({ walletAddress })) ?? {});
+								user = await ctx.context.internalAdapter.createUser({
+									name: name ?? walletAddress,
+									email: userEmail,
+									image: avatar ?? "",
+								});
+								await transaction.create({
 									model: "walletAddress",
 									data: {
 										userId: user.id,
 										address: walletAddress,
 										chainId,
-										isPrimary: false, // Additional addresses are not primary by default
+										isPrimary: true,
 										createdAt: new Date(),
 									},
 								});
-
-								// Create account record for this new wallet+chain combination
+								await ctx.context.internalAdapter.createAccount({
+									userId: user.id,
+									providerId: "siwe",
+									accountId: `${walletAddress}:${chainId}`,
+									createdAt: new Date(),
+									updatedAt: new Date(),
+								});
+							} else if (!existingWalletAddress) {
+								await transaction.create({
+									model: "walletAddress",
+									data: {
+										userId: user.id,
+										address: walletAddress,
+										chainId,
+										isPrimary: false,
+										createdAt: new Date(),
+									},
+								});
 								await ctx.context.internalAdapter.createAccount({
 									userId: user.id,
 									providerId: "siwe",
@@ -358,11 +392,28 @@ export const siwe = (options: SIWEPluginOptions) => {
 									updatedAt: new Date(),
 								});
 							}
-						}
 
-						const session = await ctx.context.internalAdapter.createSession(
-							user.id,
-						);
+							const session = await ctx.context.internalAdapter.createSession(
+								user.id,
+								undefined,
+								undefined,
+								false,
+								createInternalSessionIssuanceContext({
+									purpose: "interactive",
+									subjectId: user.id,
+									evidence: [
+										{ kind: "primary", primaryMethod: "wallet_signature" },
+									],
+								}),
+							);
+							return { session, user };
+						};
+						const { session, user } = managedPolicy
+							? await runWithTransaction(
+									ctx.context.adapter,
+									persistIdentityAndSession,
+								)
+							: await persistIdentityAndSession();
 
 						if (!session) {
 							throw APIError.fromStatus("INTERNAL_SERVER_ERROR", {

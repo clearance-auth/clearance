@@ -5,6 +5,7 @@ import { createAuthClient } from "@clearance/runtime/client";
 import { setCookieToHeader } from "@clearance/runtime/cookies";
 import { bearer, organization } from "@clearance/runtime/plugins";
 import { getTestInstance } from "@clearance/runtime/test";
+import { base64Url } from "@clearance/utils/base64";
 import { describe, expect, it } from "vitest";
 import { scim } from ".";
 import { scimClient } from "./client";
@@ -155,6 +156,64 @@ const _createSqlTestInstance = async (
 };
 
 describe("SCIM", () => {
+	it("binds custom token storage to the exact provider and organization", async () => {
+		const encryptedContexts: Array<{
+			providerId: string;
+			organizationId?: string;
+		}> = [];
+		const decryptedContexts: Array<{
+			providerId: string;
+			organizationId?: string;
+		}> = [];
+		const { auth, getAuthCookieHeaders } = createTestInstance({
+			storeSCIMToken: {
+				encrypt: async (token, context) => {
+					expect(Object.isFrozen(context)).toBe(true);
+					encryptedContexts.push(context);
+					return `${context.providerId}:${context.organizationId}:${token}`;
+				},
+				decrypt: async (storedToken, context) => {
+					expect(Object.isFrozen(context)).toBe(true);
+					decryptedContexts.push(context);
+					const prefix = `${context.providerId}:${context.organizationId}:`;
+					if (!storedToken.startsWith(prefix)) {
+						throw new Error("SCIM token storage context mismatch");
+					}
+					return storedToken.slice(prefix.length);
+				},
+			},
+		});
+		const headers = await getAuthCookieHeaders();
+		const organization = await auth.api.createOrganization({
+			body: { slug: "storage-context", name: "Storage Context" },
+			headers,
+		});
+		const providerId = "context-provider";
+		const { scimToken } = await auth.api.generateSCIMToken({
+			body: { providerId, organizationId: organization.id },
+			headers,
+		});
+
+		await auth.api.listSCIMUsers({
+			headers: { authorization: `Bearer ${scimToken}` },
+		});
+
+		const [baseToken] = new TextDecoder()
+			.decode(base64Url.decode(scimToken))
+			.split(":");
+		const tokenWithWrongOrganization = base64Url.encode(
+			`${baseToken}:${providerId}:another-organization`,
+		);
+		await expect(
+			auth.api.listSCIMUsers({
+				headers: { authorization: `Bearer ${tokenWithWrongOrganization}` },
+			}),
+		).rejects.toThrowError(expect.objectContaining({ status: "UNAUTHORIZED" }));
+
+		expect(encryptedContexts).toEqual([{ providerId, organizationId: organization.id }]);
+		expect(decryptedContexts).toEqual([{ providerId, organizationId: organization.id }]);
+	});
+
 	describe("GET /scim/v2/ServiceProviderConfig", () => {
 		it("should fetch the service provider config", async () => {
 			const { auth } = createTestInstance();

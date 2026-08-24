@@ -120,6 +120,8 @@ interface OrganizationDefaultFields {
 	updatedAt: {
 		type: "date";
 		required: false;
+		input: false;
+		returned: false;
 	};
 }
 

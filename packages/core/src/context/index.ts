@@ -15,9 +15,15 @@ export {
 	runWithRequestState,
 } from "./request-state";
 export {
+	AfterOperationHookError,
+	AfterTransactionHookError,
+	getActiveTransactionAdapter,
 	getCurrentAdapter,
 	getCurrentDBAdapterAsyncLocalStorage,
+	isRollbackCapableTransactionActive,
+	isTransactionActive,
 	queueAfterTransactionHook,
+	queueBeforeTransactionCommitHook,
 	runWithAdapter,
 	runWithTransaction,
 } from "./transaction";

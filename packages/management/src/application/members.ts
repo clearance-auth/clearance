@@ -1,11 +1,13 @@
 import {
 	addMember,
+	addMemberWithPrincipal,
 	removeMember,
 	updateMember,
 	type MembershipActorSource,
 	type MembershipSource,
 } from "../services/members.js";
-import type { ManagementStore } from "../store/types.js";
+import type { ManagementStore, ManagementUnitOfWork } from "../store/types.js";
+import { ClearanceError } from "../services/errors.js";
 import { withManagementUnitOfWork } from "../store/unit-of-work.js";
 import type { Membership } from "../types/resources.js";
 import type { AuthRuntimeGateway } from "./auth-runtime-gateway.js";
@@ -25,6 +27,45 @@ export async function addMemberUseCase(
 	context: OperationContext,
 	input: AddMemberUseCaseInput,
 ): Promise<Membership> {
+	if (!authRuntime && store.storeV2Principals?.authoritative) {
+		if (typeof store.mutateCoordinated !== "function") {
+			throw new ClearanceError({
+				code: "STORE_V2_PRINCIPAL_MUTATION_REQUIRED",
+				message: "Relational membership changes require a coordinated transaction.",
+				stage: "orgs.members.add",
+				status: 500,
+			});
+		}
+		return store.mutateCoordinated(async ({ data, principals }) => {
+			const principal = await principals?.getById({
+				scope: context.scope,
+				id: input.principalId,
+			});
+			if (!principal) {
+				throw new ClearanceError({
+					code: "USER_NOT_FOUND",
+					message: "User not found",
+					stage: "orgs.members.add",
+					status: 404,
+				});
+			}
+			const draft: ManagementUnitOfWork = {
+				get snapshot() {
+					return data;
+				},
+				mutate(mutator) {
+					mutator(data);
+					return data;
+				},
+			};
+			return addMemberWithPrincipal(draft, principal, {
+				...input,
+				actor: context.actor,
+				auditSource: input.auditSource ?? context.source,
+				scope: context.scope,
+			});
+		});
+	}
 	return authRuntime
 		? await authRuntime.members.addCoordinated(context, input)
 		: await withManagementUnitOfWork(store, (unitOfWork) =>

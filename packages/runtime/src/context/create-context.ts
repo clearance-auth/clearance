@@ -37,6 +37,124 @@ import {
 	validateSecretsArray,
 } from "./secret-utils";
 import { hasServerSessionStore } from "./store-capabilities";
+import {
+	attachInternalCredentialAuthority,
+	readInternalCredentialAuthority,
+} from "../internal/credential-authority";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+	type InternalRuntimeAuthenticationPolicyBinding,
+} from "../internal/authentication-policy";
+import {
+	attachCapturedInternalAuthorizationAuthority,
+	readInternalAuthorizationAuthority,
+	type InternalAuthorizationAuthority,
+} from "../internal/authorization-authority";
+import {
+	attachCapturedInternalManagedOrganizationLifecycleAuthority,
+	readInternalManagedOrganizationLifecycleAuthority,
+	type InternalManagedOrganizationLifecycleAuthority,
+} from "../internal/organization-lifecycle-authority";
+import {
+	attachCapturedInternalRuntimeAudit,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditBinding,
+} from "@clearance/runtime/internal/runtime-audit";
+
+function sameAuthenticationPolicyBinding(
+	left: InternalRuntimeAuthenticationPolicyBinding,
+	right: InternalRuntimeAuthenticationPolicyBinding,
+): boolean {
+	return left === right;
+}
+
+function assertCompatibleAuthenticationPolicyTarget(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	const existing = readInternalAuthenticationPolicy(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Authentication policy authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && !sameAuthenticationPolicyBinding(existing, binding)) {
+		throw new ClearanceError(
+			"Authentication policy authority does not match the runtime options binding",
+		);
+	}
+}
+
+function assertCompatibleAuthorizationAuthorityTarget(
+	target: object,
+	binding: InternalAuthorizationAuthority | undefined,
+): void {
+	const existing = readInternalAuthorizationAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Authorization authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Authorization authority does not match the runtime options binding",
+		);
+	}
+}
+
+function assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	const existing = readInternalManagedOrganizationLifecycleAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Managed organization lifecycle authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Managed organization lifecycle authority does not match the runtime options binding",
+		);
+	}
+}
+
+function sameRuntimeAuditBinding(
+	left: InternalRuntimeAuditBinding,
+	right: InternalRuntimeAuditBinding,
+): boolean {
+	return left === right;
+}
+
+function assertCompatibleRuntimeAuditTarget(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	const existing = readInternalRuntimeAudit(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Runtime audit authority is attached to the adapter but absent from runtime options",
+			);
+		}
+		return;
+	}
+	if (existing && !sameRuntimeAuditBinding(existing, binding)) {
+		throw new ClearanceError(
+			"Runtime audit authority does not match the runtime options binding",
+		);
+	}
+}
 
 /**
  * Estimates the entropy of a string in bits.
@@ -96,6 +214,48 @@ export async function createAuthContext<Options extends ClearanceOptions>(
 	options: Options,
 	getDatabaseType: (database: Options["database"]) => string,
 ): Promise<AuthContext<Options>> {
+	const credentialAuthority = readInternalCredentialAuthority(options);
+	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const authorizationAuthority = readInternalAuthorizationAuthority(options);
+	const managedOrganizationLifecycleAuthority =
+		readInternalManagedOrganizationLifecycleAuthority(options);
+	const runtimeAudit = readInternalRuntimeAudit(options);
+	const initialPolicyTargets = [
+		adapter,
+		...(adapter.options ? [adapter.options] : []),
+	];
+	for (const target of new Set(initialPolicyTargets)) {
+		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+		assertCompatibleAuthorizationAuthorityTarget(target, authorizationAuthority);
+		assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+			target,
+			managedOrganizationLifecycleAuthority,
+		);
+		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
+	}
+	if (authenticationPolicy) {
+		if (!options.database) {
+			throw new ClearanceError(
+				"Managed authentication policy requires a primary database",
+			);
+		}
+		if (
+			options.secondaryStorage &&
+			options.session?.storeSessionInDatabase !== true
+		) {
+			throw new ClearanceError(
+				"Managed authentication policy requires sessions to be stored in the primary database",
+			);
+		}
+		if (
+			!adapter.options ||
+			typeof adapter.options.adapterConfig?.transaction !== "function"
+		) {
+			throw new ClearanceError(
+				"Managed authentication policy requires rollback-capable database transactions",
+			);
+		}
+	}
 	// secondaryStorage is a durable server-side session store, so treat it like
 	// a database for session cache defaults.
 	const isStateful = hasServerSessionStore(options);
@@ -196,6 +356,53 @@ Most of the features of Clearance will not work correctly.`,
 		basePath: options.basePath || "/api/auth",
 		plugins: plugins.concat(internalPlugins),
 	};
+	if (credentialAuthority) {
+		attachInternalCredentialAuthority(options, credentialAuthority);
+		attachInternalCredentialAuthority(adapter, credentialAuthority);
+	}
+	if (credentialAuthority && adapter.options) {
+		attachInternalCredentialAuthority(
+			adapter.options as unknown as ClearanceOptions,
+			credentialAuthority,
+		);
+	}
+	const authenticationPolicyTargets = new Set<object>([
+		options,
+		adapter,
+		...(adapter.options ? [adapter.options] : []),
+	]);
+	for (const target of authenticationPolicyTargets) {
+		assertCompatibleAuthenticationPolicyTarget(target, authenticationPolicy);
+		assertCompatibleAuthorizationAuthorityTarget(target, authorizationAuthority);
+		assertCompatibleManagedOrganizationLifecycleAuthorityTarget(
+			target,
+			managedOrganizationLifecycleAuthority,
+		);
+		assertCompatibleRuntimeAuditTarget(target, runtimeAudit);
+	}
+	if (authenticationPolicy) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalAuthenticationPolicy(target, authenticationPolicy);
+		}
+	}
+	if (authorizationAuthority) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalAuthorizationAuthority(target, authorizationAuthority);
+		}
+	}
+	if (managedOrganizationLifecycleAuthority) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalManagedOrganizationLifecycleAuthority(
+				target,
+				managedOrganizationLifecycleAuthority,
+			);
+		}
+	}
+	if (runtimeAudit) {
+		for (const target of authenticationPolicyTargets) {
+			attachCapturedInternalRuntimeAudit(target, runtimeAudit);
+		}
+	}
 
 	checkEndpointConflicts(options, logger);
 
@@ -382,9 +589,16 @@ Most of the features of Clearance will not work correctly.`,
 			options,
 			logger,
 			hooks: options.databaseHooks
-				? [{ source: "user", hooks: options.databaseHooks }]
+				? [
+						{
+							source: "user",
+							hooks: options.databaseHooks,
+							failureMode: options.databaseHookFailureMode,
+						},
+					]
 				: [],
 			generateId: generateIdFunc,
+			secretConfig,
 		}),
 		createAuthCookie: createCookieGetter(options),
 		async runMigrations() {

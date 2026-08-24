@@ -44,8 +44,105 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
 
-  release:
+  candidate:
     needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Rebuild native bindings for matrix node
+        run: pnpm -r rebuild better-sqlite3
+
+      - name: Build
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test:only
+
+      - name: Postgres-gated tests
+        run: bash scripts/test-with-postgres.sh
+
+      - name: Import smoke
+        run: pnpm smoke:import
+
+      - name: Pack smoke
+        run: pnpm smoke:pack
+
+  sdk-conformance:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.22.0'
+          check-latest: false
+          cache: false
+
+      - name: Install Python SDK
+        working-directory: sdks/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Test Python SDK conformance
+        working-directory: sdks/python
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Test Go SDK conformance
+        working-directory: sdks/go
+        run: go test ./...
+
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+
+      - name: Test Rust SDK unit suite
+        working-directory: sdks/rust
+        run: cargo +1.85.0 test --lib
+
+      - name: Test Rust SDK documentation suite
+        working-directory: sdks/rust
+        run: cargo +1.85.0 test --doc
+
+  release:
+    needs: [gate, candidate, sdk-conformance]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment: npm-release
@@ -73,7 +170,13 @@ jobs:
           persist-credentials: false
           ref: ${{ github.workflow_sha }}
           path: .release-tooling
-          sparse-checkout: scripts/verify-npm-provenance.mjs
+          sparse-checkout: |
+            scripts/release-packages.mjs
+            scripts/verify-npm-provenance.mjs
+
+      # Cross-platform builds require emulation on the hosted amd64 runner; keep
+      # Buildx itself native and fail the release if either target cannot build.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -84,6 +187,27 @@ jobs:
           node-version-file: ".nvmrc"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
+
+      - name: Provision integrity-pinned npm CLI
+        env:
+          NPM_CLI_VERSION: 11.16.0
+          NPM_CLI_INTEGRITY: sha512-A74XL8OxmcegZDMWPkWb5bEQppg8HdYwW3rBD2sPoS4UQHVajfaxBkqyzLeJ3wR0kZ+5xoTjItxXaF7eIXUsyw==
+        run: |
+          set -Eeuo pipefail
+          NPM_CLI_ARCHIVE="$RUNNER_TEMP/npm-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tgz"
+          NPM_CLI_DIR="$RUNNER_TEMP/npm-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$NPM_CLI_DIR"
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/npm/-/npm-${NPM_CLI_VERSION}.tgz" \
+            --output "$NPM_CLI_ARCHIVE"
+          ACTUAL_INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$NPM_CLI_ARCHIVE" | openssl base64 -A)"
+          [[ "$ACTUAL_INTEGRITY" == "$NPM_CLI_INTEGRITY" ]] || {
+            echo "::error::npm CLI archive integrity does not match the pinned SHA-512"
+            exit 1
+          }
+          tar -xzf "$NPM_CLI_ARCHIVE" -C "$NPM_CLI_DIR"
+          test "$(node "$NPM_CLI_DIR/package/bin/npm-cli.js" --version)" = "$NPM_CLI_VERSION"
+          echo "$NPM_CLI_DIR/package/bin" >> "$GITHUB_PATH"
 
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
@@ -96,13 +220,8 @@ jobs:
       - name: Resolve version and require release signing identity
         env:
           REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
-          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
         run: |
           set -Eeuo pipefail
-          test -n "${CLEARANCE_RELEASE_SIGNING_KEY:-}" || {
-            echo "::error::CLEARANCE_RELEASE_SIGNING_KEY is required; refusing an unsigned release"
-            exit 1
-          }
           VERSION="${REQUESTED_VERSION#v}"
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?(\+([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$ ]] || {
             echo "::error::Release version must be exact SemVer: $VERSION"
@@ -131,6 +250,12 @@ jobs:
               echo "::error::npm recovery must use the release workflow from the current master commit"
               exit 1
             }
+          else
+            [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/tags/v${VERSION}" ]] || {
+              echo "::error::First publication requires the matching release-tag push"
+              exit 1
+            }
+            bash scripts/verify-release-tag-authority.sh
           fi
           COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -149,50 +274,89 @@ jobs:
           node scripts/verify-release-version.mjs "$VERSION"
           pnpm verify:real
 
-      - name: Pack shipping packages
+      - name: Rehearse release assembly
+        run: pnpm release:rehearse -- "$VERSION"
+
+      - name: Verify recovery npm packages before signing assets
+        if: env.RECOVER_PUBLISHED_NPM == '1'
         run: |
           set -Eeuo pipefail
-          mkdir -p dist-release/assets
-          PACKAGES=(@clearance/auth @clearance/management @clearance/cli @clearance/api)
-          if [[ "$RECOVER_PUBLISHED_NPM" == "1" ]]; then
-            npm install --global npm@11.16.0
-            AUDIT_DIR="$(mktemp -d)"
-            npm install --prefix "$AUDIT_DIR" --ignore-scripts --save-exact \
-              "${PACKAGES[@]/%/@$VERSION}"
-            npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations \
-              > "$AUDIT_DIR/npm-audit-signatures.json"
-            for PACKAGE in "${PACKAGES[@]}"; do
-              npm pack "${PACKAGE}@${VERSION}" --pack-destination dist-release/assets --ignore-scripts
-            done
-            node .release-tooling/scripts/verify-npm-provenance.mjs \
-              "$VERSION" "$(git rev-parse HEAD)" "$AUDIT_DIR/npm-audit-signatures.json" \
-              dist-release/assets dist-release/assets/npm-provenance.json "${PACKAGES[@]}"
-          else
-            pnpm --filter @clearance/auth pack --pack-destination dist-release/assets
-            pnpm --filter @clearance/management pack --pack-destination dist-release/assets
-            pnpm --filter @clearance/cli pack --pack-destination dist-release/assets
-            pnpm --filter @clearance/api pack --pack-destination dist-release/assets
-          fi
-          command -v helm >/dev/null
-          helm package deploy/helm/clearance --version "$VERSION" --app-version "$VERSION" --destination dist-release/assets
-          pnpm list -r --prod --json --depth Infinity > dist-release/assets/dependency-graph.json
-          test "$(find dist-release/assets -name '*.tgz' | wc -l)" -eq 5
+          test "$(npm --version)" = "11.16.0"
+          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          mapfile -t PACKAGES < <(node .release-tooling/scripts/release-packages.mjs names)
+          integrity_for() {
+            node -e '
+              const fs=require("fs"), crypto=require("crypto");
+              process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
+            ' "$1"
+          }
           tarball_for() {
             node -e '
               const fs=require("fs"), cp=require("child_process"), path=require("path");
               const dir=process.argv[1], wanted=process.argv[2];
               const found=fs.readdirSync(dir).filter(f=>f.endsWith(".tgz")).find(f=>{
-                try {
-                  const p=JSON.parse(cp.execFileSync("tar",["-xzf",path.join(dir,f),"-O","package/package.json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}));
-                  return p.name===wanted;
-                } catch { return false; }
+                try { const p=JSON.parse(cp.execFileSync("tar",["-xzf",path.join(dir,f),"-O","package/package.json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]})); return p.name===wanted; } catch { return false; }
               });
-              if (!found) process.exit(1);
-              process.stdout.write(path.join(dir,found));
+              if (!found) process.exit(1); process.stdout.write(path.join(dir,found));
             ' dist-release/assets "$1"
           }
-          node scripts/verify-release-runtime-closure.mjs "$(tarball_for '@clearance/auth')" dist-release/assets/auth-runtime-closure.json
-          node scripts/verify-release-runtime-closure.mjs "$(tarball_for '@clearance/management')" dist-release/assets/management-runtime-closure.json
+          registry_integrity() {
+            local package="$1" integrity=""
+            for ATTEMPT in {1..120}; do
+              if integrity="$(npm view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
+                && [[ -n "$integrity" ]]; then
+                printf '%s' "$integrity"
+                return 0
+              fi
+              echo "Waiting for ${package}@${VERSION} to become readable from the public registry (${ATTEMPT}/120)..." >&2
+              sleep 5
+            done
+            echo "::error::${package}@${VERSION} did not become readable from the public registry" >&2
+            return 1
+          }
+          prepare_audit_tree() {
+            local audit_dir="$1" package target
+            shift
+            mkdir -p "$audit_dir/node_modules"
+            node -e '
+              const fs = require("fs");
+              const [output, version, ...packages] = process.argv.slice(1);
+              const dependencies = Object.fromEntries(packages.map(name => [name, version]));
+              fs.writeFileSync(output, `${JSON.stringify({ name: "clearance-provenance-audit", private: true, version: "0.0.0", dependencies }, null, 2)}\n`);
+            ' "$audit_dir/package.json" "$VERSION" "$@"
+            for package in "$@"; do
+              target="$audit_dir/node_modules/$package"
+              mkdir -p "$target"
+              tar -xzf "$(tarball_for "$package")" -C "$target" --strip-components=1
+            done
+          }
+          verify_provenance() {
+            local output="$1"
+            shift
+            for ATTEMPT in {1..120}; do
+              AUDIT_DIR="$(mktemp -d)"
+              prepare_audit_tree "$AUDIT_DIR" "$@"
+              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+                && node .release-tooling/scripts/verify-npm-provenance.mjs \
+                  "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
+                  dist-release/assets "$output" "$@"; then
+                return 0
+              fi
+              echo "Waiting for signed provenance for ${*} (${ATTEMPT}/120)..." >&2
+              sleep 5
+            done
+            echo "::error::Signed npm provenance did not become verifiable within ten minutes" >&2
+            return 1
+          }
+          for PACKAGE in "${PACKAGES[@]}"; do
+            EXPECTED_INTEGRITY="$(integrity_for "$(tarball_for "$PACKAGE")")"
+            ACTUAL_INTEGRITY="$(registry_integrity "$PACKAGE")"
+            [[ "$ACTUAL_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
+              echo "::error::${PACKAGE}@${VERSION} registry SHA-512 does not match the frozen local tarball"
+              exit 1
+            }
+          done
+          verify_provenance dist-release/assets/npm-provenance.json "${PACKAGES[@]}"
 
       - name: Build and push staging container references
         if: env.RECOVER_PUBLISHED_NPM != '1'
@@ -201,7 +365,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker buildx build --push --tag "$STAGING_IMAGE" \
+          docker buildx build --platform linux/amd64,linux/arm64 --push --tag "$STAGING_IMAGE" \
             --provenance=mode=max --sbom=true \
             --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
@@ -209,7 +373,7 @@ jobs:
           DIGEST="$(node -e "const j=require('./dist-release/image-metadata.json'); process.stdout.write(j['containerimage.digest']||'')")"
           test -n "$DIGEST"
           printf '%s@%s\n' "${IMAGE%:*}" "$DIGEST" > dist-release/assets/container-image.txt
-          docker buildx build --push --target backup-runtime --tag "$STAGING_BACKUP_IMAGE" \
+          docker buildx build --platform linux/amd64,linux/arm64 --push --target backup-runtime --tag "$STAGING_BACKUP_IMAGE" \
             --provenance=mode=max --sbom=true \
             --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
@@ -255,22 +419,6 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${BACKUP_IMAGE%:*}@${BACKUP_DIGEST}" >/dev/null
 
-      - name: Sign package and container-digest bundle
-        env:
-          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
-          CLEARANCE_RELEASE_ASSET_DIR: ${{ github.workspace }}/dist-release/assets
-          CLEARANCE_REQUIRE_RELEASE_ASSETS: "1"
-          CLEARANCE_REQUIRE_TAG_BINDING: "1"
-          CLEARANCE_VERSION: ${{ env.VERSION }}
-        run: bash scripts/sign-release.sh "${{ github.workspace }}/dist-release"
-
-      - name: Verify detached signature and asset manifest
-        run: |
-          set -Eeuo pipefail
-          openssl dgst -sha256 -verify dist-release/release-public.pem \
-            -signature dist-release/release-bundle.sig dist-release/release-bundle.txt
-          (cd dist-release/assets && sha256sum --check ../assets.sha256)
-
       - name: Keyless-sign and verify immutable container digests
         if: env.RECOVER_PUBLISHED_NPM != '1'
         run: |
@@ -295,7 +443,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           verify_tag_digest() {
-            local image="$1" evidence="$2" repository expected actual
+            local image="$1" evidence="$2" platform_evidence="$3" repository expected actual manifest ANON_DOCKER_CONFIG
             repository="${image%:*}"
             expected="$(sed -n 's/^.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$evidence")"
             [[ -n "$expected" ]] || {
@@ -309,9 +457,27 @@ jobs:
               echo "::error::$image resolves to ${actual:-no digest}; signed digest is $expected"
               exit 1
             }
+            # A release image must be publicly consumable by both supported Linux
+            # platforms without using the authenticated publishing credentials.
+            ANON_DOCKER_CONFIG="$(mktemp -d)"
+            docker --config "$ANON_DOCKER_CONFIG" pull --platform linux/amd64 "${repository}@${expected}" >/dev/null
+            docker --config "$ANON_DOCKER_CONFIG" pull --platform linux/arm64 "${repository}@${expected}" >/dev/null
+            manifest="$ANON_DOCKER_CONFIG/manifest.json"
+            docker --config "$ANON_DOCKER_CONFIG" manifest inspect "${repository}@${expected}" > "$manifest"
+            node -e '
+              const fs=require("fs");
+              const [manifestPath, output, reference]=process.argv.slice(1);
+              const manifest=JSON.parse(fs.readFileSync(manifestPath,"utf8"));
+              const descriptors=(manifest.manifests ?? []).map(({digest, mediaType, platform}) => ({ digest, mediaType, platform: `${platform?.os}/${platform?.architecture}` }));
+              const platforms=descriptors.map(({platform}) => platform).sort();
+              for (const wanted of ["linux/amd64", "linux/arm64"]) {
+                if (!platforms.includes(wanted)) throw new Error(`${reference} manifest list is missing ${wanted}`);
+              }
+              fs.writeFileSync(output, `${JSON.stringify({ reference, mediaType: manifest.mediaType, descriptors, platforms }, null, 2)}\n`);
+            ' "$manifest" "$platform_evidence" "${repository}@${expected}"
           }
-          verify_tag_digest "$IMAGE" dist-release/assets/container-image.txt
-          verify_tag_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt
+          verify_tag_digest "$IMAGE" dist-release/assets/container-image.txt dist-release/assets/container-image-platforms.json
+          verify_tag_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt dist-release/assets/backup-container-image-platforms.json
 
       - name: Publish public npm packages with trusted provenance
         if: env.RECOVER_PUBLISHED_NPM != '1'
@@ -320,8 +486,9 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -Eeuo pipefail
-          npm install --global npm@11.16.0
+          test "$(npm --version)" = "11.16.0"
           test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          mapfile -t PACKAGES < <(node scripts/release-packages.mjs names)
           tarball_for() {
             node -e '
               const fs=require("fs"), cp=require("child_process"), path=require("path");
@@ -343,14 +510,23 @@ jobs:
             ' "$1"
           }
           registry_status() {
-            local package="$1" encoded response status
+            local package="$1" encoded status
             encoded="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$package")"
-            response="dist-release/npm-registry-response.json"
             for ATTEMPT in {1..120}; do
-              status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+              status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
                 "https://registry.npmjs.org/${encoded}/${VERSION}" || true)"
               case "$status" in
-                200|404) printf '%s' "$status"; return 0 ;;
+                200) printf '%s' "$status"; return 0 ;;
+                404)
+                  # npm's negative cache can briefly hide an immutable version.
+                  # Do not classify it absent until the full readback window ends.
+                  if [[ "$ATTEMPT" -eq 120 ]]; then
+                    printf '%s' "$status"
+                    return 0
+                  fi
+                  echo "Waiting to confirm ${package}@${VERSION} is absent from the public registry (${ATTEMPT}/120)..." >&2
+                  sleep 5
+                  ;;
                 000|429|5??)
                   echo "Waiting for a conclusive registry response for ${package}@${VERSION} (${ATTEMPT}/120)..." >&2
                   sleep 5
@@ -364,37 +540,140 @@ jobs:
             echo "::error::Registry did not return a conclusive response for ${package}@${VERSION}" >&2
             return 1
           }
-          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
-            STATUS="$(registry_status "$PACKAGE")"
-            [[ "$STATUS" == "404" ]] || {
-              echo "::error::${PACKAGE}@${VERSION} already exists; use the explicit provenance-verified recovery path"
-              exit 1
-            }
-          done
-          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
-            npm publish "$(tarball_for "$PACKAGE")" --access public --provenance
-          done
-          for PACKAGE in @clearance/auth @clearance/management @clearance/cli @clearance/api; do
-            TARBALL="$(tarball_for "$PACKAGE")"
-            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
-            PUBLISHED_INTEGRITY=""
+          registry_integrity() {
+            local package="$1" integrity=""
             for ATTEMPT in {1..120}; do
-              if PUBLISHED_INTEGRITY="$(npm view "${PACKAGE}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
-                && [[ -n "$PUBLISHED_INTEGRITY" ]]; then
-                break
+              if integrity="$(npm view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
+                && [[ -n "$integrity" ]]; then
+                printf '%s' "$integrity"
+                return 0
               fi
-              echo "Waiting for ${PACKAGE}@${VERSION} to propagate (${ATTEMPT}/120)..."
+              echo "Waiting for ${package}@${VERSION} to become readable from the public registry (${ATTEMPT}/120)..." >&2
               sleep 5
             done
-            [[ -n "$PUBLISHED_INTEGRITY" ]] || {
-              echo "::error::${PACKAGE}@${VERSION} did not become readable from the public registry"
+            echo "::error::${package}@${VERSION} did not become readable from the public registry" >&2
+            return 1
+          }
+          prepare_audit_tree() {
+            local audit_dir="$1" package target
+            shift
+            mkdir -p "$audit_dir/node_modules"
+            node -e '
+              const fs = require("fs");
+              const [output, version, ...packages] = process.argv.slice(1);
+              const dependencies = Object.fromEntries(packages.map(name => [name, version]));
+              fs.writeFileSync(output, `${JSON.stringify({ name: "clearance-provenance-audit", private: true, version: "0.0.0", dependencies }, null, 2)}\n`);
+            ' "$audit_dir/package.json" "$VERSION" "$@"
+            for package in "$@"; do
+              target="$audit_dir/node_modules/$package"
+              mkdir -p "$target"
+              tar -xzf "$(tarball_for "$package")" -C "$target" --strip-components=1
+            done
+          }
+          verify_provenance() {
+            local output="$1"
+            shift
+            for ATTEMPT in {1..120}; do
+              AUDIT_DIR="$(mktemp -d)"
+              prepare_audit_tree "$AUDIT_DIR" "$@"
+              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+                && node scripts/verify-npm-provenance.mjs \
+                  "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
+                  dist-release/assets "$output" "$@"; then
+                return 0
+              fi
+              echo "Waiting for signed provenance for ${*} (${ATTEMPT}/120)..." >&2
+              sleep 5
+            done
+            echo "::error::Signed npm provenance did not become verifiable within ten minutes" >&2
+            return 1
+          }
+          EXISTING_PACKAGES=()
+          ABSENT_PACKAGES=()
+          for PACKAGE in "${PACKAGES[@]}"; do
+            STATUS="$(registry_status "$PACKAGE")"
+            if [[ "$STATUS" == "404" ]]; then
+              ABSENT_PACKAGES+=("$PACKAGE")
+              continue
+            fi
+            EXPECTED_INTEGRITY="$(integrity_for "$(tarball_for "$PACKAGE")")"
+            PUBLISHED_INTEGRITY="$(registry_integrity "$PACKAGE")"
+            [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
+              echo "::error::${PACKAGE}@${VERSION} registry SHA-512 does not match the frozen local tarball"
               exit 1
             }
+            EXISTING_PACKAGES+=("$PACKAGE")
+          done
+          if [[ "${#EXISTING_PACKAGES[@]}" -gt 0 ]]; then
+            echo "Verify every existing immutable package before publishing any absent version: ${EXISTING_PACKAGES[*]}"
+            verify_provenance dist-release/assets/npm-provenance-existing.json "${EXISTING_PACKAGES[@]}"
+          fi
+          for PACKAGE in "${ABSENT_PACKAGES[@]}"; do
+            if ! npm publish "$(tarball_for "$PACKAGE")" --access public --provenance; then
+              # A competing immutable publish is acceptable only when the public
+              # registry readback proves it is byte-for-byte the frozen artifact.
+              [[ "$(registry_status "$PACKAGE")" == "200" ]] || exit 1
+              EXPECTED_INTEGRITY="$(integrity_for "$(tarball_for "$PACKAGE")")"
+              PUBLISHED_INTEGRITY="$(registry_integrity "$PACKAGE")"
+              [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
+                echo "::error::${PACKAGE}@${VERSION} publish conflict has different immutable bytes"
+                exit 1
+              }
+            fi
+          done
+          for PACKAGE in "${PACKAGES[@]}"; do
+            TARBALL="$(tarball_for "$PACKAGE")"
+            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
+            PUBLISHED_INTEGRITY="$(registry_integrity "$PACKAGE")"
             [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
               echo "::error::${PACKAGE}@${VERSION} failed final registry integrity verification"
               exit 1
             }
           done
+          verify_provenance dist-release/assets/npm-provenance.json "${PACKAGES[@]}"
+
+      - name: Prove anonymous public-registry install and imports
+        if: env.RECOVER_PUBLISHED_NPM != '1'
+        run: |
+          set -Eeuo pipefail
+          mapfile -t PACKAGES < <(node scripts/release-packages.mjs names)
+          ANON_NPMRC="$(mktemp)"
+          ANON_HOME="$(mktemp -d)"
+          printf 'registry=https://registry.npmjs.org/\n' > "$ANON_NPMRC"
+          INSTALL_DIR="$(mktemp -d)"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" npm --userconfig "$ANON_NPMRC" \
+            install --prefix "$INSTALL_DIR" --ignore-scripts --save-exact "${PACKAGES[@]/%/@$VERSION}"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" INSTALL_DIR="$INSTALL_DIR" node --input-type=module <<'NODE'
+          import { createRequire } from "node:module";
+          import path from "node:path";
+          const install = process.env.INSTALL_DIR;
+          const require = createRequire(path.join(install, "package.json"));
+          for (const name of ["@clearance/management-client", "@clearance/observability-node", "@clearance/delivery", "@clearance/delivery-worker", "@clearance/key-management", "@clearance/verification", "@clearance/vault", "@clearance/auth", "@clearance/management", "@clearance/cli", "@clearance/api"]) {
+            await import(require.resolve(name));
+          }
+          const consolePackage = path.join(install, "node_modules", "@clearance", "console", "package.json");
+          if (!require("node:fs").existsSync(consolePackage)) throw new Error("Anonymous registry install omitted @clearance/console.");
+          NODE
+
+      - name: Sign package and container-digest bundle
+        env:
+          CLEARANCE_RELEASE_ASSET_DIR: ${{ github.workspace }}/dist-release/assets
+          CLEARANCE_REQUIRE_RELEASE_ASSETS: "1"
+          CLEARANCE_REQUIRE_TAG_BINDING: "1"
+          CLEARANCE_RELEASE_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY: ${{ env.RECOVER_PUBLISHED_NPM }}
+          CLEARANCE_VERSION: ${{ env.VERSION }}
+        run: bash scripts/sign-release.sh "${{ github.workspace }}/dist-release"
+
+      - name: Verify detached signature and asset manifest
+        env:
+          CLEARANCE_RELEASE_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY: ${{ env.RECOVER_PUBLISHED_NPM }}
+        run: |
+          set -Eeuo pipefail
+          bash scripts/verify-release-bundle.sh dist-release
 
       - name: Upload signed release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

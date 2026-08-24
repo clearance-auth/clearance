@@ -280,6 +280,7 @@ describe("testUtils plugin", async () => {
 			plugins: [
 				testUtils({ captureOTP: true }),
 				emailOTP({
+					storeOTP: "plain",
 					async sendVerificationOTP({ email, otp }) {
 						// Don't actually send email in tests
 					},

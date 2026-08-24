@@ -41,6 +41,18 @@ export type SessionView = {
 	userAgent?: string;
 };
 
+function principalReadView(store: ManagementSnapshotReader) {
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage: "sessions.read",
+			status: 500,
+		});
+	}
+	return store.snapshot.principals;
+}
+
 export type SessionSource = AuditEvent["source"];
 
 export type RevokeSessionResult = {
@@ -48,20 +60,6 @@ export type RevokeSessionResult = {
 	/** True when session was already revoked / absent under authorized contract */
 	idempotent: boolean;
 };
-
-export function normalizeSessionLimit(limit: number | undefined): number {
-	const value = limit ?? 100;
-	if (!Number.isInteger(value) || value < 1 || value > 500) {
-		throw new ClearanceError({
-			code: "SESSION_LIMIT_INVALID",
-			message: "Session limit must be an integer between 1 and 500",
-			stage: "sessions.list",
-			status: 400,
-			remediation: "Pass --limit with an integer from 1 through 500",
-		});
-	}
-	return value;
-}
 
 const SENSITIVE_SESSION_KEYS = /token|secret|password|authorization|bearer|cookie/i;
 
@@ -101,7 +99,9 @@ function principalForSession(
 	scope: ResourceScope,
 	stage: string,
 ) {
-	const principal = store.snapshot.principals.find((p) => p.id === principalId);
+	const principal = principalReadView(store).find(
+		(p) => p.id === principalId,
+	);
 	if (!principal || principal.status === "deleted") {
 		throw new ClearanceError({
 			code: "SESSION_NOT_FOUND",
@@ -150,7 +150,7 @@ export function listSessions(
 ): SessionView[] {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const includeRevoked = opts?.includeRevoked === true;
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const views = selectSessionViews(store, scope, includeRevoked);
 	// Newest first, then apply limit
 	views.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
@@ -164,7 +164,7 @@ function selectSessionViews(
 	includeRevoked: boolean,
 ): SessionView[] {
 	const principals = new Map(
-		store.snapshot.principals
+		principalReadView(store)
 			.filter(
 				(p) =>
 					p.projectId === scope.projectId &&
@@ -205,7 +205,7 @@ export function listSessionsPage(
 ): { sessions: SessionView[]; nextCursor: string | null } {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	// Keep the shipped SESSION_LIMIT_INVALID contract for page size.
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const cursor = decodePageCursor(opts?.cursor, "sessions", "sessions.list");
 	// Same selection semantics as listSessions, unbounded.
 	const all = selectSessionViews(store, scope, opts?.includeRevoked === true);
@@ -292,7 +292,9 @@ export function revokeSession(
 			});
 		}
 
-		const principal = data.principals.find((p) => p.id === session.principalId);
+		const principal = principalReadView(store).find(
+			(p) => p.id === session.principalId,
+		);
 		if (!principal || principal.status === "deleted") {
 			throw new ClearanceError({
 				code: "SESSION_NOT_FOUND",

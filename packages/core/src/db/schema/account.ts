@@ -30,6 +30,9 @@ export const accountSchema = coreSchema.extend({
 	 * Password is only stored in the credential provider
 	 */
 	password: z.string().nullish(),
+	failedPasswordAttempts: z.number().nullish(),
+	activePasswordAttemptReservations: z.string().nullish(),
+	passwordLockedUntil: z.date().nullish(),
 });
 
 export type BaseAccount = z.infer<typeof accountSchema>;

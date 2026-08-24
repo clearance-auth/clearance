@@ -9,7 +9,7 @@ const defaultKeyHasher = async (identifier: string) => {
 	return base64Url.encode(new Uint8Array(hash), { padding: false });
 };
 
-export async function processIdentifier(
+export async function deriveStoredIdentifier(
 	identifier: string,
 	option: StoreIdentifierOption | undefined,
 ): Promise<string> {

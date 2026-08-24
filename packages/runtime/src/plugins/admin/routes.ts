@@ -3,8 +3,9 @@ import {
 	createAuthMiddleware,
 } from "@clearance/core/api";
 import type { Session } from "@clearance/core/db";
-import type { Where } from "@clearance/core/db/adapter";
+import type { DBAdapter, DBTransactionAdapter, Where } from "@clearance/core/db/adapter";
 import { whereOperators } from "@clearance/core/db/adapter";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import * as z from "zod";
 import { getAuthoritativeSessionFromCtx, getSessionFromCtx } from "../../api";
@@ -14,6 +15,15 @@ import {
 	setSessionCookie,
 } from "../../cookies";
 import { parseSessionOutput, parseUserOutput } from "../../db/schema";
+import { lockAndReadUser } from "../../db/user-authority";
+import { captureInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditDraft,
+} from "@clearance/runtime/internal/runtime-audit";
 import { getDate } from "../../utils/date";
 import type { AccessControl, ArrayElement } from "../access";
 import type { defaultStatements } from "./access";
@@ -47,6 +57,31 @@ const adminMiddleware = createAuthMiddleware(async (ctx) => {
 
 function parseRoles(roles: string | string[]): string {
 	return Array.isArray(roles) ? roles.join(",") : roles;
+}
+
+function requireAtomicCredentialMutation(adapter: Pick<DBAdapter, "options">) {
+	if (typeof adapter.options?.adapterConfig.transaction !== "function") {
+		throw new APIError("SERVICE_UNAVAILABLE", {
+			message:
+				"Administrative credential revocation requires rollback-capable database transactions",
+		});
+	}
+}
+
+async function appendRuntimeAuditIfBound(
+	ctx: { context: { adapter: DBAdapter; options: object } },
+	transaction: DBTransactionAdapter,
+	draft: Omit<InternalRuntimeAuditDraft, "request">,
+) {
+	const binding =
+		readInternalRuntimeAudit(transaction) ??
+		readInternalRuntimeAudit(ctx.context.adapter) ??
+		readInternalRuntimeAudit(ctx.context.options);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	await appendInternalRuntimeAudit(transaction, { ...draft, request });
 }
 
 const setRoleBodySchema = z.object({
@@ -663,14 +698,28 @@ export const adminUpdateUser = (opts: AdminOptions) =>
 				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
 			}
 
-			const updatedUser = await ctx.context.internalAdapter.updateUser(
-				ctx.body.userId,
-				ctx.body.data,
-			);
+			const update = async () => {
+				const updatedUser = await ctx.context.internalAdapter.updateUser(
+					ctx.body.userId,
+					ctx.body.data,
+				);
 
-			// Match the ban-user endpoint: banning a user must revoke their sessions.
+				// Match the ban-user endpoint: banning a user revokes every bearer
+				// authority in the same database transaction as the user mutation.
+				if (updateData.banned === true) {
+					await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+					await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+						ctx.body.userId,
+					);
+				}
+				return updatedUser;
+			};
+			let updatedUser: Awaited<ReturnType<typeof update>>;
 			if (updateData.banned === true) {
-				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				requireAtomicCredentialMutation(ctx.context.adapter);
+				updatedUser = await runWithTransaction(ctx.context.adapter, update);
+			} else {
+				updatedUser = await update();
 			}
 
 			return ctx.json(
@@ -828,17 +877,17 @@ export const listUsers = (opts: AdminOptions) =>
 			}
 
 			try {
-				const users = await ctx.context.internalAdapter.listUsers(
-					Number(ctx.query?.limit) || undefined,
-					Number(ctx.query?.offset) || undefined,
-					ctx.query?.sortBy
+				const users = await ctx.context.internalAdapter.listUsers({
+					limit: Number(ctx.query?.limit) || undefined,
+					offset: Number(ctx.query?.offset) || undefined,
+					sortBy: ctx.query?.sortBy
 						? {
 								field: ctx.query.sortBy,
 								direction: ctx.query.sortDirection || "asc",
 							}
 						: undefined,
-					where.length ? where : undefined,
-				);
+					where: where.length ? where : undefined,
+				});
 				const total = await ctx.context.internalAdapter.countTotalUsers(
 					where.length ? where : undefined,
 				);
@@ -1136,22 +1185,28 @@ export const banUser = (opts: AdminOptions) =>
 					ADMIN_ERROR_CODES.YOU_CANNOT_BAN_YOURSELF,
 				);
 			}
-			const user = await ctx.context.internalAdapter.updateUser(
-				ctx.body.userId,
-				{
-					banned: true,
-					banReason:
-						ctx.body.banReason || opts?.defaultBanReason || "No reason",
-					banExpires: ctx.body.banExpiresIn
-						? getDate(ctx.body.banExpiresIn, "sec")
-						: opts?.defaultBanExpiresIn
-							? getDate(opts.defaultBanExpiresIn, "sec")
-							: undefined,
-					updatedAt: new Date(),
-				},
-			);
-			//revoke all sessions
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			const user = await runWithTransaction(ctx.context.adapter, async () => {
+				const updated = await ctx.context.internalAdapter.updateUser(
+					ctx.body.userId,
+					{
+						banned: true,
+						banReason:
+							ctx.body.banReason || opts?.defaultBanReason || "No reason",
+						banExpires: ctx.body.banExpiresIn
+							? getDate(ctx.body.banExpiresIn, "sec")
+							: opts?.defaultBanExpiresIn
+								? getDate(opts.defaultBanExpiresIn, "sec")
+								: undefined,
+						updatedAt: new Date(),
+					},
+				);
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+				return updated;
+			});
 			return ctx.json({
 				user: parseUserOutput(ctx.context.options, user) as UserWithRole,
 			});
@@ -1214,72 +1269,111 @@ export const impersonateUser = (opts: AdminOptions) =>
 			},
 		},
 		async (ctx) => {
-			const canImpersonateUser = hasPermission({
-				userId: ctx.context.session.user.id,
-				role: ctx.context.session.user.role,
-				options: opts,
-				permissions: {
-					user: ["impersonate"],
-				},
-			});
-			if (!canImpersonateUser) {
-				throw APIError.from(
-					"FORBIDDEN",
-					ADMIN_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS,
+			const issued = await runWithTransaction(ctx.context.adapter, async () => {
+				const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+				const actorId = ctx.context.session.user.id;
+				const lockedUsers = new Map<string, UserWithRole>();
+				for (const userId of [...new Set([actorId, ctx.body.userId])].sort()) {
+					const locked = await lockAndReadUser(transactionAdapter, userId);
+					if (locked) lockedUsers.set(userId, locked as UserWithRole);
+				}
+				const actor = lockedUsers.get(actorId);
+				if (!actor || actor.banned === true) {
+					throw APIError.fromStatus("UNAUTHORIZED");
+				}
+				const targetUser = lockedUsers.get(ctx.body.userId);
+				if (!targetUser || targetUser.banned === true) {
+					throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
+				}
+				const source = await ctx.context.internalAdapter.findSessionById(
+					ctx.context.session.session.id,
 				);
-			}
-
-			const targetUser = (await ctx.context.internalAdapter.findUserById(
-				ctx.body.userId,
-			)) as UserWithRole | null;
-
-			if (!targetUser) {
-				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
-			}
-
-			const adminRoles = (
-				Array.isArray(opts.adminRoles)
-					? opts.adminRoles
-					: opts.adminRoles?.split(",") || []
-			).map((role) => role.trim());
-			const targetUserRole = (
-				targetUser.role ||
-				opts.defaultRole ||
-				"user"
-			).split(",");
-			const isTargetAdmin =
-				targetUserRole.some((role) => adminRoles.includes(role)) ||
-				!!opts.adminUserIds?.includes(targetUser.id);
-			if (isTargetAdmin) {
-				const canImpersonateAdmins =
-					opts.allowImpersonatingAdmins === true ||
-					hasPermission({
-						userId: ctx.context.session.user.id,
-						role: ctx.context.session.user.role,
+				if (
+					!source ||
+					source.session.id !== ctx.context.session.session.id ||
+					source.user.id !== actor.id
+				) {
+					throw APIError.fromStatus("UNAUTHORIZED");
+				}
+				const canImpersonateUser = hasPermission({
+					userId: actor.id,
+					role: actor.role,
+					options: opts,
+					permissions: { user: ["impersonate"] },
+				});
+				if (!canImpersonateUser) {
+					throw APIError.from(
+						"FORBIDDEN",
+						ADMIN_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_IMPERSONATE_USERS,
+					);
+				}
+				const adminRoles = (
+					Array.isArray(opts.adminRoles)
+						? opts.adminRoles
+						: opts.adminRoles?.split(",") || []
+				).map((role) => role.trim());
+				const targetUserRole = (
+					targetUser.role || opts.defaultRole || "user"
+				).split(",");
+				const isTargetAdmin =
+					targetUserRole.some((role) => adminRoles.includes(role)) ||
+					Boolean(opts.adminUserIds?.includes(targetUser.id));
+				if (
+					isTargetAdmin &&
+					opts.allowImpersonatingAdmins !== true &&
+					!hasPermission({
+						userId: actor.id,
+						role: actor.role,
 						options: opts,
-						permissions: {
-							user: ["impersonate-admins"],
-						},
-					});
-				if (!canImpersonateAdmins) {
+						permissions: { user: ["impersonate-admins"] },
+					})
+				) {
 					throw APIError.from(
 						"FORBIDDEN",
 						ADMIN_ERROR_CODES.YOU_CANNOT_IMPERSONATE_ADMINS,
 					);
 				}
-			}
-
-			const session = await ctx.context.internalAdapter.createSession(
-				targetUser.id,
-				true,
-				{
-					impersonatedBy: ctx.context.session.user.id,
-					expiresAt: opts?.impersonationSessionDuration
-						? getDate(opts.impersonationSessionDuration, "sec")
-						: getDate(60 * 60, "sec"), // 1 hour
-				},
-				true,
-			);
+				const issuanceContext = await captureInternalSessionIssuanceContext(
+					ctx.context.internalAdapter,
+					{
+						purpose: "impersonation",
+						subjectId: targetUser.id,
+						evidence: [
+							{
+								kind: "primary",
+								primaryMethod: "admin_impersonation",
+							},
+						],
+						sourceSessionToken: source.session.token,
+						targetOrganizationId: null,
+					},
+				);
+				const session = await ctx.context.internalAdapter.createSession(
+					targetUser.id,
+					true,
+					{
+						impersonatedBy: actor.id,
+						expiresAt: opts?.impersonationSessionDuration
+							? getDate(opts.impersonationSessionDuration, "sec")
+							: getDate(60 * 60, "sec"),
+					},
+					true,
+					issuanceContext,
+				);
+				await appendRuntimeAuditIfBound(ctx, transactionAdapter, {
+					actor: actor.id,
+					action: "auth.impersonation.started",
+					subjectType: "session",
+					subjectId: session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: null,
+					message: "Impersonation started",
+					metadata: { targetUserId: targetUser.id },
+				});
+				return { session, targetUser };
+			});
+			const session = issued.session;
 			if (!session) {
 				throw APIError.from(
 					"INTERNAL_SERVER_ERROR",
@@ -1303,13 +1397,13 @@ export const impersonateUser = (opts: AdminOptions) =>
 				ctx,
 				{
 					session: session,
-					user: targetUser,
+					user: issued.targetUser,
 				},
 				true,
 			);
 			return ctx.json({
-				session: session,
-				user: parseUserOutput(ctx.context.options, targetUser) as UserWithRole,
+				session: parseSessionOutput(ctx.context.options, session),
+				user: parseUserOutput(ctx.context.options, issued.targetUser) as UserWithRole,
 			});
 		},
 	);
@@ -1380,7 +1474,21 @@ export const stopImpersonating = () =>
 					message: "Failed to find admin session",
 				});
 			}
-			await ctx.context.internalAdapter.deleteSession(session.session.token);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				const transactionAdapter = await getCurrentAdapter(ctx.context.adapter);
+				await ctx.context.internalAdapter.deleteSessionById(session.session.id);
+				await appendRuntimeAuditIfBound(ctx, transactionAdapter, {
+					actor: session.session.impersonatedBy,
+					action: "auth.impersonation.stopped",
+					subjectType: "session",
+					subjectId: session.session.id,
+					outcome: "success",
+					source: "system",
+					organizationId: null,
+					message: "Impersonation stopped",
+					metadata: { targetUserId: session.user.id },
+				});
+			});
 			await setSessionCookie(ctx, adminSession, !!dontRememberMeCookie);
 			expireCookie(ctx, adminSessionCookie);
 			return ctx.json({
@@ -1390,11 +1498,20 @@ export const stopImpersonating = () =>
 		},
 	);
 
-const revokeUserSessionBodySchema = z.object({
-	sessionToken: z.string().meta({
-		description: "The session token",
-	}),
-});
+const revokeUserSessionBodySchema = z
+	.object({
+		sessionId: z.string().optional().meta({
+			description: "The stable session identifier",
+		}),
+		sessionToken: z.string().optional().meta({
+			description:
+				"Deprecated session-token compatibility alias. Public session responses provide a non-secret stable handle.",
+			deprecated: true,
+		}),
+	})
+	.refine((body) => Boolean(body.sessionId) !== Boolean(body.sessionToken), {
+		message: "Provide exactly one of sessionId or sessionToken",
+	});
 /**
  * ### Endpoint
  *
@@ -1422,6 +1539,31 @@ export const revokeUserSession = (opts: AdminOptions) =>
 					operationId: "revokeUserSession",
 					summary: "Revoke a user session",
 					description: "Revoke a user session",
+					requestBody: {
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										sessionId: {
+											type: "string",
+											description: "The stable session identifier",
+										},
+										sessionToken: {
+											type: "string",
+											description:
+												"Deprecated non-secret session handle or legacy bearer token",
+											deprecated: true,
+										},
+									},
+									oneOf: [
+										{ required: ["sessionId"] },
+										{ required: ["sessionToken"] },
+									],
+								},
+							},
+						},
+					},
 					responses: {
 						200: {
 							description: "Session revoked",
@@ -1459,7 +1601,18 @@ export const revokeUserSession = (opts: AdminOptions) =>
 				);
 			}
 
-			await ctx.context.internalAdapter.deleteSession(ctx.body.sessionToken);
+			const legacySession = ctx.body.sessionToken
+				? (await ctx.context.internalAdapter.findSessionById(
+						ctx.body.sessionToken,
+					)) ??
+					(await ctx.context.internalAdapter.findSession(
+						ctx.body.sessionToken,
+					))
+				: null;
+			const sessionId = ctx.body.sessionId ?? legacySession?.session.id;
+			if (sessionId) {
+				await ctx.context.internalAdapter.deleteSessionById(sessionId);
+			}
 			return ctx.json({
 				success: true,
 			});
@@ -1535,7 +1688,13 @@ export const revokeUserSessions = (opts: AdminOptions) =>
 				);
 			}
 
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+			});
 			return ctx.json({
 				success: true,
 			});
@@ -1628,8 +1787,14 @@ export const removeUser = (opts: AdminOptions) =>
 				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
 			}
 
-			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
-			await ctx.context.internalAdapter.deleteUser(ctx.body.userId);
+			requireAtomicCredentialMutation(ctx.context.adapter);
+			await runWithTransaction(ctx.context.adapter, async () => {
+				await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
+				await ctx.context.internalAdapter.revokeUserOAuthTokenFamilies(
+					ctx.body.userId,
+				);
+				await ctx.context.internalAdapter.deleteUser(ctx.body.userId);
+			});
 			return ctx.json({
 				success: true,
 			});

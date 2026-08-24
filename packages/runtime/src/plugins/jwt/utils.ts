@@ -1,10 +1,61 @@
-import type { GenericEndpointContext } from "@clearance/core";
+import type { Awaitable, GenericEndpointContext } from "@clearance/core";
+import { ClearanceError } from "@clearance/core/error";
 import { exportJWK, generateKeyPair } from "jose";
 import { symmetricEncrypt } from "../../crypto";
 import type { TimeString } from "../../utils/time";
 import { sec } from "../../utils/time";
 import { getJwksAdapter } from "./adapter";
-import type { Jwk, JwtOptions } from "./types";
+import type { Jwk, JwtOptions, JwtPrivateKeyStorage } from "./types";
+
+export function getPrivateKeyStorage(options?: JwtOptions | undefined) {
+	const jwksOptions = options?.jwks;
+	if (
+		jwksOptions?.privateKeyStorage &&
+		jwksOptions.disablePrivateKeyEncryption
+	) {
+		throw new ClearanceError(
+			"jwks.privateKeyStorage cannot be combined with jwks.disablePrivateKeyEncryption",
+		);
+	}
+	return jwksOptions?.privateKeyStorage;
+}
+
+async function invokePrivateKeyStorage(
+	operation: () => Awaitable<string>,
+	failureMessage: string,
+) {
+	try {
+		const privateKey = await operation();
+		if (typeof privateKey !== "string") {
+			throw new Error("Private key storage returned a non-string value");
+		}
+		return privateKey;
+	} catch {
+		throw new ClearanceError(failureMessage);
+	}
+}
+
+export async function encryptPrivateJwk(
+	storage: JwtPrivateKeyStorage,
+	privateKey: string,
+	publicKey: string,
+) {
+	return invokePrivateKeyStorage(
+		() => storage.encrypt(privateKey, publicKey),
+		"Failed to encrypt private key with configured private key storage",
+	);
+}
+
+export async function decryptPrivateJwk(
+	storage: JwtPrivateKeyStorage,
+	encryptedPrivateKey: string,
+	publicKey: string,
+) {
+	return invokePrivateKeyStorage(
+		() => storage.decrypt(encryptedPrivateKey, publicKey),
+		"Failed to decrypt private key with configured private key storage",
+	);
+}
 
 /**
  * Converts an expirationTime to ISO seconds expiration time (the format of JWT exp)
@@ -61,6 +112,8 @@ export async function createJwk(
 		await generateExportedKeyPair(options);
 
 	const stringifiedPrivateWebKey = JSON.stringify(privateWebKey);
+	const publicKey = JSON.stringify(publicWebKey);
+	const privateKeyStorage = getPrivateKeyStorage(options);
 	const privateKeyEncryptionEnabled =
 		!options?.jwks?.disablePrivateKeyEncryption;
 	const jwk: Omit<Jwk, "id"> = {
@@ -70,8 +123,14 @@ export async function createJwk(
 					crv: (cfg as { crv: (typeof jwk)["crv"] }).crv,
 				}
 			: {}),
-		publicKey: JSON.stringify(publicWebKey),
-		privateKey: privateKeyEncryptionEnabled
+		publicKey,
+		privateKey: privateKeyStorage
+			? await encryptPrivateJwk(
+					privateKeyStorage,
+					stringifiedPrivateWebKey,
+					publicKey,
+				)
+			: privateKeyEncryptionEnabled
 			? JSON.stringify(
 					await symmetricEncrypt({
 						key: ctx.context.secretConfig,

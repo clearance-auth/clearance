@@ -106,6 +106,11 @@
       "types": "./dist/test-utils/index.d.mts",
       "default": "./dist/test-utils/index.mjs"
     },
+    "./internal/runtime-audit": {
+      "dev-source": "./src/internal/runtime-audit.ts",
+      "types": "./dist/internal/runtime-audit.d.mts",
+      "default": "./dist/internal/runtime-audit.mjs"
+    },
     "./api": {
       "dev-source": "./src/api/index.ts",
       "types": "./dist/api/index.d.mts",
@@ -281,6 +286,11 @@
       "types": "./dist/plugins/organization/access/index.d.mts",
       "default": "./dist/plugins/organization/access/index.mjs"
     },
+    "./plugins/passkey": {
+      "dev-source": "./src/plugins/passkey/index.ts",
+      "types": "./dist/plugins/passkey/index.d.mts",
+      "default": "./dist/plugins/passkey/index.mjs"
+    },
     "./plugins/one-time-token": {
       "dev-source": "./src/plugins/one-time-token/index.ts",
       "types": "./dist/plugins/one-time-token/index.d.mts",
@@ -371,6 +381,9 @@
       ],
       "api": [
         "./dist/api/index.d.mts"
+      ],
+      "internal/runtime-audit": [
+        "./dist/internal/runtime-audit.d.mts"
       ],
       "db": [
         "./dist/db/index.d.mts"
@@ -485,6 +498,9 @@
       ],
       "plugins/mcp/client/adapters": [
         "./dist/plugins/mcp/client/adapters.d.mts"
+      ],
+      "plugins/passkey": [
+        "./dist/plugins/passkey/index.d.mts"
       ]
     }
   },
@@ -500,11 +516,14 @@
     "@better-fetch/fetch": "catalog:",
     "@noble/ciphers": "^2.1.1",
     "@noble/hashes": "^2.0.1",
+    "@simplewebauthn/browser": "^13.2.2",
+    "@simplewebauthn/server": "^13.2.3",
     "@clearance/call": "workspace:^",
     "defu": "^6.1.4",
     "jose": "^6.1.3",
     "kysely": "catalog:",
     "nanostores": "^1.1.1",
+    "tldts": "^7.4.8",
     "zod": "^4.3.6"
   },
   "devDependencies": {
@@ -522,7 +541,7 @@
     "happy-dom": "^20.8.9",
     "listhen": "^1.9.0",
     "msw": "^2.12.10",
-    "next": "^16.2.6",
+    "next": "^16.3.0",
     "oauth2-mock-server": "^8.2.2",
     "react": "catalog:react19",
     "react-dom": "catalog:react19",

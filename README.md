@@ -66,13 +66,21 @@ export CLEARANCE_CONSOLE_ADMIN_USER=admin
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="$(openssl rand -hex 32)"
 export CLEARANCE_CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
 pnpm stack:up
-docker compose ps
+pnpm stack:status
 
 curl http://localhost:13200/health
 curl http://localhost:13300/health     # must return {"ok":true,"app":"sample-b2b"}
 open http://localhost:13300/sign-up    # first login
 open http://localhost:13100/overview   # console
 ```
+
+`stack:up` derives a stable, purpose-separated local key-management
+configuration from `CLEARANCE_CREDENTIAL_KEY` and `CLEARANCE_CREDENTIAL_KEY_ID`.
+It also migrates a fresh Postgres credential-authority fence to `digest-v1`
+before starting the serving cohort.
+Set `CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON` only when intentionally supplying
+your own local provider configuration; production requires its operator-managed
+configuration through the production overlay.
 
 Optional social login is enabled only when a complete provider credential pair is present. An incomplete pair fails application startup so a broken sign-in option cannot be advertised.
 

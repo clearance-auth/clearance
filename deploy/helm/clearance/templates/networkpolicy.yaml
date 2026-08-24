@@ -9,7 +9,56 @@
 {{- if and $serviceMonitorScrape (empty .Values.metrics.networkPolicy.namespaceSelector) }}{{ fail "trusted-proxy ServiceMonitor requires metrics.networkPolicy.namespaceSelector" }}{{- end }}
 {{- if and $serviceMonitorScrape (empty .Values.metrics.networkPolicy.podSelector) }}{{ fail "trusted-proxy ServiceMonitor requires metrics.networkPolicy.podSelector" }}{{- end }}
 {{- end }}
+{{- if and .Values.delivery.enabled .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-delivery-worker
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: delivery-worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: delivery-worker
+  policyTypes: [Ingress, Egress]
+{{- if and .Values.delivery.worker.metrics.enabled .Values.delivery.worker.metrics.serviceMonitor.enabled }}
+  ingress:
+    - from:
+        - namespaceSelector:
+{{ toYaml .Values.delivery.worker.networkPolicy.metrics.namespaceSelector | indent 12 }}
+          podSelector:
+{{ toYaml .Values.delivery.worker.networkPolicy.metrics.podSelector | indent 12 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.delivery.worker.healthPort }} }
+{{- else }}
+  ingress: []
+{{- end }}
+  # The worker is excluded from the release-wide policy below. Its minimal
+  # transport contract is explicit here: cluster DNS, the configured database
+  # port, HTTPS for SES/webhooks, plus destination-scoped SMTP rules when used.
+  egress:
+    - to:
+{{ toYaml .Values.delivery.worker.networkPolicy.dnsPeers | indent 8 }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+{{ toYaml .Values.delivery.worker.networkPolicy.databasePeers | indent 8 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.postgres.port }} }
+    - ports:
+        - { protocol: TCP, port: 443 }
+{{- if eq .Values.delivery.worker.email.transport "smtp" }}
+{{ toYaml .Values.delivery.worker.networkPolicy.smtpEgress | indent 4 }}
+{{- end }}
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -74,6 +123,38 @@ spec:
     - ports:
         - protocol: TCP
           port: {{ .Values.console.service.port }}
+{{- if .Values.vault.enabled }}
+{{- $customDomainsEnabled := .Values.productPresentation.customDomains.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-vault-ingress
+  labels:
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: clearance
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: vault
+  policyTypes: [Ingress]
+  ingress:
+{{- if $customDomainsEnabled }}
+    # With custom domains, only the operator-declared private edge and the
+    # canonical Vault ingress controller may reach the Vault Service.
+    - from:
+{{ toYaml .Values.productPresentation.customDomains.edge.upstream.sourcePeers | indent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.vault.service.port }}
+{{- else }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.vault.service.port }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -113,6 +194,9 @@ spec:
     matchLabels:
       app.kubernetes.io/name: clearance
       app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: clearance.dev/delivery-worker
+        operator: DoesNotExist
   policyTypes: [Egress]
   egress:
     - ports:

@@ -8,11 +8,15 @@ import * as z from "zod";
 import { setSessionCookie } from "../../cookies";
 import { parseUserInput } from "../../db";
 import { buildSyntheticUserOutput, parseUserOutput } from "../../db/schema";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import type { AdditionalUserFieldsInput, User } from "../../types";
 import { isAPIError } from "../../utils/is-api-error";
 import { safeCloneRequest } from "../../utils/request";
 import { formCsrfMiddleware } from "../middlewares/origin-check";
-import { createEmailVerificationToken } from "./email-verification";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "./email-verification";
 
 const signUpEmailBodySchema = z
 	.object({
@@ -180,158 +184,180 @@ export const signUpEmail = <O extends ClearanceOptions>() =>
 			},
 		},
 		async (ctx) => {
-			return runWithTransaction(ctx.context.adapter, async () => {
-				if (
-					!ctx.context.options.emailAndPassword?.enabled ||
-					ctx.context.options.emailAndPassword?.disableSignUp
-				) {
-					throw APIError.from("BAD_REQUEST", {
-						message: "Email and password sign up is not enabled",
-						code: "EMAIL_PASSWORD_SIGN_UP_DISABLED",
-					});
-				}
-				const body = ctx.body as any as User & {
-					password: string;
-					callbackURL?: string | undefined;
-					rememberMe?: boolean | undefined;
-				} & {
-					[key: string]: any;
-				};
-				const {
-					name,
-					email,
-					password,
-					image,
-					callbackURL: _callbackURL,
-					rememberMe,
-					...rest
-				} = body;
-				const isValidEmail = z.email().safeParse(email);
+			if (
+				!ctx.context.options.emailAndPassword?.enabled ||
+				ctx.context.options.emailAndPassword?.disableSignUp
+			) {
+				throw APIError.from("BAD_REQUEST", {
+					message: "Email and password sign up is not enabled",
+					code: "EMAIL_PASSWORD_SIGN_UP_DISABLED",
+				});
+			}
+			const body = ctx.body as any as User & {
+				password: string;
+				callbackURL?: string | undefined;
+				rememberMe?: boolean | undefined;
+			} & {
+				[key: string]: any;
+			};
+			const {
+				name,
+				email,
+				password,
+				image,
+				callbackURL: _callbackURL,
+				rememberMe,
+				...rest
+			} = body;
+			const isValidEmail = z.email().safeParse(email);
 
-				if (!isValidEmail.success) {
-					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_EMAIL);
-				}
+			if (!isValidEmail.success) {
+				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_EMAIL);
+			}
 
-				if (!password || typeof password !== "string") {
-					throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_PASSWORD);
-				}
+			if (!password || typeof password !== "string") {
+				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_PASSWORD);
+			}
 
-				const minPasswordLength = ctx.context.password.config.minPasswordLength;
-				if (password.length < minPasswordLength) {
-					ctx.context.logger.warn("Password is too short");
-					throw APIError.from(
-						"BAD_REQUEST",
-						BASE_ERROR_CODES.PASSWORD_TOO_SHORT,
-					);
-				}
-
-				const maxPasswordLength = ctx.context.password.config.maxPasswordLength;
-				if (password.length > maxPasswordLength) {
-					ctx.context.logger.warn("Password is too long");
-					throw APIError.from(
-						"BAD_REQUEST",
-						BASE_ERROR_CODES.PASSWORD_TOO_LONG,
-					);
-				}
-				const shouldReturnGenericDuplicateResponse =
-					ctx.context.options.emailAndPassword.requireEmailVerification ||
-					ctx.context.options.emailAndPassword.autoSignIn === false;
-				const shouldSkipAutoSignIn =
-					ctx.context.options.emailAndPassword.autoSignIn === false ||
-					shouldReturnGenericDuplicateResponse;
-				const additionalUserFields = parseUserInput(
-					ctx.context.options,
-					rest,
-					"create",
+			const minPasswordLength = ctx.context.password.config.minPasswordLength;
+			if (password.length < minPasswordLength) {
+				ctx.context.logger.warn("Password is too short");
+				throw APIError.from(
+					"BAD_REQUEST",
+					BASE_ERROR_CODES.PASSWORD_TOO_SHORT,
 				);
-				const normalizedEmail = email.toLowerCase();
-				const dbUser =
-					await ctx.context.internalAdapter.findUserByEmail(normalizedEmail);
-				if (dbUser?.user) {
-					ctx.context.logger.info(
-						`Sign-up attempt for existing email: ${email}`,
-					);
-					if (shouldReturnGenericDuplicateResponse) {
-						/**
-						 * Hash the password to reduce timing differences
-						 * between existing and non-existing emails.
-						 */
-						await ctx.context.password.hash(password);
-						if (ctx.context.options.emailAndPassword?.onExistingUserSignUp) {
-							await ctx.context.runInBackgroundOrAwait(
-								ctx.context.options.emailAndPassword.onExistingUserSignUp(
-									{ user: dbUser.user },
-									safeCloneRequest(ctx.request),
-								),
-							);
-						}
-						const now = new Date();
-						const generatedId =
-							ctx.context.generateId({ model: "user" }) || generateId();
-						const coreFields = {
-							name,
-							email: normalizedEmail,
-							emailVerified: false,
-							image: image ?? null,
-							createdAt: now,
-							updatedAt: now,
-						};
+			}
 
-						const customSyntheticUser =
-							ctx.context.options.emailAndPassword?.customSyntheticUser;
+			const maxPasswordLength = ctx.context.password.config.maxPasswordLength;
+			if (password.length > maxPasswordLength) {
+				ctx.context.logger.warn("Password is too long");
+				throw APIError.from(
+					"BAD_REQUEST",
+					BASE_ERROR_CODES.PASSWORD_TOO_LONG,
+				);
+			}
+			const shouldReturnGenericDuplicateResponse =
+				ctx.context.options.emailAndPassword.requireEmailVerification ||
+				ctx.context.options.emailAndPassword.autoSignIn === false;
+			const shouldSkipAutoSignIn =
+				ctx.context.options.emailAndPassword.autoSignIn === false ||
+				shouldReturnGenericDuplicateResponse;
+			const additionalUserFields = parseUserInput(
+				ctx.context.options,
+				rest,
+				"create",
+			);
+			const normalizedEmail = email.toLowerCase();
+			const dbUser =
+				await ctx.context.internalAdapter.findUserByEmail(normalizedEmail);
+			if (dbUser?.user) {
+				ctx.context.logger.info(
+					`Sign-up attempt for existing email: ${email}`,
+				);
+				if (shouldReturnGenericDuplicateResponse) {
+					/**
+					 * Hash the password to reduce timing differences
+					 * between existing and non-existing emails.
+					 */
+					await ctx.context.password.hash(password);
+					if (ctx.context.options.emailAndPassword?.onExistingUserSignUp) {
+						await ctx.context.runInBackgroundOrAwait(
+							ctx.context.options.emailAndPassword.onExistingUserSignUp(
+								{ user: dbUser.user },
+								safeCloneRequest(ctx.request),
+							),
+						);
+					}
+					const now = new Date();
+					const generatedId =
+						ctx.context.generateId({ model: "user" }) || generateId();
+					const coreFields = {
+						name,
+						email: normalizedEmail,
+						emailVerified: false,
+						image: image ?? null,
+						createdAt: now,
+						updatedAt: now,
+					};
 
-						let syntheticUser: Record<string, unknown>;
-						if (customSyntheticUser) {
-							// Extract only user-defined additionalFields (not plugin fields)
-							const additionalFieldKeys = Object.keys(
-								ctx.context.options.user?.additionalFields ?? {},
-							);
-							const additionalFields: Record<string, unknown> = {};
-							for (const key of additionalFieldKeys) {
-								if (key in additionalUserFields) {
-									additionalFields[key] = additionalUserFields[key];
-								}
+					const customSyntheticUser =
+						ctx.context.options.emailAndPassword?.customSyntheticUser;
+
+					let syntheticUser: Record<string, unknown>;
+					if (customSyntheticUser) {
+						// Extract only user-defined additionalFields (not plugin fields)
+						const additionalFieldKeys = Object.keys(
+							ctx.context.options.user?.additionalFields ?? {},
+						);
+						const additionalFields: Record<string, unknown> = {};
+						for (const key of additionalFieldKeys) {
+							if (key in additionalUserFields) {
+								additionalFields[key] = additionalUserFields[key];
 							}
-							const customResult = customSyntheticUser({
-								coreFields,
-								additionalFields,
-								id: generatedId,
-							});
-							// Ensure custom synthetic users have consistent shape with real users
-							syntheticUser = buildSyntheticUserOutput(
-								ctx.context.options,
-								customResult,
-							);
-						} else {
-							syntheticUser = buildSyntheticUserOutput(ctx.context.options, {
-								...coreFields,
-								...additionalUserFields,
-								id: generatedId,
-							});
 						}
-
-						return ctx.json({
-							token: null,
-							user: parseUserOutput(
-								ctx.context.options,
-								syntheticUser as User,
-							) as User<O["user"], O["plugins"]>,
+						const customResult = customSyntheticUser({
+							coreFields,
+							additionalFields,
+							id: generatedId,
+						});
+						// Ensure custom synthetic users have consistent shape with real users
+						syntheticUser = buildSyntheticUserOutput(
+							ctx.context.options,
+							customResult,
+						);
+					} else {
+						syntheticUser = buildSyntheticUserOutput(ctx.context.options, {
+							...coreFields,
+							...additionalUserFields,
+							id: generatedId,
 						});
 					}
-					throw APIError.from(
-						"UNPROCESSABLE_ENTITY",
-						BASE_ERROR_CODES.USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL,
-					);
+
+					return ctx.json({
+						token: null,
+						user: parseUserOutput(
+							ctx.context.options,
+							syntheticUser as User,
+						) as User<O["user"], O["plugins"]>,
+					});
 				}
-				/**
-				 * Hash the password
-				 *
-				 * This is done prior to creating the user
-				 * to ensure that any plugin that
-				 * may break the hashing should break
-				 * before the user is created.
-				 */
-				const hash = await ctx.context.password.hash(password);
+				throw APIError.from(
+					"UNPROCESSABLE_ENTITY",
+					BASE_ERROR_CODES.USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL,
+				);
+			}
+			/**
+			 * Hash the password
+			 *
+			 * This is done prior to creating the user
+			 * to ensure that any plugin that
+			 * may break the hashing should break
+			 * before the user is created.
+			 */
+			const hash = await ctx.context.password.hash(password);
+			const shouldSendVerificationEmail =
+				ctx.context.options.emailVerification?.sendOnSignUp ??
+				ctx.context.options.emailAndPassword.requireEmailVerification;
+			const verification = shouldSendVerificationEmail
+				? await (async () => {
+						const token = await createEmailVerificationToken(
+							ctx.context.secret,
+							normalizedEmail,
+							undefined,
+							ctx.context.options.emailVerification?.expiresIn,
+							{ jti: generateId(16) },
+						);
+						const callbackURL = body.callbackURL
+							? encodeURIComponent(body.callbackURL)
+							: encodeURIComponent("/");
+						return {
+							token,
+							url: `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${callbackURL}`,
+						};
+					})()
+				: null;
+
+			const persistSignUp = async () => {
 				let createdUser: User;
 				try {
 					createdUser = await ctx.context.internalAdapter.createUser({
@@ -360,60 +386,38 @@ export const signUpEmail = <O extends ClearanceOptions>() =>
 						BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
 					);
 				}
-				if (!createdUser) {
-					throw APIError.from(
-						"UNPROCESSABLE_ENTITY",
-						BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
-					);
-				}
 				await ctx.context.internalAdapter.linkAccount({
 					userId: createdUser.id,
 					providerId: "credential",
 					accountId: createdUser.id,
 					password: hash,
 				});
-				const shouldSendVerificationEmail =
-					ctx.context.options.emailVerification?.sendOnSignUp ??
-					ctx.context.options.emailAndPassword.requireEmailVerification;
-				if (shouldSendVerificationEmail) {
-					const token = await createEmailVerificationToken(
-						ctx.context.secret,
-						createdUser.email,
-						undefined,
-						ctx.context.options.emailVerification?.expiresIn,
-					);
-					const callbackURL = body.callbackURL
-						? encodeURIComponent(body.callbackURL)
-						: encodeURIComponent("/");
-					const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${callbackURL}`;
-
-					if (ctx.context.options.emailVerification?.sendVerificationEmail) {
-						await ctx.context.runInBackgroundOrAwait(
-							ctx.context.options.emailVerification.sendVerificationEmail(
-								{
-									user: createdUser,
-									url,
-									token,
-								},
-								safeCloneRequest(ctx.request),
-							),
-						);
-					}
-				}
-
-				if (shouldSkipAutoSignIn) {
-					return ctx.json({
-						token: null,
-						user: parseUserOutput(ctx.context.options, createdUser) as User<
-							O["user"],
-							O["plugins"]
-						>,
+				if (
+					verification &&
+					(ctx.context.options.durableDelivery ||
+						ctx.context.options.emailVerification?.sendVerificationEmail)
+				) {
+					await dispatchVerificationEmail(ctx, {
+						user: createdUser,
+						...verification,
 					});
 				}
 
+				if (shouldSkipAutoSignIn) {
+					return { createdUser, session: null };
+				}
 				const session = await ctx.context.internalAdapter.createSession(
 					createdUser.id,
 					rememberMe === false,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: createdUser.id,
+						evidence: [
+							{ kind: "primary", primaryMethod: "password_enrollment" },
+						],
+					}),
 				);
 				if (!session) {
 					throw APIError.from(
@@ -421,21 +425,35 @@ export const signUpEmail = <O extends ClearanceOptions>() =>
 						BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
 					);
 				}
-				await setSessionCookie(
-					ctx,
-					{
-						session,
-						user: createdUser,
-					},
-					rememberMe === false,
-				);
+				return { createdUser, session };
+			};
+			const { createdUser, session } = await runWithTransaction(
+				ctx.context.adapter,
+				persistSignUp,
+			);
+			if (!session) {
 				return ctx.json({
-					token: session.token,
+					token: null,
 					user: parseUserOutput(ctx.context.options, createdUser) as User<
 						O["user"],
 						O["plugins"]
 					>,
 				});
+			}
+			await setSessionCookie(
+				ctx,
+				{
+					session,
+					user: createdUser,
+				},
+				rememberMe === false,
+			);
+			return ctx.json({
+				token: session.token,
+				user: parseUserOutput(ctx.context.options, createdUser) as User<
+					O["user"],
+					O["plugins"]
+				>,
 			});
 		},
 	);

@@ -1,5 +1,5 @@
 import type { ManagementStore } from "../store/types.js";
-import type { Membership, Organization, Principal } from "../types/resources.js";
+import type { Membership, Organization, User } from "../types/resources.js";
 import type { ArchiveOrganizationResult } from "../services/core.js";
 import type { MembershipActorSource, MembershipSource } from "../services/members.js";
 import type { RevokeSessionResult, SessionView } from "../services/sessions.js";
@@ -42,7 +42,7 @@ export type CreateUserResult =
 		}
 	| {
 			dryRun: false;
-			user: Principal;
+			user: User;
 			passwordSetup?: PasswordSetupGrant;
 		};
 
@@ -62,7 +62,7 @@ export type UpdateUserResult =
 			email?: string;
 			status?: "active" | "disabled";
 		}
-	| { dryRun: false; user: Principal };
+	| { dryRun: false; user: User };
 
 export interface DisableUserInput {
 	readonly id: string;
@@ -70,8 +70,8 @@ export interface DisableUserInput {
 }
 
 export type DisableUserResult =
-	| { dryRun: true; user: Principal }
-	| { dryRun: false; user: Principal };
+	| { dryRun: true; user: User }
+	| { dryRun: false; user: User };
 
 export interface ManagementApplication {
 	readonly users: {
@@ -87,7 +87,7 @@ export interface ManagementApplication {
 			context: OperationContext,
 			input: DisableUserInput,
 		): Promise<DisableUserResult>;
-		delete(context: OperationContext, id: string): Promise<Principal>;
+		delete(context: OperationContext, id: string): Promise<User>;
 	};
 	readonly sessions: {
 		list(
@@ -141,7 +141,11 @@ export function createManagementApplication(input: {
 	store: ManagementStore;
 	authRuntime?: AuthRuntimeGateway;
 }): ManagementApplication {
-	if (input.store.backend === "postgres" && !input.authRuntime) {
+	if (
+		input.store.backend === "postgres" &&
+		!input.authRuntime &&
+		!input.store.storeV2Principals?.authoritative
+	) {
 		throw new Error("Postgres ManagementApplication requires an AuthRuntimeGateway");
 	}
 	const authRuntime = input.store.backend === "postgres" ? input.authRuntime : undefined;

@@ -2,13 +2,22 @@ import type { ClearanceOptions } from "@clearance/core";
 import {
 	getCurrentAdapter,
 	getCurrentAuthContext,
+	isTransactionActive,
 	queueAfterTransactionHook,
+	queueBeforeTransactionCommitHook,
+	runWithTransaction,
 } from "@clearance/core/context";
 import type { BaseModelNames } from "@clearance/core/db";
-import type { DBAdapter, Where } from "@clearance/core/db/adapter";
+import type {
+	DBAdapter,
+	DBTransactionAdapter,
+	Where,
+} from "@clearance/core/db/adapter";
+import type { InternalLogger } from "@clearance/core/env";
 import {
 	ATTR_CONTEXT,
 	ATTR_DB_COLLECTION_NAME,
+	ATTR_DB_OPERATION_NAME,
 	ATTR_HOOK_TYPE,
 	withSpan,
 } from "@clearance/core/instrumentation";
@@ -16,6 +25,14 @@ import {
 export type DatabaseHooksEntry = {
 	source: string;
 	hooks: Exclude<ClearanceOptions["databaseHooks"], undefined>;
+	failureMode?: "observe" | "rollback" | undefined;
+};
+
+type CustomMutation<Input> = {
+	fn: (input: Input, adapter: DBTransactionAdapter) => void | Promise<any>;
+	executeMainFn?: boolean | undefined;
+	/** The callback performs database work only through the supplied adapter. */
+	usesTransactionAdapter?: true | undefined;
 };
 
 export function getWithHooks(
@@ -23,19 +40,89 @@ export function getWithHooks(
 	ctx: {
 		options: ClearanceOptions;
 		hooks: DatabaseHooksEntry[];
+		logger?: Pick<InternalLogger, "error"> | undefined;
 	},
 ) {
 	const hooksEntries = ctx.hooks;
+
+	function hasRollbackAfterHook(
+		model: BaseModelNames,
+		operation: "create" | "update" | "delete",
+	): boolean {
+		return hooksEntries.some(
+			({ hooks, failureMode }) =>
+				failureMode === "rollback" && Boolean(hooks[model]?.[operation]?.after),
+		);
+	}
+
+	function assertRollbackSafeCustomMutation(
+		model: BaseModelNames,
+		operation: "create" | "update" | "delete",
+		customMutation: CustomMutation<any> | undefined,
+	): void {
+		if (
+			customMutation &&
+			hasRollbackAfterHook(model, operation) &&
+			customMutation.usesTransactionAdapter !== true
+		) {
+			throw new Error(
+				`Rollback-critical ${model}.${operation} hooks require custom mutations to use the supplied transaction adapter`,
+			);
+		}
+	}
+
+	async function queuePublicAfterHook(
+		model: BaseModelNames,
+		operation: "create" | "update" | "updateMany" | "delete" | "deleteMany",
+		source: string,
+		failureMode: "observe" | "rollback" | undefined,
+		run: () => Promise<unknown>,
+	): Promise<void> {
+		const execute = () =>
+			withSpan(
+				`db ${operation}.after ${model}`,
+				{
+					[ATTR_HOOK_TYPE]: `${operation}.after`,
+					[ATTR_DB_COLLECTION_NAME]: model,
+					[ATTR_CONTEXT]: source,
+				},
+				run,
+			);
+		if (failureMode === "rollback") {
+			await queueBeforeTransactionCommitHook(async () => {
+				await execute();
+			}, adapter);
+			return;
+		}
+		await queueAfterTransactionHook(async () => {
+			try {
+				await execute();
+			} catch (error) {
+				ctx.logger?.error("Database after hook failed after commit", {
+					model,
+					operation,
+					source,
+					errorName: error instanceof Error ? error.name : "UnknownError",
+				});
+			}
+		}, adapter);
+	}
+
 	async function createWithHooks<T extends Record<string, any>>(
 		data: T,
 		model: BaseModelNames,
-		customCreateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customCreateFn?: CustomMutation<Record<string, any>> | undefined,
+		enforceData?: ((data: T) => T) | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "create", customCreateFn);
+		if (
+			hasRollbackAfterHook(model, "create") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				createWithHooks(data, model, customCreateFn, enforceData),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 		for (const { source, hooks } of hooksEntries) {
@@ -64,6 +151,7 @@ export function getWithHooks(
 				}
 			}
 		}
+		actualData = enforceData ? enforceData(actualData) : actualData;
 
 		let created: any = null;
 		if (!customCreateFn || customCreateFn.executeMainFn) {
@@ -74,25 +162,19 @@ export function getWithHooks(
 			});
 		}
 		if (customCreateFn?.fn) {
-			created = await customCreateFn.fn(created ?? actualData);
+			created = await customCreateFn.fn(
+				created ?? actualData,
+				await getCurrentAdapter(adapter),
+			);
 		}
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.create?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db create.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "create.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(created as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "create", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(created as any, context),
+				);
 			}
 		}
 
@@ -103,13 +185,18 @@ export function getWithHooks(
 		data: any,
 		where: Where[],
 		model: BaseModelNames,
-		customUpdateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customUpdateFn?: CustomMutation<Record<string, any>> | undefined,
+		enforceData?: ((data: T) => T) | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
+		if (
+			hasRollbackAfterHook(model, "update") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				updateWithHooks(data, where, model, customUpdateFn, enforceData),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 
@@ -139,9 +226,10 @@ export function getWithHooks(
 				}
 			}
 		}
+		actualData = enforceData ? enforceData(actualData) : actualData;
 
 		const customUpdated = customUpdateFn
-			? await customUpdateFn.fn(actualData)
+			? await customUpdateFn.fn(actualData, await getCurrentAdapter(adapter))
 			: null;
 
 		const updated =
@@ -153,22 +241,13 @@ export function getWithHooks(
 					})
 				: customUpdated;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.update?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db update.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "update.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(updated as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "update", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(updated as any, context),
+				);
 			}
 		}
 		return updated;
@@ -178,13 +257,17 @@ export function getWithHooks(
 		data: any,
 		where: Where[],
 		model: BaseModelNames,
-		customUpdateFn?:
-			| {
-					fn: (data: Record<string, any>) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customUpdateFn?: CustomMutation<Record<string, any>> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "update", customUpdateFn);
+		if (
+			hasRollbackAfterHook(model, "update") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				updateManyWithHooks(data, where, model, customUpdateFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let actualData = data;
 
@@ -216,7 +299,7 @@ export function getWithHooks(
 		}
 
 		const customUpdated = customUpdateFn
-			? await customUpdateFn.fn(actualData)
+			? await customUpdateFn.fn(actualData, await getCurrentAdapter(adapter))
 			: null;
 
 		const updated =
@@ -228,22 +311,13 @@ export function getWithHooks(
 					})
 				: customUpdated;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.update?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db updateMany.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "updateMany.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(updated as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "updateMany", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(updated as any, context),
+				);
 			}
 		}
 
@@ -253,13 +327,17 @@ export function getWithHooks(
 	async function deleteWithHooks<T extends Record<string, any>>(
 		where: Where[],
 		model: BaseModelNames,
-		customDeleteFn?:
-			| {
-					fn: (where: Where[]) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customDeleteFn?: CustomMutation<Where[]> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				deleteWithHooks(where, model, customDeleteFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let entityToDelete: T | null = null;
 
@@ -297,7 +375,7 @@ export function getWithHooks(
 		}
 
 		const customDeleted = customDeleteFn
-			? await customDeleteFn.fn(where)
+			? await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
 			: null;
 
 		const shouldRunAdapterDelete =
@@ -311,22 +389,13 @@ export function getWithHooks(
 				: customDeleted;
 
 		if (entityToDelete) {
-			for (const { source, hooks } of hooksEntries) {
+			for (const { source, hooks, failureMode } of hooksEntries) {
 				const toRun = hooks[model]?.delete?.after;
 				if (toRun) {
-					await queueAfterTransactionHook(async () => {
-						await withSpan(
-							`db delete.after ${model}`,
-							{
-								[ATTR_HOOK_TYPE]: "delete.after",
-								[ATTR_DB_COLLECTION_NAME]: model,
-								[ATTR_CONTEXT]: source,
-							},
-							() =>
-								// @ts-expect-error context type mismatch
-								toRun(entityToDelete as any, context),
-						);
-					});
+					await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+						// @ts-expect-error context type mismatch
+						toRun(entityToDelete as any, context),
+					);
 				}
 			}
 		}
@@ -337,13 +406,17 @@ export function getWithHooks(
 	async function deleteManyWithHooks<T extends Record<string, any>>(
 		where: Where[],
 		model: BaseModelNames,
-		customDeleteFn?:
-			| {
-					fn: (where: Where[]) => void | Promise<any>;
-					executeMainFn?: boolean;
-			  }
-			| undefined,
-	) {
+		customDeleteFn?: CustomMutation<Where[]> | undefined,
+	): Promise<any> {
+		assertRollbackSafeCustomMutation(model, "delete", customDeleteFn);
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				deleteManyWithHooks(where, model, customDeleteFn),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		let entitiesToDelete: T[] = [];
 
@@ -379,7 +452,17 @@ export function getWithHooks(
 		}
 
 		const customDeleted = customDeleteFn
-			? await customDeleteFn.fn(where)
+			? customDeleteFn.executeMainFn === false
+				? await withSpan(
+						`db deleteMany ${model}`,
+						{
+							[ATTR_DB_OPERATION_NAME]: "deleteMany",
+							[ATTR_DB_COLLECTION_NAME]: model,
+						},
+						async () =>
+							customDeleteFn.fn(where, await getCurrentAdapter(adapter)),
+					)
+				: await customDeleteFn.fn(where, await getCurrentAdapter(adapter))
 			: null;
 
 		const deleted =
@@ -391,23 +474,13 @@ export function getWithHooks(
 				: customDeleted;
 
 		for (const entity of entitiesToDelete) {
-			for (const { source, hooks } of hooksEntries) {
+			for (const { source, hooks, failureMode } of hooksEntries) {
 				const toRun = hooks[model]?.delete?.after;
 				if (toRun) {
-					// Queue after hooks to run post-transaction
-					await queueAfterTransactionHook(async () => {
-						await withSpan(
-							`db delete.after ${model}`,
-							{
-								[ATTR_HOOK_TYPE]: "delete.after",
-								[ATTR_DB_COLLECTION_NAME]: model,
-								[ATTR_CONTEXT]: source,
-							},
-							() =>
-								// @ts-expect-error context type mismatch
-								toRun(entity as any, context),
-						);
-					});
+					await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+						// @ts-expect-error context type mismatch
+						toRun(entity as any, context),
+					);
 				}
 			}
 		}
@@ -434,9 +507,17 @@ export function getWithHooks(
 	async function consumeOneWithHooks<T extends Record<string, any>>(
 		model: BaseModelNames,
 		hookWhere: Where[],
-		consumeFn: () => Promise<T | null>,
+		consumeFn: (adapter: DBTransactionAdapter) => Promise<T | null>,
 		preSnapshot?: T | null,
 	): Promise<T | null> {
+		if (
+			hasRollbackAfterHook(model, "delete") &&
+			!(await isTransactionActive(adapter))
+		) {
+			return runWithTransaction(adapter, () =>
+				consumeOneWithHooks(model, hookWhere, consumeFn, preSnapshot),
+			);
+		}
 		const context = await getCurrentAuthContext().catch(() => null);
 		const beforeHooks = hooksEntries.flatMap(({ source, hooks }) => {
 			const fn = hooks[model]?.delete?.before;
@@ -476,25 +557,16 @@ export function getWithHooks(
 			}
 		}
 
-		const consumed = await consumeFn();
+		const consumed = await consumeFn(await getCurrentAdapter(adapter));
 		if (!consumed) return null;
 
-		for (const { source, hooks } of hooksEntries) {
+		for (const { source, hooks, failureMode } of hooksEntries) {
 			const toRun = hooks[model]?.delete?.after;
 			if (toRun) {
-				await queueAfterTransactionHook(async () => {
-					await withSpan(
-						`db delete.after ${model}`,
-						{
-							[ATTR_HOOK_TYPE]: "delete.after",
-							[ATTR_DB_COLLECTION_NAME]: model,
-							[ATTR_CONTEXT]: source,
-						},
-						() =>
-							// @ts-expect-error context type mismatch
-							toRun(consumed as any, context),
-					);
-				});
+				await queuePublicAfterHook(model, "delete", source, failureMode, () =>
+					// @ts-expect-error context type mismatch
+					toRun(consumed as any, context),
+				);
 			}
 		}
 

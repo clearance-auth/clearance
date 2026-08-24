@@ -2,12 +2,19 @@ import type { GenericEndpointContext } from "@clearance/core";
 import { APIError } from "@clearance/core/error";
 import { getSessionFromCtx } from "../../api";
 import { generateRandomString } from "../../crypto";
+import { runManagedAuthenticationTransaction } from "../../internal/managed-authentication-transaction";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import type { OAuthApplication } from "../oidc-provider/schema";
 import type {
 	AuthorizationQuery,
 	Client,
 	OIDCOptions,
 } from "../oidc-provider/types";
+import { captureOAuthAuthorizationSessionAuthority } from "../oidc-provider/session-authority";
+import {
+	restoreOAuthResponseHeaders,
+	snapshotOAuthResponseHeaders,
+} from "../oidc-provider/token-response";
 
 function redirectErrorURL(url: string, error: string, description: string) {
 	return `${url}${
@@ -195,17 +202,33 @@ export async function authorizeMCPOAuth(
 	const code = generateRandomString(32, "a-z", "A-Z", "0-9");
 	const codeExpiresInMs = opts.codeExpiresIn * 1000;
 	const expiresAt = new Date(Date.now() + codeExpiresInMs);
+	const responseHeaderSnapshot = snapshotOAuthResponseHeaders(ctx);
 	try {
 		/**
 		 * Save the code in the database
 		 */
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: JSON.stringify({
-				clientId: client.clientId,
-				redirectURI: query.redirect_uri,
-				scope: requestScope,
-				userId: session.user.id,
-				authTime: new Date(session.session.createdAt).getTime(),
+		await runManagedAuthenticationTransaction(ctx, async () => {
+			const {
+				sourceSession,
+				sessionDerivativeAuthority,
+				sourceAuthority,
+			} = await captureOAuthAuthorizationSessionAuthority(
+				ctx,
+				"mcp",
+				session,
+			);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{ purpose: "mcp-authorization-code", subject: client.clientId },
+				{
+					value: JSON.stringify({
+						clientId: client.clientId,
+						redirectURI: query.redirect_uri,
+						scope: requestScope,
+						userId: sourceAuthority?.sourceSubjectId ?? sourceSession.user.id,
+						authTime: new Date(
+							sourceSession.session.createdAt,
+						).getTime(),
 				/**
 				 * If the prompt is set to `consent`, then we need
 				 * to require the user to consent to the scopes.
@@ -218,16 +241,25 @@ export async function authorizeMCPOAuth(
 				 * client from using the code before the user
 				 * consents.
 				 */
-				requireConsent: query.prompt === "consent",
-				state: query.prompt === "consent" ? query.state : null,
-				codeChallenge: query.code_challenge,
-				codeChallengeMethod: query.code_challenge_method,
-				nonce: query.nonce,
-			}),
-			identifier: code,
-			expiresAt,
+						requireConsent: query.prompt === "consent",
+						state: query.prompt === "consent" ? query.state : null,
+						codeChallenge: query.code_challenge,
+						codeChallengeMethod: query.code_challenge_method,
+						nonce: query.nonce,
+						...(sessionDerivativeAuthority && sourceAuthority
+							? {
+									sessionDerivativeAuthority,
+									organizationId: sourceAuthority.sourceOrganizationId,
+								}
+							: {}),
+					}),
+					identifier: code,
+					expiresAt,
+				},
+			);
 		});
 	} catch {
+		restoreOAuthResponseHeaders(ctx, responseHeaderSnapshot);
 		throw ctx.redirect(
 			redirectErrorURL(
 				query.redirect_uri,

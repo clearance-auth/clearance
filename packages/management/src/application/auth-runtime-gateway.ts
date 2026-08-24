@@ -1,4 +1,4 @@
-import type { Membership, Organization, Principal } from "../types/resources.js";
+import type { Membership, Organization, User } from "../types/resources.js";
 import type { ArchiveOrganizationResult } from "../services/core.js";
 import type { MembershipActorSource, MembershipSource } from "../services/members.js";
 import type { RevokeSessionResult, SessionView } from "../services/sessions.js";
@@ -14,14 +14,14 @@ export interface AuthRuntimeGateway {
 		provision(
 			context: OperationContext,
 			input: { email: string; name: string; password?: string },
-		): Promise<{ user: Principal; passwordSetup?: PasswordSetupGrant }>;
+		): Promise<{ user: User; passwordSetup?: PasswordSetupGrant }>;
 		updateCoordinated(
 			context: OperationContext,
 			id: string,
 			input: { name?: string; email?: string; status?: "active" | "disabled" },
-		): Promise<Principal>;
-		disableCoordinated(context: OperationContext, id: string): Promise<Principal>;
-		deleteCoordinated(context: OperationContext, id: string): Promise<Principal>;
+		): Promise<User>;
+		disableCoordinated(context: OperationContext, id: string): Promise<User>;
+		deleteCoordinated(context: OperationContext, id: string): Promise<User>;
 	};
 	readonly sessions: {
 		listPage(

@@ -63,7 +63,7 @@ async function generateTOTP(
 	return await generateHOTP(secret, { counter, digits, hash: options?.hash });
 }
 
-async function verifyTOTP(
+async function verifyTOTPWithCounter(
 	otp: string,
 	{
 		window = 1,
@@ -76,18 +76,33 @@ async function verifyTOTP(
 		digits?: number;
 		secret: string;
 	},
-) {
+): Promise<number | null> {
 	const milliseconds = period * 1000;
 	const counter = Math.floor(Date.now() / milliseconds);
-	let matched = false;
+	let matchedCounter: number | null = null;
 	for (let i = -window; i <= window; i++) {
+		const candidateCounter = counter + i;
 		const generatedOTP = await generateHOTP(secret, {
-			counter: counter + i,
+			counter: candidateCounter,
 			digits,
 		});
-		matched = constantTimeEqualOTP(otp, generatedOTP) || matched;
+		if (constantTimeEqualOTP(otp, generatedOTP)) {
+			matchedCounter = candidateCounter;
+		}
 	}
-	return matched;
+	return matchedCounter;
+}
+
+async function verifyTOTP(
+	otp: string,
+	options: {
+		period?: number;
+		window?: number;
+		digits?: number;
+		secret: string;
+	},
+) {
+	return (await verifyTOTPWithCounter(otp, options)) !== null;
 }
 
 /**
@@ -139,6 +154,8 @@ export const createOTP = (
 		totp: () => generateTOTP(secret, { digits, period }),
 		verify: (otp: string, options?: { window?: number }) =>
 			verifyTOTP(otp, { secret, digits, period, ...options }),
+		verifyWithCounter: (otp: string, options?: { window?: number }) =>
+			verifyTOTPWithCounter(otp, { secret, digits, period, ...options }),
 		url: (issuer: string, account: string) =>
 			generateQRCode({ issuer, account, secret, digits, period }),
 	};

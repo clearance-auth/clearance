@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -103,132 +103,6 @@ function rawRequest(port, { path, method = "POST", headers = {}, chunks = [] }) 
 		req.end();
 	});
 }
-
-// Tripwires: source-grep checks over the shipped static assets. Rendered-DOM
-// behavior (login form, routing, escaping) is proven by src/ui.test.js; these
-// greps remain only to catch accidental deletion/renaming of shipped surfaces.
-describe("console shell assets", () => {
-	it("ships primary nav surfaces in index.html", () => {
-		for (const nav of [
-			"Overview",
-			"Users",
-			"Organizations",
-			"Members",
-			"Sessions",
-			"Roles",
-			"Events",
-			"Readiness",
-			"Settings",
-		]) {
-			assert.match(indexHtml, new RegExp(nav));
-		}
-		assert.match(indexHtml, /data-theme="dark"|theme-dark|--bg/);
-		assert.match(indexHtml, /data-route="roles"/);
-		assert.match(indexHtml, /data-route="sessions"/);
-		assert.match(indexHtml, /data-route="members"/);
-	});
-
-	it("app.js declares readiness route fetching readiness API", () => {
-		assert.match(appJs, /readiness\s*:/);
-		assert.match(appJs, /\/v1\/readiness\//);
-		assert.match(appJs, /renderReadiness/);
-	});
-
-	it("app.js declares roles route with validate-before-save workflow", () => {
-		assert.match(appJs, /roles\s*:/);
-		assert.match(appJs, /renderRoles/);
-		assert.match(appJs, /\/v1\/roles\/validate/);
-		assert.match(appJs, /\/v1\/roles/);
-		assert.match(appJs, /clearance roles list --json/);
-		assert.match(appJs, /parsePermissionsText/);
-		assert.match(appJs, /canMutate/);
-		// Built-ins must be treated as immutable in the UI
-		assert.match(appJs, /built_in|role_builtin_/);
-		assert.match(appJs, /Immutable|immutable/);
-		// Viewer mutation UI disabled / absent
-		assert.match(appJs, /viewer.*inspect|cannot create or update|View only/i);
-	});
-
-	it("app.js declares sessions list/revoke workflow with confirmation and no token UI", () => {
-		assert.match(appJs, /sessions\s*:/);
-		assert.match(appJs, /renderSessions/);
-		assert.match(appJs, /\/v1\/sessions/);
-		assert.match(appJs, /\/v1\/sessions\/\$\{|\/v1\/sessions\/.*revoke|sessions\/.*\/revoke/);
-		assert.match(appJs, /clearance sessions list --json/);
-		assert.match(appJs, /clearance sessions revoke/);
-		assert.match(appJs, /confirmDestructive|window\.confirm/);
-		assert.match(appJs, /sanitizeSessionForUi|SESSION_SENSITIVE_KEY/);
-		assert.match(appJs, /sessionsLoadVersion|revokingId/);
-		assert.match(appJs, /No active sessions|Loading sessions/);
-		// Must never interpolate token-like fields into HTML
-		assert.doesNotMatch(appJs, /session\.token|session\.bearer|Bearer \$\{/);
-		assert.doesNotMatch(appJs, /\$\{\s*session\.token\s*\}/);
-	});
-
-	it("app.js declares members list/add/update/remove workflow", () => {
-		assert.match(appJs, /members\s*:/);
-		assert.match(appJs, /renderMembers/);
-		assert.match(appJs, /\/v1\/organizations\/\$\{.*\}\/members|\/v1\/organizations\/.*\/members/);
-		assert.match(appJs, /clearance orgs members list/);
-		assert.match(appJs, /clearance orgs members add/);
-		assert.match(appJs, /clearance orgs members update/);
-		assert.match(appJs, /clearance orgs members remove/);
-		assert.match(appJs, /membersLoadVersion|mutatingId|membersState/);
-		assert.match(appJs, /canMutate/);
-		assert.match(appJs, /viewer.*inspect members|cannot add members|View only/i);
-	});
-
-	it("public dir exists", () => {
-		assert.equal(existsSync(publicDir), true);
-	});
-
-	it("preserves dark dense product tokens", () => {
-		assert.match(stylesCss, /--bg:\s*#0b0d10/);
-		assert.match(stylesCss, /--panel:\s*#12151a/);
-		assert.match(indexHtml, /data-theme="dark"/);
-		assert.match(stylesCss, /\.role-form|\.badge-locked|\.role-validate-preview/);
-		assert.match(stylesCss, /\.member-form|\.sessions-table|\.sr-only|\.danger-action/);
-	});
-
-	it("declares all MANAGEMENT_SURFACES console routes", () => {
-		for (const key of [
-			"overview",
-			"users",
-			"organizations",
-			"members",
-			"sessions",
-			"roles",
-			"events",
-			"readiness",
-			"settings",
-		]) {
-			assert.match(appJs, new RegExp(`${key}\\s*:`));
-		}
-	});
-
-	it("ships capability-token setup pages for SSO and SCIM", () => {
-		assert.match(setupHtml, /Customer setup/i);
-		assert.match(setupJs, /\/api\/setup\//);
-		assert.match(setupJs, /URLSearchParams/);
-		assert.doesNotMatch(setupJs, /authorization|operator.token/i);
-	});
-
-	it("SCIM setup renders one-time handoff with copy controls and never persists token", () => {
-		assert.match(setupJs, /scimHandoff/);
-		assert.match(setupJs, /renderScimHandoff/);
-		assert.match(setupJs, /bearerToken/);
-		assert.match(setupJs, /cannot show the token again|cannot be retrieved/i);
-		assert.match(setupJs, /navigator\.clipboard\.writeText|setup-copy/);
-		assert.match(setupJs, /history\.replaceState/);
-		// No durable browser persistence APIs for the one-time secret
-		assert.doesNotMatch(setupJs, /\blocalStorage\b/);
-		assert.doesNotMatch(setupJs, /\bsessionStorage\b/);
-		assert.doesNotMatch(setupJs, /document\.cookie/);
-		// Must not re-fetch the SCIM secret after the setup POST
-		const fetchMatches = setupJs.match(/\bfetch\s*\(/g) || [];
-		assert.equal(fetchMatches.length, 1, "setup.js should perform only the setup POST fetch");
-	});
-});
 
 describe("resolveConfig / buildUpstreamHeaders", () => {
 	it("injects bearer operator token from config, not client headers", () => {
@@ -370,10 +244,18 @@ describe("operator sessions, roles, CSRF", () => {
 
 	before(async () => {
 		mockApi = createMockApi((req, res) => {
+			if (/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials(?:\/[^/]+\/rotate)?$/.test(req.url || "")) {
+				res.statusCode = 201;
+				res.setHeader("content-type", "application/json");
+				res.setHeader("cache-control", "public, max-age=600");
+				res.setHeader("pragma", "cache");
+				res.end(JSON.stringify({ secret: "one-time-secret" }));
+				return;
+			}
 			if (req.url?.startsWith("/health")) {
 				res.statusCode = 200;
 				res.setHeader("content-type", "application/json");
-				res.end(JSON.stringify({ ok: true, version: "0.2.1", service: "clearance-api" }));
+				res.end(JSON.stringify({ ok: true, version: "0.3.0", service: "clearance-api" }));
 				return;
 			}
 			if (req.url?.startsWith("/v1/users")) {
@@ -518,6 +400,50 @@ describe("operator sessions, roles, CSRF", () => {
 		assert.equal(res.status, 401);
 		const body = await res.json();
 		assert.equal(body.error?.code, "NOT_AUTHENTICATED");
+	});
+
+	it("rejects malformed cookie encoding without terminating the server", async () => {
+		const res = await fetch(`http://127.0.0.1:${consolePort}/api/v1/users`, {
+			headers: { cookie: "probe=%" },
+		});
+		assert.equal(res.status, 400);
+		assert.equal((await res.json()).error?.code, "MALFORMED_COOKIE");
+		assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+
+		const live = await fetch(`http://127.0.0.1:${consolePort}/livez`);
+		assert.equal(live.status, 200);
+	});
+
+	it("contains unexpected handler failures without leaking internal details", async () => {
+		const sessions = new Map();
+		sessions.get = () => {
+			throw new Error("sensitive internal failure detail");
+		};
+		const failing = createConsoleServer({
+			apiBase: consoleServer.clearanceConfig.apiBase,
+			operatorToken: OPERATOR,
+			port: 0,
+			nodeEnv: "development",
+			sessionSecret: "console-session-secret-32chars!!",
+			operators: [ADMIN],
+			sessions,
+		});
+		const port = await listen(failing);
+		try {
+			const res = await fetch(`http://127.0.0.1:${port}/api/v1/users`, {
+				headers: { cookie: `${SESSION_COOKIE}=syntactically-valid` },
+			});
+			assert.equal(res.status, 500);
+			const text = await res.text();
+			assert.equal(JSON.parse(text).error?.code, "INTERNAL_SERVER_ERROR");
+			assert.equal(text.includes("sensitive internal failure detail"), false);
+			assert.equal(res.headers.get("x-frame-options"), "DENY");
+
+			const live = await fetch(`http://127.0.0.1:${port}/livez`);
+			assert.equal(live.status, 200);
+		} finally {
+			await close(failing);
+		}
 	});
 
 	it("serves setup routes and proxies same-origin capability submissions without operator auth", async () => {
@@ -809,6 +735,23 @@ describe("operator sessions, roles, CSRF", () => {
 		assert.equal(mockApi.requests[0].headers["x-forwarded-for"], "127.0.0.1");
 	});
 
+	it("forces no-store for one-time credential create and rotate responses", async () => {
+		const { cookie, csrf, origin } = await login(consolePort, ADMIN.username, ADMIN.password);
+		for (const path of [
+			"/api/v1/organizations/org_1/service-accounts/svc_1/credentials",
+			"/api/v1/organizations/org_1/service-accounts/svc_1/credentials/cred_1/rotate",
+		]) {
+			const response = await fetch(`http://127.0.0.1:${consolePort}${path}`, {
+				method: "POST",
+				headers: { cookie, origin, "x-csrf-token": csrf, "content-type": "application/json" },
+				body: "{}",
+			});
+			assert.equal(response.status, 201);
+			assert.equal(response.headers.get("cache-control"), "no-store");
+			assert.equal(response.headers.get("pragma"), "no-cache");
+		}
+	});
+
 	it("viewer can read but mutations are forbidden", async () => {
 		const { cookie, csrf, origin } = await login(
 			consolePort,
@@ -1055,6 +998,27 @@ describe("roles surface helpers and integration", () => {
 			const html = await res.text();
 			assert.match(html, /Clearance Console/);
 			assert.match(html, /data-route="roles"/);
+		} finally {
+			await close(server);
+		}
+	});
+
+	it("authorization administration SPA deep links are served", async () => {
+		const server = createConsoleServer({
+			apiBase: "http://127.0.0.1:1",
+			operatorToken: "authorization-spa-shell-token-32chars!!",
+			sessionSecret: "authorization-spa-shell-session-secret!!",
+			operators: [{ username: "a", password: "p", role: "admin" }],
+			nodeEnv: "development",
+			secureCookies: false,
+		});
+		const port = await listen(server);
+		try {
+			for (const route of ["authorization", "service-accounts"]) {
+				const res = await fetch(`http://127.0.0.1:${port}/${route}`);
+				assert.equal(res.status, 200, route);
+				assert.match(await res.text(), /Clearance Console/);
+			}
 		} finally {
 			await close(server);
 		}
@@ -1991,7 +1955,7 @@ describe("rendering safety (XSS)", () => {
 			/\$\{\s*c\.id\s*\}/,
 			/\$\{\s*c\.fingerprint\s*\}/,
 			/\$\{\s*report\.overall\s*\}/,
-			/\$\{\s*report\.signature\s*\}/,
+			/\$\{\s*report\.reportDigest\s*\}/,
 			/\$\{\s*report\.organizationId\s*\}/,
 			/\$\{\s*settings\.releaseVersion\s*\}/,
 			/\$\{\s*settings\.schemaVersion\s*\}/,

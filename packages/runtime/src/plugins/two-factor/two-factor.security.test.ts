@@ -2,7 +2,13 @@ import type { ClearancePlugin } from "@clearance/core";
 import { createAuthMiddleware } from "@clearance/core/api";
 import { createOTP } from "@clearance/utils/otp";
 import { describe, expect, it } from "vitest";
-import { symmetricDecrypt } from "../../crypto";
+import { parseSetCookieHeader } from "../../cookies";
+import { makeSignature, symmetricDecrypt } from "../../crypto";
+import {
+	createSessionHandle,
+	digestSessionRefreshSecret,
+	SESSION_CREDENTIAL_DIGEST_VERSION,
+} from "../../db/session-credential";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
 import type { Session, User, Verification } from "../../types";
@@ -57,6 +63,29 @@ function getCookieValue(entry: string): string {
 	const firstSegment = entry.split(";")[0] ?? "";
 	const eq = firstSegment.indexOf("=");
 	return eq > 0 ? firstSegment.slice(eq + 1) : "";
+}
+
+function createInMemoryRunExclusive() {
+	const leases = new Map<string, Promise<void>>();
+	return async <T>(
+		name: string,
+		operation: () => T | Promise<T>,
+	): Promise<T> => {
+		const previous = leases.get(name) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const next = previous.catch(() => {}).then(() => current);
+		leases.set(name, next);
+		await previous.catch(() => {});
+		try {
+			return await operation();
+		} finally {
+			release();
+			if (leases.get(name) === next) leases.delete(name);
+		}
+	};
 }
 
 describe("two-factor security: sign-in does not leak session cookies (cookieCache enabled)", async () => {
@@ -162,57 +191,55 @@ describe("two-factor security: sign-in does not leak session cookies (cookieCach
 		},
 	];
 
-	it.each(
-		cases,
-	)("$path: response carries no valid signed session_token or session_data", async ({
-		call,
-	}) => {
-		const res = await call();
-		expect(res.status).toBe(200);
-		expect(res.headers.get("x-new-session-visible")).toBeNull();
+	it.each(cases)(
+		"$path: response carries no valid signed session_token or session_data",
+		async ({ call }) => {
+			const res = await call();
+			expect(res.status).toBe(200);
+			expect(res.headers.get("x-new-session-visible")).toBeNull();
 
-		const setCookies = extractSetCookies(res);
-		expect(setCookies.length).toBeGreaterThan(0);
+			const setCookies = extractSetCookies(res);
+			expect(setCookies.length).toBeGreaterThan(0);
 
-		const sessionEntries = setCookies.filter(
-			(entry) =>
-				entry.startsWith("clearance.session_token=") ||
-				entry.startsWith("clearance.session_data=") ||
-				entry.startsWith("clearance.session_data."),
-		);
+			const sessionEntries = setCookies.filter(
+				(entry) =>
+					entry.startsWith("clearance.session_token=") ||
+					entry.startsWith("clearance.session_data=") ||
+					entry.startsWith("clearance.session_data."),
+			);
 
-		for (const entry of sessionEntries) {
-			expect(getCookieValue(entry)).toBe("");
-		}
+			for (const entry of sessionEntries) {
+				expect(getCookieValue(entry)).toBe("");
+			}
 
-		const twoFactorEntry = setCookies.find((entry) =>
-			entry.startsWith("clearance.two_factor="),
-		);
-		expect(twoFactorEntry).toBeDefined();
-	});
+			const twoFactorEntry = setCookies.find((entry) =>
+				entry.startsWith("clearance.two_factor="),
+			);
+			expect(twoFactorEntry).toBeDefined();
+		},
+	);
 
-	it.each(
-		cases,
-	)("$path: replaying captured cookies cannot authenticate or disable 2FA", async ({
-		call,
-	}) => {
-		const res = await call();
-		const setCookies = extractSetCookies(res);
-		const replay = buildCookieHeader(setCookies, [
-			"clearance.session_token",
-			"clearance.session_data",
-		]);
+	it.each(cases)(
+		"$path: replaying captured cookies cannot authenticate or disable 2FA",
+		async ({ call }) => {
+			const res = await call();
+			const setCookies = extractSetCookies(res);
+			const replay = buildCookieHeader(setCookies, [
+				"clearance.session_token",
+				"clearance.session_data",
+			]);
 
-		const session = await auth.api.getSession({ headers: replay });
-		expect(session).toBeNull();
+			const session = await auth.api.getSession({ headers: replay });
+			expect(session).toBeNull();
 
-		const disableRes = await auth.api.disableTwoFactor({
-			body: { password: testUser.password },
-			headers: replay,
-			asResponse: true,
-		});
-		expect(disableRes.status).toBe(401);
-	});
+			const disableRes = await auth.api.disableTwoFactor({
+				body: { password: testUser.password },
+				headers: replay,
+				asResponse: true,
+			});
+			expect(disableRes.status).toBe(401);
+		},
+	);
 });
 
 describe("two-factor security: sign-in does not leak session cookies (cookieCache disabled)", async () => {
@@ -447,6 +474,11 @@ describe("two-factor security: 2FA challenge is single-use and expiry-bounded", 
 	});
 	const enrollCode = await createOTP(secret).totp();
 	await auth.api.verifyTOTP({ body: { code: enrollCode }, headers });
+	await db.update({
+		model: "twoFactor",
+		where: [{ field: "id", value: row!.id }],
+		update: { lastUsedTotpCounter: -1 },
+	});
 	const verified = await db.findOne<UserWithTwoFactor>({
 		model: "user",
 		where: [{ field: "id", value: userId }],
@@ -517,6 +549,11 @@ describe("two-factor security: 2FA challenge is single-use and expiry-bounded", 
 	});
 
 	it("two concurrent verifications of the same challenge yield exactly one session", async () => {
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: row!.id }],
+			update: { lastUsedTotpCounter: -1 },
+		});
 		const challengeHeaders = await startChallenge();
 		const sessionsBefore = await countSessions();
 		const code = await createOTP(secret).totp();
@@ -542,6 +579,383 @@ describe("two-factor security: 2FA challenge is single-use and expiry-bounded", 
 	});
 });
 
+describe("two-factor security: trusted-device proof is single-use", () => {
+	it("allows exactly one concurrent sign-in to rotate a trusted-device proof", async () => {
+		let otp = "";
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [
+				twoFactor({
+					skipVerificationOnEnable: true,
+					otpOptions: {
+						sendOTP({ otp: sent }) {
+							otp = sent;
+						},
+					},
+				}),
+			],
+		});
+		const signedIn = await signInWithTestUser();
+		const enabled = await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers: signedIn.headers,
+			asResponse: true,
+		});
+		expect(enabled.status).toBe(200);
+
+		const challenge = await auth.api.signInEmail({
+			body: { email: testUser.email, password: testUser.password },
+			asResponse: true,
+		});
+		const challengeHeaders = convertSetCookieToCookie(challenge.headers);
+		await auth.api.sendTwoFactorOTP({ headers: challengeHeaders });
+		const trusted = await auth.api.verifyTwoFactorOTP({
+			body: { code: otp, trustDevice: true },
+			headers: challengeHeaders,
+			asResponse: true,
+		});
+		expect(trusted.status).toBe(200);
+		const trustCookie = parseSetCookieHeader(
+			trusted.headers.get("Set-Cookie") || "",
+		).get("clearance.trust_device")?.value;
+		expect(trustCookie).toBeDefined();
+		const trustHeaders = new Headers({
+			cookie: `clearance.trust_device=${trustCookie}`,
+		});
+
+		const results = await Promise.all([
+			auth.api.signInEmail({
+				body: { email: testUser.email, password: testUser.password },
+				headers: trustHeaders,
+				asResponse: true,
+			}),
+			auth.api.signInEmail({
+				body: { email: testUser.email, password: testUser.password },
+				headers: trustHeaders,
+				asResponse: true,
+			}),
+		]);
+		const bodies = await Promise.all(
+			results.map(
+				(response) =>
+					response.json() as Promise<{
+						twoFactorRedirect?: boolean;
+						user?: { email?: string };
+					}>,
+			),
+		);
+		expect(
+			bodies.filter((body) => body.user?.email === testUser.email),
+		).toHaveLength(1);
+		expect(
+			bodies.filter((body) => body.twoFactorRedirect === true),
+		).toHaveLength(1);
+	});
+
+	it("fails closed before proof or trust mutation with secondary-authoritative sessions", async () => {
+		let otp = "";
+		const store = new Map<string, string>();
+		const runExclusive = createInMemoryRunExclusive();
+		let secondaryWrites = 0;
+		const secondaryStorage = {
+			async get(key: string) {
+				return store.get(key) ?? null;
+			},
+			async set(key: string, value: string) {
+				secondaryWrites++;
+				store.set(key, value);
+			},
+			async delete(key: string) {
+				secondaryWrites++;
+				store.delete(key);
+			},
+			async getAndDelete(key: string) {
+				const value = store.get(key) ?? null;
+				store.delete(key);
+				return value;
+			},
+			runExclusive,
+		};
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			secondaryStorage,
+			verification: { storeInDatabase: false },
+			plugins: [
+				twoFactor({
+					skipVerificationOnEnable: true,
+					otpOptions: {
+						sendOTP({ otp: sent }) {
+							otp = sent;
+						},
+					},
+				}),
+			],
+		});
+		const signedIn = await signInWithTestUser();
+		const enabled = await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers: signedIn.headers,
+			asResponse: true,
+		});
+		expect(enabled.status).toBe(200);
+		const user = await auth.api.getSession({
+			headers: convertSetCookieToCookie(enabled.headers),
+		});
+		const factor = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user!.user.id }],
+		});
+
+		const challenge = await auth.api.signInEmail({
+			body: { email: testUser.email, password: testUser.password },
+			asResponse: true,
+		});
+		const challengeHeaders = convertSetCookieToCookie(challenge.headers);
+		await auth.api.sendTwoFactorOTP({ headers: challengeHeaders });
+		const trusted = await auth.api.verifyTwoFactorOTP({
+			body: { code: otp, trustDevice: true },
+			headers: challengeHeaders,
+			asResponse: true,
+		});
+		expect(trusted.status).toBe(200);
+		const markerKey = `verification:trust-device-generation-${user!.user.id}-${factor!.trustDeviceGeneration}`;
+		expect(store.has(markerKey)).toBe(true);
+		const trustedHeaders = convertSetCookieToCookie(trusted.headers);
+		const beforeDisable = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user!.user.id }],
+		});
+		const secret = await symmetricDecrypt({
+			key: DEFAULT_SECRET,
+			data: factor!.secret,
+		});
+		const writesBeforeDisable = secondaryWrites;
+		const disabled = await auth.api.disableTwoFactor({
+			body: {
+				password: testUser.password,
+				currentCode: await createOTP(secret).totp(),
+			},
+			headers: trustedHeaders,
+			asResponse: true,
+		});
+		expect(disabled.status).toBe(500);
+		expect(await disabled.json()).toMatchObject({
+			code: "LIFECYCLE_CONFIGURATION_ERROR",
+		});
+		expect(disabled.headers.get("set-cookie")).toBeNull();
+		expect(secondaryWrites).toBe(writesBeforeDisable);
+		expect(store.has(markerKey)).toBe(true);
+		expect(
+			await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: user!.user.id }],
+			}),
+		).toMatchObject({
+			id: beforeDisable?.id,
+			backupCodes: beforeDisable?.backupCodes,
+			failedVerificationCount: beforeDisable?.failedVerificationCount,
+			activeVerificationReservations:
+				beforeDisable?.activeVerificationReservations,
+		});
+		await expect(
+			auth.api.getSession({ headers: trustedHeaders }),
+		).resolves.not.toBeNull();
+	});
+
+	it("refuses trusted-device bypass when secondary consume is process-local", async () => {
+		let otp = "";
+		const store = new Map<string, string>();
+		const runExclusive = createInMemoryRunExclusive();
+		const secondaryStorage = {
+			async get(key: string) {
+				return store.get(key) ?? null;
+			},
+			async set(key: string, value: string) {
+				store.set(key, value);
+			},
+			async delete(key: string) {
+				store.delete(key);
+			},
+			async getAndDelete(key: string) {
+				const value = store.get(key) ?? null;
+				store.delete(key);
+				return value;
+			},
+			runExclusive,
+		};
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			secondaryStorage,
+			verification: { storeInDatabase: false },
+			plugins: [
+				twoFactor({
+					skipVerificationOnEnable: true,
+					otpOptions: {
+						sendOTP({ otp: sent }) {
+							otp = sent;
+						},
+					},
+				}),
+			],
+		});
+		const signedIn = await signInWithTestUser();
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers: signedIn.headers,
+		});
+		const challenge = await auth.api.signInEmail({
+			body: { email: testUser.email, password: testUser.password },
+			asResponse: true,
+		});
+		const challengeHeaders = convertSetCookieToCookie(challenge.headers);
+		await auth.api.sendTwoFactorOTP({ headers: challengeHeaders });
+		const trusted = await auth.api.verifyTwoFactorOTP({
+			body: { code: otp, trustDevice: true },
+			headers: challengeHeaders,
+			asResponse: true,
+		});
+		const trustCookie = parseSetCookieHeader(
+			trusted.headers.get("Set-Cookie") || "",
+		).get("clearance.trust_device")?.value;
+		// getTestInstance normalizes secondary storage into auth.options. Simulate
+		// that the effective provider losing its atomic consume capability before
+		// the next sign-in: trusted-device bypass must then fail closed.
+		Reflect.deleteProperty(auth.options.secondaryStorage!, "getAndDelete");
+		const attemptedBypass = await auth.api.signInEmail({
+			body: { email: testUser.email, password: testUser.password },
+			headers: new Headers({
+				cookie: `clearance.trust_device=${trustCookie}`,
+			}),
+			asResponse: true,
+		});
+		const body = (await attemptedBypass.json()) as {
+			twoFactorRedirect?: boolean;
+		};
+		expect(body.twoFactorRedirect).toBe(true);
+	});
+});
+
+describe("two-factor security: sessions are bound to the factor generation", () => {
+	it("atomically backfills legacy database sessions on ordinary session creation", async () => {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor()],
+		});
+		const legacy = await signInWithTestUser();
+		await db.update({
+			model: "user",
+			where: [{ field: "id", value: legacy.user.id }],
+			update: { twoFactorSessionGeneration: null },
+		});
+		await db.updateMany({
+			model: "session",
+			where: [{ field: "userId", value: legacy.user.id }],
+			update: { twoFactorSessionGeneration: null },
+		});
+
+		const ordinarySignIn = await auth.api.signInEmail({
+			body: { email: testUser.email, password: testUser.password },
+			asResponse: true,
+		});
+		expect(ordinarySignIn.status).toBe(200);
+		expect(
+			await auth.api.getSession({ headers: legacy.headers }),
+		).not.toBeNull();
+		const user = await db.findOne<User & Record<string, unknown>>({
+			model: "user",
+			where: [{ field: "id", value: legacy.user.id }],
+		});
+		const sessions = await db.findMany<Session & Record<string, unknown>>({
+			model: "session",
+			where: [{ field: "userId", value: legacy.user.id }],
+		});
+		expect(typeof user?.twoFactorSessionGeneration).toBe("string");
+		expect(
+			sessions.every(
+				(session) =>
+					session.twoFactorSessionGeneration ===
+					user?.twoFactorSessionGeneration,
+			),
+		).toBe(true);
+	});
+
+	it("rejects a session inserted after lifecycle revocation with the stale generation", async () => {
+		const { auth, signInWithTestUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor()],
+		});
+		const signedIn = await signInWithTestUser();
+		const signedInSession = await auth.api.getSession({
+			headers: signedIn.headers,
+		});
+		const source = await db.findOne<Session & Record<string, unknown>>({
+			model: "session",
+			where: [{ field: "id", value: signedInSession!.session.id }],
+		});
+		const user = await db.findOne<User & Record<string, unknown>>({
+			model: "user",
+			where: [{ field: "id", value: signedIn.user.id }],
+		});
+		const staleGeneration = source?.twoFactorSessionGeneration;
+		expect(staleGeneration).toBe(user?.twoFactorSessionGeneration);
+		expect(typeof staleGeneration).toBe("string");
+
+		await db.update({
+			model: "user",
+			where: [{ field: "id", value: signedIn.user.id }],
+			update: { twoFactorSessionGeneration: "rotated-session-generation" },
+		});
+		const staleToken = "late-stale-session-token";
+		const staleSessionId = "late-stale-session-id";
+		const { id: _sourceId, ...sourceData } = source!;
+		await db.create({
+			model: "session",
+			forceAllowId: true,
+			data: {
+				...sourceData,
+				id: staleSessionId,
+				token: createSessionHandle(staleSessionId),
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+				twoFactorSessionGeneration: staleGeneration,
+			},
+		});
+		const credentialNow = new Date();
+		await db.create({
+			model: "sessionCredential",
+			forceAllowId: true,
+			data: {
+				id: "late-stale-session-credential",
+				selector: "late-stale-session-selector",
+				sessionId: staleSessionId,
+				familyId: "late-stale-session-family",
+				secretDigest: await digestSessionRefreshSecret(staleToken),
+				digestVersion: SESSION_CREDENTIAL_DIGEST_VERSION,
+				status: "active",
+				rotationCounter: 0,
+				parentCredentialId: null,
+				expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+				consumedAt: null,
+				revokedAt: null,
+				reuseDetectedAt: null,
+				rotationNonceDigest: null,
+				recoverySecretCiphertext: null,
+				recoveryExpiresAt: null,
+				createdAt: credentialNow,
+				updatedAt: credentialNow,
+			},
+		});
+		const signature = await makeSignature(staleToken, DEFAULT_SECRET);
+		const session = await auth.api.getSession({
+			headers: new Headers({
+				cookie: `clearance.session_token=${staleToken}.${signature}`,
+			}),
+		});
+		expect(session).toBeNull();
+	});
+});
+
 /**
  * The two-factor OTP attempt counter must survive a burst of concurrent
  * submissions. The counter used to be tracked with a read-counter then
@@ -561,11 +975,11 @@ describe("two-factor security: OTP attempts are atomic under concurrency", async
 	// whose writes are instant. Without an atomic consume gate, every concurrent
 	// verification finishes its slow read of the same counter before any write
 	// lands, so they would all pass the budget check against a stale value. The
-	// fix consumes the row under a per-key lock, so the slow reads serialize and
-	// the budget holds. `getAndDelete` is intentionally absent so the consume
-	// path exercises that lock rather than a single storage primitive.
+	// provider-level consume operation, so every verification observes a
+	// single-use credential instead of a stale counter snapshot.
 	const store = new Map<string, { value: string; expiresAt: number }>();
 	const isOtpRow = (key: string) => key.includes("2fa-otp");
+	const runExclusive = createInMemoryRunExclusive();
 	const secondaryStorage = {
 		async get(key: string) {
 			if (isOtpRow(key)) {
@@ -588,6 +1002,13 @@ describe("two-factor security: OTP attempts are atomic under concurrency", async
 		async delete(key: string) {
 			store.delete(key);
 		},
+		async getAndDelete(key: string) {
+			const entry = store.get(key);
+			store.delete(key);
+			if (!entry || entry.expiresAt < Date.now()) return null;
+			return entry.value;
+		},
+		runExclusive,
 	};
 
 	const { auth, signInWithTestUser, testUser, db } = await getTestInstance({

@@ -1,0 +1,29 @@
+{
+  "name": "@clearance/framework-quickstarts",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "NODE_OPTIONS=--conditions=dev-source tsc -p react/tsconfig.json --noEmit && NODE_OPTIONS=--conditions=dev-source tsc -p express/tsconfig.json --noEmit && NODE_OPTIONS=--conditions=dev-source tsc -p next-app-router/tsconfig.json --noEmit",
+    "dev:react": "NODE_OPTIONS=--conditions=dev-source vite --config react/vite.config.ts",
+    "dev:express": "NODE_OPTIONS=--conditions=dev-source tsx express/src/server.ts",
+    "dev:next": "NODE_OPTIONS=--conditions=dev-source next dev next-app-router"
+  },
+  "dependencies": {
+    "@clearance/runtime": "workspace:*",
+    "@clearance/verification": "workspace:*",
+    "express": "^5.2.1",
+    "next": "^16.3.0",
+    "react": "catalog:react19",
+    "react-dom": "catalog:react19"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.1",
+    "@types/react": "catalog:react19",
+    "@types/react-dom": "catalog:react19",
+    "tsx": "^4.23.1",
+    "typescript": "catalog:",
+    "vite": "8.1.4"
+  }
+}

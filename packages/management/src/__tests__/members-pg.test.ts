@@ -11,12 +11,23 @@ import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import {
 	addMemberInAuth,
-	createOrgInAuth,
 	createUserInAuth,
+	createTenantProductAdministrationFacade,
 	ensureAuthMigrated,
 	getAuthBundle,
+	inspectEffectiveAuthorizationInAuth,
+	inspectServiceAccountInAuth,
+	listAuthorizationAssignmentsInAuth,
+	listServiceAccountsInAuth,
+	provisionOrganizationInAuth,
+	reconcileAuthorizationOrganizationInAuth,
+	replaceAuthorizationAssignmentsInAuth,
+	createServiceAccountInAuth,
+	createServiceAccountCredentialInAuth,
+	revokeServiceAccountCredentialInAuth,
 	removeMemberInAuth,
 	resetAuthBundle,
+	setServiceAccountStatusInAuth,
 	updateMemberInAuth,
 } from "../auth-bridge.js";
 import {
@@ -24,7 +35,6 @@ import {
 	initProject,
 	listEvents,
 	resolveOperatorScope,
-	syncRuntimeOrganizationToManagementDurable,
 } from "../index.js";
 import { ClearanceError } from "../services/errors.js";
 
@@ -39,6 +49,7 @@ const createdRuntimeUserIds = new Set<string>();
 const createdRuntimeOrgIds = new Set<string>();
 const createdRuntimeMemberIds = new Set<string>();
 const createdRuntimeEmails = new Set<string>();
+const createdSsoProviderIds = new Set<string>();
 
 
 function trackUser(user: { id: string; email?: string | null }): void {
@@ -57,6 +68,14 @@ function trackMember(id: string): void {
 async function cleanupTracked(): Promise<void> {
 	const pool = new pg.Pool({ connectionString: DATABASE_URL });
 	try {
+		const ssoProviderIds = [...createdSsoProviderIds];
+		if (ssoProviderIds.length > 0) {
+			await pool
+				.query(`delete from "ssoProvider" where id = any($1::text[])`, [
+					ssoProviderIds,
+				])
+				.catch(() => undefined);
+		}
 		const memberIds = [...createdRuntimeMemberIds];
 		if (memberIds.length > 0) {
 			await pool
@@ -139,6 +158,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		createdRuntimeOrgIds.clear();
 		createdRuntimeMemberIds.clear();
 		createdRuntimeEmails.clear();
+		createdSsoProviderIds.clear();
 		resetAuthBundle();
 	});
 
@@ -186,36 +206,28 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			managementStore: store,
 		});
 		trackUser(owner);
-		const runtimeOrg = await createOrgInAuth({
+		const organization = await provisionOrganizationInAuth(store, {
 			name: `Org ${stamp}`,
 			slug: `org-${stamp}`,
-			userId: owner.id,
+			ownerUserId: owner.id,
+			actor: "test",
 		});
-		trackOrg(runtimeOrg);
-		// Capture owner membership id from runtime (must equal createOrgInAuth return)
+		trackOrg(organization);
+		// Capture the exact owner membership id committed with the provision.
 		const b = getAuthBundle();
 		const mem = await b.pool.query(
 			`select id from member where "organizationId" = $1 and "userId" = $2`,
-			[runtimeOrg.id, owner.id],
+			[organization.id, owner.id],
 		);
 		const runtimeOwnerMembershipId = mem.rows[0]?.id
 			? String(mem.rows[0].id)
 			: undefined;
 		if (runtimeOwnerMembershipId) trackMember(runtimeOwnerMembershipId);
-		expect(runtimeOrg.ownerMembershipId).toBe(runtimeOwnerMembershipId);
-
-		const organization = await syncRuntimeOrganizationToManagementDurable(
-			store,
-			runtimeOrg,
-			owner.id,
-			{ actor: "test", role: "owner" },
-		);
 		return {
 			owner,
 			organization,
 			stamp,
 			runtimeOwnerMembershipId,
-			runtimeOrg,
 		};
 	}
 
@@ -245,17 +257,15 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			: undefined;
 	}
 
-	it("org sync preserves runtime owner membership id immediately and is idempotent", async () => {
+	it("provision commits the owner membership and effective owner actions without reconciliation", async () => {
 		const store = await freshStore();
 		const {
 			owner,
 			organization,
 			runtimeOwnerMembershipId,
-			runtimeOrg,
 		} = await seedOwnerAndOrg(store);
 
 		expect(runtimeOwnerMembershipId).toBeTruthy();
-		expect(runtimeOrg.ownerMembershipId).toBe(runtimeOwnerMembershipId);
 
 		const rt = await runtimeMember(organization.id, owner.id);
 		expect(rt?.id).toBe(runtimeOwnerMembershipId);
@@ -272,23 +282,14 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(mgmt[0]?.id).toBe(runtimeOwnerMembershipId);
 		expect(mgmt[0]?.role).toBe("owner");
 
-		// Re-sync is idempotent: one canonical active membership, same stable id
-		await syncRuntimeOrganizationToManagementDurable(
-			store,
-			runtimeOrg,
-			owner.id,
-			{ actor: "test", role: "owner" },
-		);
-		const after = store.snapshot.memberships.filter(
-			(m) =>
-				m.organizationId === organization.id &&
-				m.principalId === owner.id &&
-				m.status === "active",
-		);
-		expect(after).toHaveLength(1);
-		expect(after[0]?.id).toBe(runtimeOwnerMembershipId);
-		const rtAgain = await runtimeMember(organization.id, owner.id);
-		expect(rtAgain?.id).toBe(runtimeOwnerMembershipId);
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const effective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(effective.roleIds).toEqual(["role_builtin_owner"]);
+		expect(effective.actions).toContain("organization:delete");
 	});
 
 	it("built-in role add parity: same id/role in runtime and management, one audit", async () => {
@@ -323,7 +324,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 
 	it("custom scoped role add and update parity with exactly one audit each", async () => {
 		const store = await freshStore();
-		const { organization, stamp } = await seedOwnerAndOrg(store);
+		const { organization, owner, stamp } = await seedOwnerAndOrg(store);
 		const user = await createMemberUser(store, stamp, "billing");
 		await createRole(store, {
 			name: "Billing",
@@ -331,6 +332,13 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			permissions: ["billing:read"],
 		});
 		await store.ready();
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const ownerEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(ownerEffective.actions).toContain("organization:delete");
 
 		const membership = await addMemberInAuth(store, {
 			organizationId: organization.id,
@@ -342,6 +350,14 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		trackMember(membership.id);
 		expect(membership.role).toBe("billing");
 		expect((await runtimeMember(organization.id, user.id))?.role).toBe("billing");
+		const billingEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(billingEffective.actions).toEqual(["billing:read"]);
+		expect(BigInt(billingEffective.revision)).toBeGreaterThan(
+			BigInt(ownerEffective.revision),
+		);
 
 		const updated = await updateMemberInAuth(store, membership.id, {
 			role: "member",
@@ -351,6 +367,24 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(updated.id).toBe(membership.id);
 		expect(updated.role).toBe("member");
 		expect((await runtimeMember(organization.id, user.id))?.role).toBe("member");
+		const memberEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(memberEffective.actions).toEqual(["ac:read"]);
+		expect(BigInt(memberEffective.revision)).toBeGreaterThan(
+			BigInt(billingEffective.revision),
+		);
+		await updateMemberInAuth(store, membership.id, {
+			role: "member",
+			actor: "test",
+			auditSource: "api",
+		});
+		const noOpEffective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(noOpEffective.revision).toBe(memberEffective.revision);
 
 		const adds = listEvents(store, { limit: 200 }).filter(
 			(e) => e.action === "orgs.members.add" && e.subjectId === membership.id,
@@ -457,11 +491,220 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		expect(
 			store.snapshot.memberships.find((m) => m.id === membership.id)?.status,
 		).toBe("removed");
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const effective = await authorization.readEffective({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: user.id },
+		});
+		expect(effective.roleIds).toEqual([]);
+		expect(effective.actions).toEqual([]);
 
 		const audits = listEvents(store, { limit: 200 }).filter(
 			(e) => e.action === "orgs.members.remove" && e.subjectId === membership.id,
 		);
 		expect(audits).toHaveLength(1);
+	});
+
+	it("bounded reconciliation clears only stale principal assignments in its organization", async () => {
+		const store = await freshStore();
+		const { organization } = await seedOwnerAndOrg(store);
+		const authorization = getAuthBundle().authorization;
+		if (!authorization) throw new Error("authorization authority unavailable");
+		const stalePrincipalId = `stale-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		await authorization.replaceSubjectRoles({
+			organizationId: organization.id,
+			subject: { kind: "principal", id: stalePrincipalId },
+			roleIds: ["role_builtin_member"],
+		});
+		const preview = await reconcileAuthorizationOrganizationInAuth(store, {
+			organizationId: organization.id,
+			actor: "test",
+		});
+		expect(preview).toMatchObject({ preview: true, assignmentsChanged: 1 });
+		expect(preview).not.toHaveProperty("revision");
+		expect(
+			await authorization.listSubjectAssignments({
+				organizationId: organization.id,
+				subject: { kind: "principal", id: stalePrincipalId },
+			}),
+		).toHaveLength(1);
+
+		const reconciled = await reconcileAuthorizationOrganizationInAuth(store, {
+			organizationId: organization.id,
+			actor: "test",
+			dryRun: false,
+			confirm: true,
+		});
+		expect(reconciled.assignmentsChanged).toBe(1);
+		expect(
+			await authorization.listSubjectAssignments({
+				organizationId: organization.id,
+				subject: { kind: "principal", id: stalePrincipalId },
+			}),
+		).toEqual([]);
+	});
+
+	it("manages normalized authorization and service-account credentials through the coordinated bridge", async () => {
+		const store = await freshStore();
+		const { owner, organization } = await seedOwnerAndOrg(store);
+		const ownerEffective = await inspectEffectiveAuthorizationInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		});
+		expect(ownerEffective.roleIds).toEqual(["role_builtin_owner"]);
+		const assignmentAuditCount = listEvents(store, { limit: 200 }).filter(
+			(event) => event.action === "authorization.assignments.replace",
+		).length;
+		await expect(
+			replaceAuthorizationAssignmentsInAuth(store, {
+				organizationId: organization.id,
+				subject: { kind: "principal", id: `nonmember-${Date.now()}` },
+				roleIds: ["role_builtin_member"],
+				dryRun: false,
+				confirm: true,
+			}),
+		).rejects.toMatchObject({ code: "AUTHORIZATION_SUBJECT_NOT_FOUND", status: 404 });
+		expect((await inspectEffectiveAuthorizationInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "principal", id: owner.id },
+		})).revision).toBe(ownerEffective.revision);
+		expect(listEvents(store, { limit: 200 }).filter(
+			(event) => event.action === "authorization.assignments.replace",
+		)).toHaveLength(assignmentAuditCount);
+
+		const previewAccount = await createServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			name: "Preview deployer",
+			roleIds: ["role_builtin_member"],
+			dryRun: true,
+		});
+		expect(previewAccount).toEqual({
+			preview: true,
+			serviceAccount: {
+				organizationId: organization.id,
+				name: "Preview deployer",
+				status: "active",
+			},
+			roleIds: ["role_builtin_member"],
+		});
+		expect(previewAccount.serviceAccount).not.toHaveProperty("serviceAccountId");
+		expect(await listServiceAccountsInAuth(store, { organizationId: organization.id })).toEqual([]);
+
+		const account = await createServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			name: "Release deployer",
+			roleIds: ["role_builtin_member"],
+			actor: "test",
+		});
+		if ("preview" in account) throw new Error("live service account creation returned a preview");
+		expect(account.serviceAccount.status).toBe("active");
+		expect(await listServiceAccountsInAuth(store, { organizationId: organization.id })).toEqual([account.serviceAccount]);
+		expect(await inspectServiceAccountInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+		})).toEqual({
+			serviceAccount: account.serviceAccount,
+			assignments: [{
+				organizationId: organization.id,
+				subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+				roleId: "role_builtin_member",
+			}],
+		});
+
+		const assignmentPreview = await replaceAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+			roleIds: ["role_builtin_admin"],
+		});
+		expect(assignmentPreview).toMatchObject({
+			preview: true,
+			assignment: {
+				organizationId: organization.id,
+				subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+				roleIds: ["role_builtin_admin"],
+			},
+			wouldChange: true,
+		});
+		expect(assignmentPreview).not.toHaveProperty("revision");
+		expect(await listAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+		})).toEqual([{ organizationId: organization.id, subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId }, roleId: "role_builtin_member" }]);
+		const replacement = await replaceAuthorizationAssignmentsInAuth(store, {
+			organizationId: organization.id,
+			subject: { kind: "service_account", id: account.serviceAccount.serviceAccountId },
+			roleIds: ["role_builtin_admin"],
+			dryRun: false,
+			confirm: true,
+			actor: "test",
+		});
+		if ("preview" in replacement) throw new Error("live assignment replacement returned a preview");
+		expect(replacement.revision).not.toBe(replacement.previousRevision);
+
+		const credentialPreview = await createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			dryRun: true,
+			actor: "test",
+		});
+		expect(credentialPreview).toEqual({
+			preview: true,
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			expiresAt: null,
+			secretGenerated: false,
+		});
+		expect(credentialPreview).not.toHaveProperty("credential");
+		expect(credentialPreview).not.toHaveProperty("credentialId");
+		expect(credentialPreview).not.toHaveProperty("credentialPrefix");
+		expect(credentialPreview).not.toHaveProperty("credentialFingerprint");
+		expect(credentialPreview).not.toHaveProperty("revision");
+		await expect(createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			dryRun: true,
+			actor: "test",
+			operationId: "33333333-3333-4333-8333-333333333333",
+		} as never)).rejects.toMatchObject({
+			code: "TENANT_OPERATION_ID_REQUIRED",
+		});
+		const credential = await createServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			actor: "test",
+			operationId: "22222222-2222-4222-8222-222222222222",
+		});
+		if ("preview" in credential) throw new Error("live credential creation returned a preview");
+		expect(credential.secret).toMatch(/^clr_sac_v1_/);
+		expect(credential.credential.expiresAt).toBeNull();
+		const disabled = await setServiceAccountStatusInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			status: "disabled",
+			actor: "test",
+		});
+		if ("preview" in disabled) throw new Error("live status change returned a preview");
+		expect(disabled.revision).not.toBe(disabled.previousRevision);
+		const enabled = await setServiceAccountStatusInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			status: "active",
+			actor: "test",
+		});
+		if ("preview" in enabled) throw new Error("live status change returned a preview");
+		const revoked = await revokeServiceAccountCredentialInAuth(store, {
+			organizationId: organization.id,
+			serviceAccountId: account.serviceAccount.serviceAccountId,
+			credentialId: credential.credential!.credentialId,
+			actor: "test",
+		});
+		if ("preview" in revoked) throw new Error("live credential revocation returned a preview");
+		expect(enabled.revision).not.toBe(enabled.previousRevision);
+		expect(revoked.revision).not.toBe(revoked.previousRevision);
+		const auditJson = JSON.stringify(listEvents(store, { limit: 200 }).filter((event) => event.action.startsWith("authorization.")));
+		expect(auditJson).not.toContain(credential.secret!);
+		expect(auditJson).not.toContain("credentialDigest");
 	});
 
 	it("final-owner invariant blocks demote and remove", async () => {
@@ -504,6 +747,126 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			actor: "test",
 		});
 		expect(demoted.role).toBe("member");
+	});
+
+	it("tenant enterprise facade reauthorizes inside the coordinated disable transaction", async () => {
+		const store = await freshStore();
+		const { owner, organization, stamp } = await seedOwnerAndOrg(store);
+		const member = await createMemberUser(store, stamp, "tenant-enterprise");
+		const membership = await addMemberInAuth(store, {
+			organizationId: organization.id,
+			principalId: member.id,
+			role: "member",
+			actor: "test",
+		});
+		trackMember(membership.id);
+
+		const allowedConnectionId = `sso_tenant_allowed_${process.pid}_${Date.now()}`;
+		const deniedConnectionId = `sso_tenant_denied_${process.pid}_${Date.now()}`;
+		const revokedConnectionId = `sso_tenant_revoked_${process.pid}_${Date.now()}`;
+		const now = new Date().toISOString();
+		store.mutate((data) => {
+			for (const id of [allowedConnectionId, deniedConnectionId, revokedConnectionId]) {
+				data.ssoConnections.push({
+					id,
+					organizationId: organization.id,
+					protocol: "oidc",
+					provider: "okta",
+					status: "active",
+					domains: ["example.test"],
+					issuer: "https://idp.example.test/oauth2/default",
+					attributeMapping: { email: "email", name: "name" },
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+		});
+		await store.ready();
+
+		const runtime = getAuthBundle();
+		for (const id of [allowedConnectionId, deniedConnectionId, revokedConnectionId]) {
+			await runtime.pool.query(
+				`insert into "ssoProvider" (
+					id, issuer, "oidcConfig", "samlConfig", "userId", "providerId",
+					"organizationId", domain
+				 ) values ($1, $2, null, null, $3, $4, $5, $6)`,
+				[
+					id,
+					"https://idp.example.test/oauth2/default",
+					owner.id,
+					`${id}_provider`,
+					organization.id,
+					"example.test",
+				],
+			);
+			createdSsoProviderIds.add(id);
+		}
+
+		const scope = resolveOperatorScope(store);
+		const facade = createTenantProductAdministrationFacade({ store, scope });
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: owner.id,
+				connectionId: allowedConnectionId,
+			}),
+		).resolves.toMatchObject({
+			connection: { id: allowedConnectionId, status: "disabled" },
+			runtimeRemoved: true,
+		});
+
+		const eventsBeforeDenied = store.snapshot.events.length;
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: member.id,
+				connectionId: deniedConnectionId,
+			}),
+		).rejects.toMatchObject({
+			code: "TENANT_AUTHORIZATION_REQUIRED",
+			status: 403,
+		});
+		expect(
+			store.snapshot.ssoConnections.find(
+				(connection) => connection.id === deniedConnectionId,
+			)?.status,
+		).toBe("active");
+		await expect(
+			runtime.pool.query(
+				`select id from "ssoProvider" where id = $1`,
+				[deniedConnectionId],
+			),
+		).resolves.toMatchObject({
+			rows: [{ id: deniedConnectionId }],
+		});
+		expect(store.snapshot.events).toHaveLength(eventsBeforeDenied);
+
+		// This actor is first granted the exact update authority, then revoked
+		// through the live membership lifecycle. The real facade must re-read
+		// normalized authorization in its coordinated transaction; an endpoint
+		// capability captured before revocation would incorrectly delete this row.
+		await updateMemberInAuth(store, membership.id, { role: "owner", actor: "test" });
+		await removeMemberInAuth(store, membership.id, { actor: "test" });
+		const eventsBeforeRevoked = store.snapshot.events.length;
+		await expect(
+			facade.disableSso({
+				organizationId: organization.id,
+				actorId: member.id,
+				connectionId: revokedConnectionId,
+			}),
+		).rejects.toMatchObject({
+			code: "TENANT_AUTHORIZATION_REQUIRED",
+			status: 403,
+		});
+		expect(
+			store.snapshot.ssoConnections.find(
+				(connection) => connection.id === revokedConnectionId,
+			)?.status,
+		).toBe("active");
+		await expect(
+			runtime.pool.query(`select id from "ssoProvider" where id = $1`, [revokedConnectionId]),
+		).resolves.toMatchObject({ rows: [{ id: revokedConnectionId }] });
+		expect(store.snapshot.events).toHaveLength(eventsBeforeRevoked);
 	});
 
 	it("cross-scope add fails closed with no runtime write", async () => {

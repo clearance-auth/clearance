@@ -2,9 +2,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { parseConfigJson, setConfig, validateConfig } from "../services/config.js";
+import {
+	parseConfigJson,
+	setConfig,
+	setConfigAuthoritative,
+	validateConfig,
+	validateConfigAuthoritative,
+} from "../services/config.js";
 import { initProject } from "../services/core.js";
 import { JsonStore } from "../store/json-store.js";
+import { resolveOperatorScopeAuthoritative } from "../services/scope.js";
+import type { ManagementStore } from "../store/types.js";
 
 const directories: string[] = [];
 
@@ -44,5 +52,114 @@ describe("config service", () => {
 			projectId: initialized.project.id,
 			environmentId: "missing",
 		}))).toBe("CONFIG_ENVIRONMENT_NOT_FOUND");
+	});
+
+	it("uses exact relational parentage after topology cutover", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "clr-config-topology-"));
+		directories.push(directory);
+		const jsonStore = new JsonStore(join(directory, "data.json"));
+		const { project, environment } = initProject(jsonStore, { name: "Topology Config" });
+		const otherProject = { ...project, id: "proj_other" };
+		const otherEnvironment = {
+			...environment,
+			id: "env_other",
+			projectId: otherProject.id,
+		};
+		const store = {
+			snapshot: {
+				...structuredClone(jsonStore.snapshot),
+				projects: [],
+				environments: [],
+				meta: {
+					...jsonStore.snapshot.meta,
+					config: {},
+				},
+			},
+			storeV2Topology: {
+				authoritative: true,
+				getProjectById: async (id: string) =>
+					[id === project.id ? project : null, id === otherProject.id ? otherProject : null]
+						.find(Boolean) ?? null,
+				getEnvironment: async ({ projectId, id }: { projectId: string; id: string }) =>
+					[environment, otherEnvironment].find(
+						(candidate) => candidate.projectId === projectId && candidate.id === id,
+					) ?? null,
+				listProjectsPage: async () => ({ projects: [project], hasMore: false }),
+				listEnvironmentsPage: async ({ projectId }: { projectId: string }) => ({
+					environments: projectId === project.id ? [environment] : [],
+					hasMore: false,
+				}),
+			},
+		} as unknown as ManagementStore;
+
+		await expect(resolveOperatorScopeAuthoritative(store)).resolves.toEqual({
+			projectId: project.id,
+			environmentId: environment.id,
+		});
+		await expect(resolveOperatorScopeAuthoritative(store, {
+			projectId: project.id,
+			environmentId: otherEnvironment.id,
+		})).rejects.toMatchObject({ code: "SCOPE_INVALID", status: 403 });
+		await expect(resolveOperatorScopeAuthoritative(store, {
+			projectId: "proj_missing",
+			environmentId: environment.id,
+		})).rejects.toMatchObject({ code: "SCOPE_INVALID", status: 403 });
+		await expect(validateConfigAuthoritative(store, {
+			projectId: project.id,
+			environmentId: environment.id,
+		})).resolves.toEqual({ projectId: project.id, environmentId: environment.id });
+		await expect(validateConfigAuthoritative(store, {
+			projectId: project.id,
+			environmentId: otherEnvironment.id,
+		})).rejects.toMatchObject({ code: "CONFIG_SCOPE_MISMATCH" });
+	});
+
+	it("rechecks topology parentage inside the coordinated config write", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "clr-config-atomicity-"));
+		directories.push(directory);
+		const jsonStore = new JsonStore(join(directory, "data.json"));
+		const { project, environment } = initProject(jsonStore, { name: "Atomic Config" });
+		const replacementEnvironment = { ...environment, id: "env_replacement" };
+		const data = structuredClone(jsonStore.snapshot);
+		let auditCount = 0;
+		const locks: string[] = [];
+		const store = {
+			backend: "postgres",
+			snapshot: data,
+			storeV2Topology: {
+				authoritative: true,
+				getProjectById: async (id: string) => id === project.id ? project : null,
+				getEnvironment: async ({ projectId, id }: { projectId: string; id: string }) =>
+					projectId === project.id && id === replacementEnvironment.id ? replacementEnvironment : null,
+			},
+			mutateCoordinated: async (fn: NonNullable<ManagementStore["mutateCoordinated"]>) =>
+				fn({
+					data,
+					topology: {
+						authoritative: true,
+						lockProject: async ({ id }: { id: string }) => {
+							locks.push(`project:${id}`);
+							return id === project.id ? project : null;
+						},
+						lockEnvironment: async ({ projectId, id }: { projectId: string; id: string }) => {
+							locks.push(`environment:${projectId}:${id}`);
+							return null;
+						},
+					},
+					appendAudit: () => {
+						auditCount += 1;
+						return {} as never;
+					},
+				}),
+		} as unknown as ManagementStore;
+
+		await expect(setConfigAuthoritative(store, "environmentId", replacementEnvironment.id))
+			.rejects.toMatchObject({ code: "CONFIG_SCOPE_MISMATCH" });
+		expect(locks).toEqual([
+			`project:${project.id}`,
+			`environment:${project.id}:${replacementEnvironment.id}`,
+		]);
+		expect(data.meta.config.environmentId).toBe(environment.id);
+		expect(auditCount).toBe(0);
 	});
 });

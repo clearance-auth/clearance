@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createTelemetry } from "./index";
+import { createTelemetry, getTelemetryAuthConfig } from "./index";
 import type { TelemetryEvent } from "./types";
 
 vi.mock("@better-fetch/fetch", () => ({
@@ -51,6 +51,51 @@ beforeEach(() => {
 });
 
 describe("telemetry", () => {
+	it("projects additional-field metadata without defaults or callbacks", async () => {
+		const sentinel = "do-not-serialize-this-secret";
+		const config = await getTelemetryAuthConfig({
+			user: {
+				additionalFields: {
+					apiKey: {
+						type: "string",
+						defaultValue: sentinel,
+						onUpdate: () => sentinel,
+						transform: { input: () => sentinel },
+					},
+				},
+			},
+			session: {
+				additionalFields: {
+					metadata: { type: "json", defaultValue: { sentinel } },
+				},
+			},
+			account: {
+				additionalFields: {
+					providerSecret: { type: [sentinel], input: false },
+				},
+			},
+			verification: {
+				additionalFields: {
+					challenge: { type: "string", required: true },
+				},
+			},
+		} as any);
+
+		expect(config.user.additionalFields).toEqual({
+			apiKey: { type: "string", required: false, input: true },
+		});
+		expect(config.session.additionalFields).toEqual({
+			metadata: { type: "json", required: false, input: true },
+		});
+		expect(config.account.additionalFields).toEqual({
+			providerSecret: { type: "enum", required: false, input: false },
+		});
+		expect(config.verification.additionalFields).toEqual({
+			challenge: { type: "string", required: true, input: true },
+		});
+		expect(JSON.stringify(config)).not.toContain(sentinel);
+	});
+
 	it("publishes events when enabled", async () => {
 		let event: TelemetryEvent | undefined;
 		const track = vi.fn().mockImplementation(async (e) => {

@@ -38,4 +38,22 @@ describe("SAML assertion replay identifier", () => {
 			}),
 		);
 	});
+
+	it("does not process entities while extracting the replay identifier", () => {
+		const response = `
+			<!DOCTYPE Response [<!ENTITY assertionId "expanded-id">]>
+			<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+				xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+				<saml:Assertion ID="&assertionId;" />
+			</samlp:Response>
+		`;
+
+		expect(() => requireSAMLAssertionId(response)).toThrow(
+			expect.objectContaining({
+				body: expect.objectContaining({
+					code: "SAML_ASSERTION_ID_REQUIRED",
+				}),
+			}),
+		);
+	});
 });

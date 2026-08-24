@@ -1,17 +1,565 @@
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import type { JSONWebKeySet } from "jose";
-import { createLocalJWKSet, jwtVerify } from "jose";
+import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 import { describe, expect, it } from "vitest";
 import { createAuthClient } from "../../client";
+import { attachInternalAuthorizationAuthority } from "../../internal/authorization-authority";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	attachInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+} from "../../internal/authentication-policy";
+import { organization } from "../organization";
 import { getTestInstance } from "../../test-utils/test-instance";
+import { generateCredentialOperationKey } from "../../utils/operation-key";
 import { jwt } from ".";
 import { jwtClient } from "./client";
+import {
+	JWT_AUTHORIZATION_ACTIONS_CLAIM,
+	JWT_AUTHORIZATION_REVISION_CLAIM,
+	JWT_ORGANIZATION_ID_CLAIM,
+	JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM,
+	JWT_SESSION_SOURCE_ORGANIZATION_CLAIM,
+	JWT_SESSION_SOURCE_SUBJECT_CLAIM,
+	JWT_SUBJECT_KIND_CLAIM,
+} from "./sign";
 import type { JWKOptions, Jwk, JwtOptions } from "./types";
 import { generateExportedKeyPair, toExpJWT } from "./utils";
 
-describe("jwt", async () => {
-	// Testing the default behavior
+const managedJwtIdentity = {
+	projectId: "jwt-project",
+	environmentId: "jwt-environment",
+} satisfies RuntimeAuthenticationPolicyIdentity;
+
+const managedJwtPolicy = {
+	passwordLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	factorLockout: { enabled: true, maxFailedAttempts: 10, durationSeconds: 900 },
+	minimumAssurance: "single_factor",
+	allowedFactors: { totp: true, passkey: true },
+	trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+	assuranceMaxAgeSeconds: 300,
+} satisfies RuntimeAuthenticationPolicy;
+
+function managedJwtOptions(override: JwtOptions = {}) {
+	const options = {
+		plugins: [
+			jwt({
+				...override,
+				disableSettingJwtHeader: true,
+				jwt: {
+					getSubject: async () => "application-subject",
+					definePayload: async () => ({
+						[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: "forged",
+						[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: "forged",
+						[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: "forged",
+					}),
+					...override.jwt,
+				},
+			}),
+		],
+		logger: { level: "error" },
+	} satisfies ClearanceOptions;
+	attachInternalAuthenticationPolicy(options, {
+		identity: managedJwtIdentity,
+		reader: {
+			async readForSubject(input) {
+				return {
+					scope: managedJwtIdentity,
+					subjectId: input.subjectId,
+					revision: "1",
+					environment: managedJwtPolicy,
+					organizationMembership: input.organizationId
+						? {
+								subjectId: input.subjectId,
+								organizationId: input.organizationId,
+							}
+						: null,
+					organizationOverride: null,
+					effective: managedJwtPolicy,
+				};
+			},
+		},
+	});
+	return options;
+}
+
+describe("jwt compatibility", async () => {
 	const { auth, signInWithTestUser } = await getTestInstance({
 		plugins: [jwt()],
+		logger: { level: "error" },
+	});
+	const { headers } = await signInWithTestUser();
+
+	it("emits the legacy session JWT header by default", async () => {
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/get-session", { headers }),
+		);
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("set-auth-jwt")).toEqual(expect.any(String));
+		expect(response.headers.get("set-auth-jwt")?.length).toBeGreaterThan(10);
+		expect(response.headers.get("access-control-expose-headers")).toContain(
+			"set-auth-jwt",
+		);
+	});
+
+	it("keeps deprecated GET /token functional with migration and cache headers", async () => {
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/token", {
+				method: "GET",
+				headers,
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("deprecation")).toBe("true");
+		expect(response.headers.get("link")).toBe(
+			'</token>; rel="successor-version"',
+		);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("pragma")).toBe("no-cache");
+		expect(await response.json()).toMatchObject({
+			token: expect.any(String),
+		});
+	});
+
+	it("keeps legacy JWT reads available with secondary-storage-only sessions", async () => {
+		const store = new Map<string, string>();
+		const secondary = await getTestInstance({
+			secondaryStorage: {
+				namespace: "jwt-secondary-compatibility-test",
+				set(key, value) {
+					store.set(key, value);
+				},
+				get(key) {
+					return store.get(key) ?? null;
+				},
+				delete(key) {
+					store.delete(key);
+				},
+			},
+			plugins: [jwt()],
+			logger: { level: "error" },
+		});
+		const signedIn = await secondary.signInWithTestUser();
+		const requests: Array<{
+			method: string;
+			status: number;
+			cacheControl: string | null;
+			pragma: string | null;
+			tokenMode: string | null;
+		}> = [];
+		const secondaryClient = createAuthClient({
+			plugins: [jwtClient()],
+			baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: {
+				customFetchImpl: async (url, init) => {
+					const request = new Request(url, init);
+					const response = await secondary.auth.handler(request);
+					requests.push({
+						method: request.method,
+						status: response.status,
+						cacheControl: response.headers.get("cache-control"),
+						pragma: response.headers.get("pragma"),
+						tokenMode: response.headers.get("clearance-jwt-token-mode"),
+					});
+					return response;
+				},
+			},
+		});
+		const response = await secondaryClient.token({
+			fetchOptions: { headers: signedIn.headers },
+		});
+
+		expect(response.data?.token).toEqual(expect.any(String));
+		expect(requests).toEqual([
+			{
+				method: "POST",
+				status: 503,
+				cacheControl: "no-store",
+				pragma: "no-cache",
+				tokenMode: "legacy-get",
+			},
+			{
+				method: "GET",
+				status: 200,
+				cacheControl: "no-store",
+				pragma: "no-cache",
+				tokenMode: null,
+			},
+		]);
+	});
+});
+
+describe("jwt session derivative authority", async () => {
+	it("binds sorted live authorization claims and rejects stale or partial claims", async () => {
+		const managedOptions = managedJwtOptions();
+		const options = {
+			...managedOptions,
+			plugins: [...managedOptions.plugins, organization()],
+		} satisfies ClearanceOptions;
+		attachCapturedInternalAuthenticationPolicy(
+			options,
+			readInternalAuthenticationPolicy(managedOptions)!,
+		);
+		const authorization = {
+			revision: "7",
+			actions: ["organization.read", "organization.write"],
+		};
+		const local = await getTestInstance(options);
+		const context = await local.auth.$context;
+		const transaction = context.adapter.transaction.bind(context.adapter);
+		Object.assign(context.adapter, {
+			transaction: async (callback: any) =>
+				transaction(async (activeTransaction) =>
+					callback(
+						Object.assign(activeTransaction, {
+							rawTransactionQuery: async () => ({ rows: [], rowCount: 0 }),
+						}),
+					),
+				),
+		});
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: authorization.revision,
+					actions: authorization.actions,
+				};
+			},
+			async initializeOrganizationOwner() { return "1"; },
+			async authenticateServiceAccountCredential() {
+				throw new Error("not used");
+			},
+		});
+
+		const signedIn = await local.signInWithTestUser();
+		const organizationClient = local.client as typeof local.client & {
+			organization: {
+				create(input: {
+					name: string;
+					slug: string;
+					fetchOptions: Record<string, unknown>;
+				}): Promise<{ data?: { id: string } }>;
+				setActive(input: {
+					organizationId: string;
+					fetchOptions: Record<string, unknown>;
+				}): Promise<{ data?: { id: string } }>;
+			};
+		};
+		const created = await organizationClient.organization.create({
+			name: "Authorization test",
+			slug: "authorization-test",
+			fetchOptions: {
+				headers: signedIn.headers,
+				onSuccess: local.cookieSetter(signedIn.headers),
+			},
+		});
+		expect(created.data?.id).toEqual(expect.any(String));
+		await organizationClient.organization.setActive({
+			organizationId: created.data!.id,
+			fetchOptions: {
+				headers: signedIn.headers,
+				onSuccess: local.cookieSetter(signedIn.headers),
+			},
+		});
+		const response = await local.auth.handler(
+			new Request("http://localhost:3000/api/auth/token", {
+				method: "GET",
+				headers: signedIn.headers,
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { token } = (await response.json()) as { token: string };
+		const payload = decodeJwt(token);
+		expect(payload).toMatchObject({
+			actions: ["organization.read", "organization.write"],
+			authz_revision: "7",
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).not.toBeNull();
+
+		authorization.revision = "8";
+		authorization.actions = ["organization.read"];
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toBeNull();
+
+		authorization.revision = "7";
+		authorization.actions = ["organization.read", "organization.write"];
+		const partial = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: payload.sub,
+					exp: payload.exp,
+					[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]:
+						payload[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM],
+					[JWT_SESSION_SOURCE_SUBJECT_CLAIM]:
+						payload[JWT_SESSION_SOURCE_SUBJECT_CLAIM],
+					[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]:
+						payload[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM],
+					actions: ["organization.read"],
+				},
+			},
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token: partial.token } })).payload,
+		).toBeNull();
+		const genericPartial = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-partial-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+					actions: ["organization.read"],
+				},
+			},
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token: genericPartial.token } }))
+				.payload,
+		).toBeNull();
+		const genericAuthorizationPair = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-authorization-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+					actions: ["organization.read"],
+					authz_revision: "7",
+				},
+			},
+		});
+		expect(
+			(
+				await local.auth.api.verifyJWT({
+					body: { token: genericAuthorizationPair.token },
+				})
+			).payload,
+		).toBeNull();
+	});
+
+	it("issues and verifies revision-bound service-account JWTs", async () => {
+		const local = await getTestInstance({
+			plugins: [jwt({ disableSettingJwtHeader: true })],
+			logger: { level: "error" },
+		});
+		const context = await local.auth.$context;
+		const authorization = {
+			revision: "7",
+			actions: ["organization.read", "organization.write"],
+			available: true,
+		};
+		const expiresAt = new Date(Date.now() + 30_000);
+		attachInternalAuthorizationAuthority(context.internalAdapter, {
+			async readEffectiveAuthorization(input) {
+				if (!authorization.available) throw new Error("unavailable");
+				return {
+					organizationId: input.organizationId,
+					subject: input.subject,
+					revision: authorization.revision,
+					actions: authorization.actions,
+				};
+			},
+			async authenticateServiceAccountCredential(secret) {
+				if (secret !== "machine-secret") throw new Error("invalid");
+				return {
+					organizationId: "organization-machine",
+					subject: { kind: "service_account", id: "service-machine" },
+					revision: authorization.revision,
+					actions: authorization.actions,
+					expiresAt,
+				};
+			},
+			async initializeOrganizationOwner() { return "1"; },
+		});
+
+		const issued = await local.auth.api.issueServiceAccountJWT({
+			body: { secret: "machine-secret" },
+		});
+		const payload = decodeJwt(issued.token);
+		expect(payload).toMatchObject({
+			sub: "service-machine",
+			[JWT_SUBJECT_KIND_CLAIM]: "service_account",
+			[JWT_ORGANIZATION_ID_CLAIM]: "organization-machine",
+			[JWT_AUTHORIZATION_ACTIONS_CLAIM]: [
+				"organization.read",
+				"organization.write",
+			],
+			[JWT_AUTHORIZATION_REVISION_CLAIM]: "7",
+		});
+		expect(payload.exp).toBeLessThanOrEqual(Math.floor(expiresAt.getTime() / 1000));
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).not.toBeNull();
+
+		authorization.revision = "8";
+		authorization.actions = ["organization.read"];
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).toBeNull();
+		authorization.revision = "7";
+		authorization.actions = ["organization.read", "organization.write"];
+		authorization.available = false;
+		expect((await local.auth.api.verifyJWT({ body: { token: issued.token } })).payload).toBeNull();
+		authorization.available = true;
+
+		const partial = await local.auth.api.signJWT({
+			body: { payload: { sub: "service-machine", [JWT_SUBJECT_KIND_CLAIM]: "service_account" } },
+		});
+		const generic = await local.auth.api.signJWT({
+			body: { payload: { sub: "generic", [JWT_AUTHORIZATION_ACTIONS_CLAIM]: ["organization.read"], [JWT_AUTHORIZATION_REVISION_CLAIM]: "7" } },
+		});
+		const mixed = await local.auth.api.signJWT({
+			body: { payload: { sub: "service-machine", [JWT_SUBJECT_KIND_CLAIM]: "service_account", [JWT_ORGANIZATION_ID_CLAIM]: "organization-machine", [JWT_AUTHORIZATION_ACTIONS_CLAIM]: ["organization.read", "organization.write"], [JWT_AUTHORIZATION_REVISION_CLAIM]: "7", [JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: "forged", [JWT_SESSION_SOURCE_SUBJECT_CLAIM]: "service-machine", [JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: "organization-machine" } },
+		});
+		for (const token of [partial.token, generic.token, mixed.token]) {
+			expect((await local.auth.api.verifyJWT({ body: { token } })).payload).toBeNull();
+		}
+
+		const subjectChanging = await getTestInstance({
+			plugins: [
+				jwt({
+					jwks: {
+						remoteUrl: "https://example.com/.well-known/jwks.json",
+						keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+					},
+					jwt: {
+						sign(payload) {
+							const encode = (value: unknown) =>
+								Buffer.from(JSON.stringify(value)).toString("base64url");
+							return `${encode({ alg: "EdDSA", typ: "JWT" })}.${encode({ ...payload, sub: "different-service-account" })}.signature`;
+						},
+					},
+				}),
+			],
+			logger: { level: "error" },
+		});
+		const subjectChangingContext = await subjectChanging.auth.$context;
+		attachInternalAuthorizationAuthority(
+			subjectChangingContext.internalAdapter,
+			{
+				async readEffectiveAuthorization(input) {
+					return {
+						organizationId: input.organizationId,
+						subject: input.subject,
+						revision: "7",
+						actions: ["organization.read"],
+					};
+				},
+				async authenticateServiceAccountCredential() {
+					return {
+						organizationId: "organization-machine",
+						subject: { kind: "service_account", id: "service-machine" },
+						revision: "7",
+						actions: ["organization.read"],
+						expiresAt: null,
+					};
+				},
+				async initializeOrganizationOwner() { return "1"; },
+			},
+		);
+		await expect(
+			subjectChanging.auth.api.issueServiceAccountJWT({
+				body: { secret: "machine-secret" },
+			}),
+		).rejects.toThrow("Cannot issue an access token");
+	});
+
+	it("binds live managed sessions, rejects stale sources, and preserves generic tokens", async () => {
+		const local = await getTestInstance(managedJwtOptions());
+		const signedIn = await local.signInWithTestUser();
+		const currentSession = await local.client.getSession({
+			fetchOptions: { headers: signedIn.headers },
+		});
+		const response = await local.auth.handler(
+			new Request("http://localhost:3000/api/auth/token", {
+				method: "GET",
+				headers: signedIn.headers,
+			}),
+		);
+		const { token } = (await response.json()) as { token: string };
+		const payload = decodeJwt(token);
+
+		expect(payload).toMatchObject({
+			sub: "application-subject",
+			[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM]: expect.any(String),
+			[JWT_SESSION_SOURCE_SUBJECT_CLAIM]: signedIn.user.id,
+			[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM]: null,
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toMatchObject({ sub: "application-subject" });
+
+		await local.client.revokeSession({
+			id: currentSession.data!.session.id,
+			fetchOptions: { headers: signedIn.headers },
+		});
+		expect(
+			(await local.auth.api.verifyJWT({ body: { token } })).payload,
+		).toBeNull();
+
+		const generic = await local.auth.api.signJWT({
+			body: {
+				payload: {
+					sub: "generic-subject",
+					exp: Math.floor(Date.now() / 1000) + 60,
+				},
+			},
+		});
+		expect(
+			(
+				await local.auth.api.verifyJWT({
+					body: { token: generic.token },
+				})
+			).payload,
+		).toMatchObject({ sub: "generic-subject" });
+	});
+
+	it("rejects a remote signer that strips managed session authority", async () => {
+		let signingCalls = 0;
+		const local = await getTestInstance(
+			managedJwtOptions({
+				jwks: {
+					remoteUrl: "https://example.com/.well-known/jwks.json",
+					keyPairConfig: { alg: "EdDSA", crv: "Ed25519" },
+				},
+				jwt: {
+					async sign(payload) {
+						signingCalls += 1;
+						const stripped = { ...payload };
+						delete stripped[JWT_SESSION_DERIVATIVE_AUTHORITY_CLAIM];
+						delete stripped[JWT_SESSION_SOURCE_SUBJECT_CLAIM];
+						delete stripped[JWT_SESSION_SOURCE_ORGANIZATION_CLAIM];
+						const encode = (value: unknown) =>
+							Buffer.from(JSON.stringify(value)).toString("base64url");
+						return `${encode({ alg: "EdDSA", typ: "JWT" })}.${encode(stripped)}.signature`;
+					},
+				},
+			}),
+		);
+		const signedIn = await local.signInWithTestUser();
+		const refresh = async () => {
+			const headers = new Headers(signedIn.headers);
+			headers.set("idempotency-key", generateCredentialOperationKey());
+			return local.auth.handler(
+				new Request("http://localhost:3000/api/auth/token", {
+					method: "POST",
+					headers,
+				}),
+			);
+		};
+
+		expect((await refresh()).status).toBe(500);
+		expect((await refresh()).status).toBe(500);
+		expect(signingCalls).toBe(2);
+	});
+});
+
+describe("jwt", async () => {
+	// Testing the default behavior
+	const { auth, signInWithTestUser, cookieSetter } = await getTestInstance({
+		plugins: [jwt({ disableSettingJwtHeader: true })],
 		logger: {
 			level: "error",
 		},
@@ -28,7 +576,7 @@ describe("jwt", async () => {
 		},
 	});
 
-	it("Client gets a token from session", async () => {
+	it("does not mint a token as a side effect of reading the session", async () => {
 		let token = "";
 		await client.getSession({
 			fetchOptions: {
@@ -39,17 +587,152 @@ describe("jwt", async () => {
 			},
 		});
 
-		expect(token.length).toBeGreaterThan(10);
+		expect(token).toBe("");
 	});
 
-	it("Client gets a token", async () => {
+	it("keeps canonical POST /token functional", async () => {
+		const setCookies = cookieSetter(headers);
 		const token = await client.token({
 			fetchOptions: {
 				headers,
+				onSuccess(context) {
+					expect(context.response.headers.get("cache-control")).toBe(
+						"no-store",
+					);
+					expect(context.response.headers.get("pragma")).toBe("no-cache");
+					return setCookies(context);
+				},
 			},
 		});
 
 		expect(token.data?.token).toBeDefined();
+	});
+
+	it("survives a lost refresh response through an exact retry", async () => {
+		const local = await getTestInstance({
+			plugins: [jwt({ disableSettingJwtHeader: true })],
+			logger: { level: "error" },
+		});
+		const signedIn = await local.signInWithTestUser();
+		const operation = generateCredentialOperationKey();
+		const refreshRequest = () => {
+			const requestHeaders = new Headers(signedIn.headers);
+			requestHeaders.set("idempotency-key", operation);
+			return local.auth.handler(
+				new Request("http://localhost:3000/api/auth/token", {
+					method: "POST",
+					headers: requestHeaders,
+				}),
+			);
+		};
+		const sessionCookieValue = (response: Response) =>
+			response.headers
+				.get("set-cookie")
+				?.match(/clearance\.session_token=([^;]+)/)?.[1];
+
+		const lost = await refreshRequest();
+		expect(lost.status).toBe(200);
+		const successorCookie = sessionCookieValue(lost);
+		expect(successorCookie).toBeTruthy();
+
+		const recoveryHeaders = new Headers(signedIn.headers);
+		recoveryHeaders.set("idempotency-key", operation);
+		const recovered = await local.auth.handler(
+			new Request("http://localhost:3000/api/auth/get-session", {
+				headers: recoveryHeaders,
+			}),
+		);
+		expect(recovered.status).toBe(200);
+		expect(sessionCookieValue(recovered)).toBe(successorCookie);
+		const recoveredBody = await recovered.json();
+		expect(recoveredBody.session.token).toBe(recoveredBody.session.id);
+
+		const retry = await refreshRequest();
+		expect(retry.status).toBe(200);
+		expect(sessionCookieValue(retry)).toBe(successorCookie);
+	});
+
+	it.each([
+		["missing", undefined],
+		["different", generateCredentialOperationKey()],
+	])(
+		"denies consumed-session recovery with a %s idempotency key",
+		async (_label, recoveryOperation) => {
+			const local = await getTestInstance({
+				plugins: [jwt({ disableSettingJwtHeader: true })],
+				logger: { level: "error" },
+			});
+			const signedIn = await local.signInWithTestUser();
+			const operation = generateCredentialOperationKey();
+			const refreshHeaders = new Headers(signedIn.headers);
+			refreshHeaders.set("idempotency-key", operation);
+			const lost = await local.auth.handler(
+				new Request("http://localhost:3000/api/auth/token", {
+					method: "POST",
+					headers: refreshHeaders,
+				}),
+			);
+			expect(lost.status).toBe(200);
+
+			const recoveryHeaders = new Headers(signedIn.headers);
+			if (recoveryOperation) {
+				recoveryHeaders.set("idempotency-key", recoveryOperation);
+			}
+			const denied = await local.auth.handler(
+				new Request("http://localhost:3000/api/auth/get-session", {
+					headers: recoveryHeaders,
+				}),
+			);
+			expect(denied.status).toBe(200);
+			expect(await denied.json()).toBeNull();
+		},
+	);
+
+	it("uses POST and generates an idempotency key for each client refresh operation", async () => {
+		const localClient = createAuthClient({
+			plugins: [jwtClient()],
+			baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: {
+				customFetchImpl: async (url, init) => {
+					const request = new Request(url, init);
+					expect(request.method).toBe("POST");
+					expect(request.headers.get("idempotency-key")).toMatch(
+						/^clr_op_v1_[A-Za-z0-9_-]{43}$/,
+					);
+					return auth.handler(request);
+				},
+			},
+		});
+
+		const token = await localClient.token({
+			fetchOptions: {
+				headers,
+				onSuccess: cookieSetter(headers),
+			},
+		});
+		expect(token.data?.token).toBeDefined();
+	});
+
+	it("rejects headerless refresh rotation", async () => {
+		const headerless = new Headers(headers);
+		headerless.delete("idempotency-key");
+		await expect(
+			auth.api.getToken({ headers: headerless }),
+		).rejects.toMatchObject({
+			status: "BAD_REQUEST",
+			statusCode: 400,
+		});
+	});
+
+	it("rejects a predictable repeated refresh operation key", async () => {
+		const predictable = new Headers(headers);
+		predictable.set("idempotency-key", "a".repeat(22));
+		await expect(
+			auth.api.getToken({ headers: predictable }),
+		).rejects.toMatchObject({
+			status: "BAD_REQUEST",
+			statusCode: 400,
+		});
 	});
 
 	it("Get JWKS", async () => {
@@ -58,6 +741,7 @@ describe("jwt", async () => {
 		const token = await client.token({
 			fetchOptions: {
 				headers,
+				onSuccess: cookieSetter(headers),
 			},
 		});
 
@@ -73,6 +757,7 @@ describe("jwt", async () => {
 		const token = await client.token({
 			fetchOptions: {
 				headers,
+				onSuccess: cookieSetter(headers),
 			},
 		});
 
@@ -82,12 +767,50 @@ describe("jwt", async () => {
 		const decoded = await jwtVerify(token.data?.token!, localJwks);
 
 		expect(decoded).toBeDefined();
+		expect(decoded.payload.sid).toEqual(expect.any(String));
+		expect(decoded.payload.session_family).toEqual(expect.any(String));
+		expect(decoded.payload.session_generation).toBeGreaterThan(0);
+	});
+
+	it("caps access-token expiry at the authoritative session expiry", async () => {
+		const local = await getTestInstance({
+			plugins: [jwt({ jwt: { expirationTime: "5m" } })],
+			logger: { level: "error" },
+		});
+		const signedIn = await local.signInWithTestUser();
+		const cookie = signedIn.headers.get("cookie") || "";
+		const signedValue = cookie.split("clearance.session_token=")[1] || "";
+		const refreshSecret = signedValue.split(".")[0] || "";
+		const expiresAt = new Date(Date.now() + 30_000);
+		const context = await local.auth.$context;
+		await context.internalAdapter.updateSession(refreshSecret, { expiresAt });
+		const localClient = createAuthClient({
+			plugins: [jwtClient()],
+			baseURL: "http://localhost:3000/api/auth",
+			fetchOptions: {
+				customFetchImpl: async (url, init) =>
+					local.auth.handler(new Request(url, init)),
+			},
+		});
+		const result = await localClient.token({
+			fetchOptions: { headers: signedIn.headers },
+		});
+		const keys = await localClient.jwks();
+		const decoded = await jwtVerify(
+			result.data!.token,
+			createLocalJWKSet(keys.data!),
+		);
+		expect(decoded.payload.exp).toBeLessThanOrEqual(
+			Math.floor(expiresAt.getTime() / 1000),
+		);
+		expect(decoded.payload.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
 	});
 
 	it("should set subject to user id by default", async () => {
 		const token = await client.token({
 			fetchOptions: {
 				headers,
+				onSuccess: cookieSetter(headers),
 			},
 		});
 
@@ -168,6 +891,7 @@ describe("jwt", async () => {
 		const expectedOutcome = algorithm.expectedOutcome;
 		for (const disablePrivateKeyEncryption of [false, true]) {
 			const jwtOptions: JwtOptions = {
+				disableSettingJwtHeader: true,
 				jwks: {
 					keyPairConfig: {
 						...algorithm.keyPairConfig,
@@ -176,7 +900,8 @@ describe("jwt", async () => {
 				},
 			};
 			try {
-				const { auth, signInWithTestUser } = await getTestInstance({
+				const { auth, signInWithTestUser, cookieSetter } =
+					await getTestInstance({
 					plugins: [jwt(jwtOptions)],
 					logger: {
 						level: "error",
@@ -243,13 +968,14 @@ describe("jwt", async () => {
 					const token = await client.token({
 						fetchOptions: {
 							headers,
+							onSuccess: cookieSetter(headers!),
 						},
 					});
 
 					expect(token.data?.token).toBeDefined();
 				});
 
-				it(`${alg} algorithm${enc}: Client gets a token from session`, async () => {
+				it(`${alg} algorithm${enc}: session reads do not mint tokens`, async () => {
 					let token = "";
 					await client.getSession({
 						fetchOptions: {
@@ -260,13 +986,14 @@ describe("jwt", async () => {
 						},
 					});
 
-					expect(token.length).toBeGreaterThan(10);
+					expect(token).toBe("");
 				});
 
 				it(`${alg} algorithm${enc}: Signed tokens can be validated with the JWKS`, async () => {
 					const token = await client.token({
 						fetchOptions: {
 							headers,
+							onSuccess: cookieSetter(headers!),
 						},
 					});
 
@@ -282,6 +1009,7 @@ describe("jwt", async () => {
 					const token = await client.token({
 						fetchOptions: {
 							headers,
+							onSuccess: cookieSetter(headers!),
 						},
 					});
 
@@ -406,7 +1134,7 @@ describe.for([
 });
 
 describe("jwt - remote signing", async () => {
-	it("should fail if sign is defined and remoteUrl is not", async () => {
+	it("requires verification keys and serves adapter JWKS for custom signing", async () => {
 		expect(() =>
 			getTestInstance({
 				plugins: [
@@ -420,8 +1148,69 @@ describe("jwt - remote signing", async () => {
 				],
 			}),
 		).toThrowError(
-			"options.jwks.remoteUrl must be set when using options.jwt.sign",
+			"options.jwt.sign requires options.jwks.remoteUrl or options.adapter.getJwks",
 		);
+
+		const keySets: Jwk[] = [
+			{
+				id: "clearance-es256",
+				publicKey: JSON.stringify({
+					kty: "EC",
+					crv: "P-256",
+					x: "test-public-x",
+					y: "test-public-y",
+				}),
+				privateKey: "not-used-by-custom-signer",
+				createdAt: new Date("2026-01-01T00:00:00.000Z"),
+				alg: "ES256",
+			},
+		];
+		let createJwkCalls = 0;
+		const { auth } = await getTestInstance({
+			plugins: [
+				jwt({
+					jwt: {
+						sign: (payload) => {
+							const header = Buffer.from(
+								JSON.stringify({ alg: "ES256", kid: "clearance-es256" }),
+							).toString("base64url");
+							const body = Buffer.from(JSON.stringify(payload)).toString(
+								"base64url",
+							);
+							return `${header}.${body}.custom-signature`;
+						},
+					},
+					adapter: {
+						getJwks: async () => keySets,
+						createJwk: async () => {
+							createJwkCalls += 1;
+							throw new Error("custom signing must not create a local key");
+						},
+					},
+				}),
+			],
+		});
+
+		const token = await auth.api.signJWT({
+			body: { payload: { sub: "custom-signer-subject" } },
+		});
+		expect(token.token).toContain("custom-signature");
+
+		const jwks = await auth.api.getJwks();
+		expect(jwks.keys).toEqual([
+			expect.objectContaining({
+				kid: "clearance-es256",
+				alg: "ES256",
+				kty: "EC",
+			}),
+		]);
+		expect(createJwkCalls).toBe(0);
+
+		keySets.length = 0;
+		await expect(auth.api.getJwks()).rejects.toThrow(
+			"No public JWKS keys found for options.jwt.sign. Make sure options.adapter.getJwks returns at least one key.",
+		);
+		expect(createJwkCalls).toBe(0);
 	});
 });
 
@@ -446,6 +1235,7 @@ describe("jwt - remote url", async () => {
 		const { auth } = await getTestInstance({
 			plugins: [
 				jwt({
+					disableSettingJwtHeader: true,
 					jwks: {
 						remoteUrl: "https://example.com/.well-known/jwks.json",
 						keyPairConfig: {
@@ -462,6 +1252,7 @@ describe("jwt - remote url", async () => {
 		const { auth } = await getTestInstance({
 			plugins: [
 				jwt({
+					disableSettingJwtHeader: true,
 					jwks: {
 						remoteUrl: "https://example.com/.well-known/jwks.json",
 						keyPairConfig: {
@@ -507,7 +1298,7 @@ describe("jwt - remote url", async () => {
 	}, 15000);
 
 	it("should still allow token generation when remoteUrl is set", async () => {
-		const { auth, signInWithTestUser } = await getTestInstance({
+		const { auth, signInWithTestUser, cookieSetter } = await getTestInstance({
 			plugins: [
 				jwt({
 					jwks: {
@@ -553,7 +1344,7 @@ describe("jwt - remote url", async () => {
 			return `${header}.${body}.${signature}`;
 		};
 
-		const { auth, signInWithTestUser } = await getTestInstance({
+		const { auth, signInWithTestUser, cookieSetter } = await getTestInstance({
 			plugins: [
 				jwt({
 					jwks: {
@@ -662,9 +1453,10 @@ describe("jwt - remote url", async () => {
 	});
 
 	it("should not interfere with other JWT endpoints when remoteUrl is set", async () => {
-		const { auth, signInWithTestUser } = await getTestInstance({
+		const { auth, signInWithTestUser, cookieSetter } = await getTestInstance({
 			plugins: [
 				jwt({
+					disableSettingJwtHeader: true,
 					jwks: {
 						remoteUrl: "https://example.com/.well-known/jwks.json",
 						keyPairConfig: {
@@ -691,6 +1483,7 @@ describe("jwt - remote url", async () => {
 		const tokenResponse = await client.token({
 			fetchOptions: {
 				headers,
+				onSuccess: cookieSetter(headers),
 			},
 		});
 		expect(tokenResponse.data?.token).toBeDefined();
@@ -709,7 +1502,7 @@ describe("jwt - remote url", async () => {
 				},
 			},
 		});
-		expect(jwtHeader).toBeTruthy();
+		expect(jwtHeader).toBe("");
 	});
 });
 
@@ -745,6 +1538,85 @@ describe("jwt - custom adapter", async () => {
 		});
 		expect(token?.token).toBeDefined();
 		expect(storage.length).toBe(1);
+	});
+});
+
+describe("jwt private key storage", () => {
+	it("binds protection to the persisted public key and fails closed", async () => {
+		const storage: Jwk[] = [];
+		const contexts: Array<{
+			operation: "encrypt" | "decrypt";
+			publicKey: string;
+		}> = [];
+		let rejectDecryption = false;
+		const { auth } = await getTestInstance({
+			plugins: [
+				jwt({
+					jwks: {
+						privateKeyStorage: {
+							async encrypt(privateKey, publicKey) {
+								contexts.push({ operation: "encrypt", publicKey });
+								return JSON.stringify({ privateKey, publicKey });
+							},
+							async decrypt(encryptedPrivateKey, publicKey) {
+								contexts.push({ operation: "decrypt", publicKey });
+								if (rejectDecryption) throw new Error("protector unavailable");
+								const stored = JSON.parse(encryptedPrivateKey) as {
+									privateKey: string;
+									publicKey: string;
+								};
+								if (stored.publicKey !== publicKey) {
+									throw new Error("wrong public key context");
+								}
+								return stored.privateKey;
+							},
+						},
+					},
+					adapter: {
+						getJwks: async () => storage,
+						createJwk: async (data) => {
+							const key = {
+								...data,
+								id: crypto.randomUUID(),
+								createdAt: new Date(),
+							};
+							storage.push(key);
+							return key;
+						},
+					},
+				}),
+			],
+		});
+
+		await auth.api.signJWT({ body: { payload: { sub: "subject" } } });
+		expect(contexts).toEqual([
+			expect.objectContaining({ operation: "encrypt" }),
+			expect.objectContaining({ operation: "decrypt" }),
+		]);
+		expect(contexts[0]?.publicKey).toBe(storage[0]?.publicKey);
+		expect(contexts[1]?.publicKey).toBe(storage[0]?.publicKey);
+
+		const originalPublicKey = storage[0]!.publicKey;
+		storage[0] = {
+			...storage[0]!,
+			publicKey: JSON.stringify({
+				...JSON.parse(originalPublicKey),
+				kid: "wrong-context",
+			}),
+		};
+		await expect(
+			auth.api.signJWT({ body: { payload: { sub: "subject" } } }),
+		).rejects.toThrow(
+			"Failed to decrypt private key with configured private key storage",
+		);
+
+		storage[0] = { ...storage[0]!, publicKey: originalPublicKey };
+		rejectDecryption = true;
+		await expect(
+			auth.api.signJWT({ body: { payload: { sub: "subject" } } }),
+		).rejects.toThrow(
+			"Failed to decrypt private key with configured private key storage",
+		);
 	});
 });
 

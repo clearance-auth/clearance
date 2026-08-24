@@ -1,4 +1,14 @@
-import { describe, expect, it } from "vitest";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyReaderInput,
+} from "@clearance/core";
+import { describe, expect, it, vi } from "vitest";
+import {
+	attachInternalAuthenticationPolicy,
+} from "../../internal/authentication-policy";
+import { readInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { siweClient } from "./client";
 import { siwe } from "./index";
@@ -8,6 +18,69 @@ describe("siwe", async () => {
 	const domain = "example.com";
 	const chainId = 1; // Ethereum mainnet
 	const NONCE = "A1b2C3d4E5f6G7h8J";
+	const managedOptions = (
+		minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+	) => {
+		const identity = {
+			projectId: "siwe-project",
+			environmentId: "siwe-environment",
+		};
+		const effective: RuntimeAuthenticationPolicy = {
+			passwordLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			factorLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			minimumAssurance,
+			allowedFactors: { totp: true, passkey: true },
+			trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+			assuranceMaxAgeSeconds: 300,
+		};
+		const runtimeOptions = {
+			plugins: [
+				siwe({
+					domain,
+					async getNonce() {
+						return NONCE;
+					},
+					async verifyMessage({ signature }) {
+						return signature === "valid_signature";
+					},
+				}),
+			],
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(runtimeOptions, {
+			identity,
+			reader: {
+				async readForSubject(input: RuntimeAuthenticationPolicyReaderInput) {
+					return {
+						scope: identity,
+						subjectId: input.subjectId,
+						revision: "1",
+						environment: effective,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective,
+					};
+				},
+			},
+		});
+		return runtimeOptions;
+	};
+	const managedInstance = async (
+		minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
+	) => {
+		const runtimeOptions = managedOptions(minimumAssurance);
+		return getTestInstance(runtimeOptions, {
+			disableTestUser: true,
+			clientOptions: { plugins: [siweClient()] },
+		});
+	};
 
 	// Builds a valid ERC-4361 message bound to the server-issued nonce. The
 	// plugin now parses and validates this message, so tests must sign a real
@@ -66,6 +139,62 @@ describe("siwe", async () => {
 		expect(typeof data?.nonce).toBe("string");
 		// to be 17 alphanumeric characters (96 bits of entropy)
 		expect(data?.nonce).toMatch(/^[a-zA-Z0-9]{17}$/);
+	});
+
+	it("rolls back every wallet identity mutation when managed policy rejects issuance", async () => {
+		const { client, auth } = await managedInstance("multi_factor");
+		const context = await auth.$context;
+		await client.siwe.nonce({ walletAddress, chainId });
+		const before = await Promise.all(
+			["user", "walletAddress", "account", "session"].map((model) =>
+				context.adapter.count({ model }),
+			),
+		);
+
+		const result = await client.siwe.verify({
+			message: siweMessage(),
+			signature: "valid_signature",
+			walletAddress,
+			chainId,
+		});
+
+		expect(result.data).toBeNull();
+		expect(result.error).toBeTruthy();
+		await expect(
+			Promise.all(
+				["user", "walletAddress", "account", "session"].map((model) =>
+					context.adapter.count({ model }),
+				),
+			),
+		).resolves.toEqual(before);
+		await expect(
+			context.internalAdapter.findVerificationValueAndPruneExpired(
+				`siwe:${walletAddress}:${chainId}`,
+			),
+		).resolves.not.toBeNull();
+	});
+
+	it("issues a managed wallet session when its live policy is satisfied", async () => {
+		const { client, auth } = await managedInstance("single_factor");
+		const context = await auth.$context;
+		const sessionsBefore = await context.adapter.count({ model: "session" });
+		await client.siwe.nonce({ walletAddress, chainId });
+		const result = await client.siwe.verify({
+			message: siweMessage(),
+			signature: "valid_signature",
+			walletAddress,
+			chainId,
+		});
+		expect(result.error).toBeNull();
+		expect(result.data?.success).toBe(true);
+		expect(await context.adapter.count({ model: "session" })).toBe(
+			sessionsBefore + 1,
+		);
+		await expect(
+			context.internalAdapter.findVerificationValueAndPruneExpired(
+				`siwe:${walletAddress}:${chainId}`,
+			),
+		).resolves.toBeNull();
 	});
 
 	it("should generate a valid nonce with default chainId", async () => {
@@ -129,6 +258,60 @@ describe("siwe", async () => {
 
 		expect(error).toBeNull();
 		expect(data?.nonce).toBe("A1b2C3d4E5f6G7h8J");
+	});
+
+	it("binds wallet signature evidence after server verification", async () => {
+		const verifyMessage = vi.fn(async ({ signature }) =>
+			signature === "valid_signature",
+		);
+		const { auth, client } = await getTestInstance(
+			{
+				plugins: [
+					siwe({
+						domain,
+						async getNonce() {
+							return NONCE;
+						},
+						verifyMessage,
+					}),
+				],
+			},
+			{ clientOptions: { plugins: [siweClient()] } },
+		);
+		await client.siwe.nonce({ walletAddress, chainId });
+		const context = await auth.$context;
+		const originalCreateSession = context.internalAdapter.createSession.bind(
+			context.internalAdapter,
+		);
+		const createSession = vi
+			.spyOn(context.internalAdapter, "createSession")
+			.mockImplementation((...args) => originalCreateSession(...args));
+
+		try {
+			const result = await client.siwe.verify({
+				message: siweMessage(),
+				signature: "valid_signature",
+				walletAddress,
+				chainId,
+			});
+			expect(result.error).toBeNull();
+			expect(result.data?.user).toBeDefined();
+			const authoritativeUserId = result.data!.user.id;
+			expect(verifyMessage).toHaveBeenCalledOnce();
+			expect(createSession).toHaveBeenCalledOnce();
+			const [subjectId, , , , issuanceContext] = createSession.mock.calls[0]!;
+			expect(subjectId).toBe(authoritativeUserId);
+			expect(readInternalSessionIssuanceContext(issuanceContext)).toEqual({
+				purpose: "interactive",
+				subjectId: authoritativeUserId,
+				evidence: [
+					{ kind: "primary", primaryMethod: "wallet_signature" },
+				],
+				targetOrganizationId: null,
+			});
+		} finally {
+			createSession.mockRestore();
+		}
 	});
 
 	it("should reject verification if nonce is missing", async () => {
@@ -623,11 +806,15 @@ describe("siwe", async () => {
 
 		const ctx = await auth.$context;
 		const identifier = `siwe:${walletAddress}:${chainId}`;
-		await ctx.internalAdapter.createVerificationValue({
-			identifier,
-			value: NONCE,
-			expiresAt: new Date(Date.now() - 1000),
-		});
+		await createInternalVerificationChallenge(
+			ctx.internalAdapter,
+			{ purpose: "siwe:sign-in", subject: identifier },
+			{
+				identifier,
+				value: NONCE,
+				expiresAt: new Date(Date.now() - 1000),
+			},
+		);
 
 		const { error } = await client.siwe.verify({
 			message: siweMessage(),
@@ -640,7 +827,7 @@ describe("siwe", async () => {
 
 		// The expired row is gone, so a retry cannot replay it.
 		const remaining =
-			await ctx.internalAdapter.findVerificationValue(identifier);
+			await ctx.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 		expect(remaining).toBeNull();
 	});
 

@@ -1,11 +1,15 @@
 /** @clearance/auth — Clearance product entry for the authentication runtime. */
-export { clearance } from "@clearance/runtime";
-export { organization } from "@clearance/runtime/plugins";
-export { getMigrations } from "@clearance/runtime/db/migration";
+export { clearance } from "../../runtime/src/index.js";
+export {
+	mcp,
+	oidcProvider,
+	organization,
+} from "../../runtime/src/plugins/index.js";
+export { getMigrations } from "../../runtime/src/db/get-migration.js";
 export { sso } from "@clearance/sso";
 export { scim } from "@clearance/scim";
 
-export {
+	export {
 	createClearanceAuth,
 	CLEARANCE_AUTH_VERSION,
 	RUNTIME_BASELINE,
@@ -14,6 +18,17 @@ export {
 	socialProvidersFromEnvironment,
 	type CreateClearanceAuthOptions,
 	type ClearanceAuthBundle,
+	type ClearanceAuthorizationFacade,
+	type ClearanceAuthorizationAffectedRevision,
+	type ClearanceAuthorizationAssignment,
+	type ClearanceAuthorizationReadResult,
+	type ClearanceAuthorizationRole,
+	type ClearanceAuthorizationServiceAccount,
+	type ClearanceAuthorizationServiceAccountAuthentication,
+	type ClearanceAuthorizationServiceAccountCredential,
+	type ClearanceAuthorizationServiceAccountCredentialMutation,
+	type ClearanceAuthorizationServiceAccountMutation,
+	type ClearanceAuthorizationSubject,
 	type ClearanceRuntimeMigrationPlan,
 	type ClearanceRuntimeMigrationResult,
 	type ClearanceRuntimeUser,
@@ -24,7 +39,10 @@ export {
 	isForbiddenDefaultSecret,
 } from "./secret-policy.js";
 
-export { toNodeHandler, fromNodeHeaders } from "@clearance/runtime/node";
+export {
+	toNodeHandler,
+	fromNodeHeaders,
+} from "../../runtime/src/integrations/node.js";
 
 /** Clearance product defaults layered on auth options. */
 export function withClearanceDefaults<T extends Record<string, unknown>>(

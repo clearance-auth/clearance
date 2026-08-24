@@ -5,7 +5,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { JsonStore } from "../store/json-store.js";
 import {
 	addMember,
@@ -28,8 +28,13 @@ import {
 import {
 	syncRuntimeOrganizationToManagementDurable,
 	syncRuntimeUserToManagement,
+	syncRuntimeUserToManagementDurable,
 } from "../services/identity.js";
 import { ClearanceError } from "../services/errors.js";
+import type {
+	ManagementStore,
+	StoreV2PrincipalRepository,
+} from "../store/types.js";
 
 const dirs: string[] = [];
 
@@ -48,6 +53,115 @@ afterEach(() => {
 });
 
 describe("canonical identity bridge", () => {
+	it("rejects an invalid authoritative scope before opening an identity mutation", async () => {
+		const base = tempStore();
+		const { project, environment } = initProject(base, { name: "Authoritative Scope" });
+		const mutateStoreV2Identity = vi.fn();
+		const store = {
+			snapshot: {
+				...structuredClone(base.snapshot),
+				projects: [],
+				environments: [],
+				meta: { ...base.snapshot.meta, config: {} },
+			},
+			storeV2Principals: { authoritative: true },
+			storeV2Topology: {
+				authoritative: true,
+				getProjectById: async (id: string) => id === project.id ? project : null,
+				getEnvironment: async () => null,
+			},
+			mutateStoreV2Identity,
+		} as unknown as ManagementStore;
+
+		await expect(syncRuntimeUserToManagementDurable(store, {
+			id: "runtime_authoritative_scope",
+			email: "authoritative-scope@example.test",
+			name: "Authoritative Scope",
+		}, {
+			projectId: project.id,
+			environmentId: `${environment.id}_typo`,
+		})).rejects.toMatchObject({ code: "SCOPE_INVALID", status: 403 });
+		expect(mutateStoreV2Identity).not.toHaveBeenCalled();
+	});
+
+	it("rejects invalid topology scope before snapshot mutation when principal cutover is pending", async () => {
+		const base = tempStore();
+		const { project, environment } = initProject(base, { name: "Topology Before Principals" });
+		const mutate = vi.fn();
+		const ready = vi.fn(async () => undefined);
+		const store = {
+			snapshot: {
+				...structuredClone(base.snapshot),
+				projects: [],
+				environments: [],
+				meta: { ...base.snapshot.meta, config: {} },
+			},
+			storeV2Principals: { authoritative: false },
+			storeV2Topology: {
+				authoritative: true,
+				getProjectById: async (id: string) => id === project.id ? project : null,
+				getEnvironment: async () => null,
+			},
+			mutate,
+			ready,
+		} as unknown as ManagementStore;
+
+		await expect(syncRuntimeUserToManagementDurable(store, {
+			id: "runtime_topology_before_principals",
+			email: "topology-before-principals@example.test",
+			name: "Topology Before Principals",
+		}, {
+			projectId: project.id,
+			environmentId: `${environment.id}_typo`,
+		})).rejects.toMatchObject({ code: "SCOPE_INVALID", status: 403 });
+		expect(mutate).not.toHaveBeenCalled();
+		expect(ready).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when an existing relational principal disappears during sync", async () => {
+		const base = tempStore();
+		const { project, environment } = initProject(base, { name: "Relational Sync" });
+		const existing = createUser(base, {
+			email: "relational-sync@example.com",
+			name: "Before Sync",
+		});
+		const principals: StoreV2PrincipalRepository = {
+			authoritative: true,
+			getById: async () => structuredClone(existing),
+			findActiveByEmail: async () => null,
+			listPage: async () => ({ principals: [], hasMore: false }),
+			insert: async (principal) => structuredClone(principal),
+			update: async () => null,
+			disable: async () => null,
+			delete: async () => null,
+		};
+		const store = {
+			snapshot: base.snapshot,
+			storeV2Principals: principals,
+			mutateStoreV2Identity: async <T>(fn: (context: {
+				principals: StoreV2PrincipalRepository;
+				appendAudit: () => never;
+			}) => Promise<T> | T) => fn({
+				principals,
+				appendAudit: () => {
+					throw new Error("Audit must not be appended after a failed update");
+				},
+			}),
+		} as unknown as ManagementStore;
+
+		await expect(syncRuntimeUserToManagementDurable(store, {
+			id: existing.id,
+			email: existing.email,
+			name: "After Sync",
+		}, {
+			projectId: project.id,
+			environmentId: environment.id,
+		})).rejects.toMatchObject({
+			code: "IDENTITY_SYNC_CONFLICT",
+			status: 409,
+		});
+	});
+
 	it("syncs runtime user with identical stable id and scope", () => {
 		const store = tempStore();
 		const { project, environment } = initProject(store, { name: "Bridge App" });
@@ -560,4 +674,3 @@ describe("users update / disable / delete lifecycle", () => {
 		).toThrow(/invalid status/i);
 	});
 });
-

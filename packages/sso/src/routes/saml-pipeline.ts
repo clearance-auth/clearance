@@ -1,13 +1,22 @@
 import { isAPIError } from "@clearance/core/utils/is-api-error";
+import {
+	getCurrentAdapter,
+	isTransactionActive,
+	runWithTransaction,
+} from "@clearance/core/context";
 import type { User } from "@clearance/runtime";
 import { APIError } from "@clearance/runtime/api";
 import { setSessionCookie } from "@clearance/runtime/cookies";
 import { handleOAuthUserInfo } from "@clearance/runtime/oauth2";
-import { XMLParser } from "fast-xml-parser";
+import { base64 } from "@clearance/utils/base64";
 import type { FlowResult } from "samlify/types/src/flow";
 
 import * as constants from "../constants";
 import { assignOrganizationFromProvider } from "../linking";
+import {
+	consumeSSOVerificationChallenge,
+	createSSOVerificationChallenge,
+} from "../internal/verification-challenge-authority";
 import {
 	getSAMLPostAssertionConsumerServiceUrls,
 	hasSAMLEncryptedAssertion,
@@ -18,6 +27,7 @@ import {
 } from "../saml";
 import type { SAMLConditions } from "../saml/timestamp";
 import { validateSAMLTimestamp } from "../saml/timestamp";
+import { parseSAMLXml } from "../saml/parser";
 import { parseRelayState } from "../saml-state";
 import { saml } from "../samlify";
 import type {
@@ -34,6 +44,58 @@ import {
 	validateEmailDomain,
 } from "../utils";
 import { createIdP, createSP, findSAMLProvider } from "./helpers";
+import {
+	appendInternalRuntimeAudit,
+	attachCapturedInternalRuntimeAudit,
+	getRuntimeAuditRequestContext,
+	readInternalRuntimeAudit,
+} from "../../../runtime/src/internal/runtime-audit";
+
+function runtimeAuditBinding(ctx: { context: { options: object; adapter: object } }) {
+	return (
+		readInternalRuntimeAudit(ctx.context.options) ??
+		readInternalRuntimeAudit(ctx.context.adapter)
+	);
+}
+
+async function runSAMLTerminalTransaction<T>(ctx: any, fn: () => Promise<T>) {
+	if (!runtimeAuditBinding(ctx) || (await isTransactionActive(ctx.context.adapter))) {
+		return fn();
+	}
+	return runWithTransaction(ctx.context.adapter, fn);
+}
+
+async function appendSAMLAudit(
+	ctx: any,
+	input: {
+		action: "sso.login.succeeded" | "sso.provisioned";
+		userId: string;
+		isRegistration: boolean;
+		organizationId: string | null;
+	},
+) {
+	const binding = runtimeAuditBinding(ctx);
+	if (!binding) return;
+	const request = await getRuntimeAuditRequestContext();
+	if (!request) throw new Error("Runtime audit request context is unavailable");
+	const transaction = await getCurrentAdapter(ctx.context.adapter);
+	attachCapturedInternalRuntimeAudit(transaction, binding);
+	await appendInternalRuntimeAudit(transaction, {
+		actor: input.userId,
+		action: input.action,
+		subjectType: "user",
+		subjectId: input.userId,
+		outcome: "success",
+		source: "sso",
+		organizationId: input.organizationId,
+		message: "SSO protocol lifecycle completed",
+		metadata: {
+			protocol: "saml",
+			isRegistration: input.isRegistration,
+		},
+		request,
+	});
+}
 
 type RelayState = Awaited<ReturnType<typeof parseRelayState>>;
 
@@ -146,12 +208,7 @@ async function getSAMLResponseBindingContent(
  */
 function extractAssertionId(samlContent: string): string | null {
 	try {
-		const parser = new XMLParser({
-			ignoreAttributes: false,
-			attributeNamePrefix: "@_",
-			removeNSPrefix: true,
-		});
-		const parsed = parser.parse(samlContent);
+		const parsed = parseSAMLXml(samlContent) as Record<string, any>;
 
 		const response = parsed.Response || parsed["samlp:Response"];
 		const rawAssertion =
@@ -202,7 +259,7 @@ export interface SAMLResponseParams {
  * SP/IdP construction, response validation, session creation, and redirect
  * URL computation.
  */
-export async function processSAMLResponse(
+export async function completeSAMLSignIn(
 	ctx: any,
 	params: SAMLResponseParams,
 	options?: SSOOptions,
@@ -269,7 +326,7 @@ export async function processSAMLResponse(
 
 	// 7. SP/IdP construction via helpers
 	const sp = createSP(parsedSamlConfig, ctx.context.baseURL, providerId, {
-		clockSkew: options?.saml?.clockSkew,
+		clockSkewMs: options?.saml?.clockSkewMs,
 	});
 	const idp = createIdP(parsedSamlConfig);
 
@@ -312,13 +369,26 @@ export async function processSAMLResponse(
 
 	const { extract } = parsedResponse!;
 	const samlContent = parsedResponse.samlContent;
+	const originalSamlContent = new TextDecoder().decode(
+		base64.decode(SAMLResponse),
+	);
 
-	// 10. Algorithm validation
-	validateSAMLAlgorithms(parsedResponse, options?.saml?.algorithms);
+	// 10. Resolve the authenticated assertion content once. For encrypted
+	// signed assertions, samlify verifies only after decryption, so the declared
+	// XML-DSig algorithms must be read from this decrypted, verified document.
+	const samlBindingContent = await getSAMLResponseBindingContent(sp, samlContent);
+	validateSAMLAlgorithms(
+		{
+			sigAlg: parsedResponse.sigAlg,
+			samlContent: samlBindingContent,
+			encryptionContent: originalSamlContent,
+		},
+		options?.saml?.algorithms,
+	);
 
 	// 11. Timestamp validation
 	validateSAMLTimestamp((extract as SAMLAssertionExtract).conditions, {
-		clockSkew: options?.saml?.clockSkew,
+		clockSkewMs: options?.saml?.clockSkewMs,
 		requireTimestamps: options?.saml?.requireTimestamps,
 		logger: ctx.context.logger,
 	});
@@ -338,9 +408,7 @@ export async function processSAMLResponse(
 		currentCallbackPath,
 		assertionConsumerServiceUrl,
 	);
-	let samlBindingContent: string;
 	try {
-		samlBindingContent = await getSAMLResponseBindingContent(sp, samlContent);
 		validateSAMLResponseBinding(samlBindingContent, {
 			expectedAudiences,
 			expectedRecipients,
@@ -390,10 +458,16 @@ export async function processSAMLResponse(
 			// submissions cannot both match one outstanding request. The consume
 			// returns null for missing or expired rows, so no separate expiry gate
 			// is needed.
-			const consumed =
-				await ctx.context.internalAdapter.consumeVerificationValue(
-					`${constants.AUTHN_REQUEST_KEY_PREFIX}${inResponseTo}`,
-				);
+			const identifier = `${constants.AUTHN_REQUEST_KEY_PREFIX}${inResponseTo}`;
+			const consumed = await consumeSSOVerificationChallenge(
+				options,
+				ctx.context.internalAdapter,
+				{
+					purpose: "saml-authn-request",
+					subject: providerId,
+					identifier,
+				},
+			);
 
 			let storedRequest: AuthnRequestRecord | null = null;
 			if (consumed) {
@@ -457,9 +531,9 @@ export async function processSAMLResponse(
 	const conditions = (extract as SAMLAssertionExtract).conditions as
 		| SAMLConditions
 		| undefined;
-	const clockSkew = options?.saml?.clockSkew ?? constants.DEFAULT_CLOCK_SKEW_MS;
+	const clockSkewMs = options?.saml?.clockSkewMs ?? constants.DEFAULT_CLOCK_SKEW_MS;
 	const expiresAt = conditions?.notOnOrAfter
-		? new Date(conditions.notOnOrAfter).getTime() + clockSkew
+		? new Date(conditions.notOnOrAfter).getTime() + clockSkewMs
 		: Date.now() + constants.DEFAULT_ASSERTION_TTL_MS;
 
 	const reserved = await ctx.context.internalAdapter.reserveVerificationValue({
@@ -557,6 +631,7 @@ export async function processSAMLResponse(
 		ctx.context.baseURL;
 	const errorUrl = relayState?.errorURL || samlRedirectUrl;
 
+	return runSAMLTerminalTransaction(ctx, async () => {
 	let result: Awaited<ReturnType<typeof handleOAuthUserInfo>>;
 	try {
 		result = await handleOAuthUserInfo(ctx, {
@@ -609,6 +684,14 @@ export async function processSAMLResponse(
 			userInfo,
 			provider,
 		});
+		if (result.isRegister) {
+			await appendSAMLAudit(ctx, {
+				action: "sso.provisioned",
+				userId: user.id,
+				isRegistration: true,
+				organizationId: provider.organizationId ?? null,
+			});
+		}
 	}
 
 	// 17. Organization assignment
@@ -625,6 +708,12 @@ export async function processSAMLResponse(
 		provider,
 		provisioningOptions: options?.organizationProvisioning,
 	});
+	await appendSAMLAudit(ctx, {
+		action: "sso.login.succeeded",
+		userId: user.id,
+		isRegistration: Boolean(result.isRegister),
+		organizationId: provider.organizationId ?? null,
+	});
 
 	// 18. Set session cookie
 	await setSessionCookie(ctx, { session, user });
@@ -639,23 +728,31 @@ export async function processSAMLResponse(
 			nameID: extract.nameID,
 			sessionIndex: (extract as SAMLAssertionExtract).sessionIndex,
 		};
-		await ctx.context.internalAdapter
-			.createVerificationValue({
+		await createSSOVerificationChallenge(
+			options,
+			ctx.context.internalAdapter,
+			{ purpose: "saml-session", subject: session.id },
+			{
 				identifier: samlSessionKey,
 				value: JSON.stringify(samlSessionData),
 				expiresAt: session.expiresAt,
-			})
+			},
+		)
 			.catch((e: unknown) =>
 				ctx.context.logger.warn("Failed to create SAML session record", {
 					error: e,
 				}),
 			);
-		await ctx.context.internalAdapter
-			.createVerificationValue({
+		await createSSOVerificationChallenge(
+			options,
+			ctx.context.internalAdapter,
+			{ purpose: "saml-session", subject: session.id },
+			{
 				identifier: `${constants.SAML_SESSION_BY_ID_PREFIX}${session.id}`,
 				value: samlSessionKey,
 				expiresAt: session.expiresAt,
-			})
+			},
+		)
 			.catch((e: unknown) =>
 				ctx.context.logger.warn(
 					"Failed to create SAML session lookup record",
@@ -672,4 +769,5 @@ export async function processSAMLResponse(
 		(url: string, settings?: { allowRelativePaths: boolean }) =>
 			ctx.context.isTrustedOrigin(url, settings),
 	);
+	});
 }

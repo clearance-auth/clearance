@@ -3,8 +3,15 @@ import { APIError } from "@clearance/core/error";
 import { isBrowserFetchRequest } from "@clearance/core/utils/fetch-metadata";
 import { getSessionFromCtx } from "../../api";
 import { generateRandomString } from "../../crypto";
+import { runManagedAuthenticationTransaction } from "../../internal/managed-authentication-transaction";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { InvalidClient, InvalidRequest } from "./error";
 import { getClient } from "./index";
+import { captureOAuthAuthorizationSessionAuthority } from "./session-authority";
+import {
+	restoreOAuthResponseHeaders,
+	snapshotOAuthResponseHeaders,
+} from "./token-response";
 import type { AuthorizationQuery, OIDCOptions } from "./types";
 import { parsePrompt } from "./utils/prompt";
 
@@ -318,17 +325,33 @@ export async function authorize(
 		!skipConsentForTrustedClient &&
 		(!hasAlreadyConsented || promptSet.has("consent"));
 
+	const responseHeaderSnapshot = snapshotOAuthResponseHeaders(ctx);
 	try {
 		/**
 		 * Save the code in the database
 		 */
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: JSON.stringify({
-				clientId: client.clientId,
-				redirectURI: query.redirect_uri,
-				scope: requestScope,
-				userId: session.user.id,
-				authTime: new Date(session.session.createdAt).getTime(),
+		await runManagedAuthenticationTransaction(ctx, async () => {
+			const {
+				sourceSession,
+				sessionDerivativeAuthority,
+				sourceAuthority,
+			} = await captureOAuthAuthorizationSessionAuthority(
+				ctx,
+				"oidc",
+				session,
+			);
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{ purpose: "oidc-authorization-code", subject: client.clientId },
+				{
+					value: JSON.stringify({
+						clientId: client.clientId,
+						redirectURI: query.redirect_uri,
+						scope: requestScope,
+						userId: sourceAuthority?.sourceSubjectId ?? sourceSession.user.id,
+						authTime: new Date(
+							sourceSession.session.createdAt,
+						).getTime(),
 				/**
 				 * Consent is required per OIDC spec unless:
 				 * 1. Client is trusted (skipConsent = true)
@@ -338,16 +361,25 @@ export async function authorize(
 				 * consent request. Once the user consents, the code will be
 				 * updated with the actual authorization code.
 				 */
-				requireConsent,
-				state: requireConsent ? query.state : null,
-				codeChallenge: query.code_challenge,
-				codeChallengeMethod: query.code_challenge_method,
-				nonce: query.nonce,
-			}),
-			identifier: code,
-			expiresAt,
+						requireConsent,
+						state: requireConsent ? query.state : null,
+						codeChallenge: query.code_challenge,
+						codeChallengeMethod: query.code_challenge_method,
+						nonce: query.nonce,
+						...(sessionDerivativeAuthority && sourceAuthority
+							? {
+									sessionDerivativeAuthority,
+									organizationId: sourceAuthority.sourceOrganizationId,
+								}
+							: {}),
+					}),
+					identifier: code,
+					expiresAt,
+				},
+			);
 		});
 	} catch {
+		restoreOAuthResponseHeaders(ctx, responseHeaderSnapshot);
 		return handleRedirect(
 			formatErrorURL(
 				query.redirect_uri,

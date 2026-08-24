@@ -5,11 +5,12 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { join, relative, resolve } from "node:path";
+import { bundledRuntimePackages, publicReleasePackageNames } from "./release-packages.mjs";
 
 const tarball = process.argv[2] ? resolve(process.argv[2]) : undefined;
 const output = process.argv[3] ? resolve(process.argv[3]) : undefined;
 if (!tarball) {
-	console.error("Usage: node scripts/verify-release-runtime-closure.mjs <auth-tarball> [evidence-json]");
+	console.error("Usage: node scripts/verify-release-runtime-closure.mjs <public-package-tarball> [evidence-json]");
 	process.exit(2);
 }
 
@@ -85,8 +86,8 @@ if (entries.some((entry) => entry.includes("../") || entry.startsWith("/") || en
 }
 
 const packageJson = JSON.parse(tar("-xOzf", tarball, "package/package.json"));
-if (packageJson.name !== "@clearance/auth" && packageJson.name !== "@clearance/management") {
-	throw new Error("Expected an @clearance/auth or @clearance/management tarball.");
+if (!publicReleasePackageNames.includes(packageJson.name)) {
+	throw new Error(`Expected a public Clearance release package, received ${packageJson.name ?? "unknown"}.`);
 }
 const dependencySections = ["dependencies", "peerDependencies", "optionalDependencies"];
 const declaredDependencies = Object.fromEntries(
@@ -95,24 +96,11 @@ const declaredDependencies = Object.fromEntries(
 	),
 );
 const dependencies = Object.keys(packageJson.dependencies ?? {}).sort();
-const bundledRuntimePackages = new Set([
-	"@clearance/runtime",
-	"@clearance/core",
-	"@clearance/sso",
-	"@clearance/scim",
-	"@clearance/utils",
-	"@clearance/call",
-	"@clearance/telemetry",
-	"@clearance/memory-adapter",
-	"@clearance/kysely-adapter",
-	"@clearance/mongo-adapter",
-	"@clearance/drizzle-adapter",
-	"@clearance/prisma-adapter",
-]);
+const bundledRuntimePackageNames = new Set(bundledRuntimePackages);
 const declaredDependencyNames = Object.keys(declaredDependencies);
 const forbiddenDependency = declaredDependencyNames
-	.find((name) => bundledRuntimePackages.has(name));
-if (forbiddenDependency) throw new Error(`Published auth runtime still depends on substitutable package ${forbiddenDependency}.`);
+	.find((name) => bundledRuntimePackageNames.has(name));
+if (forbiddenDependency) throw new Error(`Published runtime still depends on substitutable package ${forbiddenDependency}.`);
 const localDependency = Object.entries(declaredDependencies).find(([, metadata]) =>
 	/^(?:workspace:|catalog:|link:|file:)/.test(String(metadata.version)),
 );
@@ -126,8 +114,9 @@ const allowedBare = new Set([
 	...builtinModules,
 	...builtinModules.map((name) => `node:${name}`),
 ]);
-const runtimeFiles = entries.filter((entry) => /^package\/dist\/.*\.(?:mjs|cjs|js)$/.test(entry));
-if (runtimeFiles.length === 0) throw new Error("Auth tarball contains no runtime files.");
+const runtimeFiles = entries.filter((entry) => /^package\/dist\/.*\.(?:mjs|cjs|js)$/.test(entry)
+	|| /^package\/src\/(?!.*\.(?:test|spec)\.)[^/]+\.(?:mjs|cjs|js)$/.test(entry));
+if (runtimeFiles.length === 0) throw new Error(`${packageJson.name} tarball contains no runtime files.`);
 function collectBareImports(files) {
 	const imports = new Set();
 	for (const file of files) {
@@ -157,7 +146,9 @@ const unresolved = [...bareImports].filter((specifier) => {
 if (unresolved.length > 0) throw new Error(`Auth tarball has undeclared bare runtime imports: ${unresolved.join(", ")}`);
 
 const declarationFiles = entries.filter((entry) => /^package\/(?:dist|types)\/.*\.d\.(?:mts|cts|ts)$/.test(entry));
-if (declarationFiles.length === 0) throw new Error("Package tarball contains no declarations.");
+const declaresTypes = typeof packageJson.types === "string"
+	|| JSON.stringify(packageJson.exports ?? {}).includes('"types"');
+if (declaresTypes && declarationFiles.length === 0) throw new Error(`${packageJson.name} tarball contains no declarations.`);
 const declarationImports = collectBareImports(declarationFiles);
 const unresolvedDeclarations = [...declarationImports].filter((specifier) => {
 	if (specifier.startsWith("node:") || specifier.startsWith("bun:")) return false;

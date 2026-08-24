@@ -48,6 +48,7 @@ export {
 } from "./saml";
 
 import type { OIDCConfig, SAMLConfig, SSOOptions, SSOProvider } from "./types";
+import { hasXMLDoctype } from "./saml/parser";
 import { PACKAGE_VERSION } from "./version";
 
 export type { SAMLConfig, OIDCConfig, SSOOptions, SSOProvider };
@@ -81,6 +82,7 @@ export {
 
 const fastValidator = {
 	async validate(xml: string) {
+		if (hasXMLDoctype(xml)) throw "ERR_SAML_DOCTYPE_FORBIDDEN";
 		const isValid = XMLValidator.validate(xml, {
 			allowBooleanAttributes: true,
 		});
@@ -219,7 +221,7 @@ export function sso<O extends SSOOptions>(
 						}
 						const sessionLookupKey = `${SAML_SESSION_BY_ID_PREFIX}${session.session.id}`;
 						const sessionLookup =
-							await ctx.context.internalAdapter.findVerificationValue(
+							await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 								sessionLookupKey,
 							);
 						if (sessionLookup?.value) {
@@ -270,6 +272,16 @@ export function sso<O extends SSOOptions>(
 						type: "string",
 						required: false,
 						fieldName: options?.fields?.oidcConfig ?? "oidcConfig",
+					},
+					keyManagementVersion: {
+						type: "number",
+						required: false,
+						returned: false,
+					},
+					keyManagementRevision: {
+						type: "number",
+						required: false,
+						returned: false,
 					},
 					samlConfig: {
 						type: "string",

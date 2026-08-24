@@ -12,7 +12,10 @@ import {
 	classifyHost,
 	isPublicRoutableHost,
 } from "@clearance/core/utils/host";
-import { betterFetch } from "@better-fetch/fetch";
+import {
+	fetchPinnedPublic,
+	fetchWithPublicEgressPolicy,
+} from "@clearance/core/utils/public-egress";
 import type { OIDCConfig } from "../types";
 import type {
 	DiscoverOIDCConfigParams,
@@ -57,7 +60,11 @@ export async function discoverOIDCConfig(
 
 	validateDiscoveryUrl(discoveryUrl, params.isTrustedOrigin);
 
-	const discoveryDoc = await fetchDiscoveryDocument(discoveryUrl, timeout);
+	const discoveryDoc = await fetchDiscoveryDocument(
+		discoveryUrl,
+		timeout,
+		createOIDCEndpointTransport(params.isTrustedOrigin),
+	);
 
 	validateDiscoveryDocument(discoveryDoc, issuer);
 
@@ -199,6 +206,22 @@ export function validateSkipDiscoveryEndpoints(
 }
 
 /**
+ * Pin each OIDC request while preserving the documented trusted-origin escape
+ * hatch for private corporate IdPs. The exception is scoped to the exact URL
+ * origin configured by the operator; it never applies to arbitrary redirects.
+ */
+export function createOIDCEndpointTransport(
+	isTrustedOrigin: (url: string) => boolean,
+): (input: string | URL, init?: RequestInit) => Promise<Response> {
+	return (input, init) => {
+		const url = new URL(input);
+		return fetchPinnedPublic(url, init, {
+			allowNonPublicAddresses: isTrustedOrigin(url.toString()),
+		});
+	};
+}
+
+/**
  * Re-validate an endpoint by resolving its hostname and rejecting any resolved
  * address that is not publicly routable.
  *
@@ -216,11 +239,8 @@ export function validateSkipDiscoveryEndpoints(
  *     resolution is unavailable; we fall back to the synchronous host check and
  *     the platform's own egress controls.
  *
- * Note: this resolves once and validates the result; it does not pin the address
- * for the subsequent connection, so a change in the resolved address between
- * this lookup and the fetch remains theoretically possible. It nonetheless
- * rejects the common case of a DNS record that statically points at an internal
- * address.
+ * The subsequent OIDC transport pins the selected address through its custom
+ * DNS callback, so a rebinding answer cannot change the connected peer.
  *
  * @throws DiscoveryError(discovery_private_host) if any resolved address is not public
  */
@@ -230,8 +250,6 @@ export async function assertEndpointResolvesPublic(
 	isTrustedOrigin: (url: string) => boolean,
 ): Promise<void> {
 	const parsed = parseURL(name, endpoint);
-
-	// Operator opt-in for internal IdPs (mirrors validateSkipDiscoveryEndpoint).
 	if (isTrustedOrigin(parsed.toString())) return;
 
 	const host = parsed.hostname;
@@ -250,8 +268,19 @@ export async function assertEndpointResolvesPublic(
 	try {
 		resolved = await dns.lookup(host, { all: true });
 	} catch {
-		// Resolution failure: let the actual fetch surface the network error.
-		return;
+		throw new DiscoveryError(
+			"discovery_private_host",
+			`The ${name} host "${host}" could not be resolved safely.`,
+			{ endpoint: name, url: endpoint, hostname: host },
+		);
+	}
+
+	if (!Array.isArray(resolved)) {
+		throw new DiscoveryError(
+			"discovery_private_host",
+			`The ${name} host "${host}" returned an invalid DNS result.`,
+			{ endpoint: name, url: endpoint, hostname: host },
+		);
 	}
 
 	for (const { address } of resolved) {
@@ -303,20 +332,27 @@ export async function assertOIDCEndpointsResolvePublic(
 export async function fetchDiscoveryDocument(
 	url: string,
 	timeout: number = DEFAULT_DISCOVERY_TIMEOUT,
+	fetchImpl: (input: string | URL, init?: RequestInit) => Promise<Response> = fetchPinnedPublic,
 ): Promise<OIDCDiscoveryDocument> {
 	try {
-		const response = await betterFetch<OIDCDiscoveryDocument>(url, {
-			method: "GET",
-			timeout,
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeout);
+		let response: Response;
+		try {
+			response = await fetchWithPublicEgressPolicy(url, {
+				method: "GET",
 			// Never auto-follow redirects on this server-side fetch. A redirect
 			// Location is not re-validated against the private-host checks, so a
 			// redirect could send the fetch to an internal/loopback/metadata
 			// address. Reject redirects outright.
-			redirect: "error",
-		});
-
-		if (response.error) {
-			const { status } = response.error;
+				redirect: "manual",
+				signal: controller.signal,
+			}, fetchImpl);
+		} finally {
+			clearTimeout(timer);
+		}
+		if (!response.ok) {
+			const status = response.status;
 
 			if (status === 404) {
 				throw new DiscoveryError(
@@ -342,28 +378,29 @@ export async function fetchDiscoveryDocument(
 
 			throw new DiscoveryError(
 				"discovery_unexpected_error",
-				`Unexpected discovery error: ${response.error.statusText}`,
-				{ url, ...response.error },
+				`Unexpected discovery error: ${response.statusText}`,
+				{ url, status },
 			);
 		}
 
-		if (!response.data) {
+		const text = await response.text();
+		if (!text) {
 			throw new DiscoveryError(
 				"discovery_invalid_json",
 				"Discovery endpoint returned an empty response",
 				{ url },
 			);
 		}
-
-		const data = response.data as OIDCDiscoveryDocument | string;
-		if (typeof data === "string") {
+		let data: OIDCDiscoveryDocument;
+		try {
+			data = JSON.parse(text) as OIDCDiscoveryDocument;
+		} catch {
 			throw new DiscoveryError(
 				"discovery_invalid_json",
 				"Discovery endpoint returned invalid JSON",
-				{ url, bodyPreview: data.slice(0, 200) },
+				{ url, bodyPreview: text.slice(0, 200) },
 			);
 		}
-
 		return data;
 	} catch (error) {
 		if (error instanceof DiscoveryError) {

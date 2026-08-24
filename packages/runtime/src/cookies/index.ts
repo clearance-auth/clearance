@@ -6,7 +6,6 @@ import type {
 } from "@clearance/core";
 import { env, isProduction } from "@clearance/core/env";
 import { ClearanceError } from "@clearance/core/error";
-import { filterOutputFields } from "@clearance/core/utils/db";
 import { safeJSONParse } from "@clearance/core/utils/json";
 import { base64Url } from "@clearance/utils/base64";
 import { binary } from "@clearance/utils/binary";
@@ -19,7 +18,9 @@ import {
 	symmetricEncodeJWT,
 	verifyJWT,
 } from "../crypto/jwt";
-import { parseUserOutput } from "../db/schema";
+import { parseSessionOutput, parseUserOutput } from "../db/schema";
+import { PASSKEY_SESSION_GENERATION_FIELD } from "../db/passkey-session-generation";
+import { TWO_FACTOR_SESSION_GENERATION_FIELD } from "../db/two-factor-session-generation";
 import type { Session, User } from "../types";
 import { getDate } from "../utils/date";
 import { isPromise } from "../utils/is-promise";
@@ -161,12 +162,43 @@ export async function setCookieCache(
 		return;
 	}
 
-	const filteredSession = filterOutputFields(
+	const filteredSession = parseSessionOutput(
+		ctx.context.options,
 		session.session,
-		ctx.context.options.session?.additionalFields,
 	);
 
 	const filteredUser = parseUserOutput(ctx.context.options, session.user);
+	const sessionGeneration = (
+		session.session as unknown as Record<string, unknown>
+	)[TWO_FACTOR_SESSION_GENERATION_FIELD];
+	if (typeof sessionGeneration === "string") {
+		(filteredSession as Record<string, unknown>)[
+			TWO_FACTOR_SESSION_GENERATION_FIELD
+		] = sessionGeneration;
+	}
+	const userGeneration = (session.user as unknown as Record<string, unknown>)[
+		TWO_FACTOR_SESSION_GENERATION_FIELD
+	];
+	if (typeof userGeneration === "string") {
+		(filteredUser as Record<string, unknown>)[
+			TWO_FACTOR_SESSION_GENERATION_FIELD
+		] = userGeneration;
+	}
+	const passkeySessionGeneration = (
+		session.session as unknown as Record<string, unknown>
+	)[PASSKEY_SESSION_GENERATION_FIELD];
+	if (typeof passkeySessionGeneration === "string") {
+		(filteredSession as Record<string, unknown>)[
+			PASSKEY_SESSION_GENERATION_FIELD
+		] = passkeySessionGeneration;
+	}
+	const passkeyUserGeneration = (
+		session.user as unknown as Record<string, unknown>
+	)[PASSKEY_SESSION_GENERATION_FIELD];
+	if (typeof passkeyUserGeneration === "string") {
+		(filteredUser as Record<string, unknown>)[PASSKEY_SESSION_GENERATION_FIELD] =
+			passkeyUserGeneration;
+	}
 
 	const versionConfig = ctx.context.options.session?.cookieCache?.version;
 	let version = "1";
@@ -277,6 +309,7 @@ export async function setSessionCookie(
 	dontRememberMe?: boolean | undefined,
 	overrides?: Partial<CookieOptions> | undefined,
 ) {
+	setSessionCredentialResponseNoStore(ctx);
 	const dontRememberMeCookie = await ctx.getSignedCookie(
 		ctx.context.authCookies.dontRememberToken.name,
 		ctx.context.secret,
@@ -310,6 +343,14 @@ export async function setSessionCookie(
 	}
 	await setCookieCache(ctx, session, dontRememberMe);
 	ctx.context.setNewSession(session);
+}
+
+/** Prevent storage of any response that issues or reissues a session credential. */
+export function setSessionCredentialResponseNoStore(
+	ctx: Pick<GenericEndpointContext, "setHeader">,
+) {
+	ctx.setHeader("Cache-Control", "no-store");
+	ctx.setHeader("Pragma", "no-cache");
 }
 
 type CookieScrubView = GenericEndpointContext & {

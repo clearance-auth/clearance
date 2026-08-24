@@ -6,6 +6,8 @@ import {
 	EVENTS_EXPORT_MAX_LIMIT,
 	EVENTS_TAIL_MAX_LIMIT,
 	USERS_EXPORT_MAX_LIMIT,
+	closeAuthBundle,
+	migrateRuntimeSchemaLocally,
 } from "@clearance/management";
 import { CliExitError, fail, printResult, type GlobalOpts } from "./output.js";
 import {
@@ -18,12 +20,18 @@ import {
 	validateAndSaveCredential,
 } from "./operator-auth.js";
 import { resolveApiSession } from "./api-client.js";
+import { registerDeliveryCommands } from "./delivery-command.js";
+import { registerAuthenticationPolicyCommands } from "./authentication-policy-command.js";
+import { registerKeyManagementCommands } from "./key-management-command.js";
+import { registerProductPresentationCommands } from "./product-presentation-command.js";
 import {
 	commandPath,
 	dispatchRemoteCommand,
 	EVENTS_TAIL_MAX_POLL_INTERVAL_MS,
 	EVENTS_TAIL_MIN_POLL_INTERVAL_MS,
 } from "./remote-dispatch.js";
+
+const MAX_STDIN_PASSWORD_BYTES = 4_096;
 
 const VERSION = (
 	JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -35,12 +43,145 @@ function globals(cmd: Command): GlobalOpts {
 	const opts = cmd.optsWithGlobals() as GlobalOpts & Record<string, unknown>;
 	return {
 		json: Boolean(opts.json),
-		noInput: Boolean(opts.noInput),
+		noInput: opts.input === false,
 		yes: Boolean(opts.yes),
 		dryRun: Boolean(opts.dryRun),
 		profile: opts.profile as string | undefined,
 		apiUrl: opts.apiUrl as string | undefined,
 	};
+}
+
+function passwordInputError(code: string, message: string, remediation: string): ClearanceError {
+	return new ClearanceError({ code, message, stage: "cli.password-input", remediation });
+}
+
+function passwordFromInput(input: string): string {
+	const password = input.replace(/\r?\n$/, "");
+	if (Buffer.byteLength(password, "utf8") > MAX_STDIN_PASSWORD_BYTES) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_TOO_LARGE",
+			"Initial password input exceeds the 4096-byte limit.",
+			"Provide a shorter password.",
+		);
+	}
+	if (password.length === 0) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_EMPTY",
+			"Initial password input cannot be empty.",
+			"Provide a non-empty password, or omit password options to issue a setup token.",
+		);
+	}
+	return password;
+}
+
+async function readPasswordFromStdin(): Promise<string> {
+	if (process.stdin.isTTY) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_STDIN_TTY",
+			"--password-stdin requires piped standard input.",
+			"Pipe the password to standard input, or use --password-prompt in an interactive terminal.",
+		);
+	}
+	let input = "";
+	for await (const chunk of process.stdin) {
+		input += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		if (Buffer.byteLength(input, "utf8") > MAX_STDIN_PASSWORD_BYTES + 2) {
+			throw passwordInputError(
+				"USER_CREATE_PASSWORD_TOO_LARGE",
+				"Initial password input exceeds the 4096-byte limit.",
+				"Provide a shorter password.",
+			);
+		}
+	}
+	return passwordFromInput(input);
+}
+
+async function readPasswordFromPrompt(): Promise<string> {
+	if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_PROMPT_TTY_REQUIRED",
+			"--password-prompt requires an interactive terminal.",
+			"Use --password-stdin with piped input, or omit password options to issue a setup token.",
+		);
+	}
+
+	process.stderr.write("Initial password: ");
+	return new Promise<string>((resolve, reject) => {
+		let input = "";
+		const finish = (callback: () => void) => {
+			process.stdin.off("data", onData);
+			process.stdin.setRawMode(false);
+			process.stderr.write("\n");
+			callback();
+		};
+		const onData = (chunk: Buffer | string) => {
+			const characters = (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+			for (const character of characters) {
+				if (character === "\r" || character === "\n") {
+					finish(() => {
+						try {
+							resolve(passwordFromInput(input));
+						} catch (cause) {
+							reject(cause);
+						}
+					});
+					return;
+				}
+				if (character === "\u0003") {
+					finish(() => reject(passwordInputError(
+						"USER_CREATE_PASSWORD_PROMPT_CANCELLED",
+						"Initial password prompt was cancelled.",
+						"Retry with --password-prompt, --password-stdin, or omit password options to issue a setup token.",
+					)));
+					return;
+				}
+				if (character === "\u007f" || character === "\b") {
+					input = input.slice(0, -1);
+					continue;
+				}
+				if (character >= " ") input += character;
+				if (Buffer.byteLength(input, "utf8") > MAX_STDIN_PASSWORD_BYTES) {
+					finish(() => reject(passwordInputError(
+						"USER_CREATE_PASSWORD_TOO_LARGE",
+						"Initial password input exceeds the 4096-byte limit.",
+						"Provide a shorter password.",
+					)));
+					return;
+				}
+			}
+		};
+		process.stdin.setRawMode(true);
+		process.stdin.resume();
+		process.stdin.on("data", onData);
+	});
+}
+
+async function remoteCommandOptions(command: Command, global: GlobalOpts): Promise<Record<string, unknown>> {
+	const opts = command.opts() as Record<string, unknown>;
+	if (commandPath(command) !== "users create") return opts;
+	const passwordStdin = opts.passwordStdin === true;
+	const passwordPrompt = opts.passwordPrompt === true;
+	if (passwordStdin && passwordPrompt) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_SOURCE_CONFLICT",
+			"Use only one initial password input mode.",
+			"Choose either --password-stdin or --password-prompt, or omit both to issue a setup token.",
+		);
+	}
+	delete opts.passwordStdin;
+	delete opts.passwordPrompt;
+	if (passwordStdin) opts.password = await readPasswordFromStdin();
+	if (passwordPrompt) {
+		if (global.noInput) {
+			throw passwordInputError(
+				"USER_CREATE_PASSWORD_PROMPT_NONINTERACTIVE",
+				"--password-prompt cannot be used with --no-input.",
+				"Use --password-stdin for CI, or omit password options to issue a setup token.",
+			);
+		}
+		opts.password = await readPasswordFromPrompt();
+	}
+	return opts;
 }
 
 /**
@@ -51,6 +192,7 @@ function globals(cmd: Command): GlobalOpts {
 async function remoteCommandAction(this: Command): Promise<void> {
 	const g = globals(this);
 	try {
+		const opts = await remoteCommandOptions(this, g);
 		const session = await resolveApiSession({
 			profile: g.profile,
 			apiUrl: g.apiUrl,
@@ -64,16 +206,63 @@ async function remoteCommandAction(this: Command): Promise<void> {
 					"Run clearance login --profile <name> for the intended API origin.",
 			});
 		}
-		const result = await dispatchRemoteCommand(
+		const result = await dispatchRemoteCommand({
 			session,
-			commandPath(this),
-			this.processedArgs,
-			this.opts() as Record<string, unknown>,
-			g,
-		);
+			path: commandPath(this),
+			args: this.processedArgs,
+			opts,
+			global: g,
+		});
 		printResult(g, result);
 	} catch (cause) {
 		fail(cause, g);
+	}
+}
+
+async function schemaMigrateAction(this: Command): Promise<void> {
+	const opts = this.opts() as Record<string, unknown>;
+	if (opts.local !== true) {
+		await remoteCommandAction.call(this);
+		return;
+	}
+	const g = globals(this);
+	try {
+		if (g.profile || g.apiUrl) {
+			throw new ClearanceError({
+				code: "SCHEMA_LOCAL_MIGRATION_REMOTE_FLAGS_INVALID",
+				message: "Local schema migration cannot use an API profile or URL.",
+				stage: "schema.migrate.local",
+				remediation: "Remove --profile and --api-url from the one-shot migration command.",
+			});
+		}
+		if (!g.dryRun && !g.yes) {
+			throw new ClearanceError({
+				code: "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED",
+				message: "Local schema migration requires explicit confirmation.",
+				stage: "schema.migrate.local",
+				remediation: "Review --dry-run, then pass --local --yes.",
+			});
+		}
+		if (
+			!g.dryRun &&
+			(typeof opts.drainId !== "string" || opts.drainId.trim().length === 0)
+		) {
+			throw new ClearanceError({
+				code: "SCHEMA_MIGRATE_DRAIN_ID_REQUIRED",
+				message: "Local schema migration requires the exact armed drain ID.",
+				stage: "schema.migrate.local",
+				remediation: "Pass --local --drain-id <id> --yes from the one-shot migrator.",
+			});
+		}
+		const result = await migrateRuntimeSchemaLocally({
+			dryRun: Boolean(g.dryRun),
+			drainId: typeof opts.drainId === "string" ? opts.drainId : undefined,
+		});
+		printResult(g, result);
+	} catch (cause) {
+		fail(cause, g);
+	} finally {
+		await closeAuthBundle().catch(() => undefined);
 	}
 }
 
@@ -160,7 +349,8 @@ async function main() {
 		.command("create")
 		.requiredOption("--email <email>")
 		.requiredOption("--name <name>")
-		.option("--password <password>", "Explicit initial password; omitted creates an expiring single-use setup token")
+		.option("--password-stdin", "Read an initial password from piped standard input (maximum 4096 bytes)", false)
+		.option("--password-prompt", "Prompt for an initial password without terminal echo (TTY only)", false)
 		.action(remoteCommandAction);
 	users
 		.command("update")
@@ -239,15 +429,102 @@ async function main() {
 	members
 		.command("update")
 		.requiredOption("--org <id>")
-		.option("--user <id>", "Principal id of the member")
+		.option("--user <id>", "User id of the member")
 		.option("--member <id>", "Membership id")
 		.requiredOption("--role <role>", "New role slug")
 		.action(remoteCommandAction);
 	members
 		.command("remove")
 		.requiredOption("--org <id>")
-		.option("--user <id>", "Principal id of the member")
+		.option("--user <id>", "User id of the member")
 		.option("--member <id>", "Membership id")
+		.action(remoteCommandAction);
+
+	const authorization = orgs
+		.command("authorization")
+		.description("Normalized organization authorization");
+	const authorizationEffective = authorization
+		.command("effective")
+		.description("Inspect a subject's effective organization authorization");
+	authorizationEffective
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--subject <id>", "User or service-account id")
+		.requiredOption("--subject-kind <kind>", "principal|service_account")
+		.action(remoteCommandAction);
+	const authorizationAssignments = authorization
+		.command("assignments")
+		.description("Inspect or replace normalized role assignments");
+	authorizationAssignments
+		.command("list")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--subject <id>", "Optional principal or service-account id")
+		.option("--subject-kind <kind>", "principal|service_account; requires --subject")
+		.action(remoteCommandAction);
+	authorizationAssignments
+		.command("replace")
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--subject <id>", "User or service-account id")
+		.requiredOption("--subject-kind <kind>", "principal|service_account")
+		.option("--role <id>", "Role id; repeat for each assigned role", (value, previous: string[] = []) => [...previous, value], [])
+		.option("--expected-revision <revision>", "Require this current authorization revision")
+		.action(remoteCommandAction);
+	authorization
+		.command("reconcile")
+		.description("Preview organization authorization reconciliation; pass --yes to apply")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+
+	const serviceAccounts = orgs
+		.command("service-accounts")
+		.description("Organization service accounts and credentials");
+	serviceAccounts
+		.command("list")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("inspect")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("create")
+		.requiredOption("--org <id>", "Organization id")
+		.requiredOption("--name <name>", "Human-readable service-account name")
+		.option("--role <id>", "Role id; repeat for each assignment", (value, previous: string[] = []) => [...previous, value], [])
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("disable")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	serviceAccounts
+		.command("enable")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.action(remoteCommandAction);
+	const serviceAccountCredentials = serviceAccounts
+		.command("credentials")
+		.description("Service-account credential lifecycle");
+	serviceAccountCredentials
+		.command("create")
+		.argument("<accountId>", "Service-account id")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.option("--operation-id <uuid>", "Stable UUID for live retry recovery")
+		.action(remoteCommandAction);
+	serviceAccountCredentials
+		.command("rotate")
+		.argument("<accountId>", "Service-account id")
+		.argument("<credentialId>", "Credential id")
+		.requiredOption("--org <id>", "Organization id")
+		.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+		.option("--operation-id <uuid>", "Stable UUID for live retry recovery")
+		.action(remoteCommandAction);
+	serviceAccountCredentials
+		.command("revoke")
+		.argument("<accountId>", "Service-account id")
+		.argument("<credentialId>", "Credential id")
+		.requiredOption("--org <id>", "Organization id")
 		.action(remoteCommandAction);
 
 	// events — list / tail / inspect / export / replay (shared management services)
@@ -295,12 +572,18 @@ async function main() {
 		.argument("<id>", "SCIM diagnostic trace id")
 		.action(remoteCommandAction);
 
+	registerDeliveryCommands(program, remoteCommandAction);
+	registerAuthenticationPolicyCommands(program, remoteCommandAction);
+	registerProductPresentationCommands(program, remoteCommandAction);
+	registerKeyManagementCommands(program, remoteCommandAction);
+
 	// keys — digest-only project/environment scoped API-key lifecycle
 	const keys = program.command("keys").description("Project and environment API keys");
 	keys.command("list").option("--include-revoked", "Include revoked keys", false).action(remoteCommandAction);
 	keys.command("create").requiredOption("--name <name>", "Human-readable key name")
-		.option("--scope <scope>", "Repeatable resource:action scope", (value, previous: string[] = []) => [...previous, value], [])
-		.action(remoteCommandAction);
+			.option("--scope <scope>", "Repeatable resource:action scope", (value, previous: string[] = []) => [...previous, value], [])
+			.option("--expires-at <iso-timestamp>", "Optional absolute ISO-8601 expiry")
+			.action(remoteCommandAction);
 	keys.command("rotate").argument("<id>", "API key id").action(remoteCommandAction);
 	keys.command("revoke").argument("<id>", "API key id").action(remoteCommandAction);
 
@@ -407,6 +690,7 @@ async function main() {
 		.argument("<id>")
 		.option("--apply", "Apply instead of dry-run", false)
 		.option("--fixture <name>", "ok|malformed|unauthorized")
+		.option("--scenario <name>", "users|group-lifecycle", "users")
 		.option(
 			"--live",
 			"Probe the REAL configured SCIM endpoint (read-only GETs). Requires --yes, HTTPS, non-loopback.",
@@ -496,7 +780,7 @@ async function main() {
 	backup
 		.command("restore")
 		.requiredOption("--id <backupId>")
-		.option("--target <path>", "API-host restore path or isolated Postgres database name")
+		.option("--target <database>", "Optional isolated Postgres database name beginning clearance_restore_; file targets are server-managed")
 		.action(remoteCommandAction);
 
 	// upgrade
@@ -507,28 +791,22 @@ async function main() {
 	upgrade
 		.command("plan")
 		.requiredOption("--target <version>", "Target release version")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.option("--current <version>", "Current release version override")
 		.action(remoteCommandAction);
 	upgrade
 		.command("apply")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.action(remoteCommandAction);
 	upgrade
 		.command("verify")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
-		.option("--health-url <url>", "Optional credential-free HTTP(S) health endpoint")
 		.action(remoteCommandAction);
 	upgrade
 		.command("rollback")
 		.description("Verify a rollback in isolation, or explicitly restore the active database")
 		.requiredOption("--plan <id-or-path>", "Plan ID or plan path")
-		.requiredOption("--dir <path>", "Absolute upgrade artifact directory")
 		.option("--restore-active", "Restore the rollback backup into the active database", false)
 		.option("--confirm <token>", "Exact RESTORE_ACTIVE:<plan-id>:<database> confirmation")
-		.option("--backup-dir <path>", "Absolute directory for the pre-restore safety backup")
 		.action(remoteCommandAction);
 
 	// schema
@@ -545,7 +823,43 @@ async function main() {
 	schema
 		.command("migrate")
 		.description("Apply pending Clearance migrations and lifecycle compatibility ensures")
+		.option("--local", "Run directly against DATABASE_URL after API replicas drain", false)
+		.option("--drain-id <id>", "Exact armed credential-authority drain id")
+		.action(schemaMigrateAction);
+	const credentialAuthority = schema
+		.command("credential-authority")
+		.description("Durable credential-generation cutover fence");
+	credentialAuthority
+		.command("status")
+		.description("Show durable phase, generation, and active runtime leases")
 		.action(remoteCommandAction);
+	credentialAuthority
+		.command("arm")
+		.requiredOption("--deployment-id <id>", "Immutable candidate deployment id")
+		.requiredOption("--expected-runtimes <count>", "Exact bridge runtime lease count")
+		.action(remoteCommandAction);
+	credentialAuthority
+		.command("drain")
+		.requiredOption("--deployment-id <id>", "Armed candidate deployment id")
+		.requiredOption("--drain-id <id>", "Unique cutover drain id")
+		.action(remoteCommandAction);
+	const storeV2 = schema
+		.command("store-v2")
+		.description("Normalized management-store migration");
+	storeV2.command("status").description("Show store-v2 phase and parity").action(remoteCommandAction);
+	storeV2.command("plan").description("Preflight the store-v2 backfill").action(remoteCommandAction);
+	storeV2.command("apply").description("Backfill and enable verified dual-write").action(remoteCommandAction);
+	storeV2.command("verify").description("Fail unless snapshot and relational data match").action(remoteCommandAction);
+	storeV2.command("rollback").description("Disable dual-write while retaining relational data").action(remoteCommandAction);
+	const storeV2Events = storeV2.command("events").description("Relational audit-event authority");
+	storeV2Events.command("cutover").description("Make relational audit events authoritative").action(remoteCommandAction);
+	storeV2Events.command("rollback").description("Return audit-event authority to the snapshot").action(remoteCommandAction);
+	const storeV2Principals = storeV2.command("principals").description("Relational principal authority");
+	storeV2Principals.command("cutover").description("Make normalized principals authoritative").action(remoteCommandAction);
+	storeV2Principals.command("rollback").description("Reverse-materialize principals into the snapshot").action(remoteCommandAction);
+	const storeV2Topology = storeV2.command("topology").description("Relational topology authority");
+	storeV2Topology.command("cutover").description("Make normalized topology authoritative").action(remoteCommandAction);
+	storeV2Topology.command("rollback").description("Reverse-materialize topology into the snapshot").action(remoteCommandAction);
 
 	// config
 	const config = program.command("config").description("Config");
@@ -645,13 +959,16 @@ async function main() {
 				if (session) {
 					const whoami = await fetchWhoami(session.apiUrl, session.token);
 					const via = session.credentialSource === "saved" ? session.profile : "environment";
+					const principal = whoami.operator.type === "api_key"
+						? `api-key ${whoami.operator.id}`
+						: "operator";
 					printResult(g, {
 						authenticated: true,
 						credentialSource: session.credentialSource,
 						...(session.credentialSource === "saved" ? { profile: session.profile } : {}),
 						apiUrl: session.apiUrl,
 						...whoami,
-					}, `operator ${whoami.projectId}/${whoami.environmentId} via ${via} (${session.apiUrl})`);
+					}, `${principal} ${whoami.projectId}/${whoami.environmentId} via ${via} (${session.apiUrl})`);
 					return;
 				}
 				throw new ClearanceError({

@@ -14,7 +14,7 @@ import type {
 	ManagementUnitOfWork,
 } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { AuditEvent, Membership, Organization, Principal } from "../types/resources.js";
+import type { AuditEvent, Membership, Organization, User } from "../types/resources.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
@@ -56,8 +56,18 @@ function requirePrincipal(
 	id: string,
 	scope: ResourceScope | undefined,
 	stage: string,
-): Principal {
-	const user = store.snapshot.principals.find((p) => p.id === id);
+): User {
+	if (store.storeV2Principals?.authoritative) {
+		throw new ClearanceError({
+			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
+			message: "Relational principal authority requires a bounded reader.",
+			stage,
+			status: 500,
+		});
+	}
+	const user = store.snapshot.principals.find(
+		(p) => p.id === id,
+	);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
 			code: "USER_NOT_FOUND",
@@ -126,14 +136,44 @@ export function assertOwnerInvariant(
 export function listMembers(
 	store: ManagementSnapshotReader,
 	organizationId: string,
-	opts?: { scope?: ResourceScope; includeRemoved?: boolean },
+	opts?: {
+		scope?: ResourceScope;
+		includeRemoved?: boolean;
+		/** A caller-provided authoritative organization avoids a stale snapshot gate. */
+		organization?: Organization;
+	},
 ): Membership[] {
-	const org = requireOrganization(
+	const org = opts?.organization ?? requireOrganization(
 		store,
 		organizationId,
 		opts?.scope,
 		"orgs.members.list",
 	);
+	if (opts?.organization) {
+		if (org.status === "archived") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.members.list",
+				status: 404,
+			});
+		}
+		if (opts.scope) {
+			assertResourceInScope(org, opts.scope, {
+				code: "ORG_NOT_FOUND",
+				stage: "orgs.members.list",
+				label: "Organization",
+			});
+		}
+	}
+	if (org.id !== organizationId) {
+		throw new ClearanceError({
+			code: "ORG_NOT_FOUND",
+			message: "Organization not found",
+			stage: "orgs.members.list",
+			status: 404,
+		});
+	}
 	return store.snapshot.memberships.filter((m) => {
 		if (m.organizationId !== org.id) return false;
 		if (!opts?.includeRemoved && m.status !== "active") return false;
@@ -145,6 +185,7 @@ export function inspectMembership(
 	store: ManagementSnapshotReader,
 	id: string,
 	scope?: ResourceScope,
+	organization?: Organization,
 ): Membership {
 	const stage = "orgs.members.inspect";
 	const membership = store.snapshot.memberships.find((m) => m.id === id);
@@ -158,7 +199,37 @@ export function inspectMembership(
 	}
 	// Scope via parent organization — foreign org ids fail as membership not found
 	try {
-		requireOrganization(store, membership.organizationId, scope, stage);
+		const parent = organization ?? requireOrganization(
+			store,
+			membership.organizationId,
+			scope,
+			stage,
+		);
+		if (organization) {
+			if (parent.status === "archived") {
+				throw new ClearanceError({
+					code: "ORG_NOT_FOUND",
+					message: "Organization not found",
+					stage,
+					status: 404,
+				});
+			}
+			if (scope) {
+				assertResourceInScope(parent, scope, {
+					code: "ORG_NOT_FOUND",
+					stage,
+					label: "Organization",
+				});
+			}
+		}
+		if (parent.id !== membership.organizationId) {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage,
+				status: 404,
+			});
+		}
 	} catch (e) {
 		if (e instanceof ClearanceError && e.code === "ORG_NOT_FOUND") {
 			throw new ClearanceError({
@@ -217,9 +288,7 @@ function assertPrincipalOrgScope(
  * Idempotent: returns existing active membership without a second audit.
  * Invalid roles fail closed with no write.
  */
-export function addMember(
-	store: ManagementUnitOfWork,
-	input: {
+export type AddMemberInput = {
 		organizationId: string;
 		principalId: string;
 		role?: string;
@@ -229,11 +298,30 @@ export function addMember(
 		scope?: ResourceScope;
 		/** Force a specific membership id (runtime id preservation) */
 		id?: string;
-	},
+	};
+
+export function addMember(
+	store: ManagementUnitOfWork,
+	input: AddMemberInput,
+): Membership {
+	requireOrganization(store, input.organizationId, input.scope, "orgs.members.add");
+	const principal = requirePrincipal(
+		store,
+		input.principalId,
+		input.scope,
+		"orgs.members.add",
+	);
+	return addMemberWithPrincipal(store, principal, input);
+}
+
+/** Same transition with a transaction-bound relational principal already resolved. */
+export function addMemberWithPrincipal(
+	store: ManagementUnitOfWork,
+	principal: User,
+	input: AddMemberInput,
 ): Membership {
 	const stage = "orgs.members.add";
 	const org = requireOrganization(store, input.organizationId, input.scope, stage);
-	const principal = requirePrincipal(store, input.principalId, input.scope, stage);
 	assertPrincipalOrgScope(org, principal, stage);
 
 	const roleSlug = input.role ?? "member";

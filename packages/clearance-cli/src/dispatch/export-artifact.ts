@@ -13,7 +13,10 @@ export function writeRemoteExport(
 			? ""
 			: `${values.map((value) => JSON.stringify(value)).join("\n")}\n`;
 	}
-	const outputPath = writeExportArtifact(String(options.output), contents, Boolean(options.force), {
+	const outputPath = writeExportArtifact({
+		outputPath: String(options.output),
+		body: contents,
+		force: Boolean(options.force),
 		stage: `${collection}.export`,
 		existsCode: `${collection.toUpperCase()}_EXPORT_EXISTS`,
 		writeFailedCode: `${collection.toUpperCase()}_EXPORT_WRITE_FAILED`,

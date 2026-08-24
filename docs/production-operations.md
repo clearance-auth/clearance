@@ -22,6 +22,121 @@ and watches Kubernetes Jobs or the host scheduler.
   HTTP work and pending store writes, closes the Postgres pool, and has a
   25-second hard deadline under the chart's 30-second grace period.
 
+## Credential-authority cutover
+
+For a fresh Compose database, bootstrap with the unexposed CLI migrator before
+starting either credential-capable service. Use a stable bootstrap drain ID so
+the same command resumes safely after interruption:
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml"
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+export CLEARANCE_CREDENTIAL_DRAIN_ID="bootstrap-$CLEARANCE_DEPLOYMENT_ID"
+
+$COMPOSE --profile migration run --rm credential-migrator
+$COMPOSE up -d api sample-b2b
+clearance --json schema credential-authority status
+```
+
+The API and sample ports remain closed until migration publishes `digest-live`.
+The same command refuses an existing unarmed database, so an upgrade cannot be
+silently treated as a fresh install.
+
+The 0.3 credential upgrade uses one immutable application image and one
+deployment identity through four phases: `bridge`, `drain`, `migrate`, and
+`serve`. Bridge runtimes hold shared PostgreSQL session advisory leases. The
+durable fence records the armed deployment, exact runtime count, drain ID,
+phase, and generation. Credential mutation requires the exclusive lease after
+every bridge process has released its shared lease. A paused process therefore
+blocks the migration, and a restarted legacy process cannot serve after drain.
+
+For production Compose, export the immutable image reference plus
+`CLEARANCE_DEPLOYMENT_ID`, start the candidate with
+`CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=legacy-v1`, and verify the image ID
+of both credential-capable services before arming:
+
+```bash
+COMPOSE="docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml"
+
+$COMPOSE up -d --force-recreate api sample-b2b
+clearance schema credential-authority arm \
+  --deployment-id "$CLEARANCE_DEPLOYMENT_ID" --expected-runtimes 2 --yes
+clearance schema credential-authority drain \
+  --deployment-id "$CLEARANCE_DEPLOYMENT_ID" \
+  --drain-id "$CLEARANCE_CREDENTIAL_DRAIN_ID" --yes
+
+$COMPOSE up -d --no-deps --scale api=0 --scale sample-b2b=0 api sample-b2b
+$COMPOSE --profile migration run --no-deps --rm credential-migrator
+
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+$COMPOSE up -d --force-recreate api sample-b2b
+clearance --json schema credential-authority status
+```
+
+The migrator has no published port, uses the exact API image digest, and accepts
+only the armed drain ID. Do not start it until every Clearance runtime sharing
+the database has joined the armed cohort and then stopped. A failed migration
+leaves the durable phase at `migrating`; resume with the same image, deployment,
+and drain ID. Writer constraints reject later plaintext session and OAuth
+authority even if an old binary reconnects. The Helm chart documents and
+renders the equivalent phase sequence as a zero-replica Deployment plus a
+one-shot Job.
+
+## Delivery worker operations
+
+Production Compose and Helm run `packages/delivery-worker/dist/cli.mjs` from
+the same immutable application image as the API. The API and every worker must
+receive the same delivery encryption ring, fingerprint ring, source-dedupe key,
+schema, and prefix. Purpose keys must use distinct 32-byte material. The source
+dedupe key stays stable across encryption and fingerprint rotations.
+
+Check one running worker directly with its built-in CLI:
+
+```bash
+docker compose -f docker-compose.yml \
+  -f deploy/compose/docker-compose.production.yml \
+  exec -T delivery-worker \
+  node packages/delivery-worker/dist/cli.mjs --ready
+
+kubectl --namespace clearance exec deployment/clearance-delivery-worker -- \
+  node packages/delivery-worker/dist/cli.mjs --ready
+```
+
+The command exits non-zero unless Postgres, the owned schema, retained keys,
+worker heartbeat, and the selected SMTP or SES transport are ready. Use the
+management CLI for fleet and queue state:
+
+```bash
+clearance --json --no-input delivery readiness
+clearance --json --no-input delivery quotas
+clearance --json --no-input delivery list --state retry --state dead
+```
+
+`/live` is process-only, `/ready` checks the complete delivery dependency set,
+and `/metrics` exports low-cardinality job outcomes and worker health. The
+Compose port is loopback-only. The Helm Service is ClusterIP-only, has no
+Ingress, and grants scrape access only to the configured Prometheus selectors.
+
+Alert when no worker is ready for five minutes, schema or email transport health
+is zero, or `accepted_unconfirmed` and `finish_failed` outcomes increase. Track
+sustained retry/dead growth and quota saturation. Counters are process-local
+and reset with a pod, so aggregate by workload in Prometheus. A live SES account
+readiness check remains part of release-environment proof.
+
+The worker migrates the delivery schema before serving health endpoints. A
+custom schema must exist before rollout, and its database role needs DDL rights
+over the owned delivery tables and guard function. Keep the worker termination
+grace longer than `CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS`. The production Compose
+profile allows 310 seconds for the supported maximum drain; the default Helm
+profile allows 45 seconds for the default 30-second drain and rejects an unsafe
+grace/deadline combination.
+
+For key rotation, deploy the expanded retained rings to API and workers first.
+After all replicas are ready, switch the current encryption and fingerprint IDs
+in a second rollout. Keep old keys until `clearance delivery readiness` proves
+they are no longer required. External Kubernetes Secret contents are invisible
+to Helm checksums, so change the API and worker restart tokens for each phase.
+
 ## Backup, RPO, and retention
 
 The beta target is **RPO <= 1 hour** and **RTO <= 60 minutes**. These targets are
@@ -38,7 +153,11 @@ lifecycle retention at the remote destination (recommended: 30 daily copies
 plus managed Postgres PITR).
 
 The checked-in deployment support matrix is Postgres 16 with the separately
-published `backup-runtime` image target (official `postgres:16-bookworm` client).
+published `backup-runtime` image target. Release Docker bases are pinned to
+reviewed multi-architecture manifest indexes: `node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436`,
+`postgres:16-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537`, and
+the Compose/Terraform Postgres service uses
+`postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685`.
 A fixed UID/GID 10001 runs the job without root privileges; Compose and Helm
 mount only `/backups` and `/tmp` writable while keeping the root filesystem
 read-only.
@@ -49,8 +168,17 @@ For Compose, invoke the one-shot `backup` profile from cron or systemd:
 
 Before any production Compose command, set `CLEARANCE_IMAGE_REPOSITORY` and
 `CLEARANCE_IMAGE_DIGEST` plus their `CLEARANCE_BACKUP_IMAGE_*` equivalents from
-the signed release evidence. The overlay disables local image builds and
-accepts only `repository@sha256:...` references.
+the immutable release evidence. The overlay validates digest-reference syntax;
+the release gate separately verifies npm provenance, OCI cosign signatures,
+and `release-bundle.sigstore.json` against the canonical GitHub Actions OIDC
+issuer and tag-bound `release-sign.yml` identity. Run
+`bash scripts/verify-release-bundle.sh dist-release` after downloading release
+assets; never verify that bundle against a public key distributed in the same
+asset set. The normal verifier accepts only the tag-bound workflow ref. Signed
+recovery assets require the explicit, independently supplied
+`CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY=1` to anchor verification to the
+canonical `master` workflow ref. Local image
+builds are disabled and only `repository@sha256:...` references are accepted.
 
 ```bash
 docker compose -f docker-compose.yml \

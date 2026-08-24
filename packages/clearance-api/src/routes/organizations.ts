@@ -4,12 +4,11 @@ import {
 	ORGANIZATION_OPERATIONS,
 	executeMemberImportPlan,
 	inspectMembership,
-	inspectOrganization,
-	inspectUser,
+	inspectOrganizationAuthoritative,
+	inspectUserAuthoritative,
 	listMembers,
-	listOrganizations,
-	listOrganizationsPage,
-	planMemberImport,
+	listOrganizationsPageAuthoritative,
+	planMemberImportAuthoritative,
 	type MemberImportFormat,
 } from "@clearance/management";
 import { Hono } from "hono";
@@ -18,7 +17,7 @@ import {
 	type ApplicationRouteDependencies,
 } from "./shared.js";
 
-export interface OrganizationRouteDependencies extends ApplicationRouteDependencies {}
+export type OrganizationRouteDependencies = ApplicationRouteDependencies;
 
 export function registerOrganizationRoutes({
 	storeForRequest,
@@ -28,30 +27,22 @@ export function registerOrganizationRoutes({
 }: OrganizationRouteDependencies) {
 	const routes = new Hono();
 
-	/**
-	 * List organizations. Legacy unpaginated without params; keyset-paginated
-	 * (createdAt+id asc) with ?limit=/?cursor=, returning nextCursor.
-	 */
 	routes.get(ORGANIZATION_OPERATIONS.list.http.path, async (c) => {
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
 			const limitRaw = c.req.query("limit");
 			const cursor = c.req.query("cursor");
-			if (limitRaw !== undefined || cursor !== undefined) {
-				const page = listOrganizationsPage(store, {
-					scope,
-					...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
-					...(cursor !== undefined ? { cursor } : {}),
-				});
-				return c.json({
-					organizations: page.organizations,
-					nextCursor: page.nextCursor,
-					scope,
-				});
-			}
+			const page = await listOrganizationsPageAuthoritative(store, {
+				scope,
+				...(limitRaw !== undefined ? { limit: Number(limitRaw) } : {}),
+				...(cursor !== undefined ? { cursor } : {}),
+			});
+			const includeNextCursor =
+				limitRaw !== undefined || cursor !== undefined || page.nextCursor !== null;
 			return c.json({
-				organizations: listOrganizations(store, { scope }),
+				organizations: page.organizations,
+				...(includeNextCursor ? { nextCursor: page.nextCursor } : {}),
 				scope,
 			});
 		} catch (e) {
@@ -63,7 +54,11 @@ export function registerOrganizationRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const organization = inspectOrganization(store, c.req.param("id"), scope);
+			const organization = await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
 			return c.json({ organization, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -76,7 +71,7 @@ export function registerOrganizationRoutes({
 			const scope = scopeForRequest(store, c);
 			const body = await c.req.json();
 			const organization = await applicationFor(store).organizations.create(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{ name: body.name, slug: body.slug, ownerUserId: body.ownerUserId },
 			);
 			return c.json({ organization }, 201);
@@ -139,11 +134,15 @@ export function registerOrganizationRoutes({
 				});
 			}
 			if (body.dryRun === true) {
-				inspectOrganization(store, c.req.param("id"), scope);
+				await inspectOrganizationAuthoritative(
+					store,
+					c.req.param("id"),
+					scope,
+				);
 				return c.json({ dryRun: true, id: c.req.param("id"), name, slug, scope });
 			}
 			const organization = await applicationFor(store).organizations.update(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 				{
 					...(name !== undefined ? { name } : {}),
@@ -191,7 +190,7 @@ export function registerOrganizationRoutes({
 				});
 			}
 			const result = await applicationFor(store).organizations.archive(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				c.req.param("id"),
 				{
 					...(dryRun !== undefined ? { dryRun } : {}),
@@ -208,7 +207,12 @@ export function registerOrganizationRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const members = listMembers(store, c.req.param("id"), { scope });
+			const organization = await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
+			const members = listMembers(store, organization.id, { scope, organization });
 			return c.json({ members, scope });
 		} catch (e) {
 			return handleError(c, e);
@@ -236,13 +240,17 @@ export function registerOrganizationRoutes({
 			}
 			const principalId = body.principalId.trim();
 			const role = body.role !== undefined ? body.role : "member";
+			await inspectOrganizationAuthoritative(
+				store,
+				c.req.param("id"),
+				scope,
+			);
 			if (body.dryRun === true) {
-				inspectOrganization(store, c.req.param("id"), scope);
-				inspectUser(store, principalId, scope);
+				await inspectUserAuthoritative(store, principalId, scope);
 				return c.json({ dryRun: true, organizationId: c.req.param("id"), principalId, role, scope });
 			}
 			const membership = await applicationFor(store).members.add(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				{
 					organizationId: c.req.param("id"),
 					principalId,
@@ -280,17 +288,18 @@ export function registerOrganizationRoutes({
 					remediation: "Send the local file contents in the authenticated request.",
 				});
 			}
-			const plan = planMemberImport(store, {
+			const plan = await planMemberImportAuthoritative(store, {
 				organizationId: c.req.param("id"),
 				content: body.content,
 				format,
+				scope,
 			});
 			if (body.dryRun === true || body.confirm !== true) {
 				return c.json({ dryRun: true, ...plan, scope });
 			}
 			const result = await executeMemberImportPlan(plan, async (row) => {
 				return applicationFor(store).members.add(
-					apiOperationContext(scope),
+					apiOperationContext(scope, c),
 					{
 						organizationId: plan.organizationId,
 						principalId: row.principalId,
@@ -313,8 +322,8 @@ export function registerOrganizationRoutes({
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
 			// Ensure org is in scope (cross-scope ids indistinguishable from missing)
-			inspectOrganization(store, orgId, scope);
-			const existing = inspectMembership(store, memberId, scope);
+			const organization = await inspectOrganizationAuthoritative(store, orgId, scope);
+			const existing = inspectMembership(store, memberId, scope, organization);
 			if (existing.organizationId !== orgId) {
 				// Treat as missing — do not leak cross-org membership existence
 				throw new ClearanceError({
@@ -337,7 +346,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, organizationId: orgId, membershipId: memberId, role: body.role, scope });
 			}
 			const membership = await applicationFor(store).members.update(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				memberId,
 				{ role: body.role, auditSource: "api" },
 			);
@@ -353,8 +362,8 @@ export function registerOrganizationRoutes({
 			const scope = scopeForRequest(store, c);
 			const orgId = c.req.param("id");
 			const memberId = c.req.param("memberId");
-			inspectOrganization(store, orgId, scope);
-			const existing = inspectMembership(store, memberId, scope);
+			const organization = await inspectOrganizationAuthoritative(store, orgId, scope);
+			const existing = inspectMembership(store, memberId, scope, organization);
 			if (existing.organizationId !== orgId) {
 				throw new ClearanceError({
 					code: "MEMBER_NOT_FOUND",
@@ -368,7 +377,7 @@ export function registerOrganizationRoutes({
 				return c.json({ dryRun: true, organizationId: orgId, membershipId: memberId, membership: existing, scope });
 			}
 			const membership = await applicationFor(store).members.remove(
-				apiOperationContext(scope),
+				apiOperationContext(scope, c),
 				memberId,
 				{ auditSource: "api" },
 			);

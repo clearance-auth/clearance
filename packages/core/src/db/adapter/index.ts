@@ -79,6 +79,11 @@ export interface DBAdapterFactoryConfig<
 	 */
 	adapterId: string;
 	/**
+	 * Whether records survive process teardown. Security migrations treat an
+	 * unspecified capability as durable and require the deployment drain fence.
+	 */
+	storagePersistence?: "durable" | "ephemeral" | undefined;
+	/**
 	 * If the database supports numeric ids, set this to `true`.
 	 *
 	 * @default true
@@ -343,6 +348,14 @@ export type Where = {
 };
 
 /**
+ * Stable scalar used to distinguish one create-if-absent attempt from every
+ * concurrent contender. Reference-valued selectors cannot classify a row
+ * returned through a database driver reliably, and `null` cannot identify one
+ * particular attempt. Numbers must be finite.
+ */
+export type CreateIfAbsentAttemptValue = string | number | boolean;
+
+/**
  * JoinOption configuration for relational queries.
  *
  * Allows you to join related tables/models in a single query operation.
@@ -396,8 +409,17 @@ export type DBTransactionAdapter<
 	Options extends ClearanceOptions = ClearanceOptions,
 > = Omit<DBAdapter<Options>, "transaction">;
 
+export type DBRawTransactionQuery = <
+	Row extends Record<string, unknown> = Record<string, unknown>,
+>(
+	text: string,
+	values?: readonly unknown[],
+) => Promise<{ rows: Row[]; rowCount: number | null }>;
+
 export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 	id: string;
+	/** Explicit storage capability; absent adapters are conservatively durable. */
+	storagePersistence?: "durable" | "ephemeral" | undefined;
 	create: <T extends Record<string, any>, R = T>(data: {
 		model: string;
 		data: Omit<T, "id">;
@@ -409,6 +431,24 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 		 */
 		forceAllowId?: boolean | undefined;
 	}) => Promise<R>;
+	/**
+	 * Atomically create a row only when the supplied schema-declared unique
+	 * equality selector is absent. The inserted row is returned only to the
+	 * winner; concurrent losers return `null` without mutating the winner or
+	 * raising an expected uniqueness error.
+	 *
+	 * `attemptBy` identifies this particular insertion attempt and must be a
+	 * string, finite number, or boolean already present in `data`. Adapters whose
+	 * native upsert returns the existing row use it to distinguish the inserter
+	 * from a loser without changing that row.
+	 */
+	createIfAbsent: <T extends Record<string, any>, R = T>(data: {
+		model: string;
+		data: T;
+		uniqueBy: { field: string; value: Where["value"] };
+		attemptBy: { field: string; value: CreateIfAbsentAttemptValue };
+		forceAllowId?: boolean | undefined;
+	}) => Promise<R | null>;
 	findOne: <T>(data: {
 		model: string;
 		where: Where[];
@@ -510,6 +550,12 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 		callback: (trx: DBTransactionAdapter<Options>) => Promise<R>,
 	) => Promise<R>;
 	/**
+	 * Execute parameterized SQL on the adapter's already-active transaction.
+	 * PostgreSQL adapters expose this only on the transaction adapter passed to
+	 * `transaction(...)`; base adapters and non-PostgreSQL adapters omit it.
+	 */
+	rawTransactionQuery?: DBRawTransactionQuery | undefined;
+	/**
 	 *
 	 * @param options
 	 * @param file - file path if provided by the user
@@ -527,6 +573,7 @@ export type DBAdapter<Options extends ClearanceOptions = ClearanceOptions> = {
 export type CleanedWhere = Required<Where>;
 
 export interface CustomAdapter {
+	rawTransactionQuery?: DBRawTransactionQuery | undefined;
 	create: <T extends Record<string, any>>({
 		data,
 		model,
@@ -536,6 +583,14 @@ export interface CustomAdapter {
 		data: T;
 		select?: string[] | undefined;
 	}) => Promise<T>;
+	/** Native first-writer-wins insert. The factory intentionally has no unsafe fallback. */
+	createIfAbsent?: <T extends Record<string, any>>(data: {
+		model: string;
+		data: T;
+		uniqueBy: { field: string; value: Where["value"] };
+		/** May contain an adapter-specific representation after input transforms. */
+		attemptBy: { field: string; value: unknown };
+	}) => Promise<T | null>;
 	update: <T>(data: {
 		model: string;
 		where: CleanedWhere[];

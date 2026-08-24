@@ -93,6 +93,7 @@ export interface UserWithTwoFactor extends User {
 	 * If the user has enabled two factor authentication.
 	 */
 	twoFactorEnabled: boolean;
+	twoFactorSessionGeneration?: string | null;
 }
 
 export interface TwoFactorProvider {
@@ -106,7 +107,12 @@ export interface TwoFactorTable {
 	userId: string;
 	secret: string;
 	backupCodes: string;
+	pendingSecret?: string | null;
+	pendingBackupCodes?: string | null;
 	verified: boolean;
-	failedVerificationCount?: number;
+	failedVerificationCount?: number | null;
+	activeVerificationReservations?: string | null;
 	lockedUntil?: Date | null;
+	lastUsedTotpCounter?: number | null;
+	trustDeviceGeneration?: string | null;
 }

@@ -1,9 +1,14 @@
-import type { ClearanceOptions } from "@clearance/core";
+import type {
+	ClearanceOptions,
+	RuntimeAuthenticationPolicy,
+	RuntimeAuthenticationPolicyIdentity,
+} from "@clearance/core";
 import { getAuthTables } from "@clearance/core/db";
 import type { DBAdapter } from "@clearance/core/db/adapter";
 import type { MemoryDB } from "@clearance/memory-adapter";
 import { memoryAdapter } from "@clearance/memory-adapter";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { attachInternalAuthenticationPolicy } from "../../internal/authentication-policy";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { deviceAuthorization, deviceAuthorizationOptionsSchema } from ".";
 import { deviceAuthorizationClient } from "./client";
@@ -259,7 +264,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			const response = await auth.api.deviceVerify({
+			const response = await auth.api.claimDeviceUserCode({
 				query: { user_code },
 			});
 			expect("error" in response).toBe(false);
@@ -271,7 +276,7 @@ describe("device authorization flow", async () => {
 
 		it("should handle invalid user code", async () => {
 			await expect(
-				auth.api.deviceVerify({
+				auth.api.claimDeviceUserCode({
 					query: { user_code: "INVALID" },
 				}),
 			).rejects.toMatchObject({
@@ -295,7 +300,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -336,7 +341,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -385,40 +390,31 @@ describe("device authorization flow", async () => {
 			});
 		});
 
-		it("should enforce rate limiting with slow_down error", async () => {
+		it("should allow only one concurrent poll into a polling window", async () => {
 			const { device_code } = await auth.api.deviceCode({
 				body: {
 					client_id: "test-client",
 				},
 			});
 
-			await auth.api
-				.deviceToken({
-					body: {
-						grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-						device_code: device_code,
-						client_id: "test-client",
-					},
-				})
-				.catch(
-					// ignore the error
-					() => {},
-				);
-
-			await expect(
+			const poll = () =>
 				auth.api.deviceToken({
 					body: {
 						grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-						device_code: device_code,
+						device_code,
 						client_id: "test-client",
 					},
-				}),
-			).rejects.toMatchObject({
-				body: {
-					error: "slow_down",
-					error_description: "Polling too frequently",
-				},
-			});
+				})
+				.then(
+					() => "success",
+					(error: unknown) =>
+						(error as { body?: { error?: string } }).body?.error ?? "unknown",
+				);
+
+			expect((await Promise.all([poll(), poll()])).sort()).toEqual([
+				"authorization_pending",
+				"slow_down",
+			]);
 		});
 	});
 
@@ -433,7 +429,7 @@ describe("device authorization flow", async () => {
 					client_id: "test-client",
 				},
 			});
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code: userCode },
 				headers,
 			});
@@ -463,7 +459,7 @@ describe("device authorization flow", async () => {
 			});
 			const cleanUserCode = user_code.replace(/-/g, "");
 
-			const response = await auth.api.deviceVerify({
+			const response = await auth.api.claimDeviceUserCode({
 				query: { user_code: cleanUserCode },
 			});
 			expect("status" in response && response.status).toBe("pending");
@@ -479,7 +475,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -521,52 +517,40 @@ describe("device authorization flow", async () => {
 			});
 		});
 
-		it("should allow first user to approve but prevent re-approval", async () => {
-			// Sign in as user
+		it("should allow only one concurrent approval decision", async () => {
 			const { headers } = await signInWithTestUser();
-
-			// Request device code
 			const { user_code } = await auth.api.deviceCode({
 				body: {
 					client_id: "test-client",
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
 
-			// User approves - this should succeed
-			const approveResponse = await auth.api.deviceApprove({
-				body: { userCode: user_code },
-				headers,
-			});
-			expect("success" in approveResponse && approveResponse.success).toBe(
-				true,
-			);
+			const decide = (decision: "approve" | "deny") =>
+				(decision === "approve"
+					? auth.api.deviceApprove({ body: { userCode: user_code }, headers })
+					: auth.api.deviceDeny({ body: { userCode: user_code }, headers })
+				).then(
+					() => "success",
+					(error: unknown) =>
+						(error as { body?: { error_description?: string } }).body
+							?.error_description ?? "unknown",
+				);
+			expect(
+				(await Promise.all([decide("approve"), decide("deny")])).sort(),
+			).toEqual(["Device code already processed", "success"]);
 
-			// Verify the device code is now approved
 			const cleanUserCode = user_code.replace(/-/g, "");
 			const deviceCodeRecord = await db.findOne<DeviceCode>({
 				model: "deviceCode",
 				where: [{ field: "userCode", value: cleanUserCode }],
 			});
-			expect(deviceCodeRecord?.status).toBe("approved");
+			expect(["approved", "denied"]).toContain(deviceCodeRecord?.status);
 			expect(deviceCodeRecord?.userId).toBeDefined();
-
-			// Try to approve again - should fail because already processed
-			await expect(
-				auth.api.deviceApprove({
-					body: { userCode: user_code },
-					headers,
-				}),
-			).rejects.toMatchObject({
-				body: {
-					error: "invalid_request",
-					error_description: "Device code already processed",
-				},
-			});
 		});
 	});
 
@@ -581,7 +565,7 @@ describe("device authorization flow", async () => {
 				body: { client_id: "test-client" },
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -638,7 +622,7 @@ describe("device authorization flow", async () => {
 				body: { client_id: "test-client" },
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -812,7 +796,7 @@ describe("device authorization ownership gate", () => {
 			body: { client_id: "test-client" },
 		});
 
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: legitHeaders,
 		});
@@ -861,7 +845,7 @@ describe("device authorization ownership gate", () => {
 			body: { client_id: "test-client" },
 		});
 
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: claimerHeaders,
 		});
@@ -1021,7 +1005,7 @@ describe("device authorization ownership gate", () => {
 		});
 
 		// The unbound code is claimable by any signed-in user via verify
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers,
 		});
@@ -1113,7 +1097,7 @@ describe("device authorization ownership gate", () => {
 		});
 
 		simulateConcurrentClaim = true;
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: racerHeaders,
 		});
@@ -1314,6 +1298,145 @@ describe("verificationUri option", async () => {
 		expect(response.verification_uri_complete).toContain("lang=en");
 		expect(response.verification_uri_complete).toContain(
 			`user_code=${response.user_code}`,
+		);
+	});
+});
+
+describe("managed device session authority", () => {
+	it("binds approval to the live source and rolls back invalid redemption", async () => {
+		const identity = {
+			projectId: "device-policy-project",
+			environmentId: "device-policy-environment",
+		} satisfies RuntimeAuthenticationPolicyIdentity;
+		const policy = {
+			passwordLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			factorLockout: {
+				enabled: true,
+				maxFailedAttempts: 10,
+				durationSeconds: 900,
+			},
+			minimumAssurance: "single_factor",
+			allowedFactors: { totp: true, passkey: true },
+			trustedDevice: { enabled: true, maxAgeSeconds: 86_400 },
+			assuranceMaxAgeSeconds: 300,
+		} satisfies RuntimeAuthenticationPolicy;
+		const options = {
+			plugins: [deviceAuthorization({ interval: "1s" })],
+		} satisfies ClearanceOptions;
+		attachInternalAuthenticationPolicy(options, {
+			identity,
+			reader: {
+				async readForSubject(input) {
+					return {
+						scope: identity,
+						subjectId: input.subjectId,
+						revision: "1",
+						environment: policy,
+						organizationMembership: null,
+						organizationOverride: null,
+						effective: policy,
+					};
+				},
+			},
+		});
+		const { auth, db, signInWithTestUser } = await getTestInstance(options);
+		const source = await signInWithTestUser();
+		const sourceSessionCount = await db.count({ model: "session" });
+		const { device_code, user_code } = await auth.api.deviceCode({
+			body: { client_id: "managed-device-client" },
+		});
+		await auth.api.claimDeviceUserCode({
+			query: { user_code },
+			headers: source.headers,
+		});
+		await auth.api.deviceApprove({
+			body: { userCode: user_code },
+			headers: source.headers,
+		});
+
+		const approved = await db.findOne<DeviceCode>({
+			model: "deviceCode",
+			where: [{ field: "deviceCode", value: device_code }],
+		});
+		expect(approved).toMatchObject({
+			status: "approved",
+			userId: source.user.id,
+			organizationId: null,
+			sessionDerivativeAuthority: expect.any(String),
+		});
+
+		await db.update({
+			model: "deviceCode",
+			where: [{ field: "id", value: approved!.id }],
+			update: {
+				sessionDerivativeAuthority: `${approved!.sessionDerivativeAuthority}x`,
+			},
+		});
+		await expect(
+			auth.api.deviceToken({
+				body: {
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+					device_code,
+					client_id: "managed-device-client",
+				},
+			}),
+		).rejects.toMatchObject({ body: { error: "invalid_grant" } });
+		await expect(
+			db.findOne<DeviceCode>({
+				model: "deviceCode",
+				where: [{ field: "id", value: approved!.id }],
+			}),
+		).resolves.toMatchObject({ status: "approved" });
+		await expect(db.count({ model: "session" })).resolves.toBe(
+			sourceSessionCount,
+		);
+
+		await db.update({
+			model: "deviceCode",
+			where: [{ field: "id", value: approved!.id }],
+			update: {
+				lastPolledAt: null,
+				sessionDerivativeAuthority: null,
+			},
+		});
+		await expect(
+			auth.api.deviceToken({
+				body: {
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+					device_code,
+					client_id: "managed-device-client",
+				},
+			}),
+		).rejects.toMatchObject({ body: { error: "invalid_grant" } });
+		await expect(
+			db.findOne<DeviceCode>({
+				model: "deviceCode",
+				where: [{ field: "id", value: approved!.id }],
+			}),
+		).resolves.toMatchObject({ status: "approved" });
+
+		await db.update({
+			model: "deviceCode",
+			where: [{ field: "id", value: approved!.id }],
+			update: {
+				lastPolledAt: null,
+				sessionDerivativeAuthority: approved!.sessionDerivativeAuthority,
+			},
+		});
+		const issued = await auth.api.deviceToken({
+			body: {
+				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+				device_code,
+				client_id: "managed-device-client",
+			},
+		});
+		expect(issued).toMatchObject({ access_token: expect.any(String) });
+		await expect(db.count({ model: "session" })).resolves.toBe(
+			sourceSessionCount + 1,
 		);
 	});
 });

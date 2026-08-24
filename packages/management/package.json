@@ -1,10 +1,14 @@
 {
   "name": "@clearance/management",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Clearance management plane — services, diagnostics, migration, backup on real auth runtime",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/management" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/management"
+  },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
@@ -13,17 +17,23 @@
       "default": "./dist/index.mjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsdown && node scripts/stage-ops.mjs",
     "test": "vitest run",
+    "test:store-v2-events-scale": "CLEARANCE_STORE_V2_SCALE=1 vitest run --disableConsoleIntercept src/__tests__/store-v2-events-scale.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@clearance/auth": "workspace:*",
+    "@clearance/delivery": "workspace:*",
+    "@clearance/key-management": "workspace:*",
     "pg": "^8.14.1"
   },
   "devDependencies": {
+    "@clearance/core": "workspace:*",
     "@clearance/sso": "workspace:*",
     "@clearance/scim": "workspace:*",
     "@types/node": "^22.20.1",

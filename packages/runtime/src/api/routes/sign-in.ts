@@ -2,17 +2,23 @@ import type { ClearanceOptions } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
 import type { User } from "@clearance/core/db";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import { SocialProviderListEnum } from "@clearance/core/social-providers";
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
 import { setSessionCookie } from "../../cookies";
 import { parseUserOutput } from "../../db/schema";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { missingEmailLogMessage } from "../../oauth2/errors";
 import { handleOAuthUserInfo } from "../../oauth2/link-account";
+import { verifyPasswordForSignIn } from "../../security/password-account-lockout";
 import { generateState } from "../../utils";
 import { safeCloneRequest } from "../../utils/request";
 import { formCsrfMiddleware } from "../middlewares/origin-check";
-import { createEmailVerificationToken } from "./email-verification";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "./email-verification";
 
 const socialSignInBodySchema = z.object({
 	/**
@@ -520,10 +526,11 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 					BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 				);
 			}
-			const validPassword = await ctx.context.password.verify({
-				hash: currentPassword,
+			const validPassword = await verifyPasswordForSignIn(
+				ctx,
+				credentialAccount,
 				password,
-			});
+			);
 			if (!validPassword) {
 				ctx.context.logger.warn("Invalid password");
 				throw APIError.from(
@@ -536,7 +543,10 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 				ctx.context.options?.emailAndPassword?.requireEmailVerification &&
 				!user.user.emailVerified
 			) {
-				if (!ctx.context.options?.emailVerification?.sendVerificationEmail) {
+				if (
+					!ctx.context.options.durableDelivery &&
+					!ctx.context.options?.emailVerification?.sendVerificationEmail
+				) {
 					throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.EMAIL_NOT_VERIFIED);
 				}
 
@@ -546,21 +556,17 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 						user.user.email,
 						undefined,
 						ctx.context.options.emailVerification?.expiresIn,
+						{ jti: generateId(16) },
 					);
 					const callbackURL = ctx.body.callbackURL
 						? encodeURIComponent(ctx.body.callbackURL)
 						: encodeURIComponent("/");
 					const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${callbackURL}`;
-					await ctx.context.runInBackgroundOrAwait(
-						ctx.context.options.emailVerification.sendVerificationEmail(
-							{
-								user: user.user,
-								url,
-								token,
-							},
-							safeCloneRequest(ctx.request),
-						),
-					);
+					await dispatchVerificationEmail(ctx, {
+						user: user.user,
+						url,
+						token,
+					});
 				}
 
 				throw APIError.from("FORBIDDEN", BASE_ERROR_CODES.EMAIL_NOT_VERIFIED);
@@ -569,6 +575,13 @@ export const signInEmail = <O extends ClearanceOptions>() =>
 			const session = await ctx.context.internalAdapter.createSession(
 				user.user.id,
 				ctx.body.rememberMe === false,
+				undefined,
+				false,
+				createInternalSessionIssuanceContext({
+					purpose: "interactive",
+					subjectId: user.user.id,
+					evidence: [{ kind: "primary", primaryMethod: "password" }],
+				}),
 			);
 
 			if (!session) {

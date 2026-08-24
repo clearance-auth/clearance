@@ -1,0 +1,20 @@
+[package]
+name = "clearance-verification"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Strict server-side verification for Clearance ES256 access tokens"
+license = "MIT"
+repository = "https://github.com/clearance-auth/clearance"
+readme = "README.md"
+keywords = ["auth", "jwt", "jwks", "es256", "clearance"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2.12", default-features = true }
+url = "2.5"

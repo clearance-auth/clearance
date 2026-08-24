@@ -5,10 +5,55 @@ import { organization } from "@clearance/runtime/plugins";
 import { getTestInstance } from "@clearance/runtime/test";
 import { OAuth2Server } from "oauth2-mock-server";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+// This suite deliberately drives a local mock IdP. Production uses the pinned
+// transport; the test injects its local transport explicitly.
+vi.mock("@clearance/core/utils/public-egress", () => ({
+	fetchPinnedPublic: (input: string | URL, init?: RequestInit) => fetch(input, init),
+	fetchWithPublicEgressPolicy: (
+		input: string | URL,
+		init: RequestInit,
+		transport: (url: string | URL, options?: RequestInit) => Promise<Response>,
+	) => transport(input, { ...init, redirect: "manual" }),
+}));
+
 import { sso } from ".";
 import { ssoClient } from "./client";
+import {
+	decryptOIDCConfig,
+	encryptOIDCConfig,
+} from "./oidc-secret-storage";
+import type { OIDCConfig } from "./types";
 
 const server = new OAuth2Server();
+
+describe("OIDC client secret storage", () => {
+	it("passes the stable providerId to encryption and decryption", async () => {
+		const encrypt = vi.fn(async (secret: string) => `encrypted:${secret}`);
+		const decrypt = vi.fn(async (ciphertext: string) =>
+			ciphertext.replace(/^encrypted:/, ""),
+		);
+		const options = { storeOIDCClientSecret: { encrypt, decrypt } };
+		const plaintextSecret = "clr-sso:v1:legitimate-plaintext-secret";
+		const config: OIDCConfig = {
+			issuer: "https://issuer.example.com",
+			pkce: true,
+			clientId: "client",
+			clientSecret: plaintextSecret,
+			discoveryEndpoint:
+				"https://issuer.example.com/.well-known/openid-configuration",
+		};
+
+		const encrypted = await encryptOIDCConfig(config, "provider-stable", options);
+		await decryptOIDCConfig(encrypted, "provider-stable", options);
+
+		expect(encrypt).toHaveBeenCalledWith(plaintextSecret, "provider-stable");
+		expect(decrypt).toHaveBeenCalledWith(
+			`encrypted:${plaintextSecret}`,
+			"provider-stable",
+		);
+	});
+});
 
 describe("SSO", async () => {
 	const { auth, signInWithTestUser, customFetchImpl, cookieSetter } =

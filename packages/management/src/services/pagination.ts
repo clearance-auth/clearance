@@ -2,7 +2,7 @@
  * Opaque keyset cursor pagination over snapshot arrays (FOLLOW.md P2.3.1).
  *
  * Ordering contract (stable, documented — shared by CLI and API):
- * - users, organizations: createdAt ascending, then id ascending
+ * - users, organizations, environments: createdAt ascending, then id ascending
  * - events, sessions:     createdAt descending, then id descending (newest first)
  *
  * Design choice: KEYSET (createdAt + id), not index/offset. The snapshot's
@@ -20,7 +20,12 @@
 import { Buffer } from "node:buffer";
 import { ClearanceError } from "./errors.js";
 
-export type PageSurface = "users" | "organizations" | "events" | "sessions";
+export type PageSurface =
+	| "users"
+	| "organizations"
+	| "environments"
+	| "events"
+	| "sessions";
 export type PageOrder = "asc" | "desc";
 
 export type PageCursorKey = {
@@ -37,6 +42,7 @@ type CursorPayload = {
 const PAGE_SURFACES: readonly PageSurface[] = [
 	"users",
 	"organizations",
+	"environments",
 	"events",
 	"sessions",
 ];

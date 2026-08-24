@@ -1,7 +1,9 @@
 {{- range $name, $config := .Values.ingress }}
 {{- if $config.enabled }}
+{{- if and (eq $name "vault") (not $.Values.vault.enabled) }}{{ fail "ingress.vault.enabled requires vault.enabled=true" }}{{- end }}
 {{- $servicePort := $.Values.service.port }}
 {{- if eq $name "console" }}{{- $servicePort = $.Values.console.service.port }}{{- end }}
+{{- if eq $name "vault" }}{{- $servicePort = $.Values.vault.service.port }}{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

@@ -32,7 +32,11 @@ describe("Domain verification", async () => {
 	const createTestAuth = (
 		options?: SSOOptions,
 		clearanceOptions?: {
+			session?: {
+				storeSessionInDatabase: boolean;
+			};
 			secondaryStorage?: {
+				namespace: string;
 				set: (key: string, value: string, ttl?: number) => void;
 				get: (key: string) => string | null;
 				delete: (key: string) => void;
@@ -68,6 +72,7 @@ describe("Domain verification", async () => {
 			emailAndPassword: {
 				enabled: true,
 			},
+			session: clearanceOptions?.session,
 			secondaryStorage: clearanceOptions?.secondaryStorage,
 			plugins: [sso(ssoOptions), organization()],
 		});
@@ -819,7 +824,9 @@ describe("Domain verification", async () => {
 			const { auth, getAuthHeaders, registerSSOProvider } = createTestAuth(
 				undefined,
 				{
+					session: { storeSessionInDatabase: true },
 					secondaryStorage: {
+						namespace: "sso-domain-verification-test",
 						set(key, value, ttl) {
 							store.set(key, value);
 						},

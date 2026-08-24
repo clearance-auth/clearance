@@ -6,8 +6,9 @@ import {
 import { generateRandomString } from "@clearance/runtime/crypto";
 import * as z from "zod";
 import type { SSOOptions, SSOProvider } from "../types";
+import { createSSOVerificationChallenge } from "../internal/verification-challenge-authority";
 import { parseProviderDomains } from "../utils";
-import { checkProviderAccess } from "./providers";
+import { requireAuthorizedProvider } from "./providers";
 
 const DNS_LABEL_MAX_LENGTH = 63;
 const DEFAULT_TOKEN_PREFIX = "clearance-token";
@@ -53,7 +54,7 @@ export const requestDomainVerification = (options: SSOOptions) => {
 		},
 		async (ctx) => {
 			const body = ctx.body;
-			const provider = await checkProviderAccess(ctx, body.providerId);
+			const provider = await requireAuthorizedProvider(ctx, body.providerId);
 
 			if (provider.domainVerified) {
 				throw new APIError("CONFLICT", {
@@ -68,7 +69,7 @@ export const requestDomainVerification = (options: SSOOptions) => {
 			);
 
 			const activeVerification =
-				await ctx.context.internalAdapter.findVerificationValue(identifier);
+				await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 
 			if (
 				activeVerification &&
@@ -79,11 +80,19 @@ export const requestDomainVerification = (options: SSOOptions) => {
 			}
 
 			const domainVerificationToken = generateRandomString(24);
-			await ctx.context.internalAdapter.createVerificationValue({
-				identifier,
-				value: domainVerificationToken,
-				expiresAt: new Date(Date.now() + 3600 * 24 * 7 * 1000), // 1 week
-			});
+			await createSSOVerificationChallenge(
+				options,
+				ctx.context.internalAdapter,
+				{
+					purpose: "sso-domain-verification",
+					subject: provider.providerId,
+				},
+				{
+					identifier,
+					value: domainVerificationToken,
+					expiresAt: new Date(Date.now() + 3600 * 24 * 7 * 1000),
+				},
+			);
 
 			ctx.setStatus(201);
 			return ctx.json({
@@ -125,7 +134,7 @@ export const verifyDomain = (options: SSOOptions) => {
 		},
 		async (ctx) => {
 			const body = ctx.body;
-			const provider = await checkProviderAccess(ctx, body.providerId);
+			const provider = await requireAuthorizedProvider(ctx, body.providerId);
 
 			if (provider.domainVerified) {
 				throw new APIError("CONFLICT", {
@@ -147,7 +156,7 @@ export const verifyDomain = (options: SSOOptions) => {
 			}
 
 			const activeVerification =
-				await ctx.context.internalAdapter.findVerificationValue(identifier);
+				await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 
 			if (
 				!activeVerification ||

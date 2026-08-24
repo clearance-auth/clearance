@@ -33,13 +33,49 @@ services:
   api:
     build: .
     image: ${CLEARANCE_IMAGE:-clearance-local:dev}
-    command: ["node", "packages/clearance-api/dist/server.js"]
+    command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/clearance-api/dist/server.js"]
+    # Server-owned product email DNS requirements live in this operator-managed
+    # file, never in this Compose manifest or command output. It may be empty
+    # for local stacks that do not exercise product-email DNS readiness.
+    env_file:
+      - ${CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE:-/dev/null}
     environment:
       CLEARANCE_API_PORT: "3200"
       CLEARANCE_OPERATOR_TOKEN: ${CLEARANCE_OPERATOR_TOKEN:?set CLEARANCE_OPERATOR_TOKEN}
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
       CLEARANCE_CREDENTIAL_KEY: ${CLEARANCE_CREDENTIAL_KEY:?set CLEARANCE_CREDENTIAL_KEY}
       CLEARANCE_CREDENTIAL_KEY_ID: ${CLEARANCE_CREDENTIAL_KEY_ID:?set CLEARANCE_CREDENTIAL_KEY_ID}
+      # Keep strict local stacks on the explicit post-migration authority;
+      # production overrides this with an operator-required generation.
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:-digest-v1}
+      # Strict local API startup also needs a stable deployment identity. The
+      # production overlay replaces this development identifier and requires
+      # an operator-supplied immutable candidate value.
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:-development}
+      CLEARANCE_PROJECT_ID: ${CLEARANCE_PROJECT_ID:-proj_default}
+      CLEARANCE_ENV_ID: ${CLEARANCE_ENV_ID:-env_default}
+      # Supply purpose-separated local providers explicitly for strict local
+      # stacks. Production replaces this with a required operator-managed
+      # provider configuration in the production overlay.
+      CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON: ${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON:?set CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON}
+      # Supplying the complete delivery keyring enables transactional delivery
+      # producers and controls in the API. Empty values keep the local stack's
+      # backwards-compatible delivery-disabled mode.
+      CLEARANCE_DELIVERY_KEY_ID: ${CLEARANCE_DELIVERY_KEY_ID-}
+      CLEARANCE_DELIVERY_KEYS_JSON: ${CLEARANCE_DELIVERY_KEYS_JSON-}
+      CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID: ${CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID-}
+      CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON: ${CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON-}
+      CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY: ${CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY-}
+      CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: ${CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID-}
+      CLEARANCE_DELIVERY_SCHEMA: ${CLEARANCE_DELIVERY_SCHEMA:-public}
+      CLEARANCE_DELIVERY_PREFIX: ${CLEARANCE_DELIVERY_PREFIX:-delivery_}
+      CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE: ${CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE:-10000}
+      CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG: ${CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG:-5000}
+      CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW: ${CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW:-1000}
+      CLEARANCE_DELIVERY_QUOTA_WINDOW_MS: ${CLEARANCE_DELIVERY_QUOTA_WINDOW_MS:-60000}
+      # Public CNAME target only. The API rejects malformed or absent targets
+      # when a custom-domain verification is attempted.
+      CLEARANCE_CUSTOM_DOMAIN_TARGET: ${CLEARANCE_CUSTOM_DOMAIN_TARGET-}
       CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
       CLEARANCE_CONSOLE_URL: http://localhost:${CLEARANCE_CONSOLE_PORT:-13100}
       CLEARANCE_API_HEALTH_URL: http://127.0.0.1:3200
@@ -81,6 +117,89 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
+  # Opt in locally with `docker compose --profile delivery up -d`. The worker
+  # validates the complete keyring and selected email transport before it can
+  # become ready; no secret material has a development default.
+  delivery-worker:
+    profiles: ["delivery"]
+    image: ${CLEARANCE_IMAGE:-clearance-local:dev}
+    command: ["node", "--import", "./packages/observability-node/dist/preload.mjs", "packages/delivery-worker/dist/cli.mjs"]
+    environment:
+      NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
+      CLEARANCE_DELIVERY_KEY_ID: ${CLEARANCE_DELIVERY_KEY_ID-}
+      CLEARANCE_DELIVERY_KEYS_JSON: ${CLEARANCE_DELIVERY_KEYS_JSON-}
+      CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID: ${CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID-}
+      CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON: ${CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON-}
+      CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY: ${CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY-}
+      CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID: ${CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID-}
+      CLEARANCE_DELIVERY_SCHEMA: ${CLEARANCE_DELIVERY_SCHEMA:-public}
+      CLEARANCE_DELIVERY_PREFIX: ${CLEARANCE_DELIVERY_PREFIX:-delivery_}
+      # The API's normalized management authority is public.mgmt_*.
+      CLEARANCE_MANAGEMENT_SCHEMA: public
+      CLEARANCE_MANAGEMENT_PREFIX: mgmt_
+      CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE: ${CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE:-10000}
+      CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG: ${CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG:-5000}
+      CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW: ${CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW:-1000}
+      CLEARANCE_DELIVERY_QUOTA_WINDOW_MS: ${CLEARANCE_DELIVERY_QUOTA_WINDOW_MS:-60000}
+      CLEARANCE_DELIVERY_CONCURRENCY: ${CLEARANCE_DELIVERY_CONCURRENCY:-4}
+      CLEARANCE_DELIVERY_POLL_MS: ${CLEARANCE_DELIVERY_POLL_MS:-500}
+      CLEARANCE_DELIVERY_LEASE_MS: ${CLEARANCE_DELIVERY_LEASE_MS:-60000}
+      CLEARANCE_DELIVERY_HEARTBEAT_MS: ${CLEARANCE_DELIVERY_HEARTBEAT_MS:-10000}
+      CLEARANCE_DELIVERY_MAINTENANCE_MS: ${CLEARANCE_DELIVERY_MAINTENANCE_MS:-30000}
+      CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS: ${CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS:-30000}
+      CLEARANCE_DELIVERY_MAX_BODY_BYTES: ${CLEARANCE_DELIVERY_MAX_BODY_BYTES:-1048576}
+      CLEARANCE_DELIVERY_APP_NAME: ${CLEARANCE_DELIVERY_APP_NAME:-Clearance}
+      CLEARANCE_DELIVERY_ALLOW_HTTP_LINKS: ${CLEARANCE_DELIVERY_ALLOW_HTTP_LINKS:-false}
+      CLEARANCE_DELIVERY_HEALTH_HOST: 0.0.0.0
+      CLEARANCE_DELIVERY_HEALTH_PORT: "8091"
+      CLEARANCE_EMAIL_TRANSPORT: ${CLEARANCE_EMAIL_TRANSPORT:-smtp}
+      CLEARANCE_EMAIL_FROM: ${CLEARANCE_EMAIL_FROM-}
+      CLEARANCE_SMTP_HOST: ${CLEARANCE_SMTP_HOST-}
+      CLEARANCE_SMTP_PORT: ${CLEARANCE_SMTP_PORT:-587}
+      CLEARANCE_SMTP_SECURE: ${CLEARANCE_SMTP_SECURE:-false}
+      CLEARANCE_SMTP_REQUIRE_TLS: ${CLEARANCE_SMTP_REQUIRE_TLS:-true}
+      CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK: ${CLEARANCE_SMTP_ALLOW_INSECURE_LOOPBACK:-false}
+      CLEARANCE_SMTP_USER: ${CLEARANCE_SMTP_USER-}
+      CLEARANCE_SMTP_PASSWORD: ${CLEARANCE_SMTP_PASSWORD-}
+      CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS: ${CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS:-10000}
+      CLEARANCE_SMTP_SOCKET_TIMEOUT_MS: ${CLEARANCE_SMTP_SOCKET_TIMEOUT_MS:-30000}
+      CLEARANCE_SMTP_GREETING_TIMEOUT_MS: ${CLEARANCE_SMTP_GREETING_TIMEOUT_MS:-10000}
+      CLEARANCE_SES_REGION: ${CLEARANCE_SES_REGION-}
+      CLEARANCE_SES_ACCESS_KEY_ID: ${CLEARANCE_SES_ACCESS_KEY_ID-}
+      CLEARANCE_SES_SECRET_ACCESS_KEY: ${CLEARANCE_SES_SECRET_ACCESS_KEY-}
+      CLEARANCE_SES_SESSION_TOKEN: ${CLEARANCE_SES_SESSION_TOKEN-}
+      CLEARANCE_SES_REQUEST_TIMEOUT_MS: ${CLEARANCE_SES_REQUEST_TIMEOUT_MS:-10000}
+      CLEARANCE_WEBHOOK_ALLOW_INSECURE_LOOPBACK: ${CLEARANCE_WEBHOOK_ALLOW_INSECURE_LOOPBACK:-false}
+      CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS: ${CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS:-5000}
+      CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS: ${CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS:-5000}
+      CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS: ${CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS:-10000}
+      CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES: ${CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES:-65536}
+    ports:
+      - "127.0.0.1:${CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT:-18091}:8091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8091/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+
   console:
     image: ${CLEARANCE_IMAGE:-clearance-local:dev}
     command: ["node", "packages/clearance-console/src/server.js"]
@@ -113,12 +232,61 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
+  vault:
+    image: ${CLEARANCE_IMAGE:-clearance-local:dev}
+    command: ["node", "apps/vault-host/dist/server.js"]
+    environment:
+      CLEARANCE_VAULT_PORT: "3400"
+      CLEARANCE_VAULT_URL: http://localhost:${CLEARANCE_VAULT_PORT:-13400}
+      CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_VAULT_PORT:-13400}
+      CLEARANCE_VAULT_PRODUCT_NAME: ${CLEARANCE_VAULT_PRODUCT_NAME:-Clearance}
+      CLEARANCE_VAULT_HOME_LABEL: ${CLEARANCE_VAULT_HOME_LABEL:-Clearance Vault}
+      CLEARANCE_VAULT_ACCENT_COLOR: "${CLEARANCE_VAULT_ACCENT_COLOR:-#6558d3}"
+      CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:-digest-v1}
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:-development}
+      CLEARANCE_PROJECT_ID: ${CLEARANCE_PROJECT_ID:-proj_default}
+      CLEARANCE_ENV_ID: ${CLEARANCE_ENV_ID:-env_default}
+      CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON: ${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON-}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${CLEARANCE_DB_USER:-clearance}:${CLEARANCE_DB_PASSWORD}@postgres:5432/${CLEARANCE_DB_NAME:-clearance}}
+      CLEARANCE_STRICT_SECRETS: "0"
+      NODE_ENV: ${CLEARANCE_NODE_ENV:-development}
+    ports:
+      - "127.0.0.1:${CLEARANCE_VAULT_PORT:-13400}:3400"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3400/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+
   sample-b2b:
     image: ${CLEARANCE_IMAGE:-clearance-local:dev}
     command: ["node", "apps/sample-b2b/dist/server.js"]
     environment:
       SAMPLE_APP_PORT: "3000"
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:-digest-v1}
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:-development}
+      CLEARANCE_PROJECT_ID: ${CLEARANCE_PROJECT_ID:-proj_default}
+      CLEARANCE_ENV_ID: ${CLEARANCE_ENV_ID:-env_default}
+      CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON: ${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON:?set CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON}
       CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
       CLEARANCE_GITHUB_CLIENT_ID: ${CLEARANCE_GITHUB_CLIENT_ID-}
       CLEARANCE_GITHUB_CLIENT_SECRET: ${CLEARANCE_GITHUB_CLIENT_SECRET-}

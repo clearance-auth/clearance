@@ -1,4 +1,5 @@
 import type { DBFieldAttribute } from "@clearance/core/db";
+import { runWithTransaction } from "@clearance/core/context";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { createAuthClient } from "../../../client";
 import { parseSetCookieHeader } from "../../../cookies";
@@ -8,6 +9,35 @@ import { adminAc, defaultStatements, memberAc, ownerAc } from "../access";
 import { inferOrgAdditionalFields, organizationClient } from "../client";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
 import { organization } from "../organization";
+
+async function completesWithin<T>(
+	operation: Promise<T>,
+	description: string,
+	timeoutMs = 2_000,
+): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			operation,
+			new Promise<never>((_, reject) => {
+				timeout = setTimeout(
+					() => reject(new Error(`${description} did not complete within ${timeoutMs}ms`)),
+					timeoutMs,
+				);
+			}),
+		]);
+	} finally {
+		if (timeout) clearTimeout(timeout);
+	}
+}
+
+function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
 
 describe("dynamic access control", async () => {
 	it("should preserve exact built-in organization role statement types", () => {
@@ -244,6 +274,726 @@ describe("dynamic access control", async () => {
 			headers: normalHeaders,
 		});
 		expect(shouldPass.success).toBe(true);
+	});
+
+	it("completes dynamic role create, update, and delete under SQLite", async () => {
+		const role = `sqlite-role-${crypto.randomUUID()}`;
+		const created = await completesWithin(
+			authClient.organization.createRole(
+				{
+					role,
+					permission: { project: ["read"] },
+					additionalFields: { color: "#000000" },
+				},
+				{ headers },
+			),
+			"SQLite dynamic role creation",
+		);
+		if (!created.data) throw created.error;
+
+		const renamedRole = `${role}-updated`;
+		const updated = await completesWithin(
+			auth.api.updateOrgRole({
+				body: {
+					roleId: created.data.roleData.id,
+					data: { roleName: renamedRole },
+				},
+				headers,
+			}),
+			"SQLite dynamic role update",
+		);
+		expect(updated.roleData.role).toBe(renamedRole);
+
+		const deleted = await completesWithin(
+			auth.api.deleteOrgRole({
+				body: { roleId: created.data.roleData.id },
+				headers,
+			}),
+			"SQLite dynamic role deletion",
+		);
+		expect(deleted.success).toBe(true);
+	});
+
+	it("canonicalizes role names and rejects blank or comma-separated names", async () => {
+		const blank = await authClient.organization.createRole(
+			{
+				role: "   ",
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		expect(blank.data).toBeNull();
+		const commaSeparated = await authClient.organization.createRole(
+			{
+				role: "role,other-role",
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		expect(commaSeparated.data).toBeNull();
+		const predefined = await authClient.organization.createRole(
+			{
+				role: " Admin ",
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		expect(predefined.error?.message).toBe(
+			ORGANIZATION_ERROR_CODES.ROLE_NAME_IS_ALREADY_TAKEN.message,
+		);
+
+		const role = `canonical-role-${crypto.randomUUID()}`;
+		const created = await authClient.organization.createRole(
+			{
+				role: ` ${role.toUpperCase()} `,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		expect(created.data.roleData.role).toBe(role);
+		const read = await auth.api.getOrgRole({
+			query: { organizationId: org.data.id, roleName: ` ${role.toUpperCase()} ` },
+			headers,
+		});
+		expect(read.role).toBe(role);
+		const noOpRename = await auth.api.updateOrgRole({
+			body: {
+				roleId: created.data.roleData.id,
+				data: { roleName: ` ${role.toUpperCase()} ` },
+			},
+			headers,
+		});
+		expect(noOpRename.roleData.role).toBe(role);
+		await auth.api.deleteOrgRole({
+			body: { roleName: ` ${role.toUpperCase()} ` },
+			headers,
+		});
+	});
+
+	it("completes role mutation inside an ambient transaction for the same adapter", async () => {
+		const context = await auth.$context;
+		const created = await completesWithin(
+			runWithTransaction(context.adapter, () =>
+				authClient.organization.createRole(
+					{
+						role: `same-adapter-transaction-role-${crypto.randomUUID()}`,
+						permission: { project: ["read"] },
+						additionalFields: { color: "#000000" },
+					},
+					{ headers },
+				),
+			),
+			"dynamic role mutation under an ambient transaction for the same adapter",
+		);
+		if (!created.data) throw created.error;
+		expect(created.data.success).toBe(true);
+	});
+
+	it("rechecks duplicate role names after a stale create preflight", async () => {
+		const role = `stale-create-role-${crypto.randomUUID()}`;
+		const authContext = await auth.$context;
+		const originalTransaction = authContext.adapter.transaction;
+		const nameCheckEntered = deferred();
+		const releaseFirstCreate = deferred();
+		let pauseNameCheck = true;
+
+		authContext.adapter.transaction = async (callback) =>
+			originalTransaction(async (transaction) => {
+				const transactionWithBarrier = new Proxy(transaction, {
+					get(target, property, receiver) {
+						if (property !== "findOne") {
+							return Reflect.get(target, property, receiver);
+						}
+						return async (
+							...args: Parameters<typeof transaction.findOne>
+						) => {
+							const [input] = args;
+							const result = await Reflect.apply(
+								target.findOne,
+								target,
+								args,
+							);
+							if (
+								pauseNameCheck &&
+								input.model === "organizationRole" &&
+								input.where?.some(
+									(condition) => condition.field === "role" && condition.value === role,
+								) === true
+							) {
+								pauseNameCheck = false;
+								nameCheckEntered.resolve();
+								await releaseFirstCreate.promise;
+							}
+							return result;
+						};
+					},
+				});
+				return callback(transactionWithBarrier);
+			});
+
+		try {
+			const create = () =>
+				authClient.organization.createRole(
+					{
+						role,
+						permission: { project: ["read"] },
+						additionalFields: { color: "#000000" },
+					},
+					{ headers },
+				);
+			const first = create();
+			await completesWithin(
+				nameCheckEntered.promise,
+				"first create reaching its locked role-name check",
+			);
+			const second = create();
+			releaseFirstCreate.resolve();
+			const [firstResult, secondResult] = await completesWithin(
+				Promise.all([first, second]),
+				"duplicate dynamic role creation race",
+			);
+			expect(firstResult.data?.success).toBe(true);
+			expect(secondResult.data).toBeNull();
+			expect(secondResult.error?.message).toBe(
+				ORGANIZATION_ERROR_CODES.ROLE_NAME_IS_ALREADY_TAKEN.message,
+			);
+		} finally {
+			releaseFirstCreate.resolve();
+			authContext.adapter.transaction = originalTransaction;
+		}
+	});
+
+	it("uses live dynamic role permissions after a stale cache was primed", async () => {
+		const delegatorRole = `stale-delegator-role-${crypto.randomUUID()}`;
+		const delegator = await authClient.organization.createRole(
+			{
+				role: delegatorRole,
+				permission: {
+					ac: ["create", "update", "delete"],
+					project: ["read"],
+				},
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!delegator.data) throw delegator.error;
+		const target = await authClient.organization.createRole(
+			{
+				role: `stale-cache-target-${crypto.randomUUID()}`,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!target.data) throw target.error;
+		const actor = await createUser({ role: "member" });
+		await auth.api.updateMemberRole({
+			body: { memberId: actor.member.id, role: delegatorRole },
+			headers,
+		});
+		const primed = await auth.api.hasPermission({
+			body: {
+				organizationId: org.data.id,
+				permissions: { project: ["read"] },
+			},
+			headers: actor.headers,
+		});
+		expect(primed.success).toBe(true);
+
+		await auth.api.updateOrgRole({
+			body: {
+				roleId: delegator.data.roleData.id,
+				data: { permission: { ac: ["create", "update", "delete"] } },
+			},
+			headers,
+		});
+		const createAfterRevocation = await authClient.organization.createRole(
+			{
+				role: `stale-cache-create-${crypto.randomUUID()}`,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers: actor.headers },
+		);
+		expect(createAfterRevocation.data).toBeNull();
+		expect(createAfterRevocation.error?.message).toBe(
+			ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_CREATE_A_ROLE.message,
+		);
+		await expect(
+			auth.api.updateOrgRole({
+				body: {
+					roleId: target.data.roleData.id,
+					data: { permission: { project: ["read"] } },
+				},
+				headers: actor.headers,
+			}),
+		).rejects.toThrow(
+			ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_UPDATE_A_ROLE.message,
+		);
+
+		await auth.api.updateOrgRole({
+			body: {
+				roleId: delegator.data.roleData.id,
+				data: { permission: { ac: ["create", "update"] } },
+			},
+			headers,
+		});
+		await expect(
+			auth.api.deleteOrgRole({
+				body: { roleId: target.data.roleData.id },
+				headers: actor.headers,
+			}),
+		).rejects.toThrow(
+			ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_DELETE_A_ROLE.message,
+		);
+	});
+
+	it("keeps a role mutation on its adapter when another adapter owns a transaction", async () => {
+		const { auth: otherAuth } = await getTestInstance();
+		const otherContext = await otherAuth.$context;
+		const result = await completesWithin(
+			runWithTransaction(otherContext.adapter, () =>
+				authClient.organization.createRole(
+					{
+						role: `foreign-transaction-role-${crypto.randomUUID()}`,
+						permission: { project: ["read"] },
+						additionalFields: { color: "#000000" },
+					},
+					{ headers },
+				),
+			),
+			"dynamic role mutation under a different adapter transaction",
+		);
+		expect(result.data?.success).toBe(true);
+	});
+
+	it("never leaves a member assigned to a role deleted concurrently", async () => {
+		const role = `assignment-race-role-${crypto.randomUUID()}`;
+		const created = await authClient.organization.createRole(
+			{
+				role,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		const { member: targetMember } = await createUser({ role: "member" });
+		const authContext = await auth.$context;
+		const originalTransaction = authContext.adapter.transaction;
+		const roleAssignmentCheckEntered = deferred();
+		const releaseRoleDeletion = deferred();
+		let pauseRoleAssignmentCheck = true;
+
+		authContext.adapter.transaction = async (callback) =>
+			originalTransaction(async (transaction) => {
+				const transactionWithBarrier = new Proxy(transaction, {
+					get(target, property, receiver) {
+						if (property !== "findMany") {
+							return Reflect.get(target, property, receiver);
+						}
+						return async (
+							...args: Parameters<typeof transaction.findMany>
+						) => {
+							const [input] = args;
+							const result = await Reflect.apply(
+								target.findMany,
+								target,
+								args,
+							);
+							if (
+								pauseRoleAssignmentCheck &&
+								input.model === "member" &&
+								input.where?.some(
+									(condition) =>
+										condition.field === "role" &&
+										condition.operator === "contains" &&
+										condition.value === role,
+									) === true
+							) {
+								pauseRoleAssignmentCheck = false;
+								roleAssignmentCheckEntered.resolve();
+								await releaseRoleDeletion.promise;
+							}
+							return result;
+						};
+					},
+				});
+				return callback(transactionWithBarrier);
+			});
+
+		try {
+			const deletion = auth.api.deleteOrgRole({
+				body: { roleId: created.data.roleData.id },
+				headers,
+			});
+			await completesWithin(
+				roleAssignmentCheckEntered.promise,
+				"role deletion reaching its member-assignment check",
+			);
+			const assignment = auth.api.updateMemberRole({
+				body: { memberId: targetMember.id, role },
+				headers,
+			});
+			releaseRoleDeletion.resolve();
+
+			const [deleted, assigned] = await completesWithin(
+				Promise.allSettled([deletion, assignment]),
+				"delete and member-role assignment race",
+			);
+			expect(deleted.status).toBe("fulfilled");
+			expect(assigned.status).toBe("rejected");
+			const members = await auth.api.listMembers({
+				query: { organizationId: org.data.id },
+				headers,
+			});
+			const target = members.members?.find((member) => member.id === targetMember.id);
+			expect(target?.role.split(",")).not.toContain(role);
+			await expect(
+				auth.api.getOrgRole({
+					query: { organizationId: org.data.id, roleName: role },
+					headers,
+				}),
+			).rejects.toThrow(ORGANIZATION_ERROR_CODES.ROLE_NOT_FOUND.message);
+		} finally {
+			releaseRoleDeletion.resolve();
+			authContext.adapter.transaction = originalTransaction;
+		}
+	});
+
+	it("does not rename a dynamic role assigned to a member", async () => {
+		const role = `assigned-rename-role-${crypto.randomUUID()}`;
+		const created = await authClient.organization.createRole(
+			{
+				role,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		const { member: targetMember } = await createUser({ role: "member" });
+		await auth.api.updateMemberRole({
+			body: { memberId: targetMember.id, role: ["member", role] },
+			headers,
+		});
+
+		const renamedRole = `${role}-renamed`;
+		await expect(
+			auth.api.updateOrgRole({
+				body: {
+					roleId: created.data.roleData.id,
+					data: { roleName: renamedRole },
+				},
+				headers,
+			}),
+		).rejects.toThrow(ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS.message);
+		const unchanged = await auth.api.getOrgRole({
+			query: { organizationId: org.data.id, roleName: role },
+			headers,
+		});
+		expect(unchanged.role).toBe(role);
+
+		await auth.api.updateMemberRole({
+			body: { memberId: targetMember.id, role: "member" },
+			headers,
+		});
+		await auth.api.deleteOrgRole({
+			body: { roleId: created.data.roleData.id },
+			headers,
+		});
+	});
+
+	it("does not rename a dynamic role assigned to a pending invitation", async () => {
+		const role = `invited-rename-role-${crypto.randomUUID()}`;
+		const created = await authClient.organization.createRole(
+			{
+				role,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		await auth.api.createInvitation({
+			body: {
+				email: `invited-rename-${crypto.randomUUID()}@email.com`,
+				organizationId: org.data.id,
+				role: role as never,
+			},
+			headers,
+		});
+
+		await expect(
+			auth.api.updateOrgRole({
+				body: {
+					roleId: created.data.roleData.id,
+					data: { roleName: `${role}-renamed` },
+				},
+				headers,
+			}),
+		).rejects.toThrow(ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS.message);
+	});
+
+	it("ignores expired pending invitations but preserves unexpired role references", async () => {
+		const expiredRole = `expired-invitation-role-${crypto.randomUUID()}`;
+		const expired = await authClient.organization.createRole(
+			{
+				role: expiredRole,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!expired.data) throw expired.error;
+		const expiredInvitation = await auth.api.createInvitation({
+			body: {
+				email: `expired-invitation-${crypto.randomUUID()}@email.com`,
+				organizationId: org.data.id,
+				role: expiredRole as never,
+			},
+			headers,
+		});
+		const authContext = await auth.$context;
+		await authContext.adapter.update({
+			model: "invitation",
+			where: [{ field: "id", value: expiredInvitation.id }],
+			update: { expiresAt: new Date(Date.now() - 1_000) },
+		});
+		const renamedExpiredRole = `${expiredRole}-renamed`;
+		const renamed = await auth.api.updateOrgRole({
+			body: {
+				roleId: expired.data.roleData.id,
+				data: { roleName: renamedExpiredRole },
+			},
+			headers,
+		});
+		expect(renamed.roleData.role).toBe(renamedExpiredRole);
+
+		const unexpiredRole = `unexpired-invitation-role-${crypto.randomUUID()}`;
+		const unexpired = await authClient.organization.createRole(
+			{
+				role: unexpiredRole,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!unexpired.data) throw unexpired.error;
+		await auth.api.createInvitation({
+			body: {
+				email: `unexpired-invitation-${crypto.randomUUID()}@email.com`,
+				organizationId: org.data.id,
+				role: unexpiredRole as never,
+			},
+			headers,
+		});
+		await expect(
+			auth.api.updateOrgRole({
+				body: {
+					roleId: unexpired.data.roleData.id,
+					data: { roleName: `${unexpiredRole}-renamed` },
+				},
+				headers,
+			}),
+		).rejects.toThrow(ORGANIZATION_ERROR_CODES.ROLE_IS_ASSIGNED_TO_MEMBERS.message);
+	});
+
+	it("never leaves a member assigned to a role renamed concurrently", async () => {
+		const role = `rename-race-role-${crypto.randomUUID()}`;
+		const renamedRole = `${role}-renamed`;
+		const created = await authClient.organization.createRole(
+			{
+				role,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		const { member: targetMember } = await createUser({ role: "member" });
+		const authContext = await auth.$context;
+		const originalTransaction = authContext.adapter.transaction;
+		const roleAssignmentCheckEntered = deferred();
+		const releaseRoleRename = deferred();
+		let pauseRoleAssignmentCheck = true;
+
+		authContext.adapter.transaction = async (callback) =>
+			originalTransaction(async (transaction) => {
+				const transactionWithBarrier = new Proxy(transaction, {
+					get(target, property, receiver) {
+						if (property !== "findMany") {
+							return Reflect.get(target, property, receiver);
+						}
+						return async (
+							...args: Parameters<typeof transaction.findMany>
+						) => {
+							const [input] = args;
+							const result = await Reflect.apply(
+								target.findMany,
+								target,
+								args,
+							);
+							if (
+								pauseRoleAssignmentCheck &&
+								input.model === "member" &&
+								input.where?.some(
+									(condition) =>
+										condition.field === "role" &&
+										condition.operator === "contains" &&
+										condition.value === role,
+									) === true
+							) {
+								pauseRoleAssignmentCheck = false;
+								roleAssignmentCheckEntered.resolve();
+								await releaseRoleRename.promise;
+							}
+							return result;
+						};
+					},
+				});
+				return callback(transactionWithBarrier);
+			});
+
+		try {
+			const rename = auth.api.updateOrgRole({
+				body: { roleId: created.data.roleData.id, data: { roleName: renamedRole } },
+				headers,
+			});
+			await completesWithin(
+				roleAssignmentCheckEntered.promise,
+				"role rename reaching its member-assignment check",
+			);
+			const assignment = auth.api.updateMemberRole({
+				body: { memberId: targetMember.id, role },
+				headers,
+			});
+			releaseRoleRename.resolve();
+
+			const [renameResult, assigned] = await completesWithin(
+				Promise.allSettled([rename, assignment]),
+				"rename and member-role assignment race",
+			);
+			expect(renameResult.status).toBe("fulfilled");
+			expect(assigned.status).toBe("rejected");
+			const members = await auth.api.listMembers({
+				query: { organizationId: org.data.id },
+				headers,
+			});
+			const target = members.members?.find((member) => member.id === targetMember.id);
+			expect(target?.role.split(",")).not.toContain(role);
+			const renamedRoleInDb = await auth.api.getOrgRole({
+				query: { organizationId: org.data.id, roleName: renamedRole },
+				headers,
+			});
+			expect(renamedRoleInDb.role).toBe(renamedRole);
+		} finally {
+			releaseRoleRename.resolve();
+			authContext.adapter.transaction = originalTransaction;
+		}
+	});
+
+	it("never leaves a pending invitation assigned to a role renamed concurrently", async () => {
+		const role = `invitation-rename-race-role-${crypto.randomUUID()}`;
+		const renamedRole = `${role}-renamed`;
+		const inviteEmail = `invitation-rename-race-${crypto.randomUUID()}@email.com`;
+		const created = await authClient.organization.createRole(
+			{
+				role,
+				permission: { project: ["read"] },
+				additionalFields: { color: "#000000" },
+			},
+			{ headers },
+		);
+		if (!created.data) throw created.error;
+		const authContext = await auth.$context;
+		const originalTransaction = authContext.adapter.transaction;
+		const invitationCheckEntered = deferred();
+		const releaseRoleRename = deferred();
+		let pauseInvitationCheck = true;
+
+		authContext.adapter.transaction = async (callback) =>
+			originalTransaction(async (transaction) => {
+				const transactionWithBarrier = new Proxy(transaction, {
+					get(target, property, receiver) {
+						if (property !== "findMany") {
+							return Reflect.get(target, property, receiver);
+						}
+						return async (
+							...args: Parameters<typeof transaction.findMany>
+						) => {
+							const [input] = args;
+							const result = await Reflect.apply(
+								target.findMany,
+								target,
+								args,
+							);
+							if (
+								pauseInvitationCheck &&
+								input.model === "invitation" &&
+								input.where?.some(
+									(condition) => condition.field === "role" && condition.value === role,
+								) === true
+							) {
+								pauseInvitationCheck = false;
+								invitationCheckEntered.resolve();
+								await releaseRoleRename.promise;
+							}
+							return result;
+						};
+					},
+				});
+				return callback(transactionWithBarrier);
+			});
+
+		try {
+			const rename = auth.api.updateOrgRole({
+				body: { roleId: created.data.roleData.id, data: { roleName: renamedRole } },
+				headers,
+			});
+			await completesWithin(
+				invitationCheckEntered.promise,
+				"role rename reaching its pending-invitation check",
+			);
+			const invitation = auth.api.createInvitation({
+				body: {
+					email: inviteEmail,
+					organizationId: org.data.id,
+					role: role as never,
+				},
+				headers,
+			});
+			releaseRoleRename.resolve();
+
+			const [renameResult, invitationResult] = await completesWithin(
+				Promise.allSettled([rename, invitation]),
+				"rename and invitation creation race",
+			);
+			expect(renameResult.status).toBe("fulfilled");
+			expect(invitationResult.status).toBe("rejected");
+			const pendingInvitation = await authContext.adapter.findOne<{ id: string }>({
+				model: "invitation",
+				where: [
+					{ field: "organizationId", value: org.data.id },
+					{ field: "email", value: inviteEmail },
+					{ field: "status", value: "pending" },
+				],
+			});
+			expect(pendingInvitation).toBeNull();
+			const renamedRoleInDb = await auth.api.getOrgRole({
+				query: { organizationId: org.data.id, roleName: renamedRole },
+				headers,
+			});
+			expect(renamedRoleInDb.role).toBe(renamedRole);
+		} finally {
+			releaseRoleRename.resolve();
+			authContext.adapter.transaction = originalTransaction;
+		}
 	});
 
 	it("should not be allowed to create a role without the right ac resource permissions", async () => {

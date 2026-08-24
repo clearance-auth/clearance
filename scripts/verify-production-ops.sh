@@ -12,6 +12,10 @@ PASS=0
 FAIL=0
 SKIP=0
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/clearance-prod-ops.XXXXXX")"
+PRODUCT_CONFIGURATION_ENV_FILE="$SCRATCH/product-configuration.env"
+printf '%s\n' 'CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON={"txt":[],"cname":[],"mx":[]}' >"$PRODUCT_CONFIGURATION_ENV_FILE"
+chmod 600 "$PRODUCT_CONFIGURATION_ENV_FILE"
+export CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE="$PRODUCT_CONFIGURATION_ENV_FILE"
 PG_CID=""
 COMPOSE_PROJECT=""
 
@@ -47,6 +51,7 @@ SCRIPTS=(
   scripts/upgrade-verify.sh
   scripts/upgrade-rollback.sh
   scripts/sign-release.sh
+  scripts/verify-release-bundle.sh
   scripts/verify-production-ops.sh
 )
 for s in "${SCRIPTS[@]}"; do
@@ -57,9 +62,20 @@ for s in "${SCRIPTS[@]}"; do
     bad "$s missing set -Eeuo pipefail (or set -euo pipefail)"
   fi
 done
-# Note: the former sign-release source-grep checks (genrsa / signing-key text)
-# were removed — the behavioral sign-release section below proves the same
-# contracts by execution (refuses missing key, real verifiable signature).
+# Detached release verification must use an independently anchored keyless
+# identity, never a public key distributed beside the asset it verifies.
+if grep -qE 'release-public\.pem|release-bundle\.sig(["[:space:]]|$)|CLEARANCE_RELEASE_SIGNING_KEY' scripts/sign-release.sh .github/workflows/release-sign.yml; then
+  bad "release signing still trusts a sibling key/signature asset or legacy private signing key"
+else
+  ok "release signing uses no sibling public key or long-lived private key"
+fi
+if grep -Fq 'cosign verify-blob --bundle' scripts/verify-release-bundle.sh \
+  && grep -Fq 'https://token.actions.githubusercontent.com' scripts/verify-release-bundle.sh \
+  && grep -Fq 'clearance-auth/clearance' scripts/verify-release-bundle.sh; then
+  ok "release verifier anchors Sigstore bundle to canonical GitHub publisher identity"
+else
+  bad "release verifier lacks canonical keyless publisher trust anchor"
+fi
 
 if grep -qE 'trap .*BASH_COMMAND|COMPOSE_SMOKE_FAILED.*command=' scripts/compose-smoke.sh; then
   bad "compose smoke failure diagnostics can expose expanded secret-bearing commands"
@@ -73,11 +89,19 @@ PROD=deploy/compose/docker-compose.production.yml
 if [[ ! -f "$PROD" ]]; then
   bad "missing $PROD"
 else
-  # Only flag real ${VAR:-default} forms (not comments, not fail-closed ${VAR:?msg}).
-  if grep -E '^[^#]*\$\{[A-Z0-9_]+:-[^}]+\}' "$PROD" >/dev/null; then
-    bad "production overlay still has \${VAR:-default} interpolation"
+  # Vault branding is intentionally user-overridable. Every other production
+  # fallback would conceal required configuration or secret material.
+  if grep -E '^[^#]*\$\{[A-Z0-9_]+:-[^}]+\}' "$PROD" | grep -vE '^[[:space:]]+CLEARANCE_VAULT_(PRODUCT_NAME|HOME_LABEL|ACCENT_COLOR): ' >/dev/null; then
+    bad "production overlay still has a non-branding \${VAR:-default} interpolation"
   else
-    ok "production overlay has no \${VAR:-default} traps"
+    ok "production overlay permits only explicit Vault branding defaults"
+  fi
+  if grep -q 'CLEARANCE_VAULT_PRODUCT_NAME: \${CLEARANCE_VAULT_PRODUCT_NAME:-Clearance}' "$PROD" \
+    && grep -q 'CLEARANCE_VAULT_HOME_LABEL: \${CLEARANCE_VAULT_HOME_LABEL:-Clearance Vault}' "$PROD" \
+    && grep -q 'CLEARANCE_VAULT_ACCENT_COLOR: "\${CLEARANCE_VAULT_ACCENT_COLOR:-#6558d3}"' "$PROD"; then
+    ok "Vault branding defaults are intentional and exact"
+  else
+    bad "Vault branding defaults are missing or changed"
   fi
   if grep -q 'DATABASE_URL: \${DATABASE_URL:?' "$PROD"; then
     ok "DATABASE_URL required fail-closed"
@@ -95,10 +119,10 @@ else
     bad "postgres ports not reset in production overlay"
   fi
   PROD_PORT_OVERRIDES="$(grep -cE '^[[:space:]]+ports: !override$' "$PROD" || true)"
-  if [[ "$PROD_PORT_OVERRIDES" == "3" ]]; then
-    ok "API, console, and sample production ports replace base bindings"
+  if [[ "$PROD_PORT_OVERRIDES" == "5" ]]; then
+    ok "API, delivery worker, console, Vault, and sample production ports replace base bindings"
   else
-    bad "expected three production !override port lists, found $PROD_PORT_OVERRIDES"
+    bad "expected five production !override port lists, found $PROD_PORT_OVERRIDES"
   fi
   if grep -qE 'CLEARANCE_SECRET:-\$\{|:-dev-secret|:-change-me|:-clearance"' "$PROD"; then
     bad "weak secret defaults in production overlay"
@@ -141,6 +165,39 @@ export CLEARANCE_OPERATOR_TOKEN="short"
 export CLEARANCE_SECRET="dev-secret-change-me"
 export CLEARANCE_CREDENTIAL_KEY="x"
 export CLEARANCE_CREDENTIAL_KEY_ID="k1"
+export CLEARANCE_DELIVERY_KEY_ID="enc-v1"
+export CLEARANCE_DELIVERY_KEYS_JSON='{"enc-v1":"short"}'
+export CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID="fp-v1"
+export CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON='{"fp-v1":"short"}'
+export CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY="short"
+export CLEARANCE_DELIVERY_SCHEMA="public"
+export CLEARANCE_DELIVERY_PREFIX="delivery_"
+export CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE="10000"
+export CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG="5000"
+export CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW="1000"
+export CLEARANCE_DELIVERY_QUOTA_WINDOW_MS="60000"
+export CLEARANCE_DELIVERY_CONCURRENCY="4"
+export CLEARANCE_DELIVERY_POLL_MS="500"
+export CLEARANCE_DELIVERY_LEASE_MS="60000"
+export CLEARANCE_DELIVERY_HEARTBEAT_MS="10000"
+export CLEARANCE_DELIVERY_MAINTENANCE_MS="30000"
+export CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS="30000"
+export CLEARANCE_DELIVERY_MAX_BODY_BYTES="1048576"
+export CLEARANCE_DELIVERY_APP_NAME="Clearance"
+export CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT="8091"
+export CLEARANCE_EMAIL_TRANSPORT="smtp"
+export CLEARANCE_EMAIL_FROM="auth@example.test"
+export CLEARANCE_SMTP_HOST="smtp.example.test"
+export CLEARANCE_SMTP_PORT="587"
+export CLEARANCE_SMTP_SECURE="false"
+export CLEARANCE_SMTP_REQUIRE_TLS="true"
+export CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS="10000"
+export CLEARANCE_SMTP_SOCKET_TIMEOUT_MS="30000"
+export CLEARANCE_SMTP_GREETING_TIMEOUT_MS="10000"
+export CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS="5000"
+export CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS="5000"
+export CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS="10000"
+export CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES="65536"
 export CLEARANCE_CONSOLE_ADMIN_USER="admin"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="password"
 export CLEARANCE_CONSOLE_SESSION_SECRET="change-me"
@@ -151,13 +208,22 @@ export DATABASE_URL="postgres://clearance:clearance@postgres:5432/clearance"
 export CLEARANCE_BASE_URL="https://app.example.test"
 export CLEARANCE_CONSOLE_URL="https://console.example.test"
 export CLEARANCE_CORS_ORIGINS="https://app.example.test"
+export CLEARANCE_CUSTOM_DOMAIN_TARGET="edge.clearance.example"
 export CLEARANCE_API_PORT="3200"
 export CLEARANCE_CONSOLE_PORT="3100"
 export CLEARANCE_SAMPLE_PORT="3000"
+export CLEARANCE_VAULT_PORT="3400"
+export CLEARANCE_VAULT_URL="https://vault.example.test"
+export CLEARANCE_PROJECT_ID="proj_production"
+export CLEARANCE_ENV_ID="env_production"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON='{"oidc-client-secret":{"kind":"local","providerId":"proof-oidc","currentKeyId":"v1","keys":{"v1":"G3QVSNhWa9M3Dg26p7lhm_JnQi9EnXmvRaYc7qNHo5E"}},"scim-bearer-token":{"kind":"local","providerId":"proof-scim","currentKeyId":"v1","keys":{"v1":"2YHq9aVr8Krno9pfjuiLWBzD1N6jXOTs9w_7kZcNEYw"}},"service-account-credential-replay":{"kind":"local","providerId":"proof-service-account","currentKeyId":"v1","keys":{"v1":"x4BIe2yE6ydWBtwZmhbKx1NRiSFOOcHzSuVpZawFdKI"}},"access-token-signing-key":{"kind":"local","providerId":"proof-jwt-envelope","currentKeyId":"v1","keys":{"v1":"p7RRo3XbWIpzBJsCZATJzIHSrc5yhuTpEqDS5EibL0A"}},"access-token-signer":{"kind":"local","providerId":"proof-jwt-signer","currentKeyReference":"v1","keys":{"v1":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtYjd5lp-OKktRH7sUX4s9jWE8tdLCTQtiNz62EkLINShRANCAATvY51FdYW9TthgUs57waN3y0-sBzsB22CEncgm9sPnGrmVnfsYScpq2v9mnRTX8zhMgdVs_ar9tuK1D9tRNEYa"}}}'
 export CLEARANCE_PG_VOLUME="clearance_pg_prod"
 export CLEARANCE_BACKUP_VOLUME="clearance_backups_prod"
 export CLEARANCE_IMAGE_REPOSITORY="ghcr.io/example/clearance"
 export CLEARANCE_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION="digest-v1"
+export CLEARANCE_DEPLOYMENT_ID="production-proof-v03"
+export CLEARANCE_CREDENTIAL_DRAIN_ID="production-proof-drain-v03"
 export CLEARANCE_BACKUP_IMAGE_REPOSITORY="ghcr.io/example/clearance-backup"
 export CLEARANCE_BACKUP_IMAGE_DIGEST="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 export NODE_ENV=production
@@ -185,9 +251,19 @@ fi
 unset CLEARANCE_GITHUB_CLIENT_ID
 
 # Strong secrets should pass (localhost base URL requires allow flag)
+# The fixture owns optional social-provider state; inherited operator shell
+# values must not turn this into an accidental incomplete-pair test.
+unset CLEARANCE_GITHUB_CLIENT_ID CLEARANCE_GITHUB_CLIENT_SECRET \
+  CLEARANCE_GOOGLE_CLIENT_ID CLEARANCE_GOOGLE_CLIENT_SECRET || true
 export CLEARANCE_OPERATOR_TOKEN="$(openssl rand -hex 24)"
 export CLEARANCE_SECRET="$(openssl rand -hex 24)"
 export CLEARANCE_CREDENTIAL_KEY="$(openssl rand -hex 24)"
+DELIVERY_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+DELIVERY_FINGERPRINT_KEY="$(openssl rand -hex 32)"
+DELIVERY_SOURCE_KEY="$(openssl rand -hex 32)"
+export CLEARANCE_DELIVERY_KEYS_JSON="{\"enc-v1\":\"$DELIVERY_ENCRYPTION_KEY\"}"
+export CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON="{\"fp-v1\":\"$DELIVERY_FINGERPRINT_KEY\"}"
+export CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY="$DELIVERY_SOURCE_KEY"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="$(openssl rand -hex 24)"
 export CLEARANCE_CONSOLE_SESSION_SECRET="$(openssl rand -hex 24)"
 export CLEARANCE_DB_PASSWORD="$(openssl rand -hex 24)"
@@ -202,43 +278,225 @@ set -e
 if [[ $ec -eq 0 ]]; then
   ok "validate-production-env accepts strong production-like env"
 else
-  bad "validate-production-env rejected strong env: $(head -5 "$SCRATCH/val-ok.txt" | tr '\n' ' ')"
+  bad "validate-production-env rejected strong env: $(grep '^fail:' "$SCRATCH/val-ok.txt" | tr '\n' ' ')"
 fi
 
-# ---------- behavioral: sign-release ----------
-section "behavioral: sign-release fail-closed without key"
-unset CLEARANCE_RELEASE_SIGNING_KEY CLEARANCE_RELEASE_SIGNING_KEY_FILE || true
+for vault_negative_case in noncanonical_url localhost_http_url invalid_port invalid_scope incomplete_key_config; do
+  case "$vault_negative_case" in
+    noncanonical_url) export CLEARANCE_VAULT_URL="https://vault.example.test/not-an-origin" ;;
+    localhost_http_url) export CLEARANCE_ALLOW_LOCALHOST_PRODUCTION=1; export CLEARANCE_VAULT_URL="http://localhost:3400" ;;
+    invalid_port) export CLEARANCE_VAULT_PORT="70000" ;;
+    invalid_scope) export CLEARANCE_PROJECT_ID=" proj_production" ;;
+    incomplete_key_config) export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON='{}' ;;
+  esac
+  set +e
+  bash scripts/validate-production-env.sh >/dev/null 2>&1
+  ec=$?
+  set -e
+  if [[ $ec -ne 0 ]]; then
+    ok "validate-production-env rejects Vault $vault_negative_case"
+  else
+    bad "validate-production-env accepted Vault $vault_negative_case"
+  fi
+  export CLEARANCE_VAULT_URL="https://vault.example.test"
+  export CLEARANCE_ALLOW_LOCALHOST_PRODUCTION=0
+  export CLEARANCE_VAULT_PORT="3400"
+  export CLEARANCE_PROJECT_ID="proj_production"
+  export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON='{"oidc-client-secret":{"kind":"local","providerId":"proof-oidc","currentKeyId":"v1","keys":{"v1":"G3QVSNhWa9M3Dg26p7lhm_JnQi9EnXmvRaYc7qNHo5E"}},"scim-bearer-token":{"kind":"local","providerId":"proof-scim","currentKeyId":"v1","keys":{"v1":"2YHq9aVr8Krno9pfjuiLWBzD1N6jXOTs9w_7kZcNEYw"}},"service-account-credential-replay":{"kind":"local","providerId":"proof-service-account","currentKeyId":"v1","keys":{"v1":"x4BIe2yE6ydWBtwZmhbKx1NRiSFOOcHzSuVpZawFdKI"}},"access-token-signing-key":{"kind":"local","providerId":"proof-jwt-envelope","currentKeyId":"v1","keys":{"v1":"p7RRo3XbWIpzBJsCZATJzIHSrc5yhuTpEqDS5EibL0A"}},"access-token-signer":{"kind":"local","providerId":"proof-jwt-signer","currentKeyReference":"v1","keys":{"v1":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtYjd5lp-OKktRH7sUX4s9jWE8tdLCTQtiNz62EkLINShRANCAATvY51FdYW9TthgUs57waN3y0-sBzsB22CEncgm9sPnGrmVnfsYScpq2v9mnRTX8zhMgdVs_ar9tuK1D9tRNEYa"}}}'
+done
+
+AWS_KMS_MINIMAL_CONFIG="$(KEY_MANAGEMENT_CONFIG="$CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["oidc-client-secret"]={kind:"aws-kms",providerId:"proof-oidc-kms",currentKeyId:"11111111-1111-4111-8111-111111111111",region:"us-east-1"};
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$AWS_KMS_MINIMAL_CONFIG"
+if bash scripts/validate-production-env.sh >/dev/null 2>&1; then
+  ok "validate-production-env accepts a minimal AWS KMS key provider without optional fields"
+else
+  bad "validate-production-env rejected a minimal AWS KMS key provider"
+fi
+INVALID_AWS_KMS_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_KMS_MINIMAL_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["oidc-client-secret"].currentKeyId="alias/proof-oidc";
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$INVALID_AWS_KMS_CONFIG"
 set +e
-bash scripts/sign-release.sh "$SCRATCH/unsigned-should-fail" >/dev/null 2>&1
+bash scripts/validate-production-env.sh >/dev/null 2>&1
 ec=$?
 set -e
 if [[ $ec -ne 0 ]]; then
-  ok "sign-release refuses missing key"
+  ok "validate-production-env rejects mutable AWS KMS aliases"
 else
-  bad "sign-release should fail without key"
+  bad "validate-production-env accepted a mutable AWS KMS alias"
+fi
+OVERLAPPING_AWS_KMS_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_KMS_MINIMAL_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["oidc-client-secret"].retainedKeyIds=[config["oidc-client-secret"].currentKeyId];
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$OVERLAPPING_AWS_KMS_CONFIG"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects an AWS KMS retained key equal to current"
+else
+  bad "validate-production-env accepted an AWS KMS retained key equal to current"
+fi
+GCP_KMS_MINIMAL_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_KMS_MINIMAL_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["scim-bearer-token"]={kind:"gcp-kms",providerId:"proof-scim-kms",currentKeyId:"projects/proof-project/locations/us-east1/keyRings/proof-ring/cryptoKeys/proof-scim"};
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$GCP_KMS_MINIMAL_CONFIG"
+if bash scripts/validate-production-env.sh >/dev/null 2>&1; then
+  ok "validate-production-env accepts a minimal immutable GCP KMS CryptoKey"
+else
+  bad "validate-production-env rejected a minimal immutable GCP KMS CryptoKey"
+fi
+INVALID_GCP_KMS_CONFIG="$(KEY_MANAGEMENT_CONFIG="$GCP_KMS_MINIMAL_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["scim-bearer-token"].currentKeyId+="/cryptoKeyVersions/1";
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$INVALID_GCP_KMS_CONFIG"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a GCP CryptoKeyVersion for encryption"
+else
+  bad "validate-production-env accepted a GCP CryptoKeyVersion for encryption"
+fi
+AWS_REMOTE_SIGNER_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_KMS_MINIMAL_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["access-token-signer"]={kind:"aws-kms",providerId:"proof-jwt-kms",currentKeyReference:"33333333-3333-4333-8333-333333333333",retainedKeys:[{keyReference:"44444444-4444-4444-8444-444444444444",retiredAt:"2025-01-01T00:00:00.000Z"}],region:"us-east-1"};
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$AWS_REMOTE_SIGNER_CONFIG"
+if bash scripts/validate-production-env.sh >/dev/null 2>&1; then
+  ok "validate-production-env accepts immutable AWS remote signer current and retained keys"
+else
+  bad "validate-production-env rejected immutable AWS remote signer keys"
+fi
+INVALID_AWS_REMOTE_SIGNER_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_REMOTE_SIGNER_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["access-token-signer"].retainedKeys[0].keyReference="alias/proof-old-signer";
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$INVALID_AWS_REMOTE_SIGNER_CONFIG"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a mutable AWS remote signer alias"
+else
+  bad "validate-production-env accepted a mutable AWS remote signer alias"
+fi
+OVERLAPPING_AWS_REMOTE_SIGNER_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_REMOTE_SIGNER_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["access-token-signer"].retainedKeys[0].keyReference=config["access-token-signer"].currentKeyReference;
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$OVERLAPPING_AWS_REMOTE_SIGNER_CONFIG"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a remote signer retained key equal to current"
+else
+  bad "validate-production-env accepted a remote signer retained key equal to current"
+fi
+FUTURE_AWS_REMOTE_SIGNER_CONFIG="$(KEY_MANAGEMENT_CONFIG="$AWS_REMOTE_SIGNER_CONFIG" node -e '
+  const config=JSON.parse(process.env.KEY_MANAGEMENT_CONFIG);
+  config["access-token-signer"].retainedKeys[0].retiredAt="2100-01-01T00:00:00.000Z";
+  process.stdout.write(JSON.stringify(config));
+')"
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="$FUTURE_AWS_REMOTE_SIGNER_CONFIG"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a future remote signer retirement"
+else
+  bad "validate-production-env accepted a future remote signer retirement"
+fi
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON='{"oidc-client-secret":{"kind":"local","providerId":"proof-oidc","currentKeyId":"v1","keys":{"v1":"G3QVSNhWa9M3Dg26p7lhm_JnQi9EnXmvRaYc7qNHo5E"}},"scim-bearer-token":{"kind":"local","providerId":"proof-scim","currentKeyId":"v1","keys":{"v1":"2YHq9aVr8Krno9pfjuiLWBzD1N6jXOTs9w_7kZcNEYw"}},"service-account-credential-replay":{"kind":"local","providerId":"proof-service-account","currentKeyId":"v1","keys":{"v1":"x4BIe2yE6ydWBtwZmhbKx1NRiSFOOcHzSuVpZawFdKI"}},"access-token-signing-key":{"kind":"local","providerId":"proof-jwt-envelope","currentKeyId":"v1","keys":{"v1":"p7RRo3XbWIpzBJsCZATJzIHSrc5yhuTpEqDS5EibL0A"}},"access-token-signer":{"kind":"local","providerId":"proof-jwt-signer","currentKeyReference":"v1","keys":{"v1":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtYjd5lp-OKktRH7sUX4s9jWE8tdLCTQtiNz62EkLINShRANCAATvY51FdYW9TthgUs57waN3y0-sBzsB22CEncgm9sPnGrmVnfsYScpq2v9mnRTX8zhMgdVs_ar9tuK1D9tRNEYa"}}}'
+
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="missing-retained-key"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects a legacy fingerprint key id absent from the retained ring"
+else
+  bad "validate-production-env accepted a legacy fingerprint key id absent from the retained ring"
+fi
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="invalid key id"
+set +e
+bash scripts/validate-production-env.sh >/dev/null 2>&1
+ec=$?
+set -e
+if [[ $ec -ne 0 ]]; then
+  ok "validate-production-env rejects malformed legacy fingerprint key ids"
+else
+  bad "validate-production-env accepted a malformed legacy fingerprint key id"
+fi
+export CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID="fp-v1"
+if bash scripts/validate-production-env.sh >/dev/null 2>&1; then
+  ok "validate-production-env accepts a retained legacy fingerprint key id"
+else
+  bad "validate-production-env rejected a retained legacy fingerprint key id"
+fi
+unset CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID
+
+export CLEARANCE_EMAIL_TRANSPORT="ses"
+export CLEARANCE_SES_REGION="us-east-1"
+export CLEARANCE_SES_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+export CLEARANCE_SES_SECRET_ACCESS_KEY="$(openssl rand -base64 32)"
+export CLEARANCE_SES_SESSION_TOKEN="$(openssl rand -base64 32)"
+export CLEARANCE_SES_REQUEST_TIMEOUT_MS="10000"
+set +e
+bash scripts/validate-production-env.sh >"$SCRATCH/val-ses-ok.txt" 2>&1
+ec=$?
+set -e
+if [[ $ec -eq 0 ]]; then
+  ok "validate-production-env accepts a complete SES session credential set"
+else
+  bad "validate-production-env rejected complete SES configuration"
+fi
+export CLEARANCE_EMAIL_TRANSPORT="smtp"
+unset CLEARANCE_SES_REGION CLEARANCE_SES_ACCESS_KEY_ID CLEARANCE_SES_SECRET_ACCESS_KEY CLEARANCE_SES_SESSION_TOKEN CLEARANCE_SES_REQUEST_TIMEOUT_MS
+
+# ---------- behavioral: detached release verifier ----------
+section "behavioral: detached release verifier rejects forged identity"
+set +e
+bash scripts/verify-release-bundle.sh --self-test >"$SCRATCH/forged-verifier.txt" 2>&1
+ec=$?
+set -e
+if [[ $ec -eq 0 ]] && grep -q 'RELEASE_BUNDLE_SELF_TEST_OK' "$SCRATCH/forged-verifier.txt"; then
+  ok "detached verifier rejects forged replacement publisher identity and sibling key"
+else
+  bad "detached verifier accepted forged replacement publisher identity or sibling key"
 fi
 
-section "behavioral: sign-release real signature + self-verify"
-KEY="$SCRATCH/test-release.key"
-openssl genrsa -out "$KEY" 2048 >/dev/null 2>&1
-export CLEARANCE_RELEASE_SIGNING_KEY_FILE="$KEY"
-export CLEARANCE_VERSION="0.1.0-test"
-bash scripts/sign-release.sh "$SCRATCH/signed" >/dev/null
-if [[ -s "$SCRATCH/signed/release-bundle.sig" && -s "$SCRATCH/signed/release-public.pem" ]]; then
-  openssl dgst -sha256 -verify "$SCRATCH/signed/release-public.pem" \
-    -signature "$SCRATCH/signed/release-bundle.sig" \
-    "$SCRATCH/signed/release-bundle.txt" >/dev/null \
-    && ok "sign-release produces verifiable signature" \
-    || bad "signature did not verify"
+section "static: release Docker and production Postgres references are digest pinned"
+if grep -Eq '^FROM .+@sha256:[0-9a-f]{64} AS ' Dockerfile \
+  && [[ "$(grep -Ec '^FROM .+@sha256:[0-9a-f]{64} AS ' Dockerfile)" -eq 3 ]] \
+  && grep -Eq 'image: postgres:16-alpine@sha256:[0-9a-f]{64}' deploy/compose/docker-compose.production.yml \
+  && grep -Eq 'name[[:space:]]*=[[:space:]]*"postgres:16-alpine@sha256:[0-9a-f]{64}"' deploy/terraform/main.tf; then
+  ok "release Docker and production Postgres image references are digest pinned"
 else
-  bad "sign-release missing sig/public key outputs"
+  bad "release Docker or production Postgres image reference is mutable"
 fi
-if grep -qi 'unsigned' "$SCRATCH/signed/provenance.json"; then
-  bad "provenance claims unsigned"
-else
-  ok "provenance does not claim unsigned"
-fi
-unset CLEARANCE_RELEASE_SIGNING_KEY_FILE
 
 # ---------- compose config with production overlay (no up) ----------
 section "behavioral: production compose config requires secrets"
@@ -274,6 +532,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   export CLEARANCE_BASE_URL="https://app.example.test"
   export CLEARANCE_CONSOLE_URL="https://console.example.test"
   export CLEARANCE_CORS_ORIGINS="https://app.example.test"
+  export CLEARANCE_CUSTOM_DOMAIN_TARGET="edge.clearance.example"
   export CLEARANCE_API_PORT="3200"
   export CLEARANCE_CONSOLE_PORT="3100"
   export CLEARANCE_SAMPLE_PORT="3000"
@@ -283,7 +542,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   export CLEARANCE_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   export CLEARANCE_BACKUP_IMAGE_REPOSITORY="ghcr.io/example/clearance-backup"
   export CLEARANCE_BACKUP_IMAGE_DIGEST="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  if docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml --profile backup config >"$SCRATCH/compose-ok.yml" 2>/dev/null; then
+  unset CLEARANCE_GITHUB_CLIENT_ID CLEARANCE_GITHUB_CLIENT_SECRET \
+    CLEARANCE_GOOGLE_CLIENT_ID CLEARANCE_GOOGLE_CLIENT_SECRET || true
+  if docker compose -f docker-compose.yml -f deploy/compose/docker-compose.production.yml --profile backup --profile migration --profile vault config >"$SCRATCH/compose-ok.yml" 2>/dev/null; then
     ok "production compose config succeeds with strong env"
     # postgres ports should be empty / absent host publish
     if node -e '
@@ -306,9 +567,13 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if node -e '
       const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
       const expected={
+        postgres:"postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
         api:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
+        "delivery-worker":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         console:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
+        vault:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         "sample-b2b":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
+        "credential-migrator":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         backup:"ghcr.io/example/clearance-backup@sha256:"+"b".repeat(64),
       };
       for (const [name,image] of Object.entries(expected)) {
@@ -316,14 +581,14 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         if(!m || !m[1].includes(`image: ${image}`) || /^    build:/m.test(m[1])) process.exit(1);
       }
     ' "$SCRATCH/compose-ok.yml"; then
-      ok "production Compose deploys signed digest references with local builds disabled"
+      ok "production Compose deploys immutable digest references with local builds disabled"
     else
-      bad "production Compose did not resolve exclusively to signed digest references"
+      bad "production Compose did not resolve exclusively to immutable digest references"
     fi
     if node -e '
       const fs=require("fs");
       const y=fs.readFileSync(process.argv[1],"utf8");
-      const expected={api:3200,console:3100,"sample-b2b":3000};
+      const expected={api:3200,"delivery-worker":8091,console:3100,vault:3400,"sample-b2b":3000};
       for (const [name,target] of Object.entries(expected)) {
         const escaped=name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
         const m=y.match(new RegExp(`^  ${escaped}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|\\nvolumes:|\\nnetworks:)`,"m"));
@@ -336,9 +601,28 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         }
       }
     ' "$SCRATCH/compose-ok.yml"; then
-      ok "resolved production config has exactly one API/console/sample binding each"
+      ok "resolved production config has exactly one API/worker/console/sample binding each"
     else
       bad "resolved production config has duplicate, missing, or unexpected service bindings"
+    fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  vault:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const vault=m[1];
+      const required=[
+        "profiles:", "- vault", "CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: digest-v1",
+        "CLEARANCE_VAULT_URL: https://vault.example.test", "CLEARANCE_PROJECT_ID: proj_production",
+        "CLEARANCE_ENV_ID: env_production", "CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON:",
+        "CLEARANCE_VAULT_PRODUCT_NAME: Clearance", "CLEARANCE_VAULT_HOME_LABEL: Clearance Vault",
+      ];
+      if(required.some((value)=>!vault.includes(value))) process.exit(1);
+      if(!/CLEARANCE_VAULT_ACCENT_COLOR:\s*["\x27]?#6558d3["\x27]?/.test(vault)) process.exit(1);
+      if(/CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:\s*legacy-v1/.test(vault)) process.exit(1);
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "Vault is profile-gated, digest-only, fully configured, and retains intentional branding defaults"
+    else
+      bad "Vault production migration, configuration, or branding contract is incomplete"
     fi
     if node -e '
       const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
@@ -355,6 +639,46 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     else
       bad "production API internal health or backup storage wiring is missing"
     fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  delivery-worker:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const worker=m[1];
+      const required=[
+        "packages/delivery-worker/dist/cli.mjs",
+        "http://127.0.0.1:8091/ready",
+      ];
+      if(required.some(value=>!worker.includes(value))) process.exit(1);
+      if(!/CLEARANCE_DELIVERY_HEALTH_HOST:\s*["\x27]?0\.0\.0\.0/.test(worker) ||
+         !/CLEARANCE_DELIVERY_HEALTH_PORT:\s*["\x27]?8091/.test(worker) ||
+         !/CLEARANCE_EMAIL_TRANSPORT:\s*["\x27]?smtp/.test(worker) ||
+         !/read_only:\s*true/.test(worker) ||
+         !/no-new-privileges:true/.test(worker) ||
+         !/stop_grace_period:\s*(?:45s|5m10s)/.test(worker)) process.exit(1);
+      for(const name of ["CLEARANCE_DELIVERY_KEYS_JSON","CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON","CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY"]) {
+        if(!worker.includes(name+":")) process.exit(1);
+      }
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "production delivery worker uses shared keys, hardened runtime, readiness, and graceful drain"
+    else
+      bad "production delivery worker wiring is incomplete"
+    fi
+    if node -e '
+      const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
+      const m=y.match(/^  credential-migrator:\n([\s\S]*?)(?=^  [a-zA-Z0-9_-]+:|\nvolumes:|\nnetworks:)/m);
+      if(!m) process.exit(2);
+      const job=m[1];
+      for(const value of ["schema","migrate","--local","--drain-id","production-proof-drain-v03"]) {
+        if(!job.includes(value)) process.exit(1);
+      }
+      if(!/^    restart:\s+(?:"no"|'no'|no)\s*$/m.test(job)) process.exit(1);
+      if(/published:|ports:/.test(job)) process.exit(1);
+	  if(!/depends_on:[\s\S]*postgres:[\s\S]*condition:\s*service_healthy/.test(job)) process.exit(1);
+    ' "$SCRATCH/compose-ok.yml"; then
+      ok "production Compose renders an unexposed one-shot credential migrator"
+    else
+      bad "production Compose credential migrator contract is incomplete"
+    fi
   else
     bad "production compose config failed with strong env"
   fi
@@ -365,6 +689,23 @@ else
 fi
 
 # ---------- Helm network and trusted-proxy contracts ----------
+fresh_compose_bootstrap=$(
+	sed -n '/For a fresh Compose database/,/The API and sample ports/p' \
+		docs/production-operations.md
+)
+if grep -Fq 'CLEARANCE_CREDENTIAL_DRAIN_ID="bootstrap-$CLEARANCE_DEPLOYMENT_ID"' \
+	<<<"$fresh_compose_bootstrap" \
+	&& grep -Fq -- '--profile migration run --rm credential-migrator' \
+		<<<"$fresh_compose_bootstrap" \
+	&& ! grep -Fq -- '--profile migration run --no-deps' \
+		<<<"$fresh_compose_bootstrap" \
+	&& grep -Fq '$COMPOSE up -d api sample-b2b' \
+		<<<"$fresh_compose_bootstrap"; then
+  ok "production Compose documents CLI-first fresh bootstrap before serving"
+else
+  bad "production Compose fresh bootstrap sequence is incomplete"
+fi
+
 section "behavioral: Helm network and trusted-proxy contracts"
 if command -v helm >/dev/null 2>&1; then
   HELM_ARGS=(
@@ -372,8 +713,13 @@ if command -v helm >/dev/null 2>&1; then
     --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --set secrets.existingSecret=clearance-secrets
     --set console.secrets.existingSecret=clearance-secrets
+    --set credentialAuthority.deploymentId=production-proof-v03
     --set env.CLEARANCE_BASE_URL=https://auth.example.test
     --set env.CLEARANCE_CORS_ORIGINS=https://console.example.test
+  )
+  DELIVERY_NETWORK_ARGS=(
+    --set-json 'delivery.worker.networkPolicy.dnsPeers=[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}]'
+    --set-json 'delivery.worker.networkPolicy.databasePeers=[{"podSelector":{"matchLabels":{"app.kubernetes.io/name":"postgresql"}}}]'
   )
   if helm lint deploy/helm/clearance "${HELM_ARGS[@]}" >/dev/null \
     && helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" >"$SCRATCH/helm-default.yml"; then
@@ -381,6 +727,13 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "Helm lint/default render failed"
   fi
+	if grep -q 'app.kubernetes.io/component: credential-migrator' "$SCRATCH/helm-default.yml" \
+	  && grep -q 'bootstrap-beta-production-proof-v03' "$SCRATCH/helm-default.yml" \
+	  && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-default.yml"; then
+	  ok "Helm fresh-install default bootstraps through an unexposed Job before serving"
+	else
+	  bad "Helm fresh-install bootstrap path is incomplete"
+	fi
   if grep -q 'name: beta-api-ingress' "$SCRATCH/helm-default.yml" \
     && grep -q 'name: beta-console-ingress' "$SCRATCH/helm-default.yml" \
     && grep -q 'name: beta-console-api-egress' "$SCRATCH/helm-default.yml" \
@@ -390,6 +743,102 @@ if command -v helm >/dev/null 2>&1; then
     ok "Helm defaults to untrusted forwarded headers and renders split policies"
   else
     bad "Helm default proxy/network policy contract is missing"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
+    --set credentialAuthority.phase=serve \
+    --set vault.enabled=true \
+    --set vault.secrets.existingSecret=clearance-secrets \
+    --set vault.publicUrl=https://vault.example.test \
+    --set vault.projectId=proj_example \
+    --set vault.environmentId=env_production \
+    --set ingress.vault.enabled=true \
+    --set ingress.vault.host=vault.example.test \
+    --set ingress.vault.tls.enabled=true \
+    --set ingress.vault.tls.secretName=vault-example-tls \
+    --set productPresentation.customDomains.enabled=true \
+    --set env.CLEARANCE_CUSTOM_DOMAIN_TARGET=edge.clearance.example \
+    --set productPresentation.customDomains.edge.mode=operator-managed \
+    --set productPresentation.customDomains.edge.customerDnsTarget=edge.clearance.example \
+    --set productPresentation.customDomains.edge.tls.certificateLifecycle=operator-managed-per-domain \
+    --set productPresentation.customDomains.edge.upstream.type=vault-service \
+    --set productPresentation.customDomains.edge.upstream.protocol=http \
+    --set productPresentation.customDomains.edge.upstream.hostHeader=preserve-original-authority \
+    --set-json 'productPresentation.customDomains.edge.upstream.sourcePeers=[{"ipBlock":{"cidr":"203.0.113.0/24"}},{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"ingress-nginx"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"ingress-nginx"}}}]' \
+    --set productPresentation.emailDomainRecords.existingSecret=product-config \
+    --set delivery.enabled=true \
+    --set delivery.existingSecret=delivery-secrets \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.smtp.host=smtp.example.test \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
+    >"$SCRATCH/helm-product-wiring.yml" \
+    && node -e '
+      const docs=require("fs").readFileSync(process.argv[1],"utf8").split(/^---$/m);
+      const find=(name)=>docs.find((doc)=>/kind: Deployment/.test(doc)&&new RegExp(`name: beta-${name}\\n`).test(doc));
+      const api=find("api"), worker=find("delivery-worker"), vault=find("vault");
+      if(!api||!worker||!vault) process.exit(1);
+      const want=(doc,name,fragment)=>new RegExp(`- name: ${name}\\n[\\s\\S]{0,180}${fragment}`).test(doc);
+      if(!want(api,"CLEARANCE_CUSTOM_DOMAIN_TARGET",String.raw`value: "edge.clearance.example"`)) process.exit(1);
+      if(!want(api,"CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON","secretKeyRef:[\\s\\S]{0,120}name: product-config[\\s\\S]{0,120}key: email-domain-records-json")) process.exit(1);
+      if(!worker.includes(`{ name: CLEARANCE_MANAGEMENT_SCHEMA, value: "public" }`)||!worker.includes(`{ name: CLEARANCE_MANAGEMENT_PREFIX, value: "mgmt_" }`)) process.exit(1);
+      if(!want(vault,"CLEARANCE_VAULT_URL",String.raw`value: "https://vault.example.test"`)||!want(vault,"CLEARANCE_PROJECT_ID",String.raw`value: "proj_example"`)||!want(vault,"CLEARANCE_ENV_ID",String.raw`value: "env_production"`)) process.exit(1);
+      if(api.includes("CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON: {")) process.exit(1);
+    ' "$SCRATCH/helm-product-wiring.yml"; then
+    ok "Helm renders scoped product-domain, secret-backed email DNS, normalized worker, and Vault authority wiring"
+  else
+    bad "Helm product configuration wiring is incomplete or exposes email DNS records"
+  fi
+  set +e
+  helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    --set productPresentation.customDomains.enabled=true \
+    --set-string env.CLEARANCE_CUSTOM_DOMAIN_TARGET=https://edge.clearance.example \
+    >"$SCRATCH/helm-product-invalid.out" 2>"$SCRATCH/helm-product-invalid.err"
+  product_invalid_ec=$?
+  set -e
+  if [[ $product_invalid_ec -ne 0 ]] \
+    && grep -Eq 'CLEARANCE_CUSTOM_DOMAIN_TARGET|productPresentation.customDomains.enabled' "$SCRATCH/helm-product-invalid.err"; then
+    ok "Helm product configuration fails closed for an invalid custom-domain target"
+  else
+    bad "Helm product configuration accepted an invalid custom-domain target"
+  fi
+	if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+	    --set credentialAuthority.phase=serve >"$SCRATCH/helm-serve.yml" \
+	  && grep -A8 'name: CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION' "$SCRATCH/helm-serve.yml" | grep -q 'value: digest-v1' \
+	  && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /type: Recreate/ && $0 ~ /replicas: 2/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-serve.yml"; then
+    ok "Helm serve phase admits only the durable digest generation"
+  else
+    bad "Helm serve phase credential generation is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=drain >"$SCRATCH/helm-drain.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/ && $0 ~ /revisionHistoryLimit: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-drain.yml" \
+    && awk 'BEGIN{RS="---"} /kind: PodDisruptionBudget/ && /name: beta-api/{found=1} END{exit found ? 1 : 0}' "$SCRATCH/helm-drain.yml"; then
+    ok "Helm drain phase renders zero API replicas and omits the API disruption budget"
+  else
+    bad "Helm drain phase can leave credential-capable API pods serving"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=migrate \
+      --set credentialAuthority.drainId=production-proof-drain-v03 \
+      --set credentialAuthority.migrationAttemptId=attempt-1 >"$SCRATCH/helm-migrate.yml" \
+    && grep -q 'kind: Job' "$SCRATCH/helm-migrate.yml" \
+    && grep -q 'app.kubernetes.io/component: credential-migrator' "$SCRATCH/helm-migrate.yml" \
+    && grep -q -- '--local' "$SCRATCH/helm-migrate.yml" \
+    && grep -q 'production-proof-drain-v03' "$SCRATCH/helm-migrate.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Deployment/ && /name: beta-api/{if($0 ~ /replicas: 0/) found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-migrate.yml"; then
+    ok "Helm migrate phase keeps API at zero and renders the exact one-shot migration job"
+  else
+    bad "Helm migrate phase contract is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      --set credentialAuthority.phase=migrate \
+      --set credentialAuthority.drainId=production-proof-drain-v03 \
+      --set credentialAuthority.migrationAttemptId=attempt-2 >"$SCRATCH/helm-migrate-retry.yml" \
+    && test "$(awk '/^  name: beta-credential-migration-/{print $2; exit}' "$SCRATCH/helm-migrate.yml")" != "$(awk '/^  name: beta-credential-migration-/{print $2; exit}' "$SCRATCH/helm-migrate-retry.yml")" \
+    && grep -q 'production-proof-drain-v03' "$SCRATCH/helm-migrate-retry.yml"; then
+    ok "Helm migration retries retain the drain and create a new immutable Job attempt"
+  else
+    bad "Helm migration retry identity is not resumable"
   fi
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
     --set-string env.CLEARANCE_TRUSTED_PROXY=1 >"$SCRATCH/helm-trusted.yml" \
@@ -428,6 +877,136 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "trusted-proxy ServiceMonitor accepted empty scraper selectors"
   fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.existingSecret=delivery-secrets \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.smtp.host=smtp.example.test \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
+    >"$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: beta-delivery-worker' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'packages/delivery-worker/dist/cli.mjs' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'path: /live' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'path: /ready' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: CLEARANCE_SMTP_HOST' "$SCRATCH/helm-delivery-smtp.yml" \
+    && grep -q 'name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE' "$SCRATCH/helm-delivery-smtp.yml" \
+    && node -e '
+      const y=require("fs").readFileSync(process.argv[1],"utf8");
+      const docs=y.split(/^---$/m);
+      const worker=docs.find(d=>/kind: Deployment/.test(d)&&/name: beta-delivery-worker/.test(d));
+      const policy=docs.find(d=>/kind: NetworkPolicy/.test(d)&&/name: beta-delivery-worker/.test(d));
+      if(!worker||!policy) process.exit(1);
+      if(!/- name: DATABASE_URL[\s\S]*?secretKeyRef: \{ name: clearance-secrets, key: database-url \}/.test(worker)) process.exit(1);
+      if(!/- name: CLEARANCE_DELIVERY_KEY_ID[\s\S]*?secretKeyRef: \{ name: delivery-secrets, key: delivery-key-id \}/.test(worker)) process.exit(1);
+      if(!policy.includes("kubernetes.io/metadata.name: kube-system")||!policy.includes("app.kubernetes.io/name: postgresql")) process.exit(1);
+      if((policy.match(/^\s+- to:$/gm)||[]).length<2) process.exit(1);
+    ' "$SCRATCH/helm-delivery-smtp.yml" \
+    && awk 'BEGIN{RS="---"} /kind: NetworkPolicy/ && /name: beta-delivery-worker/{found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-delivery-smtp.yml" \
+    && awk 'BEGIN{RS="---"} /kind: Ingress/ && /name: beta-delivery-worker/{found=1} END{exit found ? 1 : 0}' "$SCRATCH/helm-delivery-smtp.yml"; then
+    ok "Helm renders hardened SMTP delivery worker with API producer configuration and scoped egress"
+  else
+    bad "Helm SMTP delivery worker render is incomplete"
+  fi
+  if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.worker.email.transport=ses \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.ses.region=us-east-1 \
+    --set delivery.worker.metrics.serviceMonitor.enabled=true \
+    --set-string 'delivery.worker.networkPolicy.metrics.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=monitoring' \
+    --set-string 'delivery.worker.networkPolicy.metrics.podSelector.matchLabels.app\.kubernetes\.io/name=prometheus' \
+    >"$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: CLEARANCE_SES_ACCESS_KEY_ID' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: CLEARANCE_SES_SECRET_ACCESS_KEY' "$SCRATCH/helm-delivery-ses.yml" \
+    && awk 'BEGIN{RS="---"} /kind: NetworkPolicy/ && /name: beta-delivery-worker/{found=1} END{exit found ? 0 : 1}' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'name: beta-delivery-worker' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'path: /metrics' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'runAsUser: 10001' "$SCRATCH/helm-delivery-ses.yml" \
+    && grep -q 'readOnlyRootFilesystem: true' "$SCRATCH/helm-delivery-ses.yml"; then
+    ok "Helm renders SES delivery worker, restricted metrics scraping, and hardened pod security"
+  else
+    bad "Helm SES delivery worker render is incomplete"
+  fi
+  set +e
+  helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+    "${DELIVERY_NETWORK_ARGS[@]}" \
+    --set delivery.enabled=true \
+    --set delivery.worker.email.from=auth@example.test \
+    --set delivery.worker.email.smtp.host=smtp.example.test \
+    >"$SCRATCH/helm-delivery-unsafe.out" 2>"$SCRATCH/helm-delivery-unsafe.err"
+  delivery_unsafe_ec=$?
+  set -e
+  if [[ $delivery_unsafe_ec -ne 0 ]] \
+    && grep -Eq 'requires delivery.worker.networkPolicy.smtpEgress|smtpEgress.*minItems' "$SCRATCH/helm-delivery-unsafe.err"; then
+    ok "Helm SMTP delivery fails closed without explicit egress"
+  else
+    bad "Helm SMTP delivery accepted missing egress"
+  fi
+  expect_helm_delivery_reject() {
+    local slug="$1"
+    local accepted_message="$2"
+    local rejected_message="$3"
+    shift 3
+    set +e
+    helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
+      "${DELIVERY_NETWORK_ARGS[@]}" \
+      --set delivery.enabled=true \
+      --set delivery.worker.email.from=auth@example.test \
+      --set delivery.worker.email.smtp.host=smtp.example.test \
+      --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"203.0.113.0/24"}}],"ports":[{"protocol":"TCP","port":587}]}]' \
+      "$@" >"$SCRATCH/${slug}.out" 2>"$SCRATCH/${slug}.err"
+    local render_ec=$?
+    set -e
+    if [[ $render_ec -ne 0 ]]; then
+      ok "$rejected_message"
+    else
+      bad "$accepted_message"
+    fi
+  }
+  expect_helm_delivery_reject \
+    helm-delivery-ipv4-allow-all \
+    "Helm SMTP egress accepted IPv4 /0" \
+    "Helm SMTP egress rejects IPv4 /0" \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"0.0.0.0/0"}}],"ports":[{"protocol":"TCP","port":587}]}]'
+  expect_helm_delivery_reject \
+    helm-delivery-ipv6-allow-all \
+    "Helm SMTP egress accepted IPv6 /0" \
+    "Helm SMTP egress rejects IPv6 /0" \
+    --set-json 'delivery.worker.networkPolicy.smtpEgress=[{"to":[{"ipBlock":{"cidr":"::/0"}}],"ports":[{"protocol":"TCP","port":587}]}]'
+  expect_helm_delivery_reject \
+    helm-delivery-insecure-smtp \
+    "Helm accepted SMTP with implicit TLS and STARTTLS both disabled" \
+    "Helm requires implicit TLS or STARTTLS for SMTP" \
+    --set delivery.worker.email.smtp.secure=false \
+    --set delivery.worker.email.smtp.requireTls=false
+  expect_helm_delivery_reject \
+    helm-delivery-empty-dns-peers \
+    "Helm accepted delivery NetworkPolicy without DNS peers" \
+    "Helm requires destination-scoped DNS peers" \
+    --set-json 'delivery.worker.networkPolicy.dnsPeers=[]'
+  expect_helm_delivery_reject \
+    helm-delivery-empty-database-peers \
+    "Helm accepted delivery NetworkPolicy without database peers" \
+    "Helm requires destination-scoped database peers" \
+    --set-json 'delivery.worker.networkPolicy.databasePeers=[]'
+  expect_helm_delivery_reject \
+    helm-delivery-unbounded-resources \
+    "Helm accepted delivery without concrete CPU requests" \
+    "Helm requires concrete worker CPU and memory resources" \
+    --set-string delivery.worker.resources.requests.cpu=
+  expect_helm_delivery_reject \
+    helm-delivery-monitor-without-policy \
+    "Helm accepted the delivery ServiceMonitor without NetworkPolicy" \
+    "Helm requires NetworkPolicy for delivery ServiceMonitor ingress" \
+    --set networkPolicy.enabled=false \
+    --set delivery.worker.email.transport=ses \
+    --set delivery.worker.email.ses.region=us-east-1 \
+    --set delivery.worker.metrics.enabled=false \
+    --set delivery.worker.metrics.serviceMonitor.enabled=true \
+    --set-string 'delivery.worker.networkPolicy.metrics.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=monitoring' \
+    --set-string 'delivery.worker.networkPolicy.metrics.podSelector.matchLabels.app\.kubernetes\.io/name=prometheus'
   if helm template beta deploy/helm/clearance --namespace beta "${HELM_ARGS[@]}" \
     --set backup.enabled=true \
     --set backup.image.repository=ghcr.io/example/clearance-backup \

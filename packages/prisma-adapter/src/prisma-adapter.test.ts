@@ -32,6 +32,58 @@ describe("prisma-adapter", () => {
 		expect(adapter).toBeDefined();
 	});
 
+	it("createIfAbsent uses an empty-update unique upsert and identifies only its own attempt", async () => {
+		let stored: Record<string, unknown> | null = null;
+		const upsert = vi.fn(async ({ create }: { create: Record<string, unknown> }) => {
+			if (!stored) stored = structuredClone(create);
+			return structuredClone(stored);
+		});
+		const adapter = createTestAdapter({
+			$transaction: vi.fn(),
+			securityMigration: { upsert },
+		});
+		const completedAt = new Date("2026-07-17T00:00:00.000Z");
+		const winner = {
+			id: "winner-id",
+			key: "shared",
+			state: "winner-attempt",
+			completedAt,
+		};
+		const loser = {
+			id: "loser-id",
+			key: "shared",
+			state: "loser-attempt",
+			completedAt,
+		};
+
+		expect(
+			await adapter.createIfAbsent({
+				model: "securityMigration",
+				data: winner,
+				uniqueBy: { field: "key", value: winner.key },
+				attemptBy: { field: "state", value: winner.state },
+				forceAllowId: true,
+			}),
+		).toMatchObject(winner);
+		const beforeLoser = structuredClone(stored);
+		expect(
+			await adapter.createIfAbsent({
+				model: "securityMigration",
+				data: loser,
+				uniqueBy: { field: "key", value: loser.key },
+				attemptBy: { field: "state", value: loser.state },
+				forceAllowId: true,
+			}),
+		).toBeNull();
+		expect(stored).toEqual(beforeLoser);
+		expect(upsert).toHaveBeenCalledWith(
+			expect.objectContaining({
+				where: { key: "shared" },
+				update: {},
+			}),
+		);
+	});
+
 	/**
 	 * @see https://github.com/clearance-auth/clearance
 	 */

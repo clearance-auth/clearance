@@ -83,6 +83,101 @@ describe("drizzle-adapter", () => {
 		expect(adapter).toBeDefined();
 	});
 
+	it("createIfAbsent uses the mapped unique column and returns only the inserted attempt", async () => {
+		const claimTable = {
+			id: { name: "id" },
+			claim_key: { name: "claim_key" },
+			attempt_id: { name: "attempt_id" },
+			value: { name: "value" },
+		};
+		let stored: Record<string, unknown> | null = null;
+		const onConflictDoNothing = vi.fn((config: Record<string, unknown>) => ({
+			returning: vi.fn(async () => {
+				if (stored) return [];
+				stored = pendingValues;
+				return [stored];
+			}),
+			config,
+		}));
+		let pendingValues: Record<string, unknown> = {};
+		const values = vi.fn((next: Record<string, unknown>) => {
+			pendingValues = next;
+			return { onConflictDoNothing };
+		});
+		const db = {
+			_: { fullSchema: { claim: claimTable } },
+			insert: vi.fn(() => ({ values })),
+		} as any;
+		const adapter = drizzleAdapter(db, {
+			provider: "pg",
+			schema: { claim: claimTable },
+		})({
+			plugins: [
+				{
+					id: "claim-test",
+					schema: {
+						claim: {
+							fields: {
+								key: {
+									type: "string",
+									required: true,
+									unique: true,
+									fieldName: "claim_key",
+								},
+								attempt: {
+									type: "string",
+									required: true,
+									fieldName: "attempt_id",
+								},
+								value: { type: "string", required: true },
+							},
+						},
+					},
+				},
+			],
+		} as any);
+		const first = {
+			id: "winner-id",
+			key: "shared",
+			attempt: "winner-attempt",
+			value: "winner-value",
+		};
+		const second = {
+			id: "loser-id",
+			key: "shared",
+			attempt: "loser-attempt",
+			value: "loser-value",
+		};
+
+		expect(
+			await adapter.createIfAbsent({
+				model: "claim",
+				data: first,
+				uniqueBy: { field: "key", value: first.key },
+				attemptBy: { field: "attempt", value: first.attempt },
+				forceAllowId: true,
+			}),
+		).toEqual(first);
+		expect(
+			await adapter.createIfAbsent({
+				model: "claim",
+				data: second,
+				uniqueBy: { field: "key", value: second.key },
+				attemptBy: { field: "attempt", value: second.attempt },
+				forceAllowId: true,
+			}),
+		).toBeNull();
+		expect(onConflictDoNothing).toHaveBeenCalledWith({
+			target: claimTable.claim_key,
+		});
+		expect(stored).toEqual({
+			id: "winner-id",
+			claim_key: "shared",
+			attempt_id: "winner-attempt",
+			value: "winner-value",
+		});
+	});
+
 	it("should use unique column fallback for MySQL creates without an id", async () => {
 		const userRow = {
 			id: 42,
@@ -443,7 +538,7 @@ describe("drizzle-adapter", () => {
 		 * `update().set().where().returning()` mutates by that id. Captures the
 		 * `set` payload, the update's `where` args, and the select guard so a test
 		 * can assert the `field = field + delta` expression and that the update is
-		 * pinned to one selected id rather than the raw guard clause.
+		 * pinned to one selected id while rechecking the original guard.
 		 */
 		function createIncrementDb(returned: unknown[]) {
 			const calls: {
@@ -486,6 +581,14 @@ describe("drizzle-adapter", () => {
 			});
 		}
 
+		function nestedQueryChunks(value: unknown): unknown[] {
+			if (!is(value, SQL)) return [value];
+			return [
+				value,
+				...(value as SQL).queryChunks.flatMap((chunk) => nestedQueryChunks(chunk)),
+			];
+		}
+
 		it("compiles each increment to a `column + delta` expression", async () => {
 			const { db, calls } = createIncrementDb([{ id: "user-1", attempts: 4 }]);
 			const adapter = createAdapter(db);
@@ -508,8 +611,8 @@ describe("drizzle-adapter", () => {
 			expect(chunks).toContainEqual(userTable.attempts);
 			expect(chunks).toContainEqual({ value: [" + "] });
 			expect(chunks).toContain(3);
-			// The guard runs on the SELECT that picks one id (one predicate here);
-			// the UPDATE is pinned to that single id, not the raw guard clause.
+			// The guard runs on the SELECT that picks one id and is repeated on the
+			// UPDATE so a row changed while PostgreSQL waits on its lock cannot pass.
 			expect(calls.selectGuard).toHaveLength(1);
 			expect(calls.whereArgs).toHaveLength(1);
 		});
@@ -554,14 +657,14 @@ describe("drizzle-adapter", () => {
 			expect(db.select).toHaveBeenCalledTimes(1);
 			expect(calls.selectGuard).toHaveLength(1);
 
-			// The UPDATE is guarded by a single `id IN (<one-row subquery>)`
-			// predicate, not the original multi-row clause.
+			// The UPDATE combines `id IN (<one-row subquery>)` with the original
+			// predicate, retaining the one-row contract and CAS guard together.
 			expect(calls.whereArgs).toHaveLength(1);
 			const updateGuard = calls.whereArgs?.[0];
 			expect(is(updateGuard, SQL)).toBe(true);
-			// The pinned predicate embeds the single-id subquery, proving the update
-			// targets only the one selected row.
-			expect((updateGuard as SQL).queryChunks).toContain(targetIds);
+			const chunks = nestedQueryChunks(updateGuard);
+			expect(chunks).toContain(targetIds);
+			expect(chunks).toContain(calls.selectGuard?.[0]);
 		});
 
 		it("returns null when the guard matches no row", async () => {

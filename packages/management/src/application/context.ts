@@ -7,4 +7,5 @@ export interface OperationContext {
 	readonly scope: ResourceScope;
 	readonly actor: string;
 	readonly source: OperationSource;
+	readonly correlationId?: string;
 }

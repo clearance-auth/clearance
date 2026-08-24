@@ -111,6 +111,8 @@ export type FieldSchema = {
 	type: DBFieldType;
 	default?: DBFieldAttributeConfig["defaultValue"] | undefined;
 	readOnly?: boolean | undefined;
+	deprecated?: boolean | undefined;
+	description?: string | undefined;
 	format?: string;
 };
 
@@ -744,6 +746,7 @@ export async function generator(ctx: AuthContext, options: ClearanceOptions) {
 	const models = Object.entries(tables).reduce<
 		Record<string, OpenAPIModelSchema>
 	>((acc, [key, value]) => {
+		if (key === "sessionCredential" || key === "securityMigration") return acc;
 		const modelName = key.charAt(0).toUpperCase() + key.slice(1);
 		const fields = value.fields;
 		const required = new Set<string>(["id"]);
@@ -751,12 +754,27 @@ export async function generator(ctx: AuthContext, options: ClearanceOptions) {
 			id: { type: "string", readOnly: true },
 		};
 		Object.entries(fields).forEach(([fieldKey, fieldValue]) => {
-			if (!fieldValue) return;
+			if (
+				!fieldValue ||
+				fieldValue.returned === false ||
+				(key === "session" && fieldKey === "token")
+			)
+				return;
 			properties[fieldKey] = getFieldSchema(fieldValue);
-			if (fieldValue.required && fieldValue.returned !== false) {
+			if (fieldValue.required) {
 				required.add(fieldKey);
 			}
 		});
+		if (key === "session") {
+			properties.token = {
+				type: "string",
+				readOnly: true,
+				deprecated: true,
+				description:
+					"Deprecated non-secret compatibility handle. This value equals the stable session id and is not a refresh credential.",
+			};
+			required.add("token");
+		}
 
 		Object.entries(properties).forEach(([key, prop]) => {
 			const field = value.fields[key];

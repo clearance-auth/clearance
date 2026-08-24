@@ -30,6 +30,7 @@ import {
 	listMembers,
 	listOrganizations,
 	promoteEnvironment,
+	promoteEnvironmentAuthoritative,
 	updateOrganization,
 	USERS_EXPORT_MAX_LIMIT,
 } from "../index.js";
@@ -172,6 +173,65 @@ describe("env promote", () => {
 		expect(result.blocked).toBe(false);
 		expect(result.blockers).toEqual([]);
 		expect(listEvents(store).some((e) => e.action === "env.promote")).toBe(true);
+	});
+
+	it("uses normalized topology for target slug and same-environment promotion after cutover", async () => {
+		const store = tempStore();
+		const { project, environment: source } = initProject(store, { name: "Normalized promote" });
+		const target = createEnvironment(store, {
+			projectId: source.projectId,
+			name: "production",
+			kind: "production",
+		});
+		Object.assign(store, {
+			storeV2Topology: {
+				authoritative: true,
+				getProjectById: async (id: string) => (id === project.id ? project : null),
+				findProjectConflict: async () => null,
+				getEnvironment: async ({ projectId, id }: { projectId: string; id: string }) =>
+					projectId === project.id
+						? [source, target].find((environment) => environment.id === id) ?? null
+						: null,
+				findEnvironmentByKey: async ({ projectId, key }: { projectId: string; key: string }) =>
+					projectId === project.id
+						? [source, target].find(
+							(environment) =>
+								environment.id === key ||
+								environment.slug === key ||
+								environment.name === key,
+						) ?? null
+						: null,
+				getOrganization: async () => null,
+				organizationIdExists: async () => false,
+				getOrganizationBySlug: async () => null,
+				countOrganizations: async () => 0,
+				listProjectsPage: async () => ({ projects: [project], hasMore: false }),
+				listEnvironmentsPage: async () => ({
+					environments: [source, target],
+					hasMore: false,
+				}),
+				listOrganizationsPage: async () => ({ organizations: [], hasMore: false }),
+			},
+		});
+		store.mutate((data) => {
+			data.projects = [];
+			data.environments = [];
+			data.organizations = [];
+		});
+
+		const plan = await promoteEnvironmentAuthoritative(store, {
+			to: target.slug,
+			dryRun: true,
+		});
+		expect(plan.target.id).toBe(target.id);
+		expect(plan.blocked).toBe(true);
+
+		const same = await promoteEnvironmentAuthoritative(store, {
+			to: source.slug,
+			confirm: true,
+		});
+		expect(same.idempotent).toBe(true);
+		expect(same.blocked).toBe(false);
 	});
 
 	it("requires target and rejects missing target in project", () => {

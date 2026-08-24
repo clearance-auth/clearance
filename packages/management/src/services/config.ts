@@ -1,6 +1,6 @@
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import type { ManagementStore } from "../store/types.js";
+import type { ManagementStore, StoreV2TopologyRepository } from "../store/types.js";
 import type { DataStoreSnapshot } from "../types/resources.js";
 
 export type ConfigRecord = Record<string, string>;
@@ -173,8 +173,38 @@ export function validateConfig(store: ManagementStore, config: unknown): ConfigR
 	return config;
 }
 
+/**
+ * Validate topology-bearing config through relational authority after cutover.
+ * The synchronous validator remains the JSON/snapshot contract. The normalized
+ * reader only exposes exact, parent-bound lookups, which deliberately treats a
+ * missing or cross-project environment as the same scope mismatch.
+ */
+export async function validateConfigAuthoritative(
+	store: ManagementStore,
+	config: unknown,
+): Promise<ConfigRecord> {
+	assertConfigRecord(config);
+	const topology = store.storeV2Topology;
+	if (!topology?.authoritative) return validateConfig(store, config);
+	await validateConfigWithTopology(topology, config, store.snapshot.meta.config);
+	if (hasOwn(config, "telemetryEndpoint")) {
+		let endpoint: URL;
+		try { endpoint = new URL(config.telemetryEndpoint); } catch { invalid("telemetryEndpoint must be a valid http or https URL."); }
+		if ((endpoint.protocol !== "http:" && endpoint.protocol !== "https:") || endpoint.username || endpoint.password) {
+			invalid("telemetryEndpoint must be a credential-free http or https URL.");
+		}
+	}
+	return config;
+}
+
 export function validateCurrentConfig(store: ManagementStore): ConfigRecord {
 	return validateConfig(store, store.snapshot.meta.config);
+}
+
+export async function validateCurrentConfigAuthoritative(
+	store: ManagementStore,
+): Promise<ConfigRecord> {
+	return validateConfigAuthoritative(store, store.snapshot.meta.config);
 }
 
 export function publicConfig(config: ConfigRecord, key?: string): { config: ConfigRecord; redactedKeys: string[] } {
@@ -191,6 +221,109 @@ export function publicConfig(config: ConfigRecord, key?: string): { config: Conf
 export function setConfig(store: ManagementStore, key: string, value: string): { changed: boolean; config: ConfigRecord } {
 	const candidate = { ...store.snapshot.meta.config, [key]: value };
 	validateConfig(store, candidate);
+	return persistConfig(store, key, value, candidate);
+}
+
+/** Relational-authority-aware config mutation for production callers. */
+export async function setConfigAuthoritative(
+	store: ManagementStore,
+	key: string,
+	value: string,
+): Promise<{ changed: boolean; config: ConfigRecord }> {
+	const candidate = { ...store.snapshot.meta.config, [key]: value };
+	await validateConfigAuthoritative(store, candidate);
+	if (store.storeV2Topology?.authoritative) {
+		if (!store.mutateCoordinated) {
+			throw new ClearanceError({
+				code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+				message: "Relational topology authority requires a coordinated transaction",
+				stage: "config.set",
+				status: 500,
+			});
+		}
+		return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
+			if (!topology) {
+				throw new ClearanceError({
+					code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
+					message: "Relational topology authority requires a coordinated transaction",
+					stage: "config.set",
+					status: 500,
+				});
+			}
+			const current = data.meta.config;
+			const transactionCandidate = { ...current, [key]: value };
+			await validateConfigWithLockedTopology(topology, transactionCandidate, current);
+			if (current[key] === value) return { changed: false, config: transactionCandidate };
+			data.meta.config[key] = value;
+			appendAudit({
+				actor: "operator", action: "config.set", subjectType: "config", subjectId: key,
+				outcome: "success", source: "cli", projectId: data.meta.config.projectId,
+				environmentId: data.meta.config.environmentId, message: "Updated configuration entry",
+				metadata: { key },
+			});
+			return { changed: true, config: transactionCandidate };
+		});
+	}
+	return persistConfig(store, key, value, candidate);
+}
+
+async function validateConfigWithTopology(
+	topology: NonNullable<ManagementStore["storeV2Topology"]>,
+	config: ConfigRecord,
+	current: ConfigRecord,
+): Promise<void> {
+	const hasProjectId = hasOwn(config, "projectId");
+	const hasEnvironmentId = hasOwn(config, "environmentId");
+	const projectId = config.projectId;
+	const environmentId = config.environmentId;
+	if (hasProjectId && !(await topology.getProjectById(projectId))) {
+		throw new ClearanceError({ code: "CONFIG_PROJECT_NOT_FOUND", message: "Configured projectId does not reference an existing project.", stage: "config.scope", remediation: "Select an existing project id." });
+	}
+	if (hasEnvironmentId) {
+		const selectedProject = projectId ?? current.projectId;
+		const environment = selectedProject
+			? await topology.getEnvironment({ projectId: selectedProject, id: environmentId })
+			: null;
+		if (!environment) {
+			throw new ClearanceError({ code: "CONFIG_SCOPE_MISMATCH", message: "Configured environmentId must belong to the selected project.", stage: "config.scope", remediation: "Use an environment from the selected project." });
+		}
+	}
+}
+
+/**
+ * Transaction-only topology validation. Locks follow the shared topology
+ * order: project before its environment, preventing a concurrent reparent
+ * from invalidating the persisted config pair after validation.
+ */
+async function validateConfigWithLockedTopology(
+	topology: StoreV2TopologyRepository,
+	config: ConfigRecord,
+	current: ConfigRecord,
+): Promise<void> {
+	const hasProjectId = hasOwn(config, "projectId");
+	const hasEnvironmentId = hasOwn(config, "environmentId");
+	const projectId = config.projectId;
+	const environmentId = config.environmentId;
+	const selectedProject = projectId ?? current.projectId;
+	if (hasProjectId && !(await topology.lockProject({ id: projectId }))) {
+		throw new ClearanceError({ code: "CONFIG_PROJECT_NOT_FOUND", message: "Configured projectId does not reference an existing project.", stage: "config.scope", remediation: "Select an existing project id." });
+	}
+	if (hasEnvironmentId) {
+		const environment = selectedProject
+			? await topology.lockEnvironment({ projectId: selectedProject, id: environmentId })
+			: null;
+		if (!environment) {
+			throw new ClearanceError({ code: "CONFIG_SCOPE_MISMATCH", message: "Configured environmentId must belong to the selected project.", stage: "config.scope", remediation: "Use an environment from the selected project." });
+		}
+	}
+}
+
+function persistConfig(
+	store: ManagementStore,
+	key: string,
+	value: string,
+	candidate: ConfigRecord,
+): { changed: boolean; config: ConfigRecord } {
 	if (store.snapshot.meta.config[key] === value) return { changed: false, config: candidate };
 	store.mutate((data: DataStoreSnapshot) => {
 		data.meta.config[key] = value;

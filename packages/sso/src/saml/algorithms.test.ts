@@ -2,7 +2,35 @@
 import { describe, expect, it, vi } from "vitest";
 import * as alg from "./algorithms";
 
-const encryptedAssertionXml = `
+function signed(
+	xml: string,
+	{
+		signature = alg.SignatureAlgorithm.RSA_SHA256,
+		digests = [alg.DigestAlgorithm.SHA256],
+	}: { signature?: string; digests?: string[] } = {},
+): string {
+	const references = digests
+		.map(
+			(digest) => `
+				<ds:Reference URI="#assertion">
+					<ds:DigestMethod Algorithm="${digest}" />
+					<ds:DigestValue>test</ds:DigestValue>
+				</ds:Reference>`,
+		)
+		.join("");
+	const signatureXml = `
+		<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+			<ds:SignedInfo>
+				<ds:SignatureMethod Algorithm="${signature}" />
+				${references}
+			</ds:SignedInfo>
+			<ds:SignatureValue>test</ds:SignatureValue>
+		</ds:Signature>`;
+
+	return xml.replace(/(<(?:\w+:)?Response\b[^>]*>)/, `$1${signatureXml}`);
+}
+
+const encryptedAssertionXml = signed(`
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
 	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
 		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
@@ -15,9 +43,9 @@ const encryptedAssertionXml = `
 		</xenc:EncryptedData>
 	</saml:EncryptedAssertion>
 </samlp:Response>
-`;
+`);
 
-const deprecatedEncryptionXml = `
+const deprecatedEncryptionXml = signed(`
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
 	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
 		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
@@ -30,9 +58,9 @@ const deprecatedEncryptionXml = `
 		</xenc:EncryptedData>
 	</saml:EncryptedAssertion>
 </samlp:Response>
-`;
+`);
 
-const deprecatedKeyEncryptionXml = `
+const deprecatedKeyEncryptionXml = signed(`
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
 	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
 		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
@@ -45,9 +73,9 @@ const deprecatedKeyEncryptionXml = `
 		</xenc:EncryptedData>
 	</saml:EncryptedAssertion>
 </samlp:Response>
-`;
+`);
 
-const deprecatedDataEncryptionXml = `
+const deprecatedDataEncryptionXml = signed(`
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
 	<saml:EncryptedAssertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
 		<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
@@ -60,7 +88,7 @@ const deprecatedDataEncryptionXml = `
 		</xenc:EncryptedData>
 	</saml:EncryptedAssertion>
 </samlp:Response>
-`;
+`);
 
 const plainAssertionXml = `
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
@@ -76,8 +104,34 @@ describe("validateSAMLAlgorithms", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
-					samlContent: plainAssertionXml,
+					samlContent: signed(plainAssertionXml),
 				}),
+			).not.toThrow();
+		});
+
+		it("should accept the RSA-PSS algorithm supported by the verifier", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: signed(plainAssertionXml, {
+						signature: alg.SignatureAlgorithm.RSA_PSS_SHA256,
+					}),
+				}),
+			).not.toThrow();
+		});
+
+		it("should accept matching Response and Assertion signatures", () => {
+			const responseSigned = signed(plainAssertionXml);
+			const signature = responseSigned.match(
+				/<ds:Signature\b[\s\S]*?<\/ds:Signature>/,
+			)?.[0];
+			expect(signature).toBeTruthy();
+			const dualSigned = responseSigned.replace(
+				/(<saml:Assertion\b[^>]*>)/,
+				`$1${signature}`,
+			);
+
+			expect(() =>
+				alg.validateSAMLAlgorithms({ samlContent: dualSigned }),
 			).not.toThrow();
 		});
 
@@ -85,7 +139,9 @@ describe("validateSAMLAlgorithms", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
-					samlContent: plainAssertionXml,
+					samlContent: signed(plainAssertionXml, {
+						signature: alg.SignatureAlgorithm.RSA_SHA1,
+					}),
 				}),
 			).toThrow(/deprecated/i);
 		});
@@ -97,7 +153,9 @@ describe("validateSAMLAlgorithms", () => {
 				alg.validateSAMLAlgorithms(
 					{
 						sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
-						samlContent: plainAssertionXml,
+						samlContent: signed(plainAssertionXml, {
+							signature: alg.SignatureAlgorithm.RSA_SHA1,
+						}),
 					},
 					{ onDeprecated: "warn" },
 				),
@@ -112,7 +170,9 @@ describe("validateSAMLAlgorithms", () => {
 				alg.validateSAMLAlgorithms(
 					{
 						sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
-						samlContent: plainAssertionXml,
+						samlContent: signed(plainAssertionXml, {
+							signature: alg.SignatureAlgorithm.RSA_SHA1,
+						}),
 					},
 					{ onDeprecated: "reject" },
 				),
@@ -126,7 +186,9 @@ describe("validateSAMLAlgorithms", () => {
 				alg.validateSAMLAlgorithms(
 					{
 						sigAlg: alg.SignatureAlgorithm.RSA_SHA1,
-						samlContent: plainAssertionXml,
+						samlContent: signed(plainAssertionXml, {
+							signature: alg.SignatureAlgorithm.RSA_SHA1,
+						}),
 					},
 					{ onDeprecated: "allow" },
 				),
@@ -140,18 +202,18 @@ describe("validateSAMLAlgorithms", () => {
 				alg.validateSAMLAlgorithms(
 					{
 						sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
-						samlContent: plainAssertionXml,
+						samlContent: signed(plainAssertionXml),
 					},
 					{ allowedSignatureAlgorithms: [alg.SignatureAlgorithm.RSA_SHA512] },
 				),
 			).toThrow(/not in allow-list/i);
 		});
 
-		it("should pass null/undefined sigAlg without error", () => {
+		it("should enforce the embedded signature when POST sigAlg is absent", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: null,
-					samlContent: plainAssertionXml,
+					samlContent: signed(plainAssertionXml),
 				}),
 			).not.toThrow();
 		});
@@ -160,9 +222,109 @@ describe("validateSAMLAlgorithms", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: "http://example.com/unknown-algo",
-					samlContent: plainAssertionXml,
+					samlContent: signed(plainAssertionXml, {
+						signature: "http://example.com/unknown-algo",
+					}),
 				}),
 			).toThrow(/not recognized/i);
+		});
+
+		it("should reject a deprecated embedded signature when POST sigAlg is absent", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: signed(plainAssertionXml, {
+						signature: alg.SignatureAlgorithm.RSA_SHA1,
+					}),
+				}),
+			).toThrow(/deprecated signature algorithm/i);
+		});
+
+		it("should reject an unsigned algorithm declaration outside the verified signature location", () => {
+			const wrapped = signed(plainAssertionXml).replace(
+				"<saml:Subject>test</saml:Subject>",
+				`<saml:Subject>test</saml:Subject>
+				<Wrapper><ds:Signature><ds:SignedInfo /></ds:Signature></Wrapper>`,
+			);
+
+			expect(() =>
+				alg.validateSAMLAlgorithms({ samlContent: wrapped }),
+			).toThrow(/ambiguous XML signatures/i);
+		});
+
+		it("should reject a missing embedded signature even when sigAlg is supplied", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
+					samlContent: plainAssertionXml,
+				}),
+			).toThrow(/missing an embedded XML signature/i);
+		});
+	});
+
+	describe("digest validation", () => {
+		it("should enforce the digest allow-list from embedded signed references", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms(
+					{ samlContent: signed(plainAssertionXml) },
+					{ allowedDigestAlgorithms: [alg.DigestAlgorithm.SHA512] },
+				),
+			).toThrow(/digest algorithm not in allow-list/i);
+		});
+
+		it("should reject deprecated embedded digest algorithms", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: signed(plainAssertionXml, {
+						digests: [alg.DigestAlgorithm.SHA1],
+					}),
+				}),
+			).toThrow(/deprecated digest algorithm/i);
+		});
+
+		it("should accept an explicitly allow-listed digest algorithm", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms(
+					{
+						samlContent: signed(plainAssertionXml, {
+							digests: [alg.DigestAlgorithm.SHA512],
+						}),
+					},
+					{ allowedDigestAlgorithms: ["sha512"] },
+				),
+			).not.toThrow();
+		});
+
+		it("should reject unknown embedded digest algorithms", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: signed(plainAssertionXml, {
+						digests: ["https://example.com/unknown-digest"],
+					}),
+				}),
+			).toThrow(/digest algorithm not recognized/i);
+		});
+
+		it("should reject mixed digest algorithms across signed references", () => {
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: signed(plainAssertionXml, {
+						digests: [
+							alg.DigestAlgorithm.SHA256,
+							alg.DigestAlgorithm.SHA512,
+						],
+					}),
+				}),
+			).toThrow(/mixed digest algorithms/i);
+		});
+
+		it("should reject a missing digest method", () => {
+			const missingDigest = signed(plainAssertionXml).replace(
+				/<ds:DigestMethod[^>]+\/>/,
+				"",
+			);
+			expect(() =>
+				alg.validateSAMLAlgorithms({ samlContent: missingDigest }),
+			).toThrow(/must declare exactly one digest algorithm/i);
 		});
 	});
 
@@ -222,11 +384,55 @@ describe("validateSAMLAlgorithms", () => {
 			).toThrow(/deprecated/i);
 		});
 
+		it("should ignore wrapped encryption decoys and validate the direct encrypted assertion", () => {
+			const secureDecoy = `
+				<Wrapper>
+					<xenc:EncryptedData>
+						<xenc:EncryptionMethod Algorithm="${alg.DataEncryptionAlgorithm.AES_256_GCM}" />
+						<ds:KeyInfo><xenc:EncryptedKey>
+							<xenc:EncryptionMethod Algorithm="${alg.KeyEncryptionAlgorithm.RSA_OAEP}" />
+						</xenc:EncryptedKey></ds:KeyInfo>
+					</xenc:EncryptedData>
+				</Wrapper>`;
+			const decoyBeforeAssertion = deprecatedEncryptionXml.replace(
+				"<saml:EncryptedAssertion",
+				`${secureDecoy}<saml:EncryptedAssertion`,
+			);
+
+			expect(() =>
+				alg.validateSAMLAlgorithms({
+					samlContent: decoyBeforeAssertion,
+				}),
+			).toThrow(/deprecated key encryption algorithm/i);
+		});
+
+		it("should reject unknown key encryption algorithms", () => {
+			const unknownKey = encryptedAssertionXml.replace(
+				alg.KeyEncryptionAlgorithm.RSA_OAEP,
+				"urn:example:unknown-key-encryption",
+			);
+
+			expect(() =>
+				alg.validateSAMLAlgorithms({ samlContent: unknownKey }),
+			).toThrow(/key encryption algorithm not recognized/i);
+		});
+
+		it("should reject unknown data encryption algorithms", () => {
+			const unknownData = encryptedAssertionXml.replace(
+				alg.DataEncryptionAlgorithm.AES_256_CBC,
+				"urn:example:unknown-data-encryption",
+			);
+
+			expect(() =>
+				alg.validateSAMLAlgorithms({ samlContent: unknownData }),
+			).toThrow(/data encryption algorithm not recognized/i);
+		});
+
 		it("should skip encryption validation for plain assertions", () => {
 			expect(() =>
 				alg.validateSAMLAlgorithms({
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
-					samlContent: plainAssertionXml,
+					samlContent: signed(plainAssertionXml),
 				}),
 			).not.toThrow();
 		});
@@ -237,7 +443,7 @@ describe("validateSAMLAlgorithms", () => {
 					sigAlg: alg.SignatureAlgorithm.RSA_SHA256,
 					samlContent: "not valid xml",
 				}),
-			).not.toThrow();
+			).toThrow(/missing a Response or Assertion root/i);
 		});
 	});
 });

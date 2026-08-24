@@ -27,6 +27,15 @@ export CLEARANCE_SECRET="${CLEARANCE_SECRET:-$(rand)}"
 export CLEARANCE_OPERATOR_TOKEN="${CLEARANCE_OPERATOR_TOKEN:-$(rand)}"
 export CLEARANCE_CREDENTIAL_KEY="${CLEARANCE_CREDENTIAL_KEY:-$(rand)}"
 export CLEARANCE_CREDENTIAL_KEY_ID="${CLEARANCE_CREDENTIAL_KEY_ID:-smoke-v1}"
+# This smoke stack starts from a blank database and therefore exercises only
+# the post-migration authority. Do not inherit a bridge-generation override.
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+export CLEARANCE_PROJECT_ID="${CLEARANCE_PROJECT_ID:-proj_default}"
+export CLEARANCE_ENV_ID="${CLEARANCE_ENV_ID:-env_default}"
+# Strict startup requires purpose-separated encryption providers and an ES256
+# signer. Derive the stable local configuration from this run's credential key;
+# production Compose always requires an operator-managed configuration instead.
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON:-$(node "$ROOT/scripts/local-key-management-config.mjs")}"
 export CLEARANCE_CONSOLE_ADMIN_USER="${CLEARANCE_CONSOLE_ADMIN_USER:-smoke-admin}"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="${CLEARANCE_CONSOLE_ADMIN_PASSWORD:-$(rand)}"
 export CLEARANCE_CONSOLE_SESSION_SECRET="${CLEARANCE_CONSOLE_SESSION_SECRET:-$(rand)}"
@@ -84,8 +93,7 @@ wait_for() {
 
   [[ -f "$CLI_NODE" ]] || pnpm build
   "${COMPOSE[@]}" config --quiet
-  "${COMPOSE[@]}" build
-  if ! "${COMPOSE[@]}" up -d; then
+  if ! COMPOSE_PROJECT_NAME="$PROJECT" bash "$ROOT/scripts/local-stack.sh" bootstrap; then
     "${COMPOSE[@]}" ps --all >&2 || true
     "${COMPOSE[@]}" logs --no-color >&2 || true
     exit 1
@@ -184,21 +192,29 @@ wait_for() {
     })().catch((e) => { console.error(e); process.exit(1); });
   ' "$API_URL" "$CLEARANCE_OPERATOR_TOKEN"
 
-  # Idempotency-Key acceptance (FOLLOW.md P2.3.2): replay returns the original
-  # response byte-identically with the replay marker; conflicting payload 409s.
+  # Operation-Key acceptance (FOLLOW.md P2.3.2): replay preserves the stored
+  # successful response status and resource, then marks the replay.
   IDEM_KEY="smoke-idem-$(openssl rand -hex 8)"
-  auth_curl -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
-    -H "idempotency-key: $IDEM_KEY" \
-    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}" >"$SCRATCH/idem-1.json"
-  curl -sS -D "$SCRATCH/idem-2.headers" -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
+  IDEM_FIRST_STATUS="$(curl -sS -o "$SCRATCH/idem-1.json" -w '%{http_code}' \
+    -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
     -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
-    -H "idempotency-key: $IDEM_KEY" \
-    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}" >"$SCRATCH/idem-2.json"
-  cmp -s "$SCRATCH/idem-1.json" "$SCRATCH/idem-2.json"
+    -H "operation-key: $IDEM_KEY" \
+    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}")"
+  IDEM_SECOND_STATUS="$(curl -sS -D "$SCRATCH/idem-2.headers" -o "$SCRATCH/idem-2.json" -w '%{http_code}' \
+    -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
+    -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
+    -H "operation-key: $IDEM_KEY" \
+    -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}")"
+  [[ "$IDEM_FIRST_STATUS" == "201" && "$IDEM_SECOND_STATUS" == "$IDEM_FIRST_STATUS" ]]
+  node -e '
+    const first=require(process.argv[1]), replay=require(process.argv[2]);
+    const original=first.organization, replayed=replay.organization;
+    if (!original?.id || replayed?.id !== original.id || replayed.name !== original.name || replayed.slug !== original.slug) process.exit(1);
+  ' "$SCRATCH/idem-1.json" "$SCRATCH/idem-2.json"
   grep -qi '^idempotency-replayed: true' "$SCRATCH/idem-2.headers"
   [[ "$(curl -sS -o /dev/null -w '%{http_code}' -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
     -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
-    -H "idempotency-key: $IDEM_KEY" \
+    -H "operation-key: $IDEM_KEY" \
     -d "{\"name\":\"Different Payload\",\"ownerUserId\":\"$USER_ID\"}")" == "409" ]]
   echo "idempotency replay + conflict asserted"
 

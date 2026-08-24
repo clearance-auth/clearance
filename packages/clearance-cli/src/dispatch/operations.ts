@@ -3,20 +3,19 @@ import {
 	ClearanceError,
 	CONFIG_OPERATIONS,
 	parseConfigJson,
-	resolveOperationPath,
 	SCHEMA_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	writeExportArtifact,
 } from "@clearance/management";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { requestManagementApi } from "../api-client.js";
+import { callManagementOperation } from "../api-client.js";
 import {
 	body,
 	type CliPathOf,
 	type DispatchInput,
 	error,
-	query,
+	managementCallOptions,
 	requireConfirmation,
 	requireRemoteMutation,
 } from "./shared.js";
@@ -27,7 +26,7 @@ type OperationsCommandPath =
 	| CliPathOf<typeof SCHEMA_OPERATIONS>
 	| CliPathOf<typeof CONFIG_OPERATIONS>;
 
-function configCandidate(path: unknown): Record<string, string> {
+function readConfigFile(path: unknown): Record<string, string> {
 	let contents: string;
 	try {
 		contents = readFileSync(resolve(String(path)), "utf8");
@@ -40,6 +39,21 @@ function configCandidate(path: unknown): Record<string, string> {
 		});
 	}
 	return parseConfigJson(contents);
+}
+
+function restoreTarget(value: unknown): `clearance_restore_${string}` | undefined {
+	if (value === undefined) return undefined;
+	if (
+		typeof value !== "string" ||
+		!/^clearance_restore_[a-z0-9_]{0,45}$/.test(value)
+	) {
+		throw error(
+			"BACKUP_RESTORE_TARGET_INVALID",
+			"Backup restore target must be a valid isolated restore database name.",
+			"Use clearance_restore_ followed by at most 45 lowercase letters, digits, or underscores.",
+		);
+	}
+	return value as `clearance_restore_${string}`;
 }
 
 export async function dispatchOperationsCommand({
@@ -59,71 +73,52 @@ export async function dispatchOperationsCommand({
 				);
 			}
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: BACKUP_OPERATIONS.create.http.method,
-				path: BACKUP_OPERATIONS.create.http.path,
-				body: {},
-			});
+			return callManagementOperation(session, "backups.create", {});
 		case BACKUP_OPERATIONS.verify.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: BACKUP_OPERATIONS.verify.http.method,
-				path: resolveOperationPath(BACKUP_OPERATIONS.verify, { id: String(opts.id) }),
-				body: {},
-			});
+			return callManagementOperation(session, "backups.verify", { id: String(opts.id) });
 		case BACKUP_OPERATIONS.restore.cliPath:
 			requireRemoteMutation(global, path);
 			requireConfirmation(global, "BACKUP_RESTORE_CONFIRM_REQUIRED", "Backup restore");
-			return requestManagementApi(session, {
-				method: BACKUP_OPERATIONS.restore.http.method,
-				path: resolveOperationPath(BACKUP_OPERATIONS.restore, { id: String(opts.id) }),
-				body: { target: opts.target, confirm: global.yes && !global.dryRun },
-			});
+				return callManagementOperation(session, "backups.restore", body({
+					id: String(opts.id),
+					target: restoreTarget(opts.target),
+				}) as Parameters<typeof callManagementOperation<"backups.restore">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.check.cliPath:
 			requireRemoteMutation(global, path);
-			return requestManagementApi(session, {
-				method: UPGRADE_OPERATIONS.check.http.method,
-				path: UPGRADE_OPERATIONS.check.http.path,
-			});
+			return callManagementOperation(session, "upgrades.check", {});
 		case UPGRADE_OPERATIONS.plan.cliPath:
-			return requestManagementApi(session, {
-				method: UPGRADE_OPERATIONS.plan.http.method,
-				path: UPGRADE_OPERATIONS.plan.http.path,
-				body: body({ target: opts.target, dir: opts.dir, current: opts.current, dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "upgrades.plan", body({
+				target: opts.target,
+				current: opts.current,
+				dryRun: global.dryRun,
+			}) as Parameters<typeof callManagementOperation<"upgrades.plan">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.apply.cliPath:
 			requireConfirmation(global, "UPGRADE_APPLY_CONFIRMATION_REQUIRED", "Upgrade apply");
-			return requestManagementApi(session, {
-				method: UPGRADE_OPERATIONS.apply.http.method,
-				path: UPGRADE_OPERATIONS.apply.http.path,
-				body: { plan: opts.plan, dir: opts.dir, dryRun: global.dryRun, confirm: global.yes && !global.dryRun },
-			});
+			return callManagementOperation(session, "upgrades.apply", body({
+				plan: opts.plan,
+				dryRun: global.dryRun,
+			}) as Parameters<typeof callManagementOperation<"upgrades.apply">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.verify.cliPath:
-			return requestManagementApi(session, {
-				method: UPGRADE_OPERATIONS.verify.http.method,
-				path: UPGRADE_OPERATIONS.verify.http.path,
-				body: body({ plan: opts.plan, dir: opts.dir, healthUrl: opts.healthUrl, dryRun: global.dryRun }),
-			});
+			return callManagementOperation(session, "upgrades.verify", body({
+				plan: opts.plan,
+				dryRun: global.dryRun,
+			}) as Parameters<typeof callManagementOperation<"upgrades.verify">>[2], managementCallOptions(global));
 		case UPGRADE_OPERATIONS.rollback.cliPath:
 			requireConfirmation(global, "UPGRADE_ROLLBACK_CONFIRMATION_REQUIRED", "Upgrade rollback");
-			return requestManagementApi(session, {
-				method: UPGRADE_OPERATIONS.rollback.http.method,
-				path: UPGRADE_OPERATIONS.rollback.http.path,
-				body: body({
+			return callManagementOperation(
+				session,
+				"upgrades.rollback",
+				body({
 					plan: opts.plan,
-					dir: opts.dir,
 					dryRun: global.dryRun,
-					confirm: global.yes && !global.dryRun,
 					restoreActive: opts.restoreActive,
 					activeDatabaseConfirmation: opts.confirm,
-					backupDir: opts.backupDir,
-				}),
-			});
+				}) as Parameters<typeof callManagementOperation<"upgrades.rollback">>[2],
+				managementCallOptions(global),
+			);
 		case SCHEMA_OPERATIONS.status.cliPath:
-			return requestManagementApi(session, {
-				method: SCHEMA_OPERATIONS.status.http.method,
-				path: SCHEMA_OPERATIONS.status.http.path,
-			});
+			return callManagementOperation(session, "schema.status", {});
 		case SCHEMA_OPERATIONS.generate.cliPath: {
 			if (!opts.output) {
 				throw error(
@@ -132,11 +127,7 @@ export async function dispatchOperationsCommand({
 					"Provide --output <path> for the generated SQL artifact.",
 				);
 			}
-			const result = await requestManagementApi<Record<string, unknown>>(session, {
-				method: SCHEMA_OPERATIONS.generate.http.method,
-				path: SCHEMA_OPERATIONS.generate.http.path,
-				body: {},
-			});
+			const result = await callManagementOperation(session, "schema.generate", {});
 			const { sql, ...metadata } = result;
 			if (typeof sql !== "string") {
 				throw error(
@@ -146,7 +137,10 @@ export async function dispatchOperationsCommand({
 				);
 			}
 			if (global.dryRun) return { ...metadata, dryRun: true };
-			const outputPath = writeExportArtifact(String(opts.output), sql, Boolean(opts.force), {
+			const outputPath = writeExportArtifact({
+				outputPath: String(opts.output),
+				body: sql,
+				force: Boolean(opts.force),
 				stage: "schema.generate",
 				existsCode: "SCHEMA_GENERATE_EXISTS",
 				writeFailedCode: "SCHEMA_GENERATE_WRITE_FAILED",
@@ -154,38 +148,66 @@ export async function dispatchOperationsCommand({
 			return { ...metadata, dryRun: false, outputPath };
 		}
 		case SCHEMA_OPERATIONS.migrate.cliPath:
+			if (opts.local === true || opts.drainId !== undefined) {
+				throw error(
+					"SCHEMA_LOCAL_MIGRATION_DISPATCH_INVALID",
+					"Local schema migration options cannot be sent to the management API.",
+					"Run schema migrate --local from the one-shot migration container.",
+				);
+			}
 			requireConfirmation(global, "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED", "Schema migration");
-			return requestManagementApi(session, {
-				method: SCHEMA_OPERATIONS.migrate.http.method,
-				path: SCHEMA_OPERATIONS.migrate.http.path,
-				body: { dryRun: global.dryRun, confirm: global.yes && !global.dryRun },
-			});
+			return callManagementOperation(session, "schema.migrate", {
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
+		case SCHEMA_OPERATIONS.credentialAuthorityStatus.cliPath:
+			return callManagementOperation(session, "schema.credential-authority.status", {});
+		case SCHEMA_OPERATIONS.credentialAuthorityArm.cliPath:
+			requireConfirmation(
+				global,
+				"CREDENTIAL_AUTHORITY_ARM_CONFIRMATION_REQUIRED",
+				"Credential authority arm",
+			);
+			return callManagementOperation(
+				session,
+				"schema.credential-authority.arm",
+				{
+					deploymentId: opts.deploymentId as string,
+					expectedRuntimeCount: Number(opts.expectedRuntimes),
+				},
+				managementCallOptions(global),
+			);
+		case SCHEMA_OPERATIONS.credentialAuthorityDrain.cliPath:
+			requireConfirmation(
+				global,
+				"CREDENTIAL_AUTHORITY_DRAIN_CONFIRMATION_REQUIRED",
+				"Credential authority drain",
+			);
+			return callManagementOperation(
+				session,
+				"schema.credential-authority.drain",
+				{
+					deploymentId: opts.deploymentId as string,
+					drainId: opts.drainId as string,
+				},
+				managementCallOptions(global),
+			);
 		case CONFIG_OPERATIONS.get.cliPath:
-			return requestManagementApi(session, {
-				method: CONFIG_OPERATIONS.get.http.method,
-				path: query(CONFIG_OPERATIONS.get.http.path, { key: args[0] }),
-			});
+			return callManagementOperation(session, "config.get", body({
+				key: args[0],
+			}) as { key?: string });
 		case CONFIG_OPERATIONS.set.cliPath:
-			return requestManagementApi(session, {
-				method: CONFIG_OPERATIONS.set.http.method,
-				path: resolveOperationPath(CONFIG_OPERATIONS.set, { key: String(args[0]) }),
-				body: { value: args[1], dryRun: global.dryRun },
-			});
+			return callManagementOperation(session, "config.set", {
+				key: String(args[0]),
+				value: String(args[1]),
+				dryRun: global.dryRun,
+			}, managementCallOptions(global));
 		case CONFIG_OPERATIONS.validate.cliPath: {
-			const config = opts.file ? configCandidate(opts.file) : undefined;
-			return requestManagementApi(session, {
-				method: CONFIG_OPERATIONS.validate.http.method,
-				path: CONFIG_OPERATIONS.validate.http.path,
-				body: body({ config }),
-			});
+			const config = opts.file ? readConfigFile(opts.file) : undefined;
+			return callManagementOperation(session, "config.validate", body({ config }));
 		}
 		case CONFIG_OPERATIONS.diff.cliPath: {
-			const config = configCandidate(opts.file);
-			return requestManagementApi(session, {
-				method: CONFIG_OPERATIONS.diff.http.method,
-				path: CONFIG_OPERATIONS.diff.http.path,
-				body: { config },
-			});
+			const config = readConfigFile(opts.file);
+			return callManagementOperation(session, "config.diff", { config });
 		}
 	}
 }

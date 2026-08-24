@@ -71,6 +71,23 @@ describe("Clearance CLI operator credentials", () => {
 		}
 	});
 
+	it("accepts managed API-key whoami for environment sessions without saving it as an operator profile", async () => {
+		const env = testEnv();
+		vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+			operator: { id: "key_cli_test", type: "api_key", authenticated: true, scopes: ["users:read"] },
+			projectId: "proj_cli_test",
+			environmentId: "env_cli_test",
+			storeBackend: "json",
+		}), { status: 200, headers: { "content-type": "application/json" } })));
+		await expect(fetchWhoami("http://localhost:3200", TOKEN)).resolves.toMatchObject({
+			operator: { id: "key_cli_test", type: "api_key", scopes: ["users:read"] },
+		});
+		await expect(
+			validateAndSaveCredential("http://localhost:3200", TOKEN, env),
+		).rejects.toMatchObject({ code: "CLI_LOGIN_OPERATOR_REQUIRED" });
+		expect(existsSync(credentialPath(env))).toBe(false);
+	});
+
 	it("rejects insecure remote HTTP and unsafe credential files without following symlinks", async () => {
 		const env = testEnv();
 		expect(() => normalizeApiUrl("http://api.example.test", env)).toThrow(/HTTPS/);

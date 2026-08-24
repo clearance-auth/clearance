@@ -3,8 +3,8 @@
  * Never persist raw secrets, tokens, or passwords in control-plane storage.
  */
 import type {
-	DirectoryConnection,
-	IdentityConnection,
+	ScimConnection,
+	SsoConnection,
 } from "../types/resources.js";
 
 const SENSITIVE_KEY =
@@ -57,15 +57,15 @@ export const WRITE_ONLY_SECRET_FIELDS = [
 	"bearerTokenEncrypted",
 ] as const;
 
-export type PublicIdentityConnection = Omit<
-	IdentityConnection,
+export type PublicSsoConnection = Omit<
+	SsoConnection,
 	"clientSecretEncrypted" | "clientSecretKeyId"
 > & {
 	hasClientSecret: boolean;
 };
 
-export type PublicDirectoryConnection = Omit<
-	DirectoryConnection,
+export type PublicScimConnection = Omit<
+	ScimConnection,
 	"bearerTokenEncrypted" | "bearerTokenKeyId"
 > & {
 	hasBearerToken: boolean;
@@ -73,8 +73,8 @@ export type PublicDirectoryConnection = Omit<
 
 /** Public domain view of SSO connection — encrypted material stripped. */
 export function publicIdentityConnection(
-	conn: IdentityConnection,
-): PublicIdentityConnection {
+	conn: SsoConnection,
+): PublicSsoConnection {
 	const {
 		clientSecretEncrypted: _e,
 		clientSecretKeyId: _k,
@@ -88,8 +88,8 @@ export function publicIdentityConnection(
 
 /** Public domain view of SCIM connection — encrypted material stripped. */
 export function publicDirectoryConnection(
-	conn: DirectoryConnection,
-): PublicDirectoryConnection {
+	conn: ScimConnection,
+): PublicScimConnection {
 	const { bearerTokenEncrypted: _e, bearerTokenKeyId: _k, ...rest } = conn;
 	return {
 		...rest,

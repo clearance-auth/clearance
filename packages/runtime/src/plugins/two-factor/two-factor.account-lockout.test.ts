@@ -7,6 +7,7 @@ import type { User } from "../../types";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { TWO_FACTOR_ERROR_CODES, twoFactor } from ".";
 import type { TwoFactorOptions, TwoFactorTable } from "./types";
+import { reserveTwoFactorAttempt } from "./verify-two-factor";
 
 /**
  * Account-level lockout caps consecutive failed second-factor verifications per
@@ -70,7 +71,12 @@ async function setup(accountLockout?: TwoFactorOptions["accountLockout"]) {
 			asResponse: true,
 		});
 	}
-	function correctTotp() {
+	async function correctTotp() {
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+			update: { lastUsedTotpCounter: -1 },
+		});
 		return createOTP(secret).totp();
 	}
 	async function failOtpOnce(): Promise<Response> {
@@ -97,6 +103,36 @@ async function setup(accountLockout?: TwoFactorOptions["accountLockout"]) {
 }
 
 describe("two-factor: account-level lockout across challenges", () => {
+	it("atomically locks when concurrent failures reach the threshold", async () => {
+		const { db, userId, startChallenge, verifyTotp, correctTotp } = await setup(
+			{
+				maxFailedAttempts: 3,
+			},
+		);
+		const challenges = await Promise.all(
+			Array.from({ length: 5 }, () => startChallenge()),
+		);
+
+		const failures = await Promise.all(
+			challenges.map((headers) => verifyTotp(headers, "000000")),
+		);
+		expect(failures.map((response) => response.status).sort()).toEqual([
+			401, 401, 401, 429, 429,
+		]);
+		const row = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+		});
+		expect(row?.failedVerificationCount).toBe(3);
+		expect(row?.lockedUntil).toBeInstanceOf(Date);
+
+		const locked = await verifyTotp(
+			await startChallenge(),
+			await correctTotp(),
+		);
+		expect(locked.status).toBe(429);
+	});
+
 	it("locks the account after failures accumulate across separate challenges", async () => {
 		const { startChallenge, verifyTotp, correctTotp } = await setup({
 			maxFailedAttempts: 3,
@@ -260,5 +296,66 @@ describe("two-factor: account-level lockout across challenges", () => {
 		);
 		const ok = await verifyTotp(await startChallenge(), await correctTotp());
 		expect(ok.status).toBe(200);
+	});
+
+	it("restores the durable account budget when verification fails internally", async () => {
+		const { db, userId, startChallenge, verifyTotp } = await setup({
+			maxFailedAttempts: 3,
+		});
+		const factor = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+		});
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: factor!.id }],
+			update: { secret: "corrupt-encrypted-secret" },
+		});
+
+		await expect(
+			verifyTotp(await startChallenge(), "000000"),
+		).rejects.toThrow();
+		const after = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "id", value: factor!.id }],
+		});
+		expect(after?.failedVerificationCount).toBe(0);
+		expect(after?.lockedUntil).toBeNull();
+	});
+
+	it("does not erase a later real failure when an older reservation restores", async () => {
+		const { db, userId } = await setup({ maxFailedAttempts: 3 });
+		const factor = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: userId }],
+		});
+		const ctx = {
+			context: {
+				adapter: db,
+				getPlugin: () => ({
+					options: { accountLockout: { maxFailedAttempts: 3 } },
+				}),
+			},
+		} as never;
+		const older = await reserveTwoFactorAttempt(ctx, "twoFactor", factor!, db);
+		await db.update({
+			model: "twoFactor",
+			where: [{ field: "id", value: factor!.id }],
+			update: {
+				failedVerificationCount: 0,
+				activeVerificationReservations: "[]",
+				lockedUntil: null,
+			},
+		});
+		const later = await reserveTwoFactorAttempt(ctx, "twoFactor", factor!, db);
+		await later.recordFailure();
+		await older.restore();
+
+		const after = await db.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "id", value: factor!.id }],
+		});
+		expect(after?.failedVerificationCount).toBe(1);
+		expect(after?.activeVerificationReservations).toBe("[]");
 	});
 });

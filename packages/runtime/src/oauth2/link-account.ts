@@ -1,8 +1,18 @@
 import type { GenericEndpointContext } from "@clearance/core";
+import {
+	queueAfterTransactionHook,
+	runWithTransaction,
+} from "@clearance/core/context";
 import { isDevelopment } from "@clearance/core/env";
-import { createEmailVerificationToken } from "../api";
+import { generateId } from "@clearance/core/utils/id";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "../api/routes/email-verification";
 import { setAccountCookie } from "../cookies/session-store";
 import { parseAdditionalUserInputFromProviderProfile } from "../db";
+import { readInternalAuthenticationPolicy } from "../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../internal/session-issuance-context";
 import type { Account, User } from "../types";
 import { isAPIError } from "../utils/is-api-error";
 import { redirectOnError } from "./errors";
@@ -10,30 +20,90 @@ import { setTokenUtil } from "./utils";
 
 // TODO(#9124): v2 widens `User.email` to nullable; every `userInfo.email.toLowerCase()`
 // call below needs null-safety, and `findOAuthUser` must accept a nullable email.
+type OAuthUserInfoOptions = {
+	userInfo: Omit<User, "createdAt" | "updatedAt">;
+	account: Omit<Account, "id" | "userId" | "createdAt" | "updatedAt">;
+	callbackURL?: string | undefined;
+	disableSignUp?: boolean | undefined;
+	overrideUserInfo?: boolean | undefined;
+	isTrustedProvider?: boolean | undefined;
+	/**
+	 * Whether `account.providerId` may be matched against the globally
+	 * configured `accountLinking.trustedProviders` list to infer trust.
+	 *
+	 * Defaults to `true` for built-in social/OAuth providers, whose
+	 * `providerId` namespace is controlled by the developer's config. Callers
+	 * whose `providerId` is user-controlled (e.g. the SSO plugin, where any
+	 * authenticated user can register a provider with an arbitrary id) must
+	 * pass `false` so a provider named after a trusted social provider can't
+	 * launder that trust. Such callers should supply their own
+	 * `isTrustedProvider` signal instead.
+	 */
+	trustProviderByName?: boolean | undefined;
+};
+
+type OAuthPostCommitEffect = () => Promise<void>;
+type DeferOAuthPostCommit = (effect: OAuthPostCommitEffect) => Promise<void>;
+
+type OAuthErrorResult = {
+	error: string;
+	data: null;
+	isRegister?: boolean | undefined;
+};
+
+class ManagedOAuthRollback extends Error {
+	constructor(readonly result: OAuthErrorResult) {
+		super("Managed OAuth authentication did not complete");
+		this.name = "ManagedOAuthRollback";
+	}
+}
+
 export async function handleOAuthUserInfo(
 	c: GenericEndpointContext,
-	opts: {
-		userInfo: Omit<User, "createdAt" | "updatedAt">;
-		account: Omit<Account, "id" | "userId" | "createdAt" | "updatedAt">;
-		callbackURL?: string | undefined;
-		disableSignUp?: boolean | undefined;
-		overrideUserInfo?: boolean | undefined;
-		isTrustedProvider?: boolean | undefined;
-		/**
-		 * Whether `account.providerId` may be matched against the globally
-		 * configured `accountLinking.trustedProviders` list to infer trust.
-		 *
-		 * Defaults to `true` for built-in social/OAuth providers, whose
-		 * `providerId` namespace is controlled by the developer's config. Callers
-		 * whose `providerId` is user-controlled (e.g. the SSO plugin, where any
-		 * authenticated user can register a provider with an arbitrary id) must
-		 * pass `false` so a provider named after a trusted social provider can't
-		 * launder that trust. Such callers should supply their own
-		 * `isTrustedProvider` signal instead.
-		 */
-		trustProviderByName?: boolean | undefined;
-	},
+	opts: OAuthUserInfoOptions,
 ) {
+	if (!readInternalAuthenticationPolicy(c.context.options)) {
+		return handleOAuthUserInfoCore(c, opts);
+	}
+	if (
+		typeof c.context.adapter.options?.adapterConfig.transaction !== "function"
+	) {
+		throw new Error(
+			"Managed OAuth authentication requires rollback-capable database transactions",
+		);
+	}
+	try {
+		const result = await runWithTransaction(c.context.adapter, async () => {
+			const managedResult = await handleOAuthUserInfoCore(
+				c,
+				opts,
+				(effect) =>
+					queueAfterTransactionHook(effect, c.context.adapter),
+			);
+			if (managedResult.error) {
+				throw new ManagedOAuthRollback(managedResult);
+			}
+			return managedResult;
+		});
+		return result;
+	} catch (error) {
+		if (error instanceof ManagedOAuthRollback) return error.result;
+		throw error;
+	}
+}
+
+async function handleOAuthUserInfoCore(
+	c: GenericEndpointContext,
+	opts: OAuthUserInfoOptions,
+	deferPostCommit?: DeferOAuthPostCommit | undefined,
+) {
+	const runOrDefer = async (effect: OAuthPostCommitEffect) => {
+		if (deferPostCommit) {
+			await deferPostCommit(effect);
+			return;
+		}
+		await effect();
+	};
 	const { userInfo, account, callbackURL, disableSignUp, overrideUserInfo } =
 		opts;
 	const dbUser = await c.context.internalAdapter
@@ -95,7 +165,7 @@ export async function handleOAuthUserInfo(
 					userId: dbUser.user.id,
 					accessToken: await setTokenUtil(account.accessToken, c.context),
 					refreshToken: await setTokenUtil(account.refreshToken, c.context),
-					idToken: account.idToken,
+					idToken: await setTokenUtil(account.idToken, c.context),
 					accessTokenExpiresAt: account.accessTokenExpiresAt,
 					refreshTokenExpiresAt: account.refreshTokenExpiresAt,
 					scope: account.scope,
@@ -129,7 +199,7 @@ export async function handleOAuthUserInfo(
 				c.context.options.account?.updateAccountOnSignIn !== false
 					? Object.fromEntries(
 							Object.entries({
-								idToken: account.idToken,
+								idToken: await setTokenUtil(account.idToken, c.context),
 								accessToken: await setTokenUtil(account.accessToken, c.context),
 								refreshToken: await setTokenUtil(
 									account.refreshToken,
@@ -143,10 +213,12 @@ export async function handleOAuthUserInfo(
 					: {};
 
 			if (c.context.options.account?.storeAccountCookie) {
-				await setAccountCookie(c, {
-					...linkedAccount,
-					...freshTokens,
-				});
+				await runOrDefer(() =>
+					setAccountCookie(c, {
+						...linkedAccount,
+						...freshTokens,
+					}),
+				);
 			}
 
 			if (Object.keys(freshTokens).length > 0) {
@@ -217,15 +289,15 @@ export async function handleOAuthUserInfo(
 			const accountData = {
 				accessToken: await setTokenUtil(account.accessToken, c.context),
 				refreshToken: await setTokenUtil(account.refreshToken, c.context),
-				idToken: account.idToken,
+				idToken: await setTokenUtil(account.idToken, c.context),
 				accessTokenExpiresAt: account.accessTokenExpiresAt,
 				refreshTokenExpiresAt: account.refreshTokenExpiresAt,
 				scope: account.scope,
 				providerId: account.providerId,
 				accountId: userInfo.id.toString(),
 			};
-			const { user: createdUser, account: createdAccount } =
-				await c.context.internalAdapter.createOAuthUser(
+			const createUserAndDelivery = async () => {
+				const result = await c.context.internalAdapter.createOAuthUser(
 					{
 						name,
 						image,
@@ -235,35 +307,43 @@ export async function handleOAuthUserInfo(
 					},
 					accountData,
 				);
-			user = createdUser;
-			if (c.context.options.account?.storeAccountCookie) {
-				await setAccountCookie(c, createdAccount);
-			}
-			if (
-				!userInfo.emailVerified &&
-				user &&
-				c.context.options.emailVerification?.sendOnSignUp &&
-				c.context.options.emailVerification?.sendVerificationEmail
-			) {
-				const token = await createEmailVerificationToken(
-					c.context.secret,
-					user.email,
-					undefined,
-					c.context.options.emailVerification?.expiresIn,
-				);
-				const url = `${c.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
-					callbackURL || "/",
-				)}`;
-				await c.context.runInBackgroundOrAwait(
-					c.context.options.emailVerification.sendVerificationEmail(
-						{
-							user,
+				if (
+					!userInfo.emailVerified &&
+					c.context.options.emailVerification?.sendOnSignUp &&
+					(c.context.options.durableDelivery ||
+						c.context.options.emailVerification?.sendVerificationEmail)
+				) {
+					const token = await createEmailVerificationToken(
+						c.context.secret,
+						result.user.email,
+						undefined,
+						c.context.options.emailVerification?.expiresIn,
+						{ jti: generateId(16) },
+					);
+					const url = `${c.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
+						callbackURL || "/",
+					)}`;
+					const dispatch = () =>
+						dispatchVerificationEmail(c, {
+							user: result.user,
 							url,
 							token,
-						},
-						c.request,
-					),
-				);
+						});
+					if (c.context.options.durableDelivery) await dispatch();
+					else await runOrDefer(dispatch);
+				}
+				return result;
+			};
+			const { user: createdUser, account: createdAccount } =
+				c.context.options.durableDelivery
+					? await runWithTransaction(
+							c.context.adapter,
+							createUserAndDelivery,
+						)
+					: await createUserAndDelivery();
+			user = createdUser;
+			if (c.context.options.account?.storeAccountCookie) {
+				await runOrDefer(() => setAccountCookie(c, createdAccount));
 			}
 		} catch (e: any) {
 			c.context.logger.error(e);
@@ -289,7 +369,17 @@ export async function handleOAuthUserInfo(
 		};
 	}
 
-	const session = await c.context.internalAdapter.createSession(user.id);
+	const session = await c.context.internalAdapter.createSession(
+		user.id,
+		undefined,
+		undefined,
+		false,
+		createInternalSessionIssuanceContext({
+			purpose: "interactive",
+			subjectId: user.id,
+			evidence: [{ kind: "primary", primaryMethod: "federated" }],
+		}),
+	);
 	if (!session) {
 		return {
 			error: "unable to create session",

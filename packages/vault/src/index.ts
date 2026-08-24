@@ -1,0 +1,61 @@
+export {
+	createVaultClient,
+	type VaultAuthClient,
+	type VaultAuthenticationResult,
+	type VaultAuthorizationAssignment,
+	type VaultAuthorizationRole,
+	type VaultAuthorizationSubject,
+	type VaultAuditEvent,
+	type VaultAuditPage,
+	type VaultClient,
+	type VaultClientConfig,
+	type VaultConnectionDisableResult,
+	type VaultConfirmedMutation,
+	type VaultCredentialMutation,
+	type VaultEffectiveAuthorization,
+	type VaultInvitation,
+	type InvitationStatus,
+	type VaultOrganization,
+	type VaultOrganizationCreateInput,
+	type VaultPasskey,
+	type VaultReadiness,
+	type VaultScimConnection,
+	type VaultScimCreatePreview,
+	type VaultScimMutationPreview,
+	type VaultScimSecretMutation,
+	type VaultScimTestResult,
+	type VaultServiceAccount,
+	type VaultServiceAccountCredential,
+	type VaultSession,
+	type VaultSessionState,
+	type VaultSsoConnection,
+	type VaultSsoCreateInput,
+	type VaultSsoCreatePreview,
+	type VaultSsoMutationPreview,
+	type VaultSsoTestResult,
+	type VaultTenantClient,
+	type VaultTwoFactorMethod,
+	type VaultUser,
+} from "./client";
+export {
+	configureVaultEndpoints,
+	type VaultEndpointConfig,
+	type VaultEndpointOrigins,
+} from "./origins";
+export {
+	mountClearanceVault,
+	type ClearanceVaultConfig,
+	type ClearanceVaultMount,
+} from "./shell";
+export { VAULT_STYLES } from "./styles";
+export {
+	VaultApiError,
+	type VaultRequestOptions,
+} from "./transport";
+export {
+	VAULT_AUTH_ENDPOINTS,
+	VAULT_TENANT_ENDPOINTS,
+	VAULT_WORKFLOWS,
+	type VaultRouteId,
+	type VaultWorkflow,
+} from "./workflows";

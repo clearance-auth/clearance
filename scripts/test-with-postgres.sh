@@ -10,12 +10,11 @@
 #   org-lifecycle -> CLEARANCE_ORG_TEST_DATABASE_URL  (hard-deletes runtime
 #                    rows; refuses the shared database by design)
 #
-# Ephemeral host ports (-p 127.0.0.1::5432) eliminate port collisions rather
-# than detecting them; deterministic container names + docker rm -f before
-# start make a SIGKILLed previous run self-healing.
+# Ephemeral host ports (-p 127.0.0.1::5432) and per-process container names
+# allow concurrent gates without one run deleting another run's databases.
 #
 # Usage:
-#   scripts/test-with-postgres.sh                 # management suite + 0-skip assert
+#   scripts/test-with-postgres.sh                 # management + delivery/runtime worker suites + 0-skip asserts
 #   scripts/test-with-postgres.sh -- <command...> # run any command in this env
 set -euo pipefail
 
@@ -27,22 +26,24 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || die "docker is required (fail closed: the Pg suites must run, not skip)"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable (fail closed: the Pg suites must run, not skip)"
 
-SHARED_NAME="clearance-pgtest-shared"
-ORG_NAME="clearance-pgtest-org"
+SHARED_NAME="clearance-pgtest-shared-$$"
+ORG_NAME="clearance-pgtest-org-$$"
 
 cleanup() {
   docker rm -f "$SHARED_NAME" "$ORG_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
-# Self-heal any stale containers from a killed prior run.
+# Self-heal a stale pair if the operating system later reuses this PID.
 cleanup
 
-docker run -d --rm --name "$SHARED_NAME" \
-  -e POSTGRES_USER=clearance -e POSTGRES_PASSWORD=clearance -e POSTGRES_DB=clearance \
-  -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
-docker run -d --rm --name "$ORG_NAME" \
-  -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=clearance \
+docker run -d --name "$SHARED_NAME" \
+	--tmpfs /var/lib/postgresql/data:rw,size=256m \
+	-e POSTGRES_USER=clearance -e POSTGRES_PASSWORD=clearance -e POSTGRES_DB=clearance \
+	-p 127.0.0.1::5432 postgres:16-alpine >/dev/null
+docker run -d --name "$ORG_NAME" \
+	--tmpfs /var/lib/postgresql/data:rw,size=256m \
+	-e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=clearance \
   -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
 
 port_of() {
@@ -77,29 +78,67 @@ if [[ "${1:-}" == "--" ]]; then
   exit $?
 fi
 
-# Default: run the management suite with a machine-checked zero-skip result.
+# Default: run management and every Postgres-backed delivery surface with machine-checked zero-skip results.
 # The pg-gate tripwire already fails unreachable-DB suites; the reporter
 # assertion additionally catches any FUTURE suite that skips by some other
 # mechanism (belt and braces, per FOLLOW.md P1.1.4).
-REPORT="$(mktemp -t clearance-mgmt-report.XXXXXX).json"
-rm_report() { rm -f "$REPORT"; }
-trap 'rm_report; cleanup' EXIT INT TERM
-
-(cd packages/management && npx vitest run --reporter=default --reporter=json --outputFile="$REPORT")
-
-node - "$REPORT" <<'EOF'
+run_zero_skip_suite() {
+  local package_dir="$1" label="$2" report
+  report="$(mktemp -t "clearance-${label}-report.XXXXXX").json"
+  (cd "$package_dir" && pnpm exec vitest run --reporter=default --reporter=json --outputFile="$report")
+  node - "$report" "$label" <<'EOF'
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const label = process.argv[3];
 const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
 if (!r.success) {
-  console.error(`management suite failed (${r.numFailedTests} failed)`);
+  console.error(`${label} suite failed (${r.numFailedTests} failed)`);
   process.exit(1);
 }
 if (skipped !== 0) {
-  console.error(`management suite skipped ${skipped} tests under the canonical gate — silent skip is a gate defect`);
+  console.error(`${label} suite skipped ${skipped} tests under the canonical gate — silent skip is a gate defect`);
   process.exit(1);
 }
-console.log(`management suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
+console.log(`${label} suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
 EOF
+  rm -f "$report"
+}
+
+run_zero_skip_suite packages/management management
+run_zero_skip_suite packages/delivery delivery
+run_zero_skip_suite packages/delivery-worker delivery-worker
+run_zero_skip_suite packages/clearance-auth clearance-auth
+
+runtime_auth_candidates=(
+  src/plugins/mcp/mcp.test.ts
+  src/plugins/mcp/mcp.postgres.test.ts
+  src/plugins/oidc-provider/oidc.postgres.test.ts
+  src/db/session-credential.postgres.test.ts
+  src/db/credential-upgrade.postgres.test.ts
+)
+runtime_auth_files=()
+for test_file in "${runtime_auth_candidates[@]}"; do
+  [[ -f "packages/runtime/$test_file" ]] && runtime_auth_files+=("$test_file")
+done
+
+if [[ ${#runtime_auth_files[@]} -eq 0 ]]; then
+  echo "runtime-auth-security suite: intentionally skipped (no selected test files exist)"
+else
+  RUNTIME_AUTH_REPORT="$(mktemp -t clearance-runtime-auth-report.XXXXXX).json"
+  (cd packages/runtime && pnpm exec vitest run "${runtime_auth_files[@]}" \
+    --reporter=default --reporter=json --outputFile="$RUNTIME_AUTH_REPORT")
+  node - "$RUNTIME_AUTH_REPORT" runtime-auth-security <<'EOF'
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const label = process.argv[3];
+const skipped = (r.numPendingTests ?? 0) + (r.numTodoTests ?? 0);
+if (!r.success || skipped !== 0) {
+  console.error(`${label} suite failed or skipped tests (${r.numFailedTests} failed, ${skipped} skipped)`);
+  process.exit(1);
+}
+console.log(`${label} suite: ${r.numPassedTests} passed, 0 skipped (asserted)`);
+EOF
+  rm -f "$RUNTIME_AUTH_REPORT"
+fi
 
 echo "TEST_WITH_POSTGRES_OK"

@@ -4,14 +4,27 @@
 image:
   # Required at install time, for example ghcr.io/owner/clearance/clearance.
   repository: ""
-  # Required immutable digest from the signed release bundle (sha256:...).
+  # Required immutable digest (sha256:...). Signature proof is a release gate.
   digest: ""
   # Informational release version; workloads deploy repository@digest.
-  tag: "0.2.1"
+  tag: "0.3.0"
   pullPolicy: IfNotPresent
 replicaCount: 2
 revisionHistoryLimit: 5
 terminationGracePeriodSeconds: 30
+# Credential-authority upgrades are an explicit four-phase protocol. Existing
+# installations first roll this candidate in bridge, then arm/drain through the
+# CLI, render drain, run migrate, and finally render serve.
+credentialAuthority:
+  # Fresh installs start with an unexposed bootstrap Job and zero API replicas.
+  # Promote to serve only after that Job publishes digest-live.
+  phase: bootstrap
+  deploymentId: ""
+  drainId: ""
+  # Unique per Job attempt. Keep drainId stable when resuming; change this value.
+  migrationAttemptId: install-1
+  expectedRuntimeCount: 2
+  migrationLeaseTimeoutMs: 180000
 # Change after rotating an external Secret to trigger a controlled rollout.
 restartToken: ""
 service:
@@ -29,10 +42,45 @@ secrets:
 env:
   CLEARANCE_BASE_URL: ""
   CLEARANCE_CORS_ORIGINS: ""
+  # Public CNAME destination used to verify customer custom domains. It is
+  # required only when productPresentation.customDomains.enabled=true.
+  CLEARANCE_CUSTOM_DOMAIN_TARGET: ""
   # Safe default for any directly reachable API. Enabling trusted proxy mode
   # activates a fail-closed chart contract: ClusterIP API, no API Ingress,
   # release-local console URL, and NetworkPolicy allowing only console -> API.
   CLEARANCE_TRUSTED_PROXY: "0"
+productPresentation:
+  # The API's normalized PostgreSQL authority is public.mgmt_*. Keep these
+  # values paired with delivery so rendered workers read exactly the API data.
+  managementSchema: public
+  managementPrefix: mgmt_
+  customDomains:
+    enabled: false
+    # Clearance does not create a hostless Ingress or a wildcard certificate
+    # for arbitrary tenant domains. Enabling custom domains declares an
+    # operator-managed edge contract instead. See README.md for the required
+    # private upstream and certificate lifecycle.
+    edge:
+      mode: ""
+      # This is the CNAME target shown to tenants and must exactly match
+      # env.CLEARANCE_CUSTOM_DOMAIN_TARGET.
+      customerDnsTarget: ""
+      tls:
+        certificateLifecycle: ""
+      upstream:
+        # The edge reaches the release Vault Service through private
+        # connectivity; it must preserve the original request Host exactly.
+        type: ""
+        protocol: ""
+        hostHeader: ""
+        # Include the edge's private source and the canonical Vault ingress
+        # controller source. Broad /0 CIDRs are schema-rejected.
+        sourcePeers: []
+  emailDomainRecords:
+    # Secret/config reference only. The chart never carries JSON record data.
+    # Required secret key: email-domain-records-json.
+    existingSecret: ""
+    key: email-domain-records-json
 resources:
   requests:
     cpu: 100m
@@ -53,6 +101,16 @@ ingress:
       enabled: true
       secretName: ""
   console:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    path: /
+    pathType: Prefix
+    tls:
+      enabled: true
+      secretName: ""
+  vault:
     enabled: false
     className: ""
     annotations: {}
@@ -89,13 +147,93 @@ metrics:
     scrapeTimeout: 10s
     additionalLabels: {}
 
+# Transactional email/webhook delivery. Disabled by default so existing chart
+# installs remain compatible; enabling it fails closed on a complete external
+# keyring and one explicitly configured email transport.
+delivery:
+  enabled: false
+  # Empty inherits secrets.existingSecret. Required Secret keys:
+  # delivery-key-id, delivery-keys-json, delivery-fingerprint-key-id,
+  # delivery-fingerprint-keys-json, and delivery-source-dedupe-key.
+  existingSecret: ""
+  schema: public
+  prefix: delivery_
+  legacyFingerprintKeyId: ""
+  quota:
+    maxActive: 10000
+    maxBacklog: 5000
+    maxEnqueuesPerWindow: 1000
+    windowMs: 60000
+  worker:
+    replicaCount: 2
+    restartToken: ""
+    healthPort: 8091
+    terminationGracePeriodSeconds: 45
+    concurrency: 4
+    pollMs: 500
+    leaseMs: 60000
+    heartbeatMs: 10000
+    maintenanceMs: 30000
+    drainTimeoutMs: 30000
+    maxBodyBytes: 1048576
+    appName: Clearance
+    email:
+      transport: smtp
+      from: ""
+      smtp:
+        host: ""
+        port: 587
+        secure: false
+        requireTls: true
+        connectionTimeoutMs: 10000
+        socketTimeoutMs: 30000
+        greetingTimeoutMs: 10000
+      ses:
+        region: ""
+        requestTimeoutMs: 10000
+    webhook:
+      dnsTimeoutMs: 5000
+      connectTimeoutMs: 5000
+      responseTimeoutMs: 10000
+      maxResponseBytes: 65536
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    networkPolicy:
+      # Match the labels used by cluster DNS and Postgres. External databases
+      # may use a narrow ipBlock. Both peer lists are required when the global
+      # NetworkPolicy and delivery worker are enabled.
+      dnsPeers: []
+      databasePeers: []
+      # SMTP rules must contain a destination and TCP port exactly matching
+      # email.smtp.port; empty and IPv4/IPv6 allow-all CIDRs are rejected.
+      smtpEgress: []
+      metrics:
+        namespaceSelector: {}
+        podSelector: {}
+    metrics:
+      enabled: true
+      path: /metrics
+      serviceMonitor:
+        enabled: false
+        interval: 30s
+        scrapeTimeout: 10s
+        additionalLabels: {}
+
 backup:
   enabled: false
   image:
     # Required when backup.enabled=true.
     repository: ""
     digest: ""
-    tag: "0.2.1"
+    tag: "0.3.0"
     pullPolicy: IfNotPresent
   schedule: "0 * * * *"
   concurrencyPolicy: Forbid
@@ -156,4 +294,40 @@ console:
       memory: 256Mi
   podDisruptionBudget:
     enabled: false
+    minAvailable: 1
+
+# Hosted customer authentication and tenant self-service. It remains scaled to
+# zero until credentialAuthority.phase=serve so only digest-generation
+# runtimes can accept browser sessions and tenant mutations.
+vault:
+  enabled: false
+  image:
+    repository: ""
+    digest: ""
+    tag: ""
+    pullPolicy: ""
+  replicaCount: 2
+  restartToken: ""
+  publicUrl: ""
+  projectId: ""
+  environmentId: ""
+  productName: Clearance
+  homeLabel: Clearance Vault
+  accentColor: "#6558d3"
+  service:
+    type: ClusterIP
+    port: 3400
+  secrets:
+    # May match secrets.existingSecret. Required keys: database-url,
+    # clearance-secret, and key-management-config-json.
+    existingSecret: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+  podDisruptionBudget:
+    enabled: true
     minAvailable: 1

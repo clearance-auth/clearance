@@ -1,6 +1,7 @@
 import { createAuthEndpoint } from "@clearance/core/api";
 import {
 	getCurrentAdapter,
+	queueAfterTransactionHook,
 	runWithTransaction,
 } from "@clearance/core/context";
 import { APIError } from "@clearance/core/error";
@@ -14,9 +15,26 @@ import { getOrgAdapter, resolveMaximumMembersPerTeam } from "../adapter";
 import { orgMiddleware, orgSessionMiddleware } from "../call";
 import { ORGANIZATION_ERROR_CODES } from "../error-codes";
 import { hasPermission } from "../has-permission";
-import type { TeamMember } from "../schema";
+import type { Organization, TeamMember } from "../schema";
 import { teamSchema } from "../schema";
 import type { OrganizationOptions } from "../types";
+
+const ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED = {
+	code: "ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED",
+	message:
+		"Organization lifecycle mutations require rollback-capable database transactions",
+} as const;
+
+function requireTeamMutationTransaction(
+	context: Parameters<typeof getOrgAdapter>[0],
+) {
+	if (typeof context.adapter.options?.adapterConfig.transaction !== "function") {
+		throw APIError.from(
+			"INTERNAL_SERVER_ERROR",
+			ORGANIZATION_LIFECYCLE_TRANSACTION_REQUIRED,
+		);
+	}
+}
 
 const teamBaseSchema = z.object({
 	name: z.string().meta({
@@ -145,7 +163,6 @@ export const createTeam = <O extends OrganizationOptions>(options: O) => {
 				}
 			}
 
-			const existingTeams = await adapter.listTeams(organizationId);
 			const maximum =
 				typeof ctx.context.orgOptions.teams?.maximumTeams === "function"
 					? await ctx.context.orgOptions.teams?.maximumTeams(
@@ -157,24 +174,8 @@ export const createTeam = <O extends OrganizationOptions>(options: O) => {
 						)
 					: ctx.context.orgOptions.teams?.maximumTeams;
 
-			const maxTeamsReached = maximum ? existingTeams.length >= maximum : false;
-			if (maxTeamsReached) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_TEAMS,
-				);
-			}
 			const { name, organizationId: _, ...additionalFields } = ctx.body;
-
-			const organization = await adapter.findOrganizationById(organizationId);
-			if (!organization) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
-				);
-			}
-
-			let teamData = {
+			const teamData = {
 				name,
 				organizationId,
 				createdAt: new Date(),
@@ -182,35 +183,63 @@ export const createTeam = <O extends OrganizationOptions>(options: O) => {
 				...additionalFields,
 			};
 
-			// Run beforeCreateTeam hook
-			if (options?.organizationHooks?.beforeCreateTeam) {
-				const response = await options?.organizationHooks.beforeCreateTeam({
-					team: {
-						name,
-						organizationId,
-						...additionalFields,
-					},
-					user: session?.user,
-					organization,
-				});
-				if (response && typeof response === "object" && "data" in response) {
-					teamData = {
-						...teamData,
-						...response.data,
-					};
-				}
-			}
-
-			const createdTeam = await adapter.createTeam(teamData);
-
-			// Run afterCreateTeam hook
-			if (options?.organizationHooks?.afterCreateTeam) {
-				await options?.organizationHooks.afterCreateTeam({
-					team: createdTeam,
-					user: session?.user,
-					organization,
-				});
-			}
+			requireTeamMutationTransaction(ctx.context);
+			const createdTeam = await runWithTransaction(
+				ctx.context.adapter,
+				async () => {
+					let organizationForHooks:
+						| (Organization & Record<string, any>)
+						| undefined;
+					const result = await adapter.createTeam(
+						teamData,
+						maximum,
+						async (organization) => {
+							organizationForHooks = organization;
+							if (!options?.organizationHooks?.beforeCreateTeam) {
+								return teamData;
+							}
+							const response = await options.organizationHooks.beforeCreateTeam({
+								team: { name, organizationId, ...additionalFields },
+								user: session?.user,
+								organization,
+							});
+							return response && typeof response === "object" && "data" in response
+								? { ...teamData, ...response.data, organizationId }
+								: teamData;
+						},
+					);
+					if (result.status === "transactionRequired") {
+						requireTeamMutationTransaction(ctx.context);
+						throw new Error("unreachable");
+					}
+					if (result.status === "organizationNotFound") {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+						);
+					}
+					if (result.status === "limitReached") {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.YOU_HAVE_REACHED_THE_MAXIMUM_NUMBER_OF_TEAMS,
+						);
+					}
+					const team = result.team;
+					if (options?.organizationHooks?.afterCreateTeam) {
+						await queueAfterTransactionHook(
+							async () => {
+								await options.organizationHooks!.afterCreateTeam!({
+									team,
+									user: session?.user,
+									organization: organizationForHooks!,
+								});
+							},
+							ctx.context.adapter,
+						);
+					}
+					return team;
+				},
+			);
 
 			return ctx.json(createdTeam);
 		},
@@ -276,6 +305,7 @@ export const removeTeam = <O extends OrganizationOptions>(options: O) =>
 			if (!session && (ctx.request || ctx.headers)) {
 				throw APIError.fromStatus("UNAUTHORIZED");
 			}
+			requireTeamMutationTransaction(ctx.context);
 			const adapter = getOrgAdapter<O>(ctx.context, options);
 			if (session) {
 				const member = await adapter.findMemberByOrgId({
@@ -320,16 +350,6 @@ export const removeTeam = <O extends OrganizationOptions>(options: O) =>
 				);
 			}
 
-			if (!ctx.context.orgOptions.teams?.allowRemovingAllTeams) {
-				const teams = await adapter.listTeams(organizationId);
-				if (teams.length <= 1) {
-					throw APIError.from(
-						"BAD_REQUEST",
-						ORGANIZATION_ERROR_CODES.UNABLE_TO_REMOVE_LAST_TEAM,
-					);
-				}
-			}
-
 			const organization = await adapter.findOrganizationById(organizationId);
 			if (!organization) {
 				throw APIError.from(
@@ -338,55 +358,50 @@ export const removeTeam = <O extends OrganizationOptions>(options: O) =>
 				);
 			}
 
-			// Run beforeDeleteTeam hook
-			if (options?.organizationHooks?.beforeDeleteTeam) {
-				await options?.organizationHooks.beforeDeleteTeam({
-					team,
-					user: session?.user,
-					organization,
-				});
-			}
-
-			await runWithTransaction(ctx.context.adapter, async () => {
-				await adapter.deleteTeam(team.id);
-
-				// Drop the removed team from pending invitations so they stay
-				// acceptable; an emptied list degrades to an org-level invitation.
-				const pendingInvitations = await adapter.findPendingInvitations({
-					organizationId,
-				});
-				const trx = await getCurrentAdapter(ctx.context.adapter);
-				for (const invitation of pendingInvitations) {
-					if (!("teamId" in invitation) || !invitation.teamId) {
-						continue;
-					}
-					const teamIds = (invitation.teamId as string).split(",");
-					if (!teamIds.includes(team.id)) {
-						continue;
-					}
-					const remainingTeamIds = teamIds.filter((id) => id !== team.id);
-					await trx.update({
-						model: "invitation",
-						where: [
-							{
-								field: "id",
-								value: invitation.id,
-							},
-						],
-						update: {
-							teamId:
-								remainingTeamIds.length > 0 ? remainingTeamIds.join(",") : null,
-						},
+			const deleted = await adapter.deleteTeam({
+				organizationId,
+				teamId: team.id,
+				allowRemovingAllTeams:
+					ctx.context.orgOptions.teams?.allowRemovingAllTeams === true,
+				beforeDelete: async ({ organization, team }) => {
+					await options?.organizationHooks?.beforeDeleteTeam?.({
+						team,
+						user: session?.user,
+						organization,
 					});
-				}
+				},
 			});
+			if (deleted.status === "transactionRequired") {
+				requireTeamMutationTransaction(ctx.context);
+				throw new Error("unreachable");
+			}
+			if (deleted.status === "organizationNotFound") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+				);
+			}
+			if (deleted.status === "teamNotFound") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
+				);
+			}
+			if (deleted.status === "lastTeam") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					ORGANIZATION_ERROR_CODES.UNABLE_TO_REMOVE_LAST_TEAM,
+				);
+			}
+			const committedTeam = deleted.team;
+			const committedOrganization = deleted.organization;
 
 			// Run afterDeleteTeam hook
 			if (options?.organizationHooks?.afterDeleteTeam) {
 				await options?.organizationHooks.afterDeleteTeam({
-					team,
+					team: committedTeam,
 					user: session?.user,
-					organization,
+					organization: committedOrganization,
 				});
 			}
 
@@ -1075,69 +1090,7 @@ export const addTeamMember = <O extends OrganizationOptions>(options: O) =>
 					ORGANIZATION_ERROR_CODES.NO_ACTIVE_ORGANIZATION,
 				);
 			}
-
-			const currentMember = await adapter.findMemberByOrgId({
-				userId: session.user.id,
-				organizationId: organizationId,
-			});
-
-			if (!currentMember) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
-				);
-			}
-
-			const canUpdateMember = await hasPermission(
-				{
-					role: currentMember.role,
-					options: ctx.context.orgOptions,
-					permissions: {
-						member: ["update"],
-					},
-					organizationId: organizationId,
-				},
-				ctx,
-			);
-
-			if (!canUpdateMember) {
-				throw APIError.from(
-					"FORBIDDEN",
-					ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_CREATE_A_NEW_TEAM_MEMBER,
-				);
-			}
-
-			const toBeAddedMember = await adapter.findMemberByOrgId({
-				userId: ctx.body.userId,
-				organizationId: organizationId,
-			});
-
-			if (!toBeAddedMember) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
-				);
-			}
-
-			const team = await adapter.findTeamById({
-				teamId: ctx.body.teamId,
-				organizationId: organizationId,
-			});
-
-			if (!team) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
-				);
-			}
-
-			const organization = await adapter.findOrganizationById(organizationId);
-			if (!organization) {
-				throw APIError.from(
-					"BAD_REQUEST",
-					ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
-				);
-			}
+			requireTeamMutationTransaction(ctx.context);
 
 			const userBeingAdded = await ctx.context.internalAdapter.findUserById(
 				ctx.body.userId,
@@ -1148,51 +1101,87 @@ export const addTeamMember = <O extends OrganizationOptions>(options: O) =>
 				});
 			}
 
-			// Run beforeAddTeamMember hook
-			if (options?.organizationHooks?.beforeAddTeamMember) {
-				const response = await options?.organizationHooks.beforeAddTeamMember({
-					teamMember: {
-						teamId: ctx.body.teamId,
+			const result = await adapter.admitTeamMember({
+				organizationId,
+				teamId: ctx.body.teamId,
+				userId: ctx.body.userId,
+				prepare: async ({ organization, team }) => {
+					const transaction = await getCurrentAdapter(ctx.context.adapter);
+					const currentMember = await adapter.findMemberByOrgId({
+						userId: session.user.id,
+						organizationId,
+					});
+					if (!currentMember) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+						);
+					}
+					const canUpdateMember = await hasPermission(
+						{
+							role: currentMember.role,
+							options: ctx.context.orgOptions,
+							permissions: { member: ["update"] },
+							organizationId,
+						},
+						{ ...ctx, context: { ...ctx.context, adapter: transaction } } as never,
+					);
+					if (!canUpdateMember) {
+						throw APIError.from(
+							"FORBIDDEN",
+							ORGANIZATION_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_CREATE_A_NEW_TEAM_MEMBER,
+						);
+					}
+					const target = await adapter.findMemberByOrgId({
 						userId: ctx.body.userId,
-					},
-					team,
-					user: userBeingAdded,
-					organization,
-				});
-				if (response && typeof response === "object" && "data" in response) {
-					// Allow the hook to modify the data
-				}
-			}
-
-			const maximumMembersPerTeam = await resolveMaximumMembersPerTeam(
-				ctx.context.orgOptions.teams,
-				{
-					teamId: ctx.body.teamId,
-					organizationId,
-					session,
+						organizationId,
+					});
+					if (!target) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							ORGANIZATION_ERROR_CODES.USER_IS_NOT_A_MEMBER_OF_THE_ORGANIZATION,
+						);
+					}
+					if (options?.organizationHooks?.beforeAddTeamMember) {
+						await options.organizationHooks.beforeAddTeamMember({
+							teamMember: { teamId: ctx.body.teamId, userId: ctx.body.userId },
+							team,
+							user: userBeingAdded,
+							organization,
+						});
+					}
+					return resolveMaximumMembersPerTeam(ctx.context.orgOptions.teams, {
+						teamId: ctx.body.teamId,
+						organizationId,
+						session,
+					});
 				},
-			);
-
-			let teamMember: TeamMember;
-			if (maximumMembersPerTeam !== undefined) {
-				const result = await adapter.addTeamMemberWithLimit({
-					teamId: ctx.body.teamId,
-					userId: ctx.body.userId,
-					maximumMembersPerTeam,
-				});
+			});
 				if (result.status === "limitReached") {
 					throw APIError.from(
 						"FORBIDDEN",
 						ORGANIZATION_ERROR_CODES.TEAM_MEMBER_LIMIT_REACHED,
 					);
 				}
-				teamMember = result.member;
-			} else {
-				teamMember = await adapter.findOrCreateTeamMember({
-					teamId: ctx.body.teamId,
-					userId: ctx.body.userId,
-				});
-			}
+				if (result.status === "teamNotFound") {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.TEAM_NOT_FOUND,
+					);
+				}
+				if (result.status === "organizationNotFound") {
+					throw APIError.from(
+						"BAD_REQUEST",
+						ORGANIZATION_ERROR_CODES.ORGANIZATION_NOT_FOUND,
+					);
+				}
+				if (result.status === "transactionRequired") {
+					requireTeamMutationTransaction(ctx.context);
+					throw new Error("unreachable");
+				}
+			const teamMember = result.member;
+			const team = result.team;
+			const organization = result.organization;
 
 			// Run afterAddTeamMember hook
 			if (options?.organizationHooks?.afterAddTeamMember) {

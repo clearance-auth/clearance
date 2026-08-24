@@ -7,7 +7,7 @@ import type {
 	Membership,
 	MigrationPlan,
 	Organization,
-	Principal,
+	User,
 	Project,
 	ReadinessReport,
 } from "../types/resources.js";
@@ -19,11 +19,12 @@ import type {
 	ReplayDiagnosticResult,
 } from "../services/events.js";
 import type { ResourceScope } from "../services/scope.js";
-import type { ArchiveOrganizationResult } from "../services/core.js";
 import type {
+	ArchiveOrganizationResult,
+	AuthoritativeOverviewStats,
 	EnvironmentInspectResult,
 	EnvironmentPromoteResult,
-	overviewStats,
+	UsersExportEnvelope,
 } from "../services/core.js";
 import type {
 	MemberImportPlan,
@@ -31,23 +32,20 @@ import type {
 } from "../services/members-import.js";
 import type { validateRole } from "../services/roles.js";
 import type {
-	PublicDirectoryConnection,
-	PublicIdentityConnection,
+	PublicScimConnection,
+	PublicSsoConnection,
 } from "../services/redact.js";
 import type { RevokeSessionResult, SessionView } from "../services/sessions.js";
 import type { ConfigRecord, diffConfig, publicConfig } from "../services/config.js";
 import type { MigrationPreview, verifyMigration } from "../services/migration.js";
 import type {
-	applyUpgrade,
-	planUpgrade,
-	rollbackUpgrade,
-	verifyUpgrade,
-} from "../services/upgrade.js";
-import type {
+	getCredentialAuthorityStatus,
 	getRuntimeSchemaStatus,
-	migrateRuntimeSchema,
 	planRuntimeSchema,
 } from "../services/runtime-schema.js";
+import type {
+	StoreV2CommandEnvelope,
+} from "../services/store-v2.js";
 import type { restoreBackup, upgradeCheck } from "../services/backup.js";
 import type {
 	restorePostgresBackup,
@@ -62,6 +60,68 @@ import type {
 	testScimConnectionLive,
 	testSsoConnectionLive,
 } from "../services/live-conformance.js";
+import type {
+	DeliveryControlResult,
+	ScopedDeliveryJob,
+	ScopedDeliveryJobPage,
+} from "../services/delivery-control.js";
+import type {
+	ScopedWebhookEndpoint,
+	ScopedWebhookEndpointPage,
+	WebhookEndpointDeletionResult,
+	WebhookEndpointControlResult,
+	WebhookEndpointCreateResult,
+	WebhookEndpointMutationPreview,
+	WebhookEndpointUpdateResult,
+} from "../services/webhook-endpoints.js";
+import type {
+	AuthenticationPolicyApplyControlResult,
+	AuthenticationPolicyApplyInput,
+	AuthenticationPolicyGetResult,
+	AuthenticationPolicyPlanInput,
+	AuthenticationPolicyPlanResult,
+	AuthenticationUnlockControlResult,
+	AuthenticationUnlockInput,
+} from "../services/authentication-policy.js";
+import type {
+	KeyManagementApplyControlResult,
+	KeyManagementApplyInput,
+	KeyManagementPlanResult,
+	KeyManagementStatusResult,
+} from "../services/key-management.js";
+import type {
+	ProductDomainControlResult,
+	ProductDomainCreateResult,
+	ProductDomainReissueResult,
+	ProductPresentationApplyResult,
+	ProductPresentationCandidate,
+	ProductPresentationPlan,
+	ProductEmailSenderApplyResult,
+	ProductEmailSenderCandidate,
+	ProductEmailSenderPlan,
+	ProductTemplateApplyResult,
+	ProductTemplateCandidate,
+	ProductTemplatePlan,
+	getProductPresentationForManagement,
+	getProductSenderForManagement,
+	getProductSenderReadinessForManagement,
+	getProductTemplateForManagement,
+	listProductDomainsForManagement,
+} from "../services/product-presentation.js";
+import type { ProductEmailTemplateKind } from "../store/product-presentation-authority.js";
+import type {
+	DeliveryControlAction,
+	DeliveryControlPreview,
+	DeliveryChannel,
+	DeliveryJobState,
+	DeliveryQuotaStatus,
+	DeliveryReadinessSummary,
+	EnqueuedDelivery,
+	PublicDeliveryJob,
+	PublicWebhookEndpoint,
+	WebhookEndpointStatus,
+	WebhookEventKind,
+} from "@clearance/delivery";
 
 export type OperationConfirmation =
 	| "none"
@@ -70,7 +130,306 @@ export type OperationConfirmation =
 	| "server-required";
 export type OperationMethod = "GET" | "POST" | "PATCH" | "DELETE";
 
-export interface ManagementOperationTypes {
+/** A normalized authorization subject, safe to expose through management APIs. */
+export type AuthorizationSubject =
+	| { kind: "principal"; id: string }
+	| { kind: "service_account"; id: string };
+
+/** A paired optional filter: callers either identify a subject completely or do not filter. */
+export type AuthorizationAssignmentFilter =
+	| { subjectKind: AuthorizationSubject["kind"]; subjectId: string }
+	| { subjectKind?: never; subjectId?: never };
+
+export interface AuthorizationEffectiveView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleIds: string[];
+	actions: string[];
+	revision: string;
+}
+
+export interface AuthorizationAssignmentView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleId: string;
+}
+
+export interface AuthorizationAssignmentSetView {
+	organizationId: string;
+	subject: AuthorizationSubject;
+	roleIds: string[];
+}
+
+export interface ServiceAccountView {
+	organizationId: string;
+	serviceAccountId: string;
+	name: string;
+	status: "active" | "disabled";
+}
+
+export interface ServiceAccountCredentialView {
+	organizationId: string;
+	serviceAccountId: string;
+	credentialId: string;
+	credentialPrefix: string;
+	credentialFingerprint: string;
+	expiresAt: string | null;
+	version: number;
+}
+
+export type ManagementJsonPrimitive = string | number | boolean | null;
+export type ManagementJsonValue =
+	| ManagementJsonPrimitive
+	| ManagementJsonValue[]
+	| { [key: string]: ManagementJsonValue };
+
+/**
+ * The service layer may use Dates, readonly collections, or opaque metadata
+ * internally. Management operations describe the JSON representation that
+ * actually crosses the HTTP boundary.
+ */
+export type ManagementJsonWire<Value> =
+	unknown extends Value
+		? ManagementJsonValue
+		: Value extends Date
+			? string
+			: Value extends ManagementJsonPrimitive | undefined
+				? Value
+				: Value extends ManagementJsonValue
+					? Value
+				: Value extends readonly unknown[]
+					? { -readonly [Key in keyof Value]: ManagementJsonWire<Value[Key]> }
+					: Value extends object
+						? { -readonly [Key in keyof Value]: ManagementJsonWire<Value[Key]> }
+						: never;
+
+type WithPublicConnection<Value, Connection> =
+	Value extends { connection: unknown }
+		? Omit<Value, "connection"> & { connection: Connection }
+		: Value;
+
+type PublicScimTestResult<Value> =
+	Value extends { connection: unknown; proposed: unknown }
+		? Omit<Value, "connection" | "proposed"> & {
+				connection: PublicScimConnection;
+				proposed: Array<{
+					action: "deprovision" | "upsert";
+					email: string;
+				}>;
+		  }
+		: WithPublicConnection<Value, PublicScimConnection>;
+
+type SetupLinkWire =
+	| (ReturnType<typeof createSetupLink> & { scope: ResourceScope })
+	| (Omit<ReturnType<typeof createSetupLink>, "token" | "url"> & {
+			scope: ResourceScope;
+			oneTimeSecretsOmitted: ["token", "url"];
+	  });
+
+type DeliveryControlWire<Action extends DeliveryControlAction> =
+	Omit<DeliveryControlResult, "operation" | "preview" | "result"> & {
+		operation: `delivery.jobs.${Action}`;
+		preview: Omit<DeliveryControlPreview, "action"> & { action: Action };
+		result?: Action extends "replay" ? EnqueuedDelivery : PublicDeliveryJob;
+	};
+
+type WebhookEndpointCreateWire =
+	| WebhookEndpointCreateResult
+	| (Omit<WebhookEndpointCreateResult, "signingSecret"> & {
+			secretAlreadyIssued: true;
+			oneTimeSecretsOmitted: ["signingSecret"];
+	  });
+
+type WebhookEndpointControlBase<Action extends "rotate" | "delete" | "test"> =
+	Omit<WebhookEndpointControlResult, "operation" | "preview" | "result"> & {
+		operation: `delivery.webhook_endpoints.${Action}`;
+		preview: Extract<WebhookEndpointMutationPreview, { action: Action }>;
+	};
+
+type WebhookEndpointRotateWire =
+	| (WebhookEndpointControlBase<"rotate"> & { dryRun: true })
+	| (WebhookEndpointControlBase<"rotate"> & {
+			dryRun: false;
+			result: { endpoint: PublicWebhookEndpoint; signingSecret: string };
+	  })
+	| (WebhookEndpointControlBase<"rotate"> & {
+			dryRun: false;
+			result: { endpoint: PublicWebhookEndpoint };
+			secretAlreadyIssued: true;
+			oneTimeSecretsOmitted: ["result.signingSecret"];
+	  });
+
+type WebhookEndpointDeleteWire = WebhookEndpointControlBase<"delete"> & {
+	result?: WebhookEndpointDeletionResult;
+};
+
+type WebhookEndpointTestWire = WebhookEndpointControlBase<"test"> & {
+	result?: { endpoint: PublicWebhookEndpoint; delivery: EnqueuedDelivery };
+};
+
+type CredentialAuthorityStatusWire =
+	Omit<Awaited<ReturnType<typeof getCredentialAuthorityStatus>>, "protocolVersion"> & {
+		protocolVersion: 1;
+	};
+
+type StoreV2StatusWire<Operation extends StoreV2CommandEnvelope["operation"]> =
+	Omit<StoreV2CommandEnvelope, "operation" | "dryRun" | "status" | "plan"> & {
+		operation: Operation;
+		dryRun: false;
+		status: NonNullable<StoreV2CommandEnvelope["status"]>;
+	};
+
+type StoreV2PlanWire<Operation extends StoreV2CommandEnvelope["operation"]> =
+	Omit<StoreV2CommandEnvelope, "operation" | "dryRun" | "status" | "plan"> & {
+		operation: Operation;
+		dryRun: true;
+		plan: NonNullable<StoreV2CommandEnvelope["plan"]>;
+	};
+
+type UpgradePlanSummaryWire = {
+	id: string;
+	targetVersion: string;
+	status: string;
+};
+
+type UpgradePlanWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.plan";
+			dryRun: true;
+			plan: {
+				targetVersion: string;
+				currentVersion: string | null;
+				directory: string;
+				createsArtifacts: false;
+			};
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.plan";
+			dryRun: false;
+			plan: UpgradePlanSummaryWire & {
+				path: string;
+				currentVersion: string;
+			};
+	  };
+
+type UpgradeApplyWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.apply";
+			dryRun: true;
+			plan: UpgradePlanSummaryWire & {
+				path: string;
+				currentVersion: string;
+			};
+			wouldRun: ["preflight", "verified_backup", "version_hook"];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.apply";
+			dryRun: false;
+			plan: UpgradePlanSummaryWire & {
+				backupId: string | null;
+				rollbackReference: ManagementJsonValue;
+			};
+	  };
+
+type UpgradeVerifyWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.verify";
+			dryRun: true;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: Array<
+				"backup_reference_check" | "apply_marker_check" | "health_url_check"
+			>;
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.verify";
+			plan: UpgradePlanSummaryWire & {
+				updatedAt: string | null;
+				backupId: string | null;
+			};
+	  };
+
+type UpgradeRollbackWire =
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: true;
+			mode: "isolated_verify_only";
+			activeDatabaseUntouched: true;
+			wouldModifyActiveDatabase: false;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: [
+				"backup_checksum_check",
+				"isolated_restore",
+				"reconciliation",
+				"rollback_receipt",
+			];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: true;
+			mode: "active_database_restore";
+			activeDatabaseUntouched: true;
+			wouldModifyActiveDatabase: true;
+			plan: UpgradePlanSummaryWire;
+			wouldRun: [
+				"advisory_lock",
+				"safety_backup",
+				"staging_restore",
+				"database_swap",
+				"live_verification",
+				"rollback_receipt",
+			];
+	  }
+	| {
+			schemaVersion: "v1";
+			operation: "upgrade.rollback";
+			dryRun: false;
+			mode: "isolated_verify_only" | "active_database_restore";
+			activeDatabaseUntouched: boolean;
+			plan: UpgradePlanSummaryWire;
+			rollbackReceipt: string;
+			receipt: Record<string, ManagementJsonValue>;
+	  };
+
+type RuntimeSchemaMigrateWire =
+	| {
+			kind: "schema.migrate";
+			dryRun: true;
+			pendingTables: number;
+			pendingFields: number;
+			pendingSecurityMigrations: string[];
+	  }
+	| {
+			kind: "schema.migrate";
+			dryRun: false;
+			appliedTables: number;
+			appliedFields: number;
+	  };
+
+type MemberImportWireResult = Omit<MemberImportResult, "results"> & {
+	results: Array<
+		| {
+				row: number;
+				principalId: string;
+				status: "success" | "idempotent";
+		  }
+		| {
+				row: number;
+				principalId: string;
+				status: "failure";
+				error: { code: string; stage: string; retryable: boolean };
+		  }
+	>;
+};
+
+export interface ManagementOperationServiceTypes {
 	"system.init": {
 		input: { name?: string; environment?: string };
 		output: { project: Project; environment: Environment };
@@ -85,7 +444,7 @@ export interface ManagementOperationTypes {
 	};
 	"system.overview": {
 		input: Record<string, never>;
-		output: ReturnType<typeof overviewStats>;
+		output: AuthoritativeOverviewStats;
 	};
 	"projects.list": {
 		input: Record<string, never>;
@@ -93,7 +452,7 @@ export interface ManagementOperationTypes {
 	};
 	"projects.inspect": {
 		input: { id?: string };
-		output: { project: Project; overview: ReturnType<typeof overviewStats>; scope: ResourceScope };
+		output: { project: Project; overview: AuthoritativeOverviewStats; scope: ResourceScope };
 	};
 	"projects.create": {
 		input: { name: string; dryRun?: boolean };
@@ -102,8 +461,8 @@ export interface ManagementOperationTypes {
 			| { dryRun: true; project: Pick<Project, "name" | "slug"> };
 	};
 	"environments.list": {
-		input: Record<string, never>;
-		output: { environments: Environment[]; scope: ResourceScope };
+		input: { limit?: number; cursor?: string };
+		output: { environments: Environment[]; nextCursor?: string | null; scope: ResourceScope };
 	};
 	"environments.inspect": {
 		input: { id?: string };
@@ -128,7 +487,8 @@ export interface ManagementOperationTypes {
 		output: { events: AuditEvent[]; nextCursor: string | null; scope: ResourceScope };
 	};
 	"events.tail": {
-		input: { limit?: number; action?: string; organizationId?: string; pollInterval?: number; maxEvents?: number; once?: boolean };
+		/** One ordinary events-list poll; the CLI owns tail lifecycle controls. */
+		input: { limit?: number; action?: string; organizationId?: string };
 		output: { events: AuditEvent[]; nextCursor: string | null; scope: ResourceScope };
 	};
 	"events.inspect": {
@@ -148,10 +508,10 @@ export interface ManagementOperationTypes {
 		output: { apiKeys: ApiKeyView[]; scope: ResourceScope };
 	};
 	"keys.create": {
-		input: { name: string; scopes?: string[]; dryRun?: boolean };
+		input: { name: string; scopes?: string[]; expiresAt?: string; dryRun?: boolean };
 		output:
 			| (CreatedApiKey & { scope: ResourceScope })
-			| { dryRun: true; apiKey: { name: string; scopes: string[] }; secretGenerated: false; scope: ResourceScope };
+			| { dryRun: true; apiKey: { name: string; scopes: string[]; expiresAt?: string }; secretGenerated: false; scope: ResourceScope };
 	};
 	"keys.rotate": {
 		input: { id: string; dryRun?: boolean };
@@ -197,7 +557,7 @@ export interface ManagementOperationTypes {
 	};
 	"sso.list": {
 		input: { organizationId?: string };
-		output: { connections: PublicIdentityConnection[]; scope: ResourceScope };
+		output: { connections: PublicSsoConnection[]; scope: ResourceScope };
 	};
 	"sso.create": {
 		input: {
@@ -210,67 +570,80 @@ export interface ManagementOperationTypes {
 			samlEntryPoint?: string;
 			samlCertificate?: string;
 		};
-		output: { connection: PublicIdentityConnection };
+		output: { connection: PublicSsoConnection };
 	};
 	"sso.configure": {
 		input: { id: string; issuer?: string; audience?: string; domain?: string; domains?: string[]; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
+			| { connection: PublicSsoConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
 	};
 	"sso.test": {
 		input: { id: string; fixture?: string; live?: boolean };
 		output:
-			| Awaited<ReturnType<typeof testSsoConnection>>
-			| Awaited<ReturnType<typeof testSsoConnectionReal>>
-			| Awaited<ReturnType<typeof testSsoConnectionLive>>;
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnection>>, PublicSsoConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionReal>>, PublicSsoConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionLive>>, PublicSsoConnection>;
 	};
 	"sso.setupLink.create": {
 		input: { organizationId: string };
-		output: ReturnType<typeof createSetupLink> & { scope: ResourceScope };
+		output: SetupLinkWire;
 	};
 	"sso.rotate": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; wouldChange: true; scope: ResourceScope };
+			| { connection: PublicSsoConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; wouldChange: true; scope: ResourceScope };
 	};
 	"sso.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicIdentityConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
-			| { dryRun: true; connection: PublicIdentityConnection; wouldChange: boolean; scope: ResourceScope };
+			| { connection: PublicSsoConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; wouldChange: boolean; scope: ResourceScope };
 	};
 	"scim.list": {
 		input: { organizationId?: string };
-		output: { connections: PublicDirectoryConnection[]; scope: ResourceScope };
+		output: { connections: PublicScimConnection[]; scope: ResourceScope };
 	};
 	"scim.create": {
 		input: { organizationId: string; provider: string; endpoint?: string };
-		output: { connection: PublicDirectoryConnection & { bearerTokenOnce?: string } };
+		output:
+			| { connection: PublicScimConnection & { bearerTokenOnce: string } }
+			| {
+					connection: PublicScimConnection;
+					oneTimeSecretsOmitted: ["connection.bearerTokenOnce"];
+			  };
 	};
 	"scim.test": {
-		input: { id: string; fixture?: string; live?: boolean; dryRun?: boolean };
+		input: {
+			id: string;
+			fixture?: string;
+		live?: boolean;
+		dryRun?: boolean;
+		users?: Array<{ userName: string; displayName?: string; active?: boolean }>;
+			/** Closed, server-executed runtime conformance scenario. */
+			scenario?: "users" | "group-lifecycle";
+		};
 		output:
-			| Awaited<ReturnType<typeof testScimConnection>>
-			| Awaited<ReturnType<typeof testScimConnectionReal>>
-			| Awaited<ReturnType<typeof testScimConnectionLive>>;
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnection>>>
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnectionReal>>>
+			| PublicScimTestResult<Awaited<ReturnType<typeof testScimConnectionLive>>>;
 	};
 	"scim.setupLink.create": {
 		input: { organizationId: string };
-		output: ReturnType<typeof createSetupLink> & { scope: ResourceScope };
+		output: SetupLinkWire;
 	};
 	"scim.rotate": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicDirectoryConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicDirectoryConnection; wouldChange: true; scope: ResourceScope };
+			| { connection: PublicScimConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicScimConnection; wouldChange: true; scope: ResourceScope };
 	};
 	"scim.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicDirectoryConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
-			| { dryRun: true; connection: PublicDirectoryConnection; wouldChange: boolean; scope: ResourceScope };
+			| { connection: PublicScimConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
+			| { dryRun: true; connection: PublicScimConnection; wouldChange: boolean; scope: ResourceScope };
 	};
 	"scim.replay": {
 		input: { traceId: string; dryRun?: boolean; confirm?: boolean };
@@ -283,6 +656,160 @@ export interface ManagementOperationTypes {
 	"readiness.report": {
 		input: { organizationId: string };
 		output: { report: ReadinessReport };
+	};
+	"delivery.jobs.list": {
+		input: {
+			limit?: number;
+			cursor?: string;
+			states?: DeliveryJobState[];
+			channel?: DeliveryChannel;
+			kind?: string;
+		};
+		output: ScopedDeliveryJobPage;
+	};
+	"delivery.jobs.inspect": {
+		input: { id: string };
+		output: ScopedDeliveryJob;
+	};
+	"delivery.readiness": {
+		input: { staleAfterMs?: number };
+		output: DeliveryReadinessSummary;
+	};
+	"delivery.quotas.get": {
+		input: Record<string, never>;
+		output: DeliveryQuotaStatus;
+	};
+	"delivery.jobs.cancel": {
+		input: { id: string; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlWire<"cancel">;
+	};
+	"delivery.jobs.retry": {
+		input: { id: string; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlWire<"retry">;
+	};
+	"delivery.jobs.replay": {
+		input: { id: string; maxAttempts?: number; dryRun?: boolean; confirm?: boolean };
+		output: DeliveryControlWire<"replay">;
+	};
+	"delivery.webhook_endpoints.list": {
+		input: {
+			limit?: number;
+			cursor?: string;
+			statuses?: WebhookEndpointStatus[];
+			eventKind?: WebhookEventKind;
+		};
+		output: ScopedWebhookEndpointPage;
+	};
+	"delivery.webhook_endpoints.inspect": {
+		input: { id: string };
+		output: ScopedWebhookEndpoint;
+	};
+	"delivery.webhook_endpoints.create": {
+		input: { name: string; url: string; eventKinds?: WebhookEventKind[] };
+		output: WebhookEndpointCreateWire;
+	};
+	"delivery.webhook_endpoints.update": {
+		input: {
+			id: string;
+			expectedVersion: number;
+			name?: string;
+			url?: string;
+			eventKinds?: WebhookEventKind[];
+			status?: "active" | "disabled";
+		};
+		output: WebhookEndpointUpdateResult;
+	};
+	"delivery.webhook_endpoints.rotate": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointRotateWire;
+	};
+	"delivery.webhook_endpoints.delete": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointDeleteWire;
+	};
+	"delivery.webhook_endpoints.test": {
+		input: { id: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: WebhookEndpointTestWire;
+	};
+	"authentication_policy.get": {
+		input: { organizationId?: string };
+		output: AuthenticationPolicyGetResult;
+	};
+	"authentication_policy.plan": {
+		input: AuthenticationPolicyPlanInput;
+		output: AuthenticationPolicyPlanResult;
+	};
+	"authentication_policy.apply": {
+		input: AuthenticationPolicyApplyInput & { dryRun?: boolean; confirm?: boolean };
+		output: AuthenticationPolicyApplyControlResult;
+	};
+	"authentication_policy.unlock": {
+		input: AuthenticationUnlockInput & { dryRun?: boolean; confirm?: boolean };
+		output: AuthenticationUnlockControlResult;
+	};
+	"product_presentation.get": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof getProductPresentationForManagement>>;
+	};
+	"product_presentation.plan": {
+		input: ProductPresentationCandidate;
+		output: ProductPresentationPlan;
+	};
+	"product_presentation.apply": {
+		input: ProductPresentationCandidate & {
+			expectedVersion: number;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output: ProductPresentationApplyResult;
+	};
+	"product_domains.list": {
+		input: Record<string, never>;
+		output: Awaited<ReturnType<typeof listProductDomainsForManagement>>;
+	};
+	"product_domains.create": {
+		input: { origin: string };
+		output: ProductDomainCreateResult;
+	};
+	"product_domains.reissue": {
+		input: { origin: string; expectedVersion: number };
+		output: ProductDomainReissueResult;
+	};
+	"product_domains.verify": {
+		input: { origin: string };
+		output: ProductDomainControlResult;
+	};
+	"product_domains.activate": {
+		input: { origin: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: ProductDomainControlResult;
+	};
+	"product_domains.disable": {
+		input: { origin: string; expectedVersion: number; dryRun?: boolean; confirm?: boolean };
+		output: ProductDomainControlResult;
+	};
+	"product_sender.readiness": {
+		input: { staleAfterMs?: number };
+		output: Awaited<ReturnType<typeof getProductSenderReadinessForManagement>>;
+	};
+	"product_sender.get": { input: Record<string, never>; output: Awaited<ReturnType<typeof getProductSenderForManagement>>; };
+	"product_sender.plan": { input: ProductEmailSenderCandidate; output: ProductEmailSenderPlan; };
+	"product_sender.apply": { input: ProductEmailSenderCandidate & { expectedVersion: number; dryRun?: boolean; confirm?: boolean }; output: ProductEmailSenderApplyResult; };
+	"product_templates.get": {
+		input: { kind: ProductEmailTemplateKind };
+		output: Awaited<ReturnType<typeof getProductTemplateForManagement>>;
+	};
+	"product_templates.plan": {
+		input: { kind: ProductEmailTemplateKind } & ProductTemplateCandidate;
+		output: ProductTemplatePlan;
+	};
+	"product_templates.apply": {
+		input: {
+			kind: ProductEmailTemplateKind;
+			expectedVersion: number;
+			dryRun?: boolean;
+			confirm?: boolean;
+		} & ProductTemplateCandidate;
+		output: ProductTemplateApplyResult;
 	};
 	"config.get": {
 		input: { key?: string };
@@ -320,7 +847,7 @@ export interface ManagementOperationTypes {
 		input: { source: "legacy"; fixture: string };
 		output: { plan: MigrationPlan };
 	};
-	"migrations.run": {
+	"migrations.apply": {
 		input: { id: string; fixture: string; dryRun?: boolean };
 		output: { plan: MigrationPlan };
 	};
@@ -345,7 +872,12 @@ export interface ManagementOperationTypes {
 		output: { backup: BackupRecord };
 	};
 	"backups.restore": {
-		input: { id: string; target?: string; confirm?: boolean };
+		input: {
+			id: string;
+			/** Isolated Postgres database name; JSON-store restore destinations are server-managed. */
+			target?: `clearance_restore_${string}`;
+			confirm?: boolean;
+		};
 		output:
 			| Awaited<ReturnType<typeof restoreBackup>>
 			| Awaited<ReturnType<typeof restorePostgresBackup>>;
@@ -357,28 +889,26 @@ export interface ManagementOperationTypes {
 			| Awaited<ReturnType<typeof upgradeCheckWithDb>>;
 	};
 	"upgrades.plan": {
-		input: { target: string; dir: string; current?: string; dryRun?: boolean };
-		output: Awaited<ReturnType<typeof planUpgrade>>;
+		input: { target: string; current?: string; dryRun?: boolean };
+		output: UpgradePlanWire;
 	};
 	"upgrades.apply": {
-		input: { plan: string; dir: string; dryRun?: boolean; confirm?: boolean };
-		output: Awaited<ReturnType<typeof applyUpgrade>>;
+		input: { plan: string; dryRun?: boolean; confirm?: boolean };
+		output: UpgradeApplyWire;
 	};
 	"upgrades.verify": {
-		input: { plan: string; dir: string; healthUrl?: string; dryRun?: boolean };
-		output: Awaited<ReturnType<typeof verifyUpgrade>>;
+		input: { plan: string; dryRun?: boolean };
+		output: UpgradeVerifyWire;
 	};
 	"upgrades.rollback": {
 		input: {
 			plan: string;
-			dir: string;
 			dryRun?: boolean;
 			confirm?: boolean;
 			restoreActive?: boolean;
 			activeDatabaseConfirmation?: string;
-			backupDir?: string;
 		};
-		output: Awaited<ReturnType<typeof rollbackUpgrade>>;
+		output: UpgradeRollbackWire;
 	};
 	"schema.status": {
 		input: Record<string, never>;
@@ -393,37 +923,122 @@ export interface ManagementOperationTypes {
 	};
 	"schema.migrate": {
 		input: { dryRun?: boolean; confirm?: boolean };
-		output: Awaited<ReturnType<typeof migrateRuntimeSchema>>;
+		output: RuntimeSchemaMigrateWire;
+	};
+	"schema.credential-authority.status": {
+		input: Record<string, never>;
+		output: CredentialAuthorityStatusWire;
+	};
+	"schema.credential-authority.arm": {
+		input: {
+			deploymentId: string;
+			expectedRuntimeCount: number;
+			confirm?: boolean;
+		};
+		output: CredentialAuthorityStatusWire;
+	};
+	"schema.credential-authority.drain": {
+		input: { deploymentId: string; drainId: string; confirm?: boolean };
+		output: CredentialAuthorityStatusWire;
+	};
+	"key_management.status": {
+		input: Record<string, never>;
+		output: KeyManagementStatusResult;
+	};
+	"key_management.plan": {
+		input: Record<string, never>;
+		output: KeyManagementPlanResult;
+	};
+	"key_management.apply": {
+		input: KeyManagementApplyInput & { dryRun?: boolean; confirm?: boolean };
+		output: KeyManagementApplyControlResult;
+	};
+	"schema.store-v2.status": {
+		input: Record<string, never>;
+		output: StoreV2StatusWire<"schema.store-v2.status">;
+	};
+	"schema.store-v2.plan": {
+		input: Record<string, never>;
+		output: StoreV2PlanWire<"schema.store-v2.plan">;
+	};
+	"schema.store-v2.apply": {
+		input: { dryRun?: boolean; confirm?: boolean };
+		output:
+			| StoreV2PlanWire<"schema.store-v2.apply">
+			| StoreV2StatusWire<"schema.store-v2.apply">;
+	};
+	"schema.store-v2.verify": {
+		input: Record<string, never>;
+		output: StoreV2StatusWire<"schema.store-v2.verify">;
+	};
+	"schema.store-v2.rollback": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.rollback">;
+	};
+	"schema.store-v2.events.cutover": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.events.cutover">;
+	};
+	"schema.store-v2.events.rollback": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.events.rollback">;
+	};
+	"schema.store-v2.principals.cutover": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.principals.cutover">;
+	};
+	"schema.store-v2.principals.rollback": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.principals.rollback">;
+	};
+	"schema.store-v2.topology.cutover": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.topology.cutover">;
+	};
+	"schema.store-v2.topology.rollback": {
+		input: { confirm?: boolean };
+		output: StoreV2StatusWire<"schema.store-v2.topology.rollback">;
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
-		output: { users: Principal[]; nextCursor?: string | null; scope: ResourceScope };
+		output: { users: User[]; nextCursor?: string | null; scope: ResourceScope };
 	};
 	"users.inspect": {
 		input: { id: string };
-		output: { user: Principal; scope: ResourceScope };
+		output: { user: User; scope: ResourceScope };
 	};
 	"users.create": {
 		input: { email: string; name: string; password?: string; dryRun?: boolean };
 		output:
 			| { dryRun: true; email: string; name: string; scope: ResourceScope }
-			| { user: Principal; passwordSetupToken?: string; passwordSetupExpiresAt?: string };
+			| { user: User; passwordSetupToken?: string; passwordSetupExpiresAt?: string };
 	};
 	"users.update": {
 		input: { id: string; email?: string; name?: string; status?: string; dryRun?: boolean };
-		output: { user: Principal } | { dryRun: true; id: string };
+		output:
+			| { user: User; scope: ResourceScope }
+			| {
+					dryRun: true;
+					id: string;
+					email?: string;
+					name?: string;
+					status?: "active" | "disabled";
+					scope: ResourceScope;
+			  };
 	};
 	"users.disable": {
 		input: { id: string; dryRun?: boolean };
-		output: { user: Principal } | { dryRun: true; id: string };
+		output:
+			| { user: User; scope: ResourceScope }
+			| { dryRun: true; user: User; scope: ResourceScope };
 	};
 	"users.delete": {
 		input: { id: string };
-		output: { user: Principal; scope: ResourceScope };
+		output: { user: User; scope: ResourceScope };
 	};
 	"users.export": {
 		input: { format?: "json" | "jsonl"; limit?: number; status?: string };
-		output: { users: Principal[]; scope: ResourceScope };
+		output: Omit<UsersExportEnvelope, "outputPath">;
 	};
 	"organizations.list": {
 		input: { limit?: number; cursor?: string };
@@ -473,9 +1088,164 @@ export interface ManagementOperationTypes {
 		input: { organizationId: string; content: string; format: "json" | "csv"; dryRun?: boolean; confirm?: boolean };
 		output:
 			| ({ dryRun: true; scope: ResourceScope } & MemberImportPlan)
-			| (MemberImportResult & { scope: ResourceScope });
+			| (MemberImportWireResult & { scope: ResourceScope });
+	};
+	"authorization.effective.inspect": {
+		input: {
+			organizationId: string;
+			subjectKind: AuthorizationSubject["kind"];
+			subjectId: string;
+		};
+		output: { effective: AuthorizationEffectiveView; scope: ResourceScope };
+	};
+	"authorization.assignments.list": {
+		input: { organizationId: string } & AuthorizationAssignmentFilter;
+		output: { assignments: AuthorizationAssignmentView[]; scope: ResourceScope };
+	};
+	"authorization.assignments.replace": {
+		input: {
+			organizationId: string;
+			subjectKind: AuthorizationSubject["kind"];
+			subjectId: string;
+			/** Sorted role IDs. */
+			roleIds: string[];
+			expectedRevision?: string;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output:
+			| {
+					assignment: AuthorizationAssignmentSetView;
+					changed: boolean;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					assignment: AuthorizationAssignmentSetView;
+					wouldChange: boolean;
+					currentRevision: string;
+					scope: ResourceScope;
+			  };
+	};
+	"authorization.reconcile": {
+		input: {
+			organizationId: string;
+			dryRun?: boolean;
+			confirm?: boolean;
+		};
+		output:
+			| {
+					organizationId: string;
+					initialized: boolean;
+					rolesChanged: number;
+					assignmentsChanged: number;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					initialized: boolean;
+					rolesChanged: number;
+					assignmentsChanged: number;
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.list": {
+		input: { organizationId: string };
+		output: { serviceAccounts: ServiceAccountView[]; scope: ResourceScope };
+	};
+	"service-accounts.inspect": {
+		input: { organizationId: string; accountId: string };
+		output: {
+			serviceAccount: ServiceAccountView;
+			assignments: AuthorizationAssignmentView[];
+			scope: ResourceScope;
+		};
+	};
+	"service-accounts.create": {
+		input: { organizationId: string; name: string; roleIds: string[]; dryRun?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| {
+					dryRun: true;
+					serviceAccount: Pick<ServiceAccountView, "organizationId" | "name"> & { status: "active" };
+					roleIds: string[];
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.disable": {
+		input: { organizationId: string; accountId: string; status: "disabled"; dryRun?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
+	};
+	"service-accounts.enable": {
+		input: { organizationId: string; accountId: string; status: "active"; dryRun?: boolean };
+		output:
+			| { serviceAccount: ServiceAccountView; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; serviceAccount: ServiceAccountView; wouldChange: boolean; currentRevision: string; scope: ResourceScope };
+	};
+	"service-accounts.credentials.create": {
+		input:
+			| { organizationId: string; accountId: string; expiresAt?: string; dryRun: true }
+			| { organizationId: string; accountId: string; expiresAt?: string; dryRun?: false; operationId: string };
+		output:
+			| { credential: ServiceAccountCredentialView; secret: string; previousRevision: string; revision: string; scope: ResourceScope }
+			| { dryRun: true; organizationId: string; serviceAccountId: string; expiresAt: string | null; secretGenerated: false; scope: ResourceScope };
+	};
+	"service-accounts.credentials.rotate": {
+		input:
+			| { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun: true }
+			| { organizationId: string; accountId: string; credentialId: string; expiresAt?: string; dryRun?: false; operationId: string };
+		output:
+			| {
+					credential: ServiceAccountCredentialView;
+					secret: string;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					expiresAt: string | null;
+					secretGenerated: false;
+					scope: ResourceScope;
+			  };
+	};
+	"service-accounts.credentials.revoke": {
+		input: { organizationId: string; accountId: string; credentialId: string; dryRun?: boolean };
+		output:
+			| {
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					previousRevision: string;
+					revision: string;
+					scope: ResourceScope;
+			  }
+			| {
+					dryRun: true;
+					organizationId: string;
+					serviceAccountId: string;
+					credentialId: string;
+					wouldChange: boolean;
+					scope: ResourceScope;
+			  };
 	};
 }
+
+export type ManagementOperationTypes = {
+	[Id in keyof ManagementOperationServiceTypes]: {
+		input: ManagementOperationServiceTypes[Id]["input"];
+		output: ManagementJsonWire<ManagementOperationServiceTypes[Id]["output"]>;
+	};
+};
 
 export type ManagementOperationId = keyof ManagementOperationTypes;
 export type OperationInput<Id extends ManagementOperationId> =
@@ -741,6 +1511,108 @@ export const ROLE_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const AUTHORIZATION_OPERATIONS = Object.freeze({
+	effectiveInspect: defineOperation({
+		id: "authorization.effective.inspect",
+		cliPath: "orgs authorization effective",
+		http: { method: "GET", path: "/v1/organizations/:id/authorization/effective/:subjectKind/:subjectId" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	assignmentsList: defineOperation({
+		id: "authorization.assignments.list",
+		cliPath: "orgs authorization assignments list",
+		http: { method: "GET", path: "/v1/organizations/:id/authorization/assignments" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	assignmentsReplace: defineOperation({
+		id: "authorization.assignments.replace",
+		cliPath: "orgs authorization assignments replace",
+		http: { method: "PATCH", path: "/v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	reconcile: defineOperation({
+		id: "authorization.reconcile",
+		cliPath: "orgs authorization reconcile",
+		http: { method: "POST", path: "/v1/organizations/:id/authorization/reconcile" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const SERVICE_ACCOUNT_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "service-accounts.list",
+		cliPath: "orgs service-accounts list",
+		http: { method: "GET", path: "/v1/organizations/:id/service-accounts" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "service-accounts.inspect",
+		cliPath: "orgs service-accounts inspect",
+		http: { method: "GET", path: "/v1/organizations/:id/service-accounts/:accountId" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "service-accounts.create",
+		cliPath: "orgs service-accounts create",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	disable: defineOperation({
+		id: "service-accounts.disable",
+		cliPath: "orgs service-accounts disable",
+		http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
+	}),
+	enable: defineOperation({
+		id: "service-accounts.enable",
+		cliPath: "orgs service-accounts enable",
+		http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	credentialCreate: defineOperation({
+		id: "service-accounts.credentials.create",
+		cliPath: "orgs service-accounts credentials create",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "none",
+	}),
+	credentialRotate: defineOperation({
+		id: "service-accounts.credentials.rotate",
+		cliPath: "orgs service-accounts credentials rotate",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
+	}),
+	credentialRevoke: defineOperation({
+		id: "service-accounts.credentials.revoke",
+		cliPath: "orgs service-accounts credentials revoke",
+		http: { method: "POST", path: "/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "client-required",
+	}),
+});
+
 export const SSO_OPERATIONS = Object.freeze({
 	list: defineOperation({
 		id: "sso.list",
@@ -878,6 +1750,278 @@ export const READINESS_OPERATIONS = Object.freeze({
 	}),
 });
 
+export const DELIVERY_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "delivery.jobs.list",
+		cliPath: "delivery list",
+		http: { method: "GET", path: "/v1/delivery/jobs" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "delivery.jobs.inspect",
+		cliPath: "delivery inspect",
+		http: { method: "GET", path: "/v1/delivery/jobs/:id" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	readiness: defineOperation({
+		id: "delivery.readiness",
+		cliPath: "delivery readiness",
+		http: { method: "GET", path: "/v1/delivery/readiness" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	quotas: defineOperation({
+		id: "delivery.quotas.get",
+		cliPath: "delivery quotas",
+		http: { method: "GET", path: "/v1/delivery/quotas" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	cancel: defineOperation({
+		id: "delivery.jobs.cancel",
+		cliPath: "delivery cancel",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/cancel" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	retry: defineOperation({
+		id: "delivery.jobs.retry",
+		cliPath: "delivery retry",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/retry" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	replay: defineOperation({
+		id: "delivery.jobs.replay",
+		cliPath: "delivery replay",
+		http: { method: "POST", path: "/v1/delivery/jobs/:id/replay" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const WEBHOOK_ENDPOINT_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "delivery.webhook_endpoints.list",
+		cliPath: "delivery endpoints list",
+		http: { method: "GET", path: "/v1/delivery/webhook-endpoints" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	inspect: defineOperation({
+		id: "delivery.webhook_endpoints.inspect",
+		cliPath: "delivery endpoints inspect",
+		http: { method: "GET", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "delivery.webhook_endpoints.create",
+		cliPath: "delivery endpoints create",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	update: defineOperation({
+		id: "delivery.webhook_endpoints.update",
+		cliPath: "delivery endpoints update",
+		http: { method: "PATCH", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	rotate: defineOperation({
+		id: "delivery.webhook_endpoints.rotate",
+		cliPath: "delivery endpoints rotate",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints/:id/rotate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	delete: defineOperation({
+		id: "delivery.webhook_endpoints.delete",
+		cliPath: "delivery endpoints delete",
+		http: { method: "DELETE", path: "/v1/delivery/webhook-endpoints/:id" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	test: defineOperation({
+		id: "delivery.webhook_endpoints.test",
+		cliPath: "delivery endpoints test",
+		http: { method: "POST", path: "/v1/delivery/webhook-endpoints/:id/test" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const AUTHENTICATION_POLICY_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "authentication_policy.get",
+		cliPath: "auth-policy get",
+		http: { method: "GET", path: "/v1/authentication-policy" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "authentication_policy.plan",
+		cliPath: "auth-policy plan",
+		http: { method: "POST", path: "/v1/authentication-policy/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "authentication_policy.apply",
+		cliPath: "auth-policy apply",
+		http: { method: "PATCH", path: "/v1/authentication-policy" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	unlock: defineOperation({
+		id: "authentication_policy.unlock",
+		cliPath: "auth-policy unlock",
+		http: { method: "POST", path: "/v1/authentication-policy/unlock" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const PRODUCT_PRESENTATION_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "product_presentation.get",
+		cliPath: "product presentation get",
+		http: { method: "GET", path: "/v1/product-presentation" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "product_presentation.plan",
+		cliPath: "product presentation plan",
+		http: { method: "POST", path: "/v1/product-presentation/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "product_presentation.apply",
+		cliPath: "product presentation apply",
+		http: { method: "PATCH", path: "/v1/product-presentation" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const PRODUCT_DOMAIN_OPERATIONS = Object.freeze({
+	list: defineOperation({
+		id: "product_domains.list",
+		cliPath: "product domains list",
+		http: { method: "GET", path: "/v1/product-presentation/domains" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	create: defineOperation({
+		id: "product_domains.create",
+		cliPath: "product domains create",
+		http: { method: "POST", path: "/v1/product-presentation/domains" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	reissue: defineOperation({
+		id: "product_domains.reissue",
+		cliPath: "product domains reissue",
+		http: { method: "POST", path: "/v1/product-presentation/domains/reissue" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	verify: defineOperation({
+		id: "product_domains.verify",
+		cliPath: "product domains verify",
+		http: { method: "POST", path: "/v1/product-presentation/domains/verify" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	activate: defineOperation({
+		id: "product_domains.activate",
+		cliPath: "product domains activate",
+		http: { method: "POST", path: "/v1/product-presentation/domains/activate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	disable: defineOperation({
+		id: "product_domains.disable",
+		cliPath: "product domains disable",
+		http: { method: "POST", path: "/v1/product-presentation/domains/disable" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
+export const PRODUCT_SENDER_OPERATIONS = Object.freeze({
+	get: defineOperation({ id: "product_sender.get", cliPath: "product sender get", http: { method: "GET", path: "/v1/product-presentation/sender" }, mutation: false, supportsDryRun: false, confirmation: "none" }),
+	plan: defineOperation({ id: "product_sender.plan", cliPath: "product sender plan", http: { method: "POST", path: "/v1/product-presentation/sender/plan" }, mutation: false, supportsDryRun: false, confirmation: "none" }),
+	apply: defineOperation({ id: "product_sender.apply", cliPath: "product sender apply", http: { method: "PATCH", path: "/v1/product-presentation/sender" }, mutation: true, supportsDryRun: true, confirmation: "server-required" }),
+	readiness: defineOperation({
+		id: "product_sender.readiness",
+		cliPath: "product sender readiness",
+		http: { method: "GET", path: "/v1/product-presentation/sender-readiness" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+});
+
+export const PRODUCT_TEMPLATE_OPERATIONS = Object.freeze({
+	get: defineOperation({
+		id: "product_templates.get",
+		cliPath: "product templates get",
+		http: { method: "GET", path: "/v1/product-presentation/templates/:kind" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "product_templates.plan",
+		cliPath: "product templates plan",
+		http: { method: "POST", path: "/v1/product-presentation/templates/:kind/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "product_templates.apply",
+		cliPath: "product templates apply",
+		http: { method: "PATCH", path: "/v1/product-presentation/templates/:kind" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+});
+
 export const CONFIG_OPERATIONS = Object.freeze({
 	get: defineOperation({
 		id: "config.get",
@@ -933,10 +2077,10 @@ export const MIGRATION_OPERATIONS = Object.freeze({
 		supportsDryRun: false,
 		confirmation: "none",
 	}),
-	run: defineOperation({
-		id: "migrations.run",
-		cliPath: "migration run",
-		http: { method: "POST", path: "/v1/migrations/:id/run" },
+	apply: defineOperation({
+		id: "migrations.apply",
+		cliPath: "migration apply",
+		http: { method: "POST", path: "/v1/migrations/:id/apply" },
 		mutation: true,
 		supportsDryRun: true,
 		confirmation: "none",
@@ -1051,13 +2195,155 @@ export const SCHEMA_OPERATIONS = Object.freeze({
 		cliPath: "schema generate",
 		http: { method: "POST", path: "/v1/schema/generate" },
 		mutation: false,
-		supportsDryRun: true,
+		supportsDryRun: false,
 		confirmation: "none",
 	}),
 	migrate: defineOperation({
 		id: "schema.migrate",
 		cliPath: "schema migrate",
 		http: { method: "POST", path: "/v1/schema/migrate" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	credentialAuthorityStatus: defineOperation({
+		id: "schema.credential-authority.status",
+		cliPath: "schema credential-authority status",
+		http: { method: "GET", path: "/v1/schema/credential-authority" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	credentialAuthorityArm: defineOperation({
+		id: "schema.credential-authority.arm",
+		cliPath: "schema credential-authority arm",
+		http: { method: "POST", path: "/v1/schema/credential-authority/arm" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	credentialAuthorityDrain: defineOperation({
+		id: "schema.credential-authority.drain",
+		cliPath: "schema credential-authority drain",
+		http: { method: "POST", path: "/v1/schema/credential-authority/drain" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+});
+
+export const STORE_V2_OPERATIONS = Object.freeze({
+	status: defineOperation({
+		id: "schema.store-v2.status",
+		cliPath: "schema store-v2 status",
+		http: { method: "GET", path: "/v1/schema/store-v2" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "schema.store-v2.plan",
+		cliPath: "schema store-v2 plan",
+		http: { method: "GET", path: "/v1/schema/store-v2/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "schema.store-v2.apply",
+		cliPath: "schema store-v2 apply",
+		http: { method: "POST", path: "/v1/schema/store-v2/apply" },
+		mutation: true,
+		supportsDryRun: true,
+		confirmation: "server-required",
+	}),
+	verify: defineOperation({
+		id: "schema.store-v2.verify",
+		cliPath: "schema store-v2 verify",
+		http: { method: "GET", path: "/v1/schema/store-v2/verify" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	rollback: defineOperation({
+		id: "schema.store-v2.rollback",
+		cliPath: "schema store-v2 rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	eventsCutover: defineOperation({
+		id: "schema.store-v2.events.cutover",
+		cliPath: "schema store-v2 events cutover",
+		http: { method: "POST", path: "/v1/schema/store-v2/events/cutover" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	eventsRollback: defineOperation({
+		id: "schema.store-v2.events.rollback",
+		cliPath: "schema store-v2 events rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/events/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	principalsCutover: defineOperation({
+		id: "schema.store-v2.principals.cutover",
+		cliPath: "schema store-v2 principals cutover",
+		http: { method: "POST", path: "/v1/schema/store-v2/principals/cutover" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	principalsRollback: defineOperation({
+		id: "schema.store-v2.principals.rollback",
+		cliPath: "schema store-v2 principals rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/principals/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	topologyCutover: defineOperation({
+		id: "schema.store-v2.topology.cutover",
+		cliPath: "schema store-v2 topology cutover",
+		http: { method: "POST", path: "/v1/schema/store-v2/topology/cutover" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+	topologyRollback: defineOperation({
+		id: "schema.store-v2.topology.rollback",
+		cliPath: "schema store-v2 topology rollback",
+		http: { method: "POST", path: "/v1/schema/store-v2/topology/rollback" },
+		mutation: true,
+		supportsDryRun: false,
+		confirmation: "server-required",
+	}),
+});
+
+export const KEY_MANAGEMENT_OPERATIONS = Object.freeze({
+	status: defineOperation({
+		id: "key_management.status",
+		cliPath: "key-management status",
+		http: { method: "GET", path: "/v1/key-management/status" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	plan: defineOperation({
+		id: "key_management.plan",
+		cliPath: "key-management plan",
+		http: { method: "POST", path: "/v1/key-management/plan" },
+		mutation: false,
+		supportsDryRun: false,
+		confirmation: "none",
+	}),
+	apply: defineOperation({
+		id: "key_management.apply",
+		cliPath: "key-management apply",
+		http: { method: "POST", path: "/v1/key-management/apply" },
 		mutation: true,
 		supportsDryRun: true,
 		confirmation: "server-required",
@@ -1217,15 +2503,26 @@ export const MANAGEMENT_OPERATIONS = Object.freeze([
 	...Object.values(API_KEY_OPERATIONS),
 	...Object.values(SESSION_OPERATIONS),
 	...Object.values(ROLE_OPERATIONS),
+	...Object.values(AUTHORIZATION_OPERATIONS),
+	...Object.values(SERVICE_ACCOUNT_OPERATIONS),
 	...Object.values(SSO_OPERATIONS),
 	...Object.values(SCIM_OPERATIONS),
 	...Object.values(READINESS_OPERATIONS),
+	...Object.values(DELIVERY_OPERATIONS),
+	...Object.values(WEBHOOK_ENDPOINT_OPERATIONS),
+	...Object.values(AUTHENTICATION_POLICY_OPERATIONS),
+	...Object.values(PRODUCT_PRESENTATION_OPERATIONS),
+	...Object.values(PRODUCT_DOMAIN_OPERATIONS),
+	...Object.values(PRODUCT_SENDER_OPERATIONS),
+	...Object.values(PRODUCT_TEMPLATE_OPERATIONS),
 	...Object.values(CONFIG_OPERATIONS),
 	...Object.values(IMPORT_OPERATIONS),
 	...Object.values(MIGRATION_OPERATIONS),
 	...Object.values(BACKUP_OPERATIONS),
 	...Object.values(UPGRADE_OPERATIONS),
 	...Object.values(SCHEMA_OPERATIONS),
+	...Object.values(STORE_V2_OPERATIONS),
+	...Object.values(KEY_MANAGEMENT_OPERATIONS),
 	...Object.values(USER_OPERATIONS),
 	...Object.values(ORGANIZATION_OPERATIONS),
 	...Object.values(MEMBER_OPERATIONS),

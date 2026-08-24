@@ -4,7 +4,15 @@
  * are failures. Evidence is always "local protocol verification" unless the
  * operator explicitly points at a real tenant (still not certification).
  */
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { lookup as dnsLookup } from "node:dns/promises";
+import {
+	createServer,
+	request as httpRequest,
+	type IncomingMessage,
+	type ServerResponse,
+} from "node:http";
+import { request as httpsRequest } from "node:https";
+import { BlockList, isIP } from "node:net";
 import { ClearanceError } from "./errors.js";
 
 export type ScimProbeOutcome =
@@ -25,6 +33,139 @@ export type ScimProbeOptions = {
 	timeoutMs?: number;
 	fetchImpl?: typeof fetch;
 };
+
+const blockedAddresses = new BlockList();
+const publicIpv6Addresses = new BlockList();
+publicIpv6Addresses.addSubnet("2000::", 3, "ipv6");
+for (const [network, prefix] of [
+	["0.0.0.0", 8],
+	["10.0.0.0", 8],
+	["100.64.0.0", 10],
+	["127.0.0.0", 8],
+	["169.254.0.0", 16],
+	["172.16.0.0", 12],
+	["192.0.0.0", 24],
+	["192.0.2.0", 24],
+	["192.168.0.0", 16],
+	["198.18.0.0", 15],
+	["198.51.100.0", 24],
+	["203.0.113.0", 24],
+	["224.0.0.0", 4],
+] as const) {
+	blockedAddresses.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [
+	["::", 128],
+	["::1", 128],
+	["fc00::", 7],
+	["fe80::", 10],
+	["ff00::", 8],
+	["2001:db8::", 32],
+] as const) {
+	blockedAddresses.addSubnet(network, prefix, "ipv6");
+}
+
+function normalizedAddress(address: string): { address: string; family: 4 | 6 } {
+	const unbracketed = address.startsWith("[") && address.endsWith("]")
+		? address.slice(1, -1)
+		: address;
+	const mappedDotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(unbracketed);
+	if (mappedDotted) return { address: mappedDotted[1]!, family: 4 };
+	const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(unbracketed);
+	if (mappedHex) {
+		const high = Number.parseInt(mappedHex[1]!, 16);
+		const low = Number.parseInt(mappedHex[2]!, 16);
+		return {
+			address: `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`,
+			family: 4,
+		};
+	}
+	return { address: unbracketed, family: isIP(unbracketed) === 6 ? 6 : 4 };
+}
+
+function assertPublicAddress(address: string): { address: string; family: 4 | 6 } {
+	const normalized = normalizedAddress(address);
+	if (
+		isIP(normalized.address) === 0 ||
+		(normalized.family === 6 &&
+			!publicIpv6Addresses.check(normalized.address, "ipv6")) ||
+		blockedAddresses.check(
+			normalized.address,
+			normalized.family === 4 ? "ipv4" : "ipv6",
+		)
+	) {
+		throw new ClearanceError({
+			code: "SCIM_ENDPOINT_FORBIDDEN",
+			message: "SCIM probes refuse local, private, reserved, and link-local destinations",
+			stage: "scim.probe.address",
+			status: 400,
+			remediation: "Use a publicly routable SCIM endpoint; use injected fixture transport for local protocol tests.",
+		});
+	}
+	return normalized;
+}
+
+async function resolvePublicAddress(hostname: string): Promise<{ address: string; family: 4 | 6 }> {
+	const literal = isIP(normalizedAddress(hostname).address);
+	if (literal) return assertPublicAddress(hostname);
+	let results: Array<{ address: string; family: number }>;
+	try {
+		results = await dnsLookup(hostname, { all: true, verbatim: true }) as Array<{
+			address: string;
+			family: number;
+		}>;
+	} catch (error) {
+		throw new ClearanceError({
+			code: "SCIM_ENDPOINT_DNS_FAILED",
+			message: error instanceof Error ? error.message : "SCIM endpoint DNS lookup failed",
+			stage: "scim.probe.dns",
+			status: 400,
+		});
+	}
+	if (results.length === 0) {
+		throw new ClearanceError({
+			code: "SCIM_ENDPOINT_DNS_FAILED",
+			message: "SCIM endpoint DNS lookup returned no addresses",
+			stage: "scim.probe.dns",
+			status: 400,
+		});
+	}
+	const safe = results.map((result) => assertPublicAddress(result.address));
+	return safe[0]!;
+}
+
+async function pinnedRequest(
+	url: URL,
+	headers: Record<string, string>,
+	timeoutMs: number,
+): Promise<{ status: number; text: string }> {
+	const target = await resolvePublicAddress(url.hostname);
+	return new Promise((resolve, reject) => {
+		const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, {
+			method: "GET",
+			headers,
+			lookup: (_hostname, _options, callback) => {
+				callback(null, target.address, target.family);
+			},
+		}, (response) => {
+			const chunks: Buffer[] = [];
+			let size = 0;
+			response.on("data", (chunk: Buffer | string) => {
+				if (size >= 65_536) return;
+				const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+				chunks.push(buffer.subarray(0, Math.max(0, 65_536 - size)));
+				size += buffer.length;
+			});
+			response.on("end", () => resolve({
+				status: response.statusCode ?? 0,
+				text: Buffer.concat(chunks).toString("utf8"),
+			}));
+		});
+		request.setTimeout(timeoutMs, () => request.destroy(new Error("SCIM probe timed out")));
+		request.on("error", reject);
+		request.end();
+	});
+}
 
 function joinScimUrl(endpoint: string, path: string): string {
 	const base = endpoint.replace(/\/$/, "");
@@ -50,52 +191,56 @@ export async function probeScimEndpoint(
 		headers.authorization = `Bearer ${opts.bearerToken}`;
 	}
 
-	const fetchFn = opts.fetchImpl ?? fetch;
-	const controller = new AbortController();
-	const timer = setTimeout(
-		() => controller.abort(),
-		opts.timeoutMs ?? 5_000,
-	);
+	const timeoutMs = opts.timeoutMs ?? 5_000;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	try {
-		const res = await fetchFn(url, {
-			method: "GET",
-			headers,
-			signal: controller.signal,
-			// SSRF guard: a validated external endpoint could still answer
-			// 302 → http://127.0.0.1/... and a following fetch would obey it.
-			// Redirects are refused, never followed (adversarial finding M2).
-			redirect: "manual",
-		});
-		const text = await res.text();
+		let status: number;
+		let text: string;
+		if (opts.fetchImpl) {
+			const controller = new AbortController();
+			timer = setTimeout(() => controller.abort(), timeoutMs);
+			const response = await opts.fetchImpl(url, {
+				method: "GET",
+				headers,
+				signal: controller.signal,
+				redirect: "manual",
+			});
+			status = response.status;
+			text = await response.text();
+		} else {
+			const response = await pinnedRequest(new URL(url), headers, timeoutMs);
+			status = response.status;
+			text = response.text;
+		}
 		const snippet = text.slice(0, 400);
 
-		if (res.status >= 300 && res.status < 400) {
+		if (status >= 300 && status < 400) {
 			return {
 				ok: false,
 				reason: "non_success",
-				status: res.status,
-				message: `SCIM endpoint answered with a redirect (${res.status}); redirects are refused (probe never follows them)`,
+				status,
+				message: `SCIM endpoint answered with a redirect (${status}); redirects are refused (probe never follows them)`,
 				path,
 			};
 		}
 
-		if (res.status === 401 || res.status === 403) {
+		if (status === 401 || status === 403) {
 			return {
 				ok: false,
 				reason: "authentication",
-				status: res.status,
-				message: `SCIM endpoint rejected credentials (${res.status})`,
+				status,
+				message: `SCIM endpoint rejected credentials (${status})`,
 				path,
 			};
 		}
 
-		if (res.status >= 400) {
+		if (status >= 400) {
 			return {
 				ok: false,
 				reason: "non_success",
-				status: res.status,
-				message: `SCIM endpoint returned non-success status ${res.status}`,
+				status,
+				message: `SCIM endpoint returned non-success status ${status}`,
 				path,
 			};
 		}
@@ -109,14 +254,14 @@ export async function probeScimEndpoint(
 				return {
 					ok: false,
 					reason: "malformed_body",
-					status: res.status,
+					status,
 					message: "SCIM response body is not valid JSON",
 					path,
 				};
 			}
 		}
 
-		return { ok: true, status: res.status, path, bodySnippet: snippet };
+		return { ok: true, status, path, bodySnippet: snippet };
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		return {
@@ -126,7 +271,7 @@ export async function probeScimEndpoint(
 			path,
 		};
 	} finally {
-		clearTimeout(timer);
+		if (timer) clearTimeout(timer);
 	}
 }
 

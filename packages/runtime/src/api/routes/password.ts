@@ -1,10 +1,19 @@
 import type { AuthContext } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { getCurrentAdapter, runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
 import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
 import { getDate } from "../../utils/date";
 import { validatePassword } from "../../utils/password";
+import {
+	requireManagedAuthenticationTransaction,
+	runManagedAuthenticationTransaction,
+} from "../../internal/managed-authentication-transaction";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import { originCheck } from "../middlewares";
 import { sensitiveSessionMiddleware } from "./session";
 
@@ -87,7 +96,10 @@ export const requestPasswordReset = createAuthEndpoint(
 		use: [originCheck((ctx) => ctx.body.redirectTo)],
 	},
 	async (ctx) => {
-		if (!ctx.context.options.emailAndPassword?.sendResetPassword) {
+		if (
+			!ctx.context.options.durableDelivery &&
+			!ctx.context.options.emailAndPassword?.sendResetPassword
+		) {
 			ctx.context.logger.error(
 				"Reset password isn't enabled.Please pass an emailAndPassword.sendResetPassword function in your auth config!",
 			);
@@ -107,7 +119,7 @@ export const requestPasswordReset = createAuthEndpoint(
 			 * to mitigate timing attacks.
 			 */
 			generateId(24);
-			await ctx.context.internalAdapter.findVerificationValue(
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 				"dummy-verification-token",
 			);
 			ctx.context.logger.warn("Reset Password: User not found");
@@ -119,33 +131,57 @@ export const requestPasswordReset = createAuthEndpoint(
 		}
 		const defaultExpiresIn = 60 * 60 * 1;
 		const expiresAt = getDate(
-			ctx.context.options.emailAndPassword.resetPasswordTokenExpiresIn ||
+			ctx.context.options.emailAndPassword?.resetPasswordTokenExpiresIn ||
 				defaultExpiresIn,
 			"sec",
 		);
 		const verificationToken = generateId(24);
-		await ctx.context.internalAdapter.createVerificationValue({
-			value: user.user.id,
-			identifier: `reset-password:${verificationToken}`,
-			expiresAt,
-		});
-		const callbackURL = redirectTo ? encodeURIComponent(redirectTo) : "";
-		const url = `${ctx.context.baseURL}/reset-password/${verificationToken}?callbackURL=${callbackURL}`;
-		await ctx.context.runInBackgroundOrAwait(
-			ctx.context.options.emailAndPassword.sendResetPassword(
+		const createResetGeneration = async () => {
+			const identifier = `reset-password:${verificationToken}`;
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{ purpose: "password-reset", subject: identifier },
 				{
-					user: user.user,
-					url,
-					token: verificationToken,
+					value: user.user.id,
+					identifier,
+				expiresAt,
 				},
-				ctx.request,
-			),
-		);
-		return ctx.json({
-			status: true,
-			message:
-				"If this email exists in our system, check your email for the reset link",
-		});
+			);
+			const callbackURL = redirectTo ? encodeURIComponent(redirectTo) : "";
+			const url = `${ctx.context.baseURL}/reset-password/${verificationToken}?callbackURL=${callbackURL}`;
+			if (ctx.context.options.durableDelivery) {
+				const transaction = await getCurrentAdapter(ctx.context.adapter);
+				await ctx.context.options.durableDelivery.enqueue(transaction, {
+					kind: "password.reset",
+					sourceKey: `reset-password:${verificationToken}`,
+					actorId: user.user.id,
+					channel: "email",
+					destination: user.user.email,
+					payload: {
+						template: "password-reset",
+						to: user.user.email,
+						userName: user.user.name,
+						url,
+					},
+					semanticExpiresAt: expiresAt,
+				});
+			} else {
+				await ctx.context.runInBackgroundOrAwait(
+					ctx.context.options.emailAndPassword!.sendResetPassword!(
+						{ user: user.user, url, token: verificationToken },
+						ctx.request,
+					),
+				);
+			}
+			return ctx.json({
+				status: true,
+				message:
+					"If this email exists in our system, check your email for the reset link",
+			});
+		};
+		return ctx.context.options.durableDelivery
+			? runWithTransaction(ctx.context.adapter, createResetGeneration)
+			: createResetGeneration();
 	},
 );
 
@@ -213,7 +249,7 @@ export const requestPasswordResetCallback = createAuthEndpoint(
 			);
 		}
 		const verification =
-			await ctx.context.internalAdapter.findVerificationValue(
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 				`reset-password:${token}`,
 			);
 		if (!verification || verification.expiresAt < new Date()) {
@@ -289,43 +325,58 @@ export const resetPassword = createAuthEndpoint(
 		}
 
 		const id = `reset-password:${token}`;
-
-		// Consume the single-use reset token before any password change so two
-		// concurrent requests with the same token cannot both proceed: the first
-		// caller wins, every racer (and any expired token) gets null.
-		const verification =
-			await ctx.context.internalAdapter.consumeVerificationValue(id);
-		if (!verification) {
-			throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_TOKEN);
-		}
-		const userId = verification.value;
-		const hashedPassword = await ctx.context.password.hash(newPassword);
-		const accounts = await ctx.context.internalAdapter.findAccounts(userId);
-		const account = accounts.find((ac) => ac.providerId === "credential");
-		if (!account) {
-			await ctx.context.internalAdapter.createAccount({
-				userId,
-				providerId: "credential",
-				password: hashedPassword,
-				accountId: userId,
-			});
-		} else {
-			await ctx.context.internalAdapter.updatePassword(userId, hashedPassword);
-		}
-
-		if (ctx.context.options.emailAndPassword?.onPasswordReset) {
+		const managed = requireManagedAuthenticationTransaction(ctx);
+		const resetUser = await runManagedAuthenticationTransaction(ctx, async () => {
+			// Consume the single-use reset token in the same transaction as the
+			// password and session-authority mutations it authorizes.
+			const verification = await consumeInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{ purpose: "password-reset", subject: id, identifier: id },
+			);
+			if (!verification) {
+				throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_TOKEN);
+			}
+			const userId = verification.value;
+			const hashedPassword = await ctx.context.password.hash(newPassword);
+			const accounts = await ctx.context.internalAdapter.findAccounts(userId);
+			const account = accounts.find((ac) => ac.providerId === "credential");
+			if (!account) {
+				await ctx.context.internalAdapter.createAccount({
+					userId,
+					providerId: "credential",
+					password: hashedPassword,
+					accountId: userId,
+				});
+			} else {
+				await ctx.context.internalAdapter.updatePassword(userId, hashedPassword);
+			}
 			const user = await ctx.context.internalAdapter.findUserById(userId);
-			if (user) {
+			if (!managed && user && ctx.context.options.emailAndPassword?.onPasswordReset) {
 				await ctx.context.options.emailAndPassword.onPasswordReset(
-					{
-						user,
-					},
+					{ user },
 					ctx.request,
 				);
 			}
-		}
-		if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
-			await ctx.context.internalAdapter.deleteUserSessions(userId);
+			if (ctx.context.options.emailAndPassword?.revokeSessionsOnPasswordReset) {
+				await ctx.context.internalAdapter.deleteUserSessions(userId);
+			}
+			return user;
+		});
+		if (
+			managed &&
+			resetUser &&
+			ctx.context.options.emailAndPassword?.onPasswordReset
+		) {
+			try {
+				await ctx.context.options.emailAndPassword.onPasswordReset(
+					{ user: resetUser },
+					ctx.request,
+				);
+			} catch {
+				ctx.context.logger.error(
+					"Managed password reset post-commit callback failed",
+				);
+			}
 		}
 		return ctx.json({
 			status: true,

@@ -21,8 +21,8 @@ const symbol = Symbol.for("clearance:global");
 let bind: ClearanceGlobal | null = null;
 
 const __context: Record<string, AsyncLocalStorage<unknown>> = {};
-const __clearanceVersion: string = import.meta.env
-	.CLEARANCE_VERSION as string;
+const __clearanceVersion =
+	import.meta.env?.CLEARANCE_VERSION ?? "0.0.0";
 
 /**
  * We store context instance in the globalThis.

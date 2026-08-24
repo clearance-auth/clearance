@@ -306,6 +306,32 @@ export type ClearanceDBSchema = Record<
 
 export interface SecondaryStorage {
 	/**
+	 * Stable deployment namespace used to bind security-migration epochs. It
+	 * must be unique for each Clearance installation sharing the backend.
+	 */
+	namespace?: string | undefined;
+	/**
+	 * Execute a callback while the named namespace is exclusively fenced from
+	 * every reader and writer, including legacy application versions. Durable
+	 * session credential migration refuses to publish completion without this
+	 * provider-level guarantee.
+	 */
+	runExclusive?<T>(
+		name: string,
+		operation: () => Awaitable<T>,
+	): Awaitable<T>;
+	/**
+	 * Fail unless every deployed application version that can write legacy,
+	 * unnamespaced session keys has been irrevocably drained. Providers must
+	 * consult durable deployment/lease state; a process-local observation is
+	 * insufficient. Credential migration checks this while holding runExclusive
+	 * and again immediately before publishing its completion epoch.
+	 */
+	assertNoLegacySessionWriters?(input: {
+		namespace: string;
+		nextGeneration: string;
+	}): Awaitable<void>;
+	/**
 	 *
 	 * @param key - Key to get
 	 * @returns - Value of the key

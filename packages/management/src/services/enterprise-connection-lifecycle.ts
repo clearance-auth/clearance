@@ -1,5 +1,8 @@
 import type { ManagementStore } from "../store/types.js";
-import { inspectOrganization } from "./core.js";
+import {
+	inspectOrganization,
+	inspectOrganizationAuthoritative,
+} from "./core.js";
 import { ClearanceError } from "./errors.js";
 import {
 	resolveOperatorScope,
@@ -50,6 +53,49 @@ export function resolveEnterpriseConnection<T extends ScopedEnterpriseConnection
 			error instanceof ClearanceError &&
 			(error.code === "ORG_NOT_FOUND" || error.status === 404)
 		) {
+			throw connectionNotFound(input, connectionId);
+		}
+		throw error;
+	}
+	return connection;
+}
+
+/**
+ * Async counterpart for relational-topology cutover consumers. Connection rows
+ * remain in the management snapshot, while their organization authority is
+ * resolved by the scoped topology reader.
+ */
+export async function resolveEnterpriseConnectionAuthoritative<T extends ScopedEnterpriseConnection>(
+	store: ManagementStore,
+	id: string,
+	input: {
+		connections: readonly T[];
+		scope?: ResourceScope;
+		stage: string;
+		label: "SSO" | "SCIM";
+		idRequiredCode: string;
+		notFoundCode: string;
+	},
+): Promise<T> {
+	const connectionId = id?.trim();
+	if (!connectionId) {
+		throw new ClearanceError({
+			code: input.idRequiredCode,
+			message: `${input.label} connection id is required`,
+			stage: input.stage,
+			status: 400,
+		});
+	}
+	const connection = input.connections.find((candidate) => candidate.id === connectionId);
+	if (!connection) throw connectionNotFound(input, connectionId);
+	try {
+		await inspectOrganizationAuthoritative(
+			store,
+			connection.organizationId,
+			input.scope ?? resolveOperatorScope(store),
+		);
+	} catch (error) {
+		if (error instanceof ClearanceError && (error.code === "ORG_NOT_FOUND" || error.status === 404)) {
 			throw connectionNotFound(input, connectionId);
 		}
 		throw error;

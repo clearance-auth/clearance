@@ -16,6 +16,7 @@ import {
 	validateSkipDiscoveryEndpoints,
 } from "../oidc";
 import { decryptOIDCConfig, encryptOIDCConfig } from "../oidc-secret-storage";
+import { isSSOKeyManagementWriter } from "../internal/key-management-writer";
 import { validateConfigAlgorithms } from "../saml";
 import type { Member, OIDCConfig, SAMLConfig, SSOOptions } from "../types";
 import { maskClientId, parseCertificate, safeJsonParse } from "../utils";
@@ -30,6 +31,8 @@ interface SSOProviderRecord {
 	domainVerified?: boolean;
 	userId: string;
 	oidcConfig?: string | null;
+	keyManagementVersion?: number | null;
+	keyManagementRevision?: number | null;
 	samlConfig?: string | null;
 }
 
@@ -331,7 +334,7 @@ const getSSOProviderQuerySchema = z.object({
 	providerId: z.string(),
 });
 
-export async function checkProviderAccess(
+export async function requireAuthorizedProvider(
 	ctx: {
 		context: AuthContext & {
 			session: { user: { id: string } };
@@ -401,7 +404,7 @@ export const getSSOProvider = () => {
 		async (ctx) => {
 			const { providerId } = ctx.query;
 
-			const provider = await checkProviderAccess(ctx, providerId);
+			const provider = await requireAuthorizedProvider(ctx, providerId);
 
 			return ctx.json(sanitizeProvider(provider, ctx.context.baseURL));
 		},
@@ -518,7 +521,7 @@ export const updateSSOProvider = (options: SSOOptions) => {
 				});
 			}
 
-			const existingProvider = await checkProviderAccess(ctx, providerId);
+			const existingProvider = await requireAuthorizedProvider(ctx, providerId);
 
 			const updateData: Partial<SSOProviderRecord> = {};
 			let providerIdentityBoundaryChanged =
@@ -599,6 +602,7 @@ export const updateSSOProvider = (options: SSOOptions) => {
 						existingProvider.oidcConfig,
 						"OIDC",
 					),
+					existingProvider.providerId,
 					options,
 				);
 
@@ -615,8 +619,17 @@ export const updateSSOProvider = (options: SSOOptions) => {
 				}
 
 				updateData.oidcConfig = JSON.stringify(
-					await encryptOIDCConfig(updatedOidcConfig, options),
+					await encryptOIDCConfig(
+						updatedOidcConfig,
+						existingProvider.providerId,
+						options,
+					),
 				);
+				if (isSSOKeyManagementWriter(options?.storeOIDCClientSecret)) {
+					updateData.keyManagementVersion = 1;
+					updateData.keyManagementRevision =
+						(existingProvider.keyManagementRevision ?? 0) + 1;
+				}
 			}
 
 			if (providerIdentityBoundaryChanged) {
@@ -692,7 +705,7 @@ export const deleteSSOProvider = () => {
 		async (ctx) => {
 			const { providerId } = ctx.body;
 
-			await checkProviderAccess(ctx, providerId);
+			await requireAuthorizedProvider(ctx, providerId);
 
 			await runWithTransaction(ctx.context.adapter, async () => {
 				const trx = await getCurrentAdapter(ctx.context.adapter);

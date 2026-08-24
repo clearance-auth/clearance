@@ -3,11 +3,14 @@ import { createRemoteJWKSet, customFetch, jwtVerify } from "jose";
 import type { AwaitableFunction } from "../types";
 import type { ProviderOptions } from "./index";
 import { getOAuth2Tokens } from "./index";
+import { fetchWithPublicEgressPolicy } from "../utils/public-egress";
 import {
 	assertResponseNotRedirect,
 	fetchRefusingRedirects,
 	NO_FOLLOW_REDIRECT,
 } from "./reject-redirects";
+
+type OAuthEndpointFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export async function authorizationCodeRequest({
 	code,
@@ -131,6 +134,7 @@ export async function validateAuthorizationCode({
 	headers,
 	additionalParams = {},
 	resource,
+	fetchImpl,
 }: {
 	code: string;
 	redirectURI: string;
@@ -142,6 +146,7 @@ export async function validateAuthorizationCode({
 	headers?: Record<string, string> | undefined;
 	additionalParams?: Record<string, string> | undefined;
 	resource?: (string | string[]) | undefined;
+	fetchImpl?: OAuthEndpointFetch | undefined;
 }) {
 	const { body, headers: requestHeaders } = await authorizationCodeRequest({
 		code,
@@ -155,6 +160,17 @@ export async function validateAuthorizationCode({
 		resource,
 	});
 
+	if (fetchImpl) {
+		const response = await fetchWithPublicEgressPolicy(tokenEndpoint, {
+			method: "POST",
+			body,
+			headers: requestHeaders,
+			...NO_FOLLOW_REDIRECT,
+		}, fetchImpl);
+		assertResponseNotRedirect(tokenEndpoint, response);
+		if (!response.ok) throw new Error(`OAuth token endpoint returned HTTP ${response.status}`);
+		return getOAuth2Tokens(await response.json() as object);
+	}
 	const { data, error } = await fetchRefusingRedirects<object>(tokenEndpoint, {
 		method: "POST",
 		body: body,
@@ -174,10 +190,15 @@ export async function validateToken(
 		audience?: string | string[];
 		issuer?: string | string[];
 	},
+	fetchImpl?: OAuthEndpointFetch,
 ) {
 	const jwks = createRemoteJWKSet(new URL(jwksEndpoint), {
 		[customFetch]: async (url, init) => {
-			const response = await fetch(url, { ...init, ...NO_FOLLOW_REDIRECT });
+			const response = await fetchWithPublicEgressPolicy(
+				url,
+				{ ...init, ...NO_FOLLOW_REDIRECT },
+				fetchImpl ?? ((input, requestInit) => fetch(input, requestInit)),
+			);
 			assertResponseNotRedirect(String(url), response);
 			return response;
 		},

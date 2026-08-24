@@ -1,5 +1,41 @@
 {{- $apiRepository := required "image.repository is required" .Values.image.repository }}
-{{- $apiDigest := required "image.digest is required; deploy the signed release digest" .Values.image.digest }}
+{{- $apiDigest := required "image.digest is required; deploy an immutable release digest" .Values.image.digest }}
+{{- $phase := required "credentialAuthority.phase is required" .Values.credentialAuthority.phase }}
+{{- if not (has $phase (list "bootstrap" "bridge" "drain" "migrate" "serve")) }}
+{{- fail "credentialAuthority.phase must be bootstrap, bridge, drain, migrate, or serve" }}
+{{- end }}
+{{- $deploymentId := required "credentialAuthority.deploymentId is required" .Values.credentialAuthority.deploymentId }}
+{{- $product := .Values.productPresentation }}
+{{- $customDomains := $product.customDomains }}
+{{- if $customDomains.enabled }}
+{{- $edge := $customDomains.edge }}
+{{- if ne $edge.mode "operator-managed" }}{{ fail "productPresentation.customDomains.edge.mode must be operator-managed when custom domains are enabled" }}{{- end }}
+{{- if empty $edge.customerDnsTarget }}{{ fail "productPresentation.customDomains.edge.customerDnsTarget is required when custom domains are enabled" }}{{- end }}
+{{- if ne .Values.env.CLEARANCE_CUSTOM_DOMAIN_TARGET $edge.customerDnsTarget }}{{ fail "env.CLEARANCE_CUSTOM_DOMAIN_TARGET must equal productPresentation.customDomains.edge.customerDnsTarget" }}{{- end }}
+{{- if ne $edge.tls.certificateLifecycle "operator-managed-per-domain" }}{{ fail "custom-domain TLS must be operator-managed-per-domain" }}{{- end }}
+{{- if ne $edge.upstream.type "vault-service" }}{{ fail "custom-domain edge upstream.type must be vault-service" }}{{- end }}
+{{- if ne $edge.upstream.protocol "http" }}{{ fail "custom-domain edge upstream.protocol must be http" }}{{- end }}
+{{- if ne $edge.upstream.hostHeader "preserve-original-authority" }}{{ fail "custom-domain edge must preserve the original Host authority to Vault" }}{{- end }}
+{{- if empty $edge.upstream.sourcePeers }}{{ fail "custom-domain edge upstream.sourcePeers must identify the private edge and canonical ingress sources" }}{{- end }}
+{{- if not .Values.vault.enabled }}{{ fail "productPresentation.customDomains.enabled requires vault.enabled=true" }}{{- end }}
+{{- if ne .Values.vault.service.type "ClusterIP" }}{{ fail "custom-domain edge requires vault.service.type=ClusterIP" }}{{- end }}
+{{- if not .Values.networkPolicy.enabled }}{{ fail "custom-domain edge requires networkPolicy.enabled=true" }}{{- end }}
+{{- if not .Values.ingress.vault.enabled }}{{ fail "custom-domain edge requires ingress.vault.enabled=true for the canonical host" }}{{- end }}
+{{- if not .Values.ingress.vault.tls.enabled }}{{ fail "custom-domain edge requires ingress.vault.tls.enabled=true for the canonical host" }}{{- end }}
+{{- if empty .Values.ingress.vault.tls.secretName }}{{ fail "custom-domain edge requires ingress.vault.tls.secretName for the canonical host" }}{{- end }}
+{{- if ne .Values.vault.publicUrl (printf "https://%s" .Values.ingress.vault.host) }}{{ fail "vault.publicUrl must exactly equal https://ingress.vault.host when custom domains are enabled" }}{{- end }}
+{{- end }}
+{{- if ne $product.managementSchema "public" }}{{ fail "productPresentation.managementSchema must remain public to match the API normalized authority" }}{{- end }}
+{{- if ne $product.managementPrefix "mgmt_" }}{{ fail "productPresentation.managementPrefix must remain mgmt_ to match the API normalized authority" }}{{- end }}
+{{- if and (eq $phase "bridge") (ne (int .Values.credentialAuthority.expectedRuntimeCount) (int .Values.replicaCount)) }}
+{{- fail "credentialAuthority.expectedRuntimeCount must equal replicaCount in bridge phase" }}
+{{- end }}
+{{- if and (eq $phase "migrate") (empty .Values.credentialAuthority.drainId) }}
+{{- fail "credentialAuthority.drainId is required in migrate phase" }}
+{{- end }}
+{{- if and (or (eq $phase "bootstrap") (eq $phase "migrate")) (empty .Values.credentialAuthority.migrationAttemptId) }}
+{{- fail "credentialAuthority.migrationAttemptId is required in bootstrap and migrate phases" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,8 +46,12 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: api
 spec:
-  replicas: {{ .Values.replicaCount }}
-  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # Bridge permits a normal candidate rollout. Drain and migrate retain the
+  # Deployment at zero replicas. Serve starts only digest-generation runtimes.
+  strategy:
+    type: {{ if eq $phase "bridge" }}RollingUpdate{{ else }}Recreate{{ end }}
+  replicas: {{ if or (eq $phase "bootstrap") (eq $phase "drain") (eq $phase "migrate") }}0{{ else }}{{ .Values.replicaCount }}{{ end }}
+  revisionHistoryLimit: {{ if eq $phase "bridge" }}{{ .Values.revisionHistoryLimit }}{{ else }}0{{ end }}
   selector:
     matchLabels:
       app: clearance-api
@@ -19,7 +59,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken | sha256sum }}
+        checksum/runtime-config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s" .Values.secrets.existingSecret .Values.env.CLEARANCE_BASE_URL .Values.env.CLEARANCE_CORS_ORIGINS .Values.env.CLEARANCE_TRUSTED_PROXY .Values.restartToken (toJson .Values.delivery) $phase $deploymentId | sha256sum }}
       labels:
         app: clearance-api
         app.kubernetes.io/name: clearance
@@ -66,6 +106,14 @@ spec:
             - { name: backups, mountPath: /backups }
 {{- end }}
           env:
+            - name: CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION
+              value: {{ if eq $phase "serve" }}digest-v1{{ else }}legacy-v1{{ end }}
+            - name: CLEARANCE_DEPLOYMENT_ID
+              value: {{ $deploymentId | quote }}
+            - name: CLEARANCE_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -85,6 +133,17 @@ spec:
 {{- end }}
             - name: CLEARANCE_CORS_ORIGINS
               value: {{ required "env.CLEARANCE_CORS_ORIGINS is required" .Values.env.CLEARANCE_CORS_ORIGINS | quote }}
+{{- if $product.customDomains.enabled }}
+            - name: CLEARANCE_CUSTOM_DOMAIN_TARGET
+              value: {{ .Values.env.CLEARANCE_CUSTOM_DOMAIN_TARGET | quote }}
+{{- end }}
+{{- with $product.emailDomainRecords.existingSecret }}
+            - name: CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $product.emailDomainRecords.key }}
+{{- end }}
             - name: CLEARANCE_TRUSTED_PROXY
               value: {{ .Values.env.CLEARANCE_TRUSTED_PROXY | quote }}
             - name: CLEARANCE_SECRET
@@ -107,6 +166,43 @@ spec:
                 secretKeyRef:
                   name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret }}
                   key: credential-key-id
+{{- if .Values.delivery.enabled }}
+            - name: CLEARANCE_DELIVERY_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "delivery.existingSecret or secrets.existingSecret is required when delivery.enabled" (.Values.delivery.existingSecret | default .Values.secrets.existingSecret) }}
+                  key: delivery-key-id
+            - name: CLEARANCE_DELIVERY_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-keys-json
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-fingerprint-key-id
+            - name: CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-fingerprint-keys-json
+            - name: CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.delivery.existingSecret | default .Values.secrets.existingSecret }}
+                  key: delivery-source-dedupe-key
+{{- with .Values.delivery.legacyFingerprintKeyId }}
+            - name: CLEARANCE_DELIVERY_LEGACY_FINGERPRINT_KEY_ID
+              value: {{ . | quote }}
+{{- end }}
+            - { name: CLEARANCE_DELIVERY_SCHEMA, value: {{ .Values.delivery.schema | quote }} }
+            - { name: CLEARANCE_DELIVERY_PREFIX, value: {{ .Values.delivery.prefix | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE, value: {{ printf "%d" (int .Values.delivery.quota.maxActive) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG, value: {{ printf "%d" (int .Values.delivery.quota.maxBacklog) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW, value: {{ printf "%d" (int .Values.delivery.quota.maxEnqueuesPerWindow) | quote }} }
+            - { name: CLEARANCE_DELIVERY_QUOTA_WINDOW_MS, value: {{ printf "%d" (int .Values.delivery.quota.windowMs) | quote }} }
+{{- end }}
             - name: CLEARANCE_STRICT_SECRETS
               value: "1"
             - name: NODE_ENV

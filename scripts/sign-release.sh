@@ -16,7 +16,6 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-require_cmd openssl
 require_cmd node
 
 [[ -n "$VERSION" ]] || die "CLEARANCE_VERSION is required"
@@ -40,34 +39,19 @@ if [[ "$REQUIRE_TAG_BINDING" == "1" ]]; then
   node "$ROOT/scripts/verify-release-version.mjs" "$VERSION"
 fi
 
-# --- Signing key (mandatory) -------------------------------------------------
-# Provide either:
-#   CLEARANCE_RELEASE_SIGNING_KEY_FILE  path to PEM private key
-#   CLEARANCE_RELEASE_SIGNING_KEY       PEM contents (CI secret)
-KEY_FILE="${CLEARANCE_RELEASE_SIGNING_KEY_FILE:-}"
-TMP_KEY=""
-cleanup() {
-  if [[ -n "$TMP_KEY" && -f "$TMP_KEY" ]]; then
-    rm -f "$TMP_KEY"
-  fi
-}
-trap cleanup EXIT
-
-if [[ -z "$KEY_FILE" && -n "${CLEARANCE_RELEASE_SIGNING_KEY:-}" ]]; then
-  TMP_KEY="$(mktemp "${TMPDIR:-/tmp}/clearance-sign-key.XXXXXX")"
-  # Restrictive perms before writing key material
-  umask 077
-  printf '%s\n' "$CLEARANCE_RELEASE_SIGNING_KEY" >"$TMP_KEY"
-  KEY_FILE="$TMP_KEY"
+# --- Keyless signing identity (mandatory) -----------------------------------
+# Sigstore obtains a short-lived certificate from the GitHub Actions OIDC token.
+# Verifiers derive the expected identity independently; no sibling public key is
+# trusted from the downloadable asset set.
+require_cmd cosign
+[[ "${CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER:-}" == "https://token.actions.githubusercontent.com" ]] \
+  || die "CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER must be GitHub Actions"
+EXPECTED_IDENTITY="https://github.com/clearance-auth/clearance/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
+if [[ "${CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY:-0}" == "1" ]]; then
+  EXPECTED_IDENTITY="https://github.com/clearance-auth/clearance/.github/workflows/release-sign.yml@refs/heads/master"
 fi
-
-[[ -n "$KEY_FILE" && -f "$KEY_FILE" && -s "$KEY_FILE" ]] \
-  || die "signing key required: set CLEARANCE_RELEASE_SIGNING_KEY_FILE or CLEARANCE_RELEASE_SIGNING_KEY (fail closed; no ephemeral or fake signatures)"
-
-# Validate key is a private key openssl can use
-openssl pkey -in "$KEY_FILE" -noout -check >/dev/null 2>&1 \
-  || openssl rsa -in "$KEY_FILE" -check -noout >/dev/null 2>&1 \
-  || die "CLEARANCE_RELEASE_SIGNING_KEY is not a usable private key"
+[[ "${CLEARANCE_RELEASE_CERTIFICATE_IDENTITY:-}" == "$EXPECTED_IDENTITY" ]] \
+  || die "CLEARANCE_RELEASE_CERTIFICATE_IDENTITY must be the canonical tag-bound release workflow identity"
 
 mkdir -p "$OUT"
 printf '%s\n' "$VERSION" >"$OUT/VERSION"
@@ -122,11 +106,11 @@ EOF
 # Bundle bytes that are signed
 cat "$OUT/VERSION" "$OUT/sbom.cdx.json" "$OUT/assets.sha256" >"$OUT/release-bundle.txt"
 
-# Detached signature over the bundle (real private key only)
-if ! openssl dgst -sha256 -sign "$KEY_FILE" -out "$OUT/release-bundle.sig" "$OUT/release-bundle.txt"; then
-  die "openssl signing failed (fail closed)"
-fi
-[[ -s "$OUT/release-bundle.sig" ]] || die "signature file empty after openssl dgst -sign"
+# Detached keyless Sigstore bundle over the release bundle. The certificate
+# identity is checked by verify-release-bundle.sh against a canonical publisher
+# identity rather than any public key distributed in this directory.
+cosign sign-blob --yes --bundle "$OUT/release-bundle.sigstore.json" "$OUT/release-bundle.txt" >/dev/null
+[[ -s "$OUT/release-bundle.sigstore.json" ]] || die "Sigstore bundle is empty after cosign sign-blob"
 
 # Content digest (not a signature)
 if command -v sha256sum >/dev/null 2>&1; then
@@ -136,14 +120,12 @@ else
 fi
 DIGEST="$(tr -d ' \n' <"$OUT/release-bundle.sha256")"
 
-# Public key material for verification (safe to distribute)
-openssl pkey -in "$KEY_FILE" -pubout -out "$OUT/release-public.pem" 2>/dev/null \
-  || openssl rsa -in "$KEY_FILE" -pubout -out "$OUT/release-public.pem" 2>/dev/null \
-  || die "failed to export public key for verification"
-
-# Self-verify immediately (fail closed if signature does not verify)
-openssl dgst -sha256 -verify "$OUT/release-public.pem" -signature "$OUT/release-bundle.sig" "$OUT/release-bundle.txt" >/dev/null \
-  || die "signature self-verification failed"
+# Verify immediately through the independently anchored verifier.
+CLEARANCE_RELEASE_CERTIFICATE_IDENTITY="$EXPECTED_IDENTITY" \
+CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY="${CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY:-0}" \
+  bash "$ROOT/scripts/verify-release-bundle.sh" "$OUT" >/dev/null \
+  || die "keyless detached signature self-verification failed"
 
 # Provenance attestation — only written after a verified signature exists
 cat >"$OUT/provenance.json" <<EOF
@@ -162,8 +144,9 @@ cat >"$OUT/provenance.json" <<EOF
     "sourceTag": "$SOURCE_TAG",
     "releaseVersion": "$VERSION",
     "signed": true,
-    "signatureFile": "release-bundle.sig",
-    "publicKeyFile": "release-public.pem",
+    "signatureBundleFile": "release-bundle.sigstore.json",
+    "certificateIdentity": "$EXPECTED_IDENTITY",
+    "certificateOidcIssuer": "https://token.actions.githubusercontent.com",
     "signedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "assetManifest": "assets.sha256"
   }

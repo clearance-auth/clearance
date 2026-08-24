@@ -8,6 +8,7 @@
 
 export {
 	computeDiscoveryUrl,
+	createOIDCEndpointTransport,
 	discoverOIDCConfig,
 	ensureRuntimeDiscovery,
 	fetchDiscoveryDocument,

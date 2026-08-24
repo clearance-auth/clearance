@@ -10,11 +10,21 @@
  * / use the durable helper for Postgres).
  */
 import type { ManagementStore } from "../store/types.js";
-import type { AuditEvent, Organization, Principal } from "../types/resources.js";
+import type {
+	AuditEvent,
+	DataStoreSnapshot,
+	Organization,
+	User,
+} from "../types/resources.js";
 import { newId, nowIso } from "../store/json-store.js";
-import { appendAuditEvent } from "./audit.js";
+import { advancingPrincipalUpdatedAt } from "../store/store-v2-principals.js";
+import { appendAuditEvent, type AuditEventInput } from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import { resolveOperatorScope, type ResourceScope } from "./scope.js";
+import {
+	resolveOperatorScope,
+	resolveOperatorScopeAuthoritative,
+	type ResourceScope,
+} from "./scope.js";
 
 export type RuntimeUserIdentity = {
 	/** Canonical Clearance / runtime user id — becomes management principal id */
@@ -60,7 +70,7 @@ export function syncRuntimeUserToManagement(
 		actor?: string;
 		source?: AuditEvent["source"];
 	},
-): Principal {
+): User {
 	if (!runtimeUser.id?.trim()) {
 		throw new ClearanceError({
 			code: "IDENTITY_ID_REQUIRED",
@@ -90,7 +100,7 @@ export function syncRuntimeUserToManagement(
 	const updatedAt = toIso(runtimeUser.updatedAt, now);
 
 	// Build return object outside mutate (PgStore applies mutators asynchronously)
-	const principal: Principal = {
+	const principal: User = {
 		id: runtimeUser.id,
 		projectId: scope.projectId,
 		environmentId: scope.environmentId,
@@ -101,7 +111,7 @@ export function syncRuntimeUserToManagement(
 		updatedAt,
 	};
 
-	store.mutate((data) => {
+	const apply = (data: DataStoreSnapshot) => {
 		const byId = data.principals.find((p) => p.id === runtimeUser.id);
 		if (byId) {
 			if (
@@ -167,7 +177,8 @@ export function syncRuntimeUserToManagement(
 			message: `Synced runtime user ${email} into management (canonical id)`,
 			metadata: { origin: "runtime", stableId: runtimeUser.id },
 		});
-	});
+	};
+	store.mutate(apply);
 
 	return principal;
 }
@@ -185,8 +196,120 @@ export async function syncRuntimeUserToManagementDurable(
 		actor?: string;
 		source?: AuditEvent["source"];
 	},
-): Promise<Principal> {
-	const principal = syncRuntimeUserToManagement(store, runtimeUser, opts);
+): Promise<User> {
+	const authoritativeTopologyScope = store.storeV2Topology?.authoritative
+		? await resolveOperatorScopeAuthoritative(store, {
+			projectId: opts?.projectId,
+			environmentId: opts?.environmentId,
+		})
+		: undefined;
+	const resolvedOpts = authoritativeTopologyScope
+		? {
+			...opts,
+			projectId: authoritativeTopologyScope.projectId,
+			environmentId: authoritativeTopologyScope.environmentId,
+		}
+		: opts;
+	if (store.storeV2Principals?.authoritative) {
+		if (!runtimeUser.id?.trim()) {
+			throw new ClearanceError({
+				code: "IDENTITY_ID_REQUIRED",
+				message: "Runtime user id is required for canonical identity sync",
+				stage: "identity.sync",
+				status: 400,
+			});
+		}
+		if (!runtimeUser.email?.trim()) {
+			throw new ClearanceError({
+				code: "IDENTITY_EMAIL_REQUIRED",
+				message: "Runtime user email is required for canonical identity sync",
+				stage: "identity.sync",
+				status: 400,
+			});
+		}
+		if (typeof store.mutateStoreV2Identity !== "function") {
+			throw new ClearanceError({
+				code: "IDENTITY_SYNC_BACKEND_INVALID",
+				message: "Relational principal authority requires relational identity transactions",
+				stage: "identity.sync",
+				status: 500,
+			});
+		}
+		const scope = authoritativeTopologyScope ?? resolveOperatorScope(store, {
+			projectId: opts?.projectId,
+			environmentId: opts?.environmentId,
+		});
+		const email = runtimeUser.email.toLowerCase();
+		const name = runtimeUser.name?.trim() || email;
+		const now = nowIso();
+		const createdAt = toIso(runtimeUser.createdAt, now);
+		const updatedAt = toIso(runtimeUser.updatedAt, now);
+		return store.mutateStoreV2Identity(async ({ principals, appendAudit }) => {
+			const audit = () => appendAudit({
+				actor: opts?.actor ?? email,
+				action: "users.sync_runtime",
+				subjectType: "principal",
+				subjectId: runtimeUser.id,
+				outcome: "success",
+				source: opts?.source ?? "system",
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Synced runtime user ${email} into management (canonical id)`,
+				metadata: { origin: "runtime", stableId: runtimeUser.id },
+			});
+			const byId = await principals.getById({
+				scope,
+				id: runtimeUser.id,
+				includeDeleted: true,
+			});
+			if (byId) {
+				const nextUpdatedAt = advancingPrincipalUpdatedAt({ proposedUpdatedAt: updatedAt, storedUpdatedAt: byId.updatedAt });
+				const principal: User = {
+					...byId,
+					email,
+					name,
+					status: byId.status === "deleted" ? "active" : byId.status,
+					updatedAt: nextUpdatedAt,
+				};
+				const synchronized = await principals.update(principal, {
+					expectedUpdatedAt: byId.updatedAt,
+				});
+				if (!synchronized) {
+					throw new ClearanceError({
+						code: "IDENTITY_SYNC_CONFLICT",
+						message: "Canonical identity changed during synchronization",
+						stage: "identity.sync",
+						status: 409,
+						remediation: "Reload the canonical identity and retry synchronization",
+					});
+				}
+				audit();
+				return synchronized;
+			}
+			const byEmail = await principals.findActiveByEmail({ scope, email });
+			if (byEmail) {
+				throw new ClearanceError({
+					code: "IDENTITY_EMAIL_CONFLICT",
+					message: `User ${email} already exists with a different stable id`,
+					stage: "identity.sync",
+					status: 409,
+				});
+			}
+			const principal = await principals.insert({
+				id: runtimeUser.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				email,
+				name,
+				status: "active",
+				createdAt,
+				updatedAt,
+			});
+			audit();
+			return principal;
+		});
+	}
+	const principal = syncRuntimeUserToManagement(store, runtimeUser, resolvedOpts);
 	await store.ready();
 	const found = store.snapshot.principals.find((p) => p.id === principal.id);
 	if (!found || found.status === "deleted") {
@@ -229,6 +352,22 @@ export async function syncRuntimeOrganizationToManagementDurable(
 	}
 	const ownerMembershipId = runtimeOrganization.ownerMembershipId?.trim() || undefined;
 	const scope = resolveOperatorScope(store, opts);
+	// Runtime-backed stores reconcile through the auth bridge's private
+	// coordinated SQL path. That path locks and validates the runtime org and
+	// owner-member binding before it writes topology, management membership,
+	// audit, and normalized authorization. JSON remains a management-only
+	// fallback for local development; it is never described as runtime-atomic.
+	if (store.backend === "postgres") {
+		const { reconcileExistingRuntimeOrganizationInAuth } = await import(
+			"../auth-bridge.js"
+		);
+		return reconcileExistingRuntimeOrganizationInAuth(store, {
+			organization: runtimeOrganization,
+			ownerPrincipalId,
+			scope,
+			actor: opts?.actor,
+		});
+	}
 	const now = nowIso();
 	const createdAt = toIso(runtimeOrganization.createdAt, now);
 	const organization: Organization = {
@@ -242,22 +381,119 @@ export async function syncRuntimeOrganizationToManagementDurable(
 		updatedAt: now,
 	};
 
-	store.mutate((data) => {
-		const principal = data.principals.find(
+	const ownerNotFound = (): never => {
+		throw new ClearanceError({
+			code: "USER_NOT_FOUND",
+			message: "Organization owner was not found in the authorized scope",
+			stage: "identity.organization_sync",
+			status: 404,
+		});
+	};
+	const membershipIdConflict = (): never => {
+		throw new ClearanceError({
+			code: "MEMBERSHIP_ID_CONFLICT",
+			message:
+				"Runtime owner membership id is already bound to a different organization or principal",
+			stage: "identity.organization_sync",
+			status: 409,
+		});
+	};
+	const reconcileMembership = (
+		data: DataStoreSnapshot,
+		principal: User,
+		organization: Organization,
+		appendAudit: (input: AuditEventInput) => unknown,
+	) => {
+		// Fail closed: runtime membership id must not be bound to another org/principal.
+		if (ownerMembershipId) {
+			const idHolder = data.memberships.find((m) => m.id === ownerMembershipId);
+			if (
+				idHolder &&
+				(idHolder.organizationId !== organization.id ||
+					idHolder.principalId !== principal.id)
+			) {
+				membershipIdConflict();
+			}
+		}
+
+		const membership = data.memberships.find(
+			(m) =>
+				m.organizationId === organization.id &&
+				m.principalId === principal.id &&
+				m.status === "active",
+		);
+		if (!membership) {
+			const membershipId = ownerMembershipId ?? newId("mem");
+			// Same id may already exist as non-active for this org+principal — revive.
+			const byId = data.memberships.find((m) => m.id === membershipId);
+			if (byId) {
+				if (
+					byId.organizationId !== organization.id ||
+					byId.principalId !== principal.id
+				) {
+					membershipIdConflict();
+				}
+				byId.status = "active";
+				byId.role = opts?.role ?? byId.role ?? "owner";
+				byId.updatedAt = now;
+			} else {
+				data.memberships.push({
+					id: membershipId,
+					organizationId: organization.id,
+					principalId: principal.id,
+					role: opts?.role ?? "owner",
+					status: "active",
+					source: "manual",
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			appendAudit({
+				actor: opts?.actor ?? principal.email,
+				action: "orgs.members.sync_runtime",
+				subjectType: "membership",
+				subjectId: membershipId,
+				outcome: "success",
+				source: "system",
+				organizationId: organization.id,
+				projectId: scope.projectId,
+				environmentId: scope.environmentId,
+				message: `Synced runtime owner ${principal.email}`,
+			});
+		} else if (ownerMembershipId && membership.id !== ownerMembershipId) {
+			// Prefer runtime id as canonical; rewrite management id deterministically.
+			const taken = data.memberships.find(
+				(m) =>
+					m.id === ownerMembershipId &&
+					m !== membership &&
+					(m.organizationId !== organization.id ||
+						m.principalId !== principal.id),
+			);
+			if (taken) membershipIdConflict();
+			// Drop a stale non-active row that already holds the target id for this pair.
+			const staleSameBinding = data.memberships.find(
+				(m) =>
+					m !== membership &&
+					m.id === ownerMembershipId &&
+					m.organizationId === organization.id &&
+					m.principalId === principal.id,
+			);
+			if (staleSameBinding) {
+				const idx = data.memberships.indexOf(staleSameBinding);
+				if (idx >= 0) data.memberships.splice(idx, 1);
+			}
+			membership.id = ownerMembershipId;
+			membership.updatedAt = now;
+		}
+	};
+	const apply = (data: DataStoreSnapshot, authoritativePrincipal?: User) => {
+		const principal = (authoritativePrincipal ?? data.principals.find(
 			(p) =>
 				p.id === ownerPrincipalId &&
 				p.projectId === scope.projectId &&
 				p.environmentId === scope.environmentId &&
 				p.status !== "deleted",
-		);
-		if (!principal) {
-			throw new ClearanceError({
-				code: "USER_NOT_FOUND",
-				message: "Organization owner was not found in the authorized scope",
-				stage: "identity.organization_sync",
-				status: 404,
-			});
-		}
+		)) ?? ownerNotFound();
 
 		const slugConflict = data.organizations.find(
 			(o) =>
@@ -312,114 +548,17 @@ export async function syncRuntimeOrganizationToManagementDurable(
 			});
 		}
 
-		// Fail closed: runtime membership id must not be bound to another org/principal
-		if (ownerMembershipId) {
-			const idHolder = data.memberships.find((m) => m.id === ownerMembershipId);
-			if (
-				idHolder &&
-				(idHolder.organizationId !== organization.id ||
-					idHolder.principalId !== principal.id)
-			) {
-				throw new ClearanceError({
-					code: "MEMBERSHIP_ID_CONFLICT",
-					message:
-						"Runtime owner membership id is already bound to a different organization or principal",
-					stage: "identity.organization_sync",
-					status: 409,
-				});
-			}
-		}
-
-		const membership = data.memberships.find(
-			(m) =>
-				m.organizationId === organization.id &&
-				m.principalId === principal.id &&
-				m.status === "active",
+		reconcileMembership(data, principal, organization, (input) =>
+			appendAuditEvent(data, input),
 		);
-		if (!membership) {
-			const membershipId = ownerMembershipId ?? newId("mem");
-			// Same id may already exist as non-active for this org+principal — revive
-			const byId = data.memberships.find((m) => m.id === membershipId);
-			if (byId) {
-				if (
-					byId.organizationId !== organization.id ||
-					byId.principalId !== principal.id
-				) {
-					throw new ClearanceError({
-						code: "MEMBERSHIP_ID_CONFLICT",
-						message:
-							"Runtime owner membership id is already bound to a different organization or principal",
-						stage: "identity.organization_sync",
-						status: 409,
-					});
-				}
-				byId.status = "active";
-				byId.role = opts?.role ?? byId.role ?? "owner";
-				byId.updatedAt = now;
-			} else {
-				data.memberships.push({
-					id: membershipId,
-					organizationId: organization.id,
-					principalId: principal.id,
-					role: opts?.role ?? "owner",
-					status: "active",
-					source: "manual",
-					createdAt: now,
-					updatedAt: now,
-				});
-			}
-			appendAuditEvent(data, {
-				actor: opts?.actor ?? principal.email,
-				action: "orgs.members.sync_runtime",
-				subjectType: "membership",
-				subjectId: membershipId,
-				outcome: "success",
-				source: "system",
-				organizationId: organization.id,
-				projectId: scope.projectId,
-				environmentId: scope.environmentId,
-				message: `Synced runtime owner ${principal.email}`,
-			});
-		} else if (ownerMembershipId && membership.id !== ownerMembershipId) {
-			// Prefer runtime id as canonical; rewrite management id deterministically
-			const taken = data.memberships.find(
-				(m) =>
-					m.id === ownerMembershipId &&
-					m !== membership &&
-					(m.organizationId !== organization.id ||
-						m.principalId !== principal.id),
-			);
-			if (taken) {
-				throw new ClearanceError({
-					code: "MEMBERSHIP_ID_CONFLICT",
-					message:
-						"Runtime owner membership id is already bound to a different organization or principal",
-					stage: "identity.organization_sync",
-					status: 409,
-				});
-			}
-			// Drop a stale non-active row that already holds the target id for this pair
-			const staleSameBinding = data.memberships.find(
-				(m) =>
-					m !== membership &&
-					m.id === ownerMembershipId &&
-					m.organizationId === organization.id &&
-					m.principalId === principal.id,
-			);
-			if (staleSameBinding) {
-				const idx = data.memberships.indexOf(staleSameBinding);
-				if (idx >= 0) data.memberships.splice(idx, 1);
-			}
-			membership.id = ownerMembershipId;
-			membership.updatedAt = now;
-		}
-	});
+	};
+	store.mutate(apply);
 
 	await store.ready();
 	const durable = store.snapshot.organizations.find(
 		(o) => o.id === runtimeOrganization.id && o.status !== "archived",
 	);
-	if (!durable) {
+	if (!durable || durable.status === "archived") {
 		throw new ClearanceError({
 			code: "ORGANIZATION_SYNC_NOT_DURABLE",
 			message: "Runtime organization sync did not persist durably",

@@ -15,6 +15,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
+import { wrapInternalCoordinatedExecutor } from "../store/coordinated-internal.js";
 import {
 	ensureAuthMigrated,
 	getAuthBundle,
@@ -102,6 +103,23 @@ function trackScim(id: string): void {
 	allScimProviderIds.add(id);
 }
 
+/** Runtime SCIM rows enforce the same purpose-separated envelope as production. */
+async function sealScimFixtureToken(
+	providerId: string,
+	organizationId: string,
+	token: string,
+): Promise<string> {
+	const keyManagement = getAuthBundle().keyManagement;
+	return `clr-scim:v1:${await keyManagement.sealText(
+		"scim-bearer-token",
+		keyManagement.resourceId("scim-bearer-token", {
+			providerId,
+			organizationId,
+		}),
+		token,
+	)}`;
+}
+
 /** Delete only exact runtime fixture IDs created by this suite. */
 async function cleanupTrackedRuntime(opts?: {
 	users?: Iterable<string>;
@@ -163,8 +181,6 @@ async function cleanupTrackedRuntime(opts?: {
 	}
 }
 
-type CoordinatedFn = NonNullable<ManagementStore["mutateCoordinated"]>;
-
 /**
  * Wrap mutateCoordinated so runtime DELETE + management mutator/audit run in
  * the open transaction, then a deliberate runtime SQL error forces ROLLBACK of
@@ -174,12 +190,11 @@ function injectRuntimeSqlFailureAfterMutator(
 	store: PgStore,
 	table: "ssoProvider" | "scimProvider",
 ): () => void {
-	const original = store.mutateCoordinated.bind(store) as CoordinatedFn;
-	const wrapped: CoordinatedFn = (fn) =>
+	return wrapInternalCoordinatedExecutor(store, (original) => (fn) =>
 		original(async (ctx) => {
 			let sawTargetDelete = false;
 			const value = await fn({
-				data: ctx.data,
+				...ctx,
 				query: async (sql, params) => {
 					const result = await ctx.query(sql, params);
 					const normalized = sql.replace(/\s+/g, " ").toLowerCase();
@@ -198,11 +213,8 @@ function injectRuntimeSqlFailureAfterMutator(
 				);
 			}
 			return value;
-		});
-	store.mutateCoordinated = wrapped;
-	return () => {
-		store.mutateCoordinated = original;
-	};
+		}),
+	);
 }
 
 async function runtimeSsoExists(id: string): Promise<boolean> {
@@ -357,7 +369,7 @@ describe.skipIf(!available)(
 			const now = new Date().toISOString();
 
 			store.mutate((data: DataStoreSnapshot) => {
-				data.identityConnections.push({
+				data.ssoConnections.push({
 					id: connectionId,
 					organizationId: org.id,
 					protocol: "oidc",
@@ -402,7 +414,7 @@ describe.skipIf(!available)(
 			const now = new Date().toISOString();
 
 			store.mutate((data: DataStoreSnapshot) => {
-				data.directoryConnections.push({
+				data.scimConnections.push({
 					id: connectionId,
 					organizationId: org.id,
 					provider: "okta",
@@ -417,12 +429,18 @@ describe.skipIf(!available)(
 
 			const b = getAuthBundle();
 			await b.pool.query(
-				`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
-         values ($1,$2,$3,$4)`,
+				`insert into "scimProvider" (
+					id, "providerId", "scimToken", "organizationId",
+					"keyManagementVersion", "keyManagementRevision"
+				) values ($1,$2,$3,$4,1,1)`,
 				[
 					connectionId,
 					providerId,
-					`scimtok_${connectionId}`,
+					await sealScimFixtureToken(
+						providerId,
+						org.id,
+						`scimtok_${connectionId}`,
+					),
 					org.id,
 				],
 			);
@@ -447,7 +465,7 @@ describe.skipIf(!available)(
 						updatedAt: now,
 					});
 				}
-				data.identityConnections.push({
+				data.ssoConnections.push({
 					id: connectionId,
 					organizationId: ORG_FOREIGN_ID,
 					protocol: "oidc",
@@ -498,7 +516,7 @@ describe.skipIf(!available)(
 						updatedAt: now,
 					});
 				}
-				data.directoryConnections.push({
+				data.scimConnections.push({
 					id: connectionId,
 					organizationId: ORG_FOREIGN_ID,
 					provider: "okta",
@@ -513,9 +531,20 @@ describe.skipIf(!available)(
 
 			const b = getAuthBundle();
 			await b.pool.query(
-				`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
-         values ($1,$2,$3,$4)`,
-				[connectionId, providerId, `scimtok_${connectionId}`, ORG_FOREIGN_ID],
+				`insert into "scimProvider" (
+					id, "providerId", "scimToken", "organizationId",
+					"keyManagementVersion", "keyManagementRevision"
+				) values ($1,$2,$3,$4,1,1)`,
+				[
+					connectionId,
+					providerId,
+					await sealScimFixtureToken(
+						providerId,
+						ORG_FOREIGN_ID,
+						`scimtok_${connectionId}`,
+					),
+					ORG_FOREIGN_ID,
+				],
 			);
 			trackScim(connectionId);
 			return connectionId;
@@ -530,7 +559,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeSsoExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 
@@ -544,7 +573,7 @@ describe.skipIf(!available)(
 			expect(result.runtimeRemoved).toBe(true);
 			expect(await runtimeSsoExists(connectionId)).toBe(false);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("disabled");
 
@@ -592,7 +621,7 @@ describe.skipIf(!available)(
 			const scope = resolveOperatorScope(store);
 			const foreignId = await seedForeignSso(store);
 			const eventsBefore = store.snapshot.events.length;
-			const statusBefore = store.snapshot.identityConnections.find(
+			const statusBefore = store.snapshot.ssoConnections.find(
 				(c) => c.id === foreignId,
 			)?.status;
 
@@ -616,7 +645,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeSsoExists(foreignId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === foreignId)
+				store.snapshot.ssoConnections.find((c) => c.id === foreignId)
 					?.status,
 			).toBe(statusBefore);
 			expect(disableAudits(store, "sso.disable", foreignId)).toHaveLength(0);
@@ -643,7 +672,7 @@ describe.skipIf(!available)(
 			// Runtime delete must not stick (transaction rolled back).
 			expect(await runtimeSsoExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 			expect(disableAudits(store, "sso.disable", connectionId)).toHaveLength(0);
@@ -669,7 +698,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 
@@ -683,7 +712,7 @@ describe.skipIf(!available)(
 			expect(result.runtimeRemoved).toBe(true);
 			expect(await runtimeScimExists(connectionId)).toBe(false);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("disabled");
 
@@ -731,7 +760,7 @@ describe.skipIf(!available)(
 			const scope = resolveOperatorScope(store);
 			const foreignId = await seedForeignScim(store);
 			const eventsBefore = store.snapshot.events.length;
-			const statusBefore = store.snapshot.directoryConnections.find(
+			const statusBefore = store.snapshot.scimConnections.find(
 				(c) => c.id === foreignId,
 			)?.status;
 
@@ -748,7 +777,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(foreignId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === foreignId)
+				store.snapshot.scimConnections.find((c) => c.id === foreignId)
 					?.status,
 			).toBe(statusBefore);
 			expect(disableAudits(store, "scim.disable", foreignId)).toHaveLength(0);
@@ -774,7 +803,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 			expect(disableAudits(store, "scim.disable", connectionId)).toHaveLength(0);

@@ -3,6 +3,7 @@ import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
 import {
@@ -16,6 +17,8 @@ import {
 	setSessionCookie,
 } from "../../cookies";
 import { mergeSchema, parseUserOutput } from "../../db/schema";
+import { readInternalAuthenticationPolicy } from "../../internal/authentication-policy";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
 import { PACKAGE_VERSION } from "../../version";
 import { ANONYMOUS_ERROR_CODES } from "./error-codes";
 import { schema } from "./schema";
@@ -108,29 +111,58 @@ export const anonymous = (options?: AnonymousOptions | undefined) => {
 
 					const email = await getAnonUserEmail(options);
 					const name = (await options?.generateName?.(ctx)) || "Anonymous";
-					const newUser = await ctx.context.internalAdapter.createUser({
-						email,
-						emailVerified: false,
-						isAnonymous: true,
-						name,
-						createdAt: new Date(),
-						updatedAt: new Date(),
-					});
-					if (!newUser) {
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							ANONYMOUS_ERROR_CODES.FAILED_TO_CREATE_USER,
-						);
+					const managedAuthenticationPolicy =
+						readInternalAuthenticationPolicy(ctx.context.options) !== undefined;
+					if (
+						managedAuthenticationPolicy &&
+						typeof ctx.context.adapter.options?.adapterConfig.transaction !==
+							"function"
+					) {
+						throw APIError.fromStatus("INTERNAL_SERVER_ERROR", {
+							message:
+								"Managed anonymous sign-in requires rollback-capable database transactions",
+						});
 					}
-					const session = await ctx.context.internalAdapter.createSession(
-						newUser.id,
-					);
-					if (!session) {
-						throw APIError.from(
-							"BAD_REQUEST",
-							ANONYMOUS_ERROR_CODES.COULD_NOT_CREATE_SESSION,
+					const persistAnonymousSession = async () => {
+						const newUser = await ctx.context.internalAdapter.createUser({
+							email,
+							emailVerified: false,
+							isAnonymous: true,
+							name,
+							createdAt: new Date(),
+							updatedAt: new Date(),
+						});
+						if (!newUser) {
+							throw APIError.from(
+								"INTERNAL_SERVER_ERROR",
+								ANONYMOUS_ERROR_CODES.FAILED_TO_CREATE_USER,
+							);
+						}
+						const session = await ctx.context.internalAdapter.createSession(
+							newUser.id,
+							undefined,
+							undefined,
+							false,
+							createInternalSessionIssuanceContext({
+								purpose: "interactive",
+								subjectId: newUser.id,
+								evidence: [{ kind: "primary", primaryMethod: "anonymous" }],
+							}),
 						);
-					}
+						if (!session) {
+							throw APIError.from(
+								"BAD_REQUEST",
+								ANONYMOUS_ERROR_CODES.COULD_NOT_CREATE_SESSION,
+							);
+						}
+						return { newUser, session };
+					};
+					const { newUser, session } = managedAuthenticationPolicy
+						? await runWithTransaction(
+								ctx.context.adapter,
+								persistAnonymousSession,
+							)
+						: await persistAnonymousSession();
 					await setSessionCookie(ctx, {
 						session,
 						user: newUser,

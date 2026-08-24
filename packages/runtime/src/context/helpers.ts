@@ -11,6 +11,26 @@ import type { EndpointContext, InputContext } from "@clearance/call";
 import { defu } from "defu";
 import { createCookieGetter, getCookies } from "../cookies";
 import { createInternalAdapter } from "../db";
+import {
+	attachCapturedInternalAuthenticationPolicy,
+	readInternalAuthenticationPolicy,
+	type InternalRuntimeAuthenticationPolicyBinding,
+} from "../internal/authentication-policy";
+import {
+	attachCapturedInternalAuthorizationAuthority,
+	readInternalAuthorizationAuthority,
+	type InternalAuthorizationAuthority,
+} from "../internal/authorization-authority";
+import {
+	attachCapturedInternalManagedOrganizationLifecycleAuthority,
+	readInternalManagedOrganizationLifecycleAuthority,
+	type InternalManagedOrganizationLifecycleAuthority,
+} from "../internal/organization-lifecycle-authority";
+import {
+	attachCapturedInternalRuntimeAudit,
+	readInternalRuntimeAudit,
+	type InternalRuntimeAuditBinding,
+} from "@clearance/runtime/internal/runtime-audit";
 import { isPromise } from "../utils/is-promise";
 import {
 	getBaseURL,
@@ -20,8 +40,129 @@ import {
 	resolveBaseURL,
 } from "../utils/url";
 
+function assertCompatibleAuthenticationPolicyBinding(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	const existing = readInternalAuthenticationPolicy(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced authentication policy authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options authentication policy authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveAuthenticationPolicyBinding(
+	target: object,
+	binding: InternalRuntimeAuthenticationPolicyBinding | undefined,
+): void {
+	assertCompatibleAuthenticationPolicyBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalAuthenticationPolicy(target, binding);
+}
+
+function assertCompatibleAuthorizationAuthorityBinding(
+	target: object,
+	binding: InternalAuthorizationAuthority | undefined,
+): void {
+	const existing = readInternalAuthorizationAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced authorization authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options authorization authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveAuthorizationAuthorityBinding(
+	target: object,
+	binding: InternalAuthorizationAuthority | undefined,
+): void {
+	assertCompatibleAuthorizationAuthorityBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalAuthorizationAuthority(target, binding);
+}
+
+function assertCompatibleManagedOrganizationLifecycleAuthorityBinding(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	const existing = readInternalManagedOrganizationLifecycleAuthority(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced managed organization lifecycle authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin managed organization lifecycle authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveManagedOrganizationLifecycleAuthorityBinding(
+	target: object,
+	binding: InternalManagedOrganizationLifecycleAuthority | undefined,
+): void {
+	assertCompatibleManagedOrganizationLifecycleAuthorityBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalManagedOrganizationLifecycleAuthority(target, binding);
+}
+
+function assertCompatibleRuntimeAuditBinding(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	const existing = readInternalRuntimeAudit(target);
+	if (!binding) {
+		if (existing) {
+			throw new ClearanceError(
+				"Plugin options introduced runtime audit authority absent from the runtime context",
+			);
+		}
+		return;
+	}
+	if (existing && existing !== binding) {
+		throw new ClearanceError(
+			"Plugin options runtime audit authority does not match the runtime context binding",
+		);
+	}
+}
+
+function preserveRuntimeAuditBinding(
+	target: object,
+	binding: InternalRuntimeAuditBinding | undefined,
+): void {
+	assertCompatibleRuntimeAuditBinding(target, binding);
+	if (!binding) return;
+	attachCapturedInternalRuntimeAudit(target, binding);
+}
+
 export async function runPluginInit(context: AuthContext) {
 	let options = context.options;
+	const authenticationPolicy = readInternalAuthenticationPolicy(options);
+	const authorizationAuthority = readInternalAuthorizationAuthority(options);
+	const managedOrganizationLifecycleAuthority =
+		readInternalManagedOrganizationLifecycleAuthority(options);
+	const runtimeAudit = readInternalRuntimeAudit(options);
 	const plugins = options.plugins || [];
 	const pluginTrustedOrigins: NonNullable<
 		ClearanceOptions["trustedOrigins"]
@@ -29,6 +170,7 @@ export async function runPluginInit(context: AuthContext) {
 	const dbHooks: {
 		source: string;
 		hooks: Exclude<ClearanceOptions["databaseHooks"], undefined>;
+		failureMode?: "observe" | "rollback" | undefined;
 	}[] = [];
 	for (const plugin of plugins) {
 		if (plugin.init) {
@@ -41,6 +183,19 @@ export async function runPluginInit(context: AuthContext) {
 			}
 			if (typeof result === "object") {
 				if (result.options) {
+					assertCompatibleAuthenticationPolicyBinding(
+						result.options,
+						authenticationPolicy,
+					);
+					assertCompatibleAuthorizationAuthorityBinding(
+						result.options,
+						authorizationAuthority,
+					);
+					assertCompatibleManagedOrganizationLifecycleAuthorityBinding(
+						result.options,
+						managedOrganizationLifecycleAuthority,
+					);
+					assertCompatibleRuntimeAuditBinding(result.options, runtimeAudit);
 					const { databaseHooks, trustedOrigins, ...restOpts } = result.options;
 					if (databaseHooks) {
 						dbHooks.push({
@@ -51,7 +206,21 @@ export async function runPluginInit(context: AuthContext) {
 					if (trustedOrigins) {
 						pluginTrustedOrigins.push(trustedOrigins);
 					}
-					options = defu(options, restOpts);
+					const normalizedOptions = defu(options, restOpts);
+					preserveAuthenticationPolicyBinding(
+						normalizedOptions,
+						authenticationPolicy,
+					);
+					preserveAuthorizationAuthorityBinding(
+						normalizedOptions,
+						authorizationAuthority,
+					);
+					preserveManagedOrganizationLifecycleAuthorityBinding(
+						normalizedOptions,
+						managedOrganizationLifecycleAuthority,
+					);
+					preserveRuntimeAuditBinding(normalizedOptions, runtimeAudit);
+					options = normalizedOptions;
 				}
 				if (result.context) {
 					// Use Object.assign to keep the reference to the original context
@@ -85,14 +254,26 @@ export async function runPluginInit(context: AuthContext) {
 
 	// Add the global database hooks last
 	if (options.databaseHooks) {
-		dbHooks.push({ source: "user", hooks: options.databaseHooks });
+		dbHooks.push({
+			source: "user",
+			hooks: options.databaseHooks,
+			failureMode: options.databaseHookFailureMode,
+		});
 	}
+	preserveAuthenticationPolicyBinding(options, authenticationPolicy);
+	preserveAuthorizationAuthorityBinding(options, authorizationAuthority);
+	preserveManagedOrganizationLifecycleAuthorityBinding(
+		options,
+		managedOrganizationLifecycleAuthority,
+	);
+	preserveRuntimeAuditBinding(options, runtimeAudit);
 
 	context.internalAdapter = createInternalAdapter(context.adapter, {
 		options,
 		logger: context.logger,
 		hooks: dbHooks,
 		generateId: context.generateId,
+		secretConfig: context.secretConfig,
 	});
 	context.options = options;
 }

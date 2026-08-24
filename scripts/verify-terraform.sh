@@ -37,6 +37,7 @@ export TF_VAR_clearance_secret="terraform-plan-clearance-secret"
 export TF_VAR_operator_token="terraform-plan-operator-token"
 export TF_VAR_credential_key="terraform-plan-credential-key-32-characters"
 export TF_VAR_credential_key_id="terraform-plan-v1"
+export TF_VAR_key_management_config_json='{"oidc-client-secret":{"kind":"local","providerId":"terraform-oidc","currentKeyId":"v1","keys":{"v1":"G3QVSNhWa9M3Dg26p7lhm_JnQi9EnXmvRaYc7qNHo5E"}},"scim-bearer-token":{"kind":"local","providerId":"terraform-scim","currentKeyId":"v1","keys":{"v1":"2YHq9aVr8Krno9pfjuiLWBzD1N6jXOTs9w_7kZcNEYw"}},"access-token-signing-key":{"kind":"local","providerId":"terraform-jwt-envelope","currentKeyId":"v1","keys":{"v1":"p7RRo3XbWIpzBJsCZATJzIHSrc5yhuTpEqDS5EibL0A"}},"access-token-signer":{"kind":"local","providerId":"terraform-jwt-signer","currentKeyReference":"v1","keys":{"v1":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtYjd5lp-OKktRH7sUX4s9jWE8tdLCTQtiNz62EkLINShRANCAATvY51FdYW9TthgUs57waN3y0-sBzsB22CEncgm9sPnGrmVnfsYScpq2v9mnRTX8zhMgdVs_ar9tuK1D9tRNEYa"}}}'
 export TF_VAR_console_admin_password="terraform-plan-console-password"
 export TF_VAR_console_session_secret="terraform-plan-console-session-secret"
 

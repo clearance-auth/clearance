@@ -1,0 +1,19 @@
+{{- if .Values.vault.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-vault
+  labels:
+    app: clearance-vault
+    app.kubernetes.io/name: clearance
+    app.kubernetes.io/component: vault
+spec:
+  type: {{ .Values.vault.service.type }}
+  selector:
+    app: clearance-vault
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.vault.service.port }}
+      targetPort: http
+{{- end }}

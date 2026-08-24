@@ -43,6 +43,49 @@ export const AUDIT_PRUNED_ACTION = "system.audit.pruned";
 let auditMaxCacheRaw: string | undefined | symbol = Symbol("unset");
 let auditMaxCacheValue = AUDIT_MAX_EVENTS_DEFAULT;
 
+type DeferredAuditDraft = { events: AuditEvent[] };
+const deferredRetentionDrafts = new WeakMap<DataStoreSnapshot, DeferredAuditDraft>();
+
+class StoreV2AuditDraftAccessError extends Error {
+	readonly code = "STORE_V2_EVENTS_HISTORY_ACCESS";
+
+	constructor() {
+		super(
+			"Duplicate or historical event access is unavailable in an authoritative append transaction; read store.snapshot before mutating and append through appendAuditEvent.",
+		);
+		this.name = "StoreV2AuditDraftAccessError";
+	}
+}
+
+/** Internal PgStore hook: authoritative event retention is applied in SQL. */
+export function deferAuditRetentionForDraft(data: DataStoreSnapshot): void {
+	deferredRetentionDrafts.set(data, { events: [] });
+	Object.defineProperty(data, "events", {
+		configurable: true,
+		enumerable: true,
+		get() {
+			throw new StoreV2AuditDraftAccessError();
+		},
+		set() {
+			throw new StoreV2AuditDraftAccessError();
+		},
+	});
+}
+
+/** Consume the append journal and restore a serializable compact draft. */
+export function consumeDeferredAuditEvents(data: DataStoreSnapshot): AuditEvent[] {
+	const deferred = deferredRetentionDrafts.get(data);
+	if (!deferred) return [];
+	deferredRetentionDrafts.delete(data);
+	Object.defineProperty(data, "events", {
+		configurable: true,
+		enumerable: true,
+		writable: true,
+		value: [],
+	});
+	return deferred.events;
+}
+
 export function auditMaxEvents(
 	env: Record<string, string | undefined> = process.env,
 ): number {
@@ -117,6 +160,7 @@ export function buildAuditEvent(input: AuditEventInput): AuditEvent {
  * never re-triggering itself (no recursion, no cap overshoot).
  */
 export function enforceAuditRetention(data: DataStoreSnapshot): void {
+	if (deferredRetentionDrafts.has(data)) return;
 	const max = auditMaxEvents();
 	if (data.events.length <= max) return;
 	let carriedDropped = 0;
@@ -169,8 +213,13 @@ export function appendAuditEvent(
 	input: AuditEventInput,
 ): AuditEvent {
 	const event = buildAuditEvent(input);
-	data.events.unshift(event);
-	enforceAuditRetention(data);
+	const deferred = deferredRetentionDrafts.get(data);
+	if (deferred) {
+		deferred.events.unshift(event);
+	} else {
+		data.events.unshift(event);
+		enforceAuditRetention(data);
+	}
 	return event;
 }
 
@@ -180,8 +229,13 @@ export function recordEvent(
 ): AuditEvent {
 	const event = buildAuditEvent(input);
 	store.mutate((data) => {
-		data.events.unshift(event);
-		enforceAuditRetention(data);
+		const deferred = deferredRetentionDrafts.get(data);
+		if (deferred) {
+			deferred.events.unshift(event);
+		} else {
+			data.events.unshift(event);
+			enforceAuditRetention(data);
+		}
 	});
 	return event;
 }

@@ -11,6 +11,12 @@ import type {
 import type { DBAdapter, Where } from "../db/adapter";
 import type { createLogger } from "../env";
 import type { OAuthProvider } from "../oauth2";
+import type {
+	RuntimeAuthenticationSessionMutationGuard,
+	SessionIssuanceContext,
+	VerificationChallengeConsumptionContext,
+	VerificationChallengeCreationContext,
+} from "./authentication-policy";
 import type { ClearanceCookie, ClearanceCookies } from "./cookie";
 import type { Awaitable, LiteralString } from "./helper";
 import type {
@@ -110,12 +116,12 @@ export interface InternalAdapter<
 		options?: { onlyActiveSessions?: boolean | undefined } | undefined,
 	): Promise<Session[]>;
 
-	listUsers(
-		limit?: number | undefined,
-		offset?: number | undefined,
-		sortBy?: { field: string; direction: "asc" | "desc" } | undefined,
-		where?: Where[] | undefined,
-	): Promise<User[]>;
+	listUsers(options?: {
+		limit?: number | undefined;
+		offset?: number | undefined;
+		sortBy?: { field: string; direction: "asc" | "desc" } | undefined;
+		where?: Where[] | undefined;
+	}): Promise<User[]>;
 
 	countTotalUsers(where?: Where[] | undefined): Promise<number>;
 
@@ -124,13 +130,45 @@ export interface InternalAdapter<
 	createSession(
 		userId: string,
 		dontRememberMe?: boolean | undefined,
-		override?: (Partial<Session> & Record<string, any>) | undefined,
+		override?:
+			| (Partial<Session> &
+					Record<string, unknown> &
+					RuntimeAuthenticationSessionMutationGuard)
+			| undefined,
 		overrideAll?: boolean | undefined,
+		issuanceContext?: SessionIssuanceContext | undefined,
 	): Promise<Session>;
 
 	findSession(token: string): Promise<{
 		session: Session & Record<string, any>;
 		user: User & Record<string, any>;
+	} | null>;
+
+	findSessionById(sessionId: string): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+	} | null>;
+
+	rotateSessionCredential(
+		token: string,
+		idempotencyKey?: string,
+	): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+		refreshToken: string;
+		familyId: string;
+		rotationCounter: number;
+	} | null>;
+
+	recoverSessionCredential(
+		token: string,
+		idempotencyKey: string,
+	): Promise<{
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+		refreshToken: string;
+		familyId: string;
+		rotationCounter: number;
 	} | null>;
 
 	findSessions(
@@ -144,10 +182,14 @@ export interface InternalAdapter<
 
 	updateSession(
 		sessionToken: string,
-		session: Partial<Session> & Record<string, any>,
+		session: Partial<Session> &
+			Record<string, unknown> &
+			RuntimeAuthenticationSessionMutationGuard,
 	): Promise<Session | null>;
 
 	deleteSession(token: string): Promise<void>;
+
+	deleteSessionById(sessionId: string): Promise<void>;
 
 	deleteAccounts(userId: string): Promise<void>;
 
@@ -162,6 +204,9 @@ export interface InternalAdapter<
 	 * Delete every session belonging to a user.
 	 */
 	deleteUserSessions(userId: string): Promise<void>;
+
+	/** Revoke every OIDC/MCP token family belonging to a user, when configured. */
+	revokeUserOAuthTokenFamilies(userId: string): Promise<void>;
 
 	/**
 	 * Delete sessions by their session tokens.
@@ -213,12 +258,21 @@ export interface InternalAdapter<
 
 	updateAccount(id: string, data: Partial<Account>): Promise<Account>;
 
+	/**
+	 * Creates a verification challenge. With managed authentication policy this
+	 * also creates a digest-keyed primary replay marker in the same rollback-capable
+	 * transaction. Secondary publication completes after commit before the call
+	 * resolves; no raw identifier or proof value is copied into the marker.
+	 */
 	createVerificationValue(
 		data: Omit<Verification, "createdAt" | "id" | "updatedAt"> &
 			Partial<Verification>,
+		challengeContext?: VerificationChallengeCreationContext,
 	): Promise<Verification>;
 
-	findVerificationValue(identifier: string): Promise<Verification | null>;
+	findVerificationValueAndPruneExpired(
+		identifier: string,
+	): Promise<Verification | null>;
 
 	deleteVerificationByIdentifier(identifier: string): Promise<void>;
 
@@ -232,21 +286,30 @@ export interface InternalAdapter<
 	 * themselves. Callers MUST gate any state change (issue session, mint
 	 * token, change password) on a non-null result.
 	 *
-	 * Replaces the racy `findVerificationValue` + `deleteVerificationByIdentifier`
+	 * Replaces the racy `findVerificationValueAndPruneExpired` + `deleteVerificationByIdentifier`
 	 * pair at single-use credential consumption sites.
+	 *
+	 * With managed authentication policy, callers must already own an active
+	 * primary transaction. Success atomically consumes both the exact challenge
+	 * and its primary marker; secondary cleanup is deferred until commit.
 	 */
-	consumeVerificationValue(identifier: string): Promise<Verification | null>;
+	consumeVerificationValue(
+		identifier: string,
+		challengeContext?: VerificationChallengeConsumptionContext,
+	): Promise<Verification | null>;
 
 	/**
-	 * First-writer-wins create keyed by a deterministic primary key derived from
+	 * First-writer-wins create keyed by a deterministic database key derived from
 	 * `identifier`. Returns `true` when this caller created the row and `false`
 	 * when a row for the same identifier already existed.
 	 *
 	 * The dual of `consumeVerificationValue`: reserve races to create a marker
 	 * exactly once, where consume races to delete one exactly once. Use it for
 	 * replay tombstones (a SAML assertion id, a JWT `jti`) where the first caller
-	 * wins. The database path is atomic via the primary key; the
-	 * secondary-storage-only path is best-effort under concurrency.
+	 * wins. The primary database is always the atomic authority via a digest-keyed
+	 * unique security-ledger row, independent of the configured id strategy and
+	 * verification storage mode. Raw identifiers and replay values are never
+	 * copied into secondary storage by this reservation primitive.
 	 */
 	reserveVerificationValue(data: {
 		identifier: string;

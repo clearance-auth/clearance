@@ -1411,6 +1411,7 @@ describe("SAML SSO", async () => {
 					user: [],
 					session: [],
 					verification: [],
+					securityMigration: [],
 					account: [],
 					ssoProvider: [],
 				}),
@@ -3921,7 +3922,7 @@ describe("SAML SSO - Timestamp Validation", () => {
 			expect(() =>
 				validateSAMLTimestamp(
 					{ notBefore: threeSecondsFromNow },
-					{ clockSkew: 1000 },
+					{ clockSkewMs: 1000 },
 				),
 			).toThrow("SAML assertion is not yet valid");
 		});
@@ -3940,7 +3941,7 @@ describe("SAML SSO - Timestamp Validation", () => {
 			expect(() =>
 				validateSAMLTimestamp(
 					{ notOnOrAfter: threeSecondsAgo },
-					{ clockSkew: 1000 },
+					{ clockSkewMs: 1000 },
 				),
 			).toThrow("SAML assertion has expired");
 		});
@@ -4061,20 +4062,20 @@ describe("SAML SSO - Timestamp Validation", () => {
 	});
 
 	describe("Custom clock skew configuration", () => {
-		it("should use custom clockSkew when provided", () => {
+		it("should use custom clockSkewMs when provided", () => {
 			const twoSecondsAgo = new Date(Date.now() - 2 * 1000).toISOString();
 
 			expect(() =>
 				validateSAMLTimestamp(
 					{ notOnOrAfter: twoSecondsAgo },
-					{ clockSkew: 1000 },
+					{ clockSkewMs: 1000 },
 				),
 			).toThrow("SAML assertion has expired");
 
 			expect(() =>
 				validateSAMLTimestamp(
 					{ notOnOrAfter: twoSecondsAgo },
-					{ clockSkew: 5 * 60 * 1000 },
+					{ clockSkewMs: 5 * 60 * 1000 },
 				),
 			).not.toThrow();
 		});

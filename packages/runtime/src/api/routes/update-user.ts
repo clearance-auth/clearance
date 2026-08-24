@@ -1,13 +1,24 @@
 import type { ClearanceOptions } from "@clearance/core";
 import { createAuthEndpoint } from "@clearance/core/api";
+import { runWithTransaction } from "@clearance/core/context";
 import { APIError, BASE_ERROR_CODES } from "@clearance/core/error";
+import { generateId } from "@clearance/core/utils/id";
 import * as z from "zod";
 import { deleteSessionCookie, setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto";
 import { parseUserInput, parseUserOutput } from "../../db/schema";
 import type { AdditionalUserFieldsInput } from "../../types";
+import { runManagedAuthenticationTransaction } from "../../internal/managed-authentication-transaction";
+import { createInternalSessionIssuanceContext } from "../../internal/session-issuance-context";
+import {
+	consumeInternalVerificationChallenge,
+	createInternalVerificationChallenge,
+} from "../../internal/verification-challenge-context";
 import { originCheck } from "../middlewares";
-import { createEmailVerificationToken } from "./email-verification";
+import {
+	createEmailVerificationToken,
+	dispatchVerificationEmail,
+} from "./email-verification";
 import {
 	getSessionFromCtx,
 	isStateful,
@@ -264,51 +275,68 @@ export const changePassword = createAuthEndpoint(
 			throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.PASSWORD_TOO_LONG);
 		}
 
-		const accounts = await ctx.context.internalAdapter.findAccounts(
-			session.user.id,
-		);
-		const account = accounts.find(
-			(account) => account.providerId === "credential" && account.password,
-		);
-		if (!account || !account.password) {
-			throw APIError.from(
-				"BAD_REQUEST",
-				BASE_ERROR_CODES.CREDENTIAL_ACCOUNT_NOT_FOUND,
-			);
-		}
 		const passwordHash = await ctx.context.password.hash(newPassword);
-		const verify = await ctx.context.password.verify({
-			hash: account.password,
-			password: currentPassword,
-		});
-		if (!verify) {
-			throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_PASSWORD);
-		}
-		await ctx.context.internalAdapter.updateAccount(account.id, {
-			password: passwordHash,
-		});
-		let token = null;
-		if (revokeOtherSessions) {
-			await ctx.context.internalAdapter.deleteUserSessions(session.user.id);
-			const newSession = await ctx.context.internalAdapter.createSession(
-				session.user.id,
-			);
-			if (!newSession) {
-				throw APIError.from(
-					"INTERNAL_SERVER_ERROR",
-					BASE_ERROR_CODES.FAILED_TO_GET_SESSION,
+		const newSession = await runManagedAuthenticationTransaction(
+			ctx,
+			async () => {
+				const accounts = await ctx.context.internalAdapter.findAccounts(
+					session.user.id,
 				);
-			}
-			// set the new session cookie
+				const account = accounts.find(
+					(account) =>
+						account.providerId === "credential" && account.password,
+				);
+				if (!account || !account.password) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						BASE_ERROR_CODES.CREDENTIAL_ACCOUNT_NOT_FOUND,
+					);
+				}
+				const verified = await ctx.context.password.verify({
+					hash: account.password,
+					password: currentPassword,
+				});
+				if (!verified) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						BASE_ERROR_CODES.INVALID_PASSWORD,
+					);
+				}
+				await ctx.context.internalAdapter.updateAccount(account.id, {
+					password: passwordHash,
+				});
+				if (!revokeOtherSessions) return null;
+				await ctx.context.internalAdapter.deleteUserSessions(session.user.id);
+				return ctx.context.internalAdapter.createSession(
+					session.user.id,
+					false,
+					undefined,
+					false,
+					createInternalSessionIssuanceContext({
+						purpose: "interactive",
+						subjectId: session.user.id,
+						evidence: [
+							{ kind: "primary", primaryMethod: "password" },
+						],
+					}),
+				);
+			},
+		);
+		if (revokeOtherSessions && !newSession) {
+			throw APIError.from(
+				"INTERNAL_SERVER_ERROR",
+				BASE_ERROR_CODES.FAILED_TO_GET_SESSION,
+			);
+		}
+		if (newSession) {
 			await setSessionCookie(ctx, {
 				session: newSession,
 				user: session.user,
 			});
-			token = newSession.token;
 		}
 
 		return ctx.json({
-			token,
+			token: newSession?.token ?? null,
 			user: parseUserOutput(ctx.context.options, session.user),
 		});
 	},
@@ -506,16 +534,21 @@ export const deleteUser = createAuthEndpoint(
 
 		if (ctx.context.options.user.deleteUser?.sendDeleteAccountVerification) {
 			const token = generateRandomString(32, "0-9", "a-z");
-			await ctx.context.internalAdapter.createVerificationValue({
-				value: session.user.id,
-				identifier: `delete-account-${token}`,
+			const identifier = `delete-account-${token}`;
+			await createInternalVerificationChallenge(
+				ctx.context.internalAdapter,
+				{ purpose: "delete-account", subject: session.user.id },
+				{
+					value: session.user.id,
+					identifier,
 				expiresAt: new Date(
 					Date.now() +
 						(ctx.context.options.user.deleteUser?.deleteTokenExpiresIn ||
 							60 * 60 * 24) *
 							1000,
 				),
-			});
+				},
+			);
 			const url = `${
 				ctx.context.baseURL
 			}/delete-user/callback?token=${token}&callbackURL=${encodeURIComponent(
@@ -632,29 +665,55 @@ export const deleteUserCallback = createAuthEndpoint(
 				BASE_ERROR_CODES.FAILED_TO_GET_USER_INFO,
 			);
 		}
-		// Consume the single-use delete token atomically before any
-		// destructive work so concurrent callbacks with the same token can
-		// only delete the account once: the first caller wins, later racers
-		// get null. A wrong-owner token is still burned by this consume.
-		const token = await ctx.context.internalAdapter.consumeVerificationValue(
-			`delete-account-${ctx.query.token}`,
-		);
-		if (!token || token.value !== session.user.id) {
-			throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.INVALID_TOKEN);
-		}
 		const beforeDelete = ctx.context.options.user.deleteUser?.beforeDelete;
-		if (beforeDelete) {
-			await beforeDelete(session.user, ctx.request);
-		}
-		await ctx.context.internalAdapter.deleteUser(session.user.id);
-		await ctx.context.internalAdapter.deleteUserSessions(session.user.id);
-		await ctx.context.internalAdapter.deleteAccounts(session.user.id);
+		const deletedUser = await runManagedAuthenticationTransaction(
+			ctx,
+			async () => {
+				const authoritativeSession = await getSessionFromCtx(ctx, {
+					disableCookieCache: isStateful(ctx),
+				});
+				if (
+					!authoritativeSession ||
+					authoritativeSession.user.id !== session.user.id
+				) {
+					throw APIError.from(
+						"NOT_FOUND",
+						BASE_ERROR_CODES.FAILED_TO_GET_USER_INFO,
+					);
+				}
+				const identifier = `delete-account-${ctx.query.token}`;
+				const token = await consumeInternalVerificationChallenge(
+					ctx.context.internalAdapter,
+					{
+						purpose: "delete-account",
+						subject: authoritativeSession.user.id,
+						identifier,
+					},
+				);
+				if (!token || token.value !== authoritativeSession.user.id) {
+					throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.INVALID_TOKEN);
+				}
+				if (beforeDelete) {
+					await beforeDelete(authoritativeSession.user, ctx.request);
+				}
+				await ctx.context.internalAdapter.deleteUser(
+					authoritativeSession.user.id,
+				);
+				await ctx.context.internalAdapter.deleteUserSessions(
+					authoritativeSession.user.id,
+				);
+				await ctx.context.internalAdapter.deleteAccounts(
+					authoritativeSession.user.id,
+				);
+				return authoritativeSession.user;
+			},
+		);
 
 		deleteSessionCookie(ctx);
 
 		const afterDelete = ctx.context.options.user.deleteUser?.afterDelete;
 		if (afterDelete) {
-			await afterDelete(session.user, ctx.request);
+			await afterDelete(deletedUser, ctx.request);
 		}
 		if (ctx.query.callbackURL) {
 			throw ctx.redirect(ctx.query.callbackURL || "/");
@@ -745,12 +804,17 @@ export const changeEmail = createAuthEndpoint(
 		const canUpdateWithoutVerification =
 			ctx.context.session.user.emailVerified !== true &&
 			ctx.context.options.user.changeEmail.updateEmailWithoutVerification;
-		const canSendVerification =
-			ctx.context.options.emailVerification?.sendVerificationEmail;
-		const canSendConfirmation =
+		const canSendVerification = Boolean(
+			ctx.context.options.durableDelivery ||
+				ctx.context.options.emailVerification?.sendVerificationEmail,
+		);
+		const legacySendConfirmation =
+			ctx.context.options.user.changeEmail.sendChangeEmailConfirmation;
+		const canSendConfirmation = Boolean(
 			canSendVerification &&
 			ctx.context.session.user.emailVerified &&
-			ctx.context.options.user.changeEmail.sendChangeEmailConfirmation;
+			(ctx.context.options.durableDelivery || legacySendConfirmation),
+		);
 
 		if (
 			!canUpdateWithoutVerification &&
@@ -783,12 +847,39 @@ export const changeEmail = createAuthEndpoint(
 		 * If the email is not verified, we can update the email if the option is enabled
 		 */
 		if (canUpdateWithoutVerification) {
-			await ctx.context.internalAdapter.updateUserByEmail(
-				ctx.context.session.user.email,
-				{
-					email: newEmail,
-				},
-			);
+			let verification: { token: string; url: string } | undefined;
+			if (canSendVerification) {
+				const token = await createEmailVerificationToken(
+					ctx.context.secret,
+					newEmail,
+					undefined,
+					ctx.context.options.emailVerification?.expiresIn,
+					{ jti: generateId(16) },
+				);
+				verification = {
+					token,
+					url: `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
+						ctx.body.callbackURL || "/",
+					)}`,
+				};
+			}
+			const updateAndDispatch = async () => {
+				await ctx.context.internalAdapter.updateUserByEmail(
+					ctx.context.session.user.email,
+					{ email: newEmail },
+				);
+				if (verification) {
+					await dispatchVerificationEmail(ctx, {
+						user: { ...ctx.context.session.user, email: newEmail },
+						...verification,
+					});
+				}
+			};
+			if (ctx.context.options.durableDelivery) {
+				await runWithTransaction(ctx.context.adapter, updateAndDispatch);
+			} else {
+				await updateAndDispatch();
+			}
 			await setSessionCookie(ctx, {
 				session: ctx.context.session.session,
 				user: {
@@ -796,33 +887,6 @@ export const changeEmail = createAuthEndpoint(
 					email: newEmail,
 				},
 			});
-			if (canSendVerification) {
-				const token = await createEmailVerificationToken(
-					ctx.context.secret,
-					newEmail,
-					undefined,
-					ctx.context.options.emailVerification?.expiresIn,
-				);
-				const url = `${
-					ctx.context.baseURL
-				}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
-					ctx.body.callbackURL || "/",
-				)}`;
-				await ctx.context.runInBackgroundOrAwait(
-					canSendVerification(
-						{
-							user: {
-								...ctx.context.session.user,
-								email: newEmail,
-							},
-							url,
-							token,
-						},
-						ctx.request,
-					),
-				);
-			}
-
 			return ctx.json({
 				status: true,
 			});
@@ -839,6 +903,7 @@ export const changeEmail = createAuthEndpoint(
 				ctx.context.options.emailVerification?.expiresIn,
 				{
 					requestType: "change-email-confirmation",
+					jti: generateId(16),
 				},
 			);
 			const url = `${
@@ -846,17 +911,21 @@ export const changeEmail = createAuthEndpoint(
 			}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
 				ctx.body.callbackURL || "/",
 			)}`;
-			await ctx.context.runInBackgroundOrAwait(
-				canSendConfirmation(
-					{
-						user: ctx.context.session.user,
-						newEmail: newEmail,
-						url,
-						token,
-					},
-					ctx.request,
-				),
-			);
+			if (ctx.context.options.durableDelivery) {
+				await dispatchVerificationEmail(ctx, {
+					user: ctx.context.session.user,
+					url,
+					token,
+					template: "email-change-confirmation",
+				});
+			} else {
+				await ctx.context.runInBackgroundOrAwait(
+					legacySendConfirmation!(
+						{ user: ctx.context.session.user, newEmail, url, token },
+						ctx.request,
+					),
+				);
+			}
 			return ctx.json({
 				status: true,
 			});
@@ -876,6 +945,7 @@ export const changeEmail = createAuthEndpoint(
 			ctx.context.options.emailVerification?.expiresIn,
 			{
 				requestType: "change-email-verification",
+				jti: generateId(16),
 			},
 		);
 		const url = `${
@@ -883,19 +953,12 @@ export const changeEmail = createAuthEndpoint(
 		}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
 			ctx.body.callbackURL || "/",
 		)}`;
-		await ctx.context.runInBackgroundOrAwait(
-			canSendVerification(
-				{
-					user: {
-						...ctx.context.session.user,
-						email: newEmail,
-					},
-					url,
-					token,
-				},
-				ctx.request,
-			),
-		);
+		await dispatchVerificationEmail(ctx, {
+			user: { ...ctx.context.session.user, email: newEmail },
+			url,
+			token,
+			template: "email-change-verification",
+		});
 		return ctx.json({
 			status: true,
 		});

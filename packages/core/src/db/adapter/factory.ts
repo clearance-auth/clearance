@@ -12,6 +12,7 @@ import { ClearanceError } from "../../error";
 import type { ClearanceOptions } from "../../types";
 import { safeJSONParse } from "../../utils/json";
 import { getAuthTables } from "../get-tables";
+import type { ClearanceDBSchema } from "../type";
 import { initGetDefaultFieldName } from "./get-default-field-name";
 import { initGetDefaultModelName } from "./get-default-model-name";
 import { initGetFieldAttributes } from "./get-field-attributes";
@@ -20,6 +21,7 @@ import { initGetIdField } from "./get-id-field";
 import { initGetModelName } from "./get-model-name";
 import type {
 	CleanedWhere,
+	CreateIfAbsentAttemptValue,
 	DBAdapter,
 	DBTransactionAdapter,
 	JoinConfig,
@@ -45,6 +47,132 @@ export * from "./types";
 
 let debugLogs: { instance: string; args: any[] }[] = [];
 let transactionId = -1;
+
+const REDACTED_DEBUG_VALUE = "[REDACTED]";
+const SENSITIVE_DEBUG_FIELD =
+	/(?:token|secret|password|credential|hash|otp|code|key|authorization|bearer)/i;
+
+type DebugValue =
+	| null
+	| boolean
+	| number
+	| string
+	| DebugValue[]
+	| { [key: string]: DebugValue };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function redactDebugString(value: string) {
+	return value
+		.replace(/\bBearer\s+[^\s,]+/gi, "Bearer [REDACTED]")
+		.replace(
+			/\b(token|secret|password|credential|hash|otp|code|key|authorization)\b\s*[:=]\s*[^\s,]+/gi,
+			"$1=[REDACTED]",
+		);
+}
+
+function isSecretBearingModel(
+	model: unknown,
+	schema: ClearanceDBSchema,
+	getDefaultModelName: (model: string) => string,
+) {
+	if (typeof model !== "string") return false;
+	const defaultModelName = getDefaultModelName(model);
+	const fields = schema[defaultModelName]?.fields;
+	if (!fields) return SENSITIVE_DEBUG_FIELD.test(model);
+	return (
+		defaultModelName === "verification" ||
+		Object.entries(fields).some(([field, attributes]) =>
+			attributes.returned === false ||
+			SENSITIVE_DEBUG_FIELD.test(field) ||
+			SENSITIVE_DEBUG_FIELD.test(attributes.fieldName ?? field),
+		)
+	);
+}
+
+function fieldNames(value: unknown): string[] {
+	if (Array.isArray(value)) {
+		return [...new Set(value.flatMap((item) => fieldNames(item)))].sort();
+	}
+	if (!isRecord(value)) return [];
+	if (typeof value.field === "string") return [value.field];
+	return Object.keys(value).sort();
+}
+
+function secretModelMetadata(record: Record<string, unknown>): DebugValue {
+	const metadata: Record<string, DebugValue> = { model: String(record.model) };
+	for (const [key, value] of Object.entries(record)) {
+		if (key === "model" || value === undefined) continue;
+		if (key === "where") {
+			metadata.where = {
+				predicateCount: Array.isArray(value) ? value.length : 0,
+				fields: fieldNames(value),
+			};
+			continue;
+		}
+		if (
+			key === "data" ||
+			key === "res" ||
+			key === "result" ||
+			key === "update" ||
+			key === "set"
+		) {
+			const fields = fieldNames(value);
+			metadata[key] = Array.isArray(value)
+				? { fieldCount: fields.length, fields, resultCount: value.length }
+				: { fieldCount: fields.length, fields };
+			continue;
+		}
+		if (key === "select" && Array.isArray(value)) {
+			metadata.select = { fieldCount: value.length, fields: value.map(String).sort() };
+			continue;
+		}
+		const fields = fieldNames(value);
+		metadata[key] =
+			Array.isArray(value) || isRecord(value)
+				? { fieldCount: fields.length, fields }
+				: { present: value !== null };
+	}
+	return metadata;
+}
+
+function redactDebugValue(value: unknown): DebugValue {
+	if (value === null || typeof value === "boolean" || typeof value === "number") {
+		return value;
+	}
+	if (typeof value === "string") return redactDebugString(value);
+	if (value instanceof Date) return value.toISOString();
+	if (Array.isArray(value)) return value.map((item) => redactDebugValue(item));
+	if (!isRecord(value)) return String(value);
+
+	const redacted: Record<string, DebugValue> = {};
+	const isPredicate = "field" in value && "operator" in value && "value" in value;
+	for (const [key, nestedValue] of Object.entries(value)) {
+		redacted[key] =
+			SENSITIVE_DEBUG_FIELD.test(key) || (isPredicate && key === "value")
+				? REDACTED_DEBUG_VALUE
+				: redactDebugValue(nestedValue);
+	}
+	return redacted;
+}
+
+function redactDebugArgs(
+	args: unknown[],
+	schema: ClearanceDBSchema,
+	getDefaultModelName: (model: string) => string,
+) {
+	return args.map((arg) => {
+		if (
+			isRecord(arg) &&
+			isSecretBearingModel(arg.model, schema, getDefaultModelName)
+		) {
+			return secretModelMetadata(arg);
+		}
+		return redactDebugValue(arg);
+	});
+}
 
 const createAsIsTransaction =
 	<Options extends ClearanceOptions>(adapter: DBAdapter<Options>) =>
@@ -92,6 +220,11 @@ export const createAdapterFactory =
 
 		const debugLog = (...args: any[]) => {
 			if (config.debugLogs === true || typeof config.debugLogs === "object") {
+				const sanitizedArgs = redactDebugArgs(
+					args,
+					schema,
+					getDefaultModelName,
+				);
 				const logger = createLogger({ level: "info" });
 				// If we're running adapter tests, we'll keep debug logs in memory, then print them out if a test fails.
 				if (
@@ -99,8 +232,11 @@ export const createAdapterFactory =
 					"isRunningAdapterTests" in config.debugLogs
 				) {
 					if (config.debugLogs.isRunningAdapterTests) {
-						args.shift(); // Removes the {method: "..."} object from the args array.
-						debugLogs.push({ instance: uniqueAdapterFactoryInstanceId, args });
+						sanitizedArgs.shift(); // Removes the {method: "..."} object from the args array.
+						debugLogs.push({
+							instance: uniqueAdapterFactoryInstanceId,
+							args: sanitizedArgs,
+						});
 					}
 					return;
 				}
@@ -113,8 +249,10 @@ export const createAdapterFactory =
 					return;
 				}
 
-				if (typeof args[0] === "object" && "method" in args[0]) {
-					const method = args.shift().method;
+				if (isRecord(sanitizedArgs[0]) && "method" in sanitizedArgs[0]) {
+					const methodArgument = sanitizedArgs.shift();
+					if (!isRecord(methodArgument)) return;
+					const method = methodArgument.method;
 					// Make sure the method is enabled in the config.
 					if (typeof config.debugLogs === "object") {
 						if (method === "create" && !config.debugLogs.create) {
@@ -151,9 +289,9 @@ export const createAdapterFactory =
 							return;
 						}
 					}
-					logger.info(`[${config.adapterName}]`, ...args);
+					logger.info(`[${config.adapterName}]`, ...sanitizedArgs);
 				} else {
-					logger.info(`[${config.adapterName}]`, ...args);
+					logger.info(`[${config.adapterName}]`, ...sanitizedArgs);
 				}
 			}
 		};
@@ -846,6 +984,9 @@ export const createAdapterFactory =
 
 		let lazyLoadTransaction: DBAdapter<Options>["transaction"] | null = null;
 		const adapter: DBAdapter<Options> = {
+			...(adapterInstance.rawTransactionQuery
+				? { rawTransactionQuery: adapterInstance.rawTransactionQuery }
+				: {}),
 			transaction: async (cb) => {
 				if (!lazyLoadTransaction) {
 					if (!config.transaction) {
@@ -948,6 +1089,116 @@ export const createAdapterFactory =
 					{ model, data: transformed },
 				);
 				return transformed;
+			},
+			createIfAbsent: async <T extends Record<string, any>, R = T>({
+				model: unsafeModel,
+				data: unsafeData,
+				uniqueBy: unsafeUniqueBy,
+				attemptBy: unsafeAttemptBy,
+				forceAllowId = false,
+			}: {
+				model: string;
+				data: T;
+				uniqueBy: { field: string; value: Where["value"] };
+				attemptBy: { field: string; value: CreateIfAbsentAttemptValue };
+				forceAllowId?: boolean;
+			}): Promise<R | null> => {
+				const defaultModel = getDefaultModelName(unsafeModel);
+				const uniqueAttributes = getFieldAttributes({
+					model: defaultModel,
+					field: unsafeUniqueBy.field,
+				});
+				getFieldAttributes({
+					model: defaultModel,
+					field: unsafeAttemptBy.field,
+				});
+				if (!uniqueAttributes.unique && unsafeUniqueBy.field !== "id") {
+					throw new ClearanceError(
+						`createIfAbsent requires a schema-declared unique field; ${unsafeUniqueBy.field} is not unique on ${defaultModel}`,
+					);
+				}
+				if (
+					(typeof unsafeAttemptBy.value !== "string" &&
+						typeof unsafeAttemptBy.value !== "number" &&
+						typeof unsafeAttemptBy.value !== "boolean") ||
+					(typeof unsafeAttemptBy.value === "number" &&
+						!Number.isFinite(unsafeAttemptBy.value))
+				) {
+					throw new ClearanceError(
+						"createIfAbsent attemptBy must be a string, finite number, or boolean",
+					);
+				}
+				if (
+					!Object.hasOwn(unsafeData, unsafeUniqueBy.field) ||
+					!Object.is(unsafeData[unsafeUniqueBy.field], unsafeUniqueBy.value)
+				) {
+					throw new ClearanceError(
+						"createIfAbsent uniqueBy must exactly match the corresponding data field",
+					);
+				}
+				if (
+					!Object.hasOwn(unsafeData, unsafeAttemptBy.field) ||
+					unsafeData[unsafeAttemptBy.field] !== unsafeAttemptBy.value
+				) {
+					throw new ClearanceError(
+						"createIfAbsent attemptBy must exactly match the corresponding data field",
+					);
+				}
+				if (!adapterInstance.createIfAbsent) {
+					throw new ClearanceError(
+						`Adapter "${config.adapterId}" does not support atomic createIfAbsent`,
+					);
+				}
+
+				let data = unsafeData;
+				if (!config.disableTransformInput) {
+					data = (await transformInput(
+						unsafeData,
+						defaultModel,
+						"create",
+						forceAllowId,
+					)) as T;
+				}
+				const uniqueWhere = transformWhereClause({
+					model: defaultModel,
+					where: [{ field: unsafeUniqueBy.field, value: unsafeUniqueBy.value }],
+					action: "create",
+				})!;
+				const attemptWhere = transformWhereClause({
+					model: defaultModel,
+					where: [{ field: unsafeAttemptBy.field, value: unsafeAttemptBy.value }],
+					action: "create",
+				})!;
+				const uniqueBy = uniqueWhere[0]!;
+				const attemptBy = attemptWhere[0]!;
+				const model = getModelName(defaultModel);
+				const result = await withSpan(
+					`db createIfAbsent ${model}`,
+					{
+						[ATTR_DB_OPERATION_NAME]: "createIfAbsent",
+						[ATTR_DB_COLLECTION_NAME]: model,
+					},
+					() =>
+						adapterInstance.createIfAbsent!<T>({
+							model,
+							data,
+							uniqueBy: {
+								field: uniqueBy!.field,
+								value: uniqueBy!.value,
+							},
+							attemptBy: {
+								field: attemptBy!.field,
+								value: attemptBy!.value,
+							},
+						}),
+				);
+				if (!result || config.disableTransformOutput) return result as R | null;
+				return (await transformOutput(
+					result,
+					defaultModel,
+					undefined,
+					undefined,
+				)) as R;
 			},
 			update: async <T>({
 				model: unsafeModel,
@@ -1676,6 +1927,7 @@ export const createAdapterFactory =
 				...(adapterInstance.options ?? {}),
 			},
 			id: config.adapterId,
+			storagePersistence: config.storagePersistence ?? "durable",
 
 			// Secretly export values ONLY if this adapter has enabled adapter-test-debug-logs.
 			// This would then be used during our adapter-tests to help print debug logs if a test fails.

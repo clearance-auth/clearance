@@ -120,6 +120,8 @@ export interface SAMLAssertionExtract {
 type BaseSSOProvider = {
 	issuer: string;
 	oidcConfig?: OIDCConfig | undefined;
+	keyManagementVersion?: number | undefined;
+	keyManagementRevision?: number | undefined;
 	samlConfig?: SAMLConfig | undefined;
 	userId: string;
 	providerId: string;
@@ -137,8 +139,8 @@ export type SSOProvider<O extends SSOOptions> =
 export interface SSOOptions {
 	/** Transparent at-rest protection for OIDC client secrets. */
 	storeOIDCClientSecret?: {
-		encrypt: (secret: string) => Awaitable<string>;
-		decrypt: (ciphertext: string) => Awaitable<string>;
+		encrypt: (secret: string, providerId: string) => Awaitable<string>;
+		decrypt: (ciphertext: string, providerId: string) => Awaitable<string>;
 	};
 	/**
 	 * custom function to provision a user when they sign in with an SSO provider.
@@ -367,7 +369,7 @@ export interface SSOOptions {
 		 *
 		 * @default 300000 (5 minutes)
 		 */
-		clockSkew?: number;
+		clockSkewMs?: number;
 		/**
 		 * Require an expiry-bounding NotOnOrAfter condition in SAML assertions.
 		 * NotBefore remains optional and is validated when present. When enabled,

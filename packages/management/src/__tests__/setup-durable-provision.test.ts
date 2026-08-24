@@ -36,10 +36,7 @@ const runtimeRows = vi.hoisted(() => ({
 	>(),
 }));
 
-vi.mock("../auth-bridge.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../auth-bridge.js")>();
-	return {
-		...actual,
+vi.mock("../auth-bridge.js", () => ({
 		insertSsoProvider: vi.fn(
 			async (input: {
 				id?: string;
@@ -53,7 +50,9 @@ vi.mock("../auth-bridge.js", async (importOriginal) => {
 				const id = input.id ?? `sso_gen_${runtimeRows.sso.size + 1}`;
 				const existing =
 					runtimeRows.sso.get(id) ??
-					[...runtimeRows.sso.values()].find((r) => r.providerId === input.providerId);
+				[...runtimeRows.sso.values()].find(
+					(r) => r.providerId === input.providerId,
+				);
 				if (existing) {
 					if (existing.id !== id) {
 						throw Object.assign(new Error("providerId bound to different id"), {
@@ -62,7 +61,8 @@ vi.mock("../auth-bridge.js", async (importOriginal) => {
 					}
 					if (
 						existing.providerId !== input.providerId ||
-						(existing.organizationId ?? null) !== (input.organizationId ?? null) ||
+					(existing.organizationId ?? null) !==
+						(input.organizationId ?? null) ||
 						existing.issuer !== input.issuer ||
 						existing.domain !== input.domain ||
 						existing.protocol !== input.protocol ||
@@ -107,7 +107,9 @@ vi.mock("../auth-bridge.js", async (importOriginal) => {
 				const id = input.id ?? `scim_gen_${runtimeRows.scim.size + 1}`;
 				const existing =
 					runtimeRows.scim.get(id) ??
-					[...runtimeRows.scim.values()].find((r) => r.providerId === input.providerId);
+				[...runtimeRows.scim.values()].find(
+					(r) => r.providerId === input.providerId,
+				);
 				if (existing) {
 					if (existing.id !== id) {
 						throw Object.assign(new Error("providerId bound to different id"), {
@@ -153,23 +155,28 @@ vi.mock("../auth-bridge.js", async (importOriginal) => {
 		deleteScimProviderById: vi.fn(async (id: string) => {
 			runtimeRows.scim.delete(id);
 		}),
-	};
-});
+	insertSsoProviderInTransaction: vi.fn(),
+	insertScimProviderInTransaction: vi.fn(),
+	applyScimUsersInTransaction: vi.fn(),
+	getAuthBundle: vi.fn(),
+}));
 
+import { JsonStore } from "../store/json-store.js";
 import {
-	JsonStore,
 	commitSetupLink,
-	createOrganization,
-	createScimConnectionReal,
 	createSetupLink,
-	createSsoConnectionReal,
 	deriveSetupConnectionIds,
 	deriveSetupReservationId,
-	initProject,
-	listEvents,
 	releaseSetupLink,
 	reserveSetupLink,
-} from "../index.js";
+} from "../services/setup-links.js";
+import {
+	createOrganization,
+	initProject,
+	listEvents,
+} from "../services/core.js";
+import { createSsoConnectionReal } from "../services/sso-real.js";
+import { createScimConnectionReal } from "../services/scim-real.js";
 
 const dirs: string[] = [];
 
@@ -235,7 +242,7 @@ describe("SSO durable setup provision", () => {
 		});
 		expect(conn.id).toMatch(/^sso/);
 		expect(runtimeRows.sso.size).toBe(1);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		expect(JSON.stringify(store.snapshot)).not.toContain("super-secret-cli");
 	});
 
@@ -270,7 +277,9 @@ describe("SSO durable setup provision", () => {
 		});
 		// Leave reservation active until TTL — then expire.
 		await new Promise((r) => setTimeout(r, 60));
-		const capHeld = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
+		const capHeld = store.snapshot.setupLinks.find(
+			(c) => c.id === link.capabilityId,
+		)!;
 		// Force lease expiry in store if timer race
 		store.mutate((data) => {
 			const idx = data.setupLinks.findIndex((c) => c.id === link.capabilityId);
@@ -305,8 +314,8 @@ describe("SSO durable setup provision", () => {
 		});
 		expect(recovered.id).toBe(ids.connectionId);
 		expect(runtimeRows.sso.size).toBe(1);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
-		expect(store.snapshot.identityConnections[0]!.id).toBe(ids.connectionId);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections[0]!.id).toBe(ids.connectionId);
 		expect(JSON.stringify(store.snapshot)).not.toContain("client-secret-value");
 		expect(JSON.stringify(store.snapshot)).not.toContain(link.token);
 
@@ -315,8 +324,11 @@ describe("SSO durable setup provision", () => {
 			kind: "sso",
 			organizationId: org.id,
 			reservationId: reserved2.reservationId,
+			reservationFencingToken: reserved2.reservationFencingToken,
 		});
-		const after = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
+		const after = store.snapshot.setupLinks.find(
+			(c) => c.id === link.capabilityId,
+		)!;
 		expect(after.useCount).toBe(1);
 		expect(after.redeemedAt).toBeTruthy();
 
@@ -337,7 +349,7 @@ describe("SSO durable setup provision", () => {
 		});
 		expect(again.id).toBe(ids.connectionId);
 		expect(runtimeRows.sso.size).toBe(1);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 	});
 
 	it("fail closed when deterministic id belongs to mismatched organization", async () => {
@@ -367,7 +379,7 @@ describe("SSO durable setup provision", () => {
 				setupAttemptId: attempt,
 			}),
 		).rejects.toThrow(/different organization|conflict|mismatch/i);
-		expect(store.snapshot.identityConnections).toHaveLength(0);
+		expect(store.snapshot.ssoConnections).toHaveLength(0);
 		expect(runtimeRows.sso.size).toBe(1);
 	});
 
@@ -402,14 +414,19 @@ describe("SSO durable setup provision", () => {
 		expect(runtimeRows.sso.get(first.id)?.clientSecret).toBe(
 			"stored-client-secret",
 		);
-		expect(JSON.stringify(store.snapshot)).not.toContain("stored-client-secret");
+		expect(JSON.stringify(store.snapshot)).not.toContain(
+			"stored-client-secret",
+		);
 	});
 
 	it("concurrent reserves: one winner, same deterministic provision target", async () => {
 		const store = tempStore();
 		initProject(store, { name: "Race" });
 		const org = createOrganization(store, { name: "Org" });
-		const link = createSetupLink(store, { organizationId: org.id, kind: "sso" });
+		const link = createSetupLink(store, {
+			organizationId: org.id,
+			kind: "sso",
+		});
 		const raced = await Promise.allSettled([
 			reserveSetupLink(store, { token: link.token, kind: "sso" }),
 			reserveSetupLink(store, { token: link.token, kind: "sso" }),
@@ -418,7 +435,12 @@ describe("SSO durable setup provision", () => {
 		const losses = raced.filter((r) => r.status === "rejected");
 		expect(wins).toHaveLength(1);
 		expect(losses).toHaveLength(1);
-		const winner = (wins[0] as PromiseFulfilledResult<{ reservationId: string }>).value;
+		const winner = (
+			wins[0] as PromiseFulfilledResult<{
+				reservationId: string;
+				reservationFencingToken: string;
+			}>
+		).value;
 		const ids = deriveSetupConnectionIds("sso", winner.reservationId);
 		const conn = await createSsoConnectionReal(store, {
 			organizationId: org.id,
@@ -435,8 +457,9 @@ describe("SSO durable setup provision", () => {
 			token: link.token,
 			kind: "sso",
 			reservationId: winner.reservationId,
+			reservationFencingToken: winner.reservationFencingToken,
 		});
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		expect(runtimeRows.sso.size).toBe(1);
 		expect(JSON.stringify(listEvents(store))).not.toContain("secret-race");
 		expect(JSON.stringify(listEvents(store))).not.toContain(link.token);
@@ -448,7 +471,10 @@ describe("SCIM durable setup provision", () => {
 		const store = tempStore();
 		initProject(store, { name: "ScimCrash" });
 		const org = createOrganization(store, { name: "Dir" });
-		const link = createSetupLink(store, { organizationId: org.id, kind: "scim" });
+		const link = createSetupLink(store, {
+			organizationId: org.id,
+			kind: "scim",
+		});
 		const reserved1 = await reserveSetupLink(store, {
 			token: link.token,
 			kind: "scim",
@@ -477,6 +503,7 @@ describe("SCIM durable setup provision", () => {
 			token: link.token,
 			kind: "scim",
 			reservationId: reserved1.reservationId,
+			reservationFencingToken: reserved1.reservationFencingToken,
 		});
 
 		const reserved2 = await reserveSetupLink(store, {
@@ -501,12 +528,12 @@ describe("SCIM durable setup provision", () => {
 		expect(recovered.bearerTokenOnce).toBe(expectedHandoff);
 
 		expect(runtimeRows.scim.size).toBe(1);
-		expect(store.snapshot.directoryConnections).toHaveLength(1);
+		expect(store.snapshot.scimConnections).toHaveLength(1);
 		const snap = JSON.stringify(store.snapshot);
 		expect(snap).not.toContain(expectedHandoff);
 		expect(snap).not.toContain(baseToken);
 		expect(snap).not.toContain(link.token);
-		expect(store.snapshot.directoryConnections[0]!.bearerTokenEncrypted).toMatch(
+		expect(store.snapshot.scimConnections[0]!.bearerTokenEncrypted).toMatch(
 			/^clr\$v1\$/,
 		);
 
@@ -515,6 +542,7 @@ describe("SCIM durable setup provision", () => {
 			kind: "scim",
 			organizationId: org.id,
 			reservationId: reserved2.reservationId,
+			reservationFencingToken: reserved2.reservationFencingToken,
 		});
 		await expect(
 			reserveSetupLink(store, { token: link.token, kind: "scim" }),
@@ -539,7 +567,7 @@ describe("SCIM durable setup provision", () => {
 		});
 		expect(second.id).toBe(first.id);
 		expect(second.bearerTokenOnce).toBe(handoff1);
-		expect(store.snapshot.directoryConnections).toHaveLength(1);
+		expect(store.snapshot.scimConnections).toHaveLength(1);
 		expect(runtimeRows.scim.size).toBe(1);
 		expect(JSON.stringify(store.snapshot)).not.toContain(handoff1);
 		expect(JSON.stringify(listEvents(store))).not.toContain(handoff1);
@@ -566,7 +594,7 @@ describe("SCIM durable setup provision", () => {
 		expect(recovered.id).toBe(first.id);
 		expect(recovered.bearerTokenOnce).toBe(firstHandoff);
 		expect(runtimeRows.scim.size).toBe(1);
-		expect(store.snapshot.directoryConnections).toHaveLength(1);
+		expect(store.snapshot.scimConnections).toHaveLength(1);
 		expect(JSON.stringify(store.snapshot)).not.toContain(firstHandoff);
 	});
 });

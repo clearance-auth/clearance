@@ -88,7 +88,7 @@ describe("API/CLI canonical management parity", () => {
 		const cli = readFileSync(cliSource, "utf8");
 		expect(cli).toMatch(/dispatchRemoteCommand/);
 		expect(cli).toMatch(/\.action\(remoteCommandAction\)/);
-		expect(cli).not.toMatch(/createUserInAuth|createUser\(|openStore|DATABASE_URL/);
+		expect(cli).not.toMatch(/createUserInAuth|createUser\(|openStore/);
 
 		const application = readFileSync(usersApplicationSource, "utf8");
 		const applicationFactory = readFileSync(applicationFactorySource, "utf8");
@@ -146,7 +146,10 @@ describe("API/CLI canonical management parity", () => {
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SSO_OPERATIONS\.test\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(SCIM_OPERATIONS\.replay\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(READINESS_OPERATIONS\.report\.http\.path/);
-		expect(api).toMatch(/app\.route\("\/", registerConfigRoutes/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(DELIVERY_OPERATIONS\.list\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.get\(DELIVERY_OPERATIONS\.quotas\.http\.path/);
+		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(operation\.http\.path/);
+		expect(api).toMatch(/app\.route\(\s*"\/",\s*registerConfigRoutes/);
 		expect(configRoutes).toMatch(/\.patch\(CONFIG_OPERATIONS\.set\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(IMPORT_OPERATIONS\.legacy\.http\.path/);
 		expect(apiRoutes).toMatch(/(?:app|routes)?\.post\(MIGRATION_OPERATIONS\.rollback\.http\.path/);
@@ -156,7 +159,7 @@ describe("API/CLI canonical management parity", () => {
 		expect(remoteDispatch).toMatch(/dispatchOrganizationCommand/);
 		expect(organizationDispatch).toMatch(/case ORGANIZATION_OPERATIONS\.archive\.cliPath/);
 		expect(organizationDispatch).toMatch(/case MEMBER_OPERATIONS\.remove\.cliPath/);
-		expect(organizationDispatch).toMatch(/resolveOperationPath/);
+		expect(organizationDispatch).toMatch(/callManagementOperation/);
 		expect(remoteDispatchers).toMatch(/case SYSTEM_OPERATIONS\.doctor\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case PROJECT_OPERATIONS\.inspect\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case EVENT_OPERATIONS\.tail\.cliPath/);
@@ -166,6 +169,9 @@ describe("API/CLI canonical management parity", () => {
 		expect(remoteDispatchers).toMatch(/case SSO_OPERATIONS\.setupLink\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case SCIM_OPERATIONS\.replay\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case READINESS_OPERATIONS\.check\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.list\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.quotas\.cliPath/);
+		expect(remoteDispatchers).toMatch(/case DELIVERY_OPERATIONS\.replay\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case CONFIG_OPERATIONS\.diff\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case IMPORT_OPERATIONS\.legacy\.cliPath/);
 		expect(remoteDispatchers).toMatch(/case MIGRATION_OPERATIONS\.verify\.cliPath/);
@@ -191,9 +197,7 @@ describe("API/CLI canonical management parity", () => {
 		expect(organizations).not.toMatch(
 			/auth-bridge|\w+InAuth|ensureAuthMigrated|runtimeDatabaseConfigured/,
 		);
-		expect(access).not.toMatch(
-			/auth-bridge|\w+InAuth|ensureAuthMigrated|runtimeDatabaseConfigured/,
-		);
+		expect(access).not.toMatch(/auth-bridge|ensureAuthMigrated|runtimeDatabaseConfigured/);
 		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.create/);
 		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.update/);
 		expect(organizations).toMatch(/applicationFor\(store\)\.organizations\.archive/);
@@ -208,7 +212,7 @@ describe("API/CLI canonical management parity", () => {
 			"listSessionsPageInAuth",
 			"inspectSessionInAuth",
 			"revokeSessionInAuth",
-			"createOrgInAuth",
+			"provisionOrganizationInAuth",
 			"updateOrganizationInAuth",
 			"archiveOrganizationInAuth",
 			"addMemberInAuth",

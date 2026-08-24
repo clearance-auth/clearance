@@ -1,8 +1,8 @@
 # Clearance Terraform local Docker profile
 
 This module pulls an immutable signed Clearance image and runs an isolated,
-single-host evaluation stack: Postgres, management API, operator console, and
-sample B2B app. Its default network, volume, and container names use the
+single-host evaluation stack: Postgres, management API, operator console,
+customer Vault, and sample B2B app. Its default network, volume, and container names use the
 `clearance-tf` prefix so they do not share Compose state. It is intentionally a
 local Docker profile, not a production infrastructure module: endpoints are
 loopback-only HTTP, secrets live in Terraform state, Postgres is a single local
@@ -17,6 +17,7 @@ clearance_secret       = "..."
 operator_token         = "..."
 credential_key         = "..." # at least 32 characters
 credential_key_id      = "v1"
+key_management_config_json = "..." # purpose-separated encryption and signing provider JSON
 console_admin_password = "..."
 console_session_secret = "..."
 clearance_image         = "ghcr.io/owner/repo/clearance@sha256:<signed-release-digest>"
@@ -40,6 +41,10 @@ keyless-signed beta release image. Set `CLEARANCE_TERRAFORM_IMAGE` to another
 digest-addressed image only after verifying that release's signature. The
 verification command never applies the plan.
 
-The default endpoints are `http://localhost:13200` (API), `http://localhost:13100` (console), and `http://localhost:13300` (sample app). Optional GitHub and Google client ID/secret variables must be supplied as complete pairs.
+The default endpoints are `http://localhost:13200` (API),
+`http://localhost:13100` (console), `http://localhost:13400` (customer Vault),
+and `http://localhost:13300` (sample app). The Vault and auth runtime share the
+Vault origin so cookie and origin protections remain valid. Optional GitHub and
+Google client ID/secret variables must be supplied as complete pairs.
 
 Terraform state contains sensitive container environment values. Use the Helm profile or your platform-specific infrastructure for beta production, with external Postgres, TLS ingress, monitoring, and scheduled off-host backups. `terraform destroy` removes the isolated Postgres volume and its data.

@@ -1,6 +1,7 @@
 import type { ClearancePlugin } from "@clearance/core";
 import { createAuthMiddleware } from "@clearance/core/api";
 import { generateRandomString } from "../../crypto";
+import { createInternalVerificationChallenge } from "../../internal/verification-challenge-context";
 import { getDate } from "../../utils/date";
 import { getEndpointResponse } from "../../utils/plugin-helper";
 import { PACKAGE_VERSION } from "../../version";
@@ -20,7 +21,7 @@ import {
 	verifyEmailOTP,
 } from "./routes";
 import type { EmailOTPOptions } from "./types";
-import { toOTPIdentifier } from "./utils";
+import { emailOTPChallenge } from "./utils";
 
 declare module "@clearance/core" {
 	interface ClearancePluginRegistry<AuthOptions, Options> {
@@ -39,8 +40,8 @@ export const emailOTP = (options: EmailOTPOptions) => {
 	const opts = {
 		expiresIn: 5 * 60,
 		generateOTP: () => defaultOTPGenerator(options),
-		storeOTP: "plain",
 		...options,
+		storeOTP: options.storeOTP ?? "keyed",
 	} satisfies EmailOTPOptions;
 
 	const sendVerificationOTPAction = sendVerificationOTP(opts);
@@ -106,11 +107,19 @@ export const emailOTP = (options: EmailOTPOptions) => {
 								opts.generateOTP({ email, type: ctx.body.type }, ctx) ||
 								defaultOTPGenerator(opts);
 							const storedOTP = await storeOTP(ctx, opts, otp);
-							await ctx.context.internalAdapter.createVerificationValue({
+							const challenge = emailOTPChallenge(
+								"email-verification",
+								email.toLowerCase(),
+							);
+							await createInternalVerificationChallenge(
+								ctx.context.internalAdapter,
+								challenge,
+								{
 								value: `${storedOTP}:0`,
-								identifier: toOTPIdentifier("email-verification", email),
+								identifier: challenge.identifier,
 								expiresAt: getDate(opts.expiresIn, "sec"),
-							});
+								},
+							);
 							await ctx.context.runInBackgroundOrAwait(
 								options.sendVerificationOTP(
 									{

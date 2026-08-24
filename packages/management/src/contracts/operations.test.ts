@@ -1,13 +1,17 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { ResourceScope } from "../services/scope.js";
-import type { Principal } from "../types/resources.js";
+import type { User } from "../types/resources.js";
 import {
 	API_KEY_OPERATIONS,
+	AUTHORIZATION_OPERATIONS,
+	AUTHENTICATION_POLICY_OPERATIONS,
 	BACKUP_OPERATIONS,
 	CONFIG_OPERATIONS,
+	DELIVERY_OPERATIONS,
 	ENVIRONMENT_OPERATIONS,
 	EVENT_OPERATIONS,
 	IMPORT_OPERATIONS,
+	KEY_MANAGEMENT_OPERATIONS,
 	MANAGEMENT_OPERATIONS,
 	MEMBER_OPERATIONS,
 	MIGRATION_OPERATIONS,
@@ -18,12 +22,16 @@ import {
 	ROLE_OPERATIONS,
 	SCIM_OPERATIONS,
 	SCHEMA_OPERATIONS,
+	STORE_V2_OPERATIONS,
 	SESSION_OPERATIONS,
+	SERVICE_ACCOUNT_OPERATIONS,
 	SSO_OPERATIONS,
 	USER_OPERATIONS,
 	UPGRADE_OPERATIONS,
 	SYSTEM_OPERATIONS,
+	WEBHOOK_ENDPOINT_OPERATIONS,
 	type OperationOutput,
+	type ManagementOperationTypes,
 } from "./operations.js";
 
 describe("management operation contracts", () => {
@@ -47,13 +55,13 @@ describe("management operation contracts", () => {
 		expect(USER_OPERATIONS.delete.confirmation).toBe("client-required");
 		expect(USER_OPERATIONS.export.mutation).toBe(true);
 		expectTypeOf<OperationOutput<"users.delete">>().toEqualTypeOf<{
-			user: Principal;
+			user: User;
 			scope: ResourceScope;
 		}>();
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(80);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(143);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },
@@ -63,6 +71,193 @@ describe("management operation contracts", () => {
 		});
 		expect(MEMBER_OPERATIONS.remove.confirmation).toBe("client-required");
 		expect(MEMBER_OPERATIONS.import.confirmation).toBe("server-required");
+	});
+
+	it("defines normalized authorization and service-account transport safety", () => {
+		expect(Object.values(AUTHORIZATION_OPERATIONS)).toHaveLength(4);
+		expect(Object.values(AUTHORIZATION_OPERATIONS).map((operation) => `${operation.http.method} ${operation.http.path}`)).toEqual([
+			"GET /v1/organizations/:id/authorization/effective/:subjectKind/:subjectId",
+			"GET /v1/organizations/:id/authorization/assignments",
+			"PATCH /v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId",
+			"POST /v1/organizations/:id/authorization/reconcile",
+		]);
+		expect(AUTHORIZATION_OPERATIONS.effectiveInspect).toMatchObject({
+			id: "authorization.effective.inspect",
+			cliPath: "orgs authorization effective",
+			http: { method: "GET", path: "/v1/organizations/:id/authorization/effective/:subjectKind/:subjectId" },
+			mutation: false,
+		});
+		for (const operation of [
+			AUTHORIZATION_OPERATIONS.assignmentsReplace,
+			AUTHORIZATION_OPERATIONS.reconcile,
+		]) {
+			expect(operation).toMatchObject({ mutation: true, supportsDryRun: true, confirmation: "server-required" });
+		}
+		expect(AUTHORIZATION_OPERATIONS.assignmentsList.http).toEqual({
+			method: "GET",
+			path: "/v1/organizations/:id/authorization/assignments",
+		});
+		expect(AUTHORIZATION_OPERATIONS.assignmentsReplace.http).toEqual({
+			method: "PATCH",
+			path: "/v1/organizations/:id/authorization/assignments/:subjectKind/:subjectId",
+		});
+		expect(AUTHORIZATION_OPERATIONS.reconcile.http).toEqual({
+			method: "POST",
+			path: "/v1/organizations/:id/authorization/reconcile",
+		});
+		expect(Object.values(SERVICE_ACCOUNT_OPERATIONS)).toHaveLength(8);
+		expect(Object.values(SERVICE_ACCOUNT_OPERATIONS).map((operation) => `${operation.http.method} ${operation.http.path}`)).toEqual([
+			"GET /v1/organizations/:id/service-accounts",
+			"GET /v1/organizations/:id/service-accounts/:accountId",
+			"POST /v1/organizations/:id/service-accounts",
+			"PATCH /v1/organizations/:id/service-accounts/:accountId/status",
+			"PATCH /v1/organizations/:id/service-accounts/:accountId/status",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate",
+			"POST /v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke",
+		]);
+		expect(SERVICE_ACCOUNT_OPERATIONS.create).toMatchObject({
+			id: "service-accounts.create",
+			http: { method: "POST", path: "/v1/organizations/:id/service-accounts" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "none",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.disable).toMatchObject({
+			http: { method: "PATCH", path: "/v1/organizations/:id/service-accounts/:accountId/status" },
+			confirmation: "client-required",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.enable.confirmation).toBe("none");
+		expect(SERVICE_ACCOUNT_OPERATIONS.inspect.http).toEqual({
+			method: "GET",
+			path: "/v1/organizations/:id/service-accounts/:accountId",
+		});
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialCreate.http).toEqual({
+			method: "POST",
+			path: "/v1/organizations/:id/service-accounts/:accountId/credentials",
+		});
+		for (const operation of [
+			SERVICE_ACCOUNT_OPERATIONS.credentialRotate,
+			SERVICE_ACCOUNT_OPERATIONS.credentialRevoke,
+		]) {
+			expect(operation).toMatchObject({ mutation: true, supportsDryRun: true, confirmation: "client-required" });
+		}
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialRotate.http.path)
+			.toBe("/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/rotate");
+		expect(SERVICE_ACCOUNT_OPERATIONS.credentialRevoke.http.path)
+			.toBe("/v1/organizations/:id/service-accounts/:accountId/credentials/:credentialId/revoke");
+	});
+
+	it("defines revisioned authentication-policy preview and mutation safety", () => {
+		expect(Object.values(AUTHENTICATION_POLICY_OPERATIONS)).toHaveLength(4);
+		expect(AUTHENTICATION_POLICY_OPERATIONS.get).toMatchObject({
+			id: "authentication_policy.get",
+			cliPath: "auth-policy get",
+			http: { method: "GET", path: "/v1/authentication-policy" },
+			mutation: false,
+			confirmation: "none",
+		});
+		expect(AUTHENTICATION_POLICY_OPERATIONS.plan).toMatchObject({
+			http: { method: "POST", path: "/v1/authentication-policy/plan" },
+			mutation: false,
+		});
+		for (const action of ["apply", "unlock"] as const) {
+			expect(AUTHENTICATION_POLICY_OPERATIONS[action]).toMatchObject({
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
+	});
+
+	it("defines the complete key-management transport and safety contract", () => {
+		expect(Object.values(KEY_MANAGEMENT_OPERATIONS)).toHaveLength(3);
+		expect(KEY_MANAGEMENT_OPERATIONS.status).toMatchObject({
+			id: "key_management.status",
+			cliPath: "key-management status",
+			http: { method: "GET", path: "/v1/key-management/status" },
+			mutation: false,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(KEY_MANAGEMENT_OPERATIONS.plan).toMatchObject({
+			id: "key_management.plan",
+			cliPath: "key-management plan",
+			http: { method: "POST", path: "/v1/key-management/plan" },
+			mutation: false,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(KEY_MANAGEMENT_OPERATIONS.apply).toMatchObject({
+			id: "key_management.apply",
+			cliPath: "key-management apply",
+			http: { method: "POST", path: "/v1/key-management/apply" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "server-required",
+		});
+		expectTypeOf<OperationOutput<"key_management.apply">>().toEqualTypeOf<
+			| { dryRun: true; result: import("../services/key-management.js").KeyManagementPlanResult }
+			| { dryRun: false; result: import("../services/key-management.js").KeyManagementApplyResult }
+		>();
+	});
+
+	it("defines the complete webhook endpoint transport and safety contract", () => {
+		expect(Object.values(WEBHOOK_ENDPOINT_OPERATIONS)).toHaveLength(7);
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.list).toMatchObject({
+			id: "delivery.webhook_endpoints.list",
+			cliPath: "delivery endpoints list",
+			http: { method: "GET", path: "/v1/delivery/webhook-endpoints" },
+			mutation: false,
+		});
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.create).toMatchObject({
+			http: { method: "POST", path: "/v1/delivery/webhook-endpoints" },
+			mutation: true,
+			supportsDryRun: false,
+			confirmation: "none",
+		});
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.update.http.method).toBe("PATCH");
+		expect(WEBHOOK_ENDPOINT_OPERATIONS.delete.http.method).toBe("DELETE");
+		for (const action of ["rotate", "delete", "test"] as const) {
+			expect(WEBHOOK_ENDPOINT_OPERATIONS[action]).toMatchObject({
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
+		expect(resolveOperationPath(WEBHOOK_ENDPOINT_OPERATIONS.test, { id: "wh /1" }))
+			.toBe("/v1/delivery/webhook-endpoints/wh%20%2F1/test");
+	});
+
+	it("defines the complete delivery transport and safety contract", () => {
+		expect(Object.values(DELIVERY_OPERATIONS)).toHaveLength(7);
+		expect(DELIVERY_OPERATIONS.list).toMatchObject({
+			id: "delivery.jobs.list",
+			cliPath: "delivery list",
+			http: { method: "GET", path: "/v1/delivery/jobs" },
+			mutation: false,
+		});
+		expect(DELIVERY_OPERATIONS.inspect.http.path).toBe("/v1/delivery/jobs/:id");
+		expect(DELIVERY_OPERATIONS.readiness.http.path).toBe("/v1/delivery/readiness");
+		expect(DELIVERY_OPERATIONS.quotas).toMatchObject({
+			id: "delivery.quotas.get",
+			cliPath: "delivery quotas",
+			http: { method: "GET", path: "/v1/delivery/quotas" },
+			mutation: false,
+		});
+		for (const action of ["cancel", "retry", "replay"] as const) {
+			expect(DELIVERY_OPERATIONS[action]).toMatchObject({
+				http: {
+					method: "POST",
+					path: `/v1/delivery/jobs/:id/${action}`,
+				},
+				mutation: true,
+				supportsDryRun: true,
+				confirmation: "server-required",
+			});
+		}
+		expect(resolveOperationPath(DELIVERY_OPERATIONS.replay, { id: "job/a b" }))
+			.toBe("/v1/delivery/jobs/job%2Fa%20b/replay");
 	});
 
 	it("defines the complete operational registry and terminal safety policies", () => {
@@ -85,9 +280,47 @@ describe("management operation contracts", () => {
 		expect(UPGRADE_OPERATIONS.rollback.confirmation).toBe("server-required");
 		expect(SCHEMA_OPERATIONS.generate).toMatchObject({
 			mutation: false,
-			supportsDryRun: true,
+			supportsDryRun: false,
 		});
 		expect(SCHEMA_OPERATIONS.migrate.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.apply).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/apply" },
+			mutation: true,
+			supportsDryRun: true,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.verify.mutation).toBe(false);
+		expect(STORE_V2_OPERATIONS.rollback.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.eventsCutover).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/events/cutover" },
+			mutation: true,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.eventsRollback.confirmation).toBe("server-required");
+		expect(STORE_V2_OPERATIONS.principalsCutover).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/principals/cutover" },
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.principalsRollback).toMatchObject({
+			http: { method: "POST", path: "/v1/schema/store-v2/principals/rollback" },
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.topologyCutover).toMatchObject({
+			id: "schema.store-v2.topology.cutover",
+			cliPath: "schema store-v2 topology cutover",
+			http: { method: "POST", path: "/v1/schema/store-v2/topology/cutover" },
+			mutation: true,
+			supportsDryRun: false,
+			confirmation: "server-required",
+		});
+		expect(STORE_V2_OPERATIONS.topologyRollback).toMatchObject({
+			id: "schema.store-v2.topology.rollback",
+			cliPath: "schema store-v2 topology rollback",
+			http: { method: "POST", path: "/v1/schema/store-v2/topology/rollback" },
+			mutation: true,
+			supportsDryRun: false,
+			confirmation: "server-required",
+		});
 	});
 
 	it("distinguishes readiness evidence writes from config inspection", () => {
@@ -121,6 +354,10 @@ describe("management operation contracts", () => {
 		expect(SSO_OPERATIONS.setupLink.supportsDryRun).toBe(false);
 		expect(SCIM_OPERATIONS.setupLink.supportsDryRun).toBe(false);
 		expect(SCIM_OPERATIONS.replay.confirmation).toBe("server-required");
+		expectTypeOf<ManagementOperationTypes["scim.test"]["input"]["scenario"]>()
+			.toEqualTypeOf<"users" | "group-lifecycle" | undefined>();
+		expectTypeOf<ManagementOperationTypes["scim.test"]["input"]["users"]>()
+			.toEqualTypeOf<Array<{ userName: string; displayName?: string; active?: boolean }> | undefined>();
 	});
 
 	it("defines event, key, session, and role policies explicitly", () => {

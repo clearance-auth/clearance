@@ -3,11 +3,19 @@ import { createConnection } from "node:net";
 import { resolve } from "node:path";
 import pg from "pg";
 import type { ManagementStore } from "../store/types.js";
-import type { DoctorCheck } from "../types/resources.js";
+import type {
+	DoctorCheck,
+	Environment,
+	Organization,
+	User,
+	Project,
+} from "../types/resources.js";
 import { STORE_SCHEMA_VERSION } from "../store/json-store.js";
 import { recordEvent } from "./audit.js";
 import { resolveCredentialKeyring } from "./credentials.js";
 import { isForbiddenDefaultSecret } from "./secrets.js";
+
+export const DEFAULT_CLEARANCE_BASE_URL = "http://localhost:3000";
 
 function tcpReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
 	return new Promise((resolvePromise) => {
@@ -37,6 +45,246 @@ async function httpReachable(url: string, timeoutMs = 2000): Promise<boolean> {
 	}
 }
 
+const DOCTOR_PAGE_SIZE = 1_000;
+const DOCTOR_MAX_TOPOLOGY_ITEMS = 50_000;
+const DOCTOR_MAX_PRINCIPALS = 50_000;
+const DOCTOR_MAX_MEMBERSHIPS = 50_000;
+const DOCTOR_MAX_RUNTIME_ITEMS = 50_000;
+
+type DoctorPageItem = { createdAt: string; id: string };
+
+type DoctorReadBudget = {
+	maxItems: number;
+	remainingItems: number;
+};
+
+type DoctorTopology = {
+	projects: Project[];
+	environments: Environment[];
+	organizations: Organization[];
+};
+
+function doctorReadBudget(maxItems: number): DoctorReadBudget {
+	return {
+		maxItems,
+		remainingItems: maxItems,
+	};
+}
+
+function readSnapshotItems<T>(
+	label: string,
+	items: readonly T[],
+	maxItems: number,
+): readonly T[] {
+	if (items.length > maxItems) {
+		throw new Error(`${label} exceeds the doctor read safety cap of ${maxItems} items`);
+	}
+	return items;
+}
+
+function membershipKey(organizationId: string, principalId: string): string {
+	return `${organizationId.length}:${organizationId}${principalId.length}:${principalId}`;
+}
+
+function cursorAdvances(
+	previous: { createdAt: string; id: string },
+	next: { createdAt: string; id: string },
+): boolean {
+	return (
+		next.createdAt > previous.createdAt ||
+		(next.createdAt === previous.createdAt && next.id > previous.id)
+	);
+}
+
+async function readDoctorPages<T extends DoctorPageItem>(
+	label: string,
+	budget: DoctorReadBudget,
+	read: (input: {
+		limit: number;
+		cursor?: { createdAt: string; id: string };
+	}) => Promise<{ items: T[]; hasMore: boolean }>,
+): Promise<T[]> {
+	const items: T[] = [];
+	let cursor: { createdAt: string; id: string } | undefined;
+	// A traversal gets its own no-progress/page guard. The item budget stays
+	// shared across scopes so the category remains capped globally.
+	let remainingPages = Math.ceil(budget.maxItems / DOCTOR_PAGE_SIZE);
+	do {
+		if (remainingPages <= 0) {
+			throw new Error(
+				`${label} exceeds the doctor read safety cap of ${budget.maxItems} items`,
+			);
+		}
+		// Request one overflow row once the shared cap is reached. That permits
+		// exactly the cap while rejecting a 50,001st row without assuming later
+		// scopes are empty.
+		const limit = Math.min(DOCTOR_PAGE_SIZE, budget.remainingItems + 1);
+		const page = await read({
+			limit,
+			...(cursor ? { cursor } : {}),
+		});
+		if (page.items.length > limit) {
+			throw new Error(`${label} exceeded its requested page limit`);
+		}
+		remainingPages -= 1;
+		if (page.items.length > budget.remainingItems) {
+			throw new Error(
+				`${label} exceeds the doctor read safety cap of ${budget.maxItems} items`,
+			);
+		}
+		budget.remainingItems -= page.items.length;
+		items.push(...page.items);
+		const last = page.items[page.items.length - 1];
+		if (page.hasMore && !last) {
+			throw new Error(`${label} returned a continuation without a cursor item`);
+		}
+		const nextCursor = page.hasMore && last
+			? { createdAt: last.createdAt, id: last.id }
+			: undefined;
+		if (cursor && nextCursor && !cursorAdvances(cursor, nextCursor)) {
+			throw new Error(`${label} returned a non-advancing cursor`);
+		}
+		cursor = nextCursor;
+	} while (cursor);
+	return items;
+}
+
+async function readRuntimeRows<T extends pg.QueryResultRow>(
+	pool: pg.Pool,
+	label: string,
+	query: string,
+): Promise<T[]> {
+	const result = await pool.query<T>(`${query} LIMIT $1`, [
+		DOCTOR_MAX_RUNTIME_ITEMS + 1,
+	]);
+	if (result.rows.length > DOCTOR_MAX_RUNTIME_ITEMS) {
+		throw new Error(
+			`${label} exceeds the doctor read safety cap of ${DOCTOR_MAX_RUNTIME_ITEMS} items`,
+		);
+	}
+	return result.rows;
+}
+
+async function topologyForDoctor(
+	store: ManagementStore,
+): Promise<{ topology: DoctorTopology | null; error?: string }> {
+	if (!store.storeV2Topology?.authoritative) {
+		try {
+			return {
+				topology: {
+					projects: [...readSnapshotItems(
+						"Projects",
+						store.snapshot.projects,
+						DOCTOR_MAX_TOPOLOGY_ITEMS,
+					)],
+					environments: [...readSnapshotItems(
+						"Environments",
+						store.snapshot.environments,
+						DOCTOR_MAX_TOPOLOGY_ITEMS,
+					)],
+					organizations: [...readSnapshotItems(
+						"Organizations",
+						store.snapshot.organizations,
+						DOCTOR_MAX_TOPOLOGY_ITEMS,
+					)],
+				},
+			};
+		} catch (error) {
+			return {
+				topology: null,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
+
+	try {
+		const topology = store.storeV2Topology;
+		const projects = await readDoctorPages(
+			"Projects",
+			doctorReadBudget(DOCTOR_MAX_TOPOLOGY_ITEMS),
+			async (input) => {
+				const page = await topology.listProjectsPage(input);
+				return { items: page.projects, hasMore: page.hasMore };
+			},
+		);
+		const environments: Environment[] = [];
+		const organizations: Organization[] = [];
+		const environmentBudget = doctorReadBudget(DOCTOR_MAX_TOPOLOGY_ITEMS);
+		for (const project of projects) {
+			environments.push(
+				...(await readDoctorPages("Environments", environmentBudget, async (input) => {
+					const page = await topology.listEnvironmentsPage({
+						projectId: project.id,
+						...input,
+					});
+					return { items: page.environments, hasMore: page.hasMore };
+				})),
+			);
+		}
+		const organizationBudget = doctorReadBudget(DOCTOR_MAX_TOPOLOGY_ITEMS);
+		for (const environment of environments) {
+			const scope = {
+				projectId: environment.projectId,
+				environmentId: environment.id,
+			};
+			if (
+				(await topology.countOrganizations({
+					scope,
+					includeArchived: true,
+				})) === 0
+			) {
+				continue;
+			}
+			organizations.push(
+				...(await readDoctorPages("Organizations", organizationBudget, async (input) => {
+					const page = await topology.listOrganizationsPage({
+						scope,
+						includeArchived: true,
+						...input,
+					});
+					return { items: page.organizations, hasMore: page.hasMore };
+				})),
+			);
+		}
+		return { topology: { projects, environments, organizations } };
+	} catch (error) {
+		return {
+			topology: null,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+async function principalsForDoctor(
+	store: ManagementStore,
+	environments: readonly Environment[],
+): Promise<User[]> {
+	if (!store.storeV2Principals?.authoritative) {
+		return readSnapshotItems(
+			"Principals",
+			store.snapshot.principals,
+			DOCTOR_MAX_PRINCIPALS,
+		).filter((principal) => principal.status !== "deleted");
+	}
+	const principals: User[] = [];
+	const budget = doctorReadBudget(DOCTOR_MAX_PRINCIPALS);
+	for (const environment of environments) {
+		principals.push(
+			...(await readDoctorPages("Principals", budget, async (input) => {
+				const page = await store.storeV2Principals!.listPage({
+					scope: {
+						projectId: environment.projectId,
+						environmentId: environment.id,
+					},
+					...input,
+				});
+				return { items: page.principals, hasMore: page.hasMore };
+			})),
+		);
+	}
+	return principals;
+}
+
 export async function runDoctor(
 	store: ManagementStore,
 	opts?: { dataPath?: string; secrets?: Record<string, string | undefined> },
@@ -45,6 +293,24 @@ export async function runDoctor(
 	await store.refresh();
 	const checks: DoctorCheck[] = [];
 	const secrets = { ...process.env, ...opts?.secrets };
+	const topologyRead = await topologyForDoctor(store);
+	const membershipRead = (() => {
+		try {
+			return {
+				ok: true as const,
+				memberships: readSnapshotItems(
+					"Memberships",
+					store.snapshot.memberships,
+					DOCTOR_MAX_MEMBERSHIPS,
+				),
+			};
+		} catch (error) {
+			return {
+				ok: false as const,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	})();
 
 	const secret = secrets.CLEARANCE_SECRET;
 	if (!secret || secret.length < 16) {
@@ -90,7 +356,15 @@ export async function runDoctor(
 		});
 	}
 
-	if (store.snapshot.projects.length === 0) {
+	if (!topologyRead.topology) {
+		checks.push({
+			id: "project",
+			name: "Project",
+			status: "fail",
+			detail: `Normalized topology could not be read: ${topologyRead.error}`,
+			remediation: "Run clearance schema store-v2 verify before serving traffic",
+		});
+	} else if (topologyRead.topology.projects.length === 0) {
 		checks.push({
 			id: "project",
 			name: "Project",
@@ -103,7 +377,7 @@ export async function runDoctor(
 			id: "project",
 			name: "Project",
 			status: "pass",
-			detail: `Project ${store.snapshot.projects[0].name}`,
+			detail: `Project ${topologyRead.topology.projects[0].name}`,
 		});
 	}
 
@@ -197,6 +471,115 @@ export async function runDoctor(
 				: `JSON file at ${store.path}`,
 	});
 
+	if (!membershipRead.ok) {
+		checks.push({
+			id: "runtime-management-parity",
+			name: "Runtime / management parity",
+			status: "fail",
+			detail: `Cannot evaluate management memberships: ${membershipRead.error}`,
+			remediation: "Reduce or repair the management membership snapshot before serving traffic",
+		});
+	}
+
+	if (store.storeV2) {
+		try {
+			const status = await store.storeV2.status();
+			const collectionSummary = Object.entries(status.collections)
+				.map(
+					([name, collection]) =>
+						`${name}=${collection.snapshotCount}/${collection.relationalCount ?? 0}`,
+				)
+				.join(", ");
+			if (status.phase === "absent") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: "warn",
+					detail: "Store-v2 has not been applied; the JSONB snapshot remains authoritative",
+					remediation:
+						"Run clearance schema store-v2 plan, then apply with --yes after review",
+				});
+			} else if (status.phase === "disabled") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: "warn",
+					detail: `Store-v2 dual-write is disabled; parity=${status.consistent}; ${collectionSummary}`,
+					remediation:
+						"Run clearance schema store-v2 plan and reapply with --yes to reconcile and resume dual-write",
+				});
+			} else if (status.phase === "hybrid") {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management store",
+					status: status.consistent ? "pass" : "fail",
+					detail: status.consistent
+						? `Relational authority verified for ${status.authoritativeCollections.join(", ")} at revision ${status.snapshotRevision}; ${collectionSummary}`
+						: `Relational-authority divergence detected across ${Object.entries(status.collections)
+								.filter(([, collection]) => !collection.consistent)
+								.map(([name]) => name)
+								.join(", ") || "revision metadata"}`,
+					remediation: status.consistent
+						? undefined
+						: "Stop mutations and run clearance schema store-v2 verify before rollback or reconciliation",
+				});
+			} else {
+				checks.push({
+					id: "store-v2-shadow",
+					name: "Normalized management shadow",
+					status: status.consistent ? "pass" : "fail",
+					detail: status.consistent
+						? `Shadow parity verified at revision ${status.snapshotRevision}; ${collectionSummary}`
+						: `Shadow divergence detected across ${Object.entries(status.collections)
+								.filter(([, collection]) => !collection.consistent)
+								.map(([name]) => name)
+								.join(", ") || "revision metadata"}`,
+					remediation: status.consistent
+						? undefined
+						: "Stop mutations and run clearance schema store-v2 verify before reconciling",
+				});
+			}
+		} catch {
+			checks.push({
+				id: "store-v2-shadow",
+				name: "Normalized management shadow",
+				status: "fail",
+				detail: "Store-v2 status could not be verified",
+				remediation:
+					"Run clearance schema store-v2 status and inspect the Postgres schema",
+			});
+		}
+	}
+
+	if (store.deliveryControl) {
+		try {
+			const readiness = await store.deliveryControl.readiness();
+			checks.push({
+				id: "delivery-readiness",
+				name: "Durable delivery readiness",
+				status: readiness.ready ? "pass" : "fail",
+				detail: readiness.ready
+					? `${readiness.workers.freshReady} fresh workers; webhook endpoints active=${readiness.webhookEndpoints.active}, disabled=${readiness.webhookEndpoints.disabled}, tested=${readiness.webhookEndpoints.testSucceededActive}`
+					: `Delivery blockers: ${readiness.reasons.join(", ") || "unknown"}; webhook endpoint tests untested=${readiness.webhookEndpoints.untestedActive}, pending=${readiness.webhookEndpoints.testPendingActive}, failed=${readiness.webhookEndpoints.testFailedActive}, succeeded=${readiness.webhookEndpoints.testSucceededActive}`,
+				remediation: readiness.ready
+					? undefined
+					: readiness.webhookEndpoints.untestedActive > 0 ||
+							readiness.webhookEndpoints.testPendingActive > 0 ||
+							readiness.webhookEndpoints.testFailedActive > 0
+						? "Run clearance delivery endpoints test for every active endpoint and confirm its test job reaches delivered, then restore other reported dependencies"
+						: "Run clearance delivery readiness --json and restore the reported worker, schema, or key dependency",
+			});
+		} catch {
+			checks.push({
+				id: "delivery-readiness",
+				name: "Durable delivery readiness",
+				status: "fail",
+				detail: "Delivery readiness could not be verified",
+				remediation: "Run clearance delivery readiness --json and inspect the PostgreSQL delivery schema",
+			});
+		}
+	}
+
 	if (secrets.DATABASE_URL?.startsWith("postgres")) {
 		try {
 			const u = new URL(secrets.DATABASE_URL);
@@ -263,88 +646,119 @@ export async function runDoctor(
 			});
 
 			if (missing.length === 0) {
-				const runtimeUsers = await pool.query<{ id: string; email: string }>(
-					`select id, email from "user" where email <> 'operator@clearance.local'`,
-				);
-				const runtimeOrgs = await pool.query<{ id: string }>(
-					`select id from organization`,
-				);
-				const runtimeMemberships = await pool.query<{
-					organizationId: string;
-					userId: string;
-				}>(`select "organizationId", "userId" from member`);
-				const runtimeUserIds = new Set(runtimeUsers.rows.map((user) => user.id));
-				const runtimeOrgIds = new Set(runtimeOrgs.rows.map((org) => org.id));
-				const runtimeMembershipKeys = new Set(
-					runtimeMemberships.rows.map(
-						(member) => `${member.organizationId}:${member.userId}`,
-					),
-				);
-				const managementUserIds = new Set(
-					store.snapshot.principals
-						.filter((principal) => principal.status !== "deleted")
-						.map((principal) => principal.id),
-				);
-				const managementOrgIds = new Set(
-					store.snapshot.organizations
-						.filter((organization) => organization.status !== "archived")
-						.map((organization) => organization.id),
-				);
-				const missingUsers = runtimeUsers.rows.filter(
-					(user) => !managementUserIds.has(user.id),
-				);
-				const missingOrgs = runtimeOrgs.rows.filter(
-					(org) => !managementOrgIds.has(org.id),
-				);
-				const managementOnlyUsers = store.snapshot.principals.filter(
-					(principal) =>
-						principal.status !== "deleted" && !runtimeUserIds.has(principal.id),
-				);
-				const managementOnlyOrgs = store.snapshot.organizations.filter(
-					(organization) =>
-						organization.status !== "archived" && !runtimeOrgIds.has(organization.id),
-				);
-				const missingRuntimeMemberships = store.snapshot.memberships.filter(
-					(membership) =>
-						membership.status === "active" &&
-						!runtimeMembershipKeys.has(
-							`${membership.organizationId}:${membership.principalId}`,
-						),
-				);
-				const managementMembershipKeys = new Set(
-					store.snapshot.memberships
-						.filter((membership) => membership.status === "active")
-						.map(
+				if (!membershipRead.ok) {
+					// The bounded snapshot read above has already recorded the
+					// fail-closed parity diagnostic.
+				} else if (!topologyRead.topology) {
+					checks.push({
+						id: "runtime-management-parity",
+						name: "Runtime / management parity",
+						status: "fail",
+						detail: `Cannot evaluate management topology: ${topologyRead.error}`,
+						remediation: "Run clearance schema store-v2 verify before serving traffic",
+					});
+				} else {
+					try {
+						const managementPrincipals = await principalsForDoctor(
+							store,
+							topologyRead.topology.environments,
+						);
+						const runtimeUsers = await readRuntimeRows<{ id: string; email: string }>(
+							pool,
+							"Runtime users",
+							`select id, email from "user" where email <> 'operator@clearance.local' order by id asc`,
+						);
+						const runtimeOrgs = await readRuntimeRows<{ id: string }>(
+							pool,
+							"Runtime organizations",
+							`select id from organization order by id asc`,
+						);
+						const runtimeMemberships = await readRuntimeRows<{
+							organizationId: string;
+							userId: string;
+						}>(
+							pool,
+							"Runtime memberships",
+							`select "organizationId", "userId" from member order by "organizationId" asc, "userId" asc`,
+						);
+						const runtimeUserIds = new Set(runtimeUsers.map((user) => user.id));
+						const runtimeOrgIds = new Set(runtimeOrgs.map((org) => org.id));
+						const runtimeMembershipKeys = new Set(
+							runtimeMemberships.map((member) =>
+								membershipKey(member.organizationId, member.userId),
+							),
+						);
+						const managementUserIds = new Set(
+							managementPrincipals.map((principal) => principal.id),
+						);
+						const managementOrgIds = new Set(
+							topologyRead.topology.organizations
+								.filter((organization) => organization.status !== "archived")
+								.map((organization) => organization.id),
+						);
+						const missingUsers = runtimeUsers.filter(
+							(user) => !managementUserIds.has(user.id),
+						);
+						const missingOrgs = runtimeOrgs.filter(
+							(org) => !managementOrgIds.has(org.id),
+						);
+						const managementOnlyUsers = managementPrincipals.filter(
+							(principal) => !runtimeUserIds.has(principal.id),
+						);
+						const managementOnlyOrgs = topologyRead.topology.organizations.filter(
+							(organization) =>
+								organization.status !== "archived" && !runtimeOrgIds.has(organization.id),
+						);
+						const missingRuntimeMemberships = membershipRead.memberships.filter(
 							(membership) =>
-								`${membership.organizationId}:${membership.principalId}`,
-						),
-				);
-				const missingManagementMemberships = runtimeMemberships.rows.filter(
-					(member) =>
-						!managementMembershipKeys.has(
-							`${member.organizationId}:${member.userId}`,
-						),
-				);
-				const parityOk =
-					missingUsers.length === 0 &&
-					missingOrgs.length === 0 &&
-					managementOnlyUsers.length === 0 &&
-					managementOnlyOrgs.length === 0 &&
-					missingRuntimeMemberships.length === 0 &&
-					missingManagementMemberships.length === 0;
-				checks.push({
-					id: "runtime-management-parity",
-					name: "Runtime / management parity",
-					status: parityOk ? "pass" : "fail",
-					detail:
-						parityOk
-							? `${runtimeUsers.rowCount ?? 0} users, ${runtimeOrgs.rowCount ?? 0} organizations, and ${runtimeMemberships.rowCount ?? 0} memberships match bidirectionally`
-							: `Drift: runtime-only users=${missingUsers.length}, orgs=${missingOrgs.length}, memberships=${missingManagementMemberships.length}; management-only users=${managementOnlyUsers.length}, orgs=${managementOnlyOrgs.length}, memberships=${missingRuntimeMemberships.length}`,
-					remediation:
-						parityOk
-							? undefined
-							: "Repair the runtime-to-management identity bridge before serving traffic",
-				});
+								membership.status === "active" &&
+								!runtimeMembershipKeys.has(
+									membershipKey(membership.organizationId, membership.principalId),
+								),
+						);
+						const managementMembershipKeys = new Set(
+							membershipRead.memberships
+								.filter((membership) => membership.status === "active")
+								.map((membership) =>
+									membershipKey(membership.organizationId, membership.principalId),
+								),
+						);
+						const missingManagementMemberships = runtimeMemberships.filter(
+							(member) =>
+								!managementMembershipKeys.has(
+									membershipKey(member.organizationId, member.userId),
+								),
+						);
+						const parityOk =
+							missingUsers.length === 0 &&
+							missingOrgs.length === 0 &&
+							managementOnlyUsers.length === 0 &&
+							managementOnlyOrgs.length === 0 &&
+							missingRuntimeMemberships.length === 0 &&
+							missingManagementMemberships.length === 0;
+						checks.push({
+							id: "runtime-management-parity",
+							name: "Runtime / management parity",
+							status: parityOk ? "pass" : "fail",
+							detail:
+								parityOk
+									? `${runtimeUsers.length} users, ${runtimeOrgs.length} organizations, and ${runtimeMemberships.length} memberships match bidirectionally`
+									: `Drift: runtime-only users=${missingUsers.length}, orgs=${missingOrgs.length}, memberships=${missingManagementMemberships.length}; management-only users=${managementOnlyUsers.length}, orgs=${managementOnlyOrgs.length}, memberships=${missingRuntimeMemberships.length}`,
+							remediation:
+								parityOk
+									? undefined
+									: "Repair the runtime-to-management identity bridge before serving traffic",
+						});
+					} catch (error) {
+						checks.push({
+							id: "runtime-management-parity",
+							name: "Runtime / management parity",
+							status: "fail",
+							detail: `Parity check failed: ${error instanceof Error ? error.message : String(error)}`,
+							remediation: "Repair the runtime-to-management identity bridge before serving traffic",
+						});
+					}
+				}
 			}
 		} catch (error) {
 			checks.push({
@@ -384,7 +798,7 @@ export async function runDoctor(
 			name: "Base URL",
 			status: "warn",
 			detail: "CLEARANCE_BASE_URL not set",
-			remediation: "export CLEARANCE_BASE_URL=http://localhost:3000",
+			remediation: `export CLEARANCE_BASE_URL=${DEFAULT_CLEARANCE_BASE_URL}`,
 		});
 	}
 

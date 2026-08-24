@@ -1,5 +1,6 @@
 export * from "./types/resources.js";
 export * from "./application/context.js";
+export * from "./application/delivery.js";
 export * from "./application/auth-runtime-gateway.js";
 export * from "./application/management-application.js";
 export * from "./adapters/auth-bridge-runtime-gateway.js";
@@ -27,6 +28,14 @@ export * from "./services/members.js";
 export * from "./services/members-import.js";
 export * from "./services/identity.js";
 export * from "./services/doctor.js";
+export * from "./services/delivery-control.js";
+export * from "./services/webhook-endpoints.js";
+export * from "./services/authentication-policy.js";
+export * from "./services/key-management.js";
+export * from "./key-management-env.js";
+export * from "./services/product-presentation.js";
+export * from "./store/product-presentation-authority.js";
+export * from "./services/store-v2.js";
 export * from "./services/sso.js";
 export * from "./services/scim.js";
 export * from "./services/scim-probe.js";
@@ -36,6 +45,7 @@ export * from "./services/scim-real.js";
 export * from "./services/live-conformance.js";
 export {
 	createSetupLink,
+	createSetupLinkAuthoritative,
 	redeemSetupLink,
 	reserveSetupLink,
 	commitSetupLink,
@@ -62,3 +72,8 @@ export * from "./services/fixtures.js";
 export * from "./contracts/surfaces.js";
 export * from "./contracts/operations.js";
 export * from "./auth-bridge.js";
+export type {
+	DeliveryChannel,
+	DeliveryJobState,
+	WebhookEndpointStatus,
+} from "@clearance/delivery";

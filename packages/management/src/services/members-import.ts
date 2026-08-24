@@ -1,8 +1,9 @@
 import type { ManagementStore } from "../store/types.js";
-import type { Membership, Organization, Principal } from "../types/resources.js";
+import type { Membership, Organization, User } from "../types/resources.js";
+import { inspectOrganizationAuthoritative } from "./core.js";
 import { ClearanceError, isClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
-import { resolveOperatorScope } from "./scope.js";
+import { resolveOperatorScope, type ResourceScope } from "./scope.js";
 
 const MAX_ROWS = 1000;
 const FIELDS = new Set(["principalId", "user", "email", "role"]);
@@ -123,7 +124,31 @@ function requireOrganization(store: ManagementStore, id: string): Organization {
 	return org;
 }
 
-function resolvePrincipal(store: ManagementStore, org: Organization, row: ImportRow): Principal {
+async function requireOrganizationAuthoritative(
+	store: ManagementStore,
+	id: string,
+	scope?: ResourceScope,
+): Promise<Organization> {
+	try {
+		return await inspectOrganizationAuthoritative(
+			store,
+			id,
+			scope ?? resolveOperatorScope(store),
+		);
+	} catch (error) {
+		if (error instanceof ClearanceError && error.code === "ORG_NOT_FOUND") {
+			throw new ClearanceError({
+				code: "ORG_NOT_FOUND",
+				message: "Organization not found",
+				stage: "orgs.members.import",
+				status: 404,
+			});
+		}
+		throw error;
+	}
+}
+
+function resolvePrincipal(store: ManagementStore, org: Organization, row: ImportRow): User {
 	const identities = [row.principalId, row.user, row.email].filter((value): value is string => Boolean(value));
 	if (identities.length !== 1) inputError("MEMBER_IMPORT_IDENTITY_INVALID", "Each row must specify exactly one of principalId, user, or email.");
 	const principal = row.email
@@ -133,16 +158,54 @@ function resolvePrincipal(store: ManagementStore, org: Organization, row: Import
 	return principal;
 }
 
-export function planMemberImport(store: ManagementStore, input: { organizationId: string; content: string; format: MemberImportFormat }): MemberImportPlan {
-	const org = requireOrganization(store, input.organizationId.trim());
-	const parsed = input.format === "json" ? parseJson(input.content) : parseCsv(input.content);
+async function resolvePrincipalAuthoritative(
+	store: ManagementStore,
+	org: Organization,
+	row: ImportRow,
+): Promise<User> {
+	const identities = [row.principalId, row.user, row.email].filter(
+		(value): value is string => Boolean(value),
+	);
+	if (identities.length !== 1) {
+		inputError(
+			"MEMBER_IMPORT_IDENTITY_INVALID",
+			"Each row must specify exactly one of principalId, user, or email.",
+		);
+	}
+	if (!store.storeV2Principals?.authoritative) {
+		return resolvePrincipal(store, org, row);
+	}
+	const scope = { projectId: org.projectId, environmentId: org.environmentId };
+	const principal = row.email
+		? await store.storeV2Principals.findActiveByEmail({ scope, email: row.email })
+		: await store.storeV2Principals.getById({ scope, id: identities[0]! });
+	if (!principal) {
+		throw new ClearanceError({
+			code: "USER_NOT_FOUND",
+			message: "User not found",
+			stage: "orgs.members.import",
+			status: 404,
+		});
+	}
+	return principal;
+}
+
+function buildMemberImportPlan(
+	store: ManagementStore,
+	org: Organization,
+	format: MemberImportFormat,
+	resolvedRows: Array<{ row: ImportRow; principal: User }>,
+): MemberImportPlan {
 	const seen = new Set<string>();
-	const resolvedRows = parsed.map((row) => {
-		const principal = resolvePrincipal(store, org, row);
-		if (seen.has(principal.id)) inputError("MEMBER_IMPORT_DUPLICATE_PRINCIPAL", "Each principal may appear only once in an import.");
+	for (const { principal } of resolvedRows) {
+		if (seen.has(principal.id)) {
+			inputError(
+				"MEMBER_IMPORT_DUPLICATE_PRINCIPAL",
+				"Each principal may appear only once in an import.",
+			);
+		}
 		seen.add(principal.id);
-		return { row, principal };
-	});
+	}
 	const rows = resolvedRows.map(({ row, principal }) => {
 		const resolved = resolveAssignableRole(store, row.role ?? "member", { scope: { projectId: org.projectId, environmentId: org.environmentId }, organizationId: org.id, stage: "orgs.members.import" });
 		const existing = store.snapshot.memberships.find(
@@ -160,11 +223,44 @@ export function planMemberImport(store: ManagementStore, input: { organizationId
 				remediation: "Update the existing membership role before retrying the import.",
 			});
 		}
-		const idempotent = Boolean(existing);
-		return { row: row.row, principalId: principal.id, role: resolved.slug, idempotent };
+		return { row: row.row, principalId: principal.id, role: resolved.slug, idempotent: Boolean(existing) };
 	});
 	const idempotent = rows.filter((row) => row.idempotent).length;
-	return { organizationId: org.id, format: input.format, rows, summary: { total: rows.length, wouldAdd: rows.length - idempotent, idempotent } };
+	return { organizationId: org.id, format, rows, summary: { total: rows.length, wouldAdd: rows.length - idempotent, idempotent } };
+}
+
+export function planMemberImport(store: ManagementStore, input: { organizationId: string; content: string; format: MemberImportFormat }): MemberImportPlan {
+	const org = requireOrganization(store, input.organizationId.trim());
+	const parsed = input.format === "json" ? parseJson(input.content) : parseCsv(input.content);
+	return buildMemberImportPlan(
+		store,
+		org,
+		input.format,
+		parsed.map((row) => ({ row, principal: resolvePrincipal(store, org, row) })),
+	);
+}
+
+/** Authority-aware plan with sequential, bounded relational identity lookups. */
+export async function planMemberImportAuthoritative(
+	store: ManagementStore,
+	input: {
+		organizationId: string;
+		content: string;
+		format: MemberImportFormat;
+		scope?: ResourceScope;
+	},
+): Promise<MemberImportPlan> {
+	const org = await requireOrganizationAuthoritative(
+		store,
+		input.organizationId.trim(),
+		input.scope,
+	);
+	const parsed = input.format === "json" ? parseJson(input.content) : parseCsv(input.content);
+	const resolvedRows: Array<{ row: ImportRow; principal: User }> = [];
+	for (const row of parsed) {
+		resolvedRows.push({ row, principal: await resolvePrincipalAuthoritative(store, org, row) });
+	}
+	return buildMemberImportPlan(store, org, input.format, resolvedRows);
 }
 
 /** Applies a fully validated plan in deterministic file order. Each callback is durable before the next row. */
