@@ -1841,10 +1841,12 @@ export const createInternalAdapter = (
 		transactionAdapter: DBTransactionAdapter,
 		session: Session,
 	): Promise<{ credentials: SessionCredential[]; keys: string[] }> {
-		const credentials = await transactionAdapter.findMany<SessionCredential>({
-			model: SESSION_CREDENTIAL_MODEL,
-			where: [{ field: "sessionId", value: session.id }],
-		});
+		const credentials = legacyCredentialAuthority
+			? []
+			: await transactionAdapter.findMany<SessionCredential>({
+					model: SESSION_CREDENTIAL_MODEL,
+					where: [{ field: "sessionId", value: session.id }],
+				});
 		const keys = credentials
 			.filter(
 				(credential) =>
@@ -1930,6 +1932,7 @@ export const createInternalAdapter = (
 		targets: readonly BulkDatabaseSessionRevocationTarget[],
 		revokedAt: Date,
 	): Promise<void> {
+		if (legacyCredentialAuthority) return;
 		for (const target of targets) {
 			const updated = await transactionAdapter.updateMany({
 				model: SESSION_CREDENTIAL_MODEL,
@@ -2265,19 +2268,21 @@ export const createInternalAdapter = (
 							reconfirmed.session,
 						);
 						const revokedAt = reuseDetectedAt ?? new Date();
-						await transactionAdapter.updateMany({
-							model: SESSION_CREDENTIAL_MODEL,
-							where: [{ field: "sessionId", value: locked.session.id }],
-							update: {
-								status: "revoked",
-								revokedAt,
-								...(reuseDetectedAt ? { reuseDetectedAt } : {}),
-								rotationNonceDigest: null,
-								recoverySecretCiphertext: null,
-								recoveryExpiresAt: null,
-								updatedAt: revokedAt,
-							},
-						});
+						if (!legacyCredentialAuthority) {
+							await transactionAdapter.updateMany({
+								model: SESSION_CREDENTIAL_MODEL,
+								where: [{ field: "sessionId", value: locked.session.id }],
+								update: {
+									status: "revoked",
+									revokedAt,
+									...(reuseDetectedAt ? { reuseDetectedAt } : {}),
+									rotationNonceDigest: null,
+									recoverySecretCiphertext: null,
+									recoveryExpiresAt: null,
+									updatedAt: revokedAt,
+								},
+							});
+						}
 						await transactionAdapter.delete({
 							model: "session",
 							where: [{ field: "id", value: locked.session.id }],

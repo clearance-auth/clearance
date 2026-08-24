@@ -6601,6 +6601,7 @@ describe("managed single-session authoritative revocation", () => {
 			options: { session: { preserveSessionInDatabase: true } },
 		});
 		const session = await issuePasswordSession(runtime);
+		runtime.database.exec('DROP TABLE "sessionCredential"');
 
 		await runtime.context.internalAdapter.deleteSession(session.token);
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
@@ -6880,6 +6881,7 @@ describe("managed bulk session authoritative revocation", () => {
 		});
 		await issuePasswordSession(runtime);
 		await issuePasswordSession(runtime);
+		runtime.database.exec('DROP TABLE "sessionCredential"');
 		await runtime.context.internalAdapter.deleteUserSessions(runtime.user.id);
 		expect(await runtime.context.adapter.count({ model: "session" })).toBe(0);
 		expect(store).toEqual(new Map());
