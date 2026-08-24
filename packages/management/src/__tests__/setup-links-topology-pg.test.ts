@@ -12,6 +12,7 @@ import {
 	reserveSetupLink,
 } from "../services/setup-links.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
+import { storeV2TableNames } from "../store/store-v2-schema.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
 const DATABASE_URL =
@@ -22,6 +23,8 @@ const TABLE = `clearance_setup_links_topology_${process.pid}`;
 const PREFIX = `${TABLE}_n_`;
 const RACE_TABLE = `${TABLE}_race`;
 const RACE_PREFIX = `${RACE_TABLE}_n_`;
+const TABLES = storeV2TableNames(PREFIX);
+const RACE_TABLES = storeV2TableNames(RACE_PREFIX);
 const available = await gatePostgresSuite(DATABASE_URL, "setup-links-topology-pg");
 
 describe.skipIf(!available)("setup capabilities with normalized topology authority", () => {
@@ -32,10 +35,14 @@ describe.skipIf(!available)("setup capabilities with normalized topology authori
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			for (const table of [
+				TABLES.productEmailTemplates, TABLES.productEmailSenders,
+				TABLES.productAuthDomains, TABLES.productPresentations,
 				`${PREFIX}events`, `${PREFIX}principals`, `${PREFIX}organizations`,
 				`${PREFIX}environments`, `${PREFIX}projects`, `${PREFIX}meta`,
 				`${TABLE}_principal_email`, `${TABLE}_organization_slug`,
 				`${TABLE}_idempotency`, TABLE,
+				RACE_TABLES.productEmailTemplates, RACE_TABLES.productEmailSenders,
+				RACE_TABLES.productAuthDomains, RACE_TABLES.productPresentations,
 				`${RACE_PREFIX}events`, `${RACE_PREFIX}principals`, `${RACE_PREFIX}organizations`,
 				`${RACE_PREFIX}environments`, `${RACE_PREFIX}projects`, `${RACE_PREFIX}meta`,
 				`${RACE_TABLE}_principal_email`, `${RACE_TABLE}_organization_slug`,

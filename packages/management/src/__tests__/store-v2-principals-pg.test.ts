@@ -43,6 +43,7 @@ const DATABASE_URL =
 	"postgres://clearance:clearance@localhost:5434/clearance";
 const TEST_TABLE = `clearance_store_v2_principals_${process.pid}`;
 const PREFIX = `${TEST_TABLE}_n_`;
+const TABLES = storeV2TableNames(PREFIX);
 const RUNTIME_AUDIT_PREFIX = `rollback_audit_${process.pid}`;
 const RUNTIME_AUDIT_TABLE = `${RUNTIME_AUDIT_PREFIX}_runtime_audit_events`;
 
@@ -79,6 +80,10 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			for (const table of [
+				TABLES.productEmailTemplates,
+				TABLES.productEmailSenders,
+				TABLES.productAuthDomains,
+				TABLES.productPresentations,
 				`${PREFIX}events`,
 				`${PREFIX}principals`,
 				`${PREFIX}organizations`,

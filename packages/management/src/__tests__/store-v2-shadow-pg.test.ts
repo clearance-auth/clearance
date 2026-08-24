@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { initProject } from "../services/core.js";
 import { appendAuditEvent, AUDIT_PRUNED_ACTION } from "../services/audit.js";
+import { storeV2TableNames } from "../store/store-v2-schema.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
 const DATABASE_URL =
@@ -16,6 +17,9 @@ const GUARD_TABLE = `${TEST_TABLE}_guard`;
 const GUARD_PREFIX = `${GUARD_TABLE}_n_`;
 const EVENTS_TABLE = `${TEST_TABLE}_events_authority`;
 const EVENTS_PREFIX = `${EVENTS_TABLE}_n_`;
+const EVENTS_TABLES = storeV2TableNames(EVENTS_PREFIX);
+const NORMALIZED_TABLES = storeV2TableNames(NORMALIZED_PREFIX);
+const GUARD_TABLES = storeV2TableNames(GUARD_PREFIX);
 
 const available = await gatePostgresSuite(DATABASE_URL, "store-v2-shadow-pg");
 
@@ -27,6 +31,8 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			for (const table of [
+				EVENTS_TABLES.productEmailTemplates, EVENTS_TABLES.productEmailSenders,
+				EVENTS_TABLES.productAuthDomains, EVENTS_TABLES.productPresentations,
 				`${EVENTS_PREFIX}events`,
 				`${EVENTS_PREFIX}principals`,
 				`${EVENTS_PREFIX}organizations`,
@@ -37,6 +43,8 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 				`${EVENTS_TABLE}_organization_slug`,
 				`${EVENTS_TABLE}_idempotency`,
 				EVENTS_TABLE,
+				NORMALIZED_TABLES.productEmailTemplates, NORMALIZED_TABLES.productEmailSenders,
+				NORMALIZED_TABLES.productAuthDomains, NORMALIZED_TABLES.productPresentations,
 				`${NORMALIZED_PREFIX}events`,
 				`${NORMALIZED_PREFIX}principals`,
 				`${NORMALIZED_PREFIX}organizations`,
@@ -51,6 +59,8 @@ describe.skipIf(!available)("PgStore store-v2 shadow", () => {
 				`${DEFAULT_OFF_TABLE}_organization_slug`,
 					`${DEFAULT_OFF_TABLE}_idempotency`,
 					DEFAULT_OFF_TABLE,
+					GUARD_TABLES.productEmailTemplates, GUARD_TABLES.productEmailSenders,
+					GUARD_TABLES.productAuthDomains, GUARD_TABLES.productPresentations,
 					`${GUARD_PREFIX}events`,
 					`${GUARD_PREFIX}principals`,
 					`${GUARD_PREFIX}organizations`,

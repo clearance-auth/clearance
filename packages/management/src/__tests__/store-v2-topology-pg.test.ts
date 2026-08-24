@@ -35,6 +35,7 @@ import { runReadinessCheckAuthoritative } from "../services/readiness.js";
 import { createSetupLinkAuthoritative } from "../services/setup-links.js";
 import { emptySnapshot } from "../store/json-store.js";
 import { createPgStore, type PgStore } from "../store/pg-store.js";
+import { storeV2TableNames } from "../store/store-v2-schema.js";
 import type { ManagementStore } from "../store/types.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 
@@ -50,6 +51,10 @@ const DOCTOR_TABLE = `clearance_store_v2_doctor_${process.pid}`;
 const DOCTOR_PREFIX = `${DOCTOR_TABLE}_n_`;
 const ENTERPRISE_TABLE = `clearance_store_v2_enterprise_${process.pid}`;
 const ENTERPRISE_PREFIX = `${ENTERPRISE_TABLE}_n_`;
+const TABLES = storeV2TableNames(PREFIX);
+const LIFECYCLE_TABLES = storeV2TableNames(LIFECYCLE_PREFIX);
+const DOCTOR_TABLES = storeV2TableNames(DOCTOR_PREFIX);
+const ENTERPRISE_TABLES = storeV2TableNames(ENTERPRISE_PREFIX);
 const available = await gatePostgresSuite(DATABASE_URL, "store-v2-topology-pg");
 
 function snapshotDoctorStore(
@@ -76,6 +81,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 		for (const table of [
+			ENTERPRISE_TABLES.productEmailTemplates, ENTERPRISE_TABLES.productEmailSenders,
+			ENTERPRISE_TABLES.productAuthDomains, ENTERPRISE_TABLES.productPresentations,
 			`${ENTERPRISE_PREFIX}events`,
 			`${ENTERPRISE_PREFIX}principals`,
 			`${ENTERPRISE_PREFIX}organizations`,
@@ -86,6 +93,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			`${ENTERPRISE_TABLE}_organization_slug`,
 			`${ENTERPRISE_TABLE}_idempotency`,
 			ENTERPRISE_TABLE,
+			DOCTOR_TABLES.productEmailTemplates, DOCTOR_TABLES.productEmailSenders,
+			DOCTOR_TABLES.productAuthDomains, DOCTOR_TABLES.productPresentations,
 			`${DOCTOR_PREFIX}events`,
 			`${DOCTOR_PREFIX}principals`,
 			`${DOCTOR_PREFIX}organizations`,
@@ -96,6 +105,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			`${DOCTOR_TABLE}_organization_slug`,
 			`${DOCTOR_TABLE}_idempotency`,
 			DOCTOR_TABLE,
+			LIFECYCLE_TABLES.productEmailTemplates, LIFECYCLE_TABLES.productEmailSenders,
+			LIFECYCLE_TABLES.productAuthDomains, LIFECYCLE_TABLES.productPresentations,
 			`${LIFECYCLE_PREFIX}events`,
 			`${LIFECYCLE_PREFIX}principals`,
 			`${LIFECYCLE_PREFIX}organizations`,
@@ -106,6 +117,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			`${LIFECYCLE_TABLE}_organization_slug`,
 			`${LIFECYCLE_TABLE}_idempotency`,
 			LIFECYCLE_TABLE,
+			TABLES.productEmailTemplates, TABLES.productEmailSenders,
+			TABLES.productAuthDomains, TABLES.productPresentations,
 			`${PREFIX}events`,
 				`${PREFIX}principals`,
 				`${PREFIX}organizations`,

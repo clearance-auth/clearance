@@ -196,10 +196,10 @@ export function storeV2TableNames(prefix: string): StoreV2TableNames {
 		principals: safeIdentifier(`${safePrefix}principals`),
 		organizations: safeIdentifier(`${safePrefix}organizations`),
 		events: safeIdentifier(`${safePrefix}events`),
-		productPresentations: safeIdentifier(`${safePrefix}product_presentations`),
-		productAuthDomains: safeIdentifier(`${safePrefix}product_auth_domains`),
-		productEmailSenders: safeIdentifier(`${safePrefix}product_email_senders`),
-		productEmailTemplates: safeIdentifier(`${safePrefix}product_email_templates`),
+		productPresentations: derivedIdentifier(`${safePrefix}product_presentations`),
+		productAuthDomains: derivedIdentifier(`${safePrefix}product_auth_domains`),
+		productEmailSenders: derivedIdentifier(`${safePrefix}product_email_senders`),
+		productEmailTemplates: derivedIdentifier(`${safePrefix}product_email_templates`),
 	};
 }
 

@@ -103,6 +103,23 @@ function trackScim(id: string): void {
 	allScimProviderIds.add(id);
 }
 
+/** Runtime SCIM rows enforce the same purpose-separated envelope as production. */
+async function sealScimFixtureToken(
+	providerId: string,
+	organizationId: string,
+	token: string,
+): Promise<string> {
+	const keyManagement = getAuthBundle().keyManagement;
+	return `clr-scim:v1:${await keyManagement.sealText(
+		"scim-bearer-token",
+		keyManagement.resourceId("scim-bearer-token", {
+			providerId,
+			organizationId,
+		}),
+		token,
+	)}`;
+}
+
 /** Delete only exact runtime fixture IDs created by this suite. */
 async function cleanupTrackedRuntime(opts?: {
 	users?: Iterable<string>;
@@ -417,7 +434,11 @@ describe.skipIf(!available)(
 				[
 					connectionId,
 					providerId,
-					`scimtok_${connectionId}`,
+					await sealScimFixtureToken(
+						providerId,
+						org.id,
+						`scimtok_${connectionId}`,
+					),
 					org.id,
 				],
 			);
@@ -510,7 +531,16 @@ describe.skipIf(!available)(
 			await b.pool.query(
 				`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
          values ($1,$2,$3,$4)`,
-				[connectionId, providerId, `scimtok_${connectionId}`, ORG_FOREIGN_ID],
+				[
+					connectionId,
+					providerId,
+					await sealScimFixtureToken(
+						providerId,
+						ORG_FOREIGN_ID,
+						`scimtok_${connectionId}`,
+					),
+					ORG_FOREIGN_ID,
+				],
 			);
 			trackScim(connectionId);
 			return connectionId;

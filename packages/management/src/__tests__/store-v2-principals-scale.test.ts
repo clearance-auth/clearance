@@ -50,6 +50,10 @@ describe.skipIf(!available)("store-v2 principal and topology production-path sca
 		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
 			for (const table of [
+				TABLES.productEmailTemplates,
+				TABLES.productEmailSenders,
+				TABLES.productAuthDomains,
+				TABLES.productPresentations,
 				`${PREFIX}events`,
 				`${PREFIX}principals`,
 				`${PREFIX}organizations`,

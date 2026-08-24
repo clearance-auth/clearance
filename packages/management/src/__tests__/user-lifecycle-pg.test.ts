@@ -8,7 +8,7 @@
  * hard-deleted (FK children first) in afterEach/afterAll. Cleanup never uses
  * broad email-domain wipes and never touches users not created by this run.
  */
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { gatePostgresSuite } from "./pg-gate.js";
 import pg from "pg";
@@ -43,6 +43,7 @@ const DATABASE_URL =
 	"postgres://clearance:clearance@localhost:5434/clearance";
 
 const TEST_TABLE = `clearance_mgmt_lifecycle_${process.pid}`;
+const RUNTIME_AUDIT_SCHEMA = `lifecycle_runtime_audit_${process.pid}`;
 
 /** Exact runtime user ids created by this process (never pre-existing rows). */
 const createdRuntimeUserIds = new Set<string>();
@@ -155,15 +156,24 @@ describe.sequential.skipIf(!available)("user lifecycle Postgres runtime + manage
 		NODE_ENV: process.env.NODE_ENV,
 		CLEARANCE_PROJECT_ID: process.env.CLEARANCE_PROJECT_ID,
 		CLEARANCE_ENV_ID: process.env.CLEARANCE_ENV_ID,
+		CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:
+			process.env.CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION,
+		CLEARANCE_RUNTIME_AUDIT_SCHEMA:
+			process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA,
+		CLEARANCE_RUNTIME_AUDIT_PREFIX:
+			process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX,
 	};
 
-	beforeAllEnv();
+	beforeAll(beforeAllEnv);
 
 	function beforeAllEnv() {
 		process.env.DATABASE_URL = DATABASE_URL;
 		process.env.CLEARANCE_SECRET = "unit-test-secret-value-not-default!!";
 		process.env.CLEARANCE_BASE_URL = "http://localhost:3300";
 		process.env.NODE_ENV = "development";
+		process.env.CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION = "digest-v1";
+		process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA = RUNTIME_AUDIT_SCHEMA;
+		delete process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX;
 	}
 
 	afterEach(async () => {
@@ -173,29 +183,39 @@ describe.sequential.skipIf(!available)("user lifecycle Postgres runtime + manage
 	});
 
 	afterAll(async () => {
-		// Safety-net cleanup (idempotent) before closing stores / dropping tables.
-		await cleanupTrackedRuntimeUsers().catch(() => undefined);
-		for (const s of stores.splice(0)) {
-			await s.destroy().catch(() => undefined);
-		}
-		resetAuthBundle();
-		const pool = new pg.Pool({ connectionString: DATABASE_URL });
 		try {
-			await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}`);
-			await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_principal_email`);
-			await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_organization_slug`);
+			// Safety-net cleanup (idempotent) before closing stores / dropping tables.
+			await cleanupTrackedRuntimeUsers().catch(() => undefined);
+			for (const s of stores.splice(0)) {
+				await s.destroy().catch(() => undefined);
+			}
+			await resetAuthBundle();
+			const pool = new pg.Pool({ connectionString: DATABASE_URL });
+			try {
+				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}`);
+				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_principal_email`);
+				await pool.query(`DROP TABLE IF EXISTS ${TEST_TABLE}_organization_slug`);
+				await pool.query(`DROP SCHEMA IF EXISTS "${RUNTIME_AUDIT_SCHEMA}" CASCADE`);
+			} finally {
+				await pool.end().catch(() => undefined);
+			}
+			// Successful suite must prove current-run users are gone.
+			await assertTrackedRuntimeUsersGone();
 		} finally {
-			await pool.end().catch(() => undefined);
-		}
-		// Successful suite must prove current-run users are gone.
-		await assertTrackedRuntimeUsersGone();
-		for (const [k, v] of Object.entries(prev)) {
-			if (v === undefined) delete process.env[k];
-			else process.env[k] = v;
+			for (const [k, v] of Object.entries(prev)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 		}
 	});
 
 	async function freshStore(): Promise<PgStore> {
+		const auditSchema = new pg.Pool({ connectionString: DATABASE_URL });
+		try {
+			await auditSchema.query(`CREATE SCHEMA IF NOT EXISTS "${RUNTIME_AUDIT_SCHEMA}"`);
+		} finally {
+			await auditSchema.end().catch(() => undefined);
+		}
 		const store = await createPgStore(DATABASE_URL, { tableName: TEST_TABLE });
 		stores.push(store);
 		await store.refresh();

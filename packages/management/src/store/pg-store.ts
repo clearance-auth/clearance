@@ -1184,6 +1184,8 @@ export class PgStore implements ManagementStore {
 		scopeKey: string,
 		key: string,
 	): Promise<{
+		scopeKey: string;
+		key: string;
 		fingerprint: string;
 		status: number;
 		contentType: string;
@@ -1203,6 +1205,8 @@ export class PgStore implements ManagementStore {
 		const row = r.rows[0];
 		if (!row) return null;
 		return {
+			scopeKey,
+			key,
 			fingerprint: row.fingerprint,
 			status: Number(row.status),
 			contentType: row.content_type,
