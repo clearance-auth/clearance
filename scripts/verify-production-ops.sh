@@ -51,6 +51,7 @@ SCRIPTS=(
   scripts/upgrade-verify.sh
   scripts/upgrade-rollback.sh
   scripts/sign-release.sh
+  scripts/verify-release-bundle.sh
   scripts/verify-production-ops.sh
 )
 for s in "${SCRIPTS[@]}"; do
@@ -61,9 +62,20 @@ for s in "${SCRIPTS[@]}"; do
     bad "$s missing set -Eeuo pipefail (or set -euo pipefail)"
   fi
 done
-# Note: the former sign-release source-grep checks (genrsa / signing-key text)
-# were removed — the behavioral sign-release section below proves the same
-# contracts by execution (refuses missing key, real verifiable signature).
+# Detached release verification must use an independently anchored keyless
+# identity, never a public key distributed beside the asset it verifies.
+if grep -qE 'release-public\.pem|release-bundle\.sig(["[:space:]]|$)|CLEARANCE_RELEASE_SIGNING_KEY' scripts/sign-release.sh .github/workflows/release-sign.yml; then
+  bad "release signing still trusts a sibling key/signature asset or legacy private signing key"
+else
+  ok "release signing uses no sibling public key or long-lived private key"
+fi
+if grep -Fq 'cosign verify-blob --bundle' scripts/verify-release-bundle.sh \
+  && grep -Fq 'https://token.actions.githubusercontent.com' scripts/verify-release-bundle.sh \
+  && grep -Fq 'clearance-auth/clearance' scripts/verify-release-bundle.sh; then
+  ok "release verifier anchors Sigstore bundle to canonical GitHub publisher identity"
+else
+  bad "release verifier lacks canonical keyless publisher trust anchor"
+fi
 
 if grep -qE 'trap .*BASH_COMMAND|COMPOSE_SMOKE_FAILED.*command=' scripts/compose-smoke.sh; then
   bad "compose smoke failure diagnostics can expose expanded secret-bearing commands"
@@ -464,40 +476,27 @@ fi
 export CLEARANCE_EMAIL_TRANSPORT="smtp"
 unset CLEARANCE_SES_REGION CLEARANCE_SES_ACCESS_KEY_ID CLEARANCE_SES_SECRET_ACCESS_KEY CLEARANCE_SES_SESSION_TOKEN CLEARANCE_SES_REQUEST_TIMEOUT_MS
 
-# ---------- behavioral: sign-release ----------
-section "behavioral: sign-release fail-closed without key"
-unset CLEARANCE_RELEASE_SIGNING_KEY CLEARANCE_RELEASE_SIGNING_KEY_FILE || true
+# ---------- behavioral: detached release verifier ----------
+section "behavioral: detached release verifier rejects forged identity"
 set +e
-bash scripts/sign-release.sh "$SCRATCH/unsigned-should-fail" >/dev/null 2>&1
+bash scripts/verify-release-bundle.sh --self-test >"$SCRATCH/forged-verifier.txt" 2>&1
 ec=$?
 set -e
-if [[ $ec -ne 0 ]]; then
-  ok "sign-release refuses missing key"
+if [[ $ec -eq 0 ]] && grep -q 'RELEASE_BUNDLE_SELF_TEST_OK' "$SCRATCH/forged-verifier.txt"; then
+  ok "detached verifier rejects forged replacement publisher identity and sibling key"
 else
-  bad "sign-release should fail without key"
+  bad "detached verifier accepted forged replacement publisher identity or sibling key"
 fi
 
-section "behavioral: sign-release real signature + self-verify"
-KEY="$SCRATCH/test-release.key"
-openssl genrsa -out "$KEY" 2048 >/dev/null 2>&1
-export CLEARANCE_RELEASE_SIGNING_KEY_FILE="$KEY"
-export CLEARANCE_VERSION="0.1.0-test"
-bash scripts/sign-release.sh "$SCRATCH/signed" >/dev/null
-if [[ -s "$SCRATCH/signed/release-bundle.sig" && -s "$SCRATCH/signed/release-public.pem" ]]; then
-  openssl dgst -sha256 -verify "$SCRATCH/signed/release-public.pem" \
-    -signature "$SCRATCH/signed/release-bundle.sig" \
-    "$SCRATCH/signed/release-bundle.txt" >/dev/null \
-    && ok "sign-release produces verifiable signature" \
-    || bad "signature did not verify"
+section "static: release Docker and production Postgres references are digest pinned"
+if grep -Eq '^FROM .+@sha256:[0-9a-f]{64} AS ' Dockerfile \
+  && [[ "$(grep -Ec '^FROM .+@sha256:[0-9a-f]{64} AS ' Dockerfile)" -eq 3 ]] \
+  && grep -Eq 'image: postgres:16-alpine@sha256:[0-9a-f]{64}' deploy/compose/docker-compose.production.yml \
+  && grep -Eq 'name[[:space:]]*=[[:space:]]*"postgres:16-alpine@sha256:[0-9a-f]{64}"' deploy/terraform/main.tf; then
+  ok "release Docker and production Postgres image references are digest pinned"
 else
-  bad "sign-release missing sig/public key outputs"
+  bad "release Docker or production Postgres image reference is mutable"
 fi
-if grep -qi 'unsigned' "$SCRATCH/signed/provenance.json"; then
-  bad "provenance claims unsigned"
-else
-  ok "provenance does not claim unsigned"
-fi
-unset CLEARANCE_RELEASE_SIGNING_KEY_FILE
 
 # ---------- compose config with production overlay (no up) ----------
 section "behavioral: production compose config requires secrets"
@@ -568,6 +567,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if node -e '
       const fs=require("fs"), y=fs.readFileSync(process.argv[1],"utf8");
       const expected={
+        postgres:"postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
         api:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         "delivery-worker":"ghcr.io/example/clearance@sha256:"+"a".repeat(64),
         console:"ghcr.io/example/clearance@sha256:"+"a".repeat(64),

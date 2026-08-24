@@ -153,7 +153,11 @@ lifecycle retention at the remote destination (recommended: 30 daily copies
 plus managed Postgres PITR).
 
 The checked-in deployment support matrix is Postgres 16 with the separately
-published `backup-runtime` image target (official `postgres:16-bookworm` client).
+published `backup-runtime` image target. Release Docker bases are pinned to
+reviewed multi-architecture manifest indexes: `node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436`,
+`postgres:16-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537`, and
+the Compose/Terraform Postgres service uses
+`postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685`.
 A fixed UID/GID 10001 runs the job without root privileges; Compose and Helm
 mount only `/backups` and `/tmp` writable while keeping the root filesystem
 read-only.
@@ -165,7 +169,15 @@ For Compose, invoke the one-shot `backup` profile from cron or systemd:
 Before any production Compose command, set `CLEARANCE_IMAGE_REPOSITORY` and
 `CLEARANCE_IMAGE_DIGEST` plus their `CLEARANCE_BACKUP_IMAGE_*` equivalents from
 the immutable release evidence. The overlay validates digest-reference syntax;
-the release gate separately verifies signatures and provenance. Local image
+the release gate separately verifies npm provenance, OCI cosign signatures,
+and `release-bundle.sigstore.json` against the canonical GitHub Actions OIDC
+issuer and tag-bound `release-sign.yml` identity. Run
+`bash scripts/verify-release-bundle.sh dist-release` after downloading release
+assets; never verify that bundle against a public key distributed in the same
+asset set. The normal verifier accepts only the tag-bound workflow ref. Signed
+recovery assets require the explicit, independently supplied
+`CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY=1` to anchor verification to the
+canonical `master` workflow ref. Local image
 builds are disabled and only `repository@sha256:...` references are accepted.
 
 ```bash

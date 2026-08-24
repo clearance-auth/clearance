@@ -57,7 +57,8 @@ resource "docker_volume" "backups" {
 }
 
 resource "docker_image" "postgres" {
-  name         = "postgres:16-alpine"
+  # Reviewed multi-arch Postgres 16 Alpine manifest index.
+  name         = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685"
   keep_locally = true
 }
 

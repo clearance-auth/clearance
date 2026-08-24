@@ -198,13 +198,8 @@ jobs:
       - name: Resolve version and require release signing identity
         env:
           REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
-          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
         run: |
           set -Eeuo pipefail
-          test -n "${CLEARANCE_RELEASE_SIGNING_KEY:-}" || {
-            echo "::error::CLEARANCE_RELEASE_SIGNING_KEY is required; refusing an unsigned release"
-            exit 1
-          }
           VERSION="${REQUESTED_VERSION#v}"
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?(\+([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?$ ]] || {
             echo "::error::Release version must be exact SemVer: $VERSION"
@@ -233,6 +228,12 @@ jobs:
               echo "::error::npm recovery must use the release workflow from the current master commit"
               exit 1
             }
+          else
+            [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/tags/v${VERSION}" ]] || {
+              echo "::error::First publication requires the matching release-tag push"
+              exit 1
+            }
+            bash scripts/verify-release-tag-authority.sh
           fi
           COSIGN_IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-sign.yml@refs/tags/v${VERSION}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -602,19 +603,23 @@ jobs:
 
       - name: Sign package and container-digest bundle
         env:
-          CLEARANCE_RELEASE_SIGNING_KEY: ${{ secrets.CLEARANCE_RELEASE_SIGNING_KEY }}
           CLEARANCE_RELEASE_ASSET_DIR: ${{ github.workspace }}/dist-release/assets
           CLEARANCE_REQUIRE_RELEASE_ASSETS: "1"
           CLEARANCE_REQUIRE_TAG_BINDING: "1"
+          CLEARANCE_RELEASE_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY: ${{ env.RECOVER_PUBLISHED_NPM }}
           CLEARANCE_VERSION: ${{ env.VERSION }}
         run: bash scripts/sign-release.sh "${{ github.workspace }}/dist-release"
 
       - name: Verify detached signature and asset manifest
+        env:
+          CLEARANCE_RELEASE_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY: ${{ env.RECOVER_PUBLISHED_NPM }}
         run: |
           set -Eeuo pipefail
-          openssl dgst -sha256 -verify dist-release/release-public.pem \
-            -signature dist-release/release-bundle.sig dist-release/release-bundle.txt
-          (cd dist-release/assets && sha256sum --check ../assets.sha256)
+          bash scripts/verify-release-bundle.sh dist-release
 
       - name: Upload signed release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

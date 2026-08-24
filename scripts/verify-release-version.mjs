@@ -83,6 +83,8 @@ case "$*" in
   "rev-parse --is-shallow-repository") printf '%s\\n' "\${CLEARANCE_TEST_GIT_SHALLOW:-false}" ;;
   "rev-parse refs/tags/v"*"{commit}") printf '%s\\n' "\${CLEARANCE_TEST_GIT_TAG_COMMIT:-commit}" ;;
   "rev-parse HEAD") printf '%s\\n' "\${CLEARANCE_TEST_GIT_HEAD_COMMIT:-commit}" ;;
+  "rev-parse --verify --quiet origin/master^{commit}") printf '%s\\n' "commit" ;;
+  "merge-base --is-ancestor commit origin/master") test "\${CLEARANCE_TEST_GIT_ANCESTOR:-true}" = "true" ;;
   *) printf 'unexpected git invocation: %s\\n' "$*" >&2; exit 64 ;;
 esac
 `, "utf8");
@@ -123,12 +125,12 @@ function verifyIdentity(run) {
 	const tag = { GITHUB_EVENT_NAME: "push", REQUESTED_VERSION: "v0.3.0", GITHUB_REF: "refs/tags/v0.3.0", GITHUB_WORKFLOW_REF: "", GITHUB_WORKFLOW_SHA: "" };
 	const outcomes = [
 		[true, tag], [true, recovery],
-		[false, { ...tag, CLEARANCE_RELEASE_SIGNING_KEY: "" }], [false, { ...tag, REQUESTED_VERSION: "invalid" }],
+		[false, { ...tag, REQUESTED_VERSION: "invalid" }],
 		[false, { ...tag, CLEARANCE_TEST_GIT_SHALLOW: "true" }], [false, { ...tag, CLEARANCE_TEST_GIT_TAG_COMMIT: "different" }],
 		[false, { ...tag, GITHUB_REPOSITORY: "fork/clearance" }],
 		[false, { ...recovery, RECOVER_PUBLISHED_NPM: "0" }], [false, { ...recovery, GITHUB_REF: "refs/heads/next" }],
 		[false, { ...recovery, GITHUB_WORKFLOW_REF: canonicalWorkflow.replace("master", "next") }], [false, { ...recovery, GITHUB_WORKFLOW_SHA: "wrong" }],
-	].map(([allowed, scenario]) => ({ allowed, ...identityHarness(run, scenario) }));
+	].map(([allowed, scenario]) => ({ allowed, recovery: scenario.RECOVER_PUBLISHED_NPM === "1", ...identityHarness(run, scenario) }));
 	const expectedEnvironment = [
 		"VERSION=0.3.0",
 		"SOURCE_COMMIT=commit",
@@ -138,14 +140,25 @@ function verifyIdentity(run) {
 		"STAGING_IMAGE=ghcr.io/clearance-auth/clearance/clearance:staging-1-1",
 		"STAGING_BACKUP_IMAGE=ghcr.io/clearance-auth/clearance/clearance-backup:staging-1-1",
 	];
-	const expectedGit = [
+	const expectedRecoveryGit = [
 		"rev-parse --is-shallow-repository",
 		"rev-parse refs/tags/v0.3.0^{commit}",
 		"rev-parse HEAD",
 		"rev-parse HEAD",
 	];
+	const expectedTagGit = [
+		"rev-parse --is-shallow-repository",
+		"rev-parse refs/tags/v0.3.0^{commit}",
+		"rev-parse HEAD",
+		"rev-parse HEAD",
+		"rev-parse --is-shallow-repository",
+		"rev-parse --verify --quiet origin/master^{commit}",
+		"merge-base --is-ancestor commit origin/master",
+		"rev-parse HEAD",
+	];
 	if (outcomes.some(({ allowed, status }) => allowed !== (status === 0))
-		|| outcomes.filter(({ allowed }) => allowed).some(({ env, git }) => {
+		|| outcomes.filter(({ allowed }) => allowed).some(({ recovery, env, git }) => {
+			const expectedGit = recovery ? expectedRecoveryGit : expectedTagGit;
 			const lines = env.trim().split("\n");
 			const gitLines = git.trim().split("\n");
 			return lines.length !== expectedEnvironment.length || expectedEnvironment.some((expected, index) => lines[index] !== expected)
@@ -155,9 +168,41 @@ function verifyIdentity(run) {
 	}
 }
 
+function verifyTagAuthority() {
+	const directory = mkdtempSync(join(tmpdir(), "clearance-release-tag-authority-"));
+	const remote = join(directory, "origin.git");
+	const worktree = join(directory, "worktree");
+	const git = (...args) => {
+		const result = spawnSync("git", args, { encoding: "utf8" });
+		if (result.status !== 0) fail(`tag-authority self-test git ${args.join(" ")} failed: ${result.stderr.trim()}`);
+		return result.stdout.trim();
+	};
+	git("init", "--bare", remote);
+	git("init", "--initial-branch=master", worktree);
+	git("-C", worktree, "config", "user.email", "release-test@clearance.invalid");
+	git("-C", worktree, "config", "user.name", "Release test");
+	writeFileSync(join(worktree, "release.txt"), "canonical\n", "utf8");
+	git("-C", worktree, "add", "release.txt");
+	git("-C", worktree, "commit", "-m", "canonical release commit");
+	git("-C", worktree, "remote", "add", "origin", remote);
+	git("-C", worktree, "push", "-u", "origin", "master");
+	git("-C", worktree, "tag", "v0.3.0");
+	git("-C", worktree, "checkout", "--detach", "v0.3.0");
+	const script = join(root, "scripts", "verify-release-tag-authority.sh");
+	const run = () => spawnSync("bash", [script], { cwd: worktree, encoding: "utf8" });
+	if (run().status !== 0) fail("tag-authority self-test rejected a tag commit reachable from origin/master");
+	git("-C", worktree, "checkout", "-b", "unmerged-release", "master");
+	writeFileSync(join(worktree, "release.txt"), "unmerged\n", "utf8");
+	git("-C", worktree, "commit", "-am", "unmerged release commit");
+	git("-C", worktree, "tag", "v0.3.1");
+	git("-C", worktree, "checkout", "--detach", "v0.3.1");
+	if (run().status === 0) fail("tag-authority self-test accepted a tag commit outside origin/master");
+}
+
 function selfTest() {
 	const workflow = yaml(".github/workflows/release-sign.yml");
 	verifyIdentity(namedStep(workflow.jobs?.release?.steps ?? [], "Resolve version and require release signing identity").step.run);
+	verifyTagAuthority();
 	process.stdout.write("RELEASE_VERIFIER_SELF_TEST_OK\n");
 }
 
@@ -211,5 +256,15 @@ if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terrafor
 	fail("release workflow must retain pinned, ordered release gates and the exact shared rehearsal invocation");
 }
 verifyIdentity(identity.step.run);
+const bundleSigning = namedStep(steps, "Sign package and container-digest bundle");
+const bundleVerification = namedStep(steps, "Verify detached signature and asset manifest");
+if (bundleSigning.step.env?.CLEARANCE_RELEASE_CERTIFICATE_IDENTITY !== "https://github.com/${{ github.workflow_ref }}"
+	|| bundleSigning.step.env?.CLEARANCE_RELEASE_CERTIFICATE_OIDC_ISSUER !== "https://token.actions.githubusercontent.com"
+	|| bundleSigning.step.env?.CLEARANCE_RELEASE_ALLOW_RECOVERY_IDENTITY !== "${{ env.RECOVER_PUBLISHED_NPM }}"
+	|| bundleSigning.step.env?.CLEARANCE_RELEASE_SIGNING_KEY !== undefined
+	|| bundleVerification.step.run?.includes("release-public.pem")
+	|| !bundleVerification.step.run?.includes("scripts/verify-release-bundle.sh")) {
+	fail("release bundle must use the canonical keyless Sigstore verifier rather than a sibling public key");
+}
 
 process.stdout.write(`RELEASE_VERSION_OK ${version}\n`);

@@ -2,7 +2,7 @@
 # Build: docker build -t clearance:local .
 # Runtime expects DATABASE_URL + strong secrets (see deploy/compose).
 
-FROM node:22-bookworm-slim AS build
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS build
 WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.json tsconfig.base.json ./
@@ -17,7 +17,7 @@ RUN pnpm build
 # Backup jobs deliberately use the official PG16 image so pg_dump matches the
 # supported production server major. Build/publish this target separately:
 # docker build --target backup-runtime -t clearance-backup:<version> .
-FROM postgres:16-bookworm AS backup-runtime
+FROM postgres:16-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537 AS backup-runtime
 WORKDIR /app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates curl nodejs openssl \
@@ -36,7 +36,7 @@ CMD ["bash", "scripts/backup-scheduled.sh", "--dir", "/backups"]
 # needs the PostgreSQL 16 client matching the supported server. Copy Node 22
 # from the build image into the official PG16 base instead of installing the
 # older Debian Node/Postgres clients.
-FROM postgres:16-bookworm AS runtime
+FROM postgres:16-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537 AS runtime
 WORKDIR /app
 COPY --from=build /usr/local /usr/local
 RUN apt-get update \
