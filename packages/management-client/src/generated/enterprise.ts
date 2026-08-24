@@ -162,6 +162,8 @@ const readinessReportSchema = z.object({
 	}).strict(),
 	remainingCustomerActions: z.array(z.string()),
 	reportDigest: z.string(),
+	stateFingerprint: z.string().optional(),
+	state: z.enum(["current", "stale", "not_run"]).optional(),
 }).strict();
 
 const scimUserSchema = z.object({
