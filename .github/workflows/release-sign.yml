@@ -68,7 +68,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           registry-url: 'https://registry.npmjs.org'
-          cache: pnpm
+          package-manager-cache: false
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -114,6 +114,7 @@ jobs:
         with:
           go-version: '1.22.0'
           check-latest: false
+          cache: false
 
       - name: Install Python SDK
         working-directory: sdks/python
@@ -187,6 +188,27 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
+      - name: Provision integrity-pinned npm CLI
+        env:
+          NPM_CLI_VERSION: 11.16.0
+          NPM_CLI_INTEGRITY: sha512-A74XL8OxmcegZDMWPkWb5bEQppg8HdYwW3rBD2sPoS4UQHVajfaxBkqyzLeJ3wR0kZ+5xoTjItxXaF7eIXUsyw==
+        run: |
+          set -Eeuo pipefail
+          NPM_CLI_ARCHIVE="$RUNNER_TEMP/npm-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tgz"
+          NPM_CLI_DIR="$RUNNER_TEMP/npm-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$NPM_CLI_DIR"
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/npm/-/npm-${NPM_CLI_VERSION}.tgz" \
+            --output "$NPM_CLI_ARCHIVE"
+          ACTUAL_INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$NPM_CLI_ARCHIVE" | openssl base64 -A)"
+          [[ "$ACTUAL_INTEGRITY" == "$NPM_CLI_INTEGRITY" ]] || {
+            echo "::error::npm CLI archive integrity does not match the pinned SHA-512"
+            exit 1
+          }
+          tar -xzf "$NPM_CLI_ARCHIVE" -C "$NPM_CLI_DIR"
+          test "$(node "$NPM_CLI_DIR/package/bin/npm-cli.js" --version)" = "$NPM_CLI_VERSION"
+          echo "$NPM_CLI_DIR/package/bin" >> "$GITHUB_PATH"
+
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: 1.5.7
@@ -259,7 +281,7 @@ jobs:
         if: env.RECOVER_PUBLISHED_NPM == '1'
         run: |
           set -Eeuo pipefail
-          npm install --global npm@11.16.0
+          test "$(npm --version)" = "11.16.0"
           test "$(npm config get registry)" = "https://registry.npmjs.org/"
           mapfile -t PACKAGES < <(node .release-tooling/scripts/release-packages.mjs names)
           integrity_for() {
@@ -292,13 +314,29 @@ jobs:
             echo "::error::${package}@${VERSION} did not become readable from the public registry" >&2
             return 1
           }
+          prepare_audit_tree() {
+            local audit_dir="$1" package target
+            shift
+            mkdir -p "$audit_dir/node_modules"
+            node -e '
+              const fs = require("fs");
+              const [output, version, ...packages] = process.argv.slice(1);
+              const dependencies = Object.fromEntries(packages.map(name => [name, version]));
+              fs.writeFileSync(output, `${JSON.stringify({ name: "clearance-provenance-audit", private: true, version: "0.0.0", dependencies }, null, 2)}\n`);
+            ' "$audit_dir/package.json" "$VERSION" "$@"
+            for package in "$@"; do
+              target="$audit_dir/node_modules/$package"
+              mkdir -p "$target"
+              tar -xzf "$(tarball_for "$package")" -C "$target" --strip-components=1
+            done
+          }
           verify_provenance() {
             local output="$1"
             shift
             for ATTEMPT in {1..120}; do
               AUDIT_DIR="$(mktemp -d)"
-              if npm install --prefix "$AUDIT_DIR" --ignore-scripts --save-exact "${@/%/@$VERSION}" \
-                && npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+              prepare_audit_tree "$AUDIT_DIR" "$@"
+              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
                 && node .release-tooling/scripts/verify-npm-provenance.mjs \
                   "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
                   dist-release/assets "$output" "$@"; then
@@ -448,7 +486,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -Eeuo pipefail
-          npm install --global npm@11.16.0
+          test "$(npm --version)" = "11.16.0"
           test "$(npm config get registry)" = "https://registry.npmjs.org/"
           mapfile -t PACKAGES < <(node scripts/release-packages.mjs names)
           tarball_for() {
@@ -516,13 +554,29 @@ jobs:
             echo "::error::${package}@${VERSION} did not become readable from the public registry" >&2
             return 1
           }
+          prepare_audit_tree() {
+            local audit_dir="$1" package target
+            shift
+            mkdir -p "$audit_dir/node_modules"
+            node -e '
+              const fs = require("fs");
+              const [output, version, ...packages] = process.argv.slice(1);
+              const dependencies = Object.fromEntries(packages.map(name => [name, version]));
+              fs.writeFileSync(output, `${JSON.stringify({ name: "clearance-provenance-audit", private: true, version: "0.0.0", dependencies }, null, 2)}\n`);
+            ' "$audit_dir/package.json" "$VERSION" "$@"
+            for package in "$@"; do
+              target="$audit_dir/node_modules/$package"
+              mkdir -p "$target"
+              tar -xzf "$(tarball_for "$package")" -C "$target" --strip-components=1
+            done
+          }
           verify_provenance() {
             local output="$1"
             shift
             for ATTEMPT in {1..120}; do
               AUDIT_DIR="$(mktemp -d)"
-              if npm install --prefix "$AUDIT_DIR" --ignore-scripts --save-exact "${@/%/@$VERSION}" \
-                && npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+              prepare_audit_tree "$AUDIT_DIR" "$@"
+              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
                 && node scripts/verify-npm-provenance.mjs \
                   "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
                   dist-release/assets "$output" "$@"; then
