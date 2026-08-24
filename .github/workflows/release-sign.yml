@@ -253,7 +253,7 @@ jobs:
           pnpm verify:real
 
       - name: Rehearse release assembly
-        run: bash scripts/rehearse-release-assembly.sh "$VERSION"
+        run: pnpm release:rehearse -- "$VERSION"
 
       - name: Verify recovery npm packages before signing assets
         if: env.RECOVER_PUBLISHED_NPM == '1'

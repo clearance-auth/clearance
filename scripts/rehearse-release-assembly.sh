@@ -3,10 +3,15 @@
 # Assemble the release artifacts without signing, publishing, tagging, or making
 # any external mutation. Run after the candidate has been built:
 #   pnpm release:rehearse -- 0.3.0
+# Direct invocation also accepts: scripts/rehearse-release-assembly.sh 0.3.0
 set -Eeuo pipefail
 
+if [[ $# -eq 2 && "$1" == "--" ]]; then
+  shift
+fi
+
 if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <exact-semver-version>" >&2
+  echo "Usage: $0 [--] <exact-semver-version>" >&2
   exit 2
 fi
 
@@ -61,6 +66,9 @@ helm template clearance deploy/helm/clearance \
   --set credentialAuthority.phase=serve \
   --set credentialAuthority.deploymentId=release-vault-proof \
   --set secrets.existingSecret=release-proof \
+  --set console.secrets.existingSecret=release-proof \
+  --set-string env.CLEARANCE_BASE_URL=https://release.example.test \
+  --set-string env.CLEARANCE_CORS_ORIGINS=https://console.release.example.test \
   --set image.repository=registry.example/clearance \
   --set image.digest="$VAULT_PROOF_DIGEST" \
   --set vault.enabled=true \

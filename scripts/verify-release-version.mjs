@@ -227,6 +227,10 @@ for (const { manifest } of publicReleasePackages) {
 }
 const cli = JSON.parse(read("packages/clearance-cli/package.json"));
 if (cli.name !== "@clearance/cli" || cli.bin?.clearance !== "./dist/index.js") fail("@clearance/cli must install the clearance binary from ./dist/index.js");
+const rootPackage = JSON.parse(read("package.json"));
+if (rootPackage.scripts?.["release:rehearse"] !== "bash scripts/rehearse-release-assembly.sh") {
+	fail("root release:rehearse script must invoke the shared release assembly script");
+}
 
 const chart = yaml("deploy/helm/clearance/Chart.yaml");
 const values = yaml("deploy/helm/clearance/values.yaml");
@@ -251,7 +255,7 @@ const publish = namedStep(steps, "Publish public npm packages with trusted prove
 const terraform = steps.map((step, index) => ({ step, index })).find(({ step }) => step.uses === "hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd");
 if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terraform.index >= clean.index || clean.index >= rehearsal.index
 	|| rehearsal.index >= recovery.index || recovery.index >= staging.index || staging.index >= finalTags.index || finalTags.index >= publish.index
-	|| rehearsal.step.run !== "bash scripts/rehearse-release-assembly.sh \"$VERSION\""
+	|| rehearsal.step.run !== "pnpm release:rehearse -- \"$VERSION\""
 	|| recovery.step.if !== "env.RECOVER_PUBLISHED_NPM == '1'" || publish.step.if !== "env.RECOVER_PUBLISHED_NPM != '1'") {
 	fail("release workflow must retain pinned, ordered release gates and the exact shared rehearsal invocation");
 }
