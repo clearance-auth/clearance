@@ -1,4 +1,4 @@
-import { base64Url } from "@clearance/utils/base64";
+import { base64, base64Url } from "@clearance/utils/base64";
 import { createAuthMiddleware } from "@clearance/runtime/api";
 import { constantTimeEqual } from "@clearance/runtime/crypto";
 import { SCIMAPIError } from "./scim-error";
@@ -13,7 +13,8 @@ const invalidSCIMToken = () =>
 	});
 
 const isValidBase64Token = (token: string) => {
-	const alphabet = token.includes("-") || token.includes("_")
+	const urlSafe = token.includes("-") || token.includes("_");
+	const alphabet = urlSafe
 		? /^[A-Za-z0-9_-]*={0,2}$/
 		: /^[A-Za-z0-9+/]*={0,2}$/;
 	if (!alphabet.test(token)) return false;
@@ -23,7 +24,20 @@ const isValidBase64Token = (token: string) => {
 	const padding = paddingStart === -1 ? "" : token.slice(paddingStart);
 	const requiredPadding = (4 - (payload.length % 4)) % 4;
 
-	return payload.length % 4 !== 1 && padding.length === requiredPadding;
+	if (payload.length % 4 === 1) return false;
+
+	if (paddingStart !== -1 && padding.length !== requiredPadding) return false;
+
+	try {
+		const decoded = base64Url.decode(payload);
+		const canonicalPayload = urlSafe
+			? base64Url.encode(decoded, { padding: false })
+			: base64.encode(decoded, { padding: false });
+
+		return canonicalPayload === payload;
+	} catch {
+		return false;
+	}
 };
 
 const decodeSCIMToken = (token: string) => {
@@ -53,7 +67,7 @@ const decodeSCIMToken = (token: string) => {
 export const authMiddlewareFactory = (opts: SCIMOptions) =>
 	createAuthMiddleware(async (ctx) => {
 		const authHeader = ctx.headers?.get("Authorization");
-		const rawBearerToken = authHeader?.replace(/^Bearer\s+/i, "");
+		const rawBearerToken = authHeader?.match(/^Bearer\s+(\S+)$/i)?.[1];
 
 		if (!rawBearerToken) {
 			throw new SCIMAPIError("UNAUTHORIZED", {
