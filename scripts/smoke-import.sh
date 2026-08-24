@@ -173,9 +173,12 @@ EOF
 }
 
 assert_isolated_resolution() {
+  local shipping_json
+  shipping_json="$(node "$ROOT/scripts/release-packages.mjs" json)" \
+    || fail "canonical release package list could not be loaded"
   cd "$CONSUMER"
   # Embed monorepo root so the consumer can detect accidental workspace leaks.
-  CLEARANCE_SMOKE_PACKAGES="$(node scripts/release-packages.mjs json)" ROOT_FOR_CHECK="$ROOT" node --input-type=module <<'EOF' || exit 1
+  CLEARANCE_SMOKE_PACKAGES="$shipping_json" ROOT_FOR_CHECK="$ROOT" node --input-type=module <<'EOF' || exit 1
 import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs";
@@ -298,10 +301,12 @@ const apiPort = await new Promise((resolve, reject) => {
   });
 });
 const packedApiDir = fs.mkdtempSync(path.join(os.tmpdir(), "clearance-packed-api-"));
+const upgradeDir = fs.mkdtempSync(path.join(os.tmpdir(), "clearance-packed-upgrade-"));
 const packedOperatorToken = "packed-operator-token-value-32-chars";
 process.env.DATABASE_URL = "";
 process.env.CLEARANCE_DATA_PATH = path.join(packedApiDir, "data.json");
 process.env.CLEARANCE_API_PORT = String(apiPort);
+process.env.CLEARANCE_UPGRADE_DIR = upgradeDir;
 process.env.CLEARANCE_OPERATOR_TOKEN = packedOperatorToken;
 process.env.CLEARANCE_SECRET = "packed-clearance-secret-value-32-chars";
 process.env.CLEARANCE_BASE_URL = `http://127.0.0.1:${apiPort}`;
@@ -375,7 +380,6 @@ if (!/Clearance CLI/i.test(help.stdout)) {
 
 // Execute an operational command from the installed tarball. This must use
 // packaged scripts; the consumer has no monorepo scripts directory.
-const upgradeDir = fs.mkdtempSync(path.join(os.tmpdir(), "clearance-packed-upgrade-"));
 const cliEnv = {
   ...process.env,
   NODE_PATH: "",
@@ -431,8 +435,6 @@ const upgradePlan = spawnSync(process.execPath, [
   "0.2.1",
   "--current",
   "0.1.4",
-  "--dir",
-  upgradeDir,
 ], {
 	encoding: "utf8",
 	env: cliEnv,
