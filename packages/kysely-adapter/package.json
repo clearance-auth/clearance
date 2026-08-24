@@ -59,7 +59,7 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250121.0",
+    "@cloudflare/workers-types": "^5.20260819.1",
     "@clearance/core": "workspace:*",
     "@clearance/utils": "workspace:^",
     "kysely": "catalog:",
