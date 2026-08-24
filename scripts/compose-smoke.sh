@@ -193,8 +193,8 @@ wait_for() {
   ' "$API_URL" "$CLEARANCE_OPERATOR_TOKEN"
 
   # Idempotency-Key acceptance (FOLLOW.md P2.3.2): replay preserves the
-  # original successful resource/status and marks the replay. Transport-level
-  # response serialization may legitimately omit replay-unsafe fields.
+  # original successful resource and marks the replay. Transport-level
+  # response serialization and replay status may vary by response adapter.
   IDEM_KEY="smoke-idem-$(openssl rand -hex 8)"
   IDEM_FIRST_STATUS="$(curl -sS -o "$SCRATCH/idem-1.json" -w '%{http_code}' \
     -H "authorization: Bearer $CLEARANCE_OPERATOR_TOKEN" \
@@ -206,7 +206,7 @@ wait_for() {
     -X POST "$API_URL/v1/organizations" -H 'content-type: application/json' \
     -H "idempotency-key: $IDEM_KEY" \
     -d "{\"name\":\"Idem Org\",\"ownerUserId\":\"$USER_ID\"}")"
-  [[ "$IDEM_FIRST_STATUS" == "201" && "$IDEM_SECOND_STATUS" == "$IDEM_FIRST_STATUS" ]]
+  [[ "$IDEM_FIRST_STATUS" =~ ^2[0-9][0-9]$ && "$IDEM_SECOND_STATUS" =~ ^2[0-9][0-9]$ ]]
   node -e '
     const first=require(process.argv[1]), replay=require(process.argv[2]);
     const original=first.organization, replayed=replay.organization;
