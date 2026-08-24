@@ -16,6 +16,7 @@ export default defineConfig({
 		],
 	},
 	test: {
+		fileParallelism: false,
 		include: ["src/**/*.test.ts"],
 		server: { deps: { inline: [/^@clearance\//] } },
 	},

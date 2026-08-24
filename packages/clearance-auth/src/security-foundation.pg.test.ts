@@ -795,8 +795,33 @@ describe.sequential.skipIf(!available)(
 						client.release();
 					}
 				};
+				const readCredentialTriggerIdentities = async () =>
+					(
+						await scopedPool.query<{
+							schemaName: string;
+							tableName: string;
+							triggerName: string;
+						}>(
+							`SELECT namespace_record.nspname AS "schemaName",
+							        table_record.relname AS "tableName",
+							        trigger_record.tgname AS "triggerName"
+							 FROM pg_trigger trigger_record
+							 JOIN pg_class table_record ON table_record.oid = trigger_record.tgrelid
+							 JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+							 WHERE trigger_record.tgname IN ('clearance_require_oidc_key_v1',
+							                                         'clearance_require_scim_key_v1',
+							                                         'clearance_require_jwt_key_v1')
+							   AND NOT trigger_record.tgisinternal
+							 ORDER BY namespace_record.nspname, table_record.relname, trigger_record.tgname`,
+						)
+					).rows;
+				const triggerIdentitiesBeforeRead =
+					await readCredentialTriggerIdentities();
 				const statusBefore = await bundle.keyManagement.status();
 				const stalePlan = await bundle.keyManagement.planMigration();
+				expect(await readCredentialTriggerIdentities()).toEqual(
+					triggerIdentitiesBeforeRead,
+				);
 				expect(statusBefore).toMatchObject({
 					ready: false,
 					schema: { setup: "pending" },
@@ -812,11 +837,14 @@ describe.sequential.skipIf(!available)(
 					},
 				});
 				const triggerCountAfterRead = await scopedPool.query<{ count: number }>(
-					`SELECT count(*)::int AS count FROM pg_trigger
-					 WHERE tgname IN ('clearance_require_oidc_key_v1',
+					`SELECT count(*)::int AS count FROM pg_trigger trigger_record
+					 JOIN pg_class table_record ON table_record.oid = trigger_record.tgrelid
+					 JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+					 WHERE namespace_record.nspname = current_schema()
+					   AND tgname IN ('clearance_require_oidc_key_v1',
 					                  'clearance_require_scim_key_v1',
 					                  'clearance_require_jwt_key_v1')
-					   AND NOT tgisinternal`,
+					   AND NOT trigger_record.tgisinternal`,
 				);
 				expect(triggerCountAfterRead.rows[0]?.count).toBe(0);
 
@@ -2196,25 +2224,49 @@ describe.sequential.skipIf(!available)(
 					"idempotency-key",
 					credentialOperationKey("security-upgrade-jwt-refresh-operation-0001"),
 				);
-				const legacyToken = await oldBundle.auth.api.getToken({ headers });
-				const legacyHeader = decodeJwtPart<{ kid: string }>(
-					legacyToken.token,
-					0,
+				const preUpgradeToken = await oldBundle.auth.api.getToken({ headers });
+				const legacyKeyId = randomUUID();
+				const legacyKeyPair = generateKeyPairSync("ed25519");
+				const legacyPublicKey = JSON.stringify(
+					legacyKeyPair.publicKey.export({ format: "jwk" }),
+				);
+				const legacyPrivateKey = JSON.stringify(
+					await encryptRuntimeCredential(
+						JSON.stringify(legacyKeyPair.privateKey.export({ format: "jwk" })),
+						secret,
+					),
+				);
+				await scopedPool.query(
+					`DROP TRIGGER clearance_require_jwt_key_v1 ON jwks`,
+				);
+				await scopedPool.query(
+					`INSERT INTO jwks
+					 (id, "publicKey", "privateKey", "createdAt", "expiresAt")
+					 VALUES ($1, $2, $3, now(), NULL)`,
+					[legacyKeyId, legacyPublicKey, legacyPrivateKey],
 				);
 				await oldBundle.destroy();
 				oldBundle = undefined;
 
-				await scopedPool.query(
-					`ALTER TABLE jwks DROP COLUMN alg, DROP COLUMN crv`,
-				);
+				await scopedPool.query(`ALTER TABLE jwks
+					DROP COLUMN alg,
+					DROP COLUMN crv,
+					DROP COLUMN "keyManagementVersion",
+					DROP COLUMN "keyManagementRevision"`);
 				await scopedPool.query(`UPDATE jwks SET "expiresAt"=NULL`);
 				const before = await basePool.query<{ column_name: string }>(
 					`SELECT column_name FROM information_schema.columns
-				 WHERE table_schema=$1 AND table_name='jwks'`,
+				 WHERE table_schema=$1 AND table_name='jwks'
+				 ORDER BY ordinal_position`,
 					[schema],
 				);
-				expect(before.rows.map((row) => row.column_name)).not.toContain("alg");
-				expect(before.rows.map((row) => row.column_name)).not.toContain("crv");
+				expect(before.rows.map((row) => row.column_name)).toEqual([
+					"id",
+					"publicKey",
+					"privateKey",
+					"createdAt",
+					"expiresAt",
+				]);
 
 				upgradeBundle = createClearanceAuth(options);
 				await upgradeBundle.migrate();
@@ -2224,13 +2276,18 @@ describe.sequential.skipIf(!available)(
 					[schema],
 				);
 				expect(after.rows.map((row) => row.column_name)).toEqual(
-					expect.arrayContaining(["alg", "crv"]),
+					expect.arrayContaining([
+						"alg",
+						"crv",
+						"keyManagementVersion",
+						"keyManagementRevision",
+					]),
 				);
 				const upgraded = (
 					await scopedPool.query<JwksRow & { expiresAt: Date }>(
 						`SELECT id, "publicKey", "privateKey", "expiresAt", alg, crv
 					 FROM jwks WHERE id=$1`,
-						[legacyHeader.kid],
+						[legacyKeyId],
 					)
 				).rows[0]!;
 				expect(upgraded).toMatchObject({ alg: "EdDSA", crv: "Ed25519" });
@@ -2241,11 +2298,11 @@ describe.sequential.skipIf(!available)(
 					replacement.token,
 					0,
 				);
-				expect(replacementHeader.kid).not.toBe(legacyHeader.kid);
+				expect(replacementHeader.kid).not.toBe(legacyKeyId);
 				expect(
 					(
 						await upgradeBundle.auth.api.verifyJWT({
-							body: { token: legacyToken.token },
+							body: { token: preUpgradeToken.token },
 						})
 					).payload,
 				).not.toBeNull();

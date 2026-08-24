@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import {
 	createDeliveryKeyring,
 	decryptDeliveryPayload,
@@ -11,6 +11,11 @@ import {
 } from "@clearance/delivery-worker";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+	storeV2SchemaStatements,
+	storeV2TableNames,
+	type StoreV2TableNames,
+} from "../../management/src/store/store-v2-schema.js";
 import { createClearanceAuth, type ClearanceAuthBundle } from "./create-auth.js";
 
 const DATABASE_URL =
@@ -44,12 +49,89 @@ type EncryptedPayloadRow = {
 	expires_at: Date;
 };
 
+const presentationTemplate = (
+	kind: "verification" | "password-reset" | "invitation",
+	subject: string,
+	plainText: string,
+	html: string,
+	variables: readonly string[],
+) => ({
+	kind,
+	subject,
+	plainText,
+	html,
+	variables,
+	contentHash: createHash("sha256")
+		.update(subject, "utf8")
+		.update("\0", "utf8")
+		.update(plainText, "utf8")
+		.update("\0", "utf8")
+		.update(html, "utf8")
+		.digest("hex"),
+});
+
+async function createPresentationAuthorityFixture(
+	client: pg.PoolClient,
+	schema: string,
+	tables: StoreV2TableNames,
+): Promise<void> {
+	await client.query(`SET search_path TO "${schema}"`);
+	for (const statement of storeV2SchemaStatements(tables)) {
+		await client.query(statement);
+	}
+	const projectId = "project-runtime-test";
+	const environmentId = "environment-runtime-test";
+	const now = new Date();
+	await client.query(
+		`INSERT INTO "${tables.projects}" (id, name, slug, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $4)`,
+		[projectId, "Runtime Project", "runtime-project", now],
+	);
+	await client.query(
+		`INSERT INTO "${tables.environments}" (id, project_id, name, slug, kind, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+		[environmentId, projectId, "Runtime", "runtime", "development", now],
+	);
+	await client.query(
+		`INSERT INTO "${tables.productPresentations}"
+		 (project_id, environment_id, product_label, home_label, accent_color, logo_url, version, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		[projectId, environmentId, "Runtime Clearance", "Runtime", "#2255cc", null, 1, now],
+	);
+	await client.query(
+		`INSERT INTO "${tables.productAuthDomains}"
+		 (project_id, environment_id, origin, hostname, dns_name, challenge_digest, state, version, verified_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)`,
+		[projectId, environmentId, "https://example.test", "example.test", "_clearance.example.test", randomBytes(32), "verified", 1, now],
+	);
+	await client.query(
+		`INSERT INTO "${tables.productEmailSenders}"
+		 (project_id, environment_id, display_name, address, domain, version, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		[projectId, environmentId, "Runtime Mail", "runtime@example.test", "example.test", 1, now],
+	);
+	for (const template of [
+		presentationTemplate("verification", "Verify {{product_name}} for {{user_name}}", "Open {{verification_url}}", "<p>Open {{verification_url}}</p>", ["product_name", "user_name", "verification_url"]),
+		presentationTemplate("password-reset", "Reset {{product_name}} for {{user_name}}", "Open {{reset_url}}", "<p>Open {{reset_url}}</p>", ["product_name", "reset_url", "user_name"]),
+		presentationTemplate("invitation", "{{inviter_name}} invited you to {{organization_name}}", "Join as {{role}}: {{invitation_url}}", "<p>{{inviter_name}} invited you to {{organization_name}} as {{role}}: {{invitation_url}}</p>", ["invitation_url", "inviter_name", "organization_name", "role"]),
+	]) {
+		await client.query(
+			`INSERT INTO "${tables.productEmailTemplates}"
+			 (project_id, environment_id, kind, subject, plain_text, html, variables, version, content_hash, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)`,
+			[projectId, environmentId, template.kind, template.subject, template.plainText, template.html, JSON.stringify(template.variables), 1, template.contentHash, now],
+		);
+	}
+}
+
 describe.sequential.skipIf(!available)(
 	"runtime durable delivery transaction wiring",
 	() => {
 		const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
 		const schema = `delivery_runtime_${suffix}`;
 		const schemaOptions = { schema, prefix: "delivery_" };
+		const managementPrefix = "runtime_mgmt_";
+		const managementTables = storeV2TableNames(managementPrefix);
 		const keys = {
 			currentKeyId: "current",
 			keys: { current: randomBytes(32).toString("base64") },
@@ -68,6 +150,12 @@ describe.sequential.skipIf(!available)(
 
 		beforeAll(async () => {
 			await basePool.query(`CREATE SCHEMA "${schema}"`);
+			const client = await basePool.connect();
+			try {
+				await createPresentationAuthorityFixture(client, schema, managementTables);
+			} finally {
+				client.release();
+			}
 			const url = new URL(DATABASE_URL);
 			url.searchParams.set("options", `-csearch_path=${schema}`);
 			bundle = createClearanceAuth({
@@ -255,6 +343,8 @@ describe.sequential.skipIf(!available)(
 				keyring,
 				schema,
 				prefix: "delivery_",
+				managementSchema: schema,
+				managementPrefix,
 				smtp: {
 					host: "127.0.0.1",
 					port: 25,
@@ -302,8 +392,8 @@ describe.sequential.skipIf(!available)(
 						html?: string;
 					};
 					expect(payload.to).toMatch(/@example\.test$/);
-					expect(payload.from).toBe("support@example.test");
-					expect(payload.subject).toBeTruthy();
+					expect(payload.from).toBe('"Runtime Mail" <runtime@example.test>');
+					expect(payload.subject).toMatch(/Runtime Clearance|invited you to Delivery Org/);
 					expect(Boolean(payload.text || payload.html)).toBe(true);
 				}
 				const tables = qualifiedDeliveryTables(schemaOptions);
