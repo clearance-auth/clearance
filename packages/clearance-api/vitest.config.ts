@@ -6,7 +6,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
 	test: {
-		include: ["src/**/*.test.ts"],
+		// Keep this package's suite focused on the API boundaries that cannot be
+		// covered more cheaply by management/runtime tests: delegated authz,
+		// Operation-Key replay, and setup-link fencing.
+		include: [
+			"src/api-key-auth.test.ts",
+			"src/idempotency.test.ts",
+			"src/setup-completion.test.ts",
+		],
 	},
 	// Resolve workspace package to TypeScript source so tests exercise this
 	// change set without a package build step.

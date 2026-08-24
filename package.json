@@ -16,7 +16,7 @@
     "test": "pnpm run build && pnpm run test:only",
     "test:only": "pnpm run test:runtime && pnpm run test:clearance",
     "test:runtime": "pnpm --filter @clearance/core --filter @clearance/sso --filter @clearance/scim --filter @clearance/kysely-adapter --filter @clearance/memory-adapter --filter @clearance/mongo-adapter --filter @clearance/drizzle-adapter --filter @clearance/prisma-adapter test -- --run && pnpm run test:runtime:clearance",
-    "test:runtime:clearance": "bash scripts/test-runtime.sh",
+    "test:runtime:clearance": "pnpm --filter @clearance/runtime test -- --run",
     "test:clearance": "pnpm --filter @clearance/auth --filter @clearance/management --filter @clearance/management-client --filter @clearance/delivery --filter @clearance/delivery-worker --filter @clearance/verification --filter @clearance/vault --filter @clearance/cli --filter @clearance/api --filter @clearance/sample-b2b --filter @clearance/console test",
     "smoke": "bash scripts/local-smoke.sh",
     "smoke:import": "bash scripts/smoke-import.sh",

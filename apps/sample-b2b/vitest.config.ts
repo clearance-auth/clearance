@@ -9,6 +9,13 @@ export default defineConfig({
 	resolve: {
 		alias: [
 			{
+				find: "@clearance/auth/management-internal",
+				replacement: resolve(
+					here,
+					"../../packages/clearance-auth/src/management-internal.ts",
+				),
+			},
+			{
 				find: "@clearance/auth/secret-policy",
 				replacement: resolve(
 					here,
