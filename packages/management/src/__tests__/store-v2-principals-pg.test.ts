@@ -32,7 +32,7 @@ import { PgStoreV2Shadow } from "../store/store-v2-shadow.js";
 import type { StoreV2PrincipalRepository } from "../store/types.js";
 import type { User } from "../types/resources.js";
 import { gatePostgresSuite } from "./pg-gate.js";
-import { closeAuthBundle } from "../auth-bridge.js";
+import { closeAuthBundle, ensureAuthMigrated } from "../auth-bridge.js";
 import {
 	storeV2TableNames,
 } from "../store/store-v2-schema.js";
@@ -59,11 +59,12 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 	const previousRuntimeAuditPrefix = process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX;
 	const previousRuntimeAuditSchema = process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA;
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		process.env.DATABASE_URL = DATABASE_URL;
 		process.env.CLEARANCE_SECRET = "principal-authority-runtime-test-secret";
 		process.env.CLEARANCE_RUNTIME_AUDIT_PREFIX = RUNTIME_AUDIT_PREFIX;
 		process.env.CLEARANCE_RUNTIME_AUDIT_SCHEMA = "public";
+		await ensureAuthMigrated();
 	});
 
 	afterAll(async () => {
