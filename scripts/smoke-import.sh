@@ -26,7 +26,10 @@ fail() {
 }
 
 # Shipping Clearance product packages under acceptance.
-mapfile -t SHIPPING < <(node scripts/release-packages.mjs names)
+SHIPPING=()
+while IFS= read -r package_name; do
+  SHIPPING+=("$package_name")
+done < <(node scripts/release-packages.mjs names)
 
 required_dist_for() {
   case "$1" in
@@ -173,12 +176,20 @@ EOF
 }
 
 assert_isolated_resolution() {
-  local shipping_json
+  local key_management_config shipping_json
   shipping_json="$(node "$ROOT/scripts/release-packages.mjs" json)" \
     || fail "canonical release package list could not be loaded"
+  key_management_config="$(
+    CLEARANCE_CREDENTIAL_KEY="packed-credential-key-value-32-chars" \
+      CLEARANCE_CREDENTIAL_KEY_ID="packed-k1" \
+      node "$ROOT/scripts/local-key-management-config.mjs"
+  )" || fail "isolated key-management config could not be derived"
   cd "$CONSUMER"
   # Embed monorepo root so the consumer can detect accidental workspace leaks.
-  CLEARANCE_SMOKE_PACKAGES="$shipping_json" ROOT_FOR_CHECK="$ROOT" node --input-type=module <<'EOF' || exit 1
+  CLEARANCE_SMOKE_KEY_MANAGEMENT_CONFIG="$key_management_config" \
+    CLEARANCE_SMOKE_PACKAGES="$shipping_json" \
+    ROOT_FOR_CHECK="$ROOT" \
+    node --input-type=module <<'EOF' || exit 1
 import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs";
@@ -454,6 +465,8 @@ if (!fs.existsSync(upgradeResult.plan.path) || !upgradeResult.plan.path.startsWi
   process.exit(1);
 }
 const packagedPreflight = path.join(clearancePkgDir, "dist", "ops", "scripts", "upgrade-preflight.sh");
+const productConfiguration = path.join(upgradeDir, "product-configuration.env");
+fs.writeFileSync(productConfiguration, "CLEARANCE_EMAIL_DOMAIN_RECORDS_JSON=[]\n", { mode: 0o600 });
 const preflight = spawnSync("bash", [
   packagedPreflight,
   "--plan",
@@ -472,6 +485,39 @@ const preflight = spawnSync("bash", [
     CLEARANCE_SECRET: "packed-clearance-secret-value-32-chars",
     CLEARANCE_CREDENTIAL_KEY: "packed-credential-key-value-32-chars",
     CLEARANCE_CREDENTIAL_KEY_ID: "packed-k1",
+    CLEARANCE_DELIVERY_KEY_ID: "packed-delivery-v1",
+    CLEARANCE_DELIVERY_KEYS_JSON: JSON.stringify({ "packed-delivery-v1": "1".repeat(64) }),
+    CLEARANCE_DELIVERY_FINGERPRINT_KEY_ID: "packed-fingerprint-v1",
+    CLEARANCE_DELIVERY_FINGERPRINT_KEYS_JSON: JSON.stringify({ "packed-fingerprint-v1": "2".repeat(64) }),
+    CLEARANCE_DELIVERY_SOURCE_DEDUPE_KEY: "3".repeat(64),
+    CLEARANCE_DELIVERY_SCHEMA: "public",
+    CLEARANCE_DELIVERY_PREFIX: "packed_delivery_",
+    CLEARANCE_DELIVERY_QUOTA_MAX_ACTIVE: "10000",
+    CLEARANCE_DELIVERY_QUOTA_MAX_BACKLOG: "5000",
+    CLEARANCE_DELIVERY_QUOTA_MAX_ENQUEUES_PER_WINDOW: "1000",
+    CLEARANCE_DELIVERY_QUOTA_WINDOW_MS: "60000",
+    CLEARANCE_DELIVERY_CONCURRENCY: "4",
+    CLEARANCE_DELIVERY_POLL_MS: "500",
+    CLEARANCE_DELIVERY_LEASE_MS: "60000",
+    CLEARANCE_DELIVERY_HEARTBEAT_MS: "10000",
+    CLEARANCE_DELIVERY_MAINTENANCE_MS: "30000",
+    CLEARANCE_DELIVERY_DRAIN_TIMEOUT_MS: "30000",
+    CLEARANCE_DELIVERY_MAX_BODY_BYTES: "1048576",
+    CLEARANCE_DELIVERY_APP_NAME: "Clearance packed smoke",
+    CLEARANCE_DELIVERY_HEALTH_PUBLISHED_PORT: "8091",
+    CLEARANCE_EMAIL_TRANSPORT: "smtp",
+    CLEARANCE_EMAIL_FROM: "auth@packed.example.test",
+    CLEARANCE_SMTP_HOST: "smtp.packed.example.test",
+    CLEARANCE_SMTP_PORT: "587",
+    CLEARANCE_SMTP_SECURE: "false",
+    CLEARANCE_SMTP_REQUIRE_TLS: "true",
+    CLEARANCE_SMTP_CONNECTION_TIMEOUT_MS: "10000",
+    CLEARANCE_SMTP_SOCKET_TIMEOUT_MS: "30000",
+    CLEARANCE_SMTP_GREETING_TIMEOUT_MS: "10000",
+    CLEARANCE_WEBHOOK_DNS_TIMEOUT_MS: "5000",
+    CLEARANCE_WEBHOOK_CONNECT_TIMEOUT_MS: "5000",
+    CLEARANCE_WEBHOOK_RESPONSE_TIMEOUT_MS: "10000",
+    CLEARANCE_WEBHOOK_MAX_RESPONSE_BYTES: "65536",
     CLEARANCE_CONSOLE_ADMIN_USER: "packed-admin",
     CLEARANCE_CONSOLE_ADMIN_PASSWORD: "packed-console-password-value-32",
     CLEARANCE_CONSOLE_SESSION_SECRET: "packed-console-session-value-32",
@@ -482,13 +528,23 @@ const preflight = spawnSync("bash", [
     CLEARANCE_BASE_URL: "http://localhost:3000",
     CLEARANCE_CONSOLE_URL: "http://localhost:3100",
     CLEARANCE_CORS_ORIGINS: "http://localhost:3100",
+    CLEARANCE_CUSTOM_DOMAIN_TARGET: "edge.packed.example.test",
+    CLEARANCE_PRODUCT_CONFIGURATION_ENV_FILE: productConfiguration,
     CLEARANCE_API_PORT: "3200",
     CLEARANCE_CONSOLE_PORT: "3100",
     CLEARANCE_SAMPLE_PORT: "3000",
+    CLEARANCE_VAULT_PORT: "3400",
+    CLEARANCE_VAULT_URL: "https://vault.packed.example.test",
+    CLEARANCE_PROJECT_ID: "packed-project",
+    CLEARANCE_ENV_ID: "packed-environment",
+    CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON: process.env.CLEARANCE_SMOKE_KEY_MANAGEMENT_CONFIG,
     CLEARANCE_PG_VOLUME: "packed-pg",
     CLEARANCE_BACKUP_VOLUME: "packed-backups",
     CLEARANCE_IMAGE_REPOSITORY: "ghcr.io/example/clearance",
     CLEARANCE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
+    CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: "digest-v1",
+    CLEARANCE_DEPLOYMENT_ID: "packed-smoke-deployment",
+    CLEARANCE_INSTANCE_ID: "packed-smoke-instance",
     CLEARANCE_BACKUP_IMAGE_REPOSITORY: "ghcr.io/example/clearance-backup",
     CLEARANCE_BACKUP_IMAGE_DIGEST: `sha256:${"b".repeat(64)}`,
   },
