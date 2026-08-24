@@ -1536,6 +1536,9 @@ async function start() {
 	const store = await sharedManagementStore();
 	await store.ready();
 	if (runtimeDatabaseConfigured()) {
+		// The gateway registers the tenant product facade consumed by the
+		// singleton auth bundle. Registration must precede the first bundle read.
+		applicationFor(store);
 		await getAuthBundle().credentialAuthority.assertRuntimeServing();
 	}
 
