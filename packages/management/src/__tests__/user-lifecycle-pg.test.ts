@@ -876,9 +876,10 @@ describe.sequential.skipIf(!available)("user lifecycle Postgres runtime + manage
 					scope,
 				}),
 			).resolves.toMatchObject({ idempotent: false });
-			await expect(
-				scopedPool.query(`SELECT 1 FROM "sessionCredential"`),
-			).rejects.toMatchObject({ code: "42P01" });
+			const credentialTable = await scopedPool.query<{ table: string | null }>(
+				`SELECT to_regclass(format('%I.%I', current_schema(), 'sessionCredential')) AS table`,
+			);
+			expect(credentialTable.rows[0]?.table).toBeNull();
 
 			const disabledUser = await createLegacyUser("disable");
 			await seedRawAuthorities(disabledUser.id, "disable");

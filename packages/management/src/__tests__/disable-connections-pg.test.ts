@@ -429,8 +429,10 @@ describe.skipIf(!available)(
 
 			const b = getAuthBundle();
 			await b.pool.query(
-				`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
-         values ($1,$2,$3,$4)`,
+				`insert into "scimProvider" (
+					id, "providerId", "scimToken", "organizationId",
+					"keyManagementVersion", "keyManagementRevision"
+				) values ($1,$2,$3,$4,1,1)`,
 				[
 					connectionId,
 					providerId,
@@ -529,8 +531,10 @@ describe.skipIf(!available)(
 
 			const b = getAuthBundle();
 			await b.pool.query(
-				`insert into "scimProvider" (id, "providerId", "scimToken", "organizationId")
-         values ($1,$2,$3,$4)`,
+				`insert into "scimProvider" (
+					id, "providerId", "scimToken", "organizationId",
+					"keyManagementVersion", "keyManagementRevision"
+				) values ($1,$2,$3,$4,1,1)`,
 				[
 					connectionId,
 					providerId,

@@ -76,6 +76,8 @@ open http://localhost:13100/overview   # console
 
 `stack:up` derives a stable, purpose-separated local key-management
 configuration from `CLEARANCE_CREDENTIAL_KEY` and `CLEARANCE_CREDENTIAL_KEY_ID`.
+It also migrates a fresh Postgres credential-authority fence to `digest-v1`
+before starting the serving cohort.
 Set `CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON` only when intentionally supplying
 your own local provider configuration; production requires its operator-managed
 configuration through the production overlay.

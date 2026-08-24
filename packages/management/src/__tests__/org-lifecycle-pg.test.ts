@@ -19,6 +19,7 @@ import {
 	type PgStore,
 	type PgStoreDeliveryOptions,
 } from "../store/pg-store.js";
+import { storeV2TableNames } from "../store/store-v2-schema.js";
 import { wrapInternalCoordinatedExecutor } from "../store/coordinated-internal.js";
 import {
 	createDeliveryKeyring,
@@ -77,6 +78,7 @@ if (DATABASE_URL.includes(":5434")) {
 const TEST_TABLE = `clearance_mgmt_org_lc_${process.pid}`;
 const TOPOLOGY_TABLE = `${TEST_TABLE}_topology`;
 const TOPOLOGY_PREFIX = `${TOPOLOGY_TABLE}_n_`;
+const TOPOLOGY_STORE_V2_TABLES = storeV2TableNames(TOPOLOGY_PREFIX);
 const STARTUP_ABSENT_TABLE = `${TEST_TABLE}_startup_absent`;
 const STARTUP_ABSENT_PREFIX = `${STARTUP_ABSENT_TABLE}_n_`;
 const DELIVERY_PREFIX = `org_lc_delivery_${process.pid}_`;
@@ -241,9 +243,7 @@ describe.skipIf(!available)(
 			const pool = new pg.Pool({ connectionString: DATABASE_URL });
 			try {
 				for (const table of [
-					`${TOPOLOGY_PREFIX}events`, `${TOPOLOGY_PREFIX}principals`,
-					`${TOPOLOGY_PREFIX}organizations`, `${TOPOLOGY_PREFIX}environments`,
-					`${TOPOLOGY_PREFIX}projects`, `${TOPOLOGY_PREFIX}meta`,
+					...Object.values(TOPOLOGY_STORE_V2_TABLES),
 					`${TOPOLOGY_TABLE}_principal_email`, `${TOPOLOGY_TABLE}_organization_slug`,
 					`${TOPOLOGY_TABLE}_idempotency`, TOPOLOGY_TABLE,
 				]) await pool.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
@@ -308,6 +308,10 @@ describe.skipIf(!available)(
 					`${TOPOLOGY_PREFIX}environments`,
 					`${TOPOLOGY_PREFIX}projects`,
 					`${TOPOLOGY_PREFIX}meta`,
+					TOPOLOGY_STORE_V2_TABLES.productPresentations,
+					TOPOLOGY_STORE_V2_TABLES.productAuthDomains,
+					TOPOLOGY_STORE_V2_TABLES.productEmailSenders,
+					TOPOLOGY_STORE_V2_TABLES.productEmailTemplates,
 					`${TOPOLOGY_TABLE}_principal_email`,
 					`${TOPOLOGY_TABLE}_organization_slug`,
 					`${TOPOLOGY_TABLE}_idempotency`,

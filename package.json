@@ -26,7 +26,7 @@
     "dev:console": "pnpm --filter @clearance/console dev",
     "dev:vault": "pnpm --filter @clearance/vault build && pnpm --filter @clearance/vault-host dev",
     "dev:sample": "pnpm --filter @clearance/sample-b2b dev",
-    "stack:up": "bash scripts/local-stack.sh up -d --build",
+    "stack:up": "bash scripts/local-stack.sh bootstrap",
     "stack:down": "bash scripts/local-stack.sh down",
     "stack:destroy": "bash scripts/local-stack.sh down -v",
     "stack:status": "bash scripts/local-stack.sh ps",

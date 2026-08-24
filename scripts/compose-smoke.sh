@@ -93,8 +93,7 @@ wait_for() {
 
   [[ -f "$CLI_NODE" ]] || pnpm build
   "${COMPOSE[@]}" config --quiet
-  "${COMPOSE[@]}" build
-  if ! "${COMPOSE[@]}" up -d; then
+  if ! COMPOSE_PROJECT_NAME="$PROJECT" bash "$ROOT/scripts/local-stack.sh" bootstrap; then
     "${COMPOSE[@]}" ps --all >&2 || true
     "${COMPOSE[@]}" logs --no-color >&2 || true
     exit 1
