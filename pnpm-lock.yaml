@@ -467,9 +467,6 @@ importers:
       '@clearance/auth':
         specifier: workspace:*
         version: link:../clearance-auth
-      '@clearance/core':
-        specifier: workspace:*
-        version: link:../core
       '@clearance/delivery':
         specifier: workspace:*
         version: link:../delivery
@@ -480,6 +477,9 @@ importers:
         specifier: ^8.14.1
         version: 8.22.0
     devDependencies:
+      '@clearance/core':
+        specifier: workspace:*
+        version: link:../core
       '@clearance/scim':
         specifier: workspace:*
         version: link:../scim
