@@ -35,7 +35,7 @@
   },
   "devDependencies": {
     "tsdown": "catalog:",
-    "tsx": "^4.23.1",
+    "tsx": "^4.23.12",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

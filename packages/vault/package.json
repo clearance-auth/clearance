@@ -45,7 +45,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
-    "happy-dom": "^20.10.6",
+    "happy-dom": "^20.11.2",
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
