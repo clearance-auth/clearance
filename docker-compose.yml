@@ -45,6 +45,13 @@ services:
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
       CLEARANCE_CREDENTIAL_KEY: ${CLEARANCE_CREDENTIAL_KEY:?set CLEARANCE_CREDENTIAL_KEY}
       CLEARANCE_CREDENTIAL_KEY_ID: ${CLEARANCE_CREDENTIAL_KEY_ID:?set CLEARANCE_CREDENTIAL_KEY_ID}
+      # Keep strict local stacks on the explicit post-migration authority;
+      # production overrides this with an operator-required generation.
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:-digest-v1}
+      # Strict local API startup also needs a stable deployment identity. The
+      # production overlay replaces this development identifier and requires
+      # an operator-supplied immutable candidate value.
+      CLEARANCE_DEPLOYMENT_ID: ${CLEARANCE_DEPLOYMENT_ID:-development}
       # Supplying the complete delivery keyring enables transactional delivery
       # producers and controls in the API. Empty values keep the local stack's
       # backwards-compatible delivery-disabled mode.
@@ -269,6 +276,7 @@ services:
     environment:
       SAMPLE_APP_PORT: "3000"
       CLEARANCE_SECRET: ${CLEARANCE_SECRET:?set CLEARANCE_SECRET}
+      CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION: ${CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION:-digest-v1}
       CLEARANCE_BASE_URL: http://localhost:${CLEARANCE_SAMPLE_PORT:-13300}
       CLEARANCE_GITHUB_CLIENT_ID: ${CLEARANCE_GITHUB_CLIENT_ID-}
       CLEARANCE_GITHUB_CLIENT_SECRET: ${CLEARANCE_GITHUB_CLIENT_SECRET-}

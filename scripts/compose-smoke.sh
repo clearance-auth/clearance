@@ -27,6 +27,9 @@ export CLEARANCE_SECRET="${CLEARANCE_SECRET:-$(rand)}"
 export CLEARANCE_OPERATOR_TOKEN="${CLEARANCE_OPERATOR_TOKEN:-$(rand)}"
 export CLEARANCE_CREDENTIAL_KEY="${CLEARANCE_CREDENTIAL_KEY:-$(rand)}"
 export CLEARANCE_CREDENTIAL_KEY_ID="${CLEARANCE_CREDENTIAL_KEY_ID:-smoke-v1}"
+# This smoke stack starts from a blank database and therefore exercises only
+# the post-migration authority. Do not inherit a bridge-generation override.
+export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
 export CLEARANCE_CONSOLE_ADMIN_USER="${CLEARANCE_CONSOLE_ADMIN_USER:-smoke-admin}"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="${CLEARANCE_CONSOLE_ADMIN_PASSWORD:-$(rand)}"
 export CLEARANCE_CONSOLE_SESSION_SECRET="${CLEARANCE_CONSOLE_SESSION_SECRET:-$(rand)}"
