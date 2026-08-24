@@ -67,7 +67,7 @@ function reader(overrides: Partial<ManagementDeliveryControlReader> = {}): Manag
 		}),
 		readiness: async () => ({
 			ready: true,
-			schema: { owner: "clearance.delivery", version: 3, currentVersion: 3, current: true },
+			schema: { owner: "clearance.delivery", installedVersion: 3, expectedVersion: 3, isUpToDate: true },
 			jobs: { queued: 1, leased: 0, retry: 0, delivered: 0, dead: 0, cancelled: 0 },
 			workers: { total: 1, ready: 1, freshReady: 1, stale: 0, staleAfterMs: 60_000, lastSeenAt: null },
 			keys: { checked: true, available: true, missingReferences: 0 },

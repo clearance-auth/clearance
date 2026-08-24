@@ -776,7 +776,7 @@ export async function preloadRecoveryFactorRepairCapability(
 	if (!bearer || !text(bearer, 512)) return null;
 	const identifier = await capabilityIdentifier(bearer);
 	const verification =
-		await ctx.context.internalAdapter.findVerificationValue(identifier);
+		await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 	const metadata = parseMetadata(verification?.value);
 	if (
 		!verification ||

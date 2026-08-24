@@ -1897,24 +1897,24 @@ type _CanonicalToOutput93 = AssertAssignable<
 	ManagementOperationTypes["migrations.plan"]["output"]
 >;
 
-/** migrations.run */
+/** migrations.apply */
 type _InputToCanonical94 = AssertAssignable<
-	ManagementOperationTypes["migrations.run"]["input"],
-	OperationInput<ManagementOperationRegistry["migrations.run"]>
+	ManagementOperationTypes["migrations.apply"]["input"],
+	OperationInput<ManagementOperationRegistry["migrations.apply"]>
 >;
 type _CanonicalToInput94 = AssertAssignable<
-	OperationInput<ManagementOperationRegistry["migrations.run"]>,
-	ManagementOperationTypes["migrations.run"]["input"]
+	OperationInput<ManagementOperationRegistry["migrations.apply"]>,
+	ManagementOperationTypes["migrations.apply"]["input"]
 >;
 
-/** migrations.run */
+/** migrations.apply */
 type _OutputToCanonical94 = AssertAssignable<
-	ManagementOperationTypes["migrations.run"]["output"],
-	OperationOutput<ManagementOperationRegistry["migrations.run"]>
+	ManagementOperationTypes["migrations.apply"]["output"],
+	OperationOutput<ManagementOperationRegistry["migrations.apply"]>
 >;
 type _CanonicalToOutput94 = AssertAssignable<
-	OperationOutput<ManagementOperationRegistry["migrations.run"]>,
-	ManagementOperationTypes["migrations.run"]["output"]
+	OperationOutput<ManagementOperationRegistry["migrations.apply"]>,
+	ManagementOperationTypes["migrations.apply"]["output"]
 >;
 
 /** migrations.verify */

@@ -44,7 +44,7 @@ export function createSP(
 	baseURL: string,
 	providerId: string,
 	opts?: {
-		clockSkew?: number;
+		clockSkewMs?: number;
 		relayState?: string;
 		sloOptions?: {
 			wantLogoutRequestSigned?: boolean;
@@ -95,8 +95,8 @@ export function createSP(
 			: undefined,
 		relayState: opts?.relayState,
 		clockDrifts:
-			opts?.clockSkew && opts?.clockSkew !== 0
-				? [-opts.clockSkew, opts.clockSkew]
+			opts?.clockSkewMs && opts?.clockSkewMs !== 0
+				? [-opts.clockSkewMs, opts.clockSkewMs]
 				: undefined,
 	});
 }

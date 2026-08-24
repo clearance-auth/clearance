@@ -2,32 +2,39 @@ import * as z from "zod";
 import type { OperationSchemaDomain } from "./assemble.js";
 import { resourceScopeSchema } from "./primitives.js";
 
-const presentationSchema = z.object({
+const presentationSchema = z
+	.object({
 	productLabel: z.string(),
 	homeLabel: z.string(),
 	accentColor: z.string(),
 	logoUrl: z.string().nullable(),
 	version: z.number(),
 	updatedAt: z.string().nullable(),
-}).strict();
+	})
+	.strict();
 
-const presentationCandidateSchema = z.object({
+const presentationCandidateSchema = z
+	.object({
 	productLabel: z.string(),
 	homeLabel: z.string(),
 	accentColor: z.string(),
 	logoUrl: z.string().nullable().optional(),
-}).strict();
+	})
+	.strict();
 
-const presentationPlanSchema = z.object({
+const presentationPlanSchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	expectedVersion: z.number(),
 	wouldChange: z.boolean(),
 	current: presentationSchema,
 	candidate: presentationSchema,
-}).strict();
+	})
+	.strict();
 
-const domainSchema = z.object({
+const domainSchema = z
+	.object({
 	origin: z.string(),
 	hostname: z.string(),
 	dnsName: z.string(),
@@ -35,56 +42,71 @@ const domainSchema = z.object({
 	version: z.number(),
 	verifiedAt: z.string().nullable(),
 	updatedAt: z.string(),
-}).strict();
+	})
+	.strict();
 
-const domainControlSchema = z.object({
+const domainControlSchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	operation: z.enum(["verify", "activate", "disable"]),
 	dryRun: z.boolean(),
 	wouldChange: z.boolean(),
 	domain: domainSchema,
-}).strict();
+	})
+	.strict();
 
-const domainChallengeSchema = z.object({
+const domainChallengeSchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	domain: domainSchema,
-	dnsChallenge: z.object({
+		dnsChallenge: z
+			.object({
 		name: z.string(),
 		value: z.string(),
-	}).strict(),
-}).strict();
+			})
+			.strict(),
+	})
+	.strict();
 
-const domainChallengeReplaySchema = z.object({
+const domainChallengeReplaySchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	domain: domainSchema,
 	challengeAlreadyIssued: z.literal(true),
 	oneTimeSecretsOmitted: z.tuple([z.literal("dnsChallenge.value")]),
-}).strict();
+	})
+	.strict();
 
-const senderSchema = z.object({
+const senderSchema = z
+	.object({
 	displayName: z.string(),
 	address: z.string(),
 	domain: z.string(),
 	version: z.number(),
 	updatedAt: z.string().nullable(),
-}).strict();
+	})
+	.strict();
 
-const senderCandidateSchema = z.object({
+const senderCandidateSchema = z
+	.object({
 	displayName: z.string(),
 	address: z.string(),
-}).strict();
+	})
+	.strict();
 
-const senderPlanSchema = z.object({
+const senderPlanSchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	expectedVersion: z.number(),
 	wouldChange: z.boolean(),
 	current: senderSchema.nullable(),
 	candidate: senderSchema,
-}).strict();
+	})
+	.strict();
 
 const templateKindSchema = z.enum([
 	"verification",
@@ -92,7 +114,8 @@ const templateKindSchema = z.enum([
 	"invitation",
 	"email-change",
 ]);
-const templateSchema = z.object({
+const templateSchema = z
+	.object({
 	kind: templateKindSchema,
 	subject: z.string(),
 	plainText: z.string(),
@@ -101,69 +124,83 @@ const templateSchema = z.object({
 	version: z.number(),
 	hash: z.string(),
 	updatedAt: z.string().nullable(),
-}).strict();
+	})
+	.strict();
 
-const templateCandidateSchema = z.object({
+const templateCandidateSchema = z
+	.object({
 	kind: templateKindSchema,
 	subject: z.string(),
 	plainText: z.string(),
 	html: z.string(),
-}).strict();
+	})
+	.strict();
 
-const templatePlanSchema = z.object({
+const templatePlanSchema = z
+	.object({
 	schemaVersion: z.literal("v1"),
 	scope: resourceScopeSchema,
 	expectedVersion: z.number(),
 	wouldChange: z.boolean(),
 	current: templateSchema,
 	candidate: templateSchema,
-}).strict();
+	})
+	.strict();
 
 export const PRODUCT_PRESENTATION_OPERATION_SCHEMAS = {
 	"product_presentation.get": {
 		input: z.object({}).strict(),
-		output: z.object({
+		output: z
+			.object({
 			schemaVersion: z.literal("v1"),
 			scope: resourceScopeSchema,
 			presentation: presentationSchema,
-		}).strict(),
+			})
+			.strict(),
 	},
 	"product_presentation.plan": {
 		input: presentationCandidateSchema,
 		output: presentationPlanSchema,
 	},
 	"product_presentation.apply": {
-		input: presentationCandidateSchema.extend({
+		input: presentationCandidateSchema
+			.extend({
 			expectedVersion: z.number(),
 			dryRun: z.boolean().optional(),
 			confirm: z.boolean().optional(),
-		}).strict(),
-		output: z.object({
+			})
+			.strict(),
+		output: z
+			.object({
 			dryRun: z.boolean(),
-			result: presentationPlanSchema.extend({
+				result: presentationPlanSchema
+					.extend({
 				changed: z.boolean().optional(),
 				previousVersion: z.number().optional(),
 				version: z.number().optional(),
-			}).strict(),
-		}).strict(),
+					})
+					.strict(),
+			})
+			.strict(),
 	},
 	"product_domains.list": {
 		input: z.object({}).strict(),
-		output: z.object({
+		output: z
+			.object({
 			schemaVersion: z.literal("v1"),
 			scope: resourceScopeSchema,
 			domains: z.array(domainSchema),
-		}).strict(),
+			})
+			.strict(),
 	},
 	"product_domains.create": {
 		input: z.object({ origin: z.string() }).strict(),
-		output: z.union([
-			domainChallengeSchema,
-			domainChallengeReplaySchema,
-		]),
+		output: z.union([domainChallengeSchema, domainChallengeReplaySchema]),
 	},
 	"product_domains.reissue": {
-		input: z.object({ origin: z.string(), expectedVersion: z.number() }).strict(),
+		input: z
+			.object({ origin: z.string(), expectedVersion: z.number() })
+			.strict(),
 		output: z.union([domainChallengeSchema, domainChallengeReplaySchema]),
 	},
 	"product_domains.verify": {
@@ -171,84 +208,128 @@ export const PRODUCT_PRESENTATION_OPERATION_SCHEMAS = {
 		output: domainControlSchema,
 	},
 	"product_domains.activate": {
-		input: z.object({
+		input: z
+			.object({
 			origin: z.string(),
 			expectedVersion: z.number(),
 			dryRun: z.boolean().optional(),
 			confirm: z.boolean().optional(),
-		}).strict(),
+			})
+			.strict(),
 		output: domainControlSchema,
 	},
 	"product_domains.disable": {
-		input: z.object({
+		input: z
+			.object({
 			origin: z.string(),
 			expectedVersion: z.number(),
 			dryRun: z.boolean().optional(),
 			confirm: z.boolean().optional(),
-		}).strict(),
+			})
+			.strict(),
 		output: domainControlSchema,
 	},
 	"product_sender.get": {
 		input: z.object({}).strict(),
-		output: z.object({ schemaVersion: z.literal("v1"), scope: resourceScopeSchema, sender: senderSchema.nullable() }).strict(),
+		output: z
+			.object({
+				schemaVersion: z.literal("v1"),
+				scope: resourceScopeSchema,
+				sender: senderSchema.nullable(),
+			})
+			.strict(),
 	},
 	"product_sender.plan": {
 		input: senderCandidateSchema,
 		output: senderPlanSchema,
 	},
 	"product_sender.apply": {
-		input: senderCandidateSchema.extend({ expectedVersion: z.number(), dryRun: z.boolean().optional(), confirm: z.boolean().optional() }).strict(),
-		output: z.object({ dryRun: z.boolean(), result: senderPlanSchema.extend({ changed: z.boolean().optional(), previousVersion: z.number().optional(), version: z.number().optional() }).strict() }).strict(),
+		input: senderCandidateSchema
+			.extend({
+				expectedVersion: z.number(),
+				dryRun: z.boolean().optional(),
+				confirm: z.boolean().optional(),
+			})
+			.strict(),
+		output: z
+			.object({
+				dryRun: z.boolean(),
+				result: senderPlanSchema
+					.extend({
+						changed: z.boolean().optional(),
+						previousVersion: z.number().optional(),
+						version: z.number().optional(),
+					})
+					.strict(),
+			})
+			.strict(),
 	},
 	"product_sender.readiness": {
 		input: z.object({ staleAfterMs: z.number().optional() }).strict(),
-		output: z.object({
+		output: z
+			.object({
 			schemaVersion: z.literal("v1"),
 			scope: resourceScopeSchema,
 			ready: z.boolean(),
-			schema: z.object({
-				current: z.boolean(),
+				schema: z
+					.object({
+						isUpToDate: z.boolean(),
 				owner: z.string().nullable(),
-				version: z.number().nullable(),
-			}).strict(),
-			worker: z.object({
+						installedVersion: z.number().nullable(),
+						expectedVersion: z.number(),
+					})
+					.strict(),
+				worker: z
+					.object({
 				freshReady: z.number(),
 				lastSeenAt: z.string().nullable(),
 				staleAfterMs: z.number(),
-			}).strict(),
-			keys: z.object({
+					})
+					.strict(),
+				keys: z
+					.object({
 				checked: z.boolean(),
 				available: z.boolean(),
 				missingReferences: z.number(),
-			}).strict(),
+					})
+					.strict(),
 			reasons: z.array(z.string()),
-		}).strict(),
+			})
+			.strict(),
 	},
 	"product_templates.get": {
 		input: z.object({ kind: templateKindSchema }).strict(),
-		output: z.object({
+		output: z
+			.object({
 			schemaVersion: z.literal("v1"),
 			scope: resourceScopeSchema,
 			template: templateSchema,
-		}).strict(),
+			})
+			.strict(),
 	},
 	"product_templates.plan": {
 		input: templateCandidateSchema,
 		output: templatePlanSchema,
 	},
 	"product_templates.apply": {
-		input: templateCandidateSchema.extend({
+		input: templateCandidateSchema
+			.extend({
 			expectedVersion: z.number(),
 			dryRun: z.boolean().optional(),
 			confirm: z.boolean().optional(),
-		}).strict(),
-		output: z.object({
+			})
+			.strict(),
+		output: z
+			.object({
 			dryRun: z.boolean(),
-			result: templatePlanSchema.extend({
+				result: templatePlanSchema
+					.extend({
 				changed: z.boolean().optional(),
 				previousVersion: z.number().optional(),
 				version: z.number().optional(),
-			}).strict(),
-		}).strict(),
+					})
+					.strict(),
+			})
+			.strict(),
 	},
 } as const satisfies OperationSchemaDomain;

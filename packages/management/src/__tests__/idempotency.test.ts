@@ -52,7 +52,7 @@ describe("idempotency key + fingerprint primitives", () => {
 		const err = idempotencyConflictError("POST /v1/users");
 		expect(err.code).toBe("IDEMPOTENCY_KEY_CONFLICT");
 		expect(err.status).toBe(409);
-		expect(err.remediation).toMatch(/fresh Idempotency-Key/);
+		expect(err.remediation).toMatch(/fresh Operation-Key/);
 	});
 
 	it("TTL env override is validated fail-closed", () => {
@@ -70,6 +70,43 @@ describe("idempotency key + fingerprint primitives", () => {
 });
 
 describe("in-memory backend (JSON store)", () => {
+	it("claims before side effects, waits concurrent callers, and fences stale completions", async () => {
+		let now = 1_000_000;
+		const backend = createIdempotencyBackend(newStore(), { ttlMs: 60_000, now: () => now });
+		const input = { scopeKey: "POST /v1/keys", key: "race", fingerprint: "fp", leaseMs: 1_000 };
+		const first = await backend.claim(input);
+		expect(first).toEqual({ state: "claimed", generation: 1 });
+		expect(await backend.claim(input)).toEqual({ state: "pending", generation: 1 });
+		now += 1_001;
+		const recovered = await backend.claim(input);
+		expect(recovered).toEqual({ state: "claimed", generation: 2 });
+		if (first.state !== "claimed" || recovered.state !== "claimed") throw new Error("expected claims");
+		expect(await backend.complete({ ...input, generation: first.generation, status: 201, contentType: "application/json", body: "stale" })).toBe(false);
+		expect(await backend.complete({ ...input, generation: recovered.generation, status: 201, contentType: "application/json", body: "current" })).toBe(true);
+		expect(await backend.get(input.scopeKey, input.key)).toMatchObject({ body: "current" });
+	});
+
+	it("keeps an active pending claim when its requested TTL is shorter than its lease", async () => {
+		let now = 1_000_000;
+		const backend = createIdempotencyBackend(newStore(), { ttlMs: 10, now: () => now });
+		const input = { scopeKey: "POST /v1/keys", key: "short-ttl", fingerprint: "fp", leaseMs: 1_000 };
+		expect(await backend.claim(input)).toEqual({ state: "claimed", generation: 1 });
+		now += 11;
+		expect(await backend.claim(input)).toEqual({ state: "pending", generation: 1 });
+	});
+
+	it("renewal keeps a long-running generation pending beyond its original lease", async () => {
+		let now = 1_000_000;
+		const backend = createIdempotencyBackend(newStore(), { ttlMs: 10, now: () => now });
+		const input = { scopeKey: "POST /v1/keys", key: "renew", fingerprint: "fp", leaseMs: 1_000 };
+		const claim = await backend.claim(input);
+		if (claim.state !== "claimed") throw new Error("expected claim");
+		now += 900;
+		expect(await backend.renew({ ...input, generation: claim.generation })).toBe(true);
+		now += 200;
+		expect(await backend.claim(input)).toEqual({ state: "pending", generation: claim.generation });
+	});
+
 	it("stores and replays a record scoped per route+method", async () => {
 		const backend = createIdempotencyBackend(newStore(), { ttlMs: 60_000 });
 		expect(backend.kind).toBe("memory");

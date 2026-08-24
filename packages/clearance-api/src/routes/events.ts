@@ -7,9 +7,9 @@ import {
 } from "@clearance/management";
 import { Hono } from "hono";
 import { requestActor } from "../request-auth.js";
-import type { ScopedRouteDependencies } from "./shared.js";
+import type { ApplicationRouteDependencies } from "./shared.js";
 
-export interface EventRouteDependencies extends ScopedRouteDependencies {}
+export type EventRouteDependencies = ApplicationRouteDependencies;
 
 export function registerEventRoutes({
 	storeForRequest,

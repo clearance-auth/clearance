@@ -877,17 +877,17 @@ export const listUsers = (opts: AdminOptions) =>
 			}
 
 			try {
-				const users = await ctx.context.internalAdapter.listUsers(
-					Number(ctx.query?.limit) || undefined,
-					Number(ctx.query?.offset) || undefined,
-					ctx.query?.sortBy
+				const users = await ctx.context.internalAdapter.listUsers({
+					limit: Number(ctx.query?.limit) || undefined,
+					offset: Number(ctx.query?.offset) || undefined,
+					sortBy: ctx.query?.sortBy
 						? {
 								field: ctx.query.sortBy,
 								direction: ctx.query.sortDirection || "asc",
 							}
 						: undefined,
-					where.length ? where : undefined,
-				);
+					where: where.length ? where : undefined,
+				});
 				const total = await ctx.context.internalAdapter.countTotalUsers(
 					where.length ? where : undefined,
 				);

@@ -40,8 +40,8 @@ export const emailOTP = (options: EmailOTPOptions) => {
 	const opts = {
 		expiresIn: 5 * 60,
 		generateOTP: () => defaultOTPGenerator(options),
-		storeOTP: "plain",
 		...options,
+		storeOTP: options.storeOTP ?? "keyed",
 	} satisfies EmailOTPOptions;
 
 	const sendVerificationOTPAction = sendVerificationOTP(opts);

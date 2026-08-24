@@ -93,12 +93,12 @@ afterEach(() => {
 	});
 	mocks.compensateSetupConnection.mockImplementation(async (store, input) => {
 		const managementRemoved = await store.mutateDurable((data: {
-			identityConnections: Array<{ id: string; organizationId: string; provider: string }>;
-			directoryConnections: Array<{ id: string; organizationId: string; provider: string }>;
+			ssoConnections: Array<{ id: string; organizationId: string; provider: string }>;
+			scimConnections: Array<{ id: string; organizationId: string; provider: string }>;
 		}) => {
 			const connections = input.kind === "sso"
-				? data.identityConnections
-				: data.directoryConnections;
+				? data.ssoConnections
+				: data.scimConnections;
 			const exact = connections.find((connection) =>
 				connection.id === input.connectionId &&
 				connection.organizationId === input.organizationId &&
@@ -106,11 +106,11 @@ afterEach(() => {
 			);
 			if (!exact) throw new Error("setup compensation exact connection missing");
 			if (input.kind === "sso") {
-				data.identityConnections = data.identityConnections.filter(
+				data.ssoConnections = data.ssoConnections.filter(
 					(connection) => connection.id !== input.connectionId,
 				);
 			} else {
-				data.directoryConnections = data.directoryConnections.filter(
+				data.scimConnections = data.scimConnections.filter(
 					(connection) => connection.id !== input.connectionId,
 				);
 			}
@@ -127,7 +127,7 @@ async function boot() {
 	dirs.push(dir);
 	configureTestEnvironment(join(dir, "data.json"));
 
-	const { app, getStore } = await import("./server.js");
+	const { app, sharedManagementStore } = await import("./server.js");
 	const {
 		createSetupLink,
 		createOrganization,
@@ -135,7 +135,7 @@ async function boot() {
 		listEvents,
 	} = await import("@clearance/management");
 
-	const store = await getStore();
+	const store = await sharedManagementStore();
 	initProject(store, { name: "Setup Completion", source: "api" });
 	const org = createOrganization(store, { name: "Customer Co", source: "api" });
 	await store.ready();
@@ -185,7 +185,7 @@ describe("setup capability completion safety", () => {
 						connectionId: `sso_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
 						providerId: `gen-${Date.now()}`,
 					};
-			const existingMgmt = store.snapshot.identityConnections.find(
+			const existingMgmt = store.snapshot.ssoConnections.find(
 				(c: { id: string }) => c.id === ids.connectionId,
 			);
 			if (existingMgmt) {
@@ -209,9 +209,9 @@ describe("setup capability completion safety", () => {
 				hasClientSecret: true,
 				clientSecretFingerprint: "fp_sso",
 			};
-			store.mutate((data: { identityConnections: unknown[] }) => {
-				if (!data.identityConnections.some((c: { id: string }) => c.id === conn.id)) {
-					data.identityConnections.push(conn);
+			store.mutate((data: { ssoConnections: unknown[] }) => {
+				if (!data.ssoConnections.some((c: { id: string }) => c.id === conn.id)) {
+					data.ssoConnections.push(conn);
 				}
 			});
 			await store.ready();
@@ -224,7 +224,7 @@ describe("setup capability completion safety", () => {
 						connectionId: `scim_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
 						providerId: `gen-scim-${Date.now()}`,
 					};
-			const existingMgmt = store.snapshot.directoryConnections.find(
+			const existingMgmt = store.snapshot.scimConnections.find(
 				(c: { id: string }) => c.id === ids.connectionId,
 			);
 			if (existingMgmt) {
@@ -260,11 +260,11 @@ describe("setup capability completion safety", () => {
 				createdAt: new Date().toISOString(),
 				updatedAt: new Date().toISOString(),
 			};
-			store.mutate((data: { directoryConnections: unknown[] }) => {
+			store.mutate((data: { scimConnections: unknown[] }) => {
 				if (
-					!data.directoryConnections.some((c: { id: string }) => c.id === persisted.id)
+					!data.scimConnections.some((c: { id: string }) => c.id === persisted.id)
 				) {
-					data.directoryConnections.push({ ...persisted });
+					data.scimConnections.push({ ...persisted });
 				}
 			});
 			await store.ready();
@@ -336,7 +336,7 @@ describe("setup capability completion safety", () => {
 		expect(cap.useCount).toBe(0);
 		expect(cap.redeemedAt).toBeFalsy();
 		expect(cap.reservationId).toBeFalsy();
-		expect(store.snapshot.identityConnections).toHaveLength(0);
+		expect(store.snapshot.ssoConnections).toHaveLength(0);
 
 		// Retry with same token can succeed
 		mocks.createSsoConnectionReal.mockImplementation(async (s, input) => {
@@ -348,8 +348,8 @@ describe("setup capability completion safety", () => {
 				status: "draft",
 				hasClientSecret: true,
 			};
-			s.mutate((data: { identityConnections: unknown[] }) => {
-				data.identityConnections.push(conn);
+			s.mutate((data: { ssoConnections: unknown[] }) => {
+				data.ssoConnections.push(conn);
 			});
 			return conn;
 		});
@@ -362,7 +362,7 @@ describe("setup capability completion safety", () => {
 		const retryBody = await retry.json();
 		expect(retryBody.ok).toBe(true);
 		expect(JSON.stringify(retryBody)).not.toContain(link.token);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		const after = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
 		expect(after.useCount).toBe(1);
 		expect(after.redeemedAt).toBeTruthy();
@@ -390,7 +390,7 @@ describe("setup capability completion safety", () => {
 			}),
 		});
 		expect(fail.status).toBeGreaterThanOrEqual(400);
-		expect(store.snapshot.directoryConnections).toHaveLength(0);
+		expect(store.snapshot.scimConnections).toHaveLength(0);
 		const cap = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
 		expect(cap.useCount).toBe(0);
 		expect(cap.redeemedAt).toBeFalsy();
@@ -410,8 +410,8 @@ describe("setup capability completion safety", () => {
 				createdAt: new Date().toISOString(),
 				updatedAt: new Date().toISOString(),
 			};
-			s.mutate((data: { directoryConnections: unknown[] }) => {
-				data.directoryConnections.push({ ...persisted });
+			s.mutate((data: { scimConnections: unknown[] }) => {
+				data.scimConnections.push({ ...persisted });
 			});
 			return { ...persisted, hasBearerToken: true, bearerTokenOnce: tokenOnce };
 		});
@@ -432,7 +432,7 @@ describe("setup capability completion safety", () => {
 		expect(body.scimHandoff?.retrieveAgain).toBe(false);
 		expect(body.scimHandoff?.warning).toMatch(/cannot show the token again/i);
 		expect(JSON.stringify(body)).not.toContain(link.token);
-		expect(store.snapshot.directoryConnections).toHaveLength(1);
+		expect(store.snapshot.scimConnections).toHaveLength(1);
 		// Plaintext handoff token is response-only — not in store snapshot
 		expect(JSON.stringify(store.snapshot)).not.toContain("scimtok_retry_once_value");
 	});
@@ -460,10 +460,10 @@ describe("setup capability completion safety", () => {
 				provider: "entra",
 			};
 			s.mutate((data: {
-				identityConnections: unknown[];
+				ssoConnections: unknown[];
 				setupLinks: Array<{ reservationExpiresAt?: string }>;
 			}) => {
-				data.identityConnections.push(target, unrelated);
+				data.ssoConnections.push(target, unrelated);
 				// Force the later commit step to fail after provisioning returned an id.
 				data.setupLinks[0]!.reservationExpiresAt = new Date(0).toISOString();
 			});
@@ -476,7 +476,7 @@ describe("setup capability completion safety", () => {
 			body: JSON.stringify(ssoBody(link.token, org.id)),
 		});
 		expect(response.status).toBeGreaterThanOrEqual(400);
-		expect(store.snapshot.identityConnections.map((connection) => connection.id)).toEqual([
+		expect(store.snapshot.ssoConnections.map((connection) => connection.id)).toEqual([
 			"sso_unrelated_concurrent",
 		]);
 		expect(mocks.deleteSsoProviderById).toHaveBeenCalledTimes(1);
@@ -505,10 +505,10 @@ describe("setup capability completion safety", () => {
 				hasClientSecret: true,
 			};
 			s.mutate((data: {
-				identityConnections: unknown[];
+				ssoConnections: unknown[];
 				setupLinks: Array<{ reservationExpiresAt?: string }>;
 			}) => {
-				data.identityConnections.push(connection);
+				data.ssoConnections.push(connection);
 				data.setupLinks[0]!.reservationExpiresAt = new Date(0).toISOString();
 			});
 			return connection;
@@ -553,8 +553,8 @@ describe("setup capability completion safety", () => {
 				status: "draft",
 				hasClientSecret: true,
 			};
-			s.mutate((data: { identityConnections: unknown[] }) => {
-				data.identityConnections.push(conn);
+			s.mutate((data: { ssoConnections: unknown[] }) => {
+				data.ssoConnections.push(conn);
 			});
 			// Keep the first request in provisioning after its connection is visible.
 			// A losing reserve must never compensate the winner's connection.
@@ -586,11 +586,94 @@ describe("setup capability completion safety", () => {
 		const r1Body = await r1.json();
 		expect(JSON.stringify(r1Body)).not.toContain(link.token);
 
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		const cap = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
 		expect(cap.useCount).toBe(1);
 		expect(cap.redeemedAt).toBeTruthy();
 		expect(createCalls).toBe(1);
+	});
+
+	it("fences an expired setup request so it cannot compensate the replacement HTTP completion", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-08-23T00:00:00.000Z"));
+		try {
+			const { app, store, org, createSetupLink } = await boot();
+			const link = createSetupLink(store, { organizationId: org.id, kind: "sso" });
+			await store.ready();
+
+			let releaseFirstProvision: (() => void) | undefined;
+			const firstProvisionBlocked = new Promise<void>((resolve) => {
+				releaseFirstProvision = resolve;
+			});
+			let signalFirstProvision: (() => void) | undefined;
+			const firstProvisionEntered = new Promise<void>((resolve) => {
+				signalFirstProvision = resolve;
+			});
+			let provisionCalls = 0;
+			mocks.createSsoConnectionReal.mockImplementation(async (s, input) => {
+				provisionCalls += 1;
+				const ids = deterministicIds("sso", input.setupAttemptId);
+				const connection = {
+					id: ids.connectionId,
+					organizationId: input.organizationId,
+					provider: "okta",
+					protocol: "oidc",
+					status: "draft",
+					hasClientSecret: true,
+				};
+				if (!s.snapshot.ssoConnections.some((item: { id: string }) => item.id === connection.id)) {
+					s.mutate((data: { ssoConnections: unknown[] }) => {
+						data.ssoConnections.push(connection);
+					});
+					runtimeSso.set(connection.id, { id: connection.id, providerId: ids.providerId });
+				}
+				if (provisionCalls === 1) {
+					signalFirstProvision?.();
+					await firstProvisionBlocked;
+				}
+				return connection;
+			});
+			mocks.compensateSetupConnection.mockImplementation(async (_store, input) => {
+				const current = store.snapshot.setupLinks.find((item) => item.id === input.capabilityId);
+				if (current?.reservationFencingToken !== input.reservationFencingToken) {
+					return { managementRemoved: false, runtimeRemoved: false };
+				}
+				throw new Error("stale compensation was incorrectly authorized");
+			});
+
+			const request = () => app.request("/setup/sso", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(ssoBody(link.token, org.id)),
+			});
+			const stale = request();
+			await firstProvisionEntered;
+			expect(provisionCalls).toBe(1);
+			const firstFence = store.snapshot.setupLinks.find((item) => item.id === link.capabilityId)!
+				.reservationFencingToken!;
+
+			vi.setSystemTime(new Date("2026-08-23T00:02:01.000Z"));
+			const replacement = await request();
+			expect(replacement.status).toBe(201);
+			const committed = store.snapshot.setupLinks.find((item) => item.id === link.capabilityId)!;
+			expect(committed.useCount).toBe(1);
+			expect(committed.reservationFencingToken).toBeUndefined();
+
+			releaseFirstProvision?.();
+			const staleResponse = await stale;
+			expect(staleResponse.status).toBeGreaterThanOrEqual(400);
+			expect(mocks.compensateSetupConnection).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.objectContaining({
+					capabilityId: link.capabilityId,
+					reservationFencingToken: firstFence,
+				}),
+			);
+			expect(store.snapshot.ssoConnections).toHaveLength(1);
+			expect(runtimeSso).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("successful completion consumes token and replay fails; no raw token in audits/snapshot", async () => {
@@ -620,7 +703,7 @@ describe("setup capability completion safety", () => {
 		const replayBody = await replay.json();
 		expect(replayBody.error?.code).toMatch(/REPLAY|IN_PROGRESS|NOT_FOUND/i);
 
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		const snap = JSON.stringify(store.snapshot);
 		expect(snap).not.toContain(link.token);
 		const events = JSON.stringify(listEvents(store, { limit: 200 }));
@@ -686,14 +769,14 @@ describe("setup capability completion safety", () => {
 			providerId: ids.providerId,
 		});
 		store.mutate((data: {
-			identityConnections: unknown[];
+			ssoConnections: unknown[];
 			setupLinks: Array<{
 				id: string;
 				reservationExpiresAt?: string;
 				reservationId?: string;
 			}>;
 		}) => {
-			data.identityConnections.push({
+			data.ssoConnections.push({
 				id: ids.connectionId,
 				organizationId: org.id,
 				provider: "okta",
@@ -717,9 +800,9 @@ describe("setup capability completion safety", () => {
 		expect(retry.status).toBe(201);
 		const body = await retry.json();
 		expect(body.connection.id).toBe(ids.connectionId);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		expect(runtimeSso.size).toBe(1);
-		expect(store.snapshot.identityConnections[0]!.id).toBe(ids.connectionId);
+		expect(store.snapshot.ssoConnections[0]!.id).toBe(ids.connectionId);
 
 		const cap = store.snapshot.setupLinks.find((c) => c.id === link.capabilityId)!;
 		expect(cap.useCount).toBe(1);
@@ -734,7 +817,7 @@ describe("setup capability completion safety", () => {
 		expect(replay.status).toBeGreaterThanOrEqual(400);
 		const replayBody = await replay.json();
 		expect(replayBody.error?.code).toMatch(/REPLAY|IN_PROGRESS|NOT_FOUND/i);
-		expect(store.snapshot.identityConnections).toHaveLength(1);
+		expect(store.snapshot.ssoConnections).toHaveLength(1);
 		expect(runtimeSso.size).toBe(1);
 		expect(JSON.stringify(store.snapshot)).not.toContain(link.token);
 		expect(JSON.stringify(listEvents(store, { limit: 200 }))).not.toContain(link.token);

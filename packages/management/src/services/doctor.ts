@@ -7,13 +7,15 @@ import type {
 	DoctorCheck,
 	Environment,
 	Organization,
-	Principal,
+	User,
 	Project,
 } from "../types/resources.js";
 import { STORE_SCHEMA_VERSION } from "../store/json-store.js";
 import { recordEvent } from "./audit.js";
 import { resolveCredentialKeyring } from "./credentials.js";
 import { isForbiddenDefaultSecret } from "./secrets.js";
+
+export const DEFAULT_CLEARANCE_BASE_URL = "http://localhost:3000";
 
 function tcpReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
 	return new Promise((resolvePromise) => {
@@ -256,7 +258,7 @@ async function topologyForDoctor(
 async function principalsForDoctor(
 	store: ManagementStore,
 	environments: readonly Environment[],
-): Promise<Principal[]> {
+): Promise<User[]> {
 	if (!store.storeV2Principals?.authoritative) {
 		return readSnapshotItems(
 			"Principals",
@@ -264,7 +266,7 @@ async function principalsForDoctor(
 			DOCTOR_MAX_PRINCIPALS,
 		).filter((principal) => principal.status !== "deleted");
 	}
-	const principals: Principal[] = [];
+	const principals: User[] = [];
 	const budget = doctorReadBudget(DOCTOR_MAX_PRINCIPALS);
 	for (const environment of environments) {
 		principals.push(
@@ -796,7 +798,7 @@ export async function runDoctor(
 			name: "Base URL",
 			status: "warn",
 			detail: "CLEARANCE_BASE_URL not set",
-			remediation: "export CLEARANCE_BASE_URL=http://localhost:3000",
+			remediation: `export CLEARANCE_BASE_URL=${DEFAULT_CLEARANCE_BASE_URL}`,
 		});
 	}
 

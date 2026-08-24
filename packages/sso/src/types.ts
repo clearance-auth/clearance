@@ -369,7 +369,7 @@ export interface SSOOptions {
 		 *
 		 * @default 300000 (5 minutes)
 		 */
-		clockSkew?: number;
+		clockSkewMs?: number;
 		/**
 		 * Require an expiry-bounding NotOnOrAfter condition in SAML assertions.
 		 * NotBefore remains optional and is validated when present. When enabled,

@@ -492,7 +492,7 @@ describe("oidc", async () => {
 			error_description: "Invalid code",
 		});
 		const stored =
-			await context.internalAdapter.findVerificationValue(identifier);
+			await context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 		if (fixture.value === undefined) {
 			expect(stored).toBeNull();
 		} else {
@@ -526,7 +526,7 @@ describe("oidc", async () => {
 			error_description: "Code expired",
 		});
 		expect(
-			await context.internalAdapter.findVerificationValue(identifier),
+			await context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).toMatchObject({ value });
 	});
 
@@ -604,7 +604,7 @@ describe("oidc", async () => {
 		expect(preloadedSubject).toBe(subject.id);
 		expect(rejected.error).toMatchObject({ code: "UNAUTHORIZED" });
 		expect(
-			await context.internalAdapter.findVerificationValue(identifier),
+			await context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).toMatchObject({ value });
 		expect(await cachedDb.count({ model: "oauthConsent" })).toBe(
 			consentCountBefore,
@@ -2306,7 +2306,7 @@ describe("oidc token response format", async () => {
 	/**
 	 * Concurrent redemption of the same authorization code must mint tokens
 	 * for exactly one caller. Reverting `consumeVerificationValue` back to a
-	 * `findVerificationValue` + `deleteVerificationByIdentifier` pair makes
+	 * `findVerificationValueAndPruneExpired` + `deleteVerificationByIdentifier` pair makes
 	 * this test fail with two successes.
 	 *
 	 * @see https://github.com/clearance-auth/clearance
@@ -3230,7 +3230,7 @@ describe("oidc-provider discovery metadata and PKCE gate (security)", () => {
 		// broke PKCE verification.
 		const code = new URL(location).searchParams.get("code")!;
 		const { internalAdapter } = await auth.$context;
-		const stored = await internalAdapter.findVerificationValue(code);
+		const stored = await internalAdapter.findVerificationValueAndPruneExpired(code);
 		expect(stored).toBeDefined();
 		const storedValue = JSON.parse(stored!.value) as {
 			codeChallengeMethod?: string;

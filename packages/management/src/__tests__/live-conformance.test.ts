@@ -326,6 +326,10 @@ describe("readiness liveCertified flips only on BOTH live passes", () => {
 		});
 
 		const before = runReadinessCheck(store, org.id);
+		store.mutate((data) => {
+			const index = data.scimConnections.findIndex((connection) => connection.id === scim.id);
+			data.scimConnections[index] = { ...data.scimConnections[index]!, status: "testing", updatedAt: scim.createdAt };
+		});
 		expect(before.conformance.liveCertified).toBe(false);
 
 		await testSsoConnectionLive(store, sso.id, {
@@ -338,14 +342,21 @@ describe("readiness liveCertified flips only on BOTH live passes", () => {
 		});
 		const ssoOnly = runReadinessCheck(store, org.id);
 		expect(ssoOnly.conformance.liveCertified).toBe(false); // scim still missing
-
-		await testScimConnectionLive(store, scim.id, {
-			fetchImpl: fetchStub({
-				"https://scim.example.com": () =>
-					jsonResponse(200, { totalResults: 0, Resources: [] }),
-			}),
+		expect(ssoOnly.checks.find((check) => check.id === "sso.test")).toMatchObject({
+			status: "pass",
+			simulation: false,
 		});
+
+		const scimLive = await testScimConnectionLive(store, scim.id, {
+			fetchImpl: (async () =>
+				jsonResponse(200, { totalResults: 0, Resources: [] })) as typeof fetch,
+		});
+		expect(scimLive.pass).toBe(true);
 		const both = runReadinessCheck(store, org.id);
+		expect(both.checks.find((check) => check.id === "scim.test")).toMatchObject({
+			status: "pass",
+			simulation: false,
+		});
 		expect(both.conformance.liveCertified).toBe(true);
 		expect(both.conformance.mode).toBe("live");
 	});

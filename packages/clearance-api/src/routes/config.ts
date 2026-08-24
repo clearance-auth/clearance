@@ -7,9 +7,9 @@ import {
 	validateConfigAuthoritative,
 } from "@clearance/management";
 import { Hono } from "hono";
-import type { ScopedRouteDependencies } from "./shared.js";
+import type { ApplicationRouteDependencies } from "./shared.js";
 
-export interface ConfigRouteDependencies extends ScopedRouteDependencies {}
+export type ConfigRouteDependencies = ApplicationRouteDependencies;
 
 export function registerConfigRoutes({
 	storeForRequest,

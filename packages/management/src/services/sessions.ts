@@ -61,20 +61,6 @@ export type RevokeSessionResult = {
 	idempotent: boolean;
 };
 
-export function normalizeSessionLimit(limit: number | undefined): number {
-	const value = limit ?? 100;
-	if (!Number.isInteger(value) || value < 1 || value > 500) {
-		throw new ClearanceError({
-			code: "SESSION_LIMIT_INVALID",
-			message: "Session limit must be an integer between 1 and 500",
-			stage: "sessions.list",
-			status: 400,
-			remediation: "Pass --limit with an integer from 1 through 500",
-		});
-	}
-	return value;
-}
-
 const SENSITIVE_SESSION_KEYS = /token|secret|password|authorization|bearer|cookie/i;
 
 /**
@@ -164,7 +150,7 @@ export function listSessions(
 ): SessionView[] {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const includeRevoked = opts?.includeRevoked === true;
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const views = selectSessionViews(store, scope, includeRevoked);
 	// Newest first, then apply limit
 	views.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
@@ -219,7 +205,7 @@ export function listSessionsPage(
 ): { sessions: SessionView[]; nextCursor: string | null } {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	// Keep the shipped SESSION_LIMIT_INVALID contract for page size.
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const cursor = decodePageCursor(opts?.cursor, "sessions", "sessions.list");
 	// Same selection semantics as listSessions, unbounded.
 	const all = selectSessionViews(store, scope, opts?.includeRevoked === true);

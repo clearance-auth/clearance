@@ -9,6 +9,21 @@ type NodeRequestWithBody = IncomingMessage & {
 	body?: unknown;
 };
 
+/** A deliberately conservative limit for public HTTP request bodies. */
+export const DEFAULT_BODY_SIZE_LIMIT = 1024 * 1024;
+
+export class RequestBodyTooLargeError extends Error {
+	constructor(readonly limit: number) {
+		super(`Request body exceeds the ${limit}-byte limit`);
+		this.name = "RequestBodyTooLargeError";
+	}
+}
+
+export type RawBodyControl = {
+	/** Drain an unread or partially-read stream without buffering it. */
+	drain: () => Promise<void>;
+};
+
 const getFirstHeaderValue = (
 	header: IncomingHttpHeaders[string],
 ): string | undefined => {
@@ -95,33 +110,42 @@ const serializeParsedBody = (
 	return JSON.stringify(parsedBody);
 };
 
-function get_raw_body(req: IncomingMessage, body_size_limit?: number) {
+export function getContentLength(req: IncomingMessage): number | undefined {
+	const value = getFirstHeaderValue(req.headers["content-length"]);
+	if (!value) return undefined;
+	const length = Number(value);
+	return Number.isSafeInteger(length) && length >= 0 ? length : undefined;
+}
+
+export function isBodyTooLarge(
+	req: IncomingMessage,
+	bodySizeLimit = DEFAULT_BODY_SIZE_LIMIT,
+): boolean {
+	const contentLength = getContentLength(req);
+	return contentLength !== undefined && contentLength > bodySizeLimit;
+}
+
+function getRawBody(
+	req: IncomingMessage,
+	bodySizeLimit = DEFAULT_BODY_SIZE_LIMIT,
+	onControl?: (control: RawBodyControl) => void,
+) {
 	const h = req.headers;
 
-	if (!h["content-type"]) return null;
-
-	const content_length = Number(h["content-length"]);
+	const contentLength = getContentLength(req);
 
 	// check if no request body
 	if (
 		(req.httpVersionMajor === 1 &&
-			isNaN(content_length) &&
+			contentLength === undefined &&
 			h["transfer-encoding"] == null) ||
-		content_length === 0
+		contentLength === 0
 	) {
 		return null;
 	}
 
-	let length = content_length;
-
-	if (body_size_limit) {
-		if (!length) {
-			length = body_size_limit;
-		} else if (length > body_size_limit) {
-			throw Error(
-				`Received content-length of ${length}, but only accept up to ${body_size_limit} bytes.`,
-			);
-		}
+	if (contentLength !== undefined && contentLength > bodySizeLimit) {
+		throw new RequestBodyTooLargeError(bodySizeLimit);
 	}
 
 	if (req.destroyed) {
@@ -132,43 +156,84 @@ function get_raw_body(req: IncomingMessage, body_size_limit?: number) {
 
 	let size = 0;
 	let cancelled = false;
+	let ended = false;
+	let failed: Error | undefined;
+	let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
 
-	return new ReadableStream({
-		start(controller) {
-			req.on("error", (error) => {
-				cancelled = true;
-				controller.error(error);
-			});
+	const onError = (error: Error) => {
+		cancelled = true;
+		failed = error;
+		controller?.error(error);
+	};
+	const onEnd = () => {
+		ended = true;
+		if (!cancelled) controller?.close();
+	};
+	const onData = (chunk: Uint8Array) => {
+		if (cancelled) return;
+		size += chunk.byteLength;
+		if (size > bodySizeLimit) {
+			cancelled = true;
+			failed = new RequestBodyTooLargeError(bodySizeLimit);
+			// Stop retaining bytes immediately. Resuming drains the socket without
+			// accumulating the rest of a chunked request in this adapter.
+			req.resume();
+			controller?.error(failed);
+			return;
+		}
+		controller?.enqueue(chunk);
+		if (
+			controller?.desiredSize === null ||
+			(controller?.desiredSize ?? 0) <= 0
+		) {
+			req.pause();
+		}
+	};
 
-			req.on("end", () => {
-				if (cancelled) return;
-				controller.close();
-			});
-
-			req.on("data", (chunk) => {
-				if (cancelled) return;
-
-				size += chunk.length;
-
-				if (size > length) {
-					cancelled = true;
-
-					controller.error(
-						new Error(
-							`request body size exceeded ${
-								content_length ? "'content-length'" : "BODY_SIZE_LIMIT"
-							} of ${length}`,
-						),
-					);
+	onControl?.({
+		drain: () =>
+			new Promise<void>((resolve, reject) => {
+				if (failed) {
+					reject(failed);
 					return;
 				}
-
-				controller.enqueue(chunk);
-
-				if (controller.desiredSize === null || controller.desiredSize <= 0) {
-					req.pause();
+				if (ended || req.readableEnded) {
+					resolve();
+					return;
 				}
-			});
+				cancelled = true;
+				req.off("data", onData);
+				req.off("error", onError);
+				req.off("end", onEnd);
+				controller?.close();
+				const onDrainData = (chunk: Uint8Array) => {
+					size += chunk.byteLength;
+					if (size > bodySizeLimit && !failed) {
+						failed = new RequestBodyTooLargeError(bodySizeLimit);
+					}
+				};
+				const onDrainError = (error: Error) => finish(error);
+				const onDrainEnd = () => finish(failed);
+				const finish = (error?: Error) => {
+					req.off("data", onDrainData);
+					req.off("error", onDrainError);
+					req.off("end", onDrainEnd);
+					if (error) reject(error);
+					else resolve();
+				};
+				req.on("data", onDrainData);
+				req.once("error", onDrainError);
+				req.once("end", onDrainEnd);
+				req.resume();
+			}),
+	});
+
+	return new ReadableStream({
+		start(streamController) {
+			controller = streamController;
+			req.on("error", onError);
+			req.on("end", onEnd);
+			req.on("data", onData);
 		},
 
 		pull() {
@@ -214,9 +279,11 @@ export function getRequest({
 	request,
 	base,
 	bodySizeLimit,
+	onRawBodyControl,
 }: {
 	base: string;
 	bodySizeLimit?: number;
+	onRawBodyControl?: (control: RawBodyControl) => void;
 	request: IncomingMessage;
 }) {
 	// Check if body has already been parsed by Express middleware
@@ -229,11 +296,19 @@ export function getRequest({
 	if (method !== "GET" && method !== "HEAD") {
 		// Raw-first strategy: prefer consuming the original request stream whenever it is still readable.
 		if (canReadRawBody(request)) {
-			body = get_raw_body(request, bodySizeLimit);
+			body = getRawBody(request, bodySizeLimit, onRawBodyControl);
 		} else if (maybeConsumedReq.body !== undefined) {
 			const parsedBody = maybeConsumedReq.body;
 
 			const bodyContent = serializeParsedBody(parsedBody, isFormUrlEncoded);
+			if (
+				Buffer.byteLength(bodyContent) >
+				(bodySizeLimit ?? DEFAULT_BODY_SIZE_LIMIT)
+			) {
+				throw new RequestBodyTooLargeError(
+					bodySizeLimit ?? DEFAULT_BODY_SIZE_LIMIT,
+				);
+			}
 			body = new ReadableStream({
 				start(controller) {
 					controller.enqueue(new TextEncoder().encode(bodyContent));

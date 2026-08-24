@@ -8,11 +8,11 @@ import {
 	testWebhookEndpointForManagement,
 	updateWebhookEndpointForManagement,
 	WEBHOOK_ENDPOINT_OPERATIONS,
+	type WebhookEndpointStatus,
 } from "@clearance/management";
 import { Hono, type Context } from "hono";
 import { apiOperationContext, type ScopedRouteDependencies } from "./shared.js";
 
-type WebhookEndpointStatus = "active" | "disabled" | "deleted";
 type MutableWebhookEndpointStatus = Exclude<WebhookEndpointStatus, "deleted">;
 type WebhookEventKind = "organization.updated";
 

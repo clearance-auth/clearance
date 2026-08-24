@@ -18,7 +18,7 @@ export interface Environment {
 	updatedAt: string;
 }
 
-export interface Principal {
+export interface User {
 	id: ResourceId;
 	projectId: ResourceId;
 	environmentId: ResourceId;
@@ -78,12 +78,12 @@ export interface CustomRole {
 	updatedAt: string;
 }
 
-export type IdentityProtocol = "saml" | "oidc" | "password" | "passkey" | "social";
+export type SsoProtocol = "saml" | "oidc";
 
-export interface IdentityConnection {
+export interface SsoConnection {
 	id: ResourceId;
 	organizationId: ResourceId;
-	protocol: IdentityProtocol;
+	protocol: SsoProtocol;
 	provider: string;
 	status: "draft" | "testing" | "active" | "disabled";
 	domains: string[];
@@ -110,7 +110,7 @@ export interface IdentityConnection {
 	updatedAt: string;
 }
 
-export interface DirectoryConnection {
+export interface ScimConnection {
 	id: ResourceId;
 	organizationId: ResourceId;
 	provider: string;
@@ -129,11 +129,11 @@ export interface DirectoryConnection {
 
 /**
  * Persisted setup capability: digest only (never raw token).
- * Single-use, scoped to project/environment/organization + action.
+ * Single-use, scoped to project/environment/organization + grant.
  *
  * Completion state machine (durable fields only):
  * - available: useCount < maxUses, !redeemedAt, !revokedAt, no active reservation
- * - reserved: reservedAt + reservationId + reservationExpiresAt (in-progress lease)
+ * - reserved: reservedAt + reservationId + reservationFencingToken + reservationExpiresAt (in-progress lease)
  * - redeemed: useCount >= maxUses and redeemedAt set (terminal; never reopen)
  * - revoked: revokedAt set
  *
@@ -145,7 +145,7 @@ export interface SetupCapability {
 	/** SHA-256 hex digest of the capability token */
 	digest: string;
 	kind: "sso" | "scim";
-	action: "setup";
+	grant: "setup";
 	resourceType: "organization";
 	resourceId: ResourceId;
 	organizationId: ResourceId;
@@ -167,6 +167,12 @@ export interface SetupCapability {
 	 * reconcile). Never the raw capability token.
 	 */
 	reservationId?: string;
+	/**
+	 * Unpredictable per-lease generation fence. The stable reservationId binds
+	 * durable recovery to a capability, while this value prevents a stale holder
+	 * from committing, releasing, or compensating a replacement generation.
+	 */
+	reservationFencingToken?: string;
 	/** When the reservation lease ends and another attempt may re-reserve. */
 	reservationExpiresAt?: string;
 	createdAt: string;
@@ -244,7 +250,7 @@ export interface ReadinessReport {
 		note: string;
 	};
 	remainingCustomerActions: string[];
-	signature: string;
+	reportDigest: string;
 	/** Exact enterprise configuration, credential, membership, and test-state digest. */
 	stateFingerprint?: string;
 	state?: "current" | "stale" | "not_run";
@@ -288,7 +294,7 @@ export interface MigrationPlan {
 				environmentId: ResourceId;
 				email: string;
 				name: string;
-				status: Principal["status"];
+				status: User["status"];
 				externalId?: string;
 				createdAt: string;
 				updatedAt: string;
@@ -401,11 +407,11 @@ export interface DataStoreSnapshot {
 	releaseVersion: string;
 	projects: Project[];
 	environments: Environment[];
-	principals: Principal[];
+	principals: User[];
 	organizations: Organization[];
 	memberships: Membership[];
-	identityConnections: IdentityConnection[];
-	directoryConnections: DirectoryConnection[];
+	ssoConnections: SsoConnection[];
+	scimConnections: ScimConnection[];
 	/** Custom (operator-defined) roles only — built-ins are virtual */
 	roles: CustomRole[];
 	events: AuditEvent[];

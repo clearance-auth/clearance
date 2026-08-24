@@ -8,6 +8,7 @@ import {
 	timingSafeEqual,
 } from "node:crypto";
 import { DeliveryError } from "./errors.js";
+import type { DeliveryChannel } from "./redaction.js";
 
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
@@ -30,7 +31,7 @@ export type DeliveryPayloadAad = {
 	version: 1;
 	eventId: string;
 	kind: string;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	projectId: string;
 	environmentId: string;
 	destinationFingerprint: string;

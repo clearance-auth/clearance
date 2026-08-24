@@ -16,7 +16,7 @@ import type {
 	ManagementStore,
 } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
+import type { DiagnosticTrace, SsoConnection } from "../types/resources.js";
 import {
 	deleteSsoProviderById,
 	insertSsoProvider,
@@ -97,7 +97,7 @@ async function sealSsoCredential(
 		: encryptCredential(plaintext);
 }
 
-function ssoSettlementFingerprint(connection: IdentityConnection): string {
+function ssoSettlementFingerprint(connection: SsoConnection): string {
 	return JSON.stringify({
 		organizationId: connection.organizationId,
 		protocol: connection.protocol,
@@ -117,9 +117,9 @@ function ssoSettlementFingerprint(connection: IdentityConnection): string {
 }
 
 function assertSsoSettlementCurrent(
-	expected: IdentityConnection,
-	current: IdentityConnection | undefined,
-): asserts current is IdentityConnection {
+	expected: SsoConnection,
+	current: SsoConnection | undefined,
+): asserts current is SsoConnection {
 	if (
 		!current ||
 		current.status === "disabled" ||
@@ -137,7 +137,7 @@ function assertSsoSettlementCurrent(
 async function settleSsoTestSuccess(
 	store: ManagementStore,
 	input: {
-		connection: IdentityConnection;
+		connection: SsoConnection;
 		trace: DiagnosticTrace;
 		actor?: string;
 		source?: "cli" | "console" | "api" | "system" | "sso";
@@ -146,7 +146,7 @@ async function settleSsoTestSuccess(
 		metadata: Record<string, unknown>;
 		guard?: SsoRealMutationGuard;
 	},
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	const expectedOrganization = await inspectOrganizationAuthoritative(
 		store,
 		input.connection.organizationId,
@@ -183,7 +183,7 @@ async function settleSsoTestSuccess(
 					status: 404,
 				});
 			}
-			const index = data.identityConnections.findIndex(
+			const index = data.ssoConnections.findIndex(
 				(connection) =>
 					connection.id === input.connection.id &&
 					connection.organizationId === organization.id,
@@ -196,10 +196,10 @@ async function settleSsoTestSuccess(
 					status: 404,
 				});
 			}
-			const current = data.identityConnections[index]!;
+			const current = data.ssoConnections[index]!;
 			assertSsoSettlementCurrent(input.connection, current);
 			const updated = { ...current, status: "testing" as const, updatedAt: input.trace.createdAt };
-			data.identityConnections[index] = updated;
+			data.ssoConnections[index] = updated;
 			data.traces.unshift({ ...input.trace, mode: SSO_REAL_FIXTURE_MODE });
 			appendAudit({
 				actor: input.actor ?? "system",
@@ -220,12 +220,12 @@ async function settleSsoTestSuccess(
 	}
 
 	store.mutate((data) => {
-		const index = data.identityConnections.findIndex(
+		const index = data.ssoConnections.findIndex(
 			(connection) => connection.id === input.connection.id,
 		);
-		assertSsoSettlementCurrent(input.connection, data.identityConnections[index]);
-		data.identityConnections[index] = {
-			...data.identityConnections[index],
+		assertSsoSettlementCurrent(input.connection, data.ssoConnections[index]);
+		data.ssoConnections[index] = {
+			...data.ssoConnections[index],
 			status: "testing",
 			updatedAt: input.trace.createdAt,
 		};
@@ -243,7 +243,7 @@ async function settleSsoTestSuccess(
 		message: input.message,
 		metadata: input.metadata,
 	});
-	return store.snapshot.identityConnections.find(
+	return store.snapshot.ssoConnections.find(
 		(connection) => connection.id === input.connection.id,
 	)!;
 }
@@ -317,7 +317,7 @@ export function validateSamlProviderConfig(input: {
 }
 
 function assertMatchingSsoConnection(
-	existing: IdentityConnection,
+	existing: SsoConnection,
 		expected: {
 		organizationId: string;
 		provider: string;
@@ -391,7 +391,7 @@ export async function createSsoConnectionReal(
 		setupAttemptId?: string;
 	},
 	guard?: SsoRealMutationGuard,
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	const org = await inspectOrganizationAuthoritative(
 		store,
 		input.organizationId,
@@ -503,7 +503,7 @@ export async function createSsoConnectionReal(
 			}
 
 			const prior = connectionId
-				? data.identityConnections.find((connection) => connection.id === connectionId)
+				? data.ssoConnections.find((connection) => connection.id === connectionId)
 				: undefined;
 			if (prior) {
 				assertMatchingSsoConnection(prior, {
@@ -549,7 +549,7 @@ export async function createSsoConnectionReal(
 							}
 							: undefined,
 				}, guard?.runtimeKeyManagement);
-				return publicIdentityConnection(prior) as IdentityConnection;
+				return publicIdentityConnection(prior) as SsoConnection;
 			}
 
 			const inserted = await insertSsoProviderInTransaction(query, {
@@ -565,7 +565,7 @@ export async function createSsoConnectionReal(
 						? { entryPoint: saml!.entryPoint, cert: saml!.certificate, audience }
 						: undefined,
 			}, guard?.runtimeKeyManagement);
-			const raced = data.identityConnections.find((connection) => connection.id === inserted.id);
+			const raced = data.ssoConnections.find((connection) => connection.id === inserted.id);
 			if (raced) {
 				assertMatchingSsoConnection(raced, {
 					organizationId: active.id,
@@ -577,14 +577,14 @@ export async function createSsoConnectionReal(
 					samlEntryPoint: saml?.entryPoint,
 					samlCertificateFingerprint: saml?.fingerprint,
 				});
-				return publicIdentityConnection(raced) as IdentityConnection;
+				return publicIdentityConnection(raced) as SsoConnection;
 			}
 
 			const enc = clientSecret
 				? await sealSsoCredential(guard, clientSecret, active.id, inserted.id)
 				: undefined;
 			const now = nowIso();
-			const conn: IdentityConnection = {
+			const conn: SsoConnection = {
 				id: inserted.id,
 				organizationId: active.id,
 				protocol,
@@ -604,7 +604,7 @@ export async function createSsoConnectionReal(
 				createdAt: now,
 				updatedAt: now,
 			};
-			data.identityConnections.push(conn);
+			data.ssoConnections.push(conn);
 			appendAudit({
 				actor: input.actor ?? "operator",
 				action: "sso.create",
@@ -625,7 +625,7 @@ export async function createSsoConnectionReal(
 					reusedRuntime: Boolean(inserted.reused),
 				},
 			});
-			return publicIdentityConnection(conn) as IdentityConnection;
+			return publicIdentityConnection(conn) as SsoConnection;
 		});
 	}
 	if (guard) {
@@ -639,7 +639,7 @@ export async function createSsoConnectionReal(
 	}
 
 	if (connectionId) {
-		const existing = store.snapshot.identityConnections.find((c) => c.id === connectionId);
+		const existing = store.snapshot.ssoConnections.find((c) => c.id === connectionId);
 		if (existing) {
 			assertMatchingSsoConnection(existing, {
 				organizationId: org.id,
@@ -689,7 +689,7 @@ export async function createSsoConnectionReal(
 							}
 						: undefined,
 			});
-			return publicIdentityConnection(existing) as IdentityConnection;
+			return publicIdentityConnection(existing) as SsoConnection;
 		}
 	}
 
@@ -716,7 +716,7 @@ export async function createSsoConnectionReal(
 
 	const now = nowIso();
 	// On runtime reuse after crash, prefer existing management secret material if present.
-	const prior = store.snapshot.identityConnections.find((c) => c.id === inserted.id);
+	const prior = store.snapshot.ssoConnections.find((c) => c.id === inserted.id);
 	if (prior) {
 		assertMatchingSsoConnection(prior, {
 			organizationId: org.id,
@@ -728,13 +728,13 @@ export async function createSsoConnectionReal(
 				samlEntryPoint: saml?.entryPoint,
 				samlCertificateFingerprint: saml?.fingerprint,
 		});
-		return publicIdentityConnection(prior) as IdentityConnection;
+		return publicIdentityConnection(prior) as SsoConnection;
 	}
 
 	const enc = clientSecret
 		? await sealSsoCredential(guard, clientSecret, org.id, inserted.id)
 		: undefined;
-	const conn: IdentityConnection = {
+	const conn: SsoConnection = {
 		id: inserted.id,
 		organizationId: org.id,
 		protocol,
@@ -759,9 +759,9 @@ export async function createSsoConnectionReal(
 		// already-created runtime provider if the control-plane commit fails.
 		// Insert-or-skip by id so a retry never duplicates the management row.
 		store.mutate((data) => {
-			const idx = data.identityConnections.findIndex((c) => c.id === conn.id);
+			const idx = data.ssoConnections.findIndex((c) => c.id === conn.id);
 			if (idx >= 0) {
-				assertMatchingSsoConnection(data.identityConnections[idx]!, {
+				assertMatchingSsoConnection(data.ssoConnections[idx]!, {
 					organizationId: org.id,
 					provider,
 					protocol,
@@ -772,7 +772,7 @@ export async function createSsoConnectionReal(
 					samlCertificateFingerprint: saml?.fingerprint,
 				});
 			} else {
-				data.identityConnections.push(conn);
+				data.ssoConnections.push(conn);
 			}
 			appendAuditEvent(data, {
 				actor: input.actor ?? "operator",
@@ -805,7 +805,7 @@ export async function createSsoConnectionReal(
 		}
 		throw error;
 	}
-	return publicIdentityConnection(conn) as IdentityConnection;
+	return publicIdentityConnection(conn) as SsoConnection;
 }
 
 /**
@@ -826,7 +826,7 @@ export async function testSsoConnectionReal(
 ): Promise<{
 	pass: boolean;
 	trace: DiagnosticTrace;
-	connection: IdentityConnection;
+	connection: SsoConnection;
 	mode: "simulation";
 	certifiedExternalTenant?: false;
 	evidence?: string;
@@ -958,7 +958,7 @@ export async function testSsoConnectionReal(
 		return {
 			pass: true,
 			trace,
-			connection: publicIdentityConnection(connection) as IdentityConnection,
+			connection: publicIdentityConnection(connection) as SsoConnection,
 			mode: SSO_REAL_FIXTURE_MODE,
 			certifiedExternalTenant: false,
 			evidence: SSO_LOCAL_EVIDENCE_LABEL,

@@ -2,7 +2,7 @@ import { APIError } from "@clearance/runtime/api";
 import * as constants from "../constants";
 
 export interface TimestampValidationOptions {
-	clockSkew?: number;
+	clockSkewMs?: number;
 	requireTimestamps?: boolean;
 	logger?: {
 		warn: (message: string, data?: Record<string, unknown>) => void;
@@ -24,7 +24,7 @@ export function validateSAMLTimestamp(
 	conditions: SAMLConditions | undefined,
 	options: TimestampValidationOptions = {},
 ): void {
-	const clockSkew = options.clockSkew ?? constants.DEFAULT_CLOCK_SKEW_MS;
+	const clockSkewMs = options.clockSkewMs ?? constants.DEFAULT_CLOCK_SKEW_MS;
 	const hasTimestamps = conditions?.notBefore || conditions?.notOnOrAfter;
 	if (options.requireTimestamps && !conditions?.notOnOrAfter) {
 		throw new APIError("BAD_REQUEST", {
@@ -52,10 +52,10 @@ export function validateSAMLTimestamp(
 				details: `Unable to parse NotBefore value: ${conditions.notBefore}`,
 			});
 		}
-		if (now < notBeforeTime - clockSkew) {
+		if (now < notBeforeTime - clockSkewMs) {
 			throw new APIError("BAD_REQUEST", {
 				message: "SAML assertion is not yet valid",
-				details: `Current time is before NotBefore (with ${clockSkew}ms clock skew tolerance)`,
+				details: `Current time is before NotBefore (with ${clockSkewMs}ms clock skew tolerance)`,
 			});
 		}
 	}
@@ -68,10 +68,10 @@ export function validateSAMLTimestamp(
 				details: `Unable to parse NotOnOrAfter value: ${conditions.notOnOrAfter}`,
 			});
 		}
-		if (now > notOnOrAfterTime + clockSkew) {
+		if (now > notOnOrAfterTime + clockSkewMs) {
 			throw new APIError("BAD_REQUEST", {
 				message: "SAML assertion has expired",
-				details: `Current time is after NotOnOrAfter (with ${clockSkew}ms clock skew tolerance)`,
+				details: `Current time is after NotOnOrAfter (with ${clockSkewMs}ms clock skew tolerance)`,
 			});
 		}
 	}

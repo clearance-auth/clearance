@@ -19,6 +19,7 @@ import {
 } from "./keyring.js";
 import {
 	redactedDeliveryJob,
+	type DeliveryChannel,
 	type DeliveryJobRecord,
 	type DeliveryJobState,
 	type PublicDeliveryJob,
@@ -63,9 +64,9 @@ export type DeliveryReadinessSummary = {
 	ready: boolean;
 	schema: {
 		owner: string | null;
-		version: number | null;
-		currentVersion: number;
-		current: boolean;
+		installedVersion: number | null;
+		expectedVersion: number;
+		isUpToDate: boolean;
 	};
 	jobs: Record<DeliveryJobState, number>;
 	workers: {
@@ -106,7 +107,7 @@ type ControlJobRow = {
 	environment_id: string;
 	organization_id: string | null;
 	webhook_endpoint_id: string | null;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	state: DeliveryJobState;
 	cancel_requested: boolean;
 	attempt_count: number;
@@ -266,7 +267,7 @@ export async function listDeliveryJobs(
 		limit?: number;
 		cursor?: string;
 		states?: readonly DeliveryJobState[];
-		channel?: "email" | "webhook";
+	channel?: DeliveryChannel;
 		kind?: string;
 	},
 	options: DeliverySchemaOptions = {},
@@ -535,7 +536,7 @@ export async function retryDeliveryInExistingTransaction(
 		webhook_endpoint_id: row.webhook_endpoint_id });
 }
 
-function replayDestination(channel: "email" | "webhook", payload: unknown): string {
+function replayDestination(channel: DeliveryChannel, payload: unknown): string {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		throw new DeliveryError("DELIVERY_REPLAY_PAYLOAD_INVALID", "Delivery payload cannot be replayed");
 	}
@@ -551,7 +552,7 @@ function replayDestination(channel: "email" | "webhook", payload: unknown): stri
 	return destination;
 }
 
-function replayPayload(channel: "email" | "webhook", payload: unknown, eventId: string): unknown {
+function replayPayload(channel: DeliveryChannel, payload: unknown, eventId: string): unknown {
 	if (channel !== "webhook" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
 	}
@@ -829,7 +830,12 @@ export async function deliveryReadiness(
 	if (schemaCurrent && workerSummary.freshReady === 0) reasons.push("worker_unavailable");
 	return {
 		ready: reasons.length === 0,
-		schema: { owner, version, currentVersion: DELIVERY_SCHEMA_VERSION, current: schemaCurrent },
+		schema: {
+			owner,
+			installedVersion: version,
+			expectedVersion: DELIVERY_SCHEMA_VERSION,
+			isUpToDate: schemaCurrent,
+		},
 		jobs,
 		workers: { ...workerSummary, staleAfterMs },
 		keys: keySummary,

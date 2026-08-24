@@ -1,4 +1,6 @@
-export type DeliveryMetricChannel = "email" | "webhook" | "unknown";
+import type { DeliveryChannel } from "@clearance/delivery";
+
+export type DeliveryMetricChannel = DeliveryChannel | "unknown";
 export type DeliveryMetricOutcome =
 	| "delivered"
 	| "retry"

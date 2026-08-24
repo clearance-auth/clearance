@@ -42,10 +42,11 @@ export type StoreV2TopologyState = {
 	organizationCount: number;
 };
 
-export type StoreV2TopologyCountDelta = Omit<
-	StoreV2TopologyState,
-	"revision"
->;
+export type StoreV2TopologyCountDelta = {
+	projectCountDelta: number;
+	environmentCountDelta: number;
+	organizationCountDelta: number;
+};
 
 export const STORE_V2_TOPOLOGY_AUTHORITY_VERSION = 1 as const;
 export const STORE_V2_TOPOLOGY_AUTHORITY_VERSION_META_KEY =
@@ -134,7 +135,7 @@ function assertLookupString(value: unknown): asserts value is string {
 export async function readStoreV2TopologyState(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
-	forUpdate = false,
+	{ forUpdate = false }: { forUpdate?: boolean } = {},
 ): Promise<StoreV2TopologyState | null> {
 	const result = await queryable.query<{ value: unknown }>(
 		`SELECT value FROM ${tables.meta} WHERE key = $1${forUpdate ? " FOR UPDATE" : ""}`,
@@ -188,7 +189,7 @@ export async function advanceStoreV2TopologyState(
 	tables: StoreV2TableNames,
 	delta: StoreV2TopologyCountDelta,
 ): Promise<StoreV2TopologyState> {
-	const current = await readStoreV2TopologyState(client, tables, true);
+	const current = await readStoreV2TopologyState(client, tables, { forUpdate: true });
 	if (!current || current.revision === Number.MAX_SAFE_INTEGER) {
 		throw new StoreV2TopologyAuthorityError(
 			"STORE_V2_TOPOLOGY_STATE_INVALID",
@@ -197,9 +198,9 @@ export async function advanceStoreV2TopologyState(
 	}
 	const next = {
 		revision: current.revision + 1,
-		projectCount: current.projectCount + delta.projectCount,
-		environmentCount: current.environmentCount + delta.environmentCount,
-		organizationCount: current.organizationCount + delta.organizationCount,
+		projectCount: current.projectCount + delta.projectCountDelta,
+		environmentCount: current.environmentCount + delta.environmentCountDelta,
+		organizationCount: current.organizationCount + delta.organizationCountDelta,
 	};
 	if (Object.values(next).some((value) => !Number.isSafeInteger(value) || value < 0)) {
 		throw new StoreV2TopologyAuthorityError(
@@ -333,9 +334,9 @@ export class PgStoreV2TopologyRepository {
 	async finalizeState(): Promise<StoreV2TopologyState | null> {
 		return this.mutated
 			? advanceStoreV2TopologyState(this.client, this.tables, {
-				projectCount: this.insertedProjects,
-				environmentCount: this.insertedEnvironments,
-				organizationCount: this.insertedOrganizations,
+				projectCountDelta: this.insertedProjects,
+				environmentCountDelta: this.insertedEnvironments,
+				organizationCountDelta: this.insertedOrganizations,
 			})
 			: readStoreV2TopologyState(this.client, this.tables);
 	}

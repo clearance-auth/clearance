@@ -3,7 +3,7 @@ import type {
 	DataStoreSnapshot,
 	Environment,
 	Organization,
-	Principal,
+	User,
 	Project,
 } from "../types/resources.js";
 import type { PageCursorKey } from "../services/pagination.js";
@@ -11,6 +11,7 @@ import type { ResourceScope } from "../services/scope.js";
 import type { RuntimeAuditEventReader } from "./runtime-audit-events.js";
 import type {
 	DeliveryControlPreview,
+	DeliveryChannel,
 	DeliveryJobPage,
 	DeliveryJobState,
 	DeliveryQuotaStatus,
@@ -112,22 +113,22 @@ export interface StoreV2PrincipalReader {
 		scope: ResourceScope;
 		id: string;
 		includeDeleted?: boolean;
-	}): Promise<Principal | null>;
+	}): Promise<User | null>;
 	findActiveByEmail(input: {
 		scope: ResourceScope;
 		email: string;
-	}): Promise<Principal | null>;
+	}): Promise<User | null>;
 	findActiveByExternalId(input: {
 		scope: ResourceScope;
 		externalId: string;
-	}): Promise<Principal | null>;
+	}): Promise<User | null>;
 	listPage(input: {
 		scope: ResourceScope;
 		limit: number;
 		cursor?: PageCursorKey;
 		includeDeleted?: boolean;
-		status?: Principal["status"];
-	}): Promise<{ principals: Principal[]; hasMore: boolean }>;
+		status?: User["status"];
+	}): Promise<{ principals: User[]; hasMore: boolean }>;
 	/** Bounded relational join used by runtime session operator reads. */
 	listActiveSessionsPage?(input: {
 		scope: ResourceScope;
@@ -136,7 +137,7 @@ export interface StoreV2PrincipalReader {
 	}): Promise<{
 		sessions: Array<{
 			id: string;
-			principal: Principal;
+			principal: User;
 			createdAt: string;
 			cursorCreatedAt: string;
 			expiresAt?: string;
@@ -149,7 +150,7 @@ export interface StoreV2PrincipalReader {
 		scope: ResourceScope;
 		limit: number;
 		status?: "active" | "disabled";
-	}): Promise<{ principals: Principal[]; hasMore: boolean }>;
+	}): Promise<{ principals: User[]; hasMore: boolean }>;
 	countByScope?(input: { scope: ResourceScope }): Promise<{
 		total: number;
 		active: number;
@@ -159,23 +160,23 @@ export interface StoreV2PrincipalReader {
 
 /** Transaction-bound normalized principal mutations. PostgreSQL only. */
 export interface StoreV2PrincipalRepository extends StoreV2PrincipalReader {
-	insert(principal: Principal): Promise<Principal>;
+	insert(principal: User): Promise<User>;
 	update(
-		principal: Principal,
+		principal: User,
 		input: { expectedUpdatedAt: string },
-	): Promise<Principal | null>;
+	): Promise<User | null>;
 	disable(input: {
 		scope: ResourceScope;
 		id: string;
 		updatedAt: string;
 		expectedUpdatedAt: string;
-	}): Promise<Principal | null>;
+	}): Promise<User | null>;
 	delete(input: {
 		scope: ResourceScope;
 		id: string;
 		updatedAt: string;
 		expectedUpdatedAt: string;
-	}): Promise<Principal | null>;
+	}): Promise<User | null>;
 }
 
 /** Scoped relational topology reads; every cursor is deterministic and bounded. */
@@ -269,7 +270,7 @@ export interface ManagementDeliveryControlReader {
 		limit?: number;
 		cursor?: string;
 		states?: readonly DeliveryJobState[];
-		channel?: "email" | "webhook";
+		channel?: DeliveryChannel;
 		kind?: string;
 	}): Promise<DeliveryJobPage>;
 	inspect(input: DeliveryControlScope & { jobId: string }): Promise<PublicDeliveryJob | null>;
@@ -408,6 +409,12 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	/** Flush pending durable writes (no-op for json; await for postgres) */
 	ready(): Promise<void>;
 	/**
+	 * Serialize one destructive upgrade across processes for the whole callback.
+	 * PostgreSQL implementations hold a session advisory lock; the JSON fallback
+	 * rejects a concurrent invocation in this process.
+	 */
+	withUpgradeLock<T>(fn: () => Promise<T>): Promise<T>;
+	/**
 	 * Reload from durable backend when another process may have written.
 	 * Json re-reads the file; Postgres compares revision and replaces local cache.
 	 */
@@ -433,12 +440,22 @@ export interface ManagementStore extends ManagementUnitOfWork {
 	resourceCounts(): Record<string, number>;
 }
 
+export type CoordinatedManagementStore = ManagementStore & {
+	backend: "postgres";
+	mutateCoordinated: NonNullable<ManagementStore["mutateCoordinated"]>;
+};
+
+export function isCoordinatedStore(store: ManagementStore): store is CoordinatedManagementStore {
+	return store.backend === "postgres" && typeof store.mutateCoordinated === "function";
+}
+
 export function isManagementStore(value: unknown): value is ManagementStore {
 	return (
 		typeof value === "object" &&
 		value !== null &&
 		"snapshot" in value &&
 		"mutate" in value &&
-		"backend" in value
+		"backend" in value &&
+		"withUpgradeLock" in value
 	);
 }

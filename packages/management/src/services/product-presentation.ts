@@ -1272,7 +1272,7 @@ export async function getProductSenderReadinessForManagement(
 	schemaVersion: typeof SCHEMA_VERSION;
 	scope: OperationContext["scope"];
 	ready: boolean;
-	schema: { current: boolean; owner: string | null; version: number | null };
+	schema: { isUpToDate: boolean; owner: string | null; installedVersion: number | null; expectedVersion: number };
 	worker: { freshReady: number; lastSeenAt: string | null; staleAfterMs: number };
 	keys: { checked: boolean; available: boolean; missingReferences: number };
 	reasons: string[];
@@ -1292,13 +1292,14 @@ export async function getProductSenderReadinessForManagement(
 			schemaVersion: SCHEMA_VERSION,
 			scope: context.scope,
 			ready:
-				readiness.schema.current &&
+				readiness.schema.isUpToDate &&
 				readiness.workers.freshReady > 0 &&
 				readiness.keys.available,
 			schema: {
-				current: readiness.schema.current,
+				isUpToDate: readiness.schema.isUpToDate,
 				owner: readiness.schema.owner,
-				version: readiness.schema.version,
+				installedVersion: readiness.schema.installedVersion,
+				expectedVersion: readiness.schema.expectedVersion,
 			},
 			worker: {
 				freshReady: readiness.workers.freshReady,

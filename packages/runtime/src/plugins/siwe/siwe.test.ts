@@ -168,7 +168,7 @@ describe("siwe", async () => {
 			),
 		).resolves.toEqual(before);
 		await expect(
-			context.internalAdapter.findVerificationValue(
+			context.internalAdapter.findVerificationValueAndPruneExpired(
 				`siwe:${walletAddress}:${chainId}`,
 			),
 		).resolves.not.toBeNull();
@@ -191,7 +191,7 @@ describe("siwe", async () => {
 			sessionsBefore + 1,
 		);
 		await expect(
-			context.internalAdapter.findVerificationValue(
+			context.internalAdapter.findVerificationValueAndPruneExpired(
 				`siwe:${walletAddress}:${chainId}`,
 			),
 		).resolves.toBeNull();
@@ -827,7 +827,7 @@ describe("siwe", async () => {
 
 		// The expired row is gone, so a retry cannot replay it.
 		const remaining =
-			await ctx.internalAdapter.findVerificationValue(identifier);
+			await ctx.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 		expect(remaining).toBeNull();
 	});
 

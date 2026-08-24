@@ -296,7 +296,7 @@ export const getVerificationOTP = (opts: RequiredEmailOTPOptions) =>
 		async (ctx) => {
 			const email = ctx.query.email.toLowerCase();
 			const verificationValue =
-				await ctx.context.internalAdapter.findVerificationValue(
+				await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 					toOTPIdentifier(ctx.query.type, email),
 				);
 			if (!verificationValue || verificationValue.expiresAt < new Date()) {
@@ -305,6 +305,7 @@ export const getVerificationOTP = (opts: RequiredEmailOTPOptions) =>
 				});
 			}
 			if (
+				opts.storeOTP === "keyed" ||
 				opts.storeOTP === "hashed" ||
 				(typeof opts.storeOTP === "object" && "hash" in opts.storeOTP)
 			) {
@@ -400,7 +401,7 @@ export const checkVerificationOTP = (opts: RequiredEmailOTPOptions) =>
 			}
 			const identifier = toOTPIdentifier(ctx.body.type, email);
 			const verificationValue =
-				await ctx.context.internalAdapter.findVerificationValue(identifier);
+				await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 			if (!verificationValue) {
 				throw APIError.from("BAD_REQUEST", ERROR_CODES.INVALID_OTP);
 			}
@@ -1523,7 +1524,7 @@ async function atomicVerifyOTP(
 	// indistinguishable from a missing record; this read only reports expiry
 	// and never decides the success path, so it does not weaken the race gate.
 	const existing =
-		await ctx.context.internalAdapter.findVerificationValue(identifier);
+		await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 	if (existing && existing.expiresAt < new Date()) {
 		await ctx.context.internalAdapter.deleteVerificationByIdentifier(
 			identifier,

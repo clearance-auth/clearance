@@ -502,7 +502,7 @@ export function mountClearanceVault(
 		state.session = session;
 	};
 
-	const captureTenantIdentity = (): TenantIdentity => {
+	const requireTenantIdentity = (): TenantIdentity => {
 		const organizationId = activeOrganizationId(state);
 		const session = state.session;
 		if (!session || !organizationId) {
@@ -1940,7 +1940,7 @@ export function mountClearanceVault(
 			}
 			let tenantIdentity: TenantIdentity;
 			try {
-				tenantIdentity = captureTenantIdentity();
+				tenantIdentity = requireTenantIdentity();
 			} catch (error) {
 				state.error = errorMessage(error);
 				render();
@@ -2013,7 +2013,7 @@ export function mountClearanceVault(
 		operation: "enable" | "disable",
 	): HTMLButtonElement => {
 		const organizationId = activeOrganizationId(state)!;
-		const tenantIdentity = captureTenantIdentity();
+		const tenantIdentity = requireTenantIdentity();
 		const enabled = operation === "enable";
 		return button(enabled ? "Enable" : "Disable", () => {
 			void request(
@@ -2117,7 +2117,7 @@ export function mountClearanceVault(
 					.map((value) => value.trim())
 					.filter(Boolean),
 			};
-			const tenantIdentity = captureTenantIdentity();
+			const tenantIdentity = requireTenantIdentity();
 			void request(
 				"Previewing service account…",
 				(signal) =>
@@ -2172,7 +2172,7 @@ export function mountClearanceVault(
 		credentialActions.append(
 			button("Create credential", () => {
 				const accountId = requireText(serviceId.input, "Service account ID");
-				const tenantIdentity = captureTenantIdentity();
+				const tenantIdentity = requireTenantIdentity();
 				const expiry = expiresAt.input.value
 					? new Date(expiresAt.input.value).toISOString()
 					: undefined;
@@ -2225,7 +2225,7 @@ export function mountClearanceVault(
 						credentialId.input,
 						"Credential ID",
 					);
-					const tenantIdentity = captureTenantIdentity();
+					const tenantIdentity = requireTenantIdentity();
 					const expiry = expiresAt.input.value
 						? new Date(expiresAt.input.value).toISOString()
 						: undefined;
@@ -2288,7 +2288,7 @@ export function mountClearanceVault(
 						credentialId.input,
 						"Credential ID",
 					);
-					const tenantIdentity = captureTenantIdentity();
+					const tenantIdentity = requireTenantIdentity();
 					void request(
 						"Previewing revocation…",
 						(signal) => tenantMutation(tenantIdentity, signal, () =>
@@ -2388,7 +2388,7 @@ export function mountClearanceVault(
 			const connectionId = id(provider);
 			const item = node("li", "cv-list-item");
 			item.append(node("span", undefined, `${value(provider, "domain")} · ${(value(provider, "protocol") || value(provider, "type")).toUpperCase()} · ${value(provider, "status") || "active"}`));
-			const identity = captureTenantIdentity();
+			const identity = requireTenantIdentity();
 			item.append(
 				button("Inspect", () => void request("Inspecting SSO connection…", (signal) => tenantCall<TenantRecord>("inspectSso", organizationId, connectionId, { signal }), (result) => { state.status = `SSO connection ${value(result, "status") || "loaded"}.`; } ), "secondary"),
 				button("Preview test", () => mutate("Previewing SSO test…", "Run SSO certification test?", "This simulation checks the current provider configuration without changing it.", "Run test", identity, (signal) => tenantCall("testSso", organizationId, connectionId, { dryRun: true, confirm: false }, { signal }), (signal) => tenantCall("testSso", organizationId, connectionId, { dryRun: false, confirm: true }, { signal }), (result) => { state.status = testResultStatus("SSO", result as TenantRecord); }), "secondary"),
@@ -2417,7 +2417,7 @@ export function mountClearanceVault(
 			event.preventDefault();
 			const protocol = ssoProtocol.value as "oidc" | "saml";
 			const input = protocol === "oidc" ? { protocol, provider: requireText(ssoProvider.input, "Provider"), issuer: requireText(ssoIssuer.input, "Issuer"), domain: requireText(ssoDomain.input, "Domain"), clientId: requireText(ssoClientId.input, "OIDC client ID"), clientSecret: requireText(ssoSecret.input, "OIDC client secret") } : { protocol, provider: requireText(ssoProvider.input, "Provider"), issuer: requireText(ssoIssuer.input, "Issuer"), domain: requireText(ssoDomain.input, "Domain"), samlEntryPoint: requireText(ssoEntryPoint.input, "SAML entry point"), samlCertificate: requireText(ssoCertificate.input, "SAML certificate") };
-			const identity = captureTenantIdentity();
+			const identity = requireTenantIdentity();
 			mutate("Previewing SSO provider…", "Create SSO provider?", `Create this strict ${protocol.toUpperCase()} connection for the active organization.`, "Create SSO", identity, (signal) => tenantCall("createSso", organizationId, { ...input, dryRun: true, confirm: false }, { signal }), (signal) => tenantCall("createSso", organizationId, { ...input, dryRun: false, confirm: true }, { signal }), () => { ssoSecret.input.value = ""; ssoCertificate.input.value = ""; void request("Refreshing enterprise connections…", refreshEnterprise); });
 		});
 		const replaceSecret = formCard("Replace OIDC secret");
@@ -2425,7 +2425,7 @@ export function mountClearanceVault(
 		const replaceValue = field("cv-sso-secret-value", "New OIDC client secret", "password", { required: true });
 		const replaceSubmit = button("Preview secret replacement", () => replaceSecret.form.requestSubmit()); replaceSubmit.type = "submit";
 		replaceSecret.form.append(replaceId.wrapper, replaceValue.wrapper, replaceSubmit);
-		replaceSecret.form.addEventListener("submit", (event) => { event.preventDefault(); const connectionId = requireText(replaceId.input, "SSO connection ID"); const newClientSecret = requireText(replaceValue.input, "New OIDC client secret"); const identity = captureTenantIdentity(); mutate("Previewing secret replacement…", "Replace OIDC secret?", "The existing OIDC client secret will stop working.", "Replace secret", identity, (signal) => tenantCall("replaceSsoSecret", organizationId, connectionId, { newClientSecret, dryRun: true, confirm: false }, { signal }), (signal, operationId) => tenantCall("replaceSsoSecret", organizationId, connectionId, { newClientSecret, operationId: operationId!, dryRun: false, confirm: true }, { signal }), () => { replaceValue.input.value = ""; }, browserOperationId); });
+		replaceSecret.form.addEventListener("submit", (event) => { event.preventDefault(); const connectionId = requireText(replaceId.input, "SSO connection ID"); const newClientSecret = requireText(replaceValue.input, "New OIDC client secret"); const identity = requireTenantIdentity(); mutate("Previewing secret replacement…", "Replace OIDC secret?", "The existing OIDC client secret will stop working.", "Replace secret", identity, (signal) => tenantCall("replaceSsoSecret", organizationId, connectionId, { newClientSecret, dryRun: true, confirm: false }, { signal }), (signal, operationId) => tenantCall("replaceSsoSecret", organizationId, connectionId, { newClientSecret, operationId: operationId!, dryRun: false, confirm: true }, { signal }), () => { replaceValue.input.value = ""; }, browserOperationId); });
 
 		const scim = node("section", "cv-card");
 		scim.append(node("h2", undefined, "Directory connections"));
@@ -2434,7 +2434,7 @@ export function mountClearanceVault(
 			const connectionId = id(connection);
 			const item = node("li", "cv-list-item");
 			item.append(node("span", undefined, `${value(connection, "provider")} · ${connectionId} · ${value(connection, "status") || "active"}`));
-			const identity = captureTenantIdentity();
+			const identity = requireTenantIdentity();
 			item.append(button("Inspect", () => void request("Inspecting SCIM connection…", (signal) => tenantCall<TenantRecord>("inspectScim", organizationId, connectionId, { signal }), (result) => { state.status = `SCIM connection ${value(result, "status") || "loaded"}.`; }), "secondary"), button("Preview test", () => mutate("Previewing SCIM test…", "Run SCIM certification test?", "This simulation checks the current directory connection without changing it.", "Run test", identity, (signal) => tenantCall("testScim", organizationId, connectionId, { dryRun: true, confirm: false }, { signal }), (signal) => tenantCall("testScim", organizationId, connectionId, { dryRun: false, confirm: true }, { signal }), (result) => { state.status = testResultStatus("SCIM", result as TenantRecord); }), "secondary"), button("Rotate token", () => mutate("Previewing SCIM token rotation…", "Rotate SCIM bearer token?", "The current bearer token will stop working. A replacement token is shown once only if the server returns one.", "Rotate token", identity, (signal) => tenantCall("rotateScim", organizationId, connectionId, { dryRun: true, confirm: false }, { signal }), (signal, operationId) => tenantCall("rotateScim", organizationId, connectionId, { operationId: operationId!, dryRun: false, confirm: true }, { signal }), (result) => { const secret = (result as TenantRecord).bearerTokenOnce; if (typeof secret === "string" && secret) showSecret("One-time SCIM bearer token", secret); else state.status = "SCIM token rotated. No one-time token was returned."; }, browserOperationId), "danger"), button("Disable", () => mutate("Previewing SCIM disable…", "Disable SCIM connection?", "This directory connection will stop provisioning the organization.", "Disable SCIM", identity, (signal) => tenantCall("disableScim", organizationId, connectionId, { dryRun: true, confirm: false }, { signal }), (signal) => tenantCall("disableScim", organizationId, connectionId, { dryRun: false, confirm: true }, { signal }), () => void request("Refreshing enterprise connections…", refreshEnterprise)), "danger"));
 			scimList.append(item);
 		}
@@ -2450,7 +2450,7 @@ export function mountClearanceVault(
 		const scimEndpoint = field("cv-scim-endpoint", "Endpoint (optional)", "url");
 		const scimSubmit = button("Preview SCIM connection", () => scimCreate.form.requestSubmit()); scimSubmit.type = "submit";
 		scimCreate.form.append(scimProvider.wrapper, scimEndpoint.wrapper, scimSubmit);
-		scimCreate.form.addEventListener("submit", (event) => { event.preventDefault(); const input = { provider: requireText(scimProvider.input, "Provider"), ...(scimEndpoint.input.value.trim() ? { endpoint: scimEndpoint.input.value.trim() } : {}) }; const identity = captureTenantIdentity(); mutate("Previewing SCIM connection…", "Create SCIM connection?", "A bearer token is shown once only if the server returns one after creation.", "Create SCIM", identity, (signal) => tenantCall("createScim", organizationId, { ...input, dryRun: true, confirm: false }, { signal }), (signal, operationId) => tenantCall("createScim", organizationId, { ...input, operationId: operationId!, dryRun: false, confirm: true }, { signal }), (result) => { const secret = (result as TenantRecord).bearerTokenOnce; if (typeof secret === "string" && secret) showSecret("One-time SCIM bearer token", secret); else state.status = "SCIM connection created. No one-time token was returned."; void request("Refreshing enterprise connections…", refreshEnterprise); }, browserOperationId); });
+		scimCreate.form.addEventListener("submit", (event) => { event.preventDefault(); const input = { provider: requireText(scimProvider.input, "Provider"), ...(scimEndpoint.input.value.trim() ? { endpoint: scimEndpoint.input.value.trim() } : {}) }; const identity = requireTenantIdentity(); mutate("Previewing SCIM connection…", "Create SCIM connection?", "A bearer token is shown once only if the server returns one after creation.", "Create SCIM", identity, (signal) => tenantCall("createScim", organizationId, { ...input, dryRun: true, confirm: false }, { signal }), (signal, operationId) => tenantCall("createScim", organizationId, { ...input, operationId: operationId!, dryRun: false, confirm: true }, { signal }), (result) => { const secret = (result as TenantRecord).bearerTokenOnce; if (typeof secret === "string" && secret) showSecret("One-time SCIM bearer token", secret); else state.status = "SCIM connection created. No one-time token was returned."; void request("Refreshing enterprise connections…", refreshEnterprise); }, browserOperationId); });
 		const readiness = node("section", "cv-card");
 		readiness.append(node("h2", undefined, "Enterprise readiness"), node("pre", "cv-muted", state.readiness ? JSON.stringify(state.readiness, null, 2) : "No readiness report is available."));
 		grid.append(sso, ssoCreate.card, replaceSecret.card, scim, scimCreate.card, readiness);

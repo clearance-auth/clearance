@@ -1723,10 +1723,10 @@ const OPERATION_METADATA_VALUES = [
 		"queryParameters": {}
 	},
 	{
-		"id": "migrations.run",
+		"id": "migrations.apply",
 		"http": {
 			"method": "POST",
-			"path": "/v1/migrations/:id/run"
+			"path": "/v1/migrations/:id/apply"
 		},
 		"mutation": true,
 		"supportsDryRun": true,

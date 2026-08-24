@@ -1,12 +1,12 @@
 import { isAPIError } from "@clearance/core/utils/is-api-error";
-import { BetterFetchError, betterFetch } from "@better-fetch/fetch";
+import { fetchWithPublicEgressPolicy } from "@clearance/core/utils/public-egress";
+import { BetterFetchError } from "@better-fetch/fetch";
+import { validateAuthorizationCode, validateToken } from "@clearance/core/oauth2";
 import {
 	createAuthorizationURL,
 	generateState,
 	HIDE_METADATA,
 	parseState,
-	validateAuthorizationCode,
-	validateToken,
 } from "@clearance/runtime";
 import {
 	APIError,
@@ -34,6 +34,7 @@ import { decryptOIDCConfig, encryptOIDCConfig } from "../oidc-secret-storage";
 import type { HydratedOIDCConfig } from "../oidc";
 import {
 	DiscoveryError,
+	createOIDCEndpointTransport,
 	discoverOIDCConfig,
 	ensureRuntimeDiscovery,
 	mapDiscoveryErrorToAPIError,
@@ -74,7 +75,7 @@ import {
 	findSAMLProvider,
 } from "./helpers";
 import { hasOrgAdminRole } from "./providers";
-import { getSafeRedirectUrl, processSAMLResponse } from "./saml-pipeline";
+import { getSafeRedirectUrl, completeSAMLSignIn } from "./saml-pipeline";
 import {
 	appendInternalRuntimeAudit,
 	attachCapturedInternalRuntimeAudit,
@@ -1592,7 +1593,7 @@ const callbackSSOQuerySchema = z.object({
  * @param stateData - Pre-parsed state data. If not provided, it will be
  *   parsed from the request context.
  */
-async function handleOIDCCallback(
+async function completeOIDCSignIn(
 	ctx: any,
 	options: SSOOptions | undefined,
 	providerId: string,
@@ -1708,6 +1709,9 @@ async function handleOIDCCallback(
 			}?error=discovery_failed&error_description=unexpected_discovery_error`,
 		);
 	}
+	const oidcEndpointTransport = createOIDCEndpointTransport((url) =>
+		ctx.context.isTrustedOrigin(url),
+	);
 	if (!config.scopes) {
 		config = {
 			...config,
@@ -1740,6 +1744,7 @@ async function handleOIDCCallback(
 			config.tokenEndpointAuthentication === "client_secret_post"
 				? "post"
 				: "basic",
+		fetchImpl: oidcEndpointTransport,
 	}).catch((e) => {
 		ctx.context.logger.error("Error validating authorization code", e);
 		if (e instanceof BetterFetchError) {
@@ -1769,23 +1774,20 @@ async function handleOIDCCallback(
 	const mapping = config.mapping || {};
 
 	if (config.userInfoEndpoint) {
-		const userInfoResponse = await betterFetch<Record<string, unknown>>(
-			config.userInfoEndpoint,
-			{
+		const userInfoResponse = await fetchWithPublicEgressPolicy(config.userInfoEndpoint, {
 				headers: {
 					Authorization: `Bearer ${tokenResponse.accessToken}`,
 				},
-				redirect: "error",
-			},
-		);
-		if (userInfoResponse.error) {
+				redirect: "manual",
+			}, oidcEndpointTransport);
+		if (!userInfoResponse.ok || (userInfoResponse.status >= 300 && userInfoResponse.status < 400)) {
 			throw ctx.redirect(
 				`${errorURL || callbackURL}?error=invalid_provider&error_description=${
-					userInfoResponse.error.message
+					`HTTP ${userInfoResponse.status}`
 				}`,
 			);
 		}
-		const rawUserInfo = userInfoResponse.data;
+		const rawUserInfo = await userInfoResponse.json() as Record<string, unknown>;
 		userInfo = {
 			...Object.fromEntries(
 				Object.entries(mapping.extraFields || {}).map(([key, value]) => [
@@ -1819,6 +1821,7 @@ async function handleOIDCCallback(
 				audience: config.clientId,
 				issuer: provider.issuer,
 			},
+			oidcEndpointTransport,
 		).catch((e) => {
 			ctx.context.logger.error(e);
 			return null;
@@ -2012,7 +2015,7 @@ export const callbackSSO = (options?: SSOOptions) => {
 		callbackSSOEndpointConfig,
 		async (ctx) => {
 			try {
-				return await handleOIDCCallback(ctx, options, ctx.params.providerId);
+				return await completeOIDCSignIn(ctx, options, ctx.params.providerId);
 			} catch (error) {
 				await appendSSOFailureAudit(ctx, "oidc");
 				throw error;
@@ -2062,7 +2065,7 @@ export const callbackSSOShared = (options?: SSOOptions) => {
 			}
 
 			try {
-				return await handleOIDCCallback(ctx, options, providerId, stateData);
+				return await completeOIDCSignIn(ctx, options, providerId, stateData);
 			} catch (error) {
 				await appendSSOFailureAudit(ctx, "oidc");
 				throw error;
@@ -2156,7 +2159,7 @@ export const callbackSSOSAML = (options?: SSOOptions) => {
 					options,
 					ctx,
 					() =>
-						processSAMLResponse(
+						completeSAMLSignIn(
 							ctx,
 							{
 								SAMLResponse: samlResponse,
@@ -2219,7 +2222,7 @@ export const acsEndpoint = (options?: SSOOptions) => {
 					options,
 					ctx,
 					() =>
-						processSAMLResponse(
+						completeSAMLSignIn(
 							ctx,
 							{
 								SAMLResponse: samlResponse,
@@ -2361,7 +2364,7 @@ export const sloEndpoint = (options?: SSOOptions) => {
 			const idp = createIdP(config);
 
 			if (samlResponse) {
-				return handleLogoutResponse(ctx, sp, idp, relayState, providerId);
+				return completeSAMLLogout(ctx, sp, idp, relayState, providerId);
 			}
 
 			return handleLogoutRequest(ctx, sp, idp, relayState, providerId);
@@ -2369,7 +2372,7 @@ export const sloEndpoint = (options?: SSOOptions) => {
 	);
 };
 
-async function handleLogoutResponse(
+async function completeSAMLLogout(
 	ctx: any,
 	sp: ReturnType<typeof createSP>,
 	idp: ReturnType<typeof createIdP>,
@@ -2415,7 +2418,7 @@ async function handleLogoutResponse(
 	if (inResponseTo) {
 		const key = `${constants.LOGOUT_REQUEST_KEY_PREFIX}${inResponseTo}`;
 		const pendingRequest =
-			await ctx.context.internalAdapter.findVerificationValue(key);
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(key);
 
 		if (!pendingRequest) {
 			ctx.context.logger.warn(
@@ -2477,7 +2480,7 @@ async function handleLogoutRequest(
 	const sessionIndex = (parsed.extract as SAMLAssertionExtract).sessionIndex;
 
 	const key = `${constants.SAML_SESSION_KEY_PREFIX}${providerId}:${nameID}`;
-	const stored = await ctx.context.internalAdapter.findVerificationValue(key);
+	const stored = await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(key);
 
 	if (stored) {
 		const data = safeJsonParse<SAMLSessionRecord>(stored.value);
@@ -2615,7 +2618,7 @@ export const initiateSLO = (options?: SSOOptions) => {
 			const session = ctx.context.session;
 			const sessionLookupKey = `${constants.SAML_SESSION_BY_ID_PREFIX}${session.session.id}`;
 			const sessionLookup =
-				await ctx.context.internalAdapter.findVerificationValue(
+				await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 					sessionLookupKey,
 				);
 
@@ -2626,7 +2629,7 @@ export const initiateSLO = (options?: SSOOptions) => {
 			if (sessionLookup) {
 				samlSessionKey = sessionLookup.value;
 				const stored =
-					await ctx.context.internalAdapter.findVerificationValue(
+					await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 						samlSessionKey,
 					);
 				if (stored) {

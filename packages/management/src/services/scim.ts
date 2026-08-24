@@ -7,7 +7,7 @@ import type {
 } from "../store/types.js";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DiagnosticTrace, DirectoryConnection, Membership, Principal } from "../types/resources.js";
+import type { DiagnosticTrace, ScimConnection, Membership, User } from "../types/resources.js";
 import {
 	deleteScimProviderById,
 	invalidateAuthBundles,
@@ -72,9 +72,9 @@ export function resolveScimConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
-): DirectoryConnection {
+): ScimConnection {
 	return resolveEnterpriseConnection(store, id, {
-		connections: store.snapshot.directoryConnections,
+		connections: store.snapshot.scimConnections,
 		scope: opts?.scope,
 		stage: opts?.stage ?? "scim.resolve",
 		label: "SCIM",
@@ -87,9 +87,9 @@ export async function resolveScimConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
-): Promise<DirectoryConnection> {
+): Promise<ScimConnection> {
 	return resolveEnterpriseConnectionAuthoritative(store, id, {
-		connections: store.snapshot.directoryConnections,
+		connections: store.snapshot.scimConnections,
 		scope: opts?.scope,
 		stage: opts?.stage ?? "scim.resolve",
 		label: "SCIM",
@@ -103,24 +103,24 @@ export function inspectScimConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope },
-): DirectoryConnection {
+): ScimConnection {
 	const conn = resolveScimConnection(store, id, {
 		scope: opts?.scope,
 		stage: "scim.inspect",
 	});
-	return publicDirectoryConnection(conn) as DirectoryConnection;
+	return publicDirectoryConnection(conn) as ScimConnection;
 }
 
 export async function inspectScimConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope },
-): Promise<DirectoryConnection> {
+): Promise<ScimConnection> {
 	const conn = await resolveScimConnectionAuthoritative(store, id, {
 		scope: opts?.scope,
 		stage: "scim.inspect",
 	});
-	return publicDirectoryConnection(conn) as DirectoryConnection;
+	return publicDirectoryConnection(conn) as ScimConnection;
 }
 
 type CreateScimConnectionInput = {
@@ -128,7 +128,7 @@ type CreateScimConnectionInput = {
 	provider: string;
 	endpoint?: string;
 	bearerToken?: string;
-	deprovisioningPolicy?: DirectoryConnection["deprovisioningPolicy"];
+	deprovisioningPolicy?: ScimConnection["deprovisioningPolicy"];
 	actor?: string;
 	source?: ScimActorSource;
 	/** Server-derived request scope for relational authority. */
@@ -138,13 +138,13 @@ type CreateScimConnectionInput = {
 function buildScimConnection(
 	input: CreateScimConnectionInput,
 	org: { id: string; projectId: string; environmentId: string },
-): DirectoryConnection {
+): ScimConnection {
 	const now = nowIso();
 	const token =
 		input.bearerToken ??
 		`scimtok_${newId("tok").replace(/^tok_/, "")}`;
 	const enc = encryptCredential(token);
-	const conn: DirectoryConnection = {
+	const conn: ScimConnection = {
 		id: newId("scim"),
 		organizationId: org.id,
 		provider: input.provider,
@@ -161,7 +161,7 @@ function buildScimConnection(
 }
 
 function scimCreateAuditInput(
-	conn: DirectoryConnection,
+	conn: ScimConnection,
 	input: CreateScimConnectionInput,
 	org: { id: string; projectId: string; environmentId: string },
 ): AuditEventInput {
@@ -187,20 +187,20 @@ function scimCreateAuditInput(
 export function createScimConnection(
 	store: ManagementStore,
 	input: CreateScimConnectionInput,
-): DirectoryConnection {
+): ScimConnection {
 	const organization = inspectOrganization(store, input.organizationId);
 	const connection = buildScimConnection(input, organization);
 	store.mutate((data) => {
-		data.directoryConnections.push(connection);
+		data.scimConnections.push(connection);
 	});
 	recordEvent(store, scimCreateAuditInput(connection, input, organization));
-	return publicDirectoryConnection(connection) as DirectoryConnection;
+	return publicDirectoryConnection(connection) as ScimConnection;
 }
 
 export async function createScimConnectionAuthoritative(
 	store: ManagementStore,
 	input: CreateScimConnectionInput,
-): Promise<DirectoryConnection> {
+): Promise<ScimConnection> {
 	if (!store.storeV2Topology?.authoritative) return createScimConnection(store, input);
 	if (!store.mutateCoordinated) {
 		throw new ClearanceError({
@@ -224,24 +224,24 @@ export async function createScimConnectionAuthoritative(
 			});
 		}
 		const connection = buildScimConnection(input, organization);
-		data.directoryConnections.push(connection);
+		data.scimConnections.push(connection);
 		appendAudit(scimCreateAuditInput(connection, input, organization));
-		return publicDirectoryConnection(connection) as DirectoryConnection;
+		return publicDirectoryConnection(connection) as ScimConnection;
 	});
 }
 
 export function listScimConnections(
 	store: ManagementStore,
 	organizationId?: string,
-): DirectoryConnection[] {
-	return store.snapshot.directoryConnections
+): ScimConnection[] {
+	return store.snapshot.scimConnections
 		.filter((c) =>
 			organizationId ? c.organizationId === organizationId : true,
 		)
-		.map((c) => publicDirectoryConnection(c) as DirectoryConnection);
+		.map((c) => publicDirectoryConnection(c) as ScimConnection);
 }
 
-export type RotatedScimCredential = DirectoryConnection & Readonly<{
+export type RotatedScimCredential = ScimConnection & Readonly<{
 	/** Returned exactly once to the tenant caller; never persisted in audit. */
 	bearerTokenOnce?: string;
 	replayed: boolean;
@@ -315,7 +315,7 @@ export function scimOperationReplayRequestFingerprint(
 }
 
 export function scimOperationReplayConnectionStateFingerprint(
-	connection: DirectoryConnection,
+	connection: ScimConnection,
 ): string {
 	return createHash("sha256").update(JSON.stringify({
 		organizationId: connection.organizationId,
@@ -699,8 +699,8 @@ export async function rotateScimCredentialAuthoritative(
 		appendAudit,
 		query,
 	}) => {
-		const index = data.directoryConnections.findIndex((connection) => connection.id === connectionId);
-		const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+		const index = data.scimConnections.findIndex((connection) => connection.id === connectionId);
+		const connection = index >= 0 ? data.scimConnections[index] : undefined;
 		if (!connection) {
 			throw new ClearanceError({
 				code: "SCIM_NOT_FOUND",
@@ -773,7 +773,7 @@ export async function rotateScimCredentialAuthoritative(
 				throw replayConflict("scim.rotate");
 			}
 			return {
-				...(publicDirectoryConnection(connection) as DirectoryConnection),
+				...(publicDirectoryConnection(connection) as ScimConnection),
 				bearerTokenOnce,
 				replayed: true,
 			};
@@ -820,14 +820,14 @@ export async function rotateScimCredentialAuthoritative(
 				scimCredentialIdentity(organization.id, connectionId),
 			)
 			: encryptCredential(replacement.token);
-		const updated: DirectoryConnection = {
+		const updated: ScimConnection = {
 			...connection,
 			bearerTokenEncrypted: encrypted.ciphertext,
 			bearerTokenKeyId: encrypted.keyId,
 			bearerTokenFingerprint: encrypted.fingerprint,
 			updatedAt: nowIso(),
 		};
-		data.directoryConnections[index] = updated;
+		data.scimConnections[index] = updated;
 		const replayAuthorityToInsert: ScimOperationReplayAuthority = {
 			...replayRequest,
 			connectionId,
@@ -870,7 +870,7 @@ export async function rotateScimCredentialAuthoritative(
 			},
 		});
 		return {
-			...(publicDirectoryConnection(updated) as DirectoryConnection),
+			...(publicDirectoryConnection(updated) as ScimConnection),
 			bearerTokenOnce: replacement.token,
 			replayed: false,
 		};
@@ -892,7 +892,7 @@ export function disableScimConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: ScimMutationOpts,
-): { connection: DirectoryConnection; idempotent: boolean } {
+): { connection: ScimConnection; idempotent: boolean } {
 	const stage = "scim.disable";
 	const conn = resolveScimConnection(store, id, {
 		scope: opts?.scope,
@@ -904,9 +904,9 @@ export function disableScimConnection(
 		opts?.scope ?? resolveOperatorScope(store),
 	);
 	const now = nowIso();
-	let result: { connection: DirectoryConnection; idempotent: boolean } | undefined;
+	let result: { connection: ScimConnection; idempotent: boolean } | undefined;
 	store.mutate((data) => {
-		const idx = data.directoryConnections.findIndex((c) => c.id === conn.id);
+		const idx = data.scimConnections.findIndex((c) => c.id === conn.id);
 		if (idx < 0) {
 			throw new ClearanceError({
 				code: "SCIM_NOT_FOUND",
@@ -915,7 +915,7 @@ export function disableScimConnection(
 				status: 404,
 			});
 		}
-		const row = data.directoryConnections[idx]!;
+		const row = data.scimConnections[idx]!;
 		const alreadyDisabled = row.status === "disabled";
 		if (!alreadyDisabled) {
 			row.status = "disabled";
@@ -941,7 +941,7 @@ export function disableScimConnection(
 			},
 		});
 		result = {
-			connection: publicDirectoryConnection(row) as DirectoryConnection,
+			connection: publicDirectoryConnection(row) as ScimConnection,
 			idempotent: alreadyDisabled,
 		};
 	});
@@ -961,7 +961,7 @@ export async function disableScimConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: ScimMutationOpts,
-): Promise<{ connection: DirectoryConnection; idempotent: boolean }> {
+): Promise<{ connection: ScimConnection; idempotent: boolean }> {
 	if (!store.storeV2Topology?.authoritative) return disableScimConnection(store, id, opts);
 	if (!store.mutateCoordinated) {
 		throw new ClearanceError({ code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED", message: "Relational topology authority requires a coordinated transaction", stage: "scim.disable", status: 500 });
@@ -970,15 +970,15 @@ export async function disableScimConnectionAuthoritative(
 	if (!connectionId) throw new ClearanceError({ code: "SCIM_ID_REQUIRED", message: "SCIM connection id is required", stage: "scim.disable", status: 400 });
 	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
 	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-		const index = data.directoryConnections.findIndex((connection) => connection.id === connectionId);
-		const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+		const index = data.scimConnections.findIndex((connection) => connection.id === connectionId);
+		const connection = index >= 0 ? data.scimConnections[index] : undefined;
 		const organization = connection && topology ? await topology.lockOrganization({ scope, id: connection.organizationId }) : null;
 		if (!connection || !organization || organization.status === "archived") throw new ClearanceError({ code: "SCIM_NOT_FOUND", message: `SCIM connection ${connectionId} not found`, stage: "scim.disable", status: 404 });
 		const alreadyDisabled = connection.status === "disabled";
 		const updated = alreadyDisabled ? connection : { ...connection, status: "disabled" as const, updatedAt: nowIso() };
-		data.directoryConnections[index] = updated;
+		data.scimConnections[index] = updated;
 		appendAudit({ actor: opts?.actor ?? "operator", action: "scim.disable", subjectType: "directory_connection", subjectId: connectionId, outcome: "success", source: opts?.source ?? "cli", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, message: alreadyDisabled ? `SCIM connection ${connectionId} already disabled` : `Disabled SCIM connection ${connectionId}`, metadata: { idempotent: alreadyDisabled, previousStatus: connection.status, runtimeRemoved: false } });
-		return { connection: publicDirectoryConnection(updated) as DirectoryConnection, idempotent: alreadyDisabled };
+		return { connection: publicDirectoryConnection(updated) as ScimConnection, idempotent: alreadyDisabled };
 	});
 }
 
@@ -992,7 +992,7 @@ export async function disableScimConnectionReal(
 	opts?: ScimMutationOpts,
 	guard?: ScimMutationGuard,
 ): Promise<{
-	connection: DirectoryConnection;
+	connection: ScimConnection;
 	idempotent: boolean;
 	runtimeRemoved: boolean;
 }> {
@@ -1022,10 +1022,10 @@ export async function disableScimConnectionReal(
 			topology,
 			appendAudit,
 		}) => {
-			const index = data.directoryConnections.findIndex(
+			const index = data.scimConnections.findIndex(
 				(connection) => connection.id === connectionId,
 			);
-			const connection = index >= 0 ? data.directoryConnections[index] : undefined;
+			const connection = index >= 0 ? data.scimConnections[index] : undefined;
 			if (!connection) {
 				throw new ClearanceError({ code: "SCIM_NOT_FOUND", message: `SCIM connection ${connectionId} not found`, stage, status: 404 });
 			}
@@ -1047,7 +1047,7 @@ export async function disableScimConnectionReal(
 			const updated = alreadyDisabled
 				? connection
 				: { ...connection, status: "disabled" as const, updatedAt: nowIso() };
-			data.directoryConnections[index] = updated;
+			data.scimConnections[index] = updated;
 			appendAudit({
 				actor: opts?.actor ?? "operator",
 				action: "scim.disable",
@@ -1068,7 +1068,7 @@ export async function disableScimConnectionReal(
 				},
 			});
 			return {
-				connection: publicDirectoryConnection(updated) as DirectoryConnection,
+				connection: publicDirectoryConnection(updated) as ScimConnection,
 				idempotent: alreadyDisabled && !runtimeRemoved,
 				runtimeRemoved,
 			};
@@ -1095,7 +1095,7 @@ export async function disableScimConnectionReal(
 				conn.id,
 			]);
 			const runtimeRemoved = (deleted.rowCount ?? 0) > 0;
-			const idx = data.directoryConnections.findIndex((c) => c.id === conn.id);
+			const idx = data.scimConnections.findIndex((c) => c.id === conn.id);
 			if (idx < 0) {
 				throw new ClearanceError({
 					code: "SCIM_NOT_FOUND",
@@ -1104,7 +1104,7 @@ export async function disableScimConnectionReal(
 					status: 404,
 				});
 			}
-			const row = data.directoryConnections[idx]!;
+			const row = data.scimConnections[idx]!;
 			const alreadyDisabled = row.status === "disabled";
 			if (!alreadyDisabled) {
 				row.status = "disabled";
@@ -1130,7 +1130,7 @@ export async function disableScimConnectionReal(
 				},
 			});
 			return {
-				connection: publicDirectoryConnection(row) as DirectoryConnection,
+				connection: publicDirectoryConnection(row) as ScimConnection,
 				idempotent: alreadyDisabled && !runtimeRemoved,
 				runtimeRemoved,
 			};
@@ -1171,7 +1171,7 @@ export const SCIM_LOCAL_PROTOCOL_EVIDENCE =
  * Perform an actual SCIM HTTP connection check against the configured endpoint.
  * Network / auth / malformed body / non-success status all fail.
  */
-export async function checkScimConnection(
+export async function probeScimConnection(
 	store: ManagementStore,
 	id: string,
 	opts: {
@@ -1186,7 +1186,7 @@ export async function checkScimConnection(
 ): Promise<{
 	pass: boolean;
 	trace: DiagnosticTrace;
-	connection: DirectoryConnection;
+	connection: ScimConnection;
 	mode: "simulation";
 	evidence: typeof SCIM_LOCAL_PROTOCOL_EVIDENCE;
 	externalProviderCertified: false;
@@ -1336,8 +1336,8 @@ export async function checkScimConnection(
 	};
 	store.mutate((d) => {
 		d.traces.unshift(trace);
-		const idx = d.directoryConnections.findIndex((c) => c.id === id);
-		d.directoryConnections[idx] = {
+		const idx = d.scimConnections.findIndex((c) => c.id === id);
+		d.scimConnections[idx] = {
 			...conn,
 			status: "testing",
 			updatedAt: nowIso(),
@@ -1364,8 +1364,8 @@ export async function checkScimConnection(
 		pass: true,
 		trace,
 		connection: publicDirectoryConnection(
-			store.snapshot.directoryConnections.find((c) => c.id === id)!,
-		) as DirectoryConnection,
+			store.snapshot.scimConnections.find((c) => c.id === id)!,
+		) as ScimConnection,
 		mode: SCIM_FIXTURE_MODE,
 		evidence: SCIM_LOCAL_PROTOCOL_EVIDENCE,
 		externalProviderCertified: false,
@@ -1387,7 +1387,7 @@ export function testScimConnection(
 	pass: boolean;
 	trace: DiagnosticTrace;
 	proposed: Array<{ action: string; email: string }>;
-	connection: DirectoryConnection;
+	connection: ScimConnection;
 	mode: "simulation";
 } {
 	const conn = resolveScimConnection(store, id, { scope: opts.scope, stage: "scim.test" });
@@ -1521,8 +1521,8 @@ export function testScimConnection(
 	};
 	store.mutate((d) => {
 		d.traces.unshift(trace);
-		const idx = d.directoryConnections.findIndex((c) => c.id === id);
-		d.directoryConnections[idx] = {
+		const idx = d.scimConnections.findIndex((c) => c.id === id);
+		d.scimConnections[idx] = {
 			...conn,
 			status: "testing",
 			updatedAt: nowIso(),
@@ -1546,8 +1546,8 @@ export function testScimConnection(
 		trace,
 		proposed,
 		connection: publicDirectoryConnection(
-			store.snapshot.directoryConnections.find((c) => c.id === id)!,
-		) as DirectoryConnection,
+			store.snapshot.scimConnections.find((c) => c.id === id)!,
+		) as ScimConnection,
 		mode: SCIM_FIXTURE_MODE,
 	};
 }
@@ -1607,7 +1607,7 @@ export async function testScimConnectionAuthoritative(
 				status: 500,
 			});
 		}
-		const conn = data.directoryConnections.find((candidate) => candidate.id === id);
+		const conn = data.scimConnections.find((candidate) => candidate.id === id);
 		if (!conn) {
 			throw new ClearanceError({
 				code: "SCIM_NOT_FOUND",
@@ -1682,8 +1682,8 @@ export async function testScimConnectionAuthoritative(
 				redactedResponse: { proposedCount: proposed.length, dryRun: true },
 			};
 			data.traces.unshift(trace);
-			const connectionIndex = data.directoryConnections.findIndex((candidate) => candidate.id === id);
-			data.directoryConnections[connectionIndex] = { ...conn, status: "testing", updatedAt: timestamp };
+			const connectionIndex = data.scimConnections.findIndex((candidate) => candidate.id === id);
+			data.scimConnections[connectionIndex] = { ...conn, status: "testing", updatedAt: timestamp };
 			appendAuditEvent(data, {
 				actor: opts.actor ?? "system", action: "scim.test", subjectType: "directory_connection", subjectId: id,
 				outcome: "success", source: opts.source ?? "scim", projectId: org.projectId, environmentId: org.environmentId,
@@ -1691,7 +1691,7 @@ export async function testScimConnectionAuthoritative(
 				message: "SCIM simulation dry-run passed (not live directory conformance)",
 				metadata: { proposed, mode: SCIM_FIXTURE_MODE, fixture },
 			});
-			return { kind: "success" as const, trace: structuredClone(trace), connection: structuredClone(data.directoryConnections[connectionIndex]!) };
+			return { kind: "success" as const, trace: structuredClone(trace), connection: structuredClone(data.scimConnections[connectionIndex]!) };
 		}
 		if (!principals) {
 			throw new ClearanceError({
@@ -1717,7 +1717,7 @@ export async function testScimConnectionAuthoritative(
 					...(user.externalId ? { externalId: user.externalId } : {}),
 					createdAt: timestamp,
 					updatedAt: timestamp,
-				} satisfies Principal);
+				} satisfies User);
 			} else {
 				const nextName = user.displayName?.trim() || email;
 				const nextExternalId = user.externalId ?? principal.externalId;
@@ -1776,10 +1776,10 @@ export async function testScimConnectionAuthoritative(
 			redactedResponse: { proposedCount: proposed.length, dryRun: false },
 		};
 		data.traces.unshift(trace);
-		const connectionIndex = data.directoryConnections.findIndex(
+		const connectionIndex = data.scimConnections.findIndex(
 			(candidate) => candidate.id === id,
 		);
-		data.directoryConnections[connectionIndex] = {
+		data.scimConnections[connectionIndex] = {
 			...conn,
 			status: "testing",
 			updatedAt: timestamp,
@@ -1801,7 +1801,7 @@ export async function testScimConnectionAuthoritative(
 		return {
 			kind: "success" as const,
 			trace: structuredClone(trace),
-			connection: structuredClone(data.directoryConnections[connectionIndex]!),
+			connection: structuredClone(data.scimConnections[connectionIndex]!),
 		};
 	});
 	if (outcome.kind === "failure") {
@@ -1816,7 +1816,7 @@ export async function testScimConnectionAuthoritative(
 		pass: true,
 		trace: outcome.trace,
 		proposed,
-		connection: publicDirectoryConnection(outcome.connection) as DirectoryConnection,
+		connection: publicDirectoryConnection(outcome.connection) as ScimConnection,
 		mode: SCIM_FIXTURE_MODE,
 	};
 }
@@ -2032,7 +2032,7 @@ export async function replayScimTraceAuthoritative(
 		}
 
 		if (current.connectionId) {
-			const connection = data.directoryConnections.find(
+			const connection = data.scimConnections.find(
 				(candidate) => candidate.id === current.connectionId,
 			);
 			const organization = connection && topology

@@ -66,7 +66,7 @@ export function requestPrincipal(context: Context): ApiRequestPrincipal {
 
 export function requestActor(context: Context): string {
 	const principal = requestPrincipal(context);
-	return principal.kind === "api_key" ? `api-key:${principal.id}` : "api";
+	return principal.kind === "api_key" ? `api-key:${principal.id}` : "operator";
 }
 
 export function requiredApiKeyScope(method: string, path: string): string | null {

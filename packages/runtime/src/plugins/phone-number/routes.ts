@@ -513,7 +513,7 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 				if (opts?.verifyOTP) {
 					if (managed) {
 					const challenge =
-						await ctx.context.internalAdapter.findVerificationValue(
+						await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 							ctx.body.phoneNumber,
 						);
 					if (!challenge || challenge.expiresAt <= new Date()) {
@@ -538,7 +538,7 @@ export const verifyPhoneNumber = (opts: RequiredPhoneNumberOptions) =>
 					);
 				}
 					if (!managed) {
-					const otp = await ctx.context.internalAdapter.findVerificationValue(
+					const otp = await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 						ctx.body.phoneNumber,
 					);
 					if (otp) {
@@ -1003,7 +1003,7 @@ async function verifyPhoneNumberOTP(
 ): Promise<void> {
 	const { identifier } = challenge;
 	const existing =
-		await ctx.context.internalAdapter.findVerificationValue(identifier);
+		await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 	if (!existing) {
 		throw APIError.from("BAD_REQUEST", PHONE_NUMBER_ERROR_CODES.OTP_NOT_FOUND);
 	}

@@ -8,7 +8,7 @@ import {
 import {
 	attachStagedAuthenticationContinuation,
 	digestStagedAuthenticationPolicy,
-	issueInitialStagedAuthenticationCapability,
+	issueStagedAuthenticationChallenge,
 	takeStagedAuthenticationContinuation,
 } from "../../internal/staged-authentication-context";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
@@ -129,7 +129,7 @@ async function stagedHeaders(
 	const seed = takeStagedAuthenticationContinuation(failure);
 	if (!seed) throw new Error("staged authority was not created");
 	const issued = await runWithTransaction(fixture.context.adapter, () =>
-		issueInitialStagedAuthenticationCapability(fixture.context as never, seed),
+		issueStagedAuthenticationChallenge(fixture.context as never, seed),
 	);
 	const serialized = await serializeSignedCookie(
 		issued.cookie.name,

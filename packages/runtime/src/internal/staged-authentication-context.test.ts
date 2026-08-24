@@ -17,7 +17,7 @@ import {
 	expireStagedAuthenticationCookie,
 	getStagedAuthenticationFactorInventory,
 	inspectStagedAuthenticationAuthority,
-	issueInitialStagedAuthenticationCapability,
+	issueStagedAuthenticationChallenge,
 	preloadStagedAuthenticationCapability,
 	readStagedAuthenticationLineage,
 	rotateStagedAuthenticationCapability,
@@ -83,7 +83,7 @@ async function issue(
 	const seed = takeStagedAuthenticationContinuation(error);
 	expect(seed).not.toBeNull();
 	return runWithTransaction(context.adapter, () =>
-		issueInitialStagedAuthenticationCapability(context, seed!),
+		issueStagedAuthenticationChallenge(context, seed!),
 	);
 }
 
@@ -142,7 +142,7 @@ describe("staged authentication continuation authority", () => {
 		const digest = await createHash("SHA-256", "base64urlnopad").digest(
 			`managed-authentication-remediation:v1:${issued.bearer}`,
 		);
-		const stored = await context.internalAdapter.findVerificationValue(
+		const stored = await context.internalAdapter.findVerificationValueAndPruneExpired(
 			`managed-authentication-remediation:v1:${digest}`,
 		);
 

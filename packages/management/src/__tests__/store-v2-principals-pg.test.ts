@@ -17,7 +17,7 @@ import {
 import {
 	planMigrationDurable,
 	rollbackMigrationDurable,
-	runMigrationDurable,
+	applyMigrationDurable,
 	verifyMigrationDurable,
 } from "../services/migration-postgres.js";
 import type { LegacyExportFixture } from "../services/migration.js";
@@ -30,7 +30,7 @@ import {
 import { createPgStore, type PgStore } from "../store/pg-store.js";
 import { PgStoreV2Shadow } from "../store/store-v2-shadow.js";
 import type { StoreV2PrincipalRepository } from "../store/types.js";
-import type { Principal } from "../types/resources.js";
+import type { User } from "../types/resources.js";
 import { gatePostgresSuite } from "./pg-gate.js";
 import { closeAuthBundle } from "../auth-bridge.js";
 import {
@@ -105,7 +105,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 		});
 		stores.push(store);
 		const initialized = initProject(store, {
-			name: "Principal Authority",
+			name: "User Authority",
 			source: "cli",
 		});
 		const now = "2026-07-15T00:00:00.000Z";
@@ -660,7 +660,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 				users: [{
 					id: migrationUserSourceId,
 					email: `${migrationUserSourceId}@example.test`,
-					name: "Legacy Principal Proof",
+					name: "Legacy User Proof",
 				}],
 				organizations: [{
 					id: migrationOrganizationSourceId,
@@ -675,7 +675,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			};
 			const firstMigrationPlan = await planMigrationDurable(store, migrationFixture);
 			await store.ready();
-			const firstMigration = await runMigrationDurable(
+			const firstMigration = await applyMigrationDurable(
 				store,
 				firstMigrationPlan.id,
 				migrationFixture,
@@ -705,7 +705,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 					note: "rollback dependency proof",
 				},
 				remainingCustomerActions: [],
-				signature: "rollback-dependent-readiness",
+				reportDigest: "rollback-dependent-readiness",
 			}));
 			await expect(
 				rollbackMigrationDurable(store, firstMigration.id, migrationFixture),
@@ -880,7 +880,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			expect(store.snapshot.organizations).toEqual([]);
 			const secondMigrationPlan = await planMigrationDurable(store, migrationFixture);
 			await store.ready();
-			const secondMigration = await runMigrationDurable(
+			const secondMigration = await applyMigrationDurable(
 				store,
 				secondMigrationPlan.id,
 				migrationFixture,
@@ -1006,7 +1006,7 @@ describe.skipIf(!available)("PgStore store-v2 principal foundation", () => {
 			const writerHasLock = new Promise<void>((resolve) => {
 				writerLocked = resolve;
 			});
-			const racingPrincipal: Principal = {
+			const racingPrincipal: User = {
 				...beforeCutover[0]!,
 				id: "user_rollback_race",
 				email: "rollback-race@example.test",

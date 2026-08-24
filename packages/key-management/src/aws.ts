@@ -48,6 +48,7 @@ export type AwsKmsKeyProviderOptions = Readonly<{
 	region: string;
 	endpoint?: string;
 	allowInsecureLoopbackHttp?: boolean;
+	strictSecrets?: boolean;
 	client?: KMSClient;
 	timeoutMs?: number;
 }>;
@@ -82,6 +83,7 @@ function validateAwsKeyId(value: unknown): string {
 function validateEndpoint(
 	value: unknown,
 	allowInsecureLoopbackHttp: boolean,
+	strictSecrets: boolean,
 ): string | undefined {
 	if (value === undefined) return undefined;
 	if (
@@ -114,7 +116,7 @@ function validateEndpoint(
 		if (
 			!allowInsecureLoopbackHttp ||
 			!loopback ||
-			process.env.NODE_ENV === "production"
+			strictSecrets
 		) {
 			return invalidOptions("AWS KMS endpoint must use HTTPS");
 		}
@@ -205,9 +207,13 @@ export function createAwsKmsKeyProvider(
 	) {
 		return invalidOptions("AWS KMS development HTTP option is invalid");
 	}
+	if (options.strictSecrets !== undefined && typeof options.strictSecrets !== "boolean") {
+		return invalidOptions("AWS KMS strict secrets option is invalid");
+	}
 	const endpoint = validateEndpoint(
 		options.endpoint,
 		options.allowInsecureLoopbackHttp === true,
+		options.strictSecrets === true,
 	);
 	const timeoutMs = validateTimeout(options.timeoutMs);
 	if (options.client !== undefined && !configuredClient(options.client)) {

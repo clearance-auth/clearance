@@ -118,7 +118,7 @@ describe("generated management client contract", () => {
 			},
 		});
 		await diagnosticClient.call(diagnostic.id, {});
-		expect(sentHeaders?.get("idempotency-key")).toBe("doctor-key");
+		expect(sentHeaders?.get("operation-key")).toBe("doctor-key");
 	});
 
 	it("retains structured API errors and idempotency replay metadata", async () => {
@@ -129,7 +129,7 @@ describe("generated management client contract", () => {
 			bearerToken: "operator-token",
 			createIdempotencyKey: () => "retry-key-789",
 			fetch: async (_url, init) => {
-				sentKey = new Headers(init.headers).get("idempotency-key");
+				sentKey = new Headers(init.headers).get("operation-key");
 				return response({
 					error: { code: "IDEMPOTENCY_KEY_CONFLICT", message: "Already used", stage: "api.idempotency", retryable: false },
 				}, 409, { "x-request-id": "req_error" });
@@ -248,7 +248,7 @@ describe("generated management client contract", () => {
 			registry: { [removeId]: { ...ORGANIZATION_MEMBER_REMOVE, mutation: "yes" } } as never,
 			bearerToken: "operator-token",
 		})).toThrow("mutation and supportsDryRun must be booleans");
-		for (const protectedName of ["Authorization", "IDEMPOTENCY-KEY", "Accept", "CONTENT-TYPE"]) {
+		for (const protectedName of ["Authorization", "OPERATION-KEY", "Accept", "CONTENT-TYPE"]) {
 			expect(() => createServerManagementClient({
 				baseUrl: "https://api.example.test",
 				registry: ORGANIZATION_MEMBER_FIXTURE_OPERATIONS,

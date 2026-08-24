@@ -102,7 +102,7 @@ describe("phone managed authentication transactions", () => {
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			expect(runtime.callbackOnVerification).not.toHaveBeenCalled();
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.not.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -166,7 +166,7 @@ describe("phone managed authentication transactions", () => {
 			).rejects.toMatchObject({ reason: "policy_unsatisfied" });
 			const context = await runtime.auth.$context;
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.not.toBeNull();
 			await expect(
 				context.adapter.findMany({
@@ -192,7 +192,7 @@ describe("phone managed authentication transactions", () => {
 				}),
 			).rejects.toBeDefined();
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.toBeNull();
 			await expect(
 				context.adapter.findMany({
@@ -268,7 +268,7 @@ describe("phone managed authentication transactions", () => {
 				}),
 			).rejects.toThrow("forced phone adoption failure");
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.not.toBeNull();
 			createUser.mockRestore();
 
@@ -283,7 +283,7 @@ describe("phone managed authentication transactions", () => {
 			).resolves.toMatchObject({ status: true, token: null });
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -309,7 +309,7 @@ describe("phone managed authentication transactions", () => {
 				}),
 			).rejects.toThrow("rollback-capable database transactions");
 			await expect(
-				context.internalAdapter.findVerificationValue(value),
+				context.internalAdapter.findVerificationValueAndPruneExpired(value),
 			).resolves.not.toBeNull();
 			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
 		} finally {
@@ -357,7 +357,7 @@ describe("phone managed authentication transactions", () => {
 				}),
 			).rejects.toThrow("forced phone update failure");
 			await expect(
-				context.internalAdapter.findVerificationValue(replacement),
+				context.internalAdapter.findVerificationValueAndPruneExpired(replacement),
 			).resolves.not.toBeNull();
 			updateUser.mockRestore();
 
@@ -372,7 +372,7 @@ describe("phone managed authentication transactions", () => {
 				}),
 			).resolves.toMatchObject({ status: true });
 			await expect(
-				context.internalAdapter.findVerificationValue(replacement),
+				context.internalAdapter.findVerificationValueAndPruneExpired(replacement),
 			).resolves.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -922,13 +922,13 @@ describe("verify phone-number race condition protection", async () => {
 		// Force both verifications to read the live OTP row before either
 		// consumes it. Without an atomic consume gate, both would read a valid
 		// code and both would mint a session; the gate must let only one win.
-		const originalFind = authCtx.internalAdapter.findVerificationValue;
+		const originalFind = authCtx.internalAdapter.findVerificationValueAndPruneExpired;
 		let entered = 0;
 		let releaseBarrier!: () => void;
 		const barrier = new Promise<void>((resolve) => {
 			releaseBarrier = resolve;
 		});
-		authCtx.internalAdapter.findVerificationValue = (async (
+		authCtx.internalAdapter.findVerificationValueAndPruneExpired = (async (
 			identifier: string,
 			...rest: unknown[]
 		) => {
@@ -941,7 +941,7 @@ describe("verify phone-number race condition protection", async () => {
 				await barrier;
 			}
 			return result;
-		}) as typeof authCtx.internalAdapter.findVerificationValue;
+		}) as typeof authCtx.internalAdapter.findVerificationValueAndPruneExpired;
 
 		try {
 			const results = await Promise.all([
@@ -958,11 +958,11 @@ describe("verify phone-number race condition protection", async () => {
 			expect(failures[0]!.error?.status).toBe(400);
 			expect(failures[0]!.error?.message).toBe("Invalid OTP");
 		} finally {
-			authCtx.internalAdapter.findVerificationValue = originalFind;
+			authCtx.internalAdapter.findVerificationValueAndPruneExpired = originalFind;
 		}
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(phoneNumber);
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(phoneNumber);
 		expect(verificationValue).toBeNull();
 	});
 
@@ -980,7 +980,7 @@ describe("verify phone-number race condition protection", async () => {
 			expect(res.error?.message).toBe("Invalid OTP");
 
 			const stored =
-				await authCtx.internalAdapter.findVerificationValue(phoneNumber);
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(phoneNumber);
 			expect(stored).not.toBeNull();
 			const [storedValue, attempts] = stored!.value.split(":");
 			// The original code survives each wrong attempt so the user can
@@ -997,7 +997,7 @@ describe("verify phone-number race condition protection", async () => {
 		expect(res.data?.status).toBe(true);
 
 		const consumed =
-			await authCtx.internalAdapter.findVerificationValue(phoneNumber);
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(phoneNumber);
 		expect(consumed).toBeNull();
 	});
 });

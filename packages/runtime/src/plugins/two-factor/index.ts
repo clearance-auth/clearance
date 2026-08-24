@@ -1086,7 +1086,7 @@ export const twoFactor = <const O extends TwoFactorOptions = {}>(options?: O) =>
 												return null;
 											}
 											const generationMarker =
-												await ctx.context.internalAdapter.findVerificationValue(
+											await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 													trustGenerationMarkerIdentifier(
 														data.user.id,
 														trustGeneration,

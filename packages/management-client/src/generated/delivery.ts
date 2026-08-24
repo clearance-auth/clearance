@@ -222,9 +222,9 @@ export const DELIVERY_OPERATION_SCHEMAS = {
 			ready: z.boolean(),
 			schema: z.object({
 				owner: z.string().nullable(),
-				version: z.number().nullable(),
-				currentVersion: z.number(),
-				current: z.boolean(),
+				installedVersion: z.number().nullable(),
+				expectedVersion: z.number(),
+				isUpToDate: z.boolean(),
 			}).strict(),
 			jobs: z.object({
 				queued: z.number(),

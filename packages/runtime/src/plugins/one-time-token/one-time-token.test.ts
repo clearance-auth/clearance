@@ -288,7 +288,7 @@ describe("One-time token", async () => {
 				expect(response.token).toBe("123456");
 
 				const hashedToken = await defaultKeyHasher(response.token);
-				const storedToken = await internalAdapter.findVerificationValue(
+				const storedToken = await internalAdapter.findVerificationValueAndPruneExpired(
 					`one-time-token:${hashedToken}`,
 				);
 				expect(storedToken).toBeDefined();
@@ -329,7 +329,7 @@ describe("One-time token", async () => {
 				expect(response.token).toBe("123456");
 
 				const hashedToken = response.token + "hashed";
-				const storedToken = await internalAdapter.findVerificationValue(
+				const storedToken = await internalAdapter.findVerificationValueAndPruneExpired(
 					`one-time-token:${hashedToken}`,
 				);
 				expect(storedToken).toBeDefined();

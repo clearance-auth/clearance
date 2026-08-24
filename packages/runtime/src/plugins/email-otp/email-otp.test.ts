@@ -26,7 +26,12 @@ import {
 async function managedEmailOTPTestRuntime(
 	minimumAssurance: RuntimeAuthenticationPolicy["minimumAssurance"],
 	afterEmailVerification?: () => Promise<void>,
-	input: { resendReuse?: boolean; secondaryOnly?: boolean } = {},
+	input: {
+		resendReuse?: boolean;
+		secondaryOnly?: boolean;
+		storeOTP?: "plain" | "encrypted";
+		explicitUndefinedStoreOTP?: boolean;
+	} = {},
 ) {
 	const database = new DatabaseSync(":memory:");
 	const secondaryStore = new Map<string, string>();
@@ -99,6 +104,11 @@ async function managedEmailOTPTestRuntime(
 				},
 				changeEmail: { enabled: true },
 				...(input.resendReuse ? { resendStrategy: "reuse" as const } : {}),
+				...(input.explicitUndefinedStoreOTP
+					? { storeOTP: undefined }
+					: input.storeOTP
+						? { storeOTP: input.storeOTP }
+						: {}),
 			}),
 		],
 	} satisfies ClearanceOptions;
@@ -129,6 +139,39 @@ async function managedEmailOTPTestRuntime(
 }
 
 describe("email OTP managed authentication transactions", () => {
+	it("uses secret-keyed storage by default across secondary stores", async () => {
+		const runtime = await managedEmailOTPTestRuntime("single_factor", undefined, {
+			secondaryOnly: true,
+			explicitUndefinedStoreOTP: true,
+		});
+		const email = "managed-keyed-otp@example.test";
+		const identifier = toOTPIdentifier("sign-in", email);
+		try {
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const firstOtp = runtime.readOTP();
+			const context = await runtime.auth.$context;
+			const first = await context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
+			expect(first?.value).not.toContain(firstOtp);
+			expect([...runtime.secondaryStore.values()].join("\n")).not.toContain(firstOtp);
+
+			await runtime.auth.api.sendVerificationOTP({
+				body: { email, type: "sign-in" },
+			});
+			const secondOtp = runtime.readOTP();
+			expect(secondOtp).not.toBe(firstOtp);
+			await expect(
+				runtime.auth.api.signInEmailOTP({ body: { email, otp: firstOtp } }),
+			).rejects.toMatchObject({ status: "BAD_REQUEST" });
+			await expect(
+				runtime.auth.api.signInEmailOTP({ body: { email, otp: secondOtp } }),
+			).resolves.toMatchObject({ token: expect.any(String) });
+		} finally {
+			runtime.database.close();
+		}
+	});
+
 	it("rolls back OTP adoption and identity creation when policy rejects the method", async () => {
 		const runtime = await managedEmailOTPTestRuntime("multi_factor");
 		const email = "managed-email-otp-reject@example.test";
@@ -146,7 +189,7 @@ describe("email OTP managed authentication transactions", () => {
 			await expect(context.adapter.count({ model: "account" })).resolves.toBe(0);
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			await expect(
-				context.internalAdapter.findVerificationValue(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
 					toOTPIdentifier("sign-in", email),
 				),
 			).resolves.not.toBeNull();
@@ -175,7 +218,11 @@ describe("email OTP managed authentication transactions", () => {
 	});
 
 	it("fails before consuming the OTP when managed transaction support disappears", async () => {
-		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const runtime = await managedEmailOTPTestRuntime(
+			"single_factor",
+			undefined,
+			{ storeOTP: "plain" },
+		);
 		const email = "managed-email-otp-no-transaction@example.test";
 		try {
 			await runtime.auth.api.sendVerificationOTP({
@@ -191,7 +238,7 @@ describe("email OTP managed authentication transactions", () => {
 			await expect(context.adapter.count({ model: "user" })).resolves.toBe(0);
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			await expect(
-				context.internalAdapter.findVerificationValue(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
 					toOTPIdentifier("sign-in", email),
 				),
 			).resolves.not.toBeNull();
@@ -237,7 +284,11 @@ describe("email OTP managed authentication transactions", () => {
 	});
 
 	it("rolls back no-session email verification and allows one retry", async () => {
-		const runtime = await managedEmailOTPTestRuntime("single_factor");
+		const runtime = await managedEmailOTPTestRuntime(
+			"single_factor",
+			undefined,
+			{ storeOTP: "plain" },
+		);
 		const email = "managed-no-session-verify@example.test";
 		const otp = "731944";
 		const identifier = toOTPIdentifier("email-verification", email);
@@ -256,7 +307,7 @@ describe("email OTP managed authentication transactions", () => {
 				runtime.auth.api.verifyEmailOTP({ body: { email, otp } }),
 			).rejects.toMatchObject({ status: "BAD_REQUEST" });
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.not.toBeNull();
 
 			await context.internalAdapter.createUser({
@@ -269,7 +320,7 @@ describe("email OTP managed authentication transactions", () => {
 			).resolves.toMatchObject({ status: true, token: null });
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -296,7 +347,7 @@ describe("email OTP managed authentication transactions", () => {
 				}),
 			).rejects.toThrow("rollback-capable database transactions");
 			await expect(
-				context.internalAdapter.findVerificationValue(
+				context.internalAdapter.findVerificationValueAndPruneExpired(
 					toOTPIdentifier("email-verification", email),
 				),
 			).resolves.not.toBeNull();
@@ -325,7 +376,7 @@ describe("email OTP managed authentication transactions", () => {
 				}),
 			).rejects.toMatchObject({ status: "BAD_REQUEST" });
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.not.toBeNull();
 
 			await expect(
@@ -338,7 +389,7 @@ describe("email OTP managed authentication transactions", () => {
 				}),
 			).resolves.toMatchObject({ success: true });
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.toBeNull();
 			await expect(context.adapter.count({ model: "account" })).resolves.toBe(1);
 		} finally {
@@ -387,7 +438,7 @@ describe("email OTP managed authentication transactions", () => {
 				}),
 			).rejects.toThrow("forced email update failure");
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.not.toBeNull();
 			updateUser.mockRestore();
 
@@ -398,7 +449,7 @@ describe("email OTP managed authentication transactions", () => {
 				}),
 			).resolves.toMatchObject({ success: true });
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.toBeNull();
 			await expect(
 				context.internalAdapter.findUserByEmail(newEmail),
@@ -414,7 +465,11 @@ describe("email OTP managed authentication transactions", () => {
 			const runtime = await managedEmailOTPTestRuntime(
 				"single_factor",
 				undefined,
-				{ resendReuse: true, secondaryOnly: storage === "secondary" },
+				{
+					resendReuse: true,
+					secondaryOnly: storage === "secondary",
+					storeOTP: "encrypted",
+				},
 			);
 			const email = `managed-reuse-${storage}@example.test`;
 			const identifier = toOTPIdentifier("email-verification", email);
@@ -429,7 +484,7 @@ describe("email OTP managed authentication transactions", () => {
 					body: { email, type: "email-verification" },
 				});
 				const otp = runtime.readOTP();
-				const initial = await context.internalAdapter.findVerificationValue(
+				const initial = await context.internalAdapter.findVerificationValueAndPruneExpired(
 					identifier,
 				);
 				expect(initial).not.toBeNull();
@@ -456,7 +511,7 @@ describe("email OTP managed authentication transactions", () => {
 				).rejects.toThrow("forced managed reuse rollback");
 				createVerificationValue.mockRestore();
 				await expect(
-					context.internalAdapter.findVerificationValue(identifier),
+					context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 				).resolves.toMatchObject({
 					id: initial!.id,
 					expiresAt: initial!.expiresAt,
@@ -475,7 +530,7 @@ describe("email OTP managed authentication transactions", () => {
 					body: { email, type: "email-verification" },
 				});
 				expect(runtime.readOTP()).toBe(otp);
-				const reused = await context.internalAdapter.findVerificationValue(identifier);
+				const reused = await context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 				expect(reused?.id).not.toBe(initial!.id);
 				expect(reused!.expiresAt.getTime()).toBeGreaterThan(
 					initial!.expiresAt.getTime(),
@@ -504,17 +559,17 @@ describe("email OTP managed authentication transactions", () => {
 					}),
 				).resolves.toHaveLength(0);
 
-				const originalFind = context.internalAdapter.findVerificationValue.bind(
+				const originalFind = context.internalAdapter.findVerificationValueAndPruneExpired.bind(
 					context.internalAdapter,
 				);
-				const findVerificationValue = vi
-					.spyOn(context.internalAdapter, "findVerificationValue")
+				const findVerificationValueAndPruneExpired = vi
+					.spyOn(context.internalAdapter, "findVerificationValueAndPruneExpired")
 					.mockResolvedValueOnce(initial)
 					.mockImplementation(originalFind);
 				await runtime.auth.api.sendVerificationOTP({
 					body: { email, type: "email-verification" },
 				});
-				findVerificationValue.mockRestore();
+				findVerificationValueAndPruneExpired.mockRestore();
 				expect(runtime.readOTP()).toBe(otp);
 				await expect(
 					context.adapter.findMany({
@@ -669,7 +724,7 @@ describe("email-otp", async () => {
 			subject: testUser.email,
 			identifier,
 		});
-		expect(await adapter.findVerificationValue(identifier)).toBeNull();
+		expect(await adapter.findVerificationValueAndPruneExpired(identifier)).toBeNull();
 		expect(createSession).toHaveBeenCalledTimes(1);
 		const [subjectId, dontRememberMe, override, overrideAll, issuanceContext] =
 			createSession.mock.calls[0]!;
@@ -1023,13 +1078,16 @@ describe("email-otp", async () => {
 		expect(otp.length).toBe(6);
 	});
 
-	it("should get verification otp on server", async () => {
-		await auth.api.getVerificationOTP({
+	it("does not retrieve the default secret-keyed OTP on the server", async () => {
+		await auth.api.sendVerificationOTP({
+			body: { email: "test@email.com", type: "sign-in" },
+		});
+		await expect(auth.api.getVerificationOTP({
 			query: {
 				email: "test@email.com",
 				type: "sign-in",
 			},
-		});
+		})).rejects.toMatchObject({ status: "BAD_REQUEST" });
 	});
 
 	it("should work with custom options", async () => {
@@ -1978,7 +2036,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 
@@ -2072,7 +2130,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 
@@ -2166,7 +2224,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 			const storedOtp = verificationValue?.value || "";
@@ -2256,7 +2314,7 @@ describe("custom storeOTP", async () => {
 				type: "sign-in",
 			});
 			const verificationValue =
-				await authCtx.internalAdapter.findVerificationValue(
+				await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					`sign-in-otp-${userEmail1}`,
 				);
 			const storedOtp = verificationValue?.value || "";
@@ -2590,7 +2648,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.token).toBeDefined();
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2613,7 +2671,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.status).toBe(true);
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`email-verification-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2638,7 +2696,7 @@ describe("race condition protection", async () => {
 		expect(res1.data?.success).toBe(true);
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`forget-password-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2667,7 +2725,7 @@ describe("race condition protection", async () => {
 		expect(failures[0]!.error?.code).toBe("INVALID_OTP");
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2706,7 +2764,7 @@ describe("race condition protection", async () => {
 		});
 		expect(wrong.error?.code).toBe("INVALID_OTP");
 
-		const afterWrong = await authCtx.internalAdapter.findVerificationValue(
+		const afterWrong = await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 			`sign-in-otp-${email}`,
 		);
 		expect(afterWrong).not.toBeNull();
@@ -2734,7 +2792,7 @@ describe("race condition protection", async () => {
 		expect(lockedOut.error?.code).toBe("TOO_MANY_ATTEMPTS");
 
 		const verificationValue =
-			await authCtx.internalAdapter.findVerificationValue(
+			await authCtx.internalAdapter.findVerificationValueAndPruneExpired(
 				`sign-in-otp-${email}`,
 			);
 		expect(verificationValue).toBeNull();
@@ -2761,6 +2819,7 @@ describe("email-otp-resendStrategy", async () => {
 						otps.push(otp);
 					},
 					resendStrategy: "reuse",
+					storeOTP: "encrypted",
 				}),
 			],
 		},

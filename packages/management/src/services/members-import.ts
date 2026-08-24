@@ -1,5 +1,5 @@
 import type { ManagementStore } from "../store/types.js";
-import type { Membership, Organization, Principal } from "../types/resources.js";
+import type { Membership, Organization, User } from "../types/resources.js";
 import { inspectOrganizationAuthoritative } from "./core.js";
 import { ClearanceError, isClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
@@ -148,7 +148,7 @@ async function requireOrganizationAuthoritative(
 	}
 }
 
-function resolvePrincipal(store: ManagementStore, org: Organization, row: ImportRow): Principal {
+function resolvePrincipal(store: ManagementStore, org: Organization, row: ImportRow): User {
 	const identities = [row.principalId, row.user, row.email].filter((value): value is string => Boolean(value));
 	if (identities.length !== 1) inputError("MEMBER_IMPORT_IDENTITY_INVALID", "Each row must specify exactly one of principalId, user, or email.");
 	const principal = row.email
@@ -162,7 +162,7 @@ async function resolvePrincipalAuthoritative(
 	store: ManagementStore,
 	org: Organization,
 	row: ImportRow,
-): Promise<Principal> {
+): Promise<User> {
 	const identities = [row.principalId, row.user, row.email].filter(
 		(value): value is string => Boolean(value),
 	);
@@ -194,7 +194,7 @@ function buildMemberImportPlan(
 	store: ManagementStore,
 	org: Organization,
 	format: MemberImportFormat,
-	resolvedRows: Array<{ row: ImportRow; principal: Principal }>,
+	resolvedRows: Array<{ row: ImportRow; principal: User }>,
 ): MemberImportPlan {
 	const seen = new Set<string>();
 	for (const { principal } of resolvedRows) {
@@ -256,7 +256,7 @@ export async function planMemberImportAuthoritative(
 		input.scope,
 	);
 	const parsed = input.format === "json" ? parseJson(input.content) : parseCsv(input.content);
-	const resolvedRows: Array<{ row: ImportRow; principal: Principal }> = [];
+	const resolvedRows: Array<{ row: ImportRow; principal: User }> = [];
 	for (const row of parsed) {
 		resolvedRows.push({ row, principal: await resolvePrincipalAuthoritative(store, org, row) });
 	}

@@ -790,7 +790,7 @@ async function loadSessionsTable() {
           <thead>
             <tr>
               <th scope="col">Session id</th>
-              <th scope="col">Principal</th>
+              <th scope="col">User</th>
               <th scope="col">Status</th>
               <th scope="col">Created</th>
               <th scope="col">Expires</th>
@@ -907,7 +907,7 @@ function membersMutationFormHtml(orgId) {
       <div class="label" id="m-form-title">Add member</div>
       <form id="m-form" class="member-form" autocomplete="off" novalidate>
         <div class="field">
-          <label class="field-label" for="m-principal">Principal id</label>
+          <label class="field-label" for="m-principal">User id</label>
           <input id="m-principal" name="principalId" type="text" required maxlength="128" placeholder="usr_…" aria-required="true" />
         </div>
         <div class="field">
@@ -1080,7 +1080,7 @@ async function addMemberFromForm() {
     return;
   }
   if (!principalId) {
-    setFormMessage(msg, "Principal id is required", "err");
+    setFormMessage(msg, "User id is required", "err");
     principalEl?.focus();
     return;
   }
@@ -1171,7 +1171,7 @@ async function loadMembersTable(orgId) {
         <div class="table-scroll" tabindex="0" role="region" aria-label="Organization members table"><table class="members-table" aria-label="Organization members">
           <thead>
             <tr>
-              <th scope="col">Principal</th>
+              <th scope="col">User</th>
               <th scope="col">Role</th>
               <th scope="col">Status</th>
               <th scope="col">Membership id</th>
@@ -1849,7 +1849,7 @@ async function renderAuthorization(params) {
         <div class="card">
           <div class="label">Effective access</div>
           <form id="az-effective-form" class="admin-form" autocomplete="off">
-            <div class="field"><label class="field-label" for="az-effective-kind">Subject kind</label><select id="az-effective-kind"><option value="principal">Principal</option><option value="service_account">Service account</option></select></div>
+            <div class="field"><label class="field-label" for="az-effective-kind">Subject kind</label><select id="az-effective-kind"><option value="principal">User</option><option value="service_account">Service account</option></select></div>
             <div class="field"><label class="field-label" for="az-effective-id">Subject ID</label><input id="az-effective-id" required placeholder="user_… or svc_…" /></div>
             <button type="submit" class="ghost">Inspect effective access</button>
           </form>
@@ -1865,7 +1865,7 @@ async function renderAuthorization(params) {
           <div class="label">Replace subject role assignments</div>
           <p class="field-hint">Preview first. Applying requires an explicit confirmation and the live revision check.</p>
           <form id="az-replace-form" class="admin-form" autocomplete="off">
-            <div class="field"><label class="field-label" for="az-replace-kind">Subject kind</label><select id="az-replace-kind"><option value="principal">Principal</option><option value="service_account">Service account</option></select></div>
+            <div class="field"><label class="field-label" for="az-replace-kind">Subject kind</label><select id="az-replace-kind"><option value="principal">User</option><option value="service_account">Service account</option></select></div>
             <div class="field"><label class="field-label" for="az-replace-id">Subject ID</label><input id="az-replace-id" required placeholder="Subject ID" /></div>
             <div class="field"><label class="field-label" for="az-role-ids">Role IDs</label><textarea id="az-role-ids" required aria-describedby="az-role-ids-hint" placeholder="${escapeAttr(roleHint)}"></textarea><p class="field-hint" id="az-role-ids-hint">One role ID per line. Existing assignments are replaced exactly.</p></div>
             <div class="row-actions"><button type="button" id="az-preview" class="ghost" ${mutable ? "" : "disabled"}>Preview replacement</button><button type="submit" id="az-apply" class="primary" disabled>Apply replacement</button></div>
@@ -2242,7 +2242,7 @@ async function loadReadinessReport(orgId) {
       <div class="grid">
         <div class="card"><div class="label">Overall</div><div class="value value-sm"><span class="dot ${escapeAttr(statusClass)}"></span> ${escapeHtml(report.overall)}</div></div>
         <div class="card"><div class="label">Organization</div><div class="value value-sm"><code>${escapeHtml(report.organizationId)}</code></div></div>
-        <div class="card"><div class="label">Signature</div><div class="value value-sm"><code id="ready-signature">${escapeHtml(report.signature)}</code></div></div>
+        <div class="card"><div class="label">Signature</div><div class="value value-sm"><code id="ready-reportDigest">${escapeHtml(report.reportDigest)}</code></div></div>
         <div class="card"><div class="label">Generated</div><div class="value value-sm">${escapeHtml(formatWhen(report.generatedAt) || report.generatedAt)}</div></div>
       </div>
       <div class="card">

@@ -53,15 +53,15 @@ const decodeSCIMToken = (token: string) => {
 export const authMiddlewareFactory = (opts: SCIMOptions) =>
 	createAuthMiddleware(async (ctx) => {
 		const authHeader = ctx.headers?.get("Authorization");
-		const authSCIMToken = authHeader?.replace(/^Bearer\s+/i, "");
+		const rawBearerToken = authHeader?.replace(/^Bearer\s+/i, "");
 
-		if (!authSCIMToken) {
+		if (!rawBearerToken) {
 			throw new SCIMAPIError("UNAUTHORIZED", {
 				detail: "SCIM token is required",
 			});
 		}
 
-		const tokenParts = decodeSCIMToken(authSCIMToken);
+		const tokenParts = decodeSCIMToken(rawBearerToken);
 		if (!tokenParts) throw invalidSCIMToken();
 
 		const { scimToken, providerId, organizationId } = tokenParts;
@@ -81,7 +81,7 @@ export const authMiddlewareFactory = (opts: SCIMOptions) =>
 
 		if (scimProvider) {
 			if (constantTimeEqual(scimProvider.scimToken, scimToken)) {
-				return { authSCIMToken: scimProvider.scimToken, scimProvider };
+				return { verifiedScimSecret: scimProvider.scimToken, scimProvider };
 			} else {
 				throw invalidSCIMToken();
 			}
@@ -116,5 +116,5 @@ export const authMiddlewareFactory = (opts: SCIMOptions) =>
 			throw invalidSCIMToken();
 		}
 
-		return { authSCIMToken: scimToken, scimProvider };
+		return { verifiedScimSecret: scimToken, scimProvider };
 	});

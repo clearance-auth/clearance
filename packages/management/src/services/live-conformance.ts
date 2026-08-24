@@ -16,12 +16,13 @@
  *  - only READ requests are issued; a live tenant is never mutated
  */
 import { computeDiscoveryUrl, validateDiscoveryDocument } from "@clearance/sso";
+import { fetchPinnedPublic } from "@clearance/core/utils/public-egress";
 import type { ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type {
 	DiagnosticTrace,
-	DirectoryConnection,
-	IdentityConnection,
+	ScimConnection,
+	SsoConnection,
 } from "../types/resources.js";
 import { recordEvent, type AuditEventInput } from "./audit.js";
 import { ClearanceError } from "./errors.js";
@@ -163,20 +164,20 @@ async function persistLiveTrace(
 		audit: AuditEventInput;
 		setTesting: boolean;
 	},
-): Promise<IdentityConnection | DirectoryConnection> {
+): Promise<SsoConnection | ScimConnection> {
 	if (!store.storeV2Topology?.authoritative) {
 		pushTrace(store, input.trace);
 		if (input.setTesting) {
 			store.mutate((data) => {
-				const connections = input.kind === "sso" ? data.identityConnections : data.directoryConnections;
+				const connections = input.kind === "sso" ? data.ssoConnections : data.scimConnections;
 				const index = connections.findIndex((connection) => connection.id === input.id);
-				if (index >= 0) connections[index] = { ...connections[index]!, status: "testing", updatedAt: nowIso() };
+			if (index >= 0) connections[index] = { ...connections[index]!, status: "testing", updatedAt: input.trace.createdAt };
 			});
 		}
 		recordEvent(store, input.audit);
 		const current = input.kind === "sso"
-			? store.snapshot.identityConnections.find((connection) => connection.id === input.id)
-			: store.snapshot.directoryConnections.find((connection) => connection.id === input.id);
+			? store.snapshot.ssoConnections.find((connection) => connection.id === input.id)
+			: store.snapshot.scimConnections.find((connection) => connection.id === input.id);
 		if (!current) throw new ClearanceError({ code: input.kind === "sso" ? "SSO_NOT_FOUND" : "SCIM_NOT_FOUND", message: "Connection not found", stage: `${input.kind}.test.live`, status: 404 });
 		return current;
 	}
@@ -185,7 +186,7 @@ async function persistLiveTrace(
 	}
 	const scope = input.scope ?? await resolveOperatorScopeAuthoritative(store);
 	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-		const connections = input.kind === "sso" ? data.identityConnections : data.directoryConnections;
+		const connections = input.kind === "sso" ? data.ssoConnections : data.scimConnections;
 		const index = connections.findIndex((connection) => connection.id === input.id);
 		const connection = index >= 0 ? connections[index] : undefined;
 		const organization = connection && topology
@@ -196,7 +197,7 @@ async function persistLiveTrace(
 		}
 		data.traces.unshift(input.trace);
 		if (data.traces.length > 2000) data.traces.length = 2000;
-		const updated = input.setTesting ? { ...connection, status: "testing" as const, updatedAt: nowIso() } : connection;
+		const updated = input.setTesting ? { ...connection, status: "testing" as const, updatedAt: input.trace.createdAt } : connection;
 		connections[index] = updated;
 		appendAudit({ ...input.audit, organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId });
 		return structuredClone(updated);
@@ -211,7 +212,7 @@ async function fetchWithTimeout(
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 10_000);
 	try {
-		return await (opts.fetchImpl ?? fetch)(url, {
+		return await (opts.fetchImpl ?? fetchPinnedPublic)(url, {
 			method: "GET",
 			headers: { accept, "user-agent": "clearance-live-conformance/0.1" },
 			redirect: "manual",
@@ -232,7 +233,7 @@ export async function testSsoConnectionLive(
 	store: ManagementStore,
 	id: string,
 	opts: LiveProbeOptions = {},
-): Promise<LiveProbeResult<IdentityConnection>> {
+): Promise<LiveProbeResult<SsoConnection>> {
 	// This authorization read is deliberately before issuer parsing or any
 	// network work. An archive that completed before invocation cannot cause a
 	// probe (or later SCIM bearer access) under a stale route precheck.
@@ -267,7 +268,7 @@ export async function testSsoConnectionLive(
 		owner: "customer" | "application",
 		remediation: string,
 		checks: Array<{ name: string; pass: boolean; detail?: string }>,
-	): Promise<LiveProbeResult<IdentityConnection>> => {
+	): Promise<LiveProbeResult<SsoConnection>> => {
 		const trace: DiagnosticTrace = {
 			...base,
 			stage,
@@ -284,7 +285,7 @@ export async function testSsoConnectionLive(
 			id,
 			scope,
 			trace,
-			setTesting: false,
+		setTesting: false,
 			audit: {
 			actor: "operator",
 			action: "sso.test",
@@ -301,7 +302,7 @@ export async function testSsoConnectionLive(
 		return {
 			pass: false,
 			trace,
-			connection: publicIdentityConnection(connection as IdentityConnection) as IdentityConnection,
+			connection: publicIdentityConnection(connection as SsoConnection) as SsoConnection,
 			mode: LIVE_CONFORMANCE_MODE,
 			evidence: LIVE_EVIDENCE_LABEL,
 			endpoint: issuerUrl.origin,
@@ -455,7 +456,7 @@ export async function testSsoConnectionLive(
 	return {
 		pass: true,
 		trace,
-		connection: publicIdentityConnection(connection as IdentityConnection) as IdentityConnection,
+		connection: publicIdentityConnection(connection as SsoConnection) as SsoConnection,
 		mode: LIVE_CONFORMANCE_MODE,
 		evidence: LIVE_EVIDENCE_LABEL,
 		endpoint: issuerUrl.origin,
@@ -471,7 +472,7 @@ export async function testScimConnectionLive(
 	store: ManagementStore,
 	id: string,
 	opts: LiveProbeOptions = {},
-): Promise<LiveProbeResult<DirectoryConnection>> {
+): Promise<LiveProbeResult<ScimConnection>> {
 	// Resolve authority before reading endpoint/token material. This is the
 	// pre-I/O half of the archive race fence; persistence locks again below.
 	const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
@@ -497,7 +498,7 @@ export async function testScimConnectionLive(
 		cause: string,
 		checks: Array<{ name: string; pass: boolean; detail?: string }>,
 		remediation?: string,
-	): Promise<LiveProbeResult<DirectoryConnection>> => {
+	): Promise<LiveProbeResult<ScimConnection>> => {
 		const trace: DiagnosticTrace = {
 			...base,
 			stage,
@@ -533,7 +534,7 @@ export async function testScimConnectionLive(
 		return {
 			pass,
 			trace,
-			connection: publicDirectoryConnection(connection as DirectoryConnection) as DirectoryConnection,
+			connection: publicDirectoryConnection(connection as ScimConnection) as ScimConnection,
 			mode: LIVE_CONFORMANCE_MODE,
 			evidence: LIVE_EVIDENCE_LABEL,
 			endpoint: endpointUrl.origin,

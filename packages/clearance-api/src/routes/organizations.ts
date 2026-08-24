@@ -17,7 +17,7 @@ import {
 	type ApplicationRouteDependencies,
 } from "./shared.js";
 
-export interface OrganizationRouteDependencies extends ApplicationRouteDependencies {}
+export type OrganizationRouteDependencies = ApplicationRouteDependencies;
 
 export function registerOrganizationRoutes({
 	storeForRequest,

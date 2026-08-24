@@ -34,7 +34,7 @@ import {
 	rollbackStoreV2Events,
 	rollbackStoreV2Principals,
 	rollbackStoreV2Topology,
-	runMigrationDurable,
+	applyMigrationDurable,
 	upgradeCheck,
 	upgradeCheckWithDb,
 	verifyBackup,
@@ -221,9 +221,11 @@ export function registerOperationRoutes({
 
 	routes.post(UPGRADE_OPERATIONS.apply.http.path, async (c) => {
 		try {
+			const store = await storeForRequest();
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
 			const upgrade = serverUpgradeOptions(body, "upgrade.apply");
 			return c.json(await applyUpgrade({
+				store,
 				plan: typeof body.plan === "string" ? body.plan : undefined,
 				dir: upgrade.dir,
 				dryRun: body.dryRun === true,
@@ -251,9 +253,11 @@ export function registerOperationRoutes({
 
 	routes.post(UPGRADE_OPERATIONS.rollback.http.path, async (c) => {
 		try {
+			const store = await storeForRequest();
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
 			const upgrade = serverUpgradeOptions(body, "upgrade.rollback");
 			return c.json(await rollbackUpgrade({
+				store,
 				plan: typeof body.plan === "string" ? body.plan : undefined,
 				dir: upgrade.dir,
 				dryRun: body.dryRun === true,
@@ -560,7 +564,7 @@ export function registerOperationRoutes({
 			const planned = await planMigrationDurable(store, fixture);
 			await store.ready();
 			await store.refresh();
-			await runMigrationDurable(store, planned.id, fixture);
+			await applyMigrationDurable(store, planned.id, fixture);
 			const verification = await verifyMigrationDurable(store, planned.id, fixture);
 			await store.ready();
 			return c.json({
@@ -602,11 +606,11 @@ export function registerOperationRoutes({
 		}
 	});
 
-	routes.post(MIGRATION_OPERATIONS.run.http.path, async (c) => {
+	routes.post(MIGRATION_OPERATIONS.apply.http.path, async (c) => {
 		try {
 			const store = await storeForRequest();
 			const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
-			const plan = await runMigrationDurable(store, c.req.param("id"), migrationFixture(body), {
+			const plan = await applyMigrationDurable(store, c.req.param("id"), migrationFixture(body), {
 				dryRun: body.dryRun === true,
 			});
 			await store.ready();

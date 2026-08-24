@@ -68,12 +68,12 @@ describe("SSO rotate / disable", () => {
 			clientSecret: secret,
 		});
 
-		const before = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
+		const before = store.snapshot.ssoConnections[0]!.clientSecretEncrypted!;
 		expect(() => rotateSsoCredential(store, sso.id, {
 			actor: "test",
 			source: "cli",
 		})).toThrow(/coordinated PostgreSQL runtime backend/i);
-		const after = store.snapshot.identityConnections[0]!.clientSecretEncrypted!;
+		const after = store.snapshot.ssoConnections[0]!.clientSecretEncrypted!;
 		expect(after).toBe(before);
 		expect(decryptCredential(after)).toBe(secret);
 		expect(JSON.stringify(listEvents(store))).not.toContain(secret);
@@ -125,7 +125,7 @@ describe("SSO rotate / disable", () => {
 				createdAt: now,
 				updatedAt: now,
 			});
-			data.identityConnections.push({
+			data.ssoConnections.push({
 				id: "sso_foreign",
 				organizationId: "org_foreign",
 				protocol: "oidc",
@@ -177,12 +177,12 @@ describe("SCIM rotate / disable / replay", () => {
 			endpoint: "https://scim.example/v2",
 			bearerToken: token,
 		});
-		const before = store.snapshot.directoryConnections[0]!.bearerTokenEncrypted!;
+		const before = store.snapshot.scimConnections[0]!.bearerTokenEncrypted!;
 		expect(() => rotateScimCredential(store, scim.id, {
 			actor: "test",
 			source: "cli",
 		})).toThrow(/coordinated PostgreSQL runtime backend/i);
-		const after = store.snapshot.directoryConnections[0]!.bearerTokenEncrypted!;
+		const after = store.snapshot.scimConnections[0]!.bearerTokenEncrypted!;
 		expect(after).toBe(before);
 		expect(decryptCredential(after)).toBe(token);
 		expect(JSON.stringify(listEvents(store))).not.toContain(token);
@@ -221,7 +221,7 @@ describe("SCIM rotate / disable / replay", () => {
 				createdAt: now,
 				updatedAt: now,
 			});
-			data.directoryConnections.push({
+			data.scimConnections.push({
 				id: "scim_foreign",
 				organizationId: "org_f2",
 				provider: "okta",
@@ -248,9 +248,9 @@ describe("SCIM rotate / disable / replay", () => {
 		});
 		const tested = testScimConnection(store, scim.id, { dryRun: true });
 		const originalId = tested.trace.id;
-		const statusBefore = store.snapshot.directoryConnections[0]!.status;
+		const statusBefore = store.snapshot.scimConnections[0]!.status;
 		const tokenBefore =
-			store.snapshot.directoryConnections[0]!.bearerTokenEncrypted;
+			store.snapshot.scimConnections[0]!.bearerTokenEncrypted;
 
 		const inspected = inspectScimTrace(store, originalId);
 		expect(inspected.id).toBe(originalId);
@@ -261,8 +261,8 @@ describe("SCIM rotate / disable / replay", () => {
 		});
 		expect(replay.id).not.toBe(originalId);
 		expect(replay.stage).toMatch(/\.replay$/);
-		expect(store.snapshot.directoryConnections[0]!.status).toBe(statusBefore);
-		expect(store.snapshot.directoryConnections[0]!.bearerTokenEncrypted).toBe(
+		expect(store.snapshot.scimConnections[0]!.status).toBe(statusBefore);
+		expect(store.snapshot.scimConnections[0]!.bearerTokenEncrypted).toBe(
 			tokenBefore,
 		);
 		expect(
@@ -294,8 +294,8 @@ describe("SCIM rotate / disable / replay", () => {
 			provider: "okta",
 			bearerToken: "token-value",
 		});
-		const rawSso = store.snapshot.identityConnections.find((c) => c.id === sso.id)!;
-		const rawScim = store.snapshot.directoryConnections.find((c) => c.id === scim.id)!;
+		const rawSso = store.snapshot.ssoConnections.find((c) => c.id === sso.id)!;
+		const rawScim = store.snapshot.scimConnections.find((c) => c.id === scim.id)!;
 		expect(publicIdentityConnection(rawSso).hasClientSecret).toBe(true);
 		expect(
 			(publicIdentityConnection(rawSso) as { clientSecretEncrypted?: string })

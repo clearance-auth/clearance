@@ -6,6 +6,8 @@ export type DeliveryJobState =
 	| "dead"
 	| "cancelled";
 
+export type DeliveryChannel = "email" | "webhook";
+
 export type DeliveryJobRecord = {
 	id: string;
 	eventId: string;
@@ -14,7 +16,7 @@ export type DeliveryJobRecord = {
 	environmentId: string;
 	organizationId: string | null;
 	webhookEndpointId: string | null;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	state: DeliveryJobState;
 	cancelRequested: boolean;
 	attemptCount: number;

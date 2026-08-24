@@ -23,16 +23,19 @@ export type WriteExportArtifactCodes = {
 	writeFailedCode?: string;
 };
 
+export type WriteExportArtifactOptions = WriteExportArtifactCodes & {
+	outputPath: string;
+	body: string;
+	force: boolean;
+};
+
 /**
  * Write export body atomically. Refuses to overwrite unless force.
  * On failure leaves no partial final artifact at outputPath.
  * Mode 0o600 — owner read/write only.
  */
 export function writeExportArtifact(
-	outputPath: string,
-	body: string,
-	force: boolean,
-	codes: WriteExportArtifactCodes = {},
+	{ outputPath, body, force, ...codes }: WriteExportArtifactOptions,
 ): string {
 	const stage = codes.stage ?? "events.export";
 	const existsCode = codes.existsCode ?? "EVENTS_EXPORT_EXISTS";

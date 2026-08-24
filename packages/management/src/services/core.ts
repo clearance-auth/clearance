@@ -17,7 +17,7 @@ import type {
 	AuditEvent,
 	Environment,
 	Organization,
-	Principal,
+	User,
 	Project,
 	SessionRecord,
 } from "../types/resources.js";
@@ -63,7 +63,7 @@ function assertSnapshotPrincipalWriterDisabled(
 	}
 }
 
-function principalReadView(store: ManagementStore): readonly Principal[] {
+function principalReadView(store: ManagementStore): readonly User[] {
 	if (store.storeV2Principals?.authoritative) {
 		throw new ClearanceError({
 			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
@@ -847,9 +847,9 @@ export type EnvironmentLocalStatus = {
 		/** Null when relational topology makes organization membership unavailable. */
 		memberships: number | null;
 		/** Null when relational topology makes organization connections unavailable. */
-		identityConnections: number | null;
+		ssoConnections: number | null;
 		/** Null when relational topology makes organization connections unavailable. */
-		directoryConnections: number | null;
+		scimConnections: number | null;
 		roles: number;
 		sessions: number;
 		/** Null when the authoritative event projection is relational. */
@@ -914,10 +914,10 @@ function inspectEnvironmentSnapshot(
 	const memberships = store.snapshot.memberships.filter(
 		(m) => orgIds.has(m.organizationId) && m.status === "active",
 	);
-	const identityConnections = store.snapshot.identityConnections.filter((c) =>
+	const ssoConnections = store.snapshot.ssoConnections.filter((c) =>
 		orgIds.has(c.organizationId),
 	);
-	const directoryConnections = store.snapshot.directoryConnections.filter((c) =>
+	const scimConnections = store.snapshot.scimConnections.filter((c) =>
 		orgIds.has(c.organizationId),
 	);
 	const roles = store.snapshot.roles.filter(
@@ -961,8 +961,8 @@ function inspectEnvironmentSnapshot(
 			principals: principals.length,
 			organizations: organizations.length,
 			memberships: memberships.length,
-			identityConnections: identityConnections.length,
-			directoryConnections: directoryConnections.length,
+			ssoConnections: ssoConnections.length,
+			scimConnections: scimConnections.length,
 			roles: roles.length,
 			sessions: sessions.length,
 			events: events.length,
@@ -1069,8 +1069,8 @@ export async function inspectEnvironmentAuthoritative(
 	const auxiliaryOrganizationCounts = topologyAuthoritative
 		? {
 			memberships: null,
-			identityConnections: null,
-			directoryConnections: null,
+			ssoConnections: null,
+			scimConnections: null,
 		}
 		: (() => {
 			const orgIds = new Set(
@@ -1081,10 +1081,10 @@ export async function inspectEnvironmentAuthoritative(
 					(membership) =>
 						orgIds.has(membership.organizationId) && membership.status === "active",
 				).length,
-				identityConnections: store.snapshot.identityConnections.filter((connection) =>
+				ssoConnections: store.snapshot.ssoConnections.filter((connection) =>
 					orgIds.has(connection.organizationId),
 				).length,
-				directoryConnections: store.snapshot.directoryConnections.filter((connection) =>
+				scimConnections: store.snapshot.scimConnections.filter((connection) =>
 					orgIds.has(connection.organizationId),
 				).length,
 			};
@@ -1407,14 +1407,14 @@ export function createUser(
 		actor?: string;
 		source?: AuditEvent["source"] | "import";
 	},
-): Principal {
+): User {
 	assertSnapshotPrincipalWriterDisabled(store, "users.create");
 	const scope = resolveCreateScope(store, input);
 	const email = input.email.toLowerCase();
 	const principalId = input.id?.trim() || newId("user");
 	const now = nowIso();
 
-	const principal: Principal = {
+	const principal: User = {
 		id: principalId,
 		projectId: scope.projectId,
 		environmentId: scope.environmentId,
@@ -1501,7 +1501,7 @@ export function listUsers(
 		/** When true (default for scoped callers), require full scope filter */
 		scope?: ResourceScope;
 	},
-): Principal[] {
+): User[] {
 	const inScope = filter?.scope ? scopeFilter(filter.scope) : null;
 	return principalReadView(store).filter((p) => {
 		if (p.status === "deleted") return false;
@@ -1533,7 +1533,7 @@ export function listUsersPage(
 		/** Opaque cursor from a previous page's nextCursor (fail-closed). */
 		cursor?: string;
 	},
-): { users: Principal[]; nextCursor: string | null } {
+): { users: User[]; nextCursor: string | null } {
 	const scope = opts?.scope ?? resolveOperatorScope(store);
 	const limit = normalizePageLimit(opts?.limit, {
 		stage: "users.list",
@@ -1563,11 +1563,11 @@ export async function listUsersPageAuthoritative(
 	store: ManagementStore,
 	opts?: {
 		scope?: ResourceScope;
-		status?: Principal["status"];
+		status?: User["status"];
 		limit?: number;
 		cursor?: string;
 	},
-): Promise<{ users: Principal[]; nextCursor: string | null }> {
+): Promise<{ users: User[]; nextCursor: string | null }> {
 	if (!store.storeV2Principals?.authoritative) {
 		return listUsersPage(store, opts);
 	}
@@ -1600,7 +1600,7 @@ export async function inspectUserAuthoritative(
 	store: ManagementStore,
 	id: string,
 	scope?: ResourceScope,
-): Promise<Principal> {
+): Promise<User> {
 	if (!store.storeV2Principals?.authoritative) {
 		return inspectUser(store, id, scope);
 	}
@@ -1628,7 +1628,7 @@ export function inspectUser(
 	store: ManagementStore,
 	id: string,
 	scope?: ResourceScope,
-): Principal {
+): User {
 	const user = principalReadView(store).find((p) => p.id === id);
 	if (!user || user.status === "deleted") {
 		throw new ClearanceError({
@@ -1682,7 +1682,7 @@ export function updateUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
 	assertSnapshotPrincipalWriterDisabled(store, "users.update");
 	const hasName = input.name !== undefined;
 	const hasEmail = input.email !== undefined;
@@ -1720,7 +1720,7 @@ export function updateUser(
 	const now = nowIso();
 	// Always bind mutations to operator scope (explicit or principal-derived).
 	const scope = input.scope ?? resolveOperatorScope(store);
-	let updated: Principal | undefined;
+	let updated: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -1806,11 +1806,11 @@ export function disableUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
 	assertSnapshotPrincipalWriterDisabled(store, "users.disable");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
-	let updated: Principal | undefined;
+	let updated: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -1884,11 +1884,11 @@ export function deleteUser(
 		source?: AuditEvent["source"] | "import";
 		scope?: ResourceScope;
 	},
-): Principal {
+): User {
 	assertSnapshotPrincipalWriterDisabled(store, "users.delete");
 	const now = nowIso();
 	const scope = input?.scope ?? resolveOperatorScope(store);
-	let deleted: Principal | undefined;
+	let deleted: User | undefined;
 
 	store.mutate((data) => {
 		const user = data.principals.find((p) => p.id === id);
@@ -2704,7 +2704,7 @@ export type UsersExportEnvelope = {
 	filters: {
 		status?: "active" | "disabled";
 	};
-	users: Principal[];
+	users: User[];
 	outputPath?: string;
 	correlationId: string;
 };
@@ -2754,7 +2754,7 @@ export function normalizeUsersExportStatus(
 }
 
 /** Stable sort: email asc, then id asc. */
-export function sortUsersDeterministic(users: Principal[]): Principal[] {
+export function sortUsersDeterministic(users: User[]): User[] {
 	return [...users].sort((a, b) => {
 		const ea = a.email.toLowerCase();
 		const eb = b.email.toLowerCase();
@@ -2765,8 +2765,8 @@ export function sortUsersDeterministic(users: Principal[]): Principal[] {
 }
 
 /** Public export view of a principal — no write-only secrets (none stored). */
-export function sanitizePrincipalForExport(user: Principal): Principal {
-	const base: Principal = {
+export function sanitizePrincipalForExport(user: User): User {
+	const base: User = {
 		id: user.id,
 		projectId: user.projectId,
 		environmentId: user.environmentId,
@@ -2794,7 +2794,7 @@ export function selectUsersForExport(
 		status?: "active" | "disabled";
 		scope: ResourceScope;
 	},
-): { users: Principal[]; truncated: boolean } {
+): { users: User[]; truncated: boolean } {
 	let users = principalReadView(store).filter(
 		(p) =>
 			p.status !== "deleted" &&
@@ -2864,16 +2864,14 @@ export function exportUsers(
 
 	if (opts.outputPath) {
 		const body = serializeUsersExportBody(envelope, format);
-		const written = writeExportArtifact(
-			opts.outputPath,
+		const written = writeExportArtifact({
+			outputPath: opts.outputPath,
 			body,
-			Boolean(opts.force),
-			{
+			force: Boolean(opts.force),
 				stage: "users.export",
 				existsCode: "USERS_EXPORT_EXISTS",
 				writeFailedCode: "USERS_EXPORT_WRITE_FAILED",
-			},
-		);
+		});
 		envelope.outputPath = written;
 	}
 
@@ -2944,16 +2942,14 @@ export async function exportUsersAuthoritative(
 		correlationId: corr,
 	};
 	if (opts.outputPath) {
-		const written = writeExportArtifact(
-			opts.outputPath,
-			serializeUsersExportBody(envelope, format),
-			Boolean(opts.force),
-			{
+		const written = writeExportArtifact({
+			outputPath: opts.outputPath,
+			body: serializeUsersExportBody(envelope, format),
+			force: Boolean(opts.force),
 				stage: "users.export",
 				existsCode: "USERS_EXPORT_EXISTS",
 				writeFailedCode: "USERS_EXPORT_WRITE_FAILED",
-			},
-		);
+		});
 		envelope.outputPath = written;
 	}
 	if (!opts.skipAudit) {
@@ -3074,7 +3070,7 @@ export function createSession(
 
 function createSessionForPrincipal(
 	store: ManagementUnitOfWork,
-	principal: Principal,
+	principal: User,
 	input: { principalId: string; environmentId: string; scope?: ResourceScope },
 ): SessionRecord {
 	if (input.scope && principal.environmentId !== input.environmentId) {
@@ -3183,8 +3179,8 @@ export type AuthoritativeOverviewResourceCounts = Readonly<{
 	principals: number;
 	organizations: number;
 	memberships: number;
-	identityConnections: number;
-	directoryConnections: number;
+	ssoConnections: number;
+	scimConnections: number;
 	roles: number;
 	setupLinks: number;
 	events: number | null;
@@ -3223,8 +3219,8 @@ function authoritativeOverviewResourceCounts(
 		principals: required("principals"),
 		organizations: required("organizations"),
 		memberships: required("memberships"),
-		identityConnections: required("identityConnections"),
-		directoryConnections: required("directoryConnections"),
+		ssoConnections: required("ssoConnections"),
+		scimConnections: required("scimConnections"),
 		roles: required("roles"),
 		setupLinks: required("setupLinks"),
 		events: required("events"),

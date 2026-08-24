@@ -293,7 +293,7 @@ export async function issueServiceAccountJWT(
 	}
 }
 
-export async function getJwtToken(
+export async function issueJwtAccessToken(
 	ctx: GenericEndpointContext,
 	options?: JwtOptions | undefined,
 	sessionClaims?:

@@ -166,7 +166,7 @@ export const siwe = (options: SIWEPluginOptions) => {
 						// identity/session transaction below. A policy or persistence failure
 						// therefore rolls the proof back with every derived mutation.
 						const verification = managedPolicy
-							? await ctx.context.internalAdapter.findVerificationValue(
+							? await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 									nonceIdentifier,
 								)
 							: await consumeInternalVerificationChallenge(

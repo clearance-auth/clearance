@@ -4,7 +4,7 @@ import type {
 	AuditEvent,
 	Environment,
 	Organization,
-	Principal,
+	User,
 	Project,
 	DataStoreSnapshot,
 } from "../types/resources.js";
@@ -76,7 +76,7 @@ const META_ENABLED_AT = "store_v2_enabled_at";
 const META_AUTHORITATIVE_COLLECTIONS =
 	STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY;
 
-type StoreV2Resource = Project | Environment | Principal | Organization | AuditEvent;
+type StoreV2Resource = Project | Environment | User | Organization | AuditEvent;
 type Queryable = pg.Pool | pg.PoolClient;
 
 export interface StoreV2SyncResult {
@@ -609,7 +609,7 @@ async function buildStatus(
 				? { events: relational.events as AuditEvent[] }
 				: {}),
 			...(authoritativeCollections.includes("principals")
-				? { principals: relational.principals as Principal[] }
+				? { principals: relational.principals as User[] }
 				: {}),
 				...(( ["projects", "environments", "organizations"] as StoreV2Collection[])
 					.every((collection) => authoritativeCollections.includes(collection))
@@ -1234,7 +1234,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 
 	async getPrincipalById(
 		input: Parameters<StoreV2PrincipalReader["getById"]>[0],
-	): Promise<Principal | null> {
+	): Promise<User | null> {
 		if (!(await this.principalsAreAuthoritative())) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
@@ -1246,7 +1246,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 
 	async findActivePrincipalByEmail(
 		input: Parameters<StoreV2PrincipalReader["findActiveByEmail"]>[0],
-	): Promise<Principal | null> {
+	): Promise<User | null> {
 		if (!(await this.principalsAreAuthoritative())) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
@@ -1258,7 +1258,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 
 	async findActivePrincipalByExternalId(
 		input: Parameters<StoreV2PrincipalReader["findActiveByExternalId"]>[0],
-	): Promise<Principal | null> {
+	): Promise<User | null> {
 		if (!(await this.principalsAreAuthoritative())) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
@@ -1270,7 +1270,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 
 	async listPrincipalsPage(
 		input: Parameters<StoreV2PrincipalReader["listPage"]>[0],
-	): Promise<{ principals: Principal[]; hasMore: boolean }> {
+	): Promise<{ principals: User[]; hasMore: boolean }> {
 		if (!(await this.principalsAreAuthoritative())) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
@@ -1321,7 +1321,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			environment_id: string;
 			email: string;
 			name: string;
-			status: Principal["status"];
+			status: User["status"];
 			external_id: string | null;
 			principal_created_at: Date | string;
 			principal_updated_at: Date | string;
@@ -1398,7 +1398,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPAL_PAGE_LIMIT_INVALID",
-				"Principal export limit must be an integer between 1 and 1000.",
+				"User export limit must be an integer between 1 and 1000.",
 			);
 		}
 		const params: unknown[] = [input.scope.projectId, input.scope.environmentId];
@@ -1845,7 +1845,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPALS_CUTOVER_PHASE_INVALID",
-					"Principal cutover requires relational-authoritative events and snapshot-authoritative principals.",
+					"User cutover requires relational-authoritative events and snapshot-authoritative principals.",
 				);
 			}
 			if (
@@ -1854,7 +1854,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPAL_AUTHORITY_VERSION_INVALID",
-					"Principal authority capability metadata is missing or invalid.",
+					"User authority capability metadata is missing or invalid.",
 				);
 			}
 			const status = await buildStatus(client, this.tables, this.snapshotTable);
@@ -1871,7 +1871,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			if (principalRevision === null) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPAL_REVISION_INVALID",
-					"Principal authority revision metadata is missing or invalid.",
+					"User authority revision metadata is missing or invalid.",
 				);
 			}
 			const nextRevision = incrementStoreV2Revision(revision);
@@ -1923,7 +1923,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			if (phase !== "hybrid" || !authoritativeCollections.includes("principals")) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPALS_ROLLBACK_PHASE_INVALID",
-					"Principal rollback requires relational-authoritative principals.",
+					"User rollback requires relational-authoritative principals.",
 				);
 			}
 			const principalRevision = await readStoreV2PrincipalRevision(
@@ -1933,7 +1933,7 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			if (principalRevision === null) {
 				throw new StoreV2MigrationError(
 					"STORE_V2_PRINCIPAL_REVISION_INVALID",
-					"Principal authority revision metadata is missing or invalid.",
+					"User authority revision metadata is missing or invalid.",
 				);
 			}
 			const principals = await readStoreV2Principals(client, this.tables);
@@ -2061,9 +2061,9 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
 			await advanceStoreV2TopologyState(client, this.tables, {
-				projectCount: 0,
-				environmentCount: 0,
-				organizationCount: 0,
+			projectCountDelta: 0,
+			environmentCountDelta: 0,
+			organizationCountDelta: 0,
 			});
 			await client.query("COMMIT");
 		} catch (error) {
@@ -2146,9 +2146,9 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 			);
 			await writeMeta(client, this.tables, META_SNAPSHOT_REVISION, nextRevision);
 			await advanceStoreV2TopologyState(client, this.tables, {
-				projectCount: 0,
-				environmentCount: 0,
-				organizationCount: 0,
+			projectCountDelta: 0,
+			environmentCountDelta: 0,
+			organizationCountDelta: 0,
 			});
 			await client.query("COMMIT");
 		} catch (error) {
@@ -2248,15 +2248,15 @@ export class PgStoreV2Shadow implements StoreV2MigrationControl {
 		if (!principalState) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPAL_STATE_INVALID",
-				"Principal authority state metadata is missing or invalid.",
+				"User authority state metadata is missing or invalid.",
 			);
 		}
 		if (!topologyAuthoritative && topologyChanged) {
 			topologyState = await advanceStoreV2TopologyState(client, this.tables, {
-				projectCount: after.projects.length - before.projects.length,
-				environmentCount:
+				projectCountDelta: after.projects.length - before.projects.length,
+				environmentCountDelta:
 					after.environments.length - before.environments.length,
-				organizationCount:
+				organizationCountDelta:
 					after.organizations.length - before.organizations.length,
 			});
 		} else {

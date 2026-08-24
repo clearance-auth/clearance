@@ -31,7 +31,7 @@ const diagnosticTraceSchema = z.object({
 	createdAt: z.string(),
 }).strict();
 
-const publicIdentityConnectionSchema = z.object({
+const publicSsoConnectionSchema = z.object({
 	id: z.string(),
 	organizationId: z.string(),
 	protocol: z.enum(["saml", "oidc"]),
@@ -53,7 +53,7 @@ const publicIdentityConnectionSchema = z.object({
 	hasClientSecret: z.boolean(),
 }).strict();
 
-const publicDirectoryConnectionSchema = z.object({
+const publicScimConnectionSchema = z.object({
 	id: z.string(),
 	organizationId: z.string(),
 	provider: z.string(),
@@ -82,7 +82,7 @@ const setupLinkReplaySchema = setupLinkSchema.omit({ url: true, token: true }).e
 const ssoSimulationTestResultSchema = z.object({
 	pass: z.boolean(),
 	trace: diagnosticTraceSchema,
-	connection: publicIdentityConnectionSchema,
+	connection: publicSsoConnectionSchema,
 	mode: z.literal("simulation"),
 	certifiedExternalTenant: z.literal(false).optional(),
 	evidence: z.string().optional(),
@@ -92,7 +92,7 @@ const ssoSimulationTestResultSchema = z.object({
 const ssoLiveTestResultSchema = z.object({
 	pass: z.boolean(),
 	trace: diagnosticTraceSchema,
-	connection: publicIdentityConnectionSchema,
+	connection: publicSsoConnectionSchema,
 	mode: z.literal("live"),
 	evidence: z.string(),
 	endpoint: z.string(),
@@ -124,7 +124,7 @@ const scimSimulationTestResultSchema = z.object({
 	pass: z.boolean(),
 	trace: diagnosticTraceSchema,
 	proposed: z.array(scimProposedChangeSchema),
-	connection: publicDirectoryConnectionSchema,
+	connection: publicScimConnectionSchema,
 	mode: z.literal("simulation"),
 	evidence: z.string().optional(),
 	groupLifecycle: groupLifecycleEvidenceSchema.optional(),
@@ -134,7 +134,7 @@ const scimSimulationTestResultSchema = z.object({
 const scimLiveTestResultSchema = z.object({
 	pass: z.boolean(),
 	trace: diagnosticTraceSchema,
-	connection: publicDirectoryConnectionSchema,
+	connection: publicScimConnectionSchema,
 	mode: z.literal("live"),
 	evidence: z.string(),
 	endpoint: z.string(),
@@ -161,7 +161,7 @@ const readinessReportSchema = z.object({
 		note: z.string(),
 	}).strict(),
 	remainingCustomerActions: z.array(z.string()),
-	signature: z.string(),
+	reportDigest: z.string(),
 }).strict();
 
 const scimUserSchema = z.object({
@@ -228,7 +228,7 @@ const scimTestInputSchema = z.object({
 export const ENTERPRISE_OPERATION_SCHEMAS = {
 	"sso.list": {
 		input: z.object({ organizationId: z.string().optional() }).strict(),
-		output: z.object({ connections: z.array(publicIdentityConnectionSchema), scope: resourceScopeSchema }).strict(),
+		output: z.object({ connections: z.array(publicSsoConnectionSchema), scope: resourceScopeSchema }).strict(),
 	},
 	"sso.create": {
 		input: z.object({
@@ -241,7 +241,7 @@ export const ENTERPRISE_OPERATION_SCHEMAS = {
 			samlEntryPoint: z.string().optional(),
 			samlCertificate: z.string().optional(),
 		}).strict(),
-		output: z.object({ connection: publicIdentityConnectionSchema }).strict(),
+		output: z.object({ connection: publicSsoConnectionSchema }).strict(),
 	},
 	"sso.configure": {
 		input: z.object({
@@ -253,10 +253,10 @@ export const ENTERPRISE_OPERATION_SCHEMAS = {
 			dryRun: z.boolean().optional(),
 		}).strict(),
 		output: z.union([
-			z.object({ connection: publicIdentityConnectionSchema, scope: resourceScopeSchema }).strict(),
+			z.object({ connection: publicSsoConnectionSchema, scope: resourceScopeSchema }).strict(),
 			z.object({
 				dryRun: z.literal(true),
-				connection: publicIdentityConnectionSchema,
+				connection: publicSsoConnectionSchema,
 				proposed: z.object({
 					issuer: z.string().optional(),
 					audience: z.string().optional(),
@@ -281,32 +281,32 @@ export const ENTERPRISE_OPERATION_SCHEMAS = {
 	"sso.rotate": {
 		input: z.object({ id: z.string(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([
-			z.object({ connection: publicIdentityConnectionSchema, scope: resourceScopeSchema }).strict(),
-			z.object({ dryRun: z.literal(true), connection: publicIdentityConnectionSchema, wouldChange: z.literal(true), scope: resourceScopeSchema }).strict(),
+			z.object({ connection: publicSsoConnectionSchema, scope: resourceScopeSchema }).strict(),
+			z.object({ dryRun: z.literal(true), connection: publicSsoConnectionSchema, wouldChange: z.literal(true), scope: resourceScopeSchema }).strict(),
 		]),
 	},
 	"sso.disable": {
 		input: z.object({ id: z.string(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([
 			z.object({
-				connection: publicIdentityConnectionSchema,
+				connection: publicSsoConnectionSchema,
 				idempotent: z.boolean(),
 				runtimeRemoved: z.boolean().optional(),
 				scope: resourceScopeSchema,
 			}).strict(),
-			z.object({ dryRun: z.literal(true), connection: publicIdentityConnectionSchema, wouldChange: z.boolean(), scope: resourceScopeSchema }).strict(),
+			z.object({ dryRun: z.literal(true), connection: publicSsoConnectionSchema, wouldChange: z.boolean(), scope: resourceScopeSchema }).strict(),
 		]),
 	},
 	"scim.list": {
 		input: z.object({ organizationId: z.string().optional() }).strict(),
-		output: z.object({ connections: z.array(publicDirectoryConnectionSchema), scope: resourceScopeSchema }).strict(),
+		output: z.object({ connections: z.array(publicScimConnectionSchema), scope: resourceScopeSchema }).strict(),
 	},
 	"scim.create": {
 		input: z.object({ organizationId: z.string(), provider: z.string(), endpoint: z.string().optional() }).strict(),
 		output: z.union([
-			z.object({ connection: publicDirectoryConnectionSchema.extend({ bearerTokenOnce: z.string() }).strict() }).strict(),
+			z.object({ connection: publicScimConnectionSchema.extend({ bearerTokenOnce: z.string() }).strict() }).strict(),
 			z.object({
-				connection: publicDirectoryConnectionSchema,
+				connection: publicScimConnectionSchema,
 				oneTimeSecretsOmitted: z.tuple([z.literal("connection.bearerTokenOnce")]),
 			}).strict(),
 		]),
@@ -322,20 +322,20 @@ export const ENTERPRISE_OPERATION_SCHEMAS = {
 	"scim.rotate": {
 		input: z.object({ id: z.string(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([
-			z.object({ connection: publicDirectoryConnectionSchema, scope: resourceScopeSchema }).strict(),
-			z.object({ dryRun: z.literal(true), connection: publicDirectoryConnectionSchema, wouldChange: z.literal(true), scope: resourceScopeSchema }).strict(),
+			z.object({ connection: publicScimConnectionSchema, scope: resourceScopeSchema }).strict(),
+			z.object({ dryRun: z.literal(true), connection: publicScimConnectionSchema, wouldChange: z.literal(true), scope: resourceScopeSchema }).strict(),
 		]),
 	},
 	"scim.disable": {
 		input: z.object({ id: z.string(), dryRun: z.boolean().optional() }).strict(),
 		output: z.union([
 			z.object({
-				connection: publicDirectoryConnectionSchema,
+				connection: publicScimConnectionSchema,
 				idempotent: z.boolean(),
 				runtimeRemoved: z.boolean().optional(),
 				scope: resourceScopeSchema,
 			}).strict(),
-			z.object({ dryRun: z.literal(true), connection: publicDirectoryConnectionSchema, wouldChange: z.boolean(), scope: resourceScopeSchema }).strict(),
+			z.object({ dryRun: z.literal(true), connection: publicScimConnectionSchema, wouldChange: z.boolean(), scope: resourceScopeSchema }).strict(),
 		]),
 	},
 	"scim.replay": {

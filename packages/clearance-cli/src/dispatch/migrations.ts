@@ -40,8 +40,8 @@ export async function dispatchMigrationCommand({
 					source: opts.source as "legacy",
 					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
 			});
-		case MIGRATION_OPERATIONS.run.cliPath:
-			return callManagementOperation(session, "migrations.run", {
+		case MIGRATION_OPERATIONS.apply.cliPath:
+			return callManagementOperation(session, "migrations.apply", {
 					id: String(opts.id),
 					fixture: localFile(opts.fixture, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Migration fixture"),
 					dryRun: global.dryRun,

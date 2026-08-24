@@ -14,7 +14,7 @@ import type {
 	AuditEvent,
 	DataStoreSnapshot,
 	Organization,
-	Principal,
+	User,
 } from "../types/resources.js";
 import { newId, nowIso } from "../store/json-store.js";
 import { advancingPrincipalUpdatedAt } from "../store/store-v2-principals.js";
@@ -70,7 +70,7 @@ export function syncRuntimeUserToManagement(
 		actor?: string;
 		source?: AuditEvent["source"];
 	},
-): Principal {
+): User {
 	if (!runtimeUser.id?.trim()) {
 		throw new ClearanceError({
 			code: "IDENTITY_ID_REQUIRED",
@@ -100,7 +100,7 @@ export function syncRuntimeUserToManagement(
 	const updatedAt = toIso(runtimeUser.updatedAt, now);
 
 	// Build return object outside mutate (PgStore applies mutators asynchronously)
-	const principal: Principal = {
+	const principal: User = {
 		id: runtimeUser.id,
 		projectId: scope.projectId,
 		environmentId: scope.environmentId,
@@ -196,7 +196,7 @@ export async function syncRuntimeUserToManagementDurable(
 		actor?: string;
 		source?: AuditEvent["source"];
 	},
-): Promise<Principal> {
+): Promise<User> {
 	const authoritativeTopologyScope = store.storeV2Topology?.authoritative
 		? await resolveOperatorScopeAuthoritative(store, {
 			projectId: opts?.projectId,
@@ -263,8 +263,8 @@ export async function syncRuntimeUserToManagementDurable(
 				includeDeleted: true,
 			});
 			if (byId) {
-				const nextUpdatedAt = advancingPrincipalUpdatedAt(updatedAt, byId.updatedAt);
-				const principal: Principal = {
+				const nextUpdatedAt = advancingPrincipalUpdatedAt({ proposedUpdatedAt: updatedAt, storedUpdatedAt: byId.updatedAt });
+				const principal: User = {
 					...byId,
 					email,
 					name,
@@ -400,7 +400,7 @@ export async function syncRuntimeOrganizationToManagementDurable(
 	};
 	const reconcileMembership = (
 		data: DataStoreSnapshot,
-		principal: Principal,
+		principal: User,
 		organization: Organization,
 		appendAudit: (input: AuditEventInput) => unknown,
 	) => {
@@ -486,7 +486,7 @@ export async function syncRuntimeOrganizationToManagementDurable(
 			membership.updatedAt = now;
 		}
 	};
-	const apply = (data: DataStoreSnapshot, authoritativePrincipal?: Principal) => {
+	const apply = (data: DataStoreSnapshot, authoritativePrincipal?: User) => {
 		const principal = (authoritativePrincipal ?? data.principals.find(
 			(p) =>
 				p.id === ownerPrincipalId &&

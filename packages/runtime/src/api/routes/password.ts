@@ -119,7 +119,7 @@ export const requestPasswordReset = createAuthEndpoint(
 			 * to mitigate timing attacks.
 			 */
 			generateId(24);
-			await ctx.context.internalAdapter.findVerificationValue(
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 				"dummy-verification-token",
 			);
 			ctx.context.logger.warn("Reset Password: User not found");
@@ -249,7 +249,7 @@ export const requestPasswordResetCallback = createAuthEndpoint(
 			);
 		}
 		const verification =
-			await ctx.context.internalAdapter.findVerificationValue(
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 				`reset-password:${token}`,
 			);
 		if (!verification || verification.expiresAt < new Date()) {

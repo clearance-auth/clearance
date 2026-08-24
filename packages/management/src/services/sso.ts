@@ -6,7 +6,7 @@ import type {
 import type { ClearanceKeyManagementFacade } from "@clearance/auth";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
+import type { DiagnosticTrace, SsoConnection } from "../types/resources.js";
 import {
 	deleteSsoProviderById,
 	invalidateAuthBundles,
@@ -97,9 +97,9 @@ export function resolveSsoConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
-): IdentityConnection {
+): SsoConnection {
 	return resolveEnterpriseConnection(store, id, {
-		connections: store.snapshot.identityConnections,
+		connections: store.snapshot.ssoConnections,
 		scope: opts?.scope,
 		stage: opts?.stage ?? "sso.resolve",
 		label: "SSO",
@@ -112,9 +112,9 @@ export async function resolveSsoConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope; stage?: string },
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	return resolveEnterpriseConnectionAuthoritative(store, id, {
-		connections: store.snapshot.identityConnections,
+		connections: store.snapshot.ssoConnections,
 		scope: opts?.scope,
 		stage: opts?.stage ?? "sso.resolve",
 		label: "SSO",
@@ -128,24 +128,24 @@ export function inspectSsoConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope },
-): IdentityConnection {
+): SsoConnection {
 	const conn = resolveSsoConnection(store, id, {
 		scope: opts?.scope,
 		stage: "sso.inspect",
 	});
-	return publicIdentityConnection(conn) as IdentityConnection;
+	return publicIdentityConnection(conn) as SsoConnection;
 }
 
 export async function inspectSsoConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: { scope?: ResourceScope },
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	const conn = await resolveSsoConnectionAuthoritative(store, id, {
 		scope: opts?.scope,
 		stage: "sso.inspect",
 	});
-	return publicIdentityConnection(conn) as IdentityConnection;
+	return publicIdentityConnection(conn) as SsoConnection;
 }
 
 export interface SsoCreateInput {
@@ -167,7 +167,7 @@ export interface SsoCreateInput {
 }
 
 function buildSsoConnection(input: SsoCreateInput): {
-	connection: IdentityConnection;
+	connection: SsoConnection;
 	clientSecretKeyId?: string;
 	samlCertificateFingerprint?: string;
 } {
@@ -187,7 +187,7 @@ function buildSsoConnection(input: SsoCreateInput): {
 				certificate: input.samlCertificate,
 			})
 		: undefined;
-	const connection: IdentityConnection = {
+	const connection: SsoConnection = {
 		id: newId("sso"),
 		organizationId: input.organizationId,
 		protocol: input.protocol,
@@ -218,10 +218,10 @@ function createSsoConnectionResolved(
 	store: ManagementStore,
 	input: SsoCreateInput,
 	org: { id: string; projectId: string; environmentId: string },
-): IdentityConnection {
+): SsoConnection {
 	const { connection: conn, clientSecretKeyId, samlCertificateFingerprint } = buildSsoConnection(input);
 	store.mutate((data) => {
-		data.identityConnections.push(conn);
+		data.ssoConnections.push(conn);
 	});
 	recordEvent(store, {
 		actor: input.actor ?? "operator",
@@ -242,17 +242,17 @@ function createSsoConnectionResolved(
 		},
 	});
 	// Domain return is write-only for secret material
-	return publicIdentityConnection(conn) as IdentityConnection;
+	return publicIdentityConnection(conn) as SsoConnection;
 }
 
-export function createSsoConnection(store: ManagementStore, input: SsoCreateInput): IdentityConnection {
+export function createSsoConnection(store: ManagementStore, input: SsoCreateInput): SsoConnection {
 	return createSsoConnectionResolved(store, input, inspectOrganization(store, input.organizationId));
 }
 
 export async function createSsoConnectionAuthoritative(
 	store: ManagementStore,
 	input: SsoCreateInput,
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	if (!store.storeV2Topology?.authoritative) {
 		const organization = await inspectOrganizationAuthoritative(store, input.organizationId, input.scope);
 		return createSsoConnectionResolved(store, input, organization);
@@ -268,7 +268,7 @@ export async function createSsoConnectionAuthoritative(
 			"sso.create",
 			"ORG_NOT_FOUND",
 		);
-		data.identityConnections.push(connection);
+		data.ssoConnections.push(connection);
 		appendAudit({
 			actor: input.actor ?? "operator",
 			action: "sso.create",
@@ -286,7 +286,7 @@ export async function createSsoConnectionAuthoritative(
 				samlCertificateFingerprint: samlCertificateFingerprint ?? null,
 			},
 		});
-		return publicIdentityConnection(connection) as IdentityConnection;
+		return publicIdentityConnection(connection) as SsoConnection;
 	});
 }
 
@@ -300,11 +300,11 @@ export async function createSsoConnectionAuthoritative(
  */
 function configureSsoConnectionResolved(
 	store: ManagementStore,
-	conn: IdentityConnection,
+	conn: SsoConnection,
 	org: { id: string; projectId: string; environmentId: string },
 	patch: Partial<
 		Pick<
-			IdentityConnection,
+			SsoConnection,
 			| "issuer"
 			| "audience"
 			| "metadataUrl"
@@ -315,7 +315,7 @@ function configureSsoConnectionResolved(
 		>
 	> & { clientSecret?: string },
 	opts?: SsoMutationOpts,
-): IdentityConnection {
+): SsoConnection {
 	const stage = "sso.configure";
 	// Encrypt outside the mutator: deterministic input, and the mutator must
 	// stay replayable (Postgres re-runs it against the locked latest draft).
@@ -324,10 +324,10 @@ function configureSsoConnectionResolved(
 		: undefined;
 	const { clientSecret: _cs, ...safePatch } = patch;
 	const now = nowIso();
-	let result: IdentityConnection | undefined;
+	let result: SsoConnection | undefined;
 
 	store.mutate((data) => {
-		const idx = data.identityConnections.findIndex((c) => c.id === conn.id);
+		const idx = data.ssoConnections.findIndex((c) => c.id === conn.id);
 		if (idx < 0) {
 			throw new ClearanceError({
 				code: "SSO_NOT_FOUND",
@@ -336,8 +336,8 @@ function configureSsoConnectionResolved(
 				status: 404,
 			});
 		}
-		const row = data.identityConnections[idx]!;
-		const updated: IdentityConnection = {
+		const row = data.ssoConnections[idx]!;
+		const updated: SsoConnection = {
 			...row,
 			...safePatch,
 			clientSecretFingerprint:
@@ -347,7 +347,7 @@ function configureSsoConnectionResolved(
 			clientSecretKeyId: secretEnvelope?.keyId ?? row.clientSecretKeyId,
 			updatedAt: now,
 		};
-		data.identityConnections[idx] = updated;
+		data.ssoConnections[idx] = updated;
 		appendAuditEvent(data, {
 			actor: opts?.actor ?? "operator",
 			action: "sso.configure",
@@ -361,7 +361,7 @@ function configureSsoConnectionResolved(
 			message: `Configured SSO connection ${conn.id}`,
 			metadata: { rotatedSecret: Boolean(patch.clientSecret) },
 		});
-		result = publicIdentityConnection(updated) as IdentityConnection;
+		result = publicIdentityConnection(updated) as SsoConnection;
 	});
 
 	if (!result) {
@@ -377,7 +377,7 @@ function configureSsoConnectionResolved(
 
 export function configureSsoConnection(
 	store: ManagementStore, id: string, patch: Parameters<typeof configureSsoConnectionResolved>[3], opts?: SsoMutationOpts,
-): IdentityConnection {
+): SsoConnection {
 	const connection = resolveSsoConnection(store, id, { scope: opts?.scope, stage: "sso.configure" });
 	const organization = inspectOrganization(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
 	return configureSsoConnectionResolved(store, connection, organization, patch, opts);
@@ -388,7 +388,7 @@ export async function configureSsoConnectionAuthoritative(
 	id: string,
 	patch: Parameters<typeof configureSsoConnection>[2],
 	opts?: SsoMutationOpts,
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	if (!store.storeV2Topology?.authoritative) {
 		const connection = await resolveSsoConnectionAuthoritative(store, id, opts);
 		const organization = await inspectOrganizationAuthoritative(store, connection.organizationId, opts?.scope ?? resolveOperatorScope(store));
@@ -411,7 +411,7 @@ export async function configureSsoConnectionAuthoritative(
 	const { clientSecret: _clientSecret, ...safePatch } = patch;
 	const now = nowIso();
 	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-		const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
+		const index = data.ssoConnections.findIndex((connection) => connection.id === connectionId);
 		if (index < 0) {
 			throw new ClearanceError({
 				code: "SSO_NOT_FOUND",
@@ -420,7 +420,7 @@ export async function configureSsoConnectionAuthoritative(
 				status: 404,
 			});
 		}
-		const row = data.identityConnections[index]!;
+		const row = data.ssoConnections[index]!;
 		const organization = await requireScopedOrganizationInTransaction(
 			topology,
 			scope,
@@ -428,7 +428,7 @@ export async function configureSsoConnectionAuthoritative(
 			"sso.configure",
 			"SSO_NOT_FOUND",
 		);
-		const updated: IdentityConnection = {
+		const updated: SsoConnection = {
 			...row,
 			...safePatch,
 			clientSecretFingerprint: secretEnvelope?.fingerprint ?? row.clientSecretFingerprint,
@@ -436,7 +436,7 @@ export async function configureSsoConnectionAuthoritative(
 			clientSecretKeyId: secretEnvelope?.keyId ?? row.clientSecretKeyId,
 			updatedAt: now,
 		};
-		data.identityConnections[index] = updated;
+		data.ssoConnections[index] = updated;
 		appendAudit({
 			actor: opts?.actor ?? "operator",
 			action: "sso.configure",
@@ -450,17 +450,17 @@ export async function configureSsoConnectionAuthoritative(
 			message: `Configured SSO connection ${connectionId}`,
 			metadata: { rotatedSecret: Boolean(patch.clientSecret) },
 		});
-		return publicIdentityConnection(updated) as IdentityConnection;
+		return publicIdentityConnection(updated) as SsoConnection;
 	});
 }
 
 export function listSsoConnections(
 	store: ManagementStore,
 	organizationId?: string,
-): IdentityConnection[] {
-	return store.snapshot.identityConnections
+): SsoConnection[] {
+	return store.snapshot.ssoConnections
 		.filter((c) => (organizationId ? c.organizationId === organizationId : true))
-		.map((c) => publicIdentityConnection(c) as IdentityConnection);
+		.map((c) => publicIdentityConnection(c) as SsoConnection);
 }
 
 /**
@@ -488,7 +488,7 @@ export async function rotateSsoCredentialAuthoritative(
 	id: string,
 	opts?: SsoMutationOpts,
 	guard?: SsoMutationGuard,
-): Promise<IdentityConnection> {
+): Promise<SsoConnection> {
 	const operationId = requiredOperationId(opts?.operationId, "sso.rotate");
 	if (store.backend !== "postgres") {
 		return rotateSsoCredential(store, id, opts);
@@ -511,7 +511,7 @@ export async function rotateSsoCredentialAuthoritative(
 		appendAudit,
 		query,
 	}) => {
-		const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
+		const index = data.ssoConnections.findIndex((connection) => connection.id === connectionId);
 		if (index < 0) {
 			throw new ClearanceError({
 				code: "SSO_NOT_FOUND",
@@ -520,7 +520,7 @@ export async function rotateSsoCredentialAuthoritative(
 				status: 404,
 			});
 		}
-		const row = data.identityConnections[index]!;
+		const row = data.ssoConnections[index]!;
 		await guard?.authorizeMutation({
 			organizationId: row.organizationId,
 			query,
@@ -530,7 +530,7 @@ export async function rotateSsoCredentialAuthoritative(
 			event.organizationId === row.organizationId &&
 			event.metadata?.operationId === operationId,
 		);
-		if (prior) return publicIdentityConnection(row) as IdentityConnection;
+		if (prior) return publicIdentityConnection(row) as SsoConnection;
 		const organization = topology
 			? await requireScopedOrganizationInTransaction(
 				topology,
@@ -650,14 +650,14 @@ export async function rotateSsoCredentialAuthoritative(
 				ssoCredentialIdentity(organization.id, connectionId),
 			)
 			: encryptCredential(newClientSecret);
-		const updated: IdentityConnection = {
+		const updated: SsoConnection = {
 			...row,
 			clientSecretEncrypted: encrypted.ciphertext,
 			clientSecretKeyId: encrypted.keyId,
 			clientSecretFingerprint: encrypted.fingerprint,
 			updatedAt: now,
 		};
-		data.identityConnections[index] = updated;
+		data.ssoConnections[index] = updated;
 		appendAudit({
 			actor: opts?.actor ?? "operator",
 			action: "sso.rotate",
@@ -676,7 +676,7 @@ export async function rotateSsoCredentialAuthoritative(
 				replacement: true,
 			},
 		});
-		return publicIdentityConnection(updated) as IdentityConnection;
+		return publicIdentityConnection(updated) as SsoConnection;
 	});
 	// Runtime provider configuration is cached by the auth bundle. Invalidate
 	// it after commit so subsequent OIDC requests use the confirmed secret,
@@ -694,7 +694,7 @@ export function disableSsoConnection(
 	store: ManagementStore,
 	id: string,
 	opts?: SsoMutationOpts,
-): { connection: IdentityConnection; idempotent: boolean } {
+): { connection: SsoConnection; idempotent: boolean } {
 	const stage = "sso.disable";
 	const conn = resolveSsoConnection(store, id, {
 		scope: opts?.scope,
@@ -706,9 +706,9 @@ export function disableSsoConnection(
 		opts?.scope ?? resolveOperatorScope(store),
 	);
 	const now = nowIso();
-	let result: { connection: IdentityConnection; idempotent: boolean } | undefined;
+	let result: { connection: SsoConnection; idempotent: boolean } | undefined;
 	store.mutate((data) => {
-		const idx = data.identityConnections.findIndex((c) => c.id === conn.id);
+		const idx = data.ssoConnections.findIndex((c) => c.id === conn.id);
 		if (idx < 0) {
 			throw new ClearanceError({
 				code: "SSO_NOT_FOUND",
@@ -717,7 +717,7 @@ export function disableSsoConnection(
 				status: 404,
 			});
 		}
-		const row = data.identityConnections[idx]!;
+		const row = data.ssoConnections[idx]!;
 		const alreadyDisabled = row.status === "disabled";
 		if (!alreadyDisabled) {
 			row.status = "disabled";
@@ -743,7 +743,7 @@ export function disableSsoConnection(
 			},
 		});
 		result = {
-			connection: publicIdentityConnection(row) as IdentityConnection,
+			connection: publicIdentityConnection(row) as SsoConnection,
 			idempotent: alreadyDisabled,
 		};
 	});
@@ -763,22 +763,22 @@ export async function disableSsoConnectionAuthoritative(
 	store: ManagementStore,
 	id: string,
 	opts?: SsoMutationOpts,
-): Promise<{ connection: IdentityConnection; idempotent: boolean }> {
+): Promise<{ connection: SsoConnection; idempotent: boolean }> {
 	if (!store.storeV2Topology?.authoritative) return disableSsoConnection(store, id, opts);
 	if (!store.mutateCoordinated) throw topologyTransactionRequired("sso.disable");
 	const connectionId = id.trim();
 	if (!connectionId) throw new ClearanceError({ code: "SSO_ID_REQUIRED", message: "SSO connection id is required", stage: "sso.disable", status: 400 });
 	const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
 	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-		const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
-		const connection = index >= 0 ? data.identityConnections[index] : undefined;
+		const index = data.ssoConnections.findIndex((connection) => connection.id === connectionId);
+		const connection = index >= 0 ? data.ssoConnections[index] : undefined;
 		const organization = connection && topology ? await topology.lockOrganization({ scope, id: connection.organizationId }) : null;
 		if (!connection || !organization || organization.status === "archived") throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${connectionId} not found`, stage: "sso.disable", status: 404 });
 		const alreadyDisabled = connection.status === "disabled";
 		const updated = alreadyDisabled ? connection : { ...connection, status: "disabled" as const, updatedAt: nowIso() };
-		data.identityConnections[index] = updated;
+		data.ssoConnections[index] = updated;
 		appendAudit({ actor: opts?.actor ?? "operator", action: "sso.disable", subjectType: "identity_connection", subjectId: connectionId, outcome: "success", source: opts?.source ?? "cli", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, message: alreadyDisabled ? `SSO connection ${connectionId} already disabled` : `Disabled SSO connection ${connectionId}`, metadata: { idempotent: alreadyDisabled, previousStatus: connection.status, runtimeRemoved: false } });
-		return { connection: publicIdentityConnection(updated) as IdentityConnection, idempotent: alreadyDisabled };
+		return { connection: publicIdentityConnection(updated) as SsoConnection, idempotent: alreadyDisabled };
 	});
 }
 
@@ -793,7 +793,7 @@ export async function disableSsoConnectionReal(
 	opts?: SsoMutationOpts,
 	guard?: SsoMutationGuard,
 ): Promise<{
-	connection: IdentityConnection;
+	connection: SsoConnection;
 	idempotent: boolean;
 	runtimeRemoved: boolean;
 }> {
@@ -806,8 +806,8 @@ export async function disableSsoConnectionReal(
 		}
 		const scope = opts?.scope ?? await resolveOperatorScopeAuthoritative(store);
 		return mutateCoordinatedWithRuntimeSql(store, async ({ data, query, topology, appendAudit }) => {
-			const index = data.identityConnections.findIndex((connection) => connection.id === connectionId);
-			const connection = index >= 0 ? data.identityConnections[index] : undefined;
+			const index = data.ssoConnections.findIndex((connection) => connection.id === connectionId);
+			const connection = index >= 0 ? data.ssoConnections[index] : undefined;
 			if (!connection) {
 				throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${connectionId} not found`, stage, status: 404 });
 			}
@@ -822,7 +822,7 @@ export async function disableSsoConnectionReal(
 			const runtimeRemoved = (deleted.rowCount ?? 0) > 0;
 			const alreadyDisabled = connection.status === "disabled";
 			const updated = alreadyDisabled ? connection : { ...connection, status: "disabled" as const, updatedAt: nowIso() };
-			data.identityConnections[index] = updated;
+			data.ssoConnections[index] = updated;
 			appendAudit({
 				actor: opts?.actor ?? "operator", action: "sso.disable", subjectType: "identity_connection", subjectId: connectionId,
 				outcome: "success", source: opts?.source ?? "cli", organizationId: organization.id,
@@ -830,7 +830,7 @@ export async function disableSsoConnectionReal(
 				message: alreadyDisabled ? `SSO connection ${connectionId} already disabled` : `Disabled SSO connection ${connectionId}`,
 				metadata: { idempotent: alreadyDisabled && !runtimeRemoved, previousStatus: connection.status, runtimeRemoved },
 			});
-			return { connection: publicIdentityConnection(updated) as IdentityConnection, idempotent: alreadyDisabled && !runtimeRemoved, runtimeRemoved };
+			return { connection: publicIdentityConnection(updated) as SsoConnection, idempotent: alreadyDisabled && !runtimeRemoved, runtimeRemoved };
 		});
 	}
 	const conn = await resolveSsoConnectionAuthoritative(store, id, {
@@ -854,7 +854,7 @@ export async function disableSsoConnectionReal(
 				conn.id,
 			]);
 			const runtimeRemoved = (deleted.rowCount ?? 0) > 0;
-			const idx = data.identityConnections.findIndex((c) => c.id === conn.id);
+			const idx = data.ssoConnections.findIndex((c) => c.id === conn.id);
 			if (idx < 0) {
 				throw new ClearanceError({
 					code: "SSO_NOT_FOUND",
@@ -863,7 +863,7 @@ export async function disableSsoConnectionReal(
 					status: 404,
 				});
 			}
-			const row = data.identityConnections[idx]!;
+			const row = data.ssoConnections[idx]!;
 			const alreadyDisabled = row.status === "disabled";
 			if (!alreadyDisabled) {
 				row.status = "disabled";
@@ -889,7 +889,7 @@ export async function disableSsoConnectionReal(
 				},
 			});
 			return {
-				connection: publicIdentityConnection(row) as IdentityConnection,
+				connection: publicIdentityConnection(row) as SsoConnection,
 				idempotent: alreadyDisabled && !runtimeRemoved,
 				runtimeRemoved,
 			};
@@ -950,7 +950,7 @@ export function testSsoConnection(
 ): {
 	pass: boolean;
 	trace: DiagnosticTrace;
-	connection: IdentityConnection;
+	connection: SsoConnection;
 	mode: "simulation";
 } {
 	const conn = resolveSsoConnection(store, id, { scope: opts.scope, stage: "sso.test" });
@@ -1166,7 +1166,7 @@ export function testSsoConnection(
 		});
 	}
 
-	const trace = pushTrace(store, {
+	const trace: DiagnosticTrace = {
 		...base,
 		stage: "assertion.accept",
 		outcome: "pass",
@@ -1181,7 +1181,7 @@ export function testSsoConnection(
 			{ name: "replay_protection", pass: true },
 			{ name: "mode", pass: true, detail: "simulation" },
 		],
-	});
+	};
 
 	const updated = configureSsoConnection(
 		store,
@@ -1189,6 +1189,8 @@ export function testSsoConnection(
 		{ status: "testing" },
 		{ actor: opts.actor, source: opts.source, scope: opts.scope },
 	);
+	trace.createdAt = updated.updatedAt;
+	pushTrace(store, trace);
 	recordEvent(store, {
 		actor: opts.actor ?? "system",
 		action: "sso.test",
@@ -1222,7 +1224,7 @@ export async function testSsoConnectionAuthoritative(
 	const fixture = opts.fixture ?? "ok";
 	const allowed = new Set(["ok", "wrong-issuer", "wrong-audience", "malformed", "expired", "clock-skew", "replay"]);
 	if (!allowed.has(fixture)) throw new ClearanceError({ code: "SSO_UNKNOWN_FIXTURE", message: `Unknown SSO fixture "${fixture}" — fail-closed (simulation mode)`, stage: "sso.test" });
-	const preliminary = store.snapshot.identityConnections.find((connection) => connection.id === id);
+	const preliminary = store.snapshot.ssoConnections.find((connection) => connection.id === id);
 	if (!preliminary) throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${id} not found`, stage: "sso.test", status: 404 });
 	const effectiveIssuer = opts.assertionIssuer ?? preliminary.issuer ?? "https://idp.example.com";
 	const effectiveAudience = opts.assertionAudience ?? preliminary.audience ?? "clearance-sp";
@@ -1243,8 +1245,8 @@ export async function testSsoConnectionAuthoritative(
 								: null;
 	const corr = `corr_sso_${newId("t").slice(4)}`;
 	const outcome = await store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-		const index = data.identityConnections.findIndex((connection) => connection.id === id);
-		const connection = index >= 0 ? data.identityConnections[index] : undefined;
+		const index = data.ssoConnections.findIndex((connection) => connection.id === id);
+		const connection = index >= 0 ? data.ssoConnections[index] : undefined;
 		const organization = connection && topology ? await topology.lockOrganization({ scope, id: connection.organizationId }) : null;
 		if (!connection || !organization || organization.status === "archived") throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${id} not found`, stage: "sso.test", status: 404 });
 		const trace: DiagnosticTrace = {
@@ -1255,13 +1257,13 @@ export async function testSsoConnectionAuthoritative(
 			createdAt: nowIso(), checks: [{ name: "mode", pass: true, detail: "simulation" }],
 		};
 		data.traces.unshift(trace);
-		const updated = failure ? connection : { ...connection, status: "testing" as const, updatedAt: nowIso() };
-		data.identityConnections[index] = updated;
+		const updated = failure ? connection : { ...connection, status: "testing" as const, updatedAt: trace.createdAt };
+		data.ssoConnections[index] = updated;
 		appendAudit({ actor: opts.actor ?? "system", action: "sso.test", subjectType: "identity_connection", subjectId: id,
 			outcome: failure ? "failure" : "success", source: opts.source ?? "sso", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId,
 			correlationId: corr, message: failure ? `SSO test failed at ${failure.stage}` : "SSO simulation test passed (not live IdP conformance)", metadata: { mode: SSO_FIXTURE_MODE, fixture } });
 		return { trace, connection: updated };
 	});
 	if (failure) throw new ClearanceError({ code: failure.code, message: failure.cause, stage: failure.stage, remediation: failure.remediation });
-	return { pass: true, trace: outcome.trace, connection: publicIdentityConnection(outcome.connection) as IdentityConnection, mode: SSO_FIXTURE_MODE };
+	return { pass: true, trace: outcome.trace, connection: publicIdentityConnection(outcome.connection) as SsoConnection, mode: SSO_FIXTURE_MODE };
 }

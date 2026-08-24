@@ -109,7 +109,7 @@ function retainedSigningKeys(value: unknown): readonly Readonly<{
 	}));
 }
 
-function signingProviderFor(value: unknown): KeySigningProvider {
+function signingProviderFor(value: unknown, strictSecrets: boolean): KeySigningProvider {
 	const config = record(value, "access-token-signer");
 	const kind = text(config.kind, "access-token-signer.kind");
 	const common = {
@@ -154,6 +154,7 @@ function signingProviderFor(value: unknown): KeySigningProvider {
 		}
 		return createAwsKmsSigningProvider({
 			...common,
+			strictSecrets,
 			region: text(config.region, "access-token-signer.region"),
 			endpoint: optionalText(config.endpoint, "access-token-signer.endpoint"),
 			allowInsecureLoopbackHttp: config.allowInsecureLoopbackHttp as
@@ -176,7 +177,7 @@ function signingProviderFor(value: unknown): KeySigningProvider {
 	throw new Error("access-token-signer.kind is invalid");
 }
 
-function providerFor(purpose: KeyPurpose, value: unknown): KeyEncryptionProvider {
+function providerFor(purpose: KeyPurpose, value: unknown, strictSecrets: boolean): KeyEncryptionProvider {
 	const config = record(value, `key management provider ${purpose}`);
 	const kind = text(config.kind, `${purpose}.kind`);
 	const common = {
@@ -214,6 +215,7 @@ function providerFor(purpose: KeyPurpose, value: unknown): KeyEncryptionProvider
 		}
 		return createAwsKmsKeyProvider({
 			...common,
+			strictSecrets,
 			region: text(config.region, `${purpose}.region`),
 			retainedKeyIds: optionalTexts(
 				config.retainedKeyIds,
@@ -270,9 +272,9 @@ export function keyManagementRuntimeOptions(): KeyManagementRuntimeOptions {
 		"CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON",
 	);
 	const providers = Object.fromEntries(
-		KEY_PURPOSES.map((purpose) => [purpose, providerFor(purpose, config[purpose])]),
+		KEY_PURPOSES.map((purpose) => [purpose, providerFor(purpose, config[purpose], production)]),
 	) as Record<KeyPurpose, KeyEncryptionProvider>;
-	const signingProvider = signingProviderFor(config["access-token-signer"]);
+	const signingProvider = signingProviderFor(config["access-token-signer"], production);
 	const projectId = text(
 		process.env.CLEARANCE_PROJECT_ID ?? (production ? "" : "proj_default"),
 		"CLEARANCE_PROJECT_ID",

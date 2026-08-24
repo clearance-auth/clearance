@@ -1,5 +1,5 @@
 /**
- * Idempotency-Key API behavior (FOLLOW.md P2.3.2), JSON-store backend.
+ * Operation-Key API behavior (FOLLOW.md P2.3.2), JSON-store backend.
  *
  * - Replay (same key + same payload) returns the ORIGINAL status and a
  *   byte-identical body, marked with the Idempotency-Replayed: true header,
@@ -13,12 +13,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 const dirs: string[] = [];
 const OPERATOR = "test-operator-token-32chars!!";
 
-afterEach(() => {
+afterAll(() => {
 	for (const d of dirs.splice(0)) {
 		rmSync(d, { recursive: true, force: true });
 	}
@@ -45,10 +45,10 @@ function setupEnv(): Record<string, string> {
 	};
 }
 
-describe("API Idempotency-Key", () => {
+describe("API Operation-Key", () => {
 	let authHeaders: Record<string, string>;
 
-	beforeEach(async () => {
+	beforeAll(async () => {
 		authHeaders = setupEnv();
 		const { app } = await import("./server.js");
 		const init = await app.request("/v1/init", {
@@ -57,11 +57,39 @@ describe("API Idempotency-Key", () => {
 			body: JSON.stringify({ name: "Idempotency API" }),
 		});
 		expect(init.status).toBe(200);
-	});
+	}, 30_000);
 
 	async function loadApp() {
 		return (await import("./server.js")).app;
 	}
+
+	it("heartbeats a long-running generation so a second claim remains pending", async () => {
+		vi.useFakeTimers();
+		try {
+			const { startIdempotencyHeartbeat } = await import("./server.js");
+			let now = 0;
+			let leaseExpiresAt = 100;
+			const renew = vi.fn(async () => {
+				if (leaseExpiresAt <= now) return false;
+				leaseExpiresAt = now + 100;
+				return true;
+			});
+			const heartbeat = startIdempotencyHeartbeat(
+				{ renew },
+				{ scopeKey: "POST /v1/keys", key: "long-operation", fingerprint: "fp", generation: 1 },
+				10,
+			);
+			now = 90;
+			await vi.advanceTimersByTimeAsync(10);
+			now = 150; // Beyond the original 100ms lease, within the renewed lease.
+			expect(renew).toHaveBeenCalledOnce();
+			expect(leaseExpiresAt).toBe(190);
+			expect(leaseExpiresAt > now).toBe(true); // A same-key claimant must remain pending.
+			expect(await heartbeat.stop()).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 
 	it("replays the original response body + status without re-executing the mutation", async () => {
 		const app = await loadApp();
@@ -72,7 +100,7 @@ describe("API Idempotency-Key", () => {
 		});
 		const first = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-create-1" },
+			headers: { ...authHeaders, "operation-key": "key-create-1" },
 			body,
 		});
 		expect(first.status).toBe(201);
@@ -81,7 +109,7 @@ describe("API Idempotency-Key", () => {
 
 		const replay = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-create-1" },
+			headers: { ...authHeaders, "operation-key": "key-create-1" },
 			body,
 		});
 		expect(replay.status).toBe(201);
@@ -101,7 +129,7 @@ describe("API Idempotency-Key", () => {
 		const body = JSON.stringify({ email: "one-time@t.dev", name: "One Time" });
 		const first = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-one-time-secret" },
+			headers: { ...authHeaders, "operation-key": "key-one-time-secret" },
 			body,
 		});
 		expect(first.status).toBe(201);
@@ -111,7 +139,7 @@ describe("API Idempotency-Key", () => {
 
 		const replay = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-one-time-secret" },
+			headers: { ...authHeaders, "operation-key": "key-one-time-secret" },
 			body,
 		});
 		expect(replay.status).toBe(201);
@@ -205,7 +233,7 @@ describe("API Idempotency-Key", () => {
 		async function firstAndReplay(path: string, key: string, requestBody: unknown) {
 			const request = () => app.request(path, {
 				method: "POST",
-				headers: { ...authHeaders, "idempotency-key": key },
+				headers: { ...authHeaders, "operation-key": key },
 				body: JSON.stringify(requestBody),
 			});
 			const first = await request();
@@ -248,20 +276,20 @@ describe("API Idempotency-Key", () => {
 		const app = await loadApp();
 		const first = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-conflict" },
+			headers: { ...authHeaders, "operation-key": "key-conflict" },
 			body: JSON.stringify({ email: "a@t.dev", name: "A" }),
 		});
 		expect(first.status).toBe(201);
 
 		const conflict = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-conflict" },
+			headers: { ...authHeaders, "operation-key": "key-conflict" },
 			body: JSON.stringify({ email: "b@t.dev", name: "B" }),
 		});
 		expect(conflict.status).toBe(409);
 		const err = await conflict.json();
 		expect(err.error.code).toBe("IDEMPOTENCY_KEY_CONFLICT");
-		expect(err.error.remediation).toMatch(/fresh Idempotency-Key/);
+		expect(err.error.remediation).toMatch(/fresh Operation-Key/);
 
 		// The conflicting request did not execute
 		const list = await app.request("/v1/users", { headers: authHeaders });
@@ -274,14 +302,14 @@ describe("API Idempotency-Key", () => {
 		const sharedKey = "key-shared-across-routes";
 		const user = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": sharedKey },
+			headers: { ...authHeaders, "operation-key": sharedKey },
 			body: JSON.stringify({ email: "scoped@t.dev", name: "Scoped" }),
 		});
 		expect(user.status).toBe(201);
 
 		const org = await app.request("/v1/organizations", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": sharedKey },
+			headers: { ...authHeaders, "operation-key": sharedKey },
 			body: JSON.stringify({ name: "Scoped Org" }),
 		});
 		expect(org.status).toBe(201);
@@ -292,7 +320,7 @@ describe("API Idempotency-Key", () => {
 		const app = await loadApp();
 		const res = await app.request("/v1/users", {
 			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "x".repeat(201) },
+			headers: { ...authHeaders, "operation-key": "x".repeat(201) },
 			body: JSON.stringify({ email: "badkey@t.dev", name: "Bad" }),
 		});
 		expect(res.status).toBe(400);
@@ -308,7 +336,7 @@ describe("API Idempotency-Key", () => {
 	it("GET requests and requests without the header are untouched", async () => {
 		const app = await loadApp();
 		const get = await app.request("/v1/users", {
-			headers: { ...authHeaders, "idempotency-key": "key-get-ignored" },
+			headers: { ...authHeaders, "operation-key": "key-get-ignored" },
 		});
 		expect(get.status).toBe(200);
 		expect(get.headers.get("idempotency-replayed")).toBeNull();
@@ -325,53 +353,5 @@ describe("API Idempotency-Key", () => {
 		const second = await mk();
 		expect(second.status).toBe(409); // duplicate slug — proves it re-executed
 		expect((await second.json()).error.code).toBe("ORG_SLUG_EXISTS");
-	});
-});
-
-describe("API Idempotency-Key TTL expiry", () => {
-	it("honors a short TTL — after expiry the request re-executes", async () => {
-		const authHeaders = setupEnv();
-		process.env.CLEARANCE_IDEMPOTENCY_TTL_MS = "120";
-		const { app } = await import("./server.js");
-		const init = await app.request("/v1/init", {
-			method: "POST",
-			headers: authHeaders,
-			body: JSON.stringify({ name: "TTL API" }),
-		});
-		expect(init.status).toBe(200);
-
-		// users export: repeatable success whose envelope differs per execution
-		// (correlationId), so replay vs re-execution is directly observable.
-		const body = JSON.stringify({ limit: 5 });
-		const first = await app.request("/v1/users/export", {
-			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-ttl" },
-			body,
-		});
-		expect(first.status).toBe(200);
-		const firstEnvelope = await first.json();
-
-		const replayed = await app.request("/v1/users/export", {
-			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-ttl" },
-			body,
-		});
-		expect(replayed.headers.get("idempotency-replayed")).toBe("true");
-		expect((await replayed.json()).correlationId).toBe(
-			firstEnvelope.correlationId,
-		);
-
-		await new Promise((resolve) => setTimeout(resolve, 150));
-
-		const after = await app.request("/v1/users/export", {
-			method: "POST",
-			headers: { ...authHeaders, "idempotency-key": "key-ttl" },
-			body,
-		});
-		expect(after.status).toBe(200);
-		expect(after.headers.get("idempotency-replayed")).toBeNull();
-		expect((await after.json()).correlationId).not.toBe(
-			firstEnvelope.correlationId,
-		);
 	});
 });

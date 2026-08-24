@@ -91,7 +91,7 @@ describe("magic-link managed authentication transactions", () => {
 			await expect(context.adapter.count({ model: "account" })).resolves.toBe(0);
 			await expect(context.adapter.count({ model: "session" })).resolves.toBe(0);
 			await expect(
-				context.internalAdapter.findVerificationValue(runtime.readSent().token),
+				context.internalAdapter.findVerificationValueAndPruneExpired(runtime.readSent().token),
 			).resolves.not.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -230,7 +230,7 @@ describe("magic link", async () => {
 			subject: sent.token,
 			identifier: sent.token,
 		});
-		expect(await adapter.findVerificationValue(sent.token)).toBeNull();
+		expect(await adapter.findVerificationValueAndPruneExpired(sent.token)).toBeNull();
 		expect(createSession).toHaveBeenCalledTimes(1);
 		const [subjectId, dontRememberMe, override, overrideAll, issuanceContext] =
 			createSession.mock.calls[0]!;
@@ -729,7 +729,7 @@ describe("magic link storeToken", async () => {
 		});
 		const hashedToken = await defaultKeyHasher(verificationEmail.token);
 		const storedToken =
-			await internalAdapter.findVerificationValue(hashedToken);
+			await internalAdapter.findVerificationValueAndPruneExpired(hashedToken);
 		expect(storedToken).toBeDefined();
 		const response2 = await auth.api.signInMagicLink({
 			body: {
@@ -772,7 +772,7 @@ describe("magic link storeToken", async () => {
 		});
 		const hashedToken = `${verificationEmail.token}hashed`;
 		const storedToken =
-			await internalAdapter.findVerificationValue(hashedToken);
+			await internalAdapter.findVerificationValueAndPruneExpired(hashedToken);
 		expect(storedToken).toBeDefined();
 		const response2 = await auth.api.signInMagicLink({
 			body: {

@@ -122,7 +122,7 @@ describe("management API client contract", () => {
 		const headers = new Headers(init.headers);
 		expect(headers.get("authorization")).toBe(`Bearer ${session.token}`);
 		expect(headers.get("content-type")).toBe("application/json");
-		expect(headers.get("idempotency-key")).toBe("cli-test-idempotency-key");
+		expect(headers.get("operation-key")).toBe("cli-test-idempotency-key");
 		expect(JSON.parse(String(init.body))).toEqual({ name: "Preview", dryRun: true });
 	});
 

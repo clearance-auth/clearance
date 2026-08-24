@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -103,156 +103,6 @@ function rawRequest(port, { path, method = "POST", headers = {}, chunks = [] }) 
 		req.end();
 	});
 }
-
-// Tripwires: source-grep checks over the shipped static assets. Rendered-DOM
-// behavior (login form, routing, escaping) is proven by src/ui.test.js; these
-// greps remain only to catch accidental deletion/renaming of shipped surfaces.
-describe("console shell assets", () => {
-	it("ships primary nav surfaces in index.html", () => {
-		for (const nav of [
-			"Overview",
-			"Users",
-			"Organizations",
-			"Members",
-			"Sessions",
-			"Roles",
-			"Authorization",
-			"Service accounts",
-			"Events",
-			"Readiness",
-			"Settings",
-		]) {
-			assert.match(indexHtml, new RegExp(nav));
-		}
-		assert.match(indexHtml, /data-theme="dark"|theme-dark|--bg/);
-		assert.match(indexHtml, /data-route="roles"/);
-		assert.match(indexHtml, /data-route="sessions"/);
-		assert.match(indexHtml, /data-route="members"/);
-		assert.match(indexHtml, /data-route="authorization"/);
-		assert.match(indexHtml, /data-route="service-accounts"/);
-	});
-
-	it("ships normalized authorization and one-time credential administration", () => {
-		assert.match(appJs, /authorization\s*:/);
-		assert.match(appJs, /"service-accounts"\s*:/);
-		assert.match(appJs, /renderAuthorization/);
-		assert.match(appJs, /renderServiceAccounts/);
-		assert.match(appJs, /authorization\/effective/);
-		assert.match(appJs, /authorization\/assignments/);
-		assert.match(appJs, /authorization\/reconcile/);
-		assert.match(appJs, /service-accounts/);
-		assert.match(appJs, /dryRun:\s*true/);
-		assert.match(appJs, /dryRun:\s*false, confirm:\s*true/);
-		assert.match(appJs, /authorizationState\.preview = null/);
-		assert.match(appJs, /showOneTimeSecret/);
-		assert.match(appJs, /secretHost\.innerHTML = ""/);
-		assert.match(appJs, /not show it again/i);
-		assert.match(appJs, /canMutate/);
-		assert.doesNotMatch(appJs, /\blocalStorage\b/);
-		assert.doesNotMatch(appJs, /\bsessionStorage\b/);
-	});
-
-	it("app.js declares readiness route fetching readiness API", () => {
-		assert.match(appJs, /readiness\s*:/);
-		assert.match(appJs, /\/v1\/readiness\//);
-		assert.match(appJs, /renderReadiness/);
-	});
-
-	it("app.js declares roles route with validate-before-save workflow", () => {
-		assert.match(appJs, /roles\s*:/);
-		assert.match(appJs, /renderRoles/);
-		assert.match(appJs, /\/v1\/roles\/validate/);
-		assert.match(appJs, /\/v1\/roles/);
-		assert.match(appJs, /clearance roles list --json/);
-		assert.match(appJs, /parsePermissionsText/);
-		assert.match(appJs, /canMutate/);
-		// Built-ins must be treated as immutable in the UI
-		assert.match(appJs, /built_in|role_builtin_/);
-		assert.match(appJs, /Immutable|immutable/);
-		// Viewer mutation UI disabled / absent
-		assert.match(appJs, /viewer.*inspect|cannot create or update|View only/i);
-	});
-
-	it("app.js declares sessions list/revoke workflow with confirmation and no token UI", () => {
-		assert.match(appJs, /sessions\s*:/);
-		assert.match(appJs, /renderSessions/);
-		assert.match(appJs, /\/v1\/sessions/);
-		assert.match(appJs, /\/v1\/sessions\/\$\{|\/v1\/sessions\/.*revoke|sessions\/.*\/revoke/);
-		assert.match(appJs, /clearance sessions list --json/);
-		assert.match(appJs, /clearance sessions revoke/);
-		assert.match(appJs, /confirmDestructive|window\.confirm/);
-		assert.match(appJs, /sanitizeSessionForUi|SESSION_SENSITIVE_KEY/);
-		assert.match(appJs, /sessionsLoadVersion|revokingId/);
-		assert.match(appJs, /No active sessions|Loading sessions/);
-		// Must never interpolate token-like fields into HTML
-		assert.doesNotMatch(appJs, /session\.token|session\.bearer|Bearer \$\{/);
-		assert.doesNotMatch(appJs, /\$\{\s*session\.token\s*\}/);
-	});
-
-	it("app.js declares members list/add/update/remove workflow", () => {
-		assert.match(appJs, /members\s*:/);
-		assert.match(appJs, /renderMembers/);
-		assert.match(appJs, /\/v1\/organizations\/\$\{.*\}\/members|\/v1\/organizations\/.*\/members/);
-		assert.match(appJs, /clearance orgs members list/);
-		assert.match(appJs, /clearance orgs members add/);
-		assert.match(appJs, /clearance orgs members update/);
-		assert.match(appJs, /clearance orgs members remove/);
-		assert.match(appJs, /membersLoadVersion|mutatingId|membersState/);
-		assert.match(appJs, /canMutate/);
-		assert.match(appJs, /viewer.*inspect members|cannot add members|View only/i);
-	});
-
-	it("public dir exists", () => {
-		assert.equal(existsSync(publicDir), true);
-	});
-
-	it("preserves dark dense product tokens", () => {
-		assert.match(stylesCss, /--bg:\s*#0b0d10/);
-		assert.match(stylesCss, /--panel:\s*#12151a/);
-		assert.match(indexHtml, /data-theme="dark"/);
-		assert.match(stylesCss, /\.role-form|\.badge-locked|\.role-validate-preview/);
-		assert.match(stylesCss, /\.member-form|\.sessions-table|\.sr-only|\.danger-action/);
-	});
-
-	it("declares all MANAGEMENT_SURFACES console routes", () => {
-		for (const key of [
-			"overview",
-			"users",
-			"organizations",
-			"members",
-			"sessions",
-			"roles",
-			"events",
-			"readiness",
-			"settings",
-		]) {
-			assert.match(appJs, new RegExp(`${key}\\s*:`));
-		}
-	});
-
-	it("ships capability-token setup pages for SSO and SCIM", () => {
-		assert.match(setupHtml, /Customer setup/i);
-		assert.match(setupJs, /\/api\/setup\//);
-		assert.match(setupJs, /URLSearchParams/);
-		assert.doesNotMatch(setupJs, /authorization|operator.token/i);
-	});
-
-	it("SCIM setup renders one-time handoff with copy controls and never persists token", () => {
-		assert.match(setupJs, /scimHandoff/);
-		assert.match(setupJs, /renderScimHandoff/);
-		assert.match(setupJs, /bearerToken/);
-		assert.match(setupJs, /cannot show the token again|cannot be retrieved/i);
-		assert.match(setupJs, /navigator\.clipboard\.writeText|setup-copy/);
-		assert.match(setupJs, /history\.replaceState/);
-		// No durable browser persistence APIs for the one-time secret
-		assert.doesNotMatch(setupJs, /\blocalStorage\b/);
-		assert.doesNotMatch(setupJs, /\bsessionStorage\b/);
-		assert.doesNotMatch(setupJs, /document\.cookie/);
-		// Must not re-fetch the SCIM secret after the setup POST
-		const fetchMatches = setupJs.match(/\bfetch\s*\(/g) || [];
-		assert.equal(fetchMatches.length, 1, "setup.js should perform only the setup POST fetch");
-	});
-});
 
 describe("resolveConfig / buildUpstreamHeaders", () => {
 	it("injects bearer operator token from config, not client headers", () => {
@@ -2105,7 +1955,7 @@ describe("rendering safety (XSS)", () => {
 			/\$\{\s*c\.id\s*\}/,
 			/\$\{\s*c\.fingerprint\s*\}/,
 			/\$\{\s*report\.overall\s*\}/,
-			/\$\{\s*report\.signature\s*\}/,
+			/\$\{\s*report\.reportDigest\s*\}/,
 			/\$\{\s*report\.organizationId\s*\}/,
 			/\$\{\s*settings\.releaseVersion\s*\}/,
 			/\$\{\s*settings\.schemaVersion\s*\}/,

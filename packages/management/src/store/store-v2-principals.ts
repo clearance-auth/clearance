@@ -1,7 +1,7 @@
 import type pg from "pg";
 import type { PageCursorKey } from "../services/pagination.js";
 import type { ResourceScope } from "../services/scope.js";
-import type { Principal } from "../types/resources.js";
+import type { User } from "../types/resources.js";
 import type { StoreV2PrincipalRepository } from "./types.js";
 import {
 	STORE_V2_AUTHORITATIVE_COLLECTIONS_META_KEY,
@@ -22,7 +22,7 @@ export interface StoreV2PrincipalRow {
 	environment_id: string;
 	email: string;
 	name: string;
-	status: Principal["status"];
+	status: User["status"];
 	external_id: string | null;
 	created_at: Date | string;
 	updated_at: Date | string;
@@ -33,7 +33,7 @@ export interface StoreV2PrincipalPageInput {
 	limit: number;
 	cursor?: PageCursorKey;
 	includeDeleted?: boolean;
-	status?: Principal["status"];
+	status?: User["status"];
 }
 
 export interface StoreV2PrincipalState {
@@ -125,11 +125,10 @@ function iso(value: Date | string): string {
 
 /** Return an OCC token guaranteed to advance beyond the token that was read. */
 export function advancingPrincipalUpdatedAt(
-	candidate: string,
-	expectedUpdatedAt: string,
+	{ proposedUpdatedAt, storedUpdatedAt }: { proposedUpdatedAt: string; storedUpdatedAt: string },
 ): string {
-	const candidateTime = new Date(candidate).getTime();
-	const expectedTime = new Date(expectedUpdatedAt).getTime();
+	const candidateTime = new Date(proposedUpdatedAt).getTime();
+	const expectedTime = new Date(storedUpdatedAt).getTime();
 	if (!Number.isFinite(candidateTime) || !Number.isFinite(expectedTime)) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_DATA_INVALID",
@@ -146,7 +145,7 @@ export function advancingPrincipalUpdatedAt(
 	return new Date(expectedTime + 1).toISOString();
 }
 
-export function mapStoreV2PrincipalRow(row: StoreV2PrincipalRow): Principal {
+export function mapStoreV2PrincipalRow(row: StoreV2PrincipalRow): User {
 	return {
 		id: row.id,
 		projectId: row.project_id,
@@ -188,7 +187,7 @@ export async function readStoreV2PrincipalState(
 	if (!state) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_STATE_INVALID",
-			"Principal authority state metadata is invalid.",
+			"User authority state metadata is invalid.",
 		);
 	}
 	return state;
@@ -205,7 +204,7 @@ export async function writeStoreV2PrincipalState(
 	) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_STATE_INVALID",
-			"Principal authority state metadata is invalid.",
+			"User authority state metadata is invalid.",
 		);
 	}
 	await client.query(
@@ -230,7 +229,7 @@ export async function advanceStoreV2PrincipalState(
 	if (!Number.isSafeInteger(countDelta)) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_STATE_INVALID",
-			"Principal authority count delta is invalid.",
+			"User authority count delta is invalid.",
 		);
 	}
 	const current = await readStoreV2PrincipalState(client, tables, {
@@ -239,7 +238,7 @@ export async function advanceStoreV2PrincipalState(
 	if (!current) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_STATE_INVALID",
-			"Principal authority state metadata is missing.",
+			"User authority state metadata is missing.",
 		);
 	}
 	const next: StoreV2PrincipalState = {
@@ -253,7 +252,7 @@ export async function advanceStoreV2PrincipalState(
 	) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_STATE_INVALID",
-			"Principal authority state cannot advance safely.",
+			"User authority state cannot advance safely.",
 		);
 	}
 	await writeStoreV2PrincipalState(client, tables, next);
@@ -320,7 +319,7 @@ export async function storeV2PrincipalsAreAuthoritative(
 export async function readStoreV2Principals(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
-): Promise<Principal[]> {
+): Promise<User[]> {
 	const result = await queryable.query<StoreV2PrincipalRow>(
 		 `SELECT id, project_id, environment_id, email, name, status, external_id,
 		        created_at, updated_at
@@ -334,7 +333,7 @@ export async function getStoreV2PrincipalById(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
 	input: { scope: ResourceScope; id: string; includeDeleted?: boolean },
-): Promise<Principal | null> {
+): Promise<User | null> {
 	const result = await queryable.query<StoreV2PrincipalRow>(
 		`SELECT id, project_id, environment_id, email, name, status, external_id,
 		        created_at, updated_at
@@ -350,7 +349,7 @@ export async function findActiveStoreV2PrincipalByEmail(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
 	input: { scope: ResourceScope; email: string },
-): Promise<Principal | null> {
+): Promise<User | null> {
 	const result = await queryable.query<StoreV2PrincipalRow>(
 		`SELECT id, project_id, environment_id, email, name, status, external_id,
 		        created_at, updated_at
@@ -366,7 +365,7 @@ export async function findActiveStoreV2PrincipalByExternalId(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
 	input: { scope: ResourceScope; externalId: string },
-): Promise<Principal | null> {
+): Promise<User | null> {
 	const result = await queryable.query<StoreV2PrincipalRow>(
 		`SELECT id, project_id, environment_id, email, name, status, external_id,
 		        created_at, updated_at
@@ -382,11 +381,11 @@ export async function listStoreV2PrincipalsPage(
 	queryable: Queryable,
 	tables: StoreV2TableNames,
 	input: StoreV2PrincipalPageInput,
-): Promise<{ principals: Principal[]; hasMore: boolean }> {
+): Promise<{ principals: User[]; hasMore: boolean }> {
 	if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPAL_PAGE_LIMIT_INVALID",
-			"Principal page limit must be an integer between 1 and 1000.",
+			"User page limit must be an integer between 1 and 1000.",
 		);
 	}
 	const params: unknown[] = [
@@ -429,7 +428,7 @@ async function assertPrincipalAuthority(
 	if (!(await storeV2PrincipalsAreAuthoritative(client, tables))) {
 		throw new StoreV2PrincipalAuthorityError(
 			"STORE_V2_PRINCIPALS_NOT_AUTHORITATIVE",
-			"Principal writes require relational principal authority.",
+			"User writes require relational principal authority.",
 		);
 	}
 }
@@ -447,7 +446,7 @@ export class PgStoreV2PrincipalRepository {
 	private removed = 0;
 	private mutated = false;
 	private finalizedState: StoreV2PrincipalState | undefined;
-	private readonly upserted = new Map<string, Principal>();
+	private readonly upserted = new Map<string, User>();
 
 	constructor(
 		private readonly client: pg.PoolClient,
@@ -497,14 +496,14 @@ export class PgStoreV2PrincipalRepository {
 		if (!state) {
 			throw new StoreV2PrincipalAuthorityError(
 				"STORE_V2_PRINCIPAL_STATE_INVALID",
-				"Principal authority state metadata is missing.",
+				"User authority state metadata is missing.",
 			);
 		}
 		this.finalizedState = state;
 		return state;
 	}
 
-	delta(): { upserted: Principal[] } {
+	delta(): { upserted: User[] } {
 		return {
 			upserted: [...this.upserted.values()].map((principal) =>
 				structuredClone(principal),
@@ -534,7 +533,7 @@ export class PgStoreV2PrincipalRepository {
 		return pending;
 	}
 
-	private record(principal: Principal): Principal {
+	private record(principal: User): User {
 		const stored = structuredClone(principal);
 		this.upserted.set(stored.id, stored);
 		return structuredClone(stored);
@@ -544,7 +543,7 @@ export class PgStoreV2PrincipalRepository {
 		scope: ResourceScope;
 		id: string;
 		includeDeleted?: boolean;
-	}): Promise<Principal | null> {
+	}): Promise<User | null> {
 		const captured = structuredClone(input);
 		return this.issue(() =>
 			getStoreV2PrincipalById(this.client, this.tables, captured),
@@ -554,7 +553,7 @@ export class PgStoreV2PrincipalRepository {
 	findActiveByEmail(input: {
 		scope: ResourceScope;
 		email: string;
-	}): Promise<Principal | null> {
+	}): Promise<User | null> {
 		const captured = structuredClone(input);
 		return this.issue(() =>
 			findActiveStoreV2PrincipalByEmail(this.client, this.tables, captured),
@@ -564,7 +563,7 @@ export class PgStoreV2PrincipalRepository {
 	findActiveByExternalId(input: {
 		scope: ResourceScope;
 		externalId: string;
-	}): Promise<Principal | null> {
+	}): Promise<User | null> {
 		const captured = structuredClone(input);
 		return this.issue(() =>
 			findActiveStoreV2PrincipalByExternalId(this.client, this.tables, captured),
@@ -572,7 +571,7 @@ export class PgStoreV2PrincipalRepository {
 	}
 
 	listPage(input: StoreV2PrincipalPageInput): Promise<{
-		principals: Principal[];
+		principals: User[];
 		hasMore: boolean;
 	}> {
 		const captured = structuredClone(input);
@@ -581,7 +580,7 @@ export class PgStoreV2PrincipalRepository {
 		);
 	}
 
-	insert(principal: Principal): Promise<Principal> {
+	insert(principal: User): Promise<User> {
 		const captured = structuredClone(principal);
 		return this.issue(async () => {
 			await assertPrincipalAuthority(this.client, this.tables);
@@ -611,15 +610,12 @@ export class PgStoreV2PrincipalRepository {
 	}
 
 	update(
-		principal: Principal,
+		principal: User,
 		input: { expectedUpdatedAt: string },
-	): Promise<Principal | null> {
+	): Promise<User | null> {
 		const captured = structuredClone(principal);
 		const expected = structuredClone(input);
-		captured.updatedAt = advancingPrincipalUpdatedAt(
-			captured.updatedAt,
-			expected.expectedUpdatedAt,
-		);
+		captured.updatedAt = advancingPrincipalUpdatedAt({ proposedUpdatedAt: captured.updatedAt, storedUpdatedAt: expected.expectedUpdatedAt });
 		return this.issue(async () => {
 			await assertPrincipalAuthority(this.client, this.tables);
 			const result = await this.client.query<StoreV2PrincipalRow>(
@@ -664,7 +660,7 @@ export class PgStoreV2PrincipalRepository {
 		id: string;
 		updatedAt: string;
 		expectedUpdatedAt: string;
-	}): Promise<Principal | null> {
+	}): Promise<User | null> {
 		return this.setLifecycleStatus(input, "disabled");
 	}
 
@@ -673,11 +669,11 @@ export class PgStoreV2PrincipalRepository {
 		id: string;
 		updatedAt: string;
 		expectedUpdatedAt: string;
-	}): Promise<Principal | null> {
+	}): Promise<User | null> {
 		return this.setLifecycleStatus(input, "deleted");
 	}
 
-	hardDeleteImportedPrincipal(principal: Principal): Promise<boolean> {
+	hardDeleteImportedPrincipal(principal: User): Promise<boolean> {
 		const captured = structuredClone(principal);
 		return this.issue(async () => {
 			await assertPrincipalAuthority(this.client, this.tables);
@@ -716,12 +712,9 @@ export class PgStoreV2PrincipalRepository {
 			expectedUpdatedAt: string;
 		},
 		status: "disabled" | "deleted",
-	): Promise<Principal | null> {
+	): Promise<User | null> {
 		const captured = structuredClone(input);
-		captured.updatedAt = advancingPrincipalUpdatedAt(
-			captured.updatedAt,
-			captured.expectedUpdatedAt,
-		);
+		captured.updatedAt = advancingPrincipalUpdatedAt({ proposedUpdatedAt: captured.updatedAt, storedUpdatedAt: captured.expectedUpdatedAt });
 		return this.issue(async () => {
 			await assertPrincipalAuthority(this.client, this.tables);
 			const result = await this.client.query<StoreV2PrincipalRow>(
@@ -762,7 +755,7 @@ export class PgStoreV2PrincipalRepository {
  */
 export function hardDeleteImportedPrincipalForRollback(
 	repository: StoreV2PrincipalRepository,
-	checkpoint: Principal,
+	checkpoint: User,
 ): Promise<boolean> {
 	const controller = PRINCIPAL_REPOSITORY_CONTROLLERS.get(repository);
 	if (!controller) {

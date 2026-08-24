@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { ResourceScope } from "../services/scope.js";
-import type { Principal } from "../types/resources.js";
+import type { User } from "../types/resources.js";
 import {
 	API_KEY_OPERATIONS,
 	AUTHORIZATION_OPERATIONS,
@@ -55,13 +55,13 @@ describe("management operation contracts", () => {
 		expect(USER_OPERATIONS.delete.confirmation).toBe("client-required");
 		expect(USER_OPERATIONS.export.mutation).toBe(true);
 		expectTypeOf<OperationOutput<"users.delete">>().toEqualTypeOf<{
-			user: Principal;
+			user: User;
 			scope: ResourceScope;
 		}>();
 	});
 
 	it("defines organization and nested membership policies explicitly", () => {
-		expect(MANAGEMENT_OPERATIONS).toHaveLength(127);
+		expect(MANAGEMENT_OPERATIONS).toHaveLength(143);
 		expect(ORGANIZATION_OPERATIONS.archive).toMatchObject({
 			id: "organizations.archive",
 			http: { method: "POST", path: "/v1/organizations/:id/archive" },

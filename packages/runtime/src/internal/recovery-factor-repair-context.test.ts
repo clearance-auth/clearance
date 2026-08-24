@@ -33,7 +33,7 @@ import {
 	attachStagedAuthenticationContinuation,
 	consumePreloadedStagedAuthenticationCapability,
 	digestStagedAuthenticationPolicy,
-	issueInitialStagedAuthenticationCapability,
+	issueStagedAuthenticationChallenge,
 	preloadStagedAuthenticationCapability,
 	takeStagedAuthenticationContinuation,
 } from "./staged-authentication-context";
@@ -229,7 +229,7 @@ async function issueStaged(
 	});
 	const seed = takeStagedAuthenticationContinuation(error);
 	return runWithTransaction(fixture.context.adapter, () =>
-		issueInitialStagedAuthenticationCapability(fixture.context, seed!),
+		issueStagedAuthenticationChallenge(fixture.context, seed!),
 	);
 }
 

@@ -1,6 +1,7 @@
 import type {
 	DeliveryControlAction,
 	DeliveryControlPreview,
+	DeliveryChannel,
 	DeliveryJobPage,
 	DeliveryJobState,
 	DeliveryQuotaStatus,
@@ -149,7 +150,7 @@ export async function listDeliveryJobsForManagement(
 		limit?: number;
 		cursor?: string;
 		states?: readonly DeliveryJobState[];
-		channel?: "email" | "webhook";
+		channel?: DeliveryChannel;
 		kind?: string;
 	},
 ): Promise<ScopedDeliveryJobPage> {

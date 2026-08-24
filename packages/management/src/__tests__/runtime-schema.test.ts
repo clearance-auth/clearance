@@ -48,43 +48,17 @@ describe("runtime schema status", () => {
 	});
 
 	it.each([
-		{
-			label: "no pending work",
-			plan: {
-				pendingTables: 0,
-				pendingFields: 0,
-				pendingSecurityMigrations: [] as string[],
-			},
-			state: "configured",
-		},
-		{
-			label: "a pending table only",
-			plan: {
-				pendingTables: 1,
-				pendingFields: 0,
-				pendingSecurityMigrations: [] as string[],
-			},
-			state: "migration-required",
-		},
-		{
-			label: "a pending field only",
-			plan: {
-				pendingTables: 0,
-				pendingFields: 1,
-				pendingSecurityMigrations: [] as string[],
-			},
-			state: "migration-required",
-		},
-		{
-			label: "a pending security migration only",
-			plan: {
-				pendingTables: 0,
-				pendingFields: 0,
-				pendingSecurityMigrations: ["session-credential-digests-v1"],
-			},
-			state: "migration-required",
-		},
-	])("reports $state for $label", async ({ plan, state }) => {
+		[
+			"configured runtime",
+			{ pendingTables: 0, pendingFields: 0, pendingSecurityMigrations: [] as string[] },
+			"configured",
+		],
+		[
+			"any pending migration work",
+			{ pendingTables: 1, pendingFields: 1, pendingSecurityMigrations: ["session-credential-digests-v1"] },
+			"migration-required",
+		],
+	])("reports %s", async (_label, plan, state) => {
 		process.env.DATABASE_URL = "postgres://runtime-schema-status.test/db";
 		runtimePlan.current = plan;
 
@@ -94,5 +68,4 @@ describe("runtime schema status", () => {
 			...plan,
 		});
 	});
-
 });

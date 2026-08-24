@@ -220,7 +220,7 @@ export function assertCredentialKeyConfigured(
 	);
 }
 
-export function getCredentialKeyring(
+export function requireCredentialKeyring(
 	env: NodeJS.ProcessEnv = process.env,
 ): CredentialKeyring {
 	return assertCredentialKeyConfigured(env);
@@ -228,7 +228,7 @@ export function getCredentialKeyring(
 
 export function encryptCredential(
 	plaintext: string,
-	ring: CredentialKeyring = getCredentialKeyring(),
+	ring: CredentialKeyring = requireCredentialKeyring(),
 ): EncryptedCredential {
 	const key = ring.keys.get(ring.currentKeyId);
 	if (!key) {
@@ -279,7 +279,7 @@ export function parseCredentialEnvelope(envelope: string): {
 
 export function decryptCredential(
 	envelope: string,
-	ring: CredentialKeyring = getCredentialKeyring(),
+	ring: CredentialKeyring = requireCredentialKeyring(),
 ): string {
 	const parsed = parseCredentialEnvelope(envelope);
 	const key = ring.keys.get(parsed.keyId);
@@ -297,7 +297,7 @@ export function decryptCredential(
 /** Re-encrypt under the current key id (rotation). */
 export function rotateCredential(
 	envelope: string,
-	ring: CredentialKeyring = getCredentialKeyring(),
+	ring: CredentialKeyring = requireCredentialKeyring(),
 ): EncryptedCredential {
 	const plaintext = decryptCredential(envelope, ring);
 	return encryptCredential(plaintext, ring);

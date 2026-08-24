@@ -4,7 +4,11 @@
   "description": "Clearance management plane — services, diagnostics, migration, backup on real auth runtime",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/management" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/management"
+  },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
@@ -13,7 +17,9 @@
       "default": "./dist/index.mjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsdown && node scripts/stage-ops.mjs",
     "test": "vitest run",
@@ -22,6 +28,7 @@
   },
   "dependencies": {
     "@clearance/auth": "workspace:*",
+    "@clearance/core": "workspace:*",
     "@clearance/delivery": "workspace:*",
     "@clearance/key-management": "workspace:*",
     "pg": "^8.14.1"

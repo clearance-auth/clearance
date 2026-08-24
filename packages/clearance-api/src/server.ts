@@ -69,7 +69,8 @@ export function resolveMaxRequestBodyBytes(
 	env: Record<string, string | undefined> = process.env,
 ): number {
 	const raw = env.CLEARANCE_API_MAX_BODY_BYTES;
-	if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_REQUEST_BODY_BYTES;
+	if (raw === undefined || raw.trim() === "")
+		return DEFAULT_MAX_REQUEST_BODY_BYTES;
 	const value = Number(raw);
 	if (!Number.isSafeInteger(value) || value < 1 || value > 64 * 1024 * 1024) {
 		throw new Error(
@@ -95,19 +96,23 @@ const strictStartup =
 	process.env.CLEARANCE_STRICT_SECRETS === "1";
 if (strictStartup) {
 	if (isForbiddenDefaultSecret(process.env.CLEARANCE_SECRET)) {
-		throw new Error("Clearance API refuses missing/default/weak CLEARANCE_SECRET");
+		throw new Error(
+			"Clearance API refuses missing/default/weak CLEARANCE_SECRET",
+		);
 	}
 	requireOperatorToken();
 	assertProductionCredentialKey(process.env);
 	if (!process.env.DATABASE_URL?.trim()) {
-		throw new Error("Clearance API requires DATABASE_URL in strict/production mode");
+		throw new Error(
+			"Clearance API requires DATABASE_URL in strict/production mode",
+		);
 	}
 }
 
 let storePromise: Promise<ManagementStore> | null = null;
 let managementApplication: ManagementApplication | null = null;
 const requestOperatorScopes = new WeakMap<Context, ResourceScope>();
-function getStore(): Promise<ManagementStore> {
+function sharedManagementStore(): Promise<ManagementStore> {
 	if (!storePromise) {
 		const url = process.env.DATABASE_URL?.trim();
 		const delivery = url ? deliveryStoreOptionsFromEnvironment() : undefined;
@@ -152,7 +157,8 @@ function upgradeConfiguration(): {
 } {
 	return {
 		configuredDirectory: process.env.CLEARANCE_UPGRADE_DIR?.trim() || undefined,
-		configuredHealthUrl: process.env.CLEARANCE_UPGRADE_HEALTH_URL?.trim() || undefined,
+		configuredHealthUrl:
+			process.env.CLEARANCE_UPGRADE_HEALTH_URL?.trim() || undefined,
 	};
 }
 
@@ -161,7 +167,7 @@ function upgradeConfiguration(): {
  * serving. Flushes pending local mutations first.
  */
 async function storeForRequest(): Promise<ManagementStore> {
-	const store = await getStore();
+	const store = await sharedManagementStore();
 	await store.refresh();
 	return store;
 }
@@ -222,7 +228,10 @@ function rateLimit(ip: string): { ok: boolean; remaining: number } {
 		rateBuckets.set(ip, bucket);
 	}
 	bucket.count += 1;
-	return { ok: bucket.count <= RATE_MAX, remaining: Math.max(0, RATE_MAX - bucket.count) };
+	return {
+		ok: bucket.count <= RATE_MAX,
+		remaining: Math.max(0, RATE_MAX - bucket.count),
+	};
 }
 
 function safeEqualToken(a: string, b: string): boolean {
@@ -264,38 +273,6 @@ function scopeForRequest(store: ManagementStore, c: Context): ResourceScope {
 		c.req.header("x-clearance-project-id"),
 		c.req.header("x-clearance-environment-id"),
 	);
-	return scope;
-}
-
-/** @deprecated Use principalScope — kept for tests that import scopeFromStore */
-function scopeFromStore(store: ManagementStore): {
-	projectId?: string;
-	environmentId?: string;
-} {
-	try {
-		return principalScope(store);
-	} catch {
-		return {
-			projectId:
-				process.env.CLEARANCE_PROJECT_ID ??
-				store.snapshot.meta.config.projectId ??
-				store.snapshot.projects[0]?.id,
-			environmentId:
-				process.env.CLEARANCE_ENV_ID ??
-				store.snapshot.meta.config.environmentId ??
-				store.snapshot.environments[0]?.id,
-		};
-	}
-}
-
-/** @deprecated Prefer scopeForRequest — header check only, never authority */
-function assertScope(
-	store: ManagementStore,
-	headerProject?: string | null,
-	headerEnv?: string | null,
-): ResourceScope {
-	const scope = principalScope(store);
-	assertClientScopeHeaders(scope, headerProject, headerEnv);
 	return scope;
 }
 
@@ -417,18 +394,23 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 		const result = authenticateManagementApiKey(store, match[1]!);
 		if (result.ok) {
 			if (apiKeyRouteIsOperatorOnly(c.req.method, c.req.path)) {
-				return c.json({
+				return c.json(
+					{
 					error: {
 						code: "OPERATOR_REQUIRED",
-						message: "This management operation requires the bootstrap operator credential",
+							message:
+								"This management operation requires the bootstrap operator credential",
 						stage: "api.auth",
 						retryable: false,
 					},
-				}, 403);
+					},
+					403,
+				);
 			}
 			const requiredScope = requiredApiKeyScope(c.req.method, c.req.path);
 			if (requiredScope && !result.apiKey.scopes.includes(requiredScope)) {
-				return c.json({
+				return c.json(
+					{
 					error: {
 						code: "API_KEY_SCOPE_FORBIDDEN",
 						message: `API key requires scope ${requiredScope}`,
@@ -437,7 +419,9 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 						requiredScope,
 						apiKeyId: result.apiKey.id,
 					},
-				}, 403);
+					},
+					403,
+				);
 			}
 			setRequestPrincipal(c, {
 				kind: "api_key",
@@ -451,15 +435,19 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 	}
 
 	if (!expected) {
-		return c.json({
+		return c.json(
+			{
 			error: {
 				code: "OPERATOR_TOKEN_UNCONFIGURED",
-				message: "CLEARANCE_OPERATOR_TOKEN (or CLEARANCE_API_TOKEN) required (≥16 chars) for management API",
+					message:
+						"CLEARANCE_OPERATOR_TOKEN (or CLEARANCE_API_TOKEN) required (≥16 chars) for management API",
 				stage: "api.auth",
 				retryable: false,
 				remediation: "Set CLEARANCE_OPERATOR_TOKEN (≥16 chars)",
 			},
-		}, 503);
+			},
+			503,
+		);
 	}
 
 	{
@@ -470,7 +458,8 @@ async function requireManagementPrincipal(c: Context, next: Next) {
 					message: "Valid bearer operator token or API key required",
 					stage: "api.auth",
 					retryable: false,
-					remediation: "Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN|API_KEY>",
+					remediation:
+						"Authorization: Bearer <CLEARANCE_OPERATOR_TOKEN|API_KEY>",
 				},
 			},
 			401,
@@ -518,12 +507,25 @@ app.use("/v1/*", async (c, next) => {
 app.use("/v1/*", async (c, next) => {
 	if (!["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) return next();
 	if (c.req.path.startsWith("/v1/key-management/")) return next();
-	if (!(c.req.header("content-type") ?? "").toLowerCase().includes("application/json")) return next();
-	const request = await c.req.raw.clone().json().catch(() => undefined);
-	if (!request || typeof request !== "object" || Array.isArray(request)) return next();
+	if (
+		!(c.req.header("content-type") ?? "")
+			.toLowerCase()
+			.includes("application/json")
+	)
+		return next();
+	const request = await c.req.raw
+		.clone()
+		.json()
+		.catch(() => undefined);
+	if (!request || typeof request !== "object" || Array.isArray(request))
+		return next();
 	for (const field of ["dryRun", "confirm"] as const) {
-		if (Object.hasOwn(request, field) && typeof (request as Record<string, unknown>)[field] !== "boolean") {
-			return c.json({
+		if (
+			Object.hasOwn(request, field) &&
+			typeof (request as Record<string, unknown>)[field] !== "boolean"
+		) {
+			return c.json(
+				{
 				error: {
 					code: "API_BOOLEAN_INVALID",
 					message: `${field} must be a JSON boolean.`,
@@ -531,14 +533,16 @@ app.use("/v1/*", async (c, next) => {
 					retryable: false,
 					remediation: `Send ${field} as true or false without quotes.`,
 				},
-			}, 400);
+				},
+				400,
+			);
 		}
 	}
 	return next();
 });
 
 /**
- * Idempotency-Key replay for /v1/* mutations (FOLLOW.md P2.3.2).
+ * Operation-Key replay for /v1/* mutations (FOLLOW.md P2.3.2).
  *
  * Keys are scoped per method+route; the request body is fingerprinted.
  * - Same key + same payload  → the ORIGINAL response body and status are
@@ -568,8 +572,12 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 	const apiKeySecretPath =
 		path === "/v1/keys" || /^\/v1\/keys\/[^/]+\/rotate$/.test(path);
 	const serviceAccountCredentialSecretPath =
-		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials$/.test(path) ||
-		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials\/[^/]+\/rotate$/.test(path);
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials$/.test(
+			path,
+		) ||
+		/^\/v1\/organizations\/[^/]+\/service-accounts\/[^/]+\/credentials\/[^/]+\/rotate$/.test(
+			path,
+		);
 	const productDomainSecretPath =
 		path === "/v1/product-presentation/domains" ||
 		path === "/v1/product-presentation/domains/reissue";
@@ -601,7 +609,11 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 		}
 		if (path === "/v1/scim") {
 			const connection = parsed.connection;
-			if (connection && typeof connection === "object" && Object.hasOwn(connection, "bearerTokenOnce")) {
+			if (
+				connection &&
+				typeof connection === "object" &&
+				Object.hasOwn(connection, "bearerTokenOnce")
+			) {
 				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
 				delete (connection as Record<string, unknown>).bearerTokenOnce;
 				omitted.push("connection.bearerTokenOnce");
@@ -627,7 +639,11 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 				omitted.push("signingSecret");
 			}
 			const result = parsed.result;
-			if (typeof result === "object" && result !== null && "signingSecret" in result) {
+			if (
+				typeof result === "object" &&
+				result !== null &&
+				"signingSecret" in result
+			) {
 				// biome-ignore lint/performance/noDelete: one-time credentials must not enter persistence.
 				delete result.signingSecret;
 				omitted.push("result.signingSecret");
@@ -644,13 +660,50 @@ function idempotencyReplayBody(path: string, body: string): string | null {
 	}
 }
 
-function idempotencyBackendFor(
-	store: ManagementStore,
-): IdempotencyBackend {
+function idempotencyBackendFor(store: ManagementStore): IdempotencyBackend {
 	if (!idempotencyBackend) {
 		idempotencyBackend = createIdempotencyBackend(store);
 	}
 	return idempotencyBackend;
+}
+
+export function startIdempotencyHeartbeat(
+	backend: Pick<IdempotencyBackend, "renew">,
+	claim: {
+		scopeKey: string;
+		key: string;
+		fingerprint: string;
+		generation: number;
+	},
+	intervalMs = 60_000,
+): { stop(): Promise<boolean> } {
+	let leaseLost = false;
+	let renewal: Promise<void> | undefined;
+	let stopped = false;
+	const renew = () => {
+		if (stopped || renewal) return;
+		renewal = backend
+			.renew(claim)
+			.then((renewed) => {
+				if (!renewed) leaseLost = true;
+			})
+			.catch(() => {
+				leaseLost = true;
+			})
+			.finally(() => {
+				renewal = undefined;
+			});
+	};
+	const timer = setInterval(renew, intervalMs);
+	timer.unref();
+	return {
+		async stop(): Promise<boolean> {
+			stopped = true;
+			clearInterval(timer);
+			await renewal;
+			return !leaseLost;
+		},
+	};
 }
 
 app.use("/v1/*", async (c, next) => {
@@ -658,12 +711,13 @@ app.use("/v1/*", async (c, next) => {
 	if (
 		c.req.method === KEY_MANAGEMENT_OPERATIONS.plan.http.method &&
 		c.req.path === KEY_MANAGEMENT_OPERATIONS.plan.http.path
-	) return next();
-	const key = c.req.header("idempotency-key");
+	)
+		return next();
+	const key = c.req.header("operation-key");
 	if (key === undefined) return next();
 	try {
 		assertIdempotencyKeyValid(key);
-		const store = await getStore();
+		const store = await sharedManagementStore();
 		const backend = idempotencyBackendFor(store);
 		// Scope includes the caller's credential fingerprint. The API is
 		// single-operator today (one bearer token), which would make this a
@@ -679,11 +733,15 @@ app.use("/v1/*", async (c, next) => {
 		// Clone the raw request so the route handler's body read is untouched.
 		const rawBody = await c.req.raw.clone().text();
 		const fingerprint = fingerprintIdempotentRequest(scopeKey, rawBody);
-		const existing = await backend.get(scopeKey, key);
-		if (existing) {
-			if (existing.fingerprint !== fingerprint) {
-				throw idempotencyConflictError(scopeKey);
-			}
+		let claim = await backend.claim({ scopeKey, key, fingerprint });
+		const deadline = Date.now() + 5_000;
+		while (claim.state === "pending" && Date.now() < deadline) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			claim = await backend.claim({ scopeKey, key, fingerprint });
+		}
+		if (claim.state === "conflict") throw idempotencyConflictError(scopeKey);
+		if (claim.state === "completed") {
+			const existing = claim.record;
 			return c.newResponse(existing.body, existing.status as 200, {
 				"content-type": existing.contentType,
 				"Idempotency-Replayed": "true",
@@ -693,21 +751,81 @@ app.use("/v1/*", async (c, next) => {
 					: {}),
 			});
 		}
+		if (claim.state === "pending") {
+			throw new ClearanceError({
+				code: "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+				message: "Operation-Key is still being processed",
+				stage: "api.idempotency",
+				status: 409,
+				retryable: true,
+				remediation: "Retry the same request with the same Operation-Key.",
+			});
+		}
+		const heartbeat = startIdempotencyHeartbeat(backend, {
+			scopeKey,
+			key,
+			fingerprint,
+			generation: claim.generation,
+		});
+		try {
 		await next();
+			if (!(await heartbeat.stop())) {
+				throw new ClearanceError({
+					code: "IDEMPOTENCY_LEASE_LOST",
+					message:
+						"Operation-Key lease was lost while the request was executing",
+					stage: "api.idempotency",
+					status: 503,
+					retryable: true,
+					remediation:
+						"Retry with the same Operation-Key to observe the durable operation result.",
+				});
+			}
 		const res = c.res;
 		if (res && res.status < 500) {
 			const responseBody = await res.clone().text();
 			const replayBody = idempotencyReplayBody(c.req.path, responseBody);
 			if (replayBody !== null) {
-				await backend.put({
+					const completed = await backend.complete({
 					scopeKey,
 					key,
 					fingerprint,
+						generation: claim.generation,
 					status: res.status,
 					contentType: res.headers.get("content-type") ?? "application/json",
 					body: replayBody,
 				});
+					if (!completed) {
+						throw new ClearanceError({
+							code: "IDEMPOTENCY_LEASE_LOST",
+							message:
+								"Operation-Key lease was lost before the response could be recorded",
+							stage: "api.idempotency",
+							status: 503,
+							retryable: true,
+							remediation:
+								"Retry with the same Operation-Key to observe the durable operation result.",
+						});
+					}
+				}
+			} else {
+				await backend.fail({
+					scopeKey,
+					key,
+					fingerprint,
+					generation: claim.generation,
+				});
 			}
+		} catch (error) {
+			await backend.fail({
+				scopeKey,
+				key,
+				fingerprint,
+				generation: claim.generation,
+			});
+			throw error;
+		} finally {
+			await heartbeat.stop();
 		}
 		return;
 	} catch (e) {
@@ -730,7 +848,10 @@ app.use("/v1/*", async (c, next) => {
 app.post("/setup/:kind", async (c) => {
 	const kindParam = c.req.param("kind");
 	if (kindParam !== "sso" && kindParam !== "scim") {
-		return c.json({ error: { code: "SETUP_KIND", message: "Unknown setup kind" } }, 404);
+		return c.json(
+			{ error: { code: "SETUP_KIND", message: "Unknown setup kind" } },
+			404,
+		);
 	}
 	const kind = kindParam;
 	let body: {
@@ -748,11 +869,19 @@ app.post("/setup/:kind", async (c) => {
 	try {
 		body = await c.req.json();
 	} catch {
-		return c.json({ error: { code: "SETUP_INPUT", message: "JSON body required" } }, 400);
+		return c.json(
+			{ error: { code: "SETUP_INPUT", message: "JSON body required" } },
+			400,
+		);
 	}
 	if (!body.token || !body.provider) {
 		return c.json(
-			{ error: { code: "SETUP_INPUT", message: "token and provider are required" } },
+			{
+				error: {
+					code: "SETUP_INPUT",
+					message: "token and provider are required",
+				},
+			},
 			400,
 		);
 	}
@@ -780,7 +909,8 @@ app.post("/setup/:kind", async (c) => {
 			{
 				error: {
 					code: "SETUP_INPUT",
-					message: "SAML issuer, entry point, and X.509 signing certificate are required",
+					message:
+						"SAML issuer, entry point, and X.509 signing certificate are required",
 				},
 			},
 			400,
@@ -792,6 +922,8 @@ app.post("/setup/:kind", async (c) => {
 	const organizationId = body.organizationId;
 
 	let reservationId: string | undefined;
+	let reservationFencingToken: string | undefined;
+	let capabilityId: string | undefined;
 	let provisionedConnectionId: string | undefined;
 	let provisionedRuntimeProviderId: string | undefined;
 	let provisionedScope: ResourceScope | undefined;
@@ -807,6 +939,8 @@ app.post("/setup/:kind", async (c) => {
 			actor: "customer-setup",
 		});
 		reservationId = reserved.reservationId;
+		reservationFencingToken = reserved.reservationFencingToken;
+		capabilityId = reserved.capability.id;
 		// Attempt id is stable across re-reserves of the same capability digest.
 		const setupAttemptId = reserved.reservationId;
 		const scope = {
@@ -818,8 +952,8 @@ app.post("/setup/:kind", async (c) => {
 
 		const beforeIds = new Set(
 			(kind === "sso"
-				? store.snapshot.identityConnections
-				: store.snapshot.directoryConnections
+				? store.snapshot.ssoConnections
+				: store.snapshot.scimConnections
 			).map((c) => c.id),
 		);
 
@@ -856,6 +990,7 @@ app.post("/setup/:kind", async (c) => {
 			kind,
 			organizationId: reserved.capability.organizationId,
 			reservationId,
+			reservationFencingToken,
 			actor: "customer-setup",
 		});
 		await store.ready();
@@ -867,11 +1002,18 @@ app.post("/setup/:kind", async (c) => {
 				bearerTokenOnce?: string;
 			};
 			const bearerTokenOnce =
-				typeof scimConn.bearerTokenOnce === "string" ? scimConn.bearerTokenOnce : undefined;
-			const publicConn = { ...(connection as object) } as Record<string, unknown>;
+				typeof scimConn.bearerTokenOnce === "string"
+					? scimConn.bearerTokenOnce
+					: undefined;
+			const publicConn = { ...(connection as object) } as Record<
+				string,
+				unknown
+			>;
 			delete publicConn.bearerTokenOnce;
 			const absoluteEndpoint = absolutePublicUrl(
-				typeof scimConn.endpoint === "string" ? scimConn.endpoint : "/api/auth/scim/v2",
+				typeof scimConn.endpoint === "string"
+					? scimConn.endpoint
+					: "/api/auth/scim/v2",
 			);
 			const responseBody: Record<string, unknown> = {
 				ok: true,
@@ -904,7 +1046,9 @@ app.post("/setup/:kind", async (c) => {
 			provisionedRuntimeProviderId &&
 			provisionedScope &&
 			provisionedOrganizationId &&
-			provisionedIsNew
+			provisionedIsNew &&
+			reservationFencingToken &&
+			capabilityId
 		) {
 			try {
 				await compensateSetupConnection(store, {
@@ -913,25 +1057,32 @@ app.post("/setup/:kind", async (c) => {
 					runtimeProviderId: provisionedRuntimeProviderId,
 					organizationId: provisionedOrganizationId,
 					provider: body.provider,
+					capabilityId,
+					reservationFencingToken,
 					scope: provisionedScope,
 					actor: "customer-setup",
 				});
 			} catch {
 				// Keep the reservation held. A retry with the deterministic attempt id
 				// can recover it; releasing here could create a second live provider.
-				return handleError(c, new ClearanceError({
+				return handleError(
+					c,
+					new ClearanceError({
 					code: "SETUP_COMPENSATION_FAILED",
-					message: "Setup cleanup did not complete; retry this setup link later",
+						message:
+							"Setup cleanup did not complete; retry this setup link later",
 					stage: "setup.compensate",
 					status: 500,
-				}));
+					}),
+				);
 			}
 		}
-		if (reservationId) {
+		if (reservationId && reservationFencingToken) {
 			await releaseSetupLink(store, {
 				token,
 				kind,
 				reservationId,
+				reservationFencingToken,
 				actor: "customer-setup",
 			}).catch(() => undefined);
 		}
@@ -960,7 +1111,10 @@ app.get("/livez", (c) =>
 
 app.get("/readyz", async (c) => {
 	if (draining) {
-		return c.json({ ok: false, service: "clearance-api", state: "draining" }, 503);
+		return c.json(
+			{ ok: false, service: "clearance-api", state: "draining" },
+			503,
+		);
 	}
 	try {
 		const store = await storeForRequest();
@@ -1054,7 +1208,12 @@ app.route(
 
 app.route(
 	"/",
-	registerEventRoutes({ storeForRequest, scopeForRequest, handleError }),
+	registerEventRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+		applicationFor,
+	}),
 );
 
 app.route(
@@ -1067,25 +1226,55 @@ app.route(
 	}),
 );
 
-app.route("/", registerConfigRoutes({ storeForRequest, scopeForRequest, handleError }));
-
-app.route("/", registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }));
-
-app.route("/", registerWebhookEndpointRoutes({ storeForRequest, scopeForRequest, handleError }));
-
 app.route(
 	"/",
-	registerAuthenticationPolicyRoutes({ storeForRequest, scopeForRequest, handleError }),
+	registerConfigRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+		applicationFor,
+	}),
 );
 
 app.route(
 	"/",
-	registerKeyManagementRoutes({ storeForRequest, scopeForRequest, handleError }),
+	registerDeliveryRoutes({ storeForRequest, scopeForRequest, handleError }),
 );
 
 app.route(
 	"/",
-	registerProductPresentationRoutes({ storeForRequest, scopeForRequest, handleError }),
+	registerWebhookEndpointRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerAuthenticationPolicyRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerKeyManagementRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
+);
+
+app.route(
+	"/",
+	registerProductPresentationRoutes({
+		storeForRequest,
+		scopeForRequest,
+		handleError,
+	}),
 );
 
 app.route(
@@ -1117,13 +1306,16 @@ function handleError(
 		return c.json(e.toJSON(), e.status);
 	}
 	console.error("Unexpected Clearance API error", e);
-	return c.json({
+	return c.json(
+		{
 		error: {
 			code: "INTERNAL",
 			message: "An unexpected internal error occurred.",
 			stage: "api",
 		},
-	}, 500);
+		},
+		500,
+	);
 }
 
 async function readBoundedRequestBody(
@@ -1133,7 +1325,10 @@ async function readBoundedRequestBody(
 	const rawContentLength = req.headers["content-length"];
 	if (typeof rawContentLength === "string") {
 		const contentLength = Number(rawContentLength);
-		if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
+		if (
+			Number.isFinite(contentLength) &&
+			contentLength > MAX_REQUEST_BODY_BYTES
+		) {
 			throw new RequestBodyTooLargeError();
 		}
 	}
@@ -1231,7 +1426,13 @@ function installGracefulShutdown(
 	const shutdown = (signal: string): Promise<void> => {
 		if (shutdownPromise) return shutdownPromise;
 		draining = true;
-		console.log(JSON.stringify({ event: "shutdown_started", service: "clearance-api", signal }));
+		console.log(
+			JSON.stringify({
+				event: "shutdown_started",
+				service: "clearance-api",
+				signal,
+			}),
+		);
 		shutdownPromise = (async () => {
 			let firstError: unknown;
 			let cleanup: Promise<void> | undefined;
@@ -1253,7 +1454,9 @@ function installGracefulShutdown(
 						recordError(error);
 					}
 					try {
-						const destroy = (store as ManagementStore & { destroy?: () => Promise<void> }).destroy;
+						const destroy = (
+							store as ManagementStore & { destroy?: () => Promise<void> }
+						).destroy;
 						if (destroy) await destroy.call(store);
 					} catch (error) {
 						recordError(error);
@@ -1280,24 +1483,39 @@ function installGracefulShutdown(
 			});
 			const complete = serverStopped.then(startCleanup);
 			const deadline = new Promise<never>((_resolve, reject) => {
-				timeout = setTimeout(() => {
+				timeout = setTimeout(
+					() => {
 					timedOut = true;
 					server.closeAllConnections?.();
 					void startCleanup();
 					reject(new Error("Clearance API shutdown timed out"));
-				}, options.timeoutMs ?? Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000));
+					},
+					options.timeoutMs ??
+						Number(process.env.CLEARANCE_SHUTDOWN_TIMEOUT_MS ?? 25_000),
+				);
 				timeout.unref();
 			});
 			try {
 				await Promise.race([complete, deadline]);
 				if (firstError) throw firstError;
-				console.log(JSON.stringify({ event: "shutdown_completed", service: "clearance-api" }));
+				console.log(
+					JSON.stringify({
+						event: "shutdown_completed",
+						service: "clearance-api",
+					}),
+				);
 			} catch (error) {
-				console.error(JSON.stringify({
+				console.error(
+					JSON.stringify({
 					event: timedOut ? "shutdown_timeout" : "shutdown_failed",
 					service: "clearance-api",
-					message: timedOut ? undefined : error instanceof Error ? error.message : String(error),
-				}));
+						message: timedOut
+							? undefined
+							: error instanceof Error
+								? error.message
+								: String(error),
+					}),
+				);
 				process.exitCode = 1;
 			} finally {
 				if (timeout) clearTimeout(timeout);
@@ -1315,7 +1533,7 @@ function installGracefulShutdown(
 async function start() {
 	const observability = await startObservability();
 	// Eager store init so postgres schema exists before traffic
-	const store = await getStore();
+	const store = await sharedManagementStore();
 	await store.ready();
 	if (runtimeDatabaseConfigured()) {
 		await getAuthBundle().credentialAuthority.assertRuntimeServing();
@@ -1345,11 +1563,9 @@ if (isDirectRun) {
 
 export {
 	app,
-	getStore,
+	sharedManagementStore,
 	storeForRequest,
 	start,
-	assertScope,
-	scopeFromStore,
 	principalScope,
 	scopeForRequest,
 	nodeRequestHandler,

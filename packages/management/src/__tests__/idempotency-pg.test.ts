@@ -87,6 +87,37 @@ describe.skipIf(!available)("PgStore idempotency companion table", () => {
 		expect((await backend.get(base.scopeKey, base.key))?.body).toBe("first");
 	});
 
+	it("does not sweep an active pending claim when TTL is shorter than its lease", async () => {
+		const store = await openStore();
+		const backend = createIdempotencyBackend(store, { ttlMs: 10 });
+		const input = {
+			scopeKey: "POST /v1/keys",
+			key: `key-${process.pid}-active-pending`,
+			fingerprint: "fp-pending",
+			leaseMs: 1_000,
+		};
+		expect(await backend.claim(input)).toEqual({ state: "claimed", generation: 1 });
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(await backend.claim(input)).toEqual({ state: "pending", generation: 1 });
+	});
+
+	it("renews a pending generation so another process cannot reclaim it", async () => {
+		const store = await openStore();
+		const backend = createIdempotencyBackend(store, { ttlMs: 10 });
+		const input = {
+			scopeKey: "POST /v1/keys",
+			key: `key-${process.pid}-renew`,
+			fingerprint: "fp-renew",
+			leaseMs: 100,
+		};
+		const claim = await backend.claim(input);
+		if (claim.state !== "claimed") throw new Error("expected claim");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(await backend.renew({ ...input, generation: claim.generation })).toBe(true);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(await backend.claim(input)).toEqual({ state: "pending", generation: claim.generation });
+	});
+
 	it("honors expires_at on read and cleans expired rows opportunistically on write", async () => {
 		const store = await openStore();
 		const backend = createIdempotencyBackend(store, { ttlMs: 60_000 });

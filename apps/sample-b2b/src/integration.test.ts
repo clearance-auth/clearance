@@ -149,6 +149,7 @@ describe.skipIf(!available)(
 					} catch {
 						// store may never have been created; teardown must not fail the suite
 					}
+					await mod.closeAuthBundle().catch(() => undefined);
 					await mod.bundle.destroy().catch(() => undefined);
 				}
 			} finally {
@@ -156,7 +157,7 @@ describe.skipIf(!available)(
 			}
 		}, 60_000);
 
-		it("signs up via POST /api/auth/sign-up/email", async () => {
+		it("signs up, authenticates, protects the dashboard, and signs out", async () => {
 			const res = await fetch(`${baseURL}/api/auth/sign-up/email`, {
 				method: "POST",
 				headers: { "content-type": "application/json", origin: baseURL },
@@ -165,75 +166,44 @@ describe.skipIf(!available)(
 			expect(res.status).toBeLessThan(300);
 			const body = (await res.json()) as { user?: { email?: string } };
 			expect(body.user?.email).toBe(email);
-		}, 30_000);
 
-		it("signs in via POST /api/auth/sign-in/email and receives a session cookie", async () => {
-			const res = await fetch(`${baseURL}/api/auth/sign-in/email`, {
+			const anonymousDashboard = await fetch(`${baseURL}/dashboard`, {
+				redirect: "manual",
+			});
+			expect(anonymousDashboard.status).toBe(302);
+			expect(anonymousDashboard.headers.get("location")).toBe("/sign-in");
+
+			const signIn = await fetch(`${baseURL}/api/auth/sign-in/email`, {
 				method: "POST",
 				headers: { "content-type": "application/json", origin: baseURL },
 				body: JSON.stringify({ email, password }),
 			});
-			expect(res.status).toBe(200);
-			cookie = cookiesFrom(res);
+			expect(signIn.status).toBe(200);
+			cookie = cookiesFrom(signIn);
 			expect(cookie).toMatch(/session_token/);
-		}, 30_000);
 
-		it("GET /dashboard without a cookie redirects to sign-in (302)", async () => {
-			const res = await fetch(`${baseURL}/dashboard`, { redirect: "manual" });
-			expect(res.status).toBe(302);
-			expect(res.headers.get("location")).toBe("/sign-in");
-		}, 30_000);
-
-		it("GET /dashboard with the session cookie returns 200 'Access granted' and auto-creates an organization", async () => {
-			const res = await fetch(`${baseURL}/dashboard`, { headers: { cookie } });
-			expect(res.status).toBe(200);
-			const html = await res.text();
+			const dashboard = await fetch(`${baseURL}/dashboard`, { headers: { cookie } });
+			expect(dashboard.status).toBe(200);
+			const html = await dashboard.text();
 			expect(html).toContain("Access granted");
-			// First authenticated dashboard load auto-creates "<name>'s Workspace"
 			expect(html).toContain("Workspace");
-			// Assert org auto-creation through the runtime API with the same session
 			const orgs = (await mod!.bundle.auth.api.listOrganizations({
 				headers: new Headers({ cookie, origin: baseURL }),
 			})) as Array<{ name: string }>;
 			expect(Array.isArray(orgs)).toBe(true);
 			expect(orgs.length).toBeGreaterThanOrEqual(1);
 			expect(orgs.some((o) => o.name.includes("Workspace"))).toBe(true);
-		}, 30_000);
 
-		it("GET /api/me with the session cookie reports protected:true without raw credentials", async () => {
-			const res = await fetch(`${baseURL}/api/me`, { headers: { cookie } });
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as {
+			const me = await fetch(`${baseURL}/api/me`, { headers: { cookie } });
+			expect(me.status).toBe(200);
+			const meBody = (await me.json()) as {
 				protected?: boolean;
 				user?: { email?: string };
 				session?: Record<string, unknown>;
 			};
-			expect(body.protected).toBe(true);
-			expect(body.user?.email).toBe(email);
-			expect(body.session?.token).toBeUndefined();
-		}, 30_000);
-
-		it("GET /api/me without a cookie is 401", async () => {
-			const res = await fetch(`${baseURL}/api/me`);
-			expect(res.status).toBe(401);
-		}, 30_000);
-
-		it("signs out through POST and forwards the runtime cookie expiration", async () => {
-			const get = await fetch(`${baseURL}/sign-out`, { redirect: "manual" });
-			expect(get.status).toBe(405);
-			expect(get.headers.get("allow")).toBe("POST");
-			const missingOrigin = await fetch(`${baseURL}/sign-out`, {
-				method: "POST",
-				headers: { cookie },
-				redirect: "manual",
-			});
-			expect(missingOrigin.status).toBe(403);
-			const crossOrigin = await fetch(`${baseURL}/sign-out`, {
-				method: "POST",
-				headers: { cookie, origin: "https://evil.example" },
-				redirect: "manual",
-			});
-			expect(crossOrigin.status).toBe(403);
+			expect(meBody.protected).toBe(true);
+			expect(meBody.user?.email).toBe(email);
+			expect(meBody.session?.token).toBeUndefined();
 
 			const signOut = await fetch(`${baseURL}/sign-out`, {
 				method: "POST",

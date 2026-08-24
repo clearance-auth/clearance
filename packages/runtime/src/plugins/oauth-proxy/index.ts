@@ -594,7 +594,7 @@ export const oAuthProxy = <O extends OAuthProxyOptions>(opts?: O) => {
 							} else {
 								// Database mode: the verification value is already plaintext JSON.
 								const verification =
-									await ctx.context.internalAdapter.findVerificationValue(
+									await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 										originalState,
 									);
 								plaintextState = verification?.value;

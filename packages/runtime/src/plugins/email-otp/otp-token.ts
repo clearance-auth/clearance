@@ -1,8 +1,10 @@
 import type { GenericEndpointContext } from "@clearance/core";
 import {
 	constantTimeEqual,
+	createOTPVerifier,
 	symmetricDecrypt,
 	symmetricEncrypt,
+	verifyOTPVerifier,
 } from "../../crypto";
 import {
 	requireManagedAuthenticationTransaction,
@@ -25,6 +27,13 @@ export async function storeOTP(
 	opts: EmailOTPOptions,
 	otp: string,
 ) {
+	if (opts.storeOTP === "keyed") {
+		return await createOTPVerifier({
+			secretConfig: ctx.context.secretConfig,
+			domain: "clearance:email-otp:v1",
+			otp,
+		});
+	}
 	if (opts.storeOTP === "encrypted") {
 		return await symmetricEncrypt({
 			key: ctx.context.secretConfig,
@@ -50,6 +59,14 @@ export async function verifyStoredOTP(
 	storedOtp: string,
 	otp: string,
 ): Promise<boolean> {
+	if (opts.storeOTP === "keyed") {
+		return await verifyOTPVerifier({
+			secretConfig: ctx.context.secretConfig,
+			domain: "clearance:email-otp:v1",
+			otp,
+			verifier: storedOtp,
+		});
+	}
 	if (opts.storeOTP === "encrypted") {
 		const decryptedOtp = await symmetricDecrypt({
 			key: ctx.context.secretConfig,
@@ -114,7 +131,7 @@ export async function tryReuseOTP(
 			try {
 				return await runManagedAuthenticationTransaction(ctx, async () => {
 					const existing =
-						await ctx.context.internalAdapter.findVerificationValue(identifier);
+						await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 					if (!existing || existing.expiresAt < new Date()) return null;
 
 					const [storedOtpValue, attempts] = splitAtLastColon(existing.value);
@@ -160,7 +177,7 @@ export async function tryReuseOTP(
 	}
 
 	const existing =
-		await ctx.context.internalAdapter.findVerificationValue(identifier);
+		await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(identifier);
 	if (!existing || existing.expiresAt < new Date()) return null;
 
 	const [storedOtpValue, attempts] = splitAtLastColon(existing.value);

@@ -85,6 +85,7 @@ describe.skipIf(!available)("setup capabilities with normalized topology authori
 			kind: "sso",
 			organizationId: organization.id,
 			reservationId: reservation.reservationId,
+			reservationFencingToken: reservation.reservationFencingToken,
 		})).rejects.toMatchObject({ code: "SETUP_LINK_SCOPE" });
 		await expect(redeemSetupLink(store, {
 			token: untouchedLink.token,
@@ -214,6 +215,7 @@ describe.skipIf(!available)("setup capabilities with normalized topology authori
 				kind: "sso",
 				organizationId: organization.id,
 				reservationId: reserved.reservationId,
+				reservationFencingToken: reserved.reservationFencingToken,
 			})).rejects.toMatchObject({ code: "SETUP_LINK_SCOPE" });
 		} finally {
 			if (!setupLockWasReleased) releaseSetupLock();

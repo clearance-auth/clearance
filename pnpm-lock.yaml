@@ -467,6 +467,9 @@ importers:
       '@clearance/auth':
         specifier: workspace:*
         version: link:../clearance-auth
+      '@clearance/core':
+        specifier: workspace:*
+        version: link:../core
       '@clearance/delivery':
         specifier: workspace:*
         version: link:../delivery

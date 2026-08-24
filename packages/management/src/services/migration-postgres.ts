@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isCoordinatedStore } from "../store/types.js";
 import { ensureAuthMigrated } from "../auth-bridge.js";
 import type {
 	InternalManagementCoordinatedMutationContext,
@@ -10,7 +11,7 @@ import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.j
 import { hardDeleteImportedPrincipalForRollback } from "../store/store-v2-principals.js";
 import { hardDeleteImportedOrganizationForRollback } from "../store/store-v2-topology.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DataStoreSnapshot, Membership, MigrationPlan, Organization, Principal } from "../types/resources.js";
+import type { DataStoreSnapshot, Membership, MigrationPlan, Organization, User } from "../types/resources.js";
 import { recordEvent } from "./audit.js";
 import { addMember, createOrganization, createUser } from "./core.js";
 import { ClearanceError } from "./errors.js";
@@ -22,7 +23,7 @@ import {
 	planMigration,
 	previewMigration,
 	rollbackMigration,
-	runMigration,
+	applyMigration,
 	verifyMigration,
 } from "./migration.js";
 import { resolveOperatorScopeAuthoritative } from "./scope.js";
@@ -45,8 +46,8 @@ function draftStore(data: DataStoreSnapshot): ManagementStore {
 	} as ManagementStore;
 }
 
-function requireCoordinated(store: ManagementStore, stage: string) {
-	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
+function coordinatedMutation(store: ManagementStore, stage: string) {
+	if (!isCoordinatedStore(store)) {
 		throw new ClearanceError({
 			code: "CLEARANCE_IMPORT_POSTGRES_UNSUPPORTED",
 			message: "Clearance import requires the coordinated Postgres management store",
@@ -389,16 +390,16 @@ type SnapshotOrganizationLookup = {
 };
 
 type SnapshotPrincipalLookup = {
-	byExternalId: ReadonlyMap<string, Principal>;
-	byEmail: ReadonlyMap<string, Principal>;
+	byExternalId: ReadonlyMap<string, User>;
+	byEmail: ReadonlyMap<string, User>;
 };
 
 function snapshotPrincipalLookup(
 	data: DataStoreSnapshot,
 	scope: { projectId: string; environmentId: string },
 ): SnapshotPrincipalLookup {
-	const byExternalId = new Map<string, Principal>();
-	const byEmail = new Map<string, Principal>();
+	const byExternalId = new Map<string, User>();
+	const byEmail = new Map<string, User>();
 	for (const principal of data.principals) {
 		if (
 			principal.projectId !== scope.projectId ||
@@ -826,7 +827,7 @@ async function assertNoRollbackDependencies(
 	input: {
 		organizationIds: ReadonlySet<string>;
 		organizations: readonly Pick<Organization, "id" | "projectId" | "environmentId">[];
-		users: readonly Pick<Principal, "id" | "projectId" | "environmentId">[];
+		users: readonly Pick<User, "id" | "projectId" | "environmentId">[];
 		membershipIds: ReadonlySet<string>;
 		runtimeMembershipIds: readonly string[];
 		userIds: ReadonlySet<string>;
@@ -840,8 +841,8 @@ async function assertNoRollbackDependencies(
 	const dependentSession = data.sessions.find((session) => input.userIds.has(session.principalId));
 	if (dependentSession) rollbackStateConflict("user", dependentSession.principalId);
 	const snapshotOrganizationDependency =
-		data.identityConnections.find((connection) => input.organizationIds.has(connection.organizationId))?.organizationId ??
-		data.directoryConnections.find((connection) => input.organizationIds.has(connection.organizationId))?.organizationId ??
+		data.ssoConnections.find((connection) => input.organizationIds.has(connection.organizationId))?.organizationId ??
+		data.scimConnections.find((connection) => input.organizationIds.has(connection.organizationId))?.organizationId ??
 		data.roles.find((role) => role.organizationId && input.organizationIds.has(role.organizationId))?.organizationId ??
 		data.setupLinks.find((link) => input.organizationIds.has(link.organizationId))?.organizationId ??
 		data.readinessReports.find((report) => input.organizationIds.has(report.organizationId))?.organizationId ??
@@ -870,20 +871,20 @@ async function assertNoRollbackDependencies(
 	}
 }
 
-export async function runMigrationDurable(
+export async function applyMigrationDurable(
 	store: ManagementStore,
 	planId: string,
 	fixture: LegacyExportFixture,
 	opts: { dryRun?: boolean } = {},
 ): Promise<MigrationPlan> {
-	if (store.backend === "json") return runMigration(store, planId, fixture, opts);
+	if (store.backend === "json") return applyMigration(store, planId, fixture, opts);
 	const initial = migrationStatus(store, planId);
 	if (initial.fixtureChecksum !== migrationFixtureChecksum(fixture)) checkpointMismatch("import.legacy.run");
 	assertMigrationRunnable(initial, "import.legacy.run");
 	if (opts.dryRun) return { ...initial, checkpoint: { phase: "dry_run", ...await relationalPreview(store, fixture) }, updatedAt: nowIso() };
 
 	await ensureAuthMigrated();
-	const mutate = requireCoordinated(store, "import.legacy.run");
+	const mutate = coordinatedMutation(store, "import.legacy.run");
 	return mutate(async ({ data, principals, topology, query, appendAudit }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);
@@ -919,7 +920,7 @@ export async function runMigrationDurable(
 			const runtime = await runtimeUser(query, source.id, source.email);
 			if (existing && runtime && existing.id !== runtime.id) runtimeConflict("user", "Runtime and management identities must share one stable id.");
 			const id = existing?.id ?? runtime?.id;
-			let principal: Principal;
+			let principal: User;
 			if (existing) principal = existing;
 			else if (principals) {
 				const now = nowIso();
@@ -1085,7 +1086,7 @@ export async function runMigrationDurable(
 export async function verifyMigrationDurable(store: ManagementStore, planId: string, fixture: LegacyExportFixture) {
 	if (store.backend === "json") return verifyMigration(store, planId, fixture);
 	await ensureAuthMigrated();
-	const mutate = requireCoordinated(store, "import.legacy.verify");
+	const mutate = coordinatedMutation(store, "import.legacy.verify");
 	const result = await mutate(async ({ data, principals, topology, query, appendAudit }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);
@@ -1154,7 +1155,7 @@ export async function verifyMigrationDurable(store: ManagementStore, planId: str
 export async function rollbackMigrationDurable(store: ManagementStore, planId: string, fixture: LegacyExportFixture): Promise<MigrationPlan> {
 	if (store.backend === "json") return rollbackMigration(store, planId, fixture);
 	await ensureAuthMigrated();
-	const mutate = requireCoordinated(store, "import.legacy.rollback");
+	const mutate = coordinatedMutation(store, "import.legacy.rollback");
 	return mutate(async ({ data, principals, topology, query, appendAudit }) => {
 		const draft = draftStore(data);
 		const plan = migrationStatus(draft, planId);

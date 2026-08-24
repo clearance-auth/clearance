@@ -8,6 +8,7 @@ import {
 	socialProvidersFromEnvironment,
 } from "@clearance/auth";
 import {
+	closeAuthBundle,
 	createManagementStore,
 	initProjectAuthoritative,
 	provisionOrganizationInAuth,
@@ -82,10 +83,12 @@ function getManagementStore() {
 		backend: "postgres",
 		databaseUrl,
 	}).then(async (managementStore) => {
-		await initProjectAuthoritative(managementStore, {
+		const scope = await initProjectAuthoritative(managementStore, {
 			name: "sample-b2b",
 			source: "api",
 		});
+		process.env.CLEARANCE_PROJECT_ID = scope.project.id;
+		process.env.CLEARANCE_ENV_ID = scope.environment.id;
 		await managementStore.ready();
 		return managementStore;
 	});
@@ -522,8 +525,10 @@ async function routeRequest(
 				runtimeOrganizations = orgs;
 			}
 			orgNames = runtimeOrganizations.map((o) => o.name).join(", ");
-		} catch {
-			orgNames = "(org plugin)";
+		} catch (error) {
+			orgNames = process.env.NODE_ENV === "test"
+				? `(${error instanceof Error ? error.message : String(error)})`
+				: "(org plugin)";
 		}
 
 		for (const organization of runtimeOrganizations) {
@@ -679,6 +684,7 @@ async function main() {
 		shutdownPromise ??= new Promise<void>((resolve) => {
 			server.close(async () => {
 				try {
+					await closeAuthBundle();
 					await bundle.destroy();
 					const store = await managementStorePromise;
 					const destroy = (
@@ -709,4 +715,4 @@ if (isMain) {
 	});
 }
 
-export { bundle, getManagementStore, getSession, handler, html };
+export { bundle, closeAuthBundle, getManagementStore, getSession, handler, html };

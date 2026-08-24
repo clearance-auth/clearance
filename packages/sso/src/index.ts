@@ -221,7 +221,7 @@ export function sso<O extends SSOOptions>(
 						}
 						const sessionLookupKey = `${SAML_SESSION_BY_ID_PREFIX}${session.session.id}`;
 						const sessionLookup =
-							await ctx.context.internalAdapter.findVerificationValue(
+							await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 								sessionLookupKey,
 							);
 						if (sessionLookup?.value) {

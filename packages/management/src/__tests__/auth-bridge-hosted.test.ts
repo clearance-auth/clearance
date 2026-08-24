@@ -96,7 +96,7 @@ describe("hosted auth bridge", () => {
 				{ id: "org_alpha", ...alphaScope, name: "Alpha", slug: "alpha", status: "active", createdAt: now, updatedAt: now },
 				{ id: "org_beta", ...betaScope, name: "Beta", slug: "beta", status: "active", createdAt: now, updatedAt: now },
 			],
-			directoryConnections: [
+			scimConnections: [
 				{ id: "scim_alpha", organizationId: "org_alpha", provider: "alpha", status: "draft", endpoint: "/scim/v2/org_alpha", bearerTokenEncrypted: "alpha-envelope", bearerTokenFingerprint: "alpha-fingerprint", bearerTokenKeyId: "alpha-key", deprovisioningPolicy: "disable", createdAt: now, updatedAt: now },
 				{ id: "scim_beta", organizationId: "org_beta", provider: "beta", status: "draft", endpoint: "/scim/v2/org_beta", bearerTokenEncrypted: "beta-envelope", bearerTokenFingerprint: "beta-fingerprint", bearerTokenKeyId: "beta-key", deprovisioningPolicy: "disable", createdAt: now, updatedAt: now },
 			],
@@ -180,7 +180,7 @@ describe("hosted auth bridge", () => {
 						createdAt: now,
 						updatedAt: now,
 					}],
-					identityConnections: [{
+					ssoConnections: [{
 						id: `sso_${name}`,
 						organizationId: `org_${name}`,
 						protocol: "saml",

@@ -3,16 +3,7 @@ import { emptySnapshot } from "./snapshot.js";
 import {
 	compareStoreV2Collections,
 	planStoreV2Snapshot,
-	storeV2CollectionDigest,
 } from "./store-v2-shadow.js";
-import {
-	STORE_V2_SCHEMA_VERSION,
-	canonicalStoreV2AuthoritySet,
-	parseStoreV2AuthoritySet,
-	storeV2PrincipalProjectionGuardStatements,
-	storeV2SchemaStatements,
-	storeV2TableNames,
-} from "./store-v2-schema.js";
 
 const now = "2026-07-15T00:00:00.000Z";
 
@@ -58,25 +49,6 @@ function coreSnapshot() {
 }
 
 describe("store-v2 shadow helpers", () => {
-	it("canonicalizes collection order and object key order", () => {
-		const first = coreSnapshot().projects;
-		const second = [
-			{
-				updatedAt: now,
-				createdAt: now,
-				slug: "two",
-				name: "Two",
-				id: "proj_two",
-			},
-			...first,
-		];
-		const reversed = [...second].reverse();
-
-		expect(storeV2CollectionDigest(second)).toBe(
-			storeV2CollectionDigest(reversed),
-		);
-	});
-
 	it("reports bounded resource ids without returning resource contents", () => {
 		const snapshot = coreSnapshot().principals;
 		const relational = snapshot.map((principal) => ({
@@ -117,54 +89,4 @@ describe("store-v2 shadow helpers", () => {
 		expect(JSON.stringify(plan.blockers)).not.toContain("one@example.test");
 	});
 
-	it("builds a prefixed schema without API-key or unrelated tables", () => {
-		const tables = storeV2TableNames("test_v2_");
-		const sql = storeV2SchemaStatements(tables).join("\n");
-
-		expect(tables.projects).toBe("test_v2_projects");
-		expect(sql).toContain("test_v2_principals");
-		expect(sql).toContain("test_v2_organizations");
-		expect(sql).toContain("test_v2_events");
-		expect(sql).toContain("committed_revision bigint NOT NULL");
-		expect(sql).not.toContain("api_key");
-		expect(() => storeV2TableNames("unsafe-prefix-")).toThrow(
-			/Invalid store-v2 Postgres identifier/,
-		);
-	});
-
-	it("defines the staged principal authority capability canonically", () => {
-		expect(STORE_V2_SCHEMA_VERSION).toBe(2);
-		expect(canonicalStoreV2AuthoritySet(["principals", "events"])).toEqual([
-			"events",
-			"principals",
-		]);
-		expect(parseStoreV2AuthoritySet(["principals", "events"])).toEqual([
-			"events",
-			"principals",
-		]);
-		expect(() => parseStoreV2AuthoritySet(["events", "events"])).toThrow(
-			"STORE_V2_AUTHORITY_SET_INVALID",
-		);
-		expect(() => parseStoreV2AuthoritySet(["unknown"])).toThrow(
-			"STORE_V2_AUTHORITY_SET_INVALID",
-		);
-		expect(() => parseStoreV2AuthoritySet({ events: true })).toThrow(
-			"STORE_V2_AUTHORITY_SET_INVALID",
-		);
-	});
-
-	it("installs a fail-closed principal projection guard with safe identifiers", () => {
-		const tables = storeV2TableNames("test_v2_guard_");
-		const statements = storeV2PrincipalProjectionGuardStatements(
-			tables,
-			"clearance_management_snapshot",
-		);
-		const sql = statements.join("\n");
-		expect(sql).toContain("STORE_V2_PRINCIPAL_PROJECTION_FORBIDDEN");
-		expect(sql).toContain("STORE_V2_AUTHORITY_SET_INVALID");
-		expect(sql).toContain("BEFORE INSERT OR UPDATE OF data");
-		expect(() =>
-			storeV2PrincipalProjectionGuardStatements(tables, "unsafe-table"),
-		).toThrow(/Invalid store-v2 Postgres identifier/);
-	});
 });

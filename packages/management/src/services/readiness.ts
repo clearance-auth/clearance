@@ -25,7 +25,7 @@ export function enterpriseReadinessStateFingerprint(
 		items.slice().sort((left, right) => left.id.localeCompare(right.id));
 	return createHash("sha256").update(JSON.stringify({
 		organizationId,
-		sso: ordered(snapshot.identityConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
+		sso: ordered(snapshot.ssoConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
 			id: connection.id, protocol: connection.protocol, provider: connection.provider,
 			status: connection.status, domains: [...connection.domains].sort(), issuer: connection.issuer ?? null,
 			audience: connection.audience ?? null, metadataUrl: connection.metadataUrl ?? null,
@@ -34,7 +34,7 @@ export function enterpriseReadinessStateFingerprint(
 			samlCertificateFingerprint: connection.samlCertificateFingerprint ?? null,
 			attributeMapping: connection.attributeMapping, updatedAt: connection.updatedAt,
 		})),
-		scim: ordered(snapshot.directoryConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
+		scim: ordered(snapshot.scimConnections.filter((connection) => connection.organizationId === organizationId)).map((connection) => ({
 			id: connection.id, provider: connection.provider, status: connection.status, endpoint: connection.endpoint,
 			bearerTokenFingerprint: connection.bearerTokenFingerprint ?? null,
 			bearerTokenKeyId: connection.bearerTokenKeyId ?? null,
@@ -111,10 +111,10 @@ function buildReadinessReport(
 ): ReadinessReport {
 	const enabled = <T extends { status: string }>(connection: T) =>
 		connection.status === "active" || connection.status === "testing";
-	const sso = snapshot.identityConnections.filter(
+	const sso = snapshot.ssoConnections.filter(
 		(c) => c.organizationId === organizationId && enabled(c),
 	);
-	const scim = snapshot.directoryConnections.filter(
+	const scim = snapshot.scimConnections.filter(
 		(c) => c.organizationId === organizationId && enabled(c),
 	);
 	const ssoTraces = snapshot.traces.filter(
@@ -310,7 +310,7 @@ function buildReadinessReport(
 				: "Fixture/simulation checks do not constitute live IdP or directory conformance",
 		},
 		remainingCustomerActions,
-		signature: fp({ organizationId, checks, overall, liveCertified }),
+		reportDigest: fp({ organizationId, checks, overall, liveCertified }),
 		stateFingerprint: enterpriseReadinessStateFingerprint(snapshot, organizationId),
 	};
 
@@ -360,7 +360,7 @@ export function getLatestReadiness(
 			conformance: { mode: "simulation", liveCertified: false, note: "Enterprise readiness has not been run for the current state" },
 			checks: [{ id: "enterprise.readiness.not_run", name: "Enterprise readiness", status: "fail", detail: "Run readiness after configuring an enabled SSO or SCIM connection" }],
 			remainingCustomerActions: ["Run an enterprise readiness check"],
-			signature: enterpriseReadinessStateFingerprint(store.snapshot, organizationId),
+			reportDigest: enterpriseReadinessStateFingerprint(store.snapshot, organizationId),
 			stateFingerprint: enterpriseReadinessStateFingerprint(store.snapshot, organizationId),
 			state: "not_run",
 		};

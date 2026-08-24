@@ -74,10 +74,16 @@ export interface EmailOTPOptions {
 	 * Store the OTP in your database in a secure way
 	 * Note: This will not affect the OTP sent to the user, it will only affect the OTP stored in your database
 	 *
-	 * @default "plain"
+	 * @default "keyed"
+	 *
+	 * `"keyed"` stores a server-secret-keyed verifier and is the secure default.
+	 * `"plain"` and `"hashed"` are legacy, offline-enumerable modes and require
+	 * explicit opt-in; migrate them to `"keyed"` unless OTP retrieval or reuse is
+	 * required.
 	 */
 	storeOTP?:
 		| (
+				| "keyed"
 				| "hashed"
 				| "plain"
 				| "encrypted"

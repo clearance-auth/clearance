@@ -12,7 +12,7 @@ import {
 	type ApplicationRouteDependencies,
 } from "./shared.js";
 
-export interface UserRouteDependencies extends ApplicationRouteDependencies {}
+export type UserRouteDependencies = ApplicationRouteDependencies;
 
 export function registerUserRoutes({
 	storeForRequest,

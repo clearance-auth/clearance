@@ -1,7 +1,6 @@
 import {
 	inspectSession,
 	listSessionsPage,
-	normalizeSessionLimit,
 	revokeSession,
 	toSessionView,
 	type RevokeSessionResult,
@@ -9,7 +8,7 @@ import {
 } from "../services/sessions.js";
 import { appendAuditEvent } from "../services/audit.js";
 import { ClearanceError } from "../services/errors.js";
-import { decodePageCursor, encodePageCursor } from "../services/pagination.js";
+import { decodePageCursor, encodePageCursor, normalizePageLimit } from "../services/pagination.js";
 import { nowIso } from "../store/json-store.js";
 import type { ManagementStore } from "../store/types.js";
 import { withManagementUnitOfWork } from "../store/unit-of-work.js";
@@ -23,7 +22,7 @@ export async function listSessionsUseCase(
 	input: { limit: number; cursor?: string },
 ): Promise<{ sessions: SessionView[]; nextCursor: string | null }> {
 	if (!authRuntime && store.storeV2Principals?.authoritative) {
-		const limit = normalizeSessionLimit(input.limit);
+		const limit = normalizePageLimit(input.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 		const cursor = decodePageCursor(input.cursor, "sessions", "sessions.list");
 		const candidates = store.snapshot.sessions
 			.filter((session) =>

@@ -8,7 +8,7 @@ import { probeProductPresentationAuthority, renderWorkerEmailPayload, workerHear
 import {
 	canonicalWebhookBytes,
 	classifyWebhookError,
-	parseOrganizationUpdatedPayload,
+	parseOrganizationUpdatedWebhookPayload,
 	verifyWebhookSignature,
 	webhookSignature,
 } from "./webhook.js";
@@ -345,7 +345,7 @@ describe("delivery worker boundaries", () => {
 
 	it("canonicalizes and verifies exact webhook bytes with terminal redirect handling", () => {
 		const signingSecret = "webhook-signing-secret-at-least-32-bytes";
-		const payload = parseOrganizationUpdatedPayload({
+		const payload = parseOrganizationUpdatedWebhookPayload({
 			version: 1,
 			endpoint: {
 				id: "primary",

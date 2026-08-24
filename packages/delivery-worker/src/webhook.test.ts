@@ -8,9 +8,9 @@ import {
 	canonicalWebhookBytes,
 	classifyWebhookError,
 	createWebhookSender,
-	parseOrganizationUpdatedPayload,
+	parseOrganizationUpdatedWebhookPayload,
 	parseWebhookEndpointTestPayload,
-	parseWebhookPayload,
+	parseWebhookDeliveryPayload,
 	pinnedWebhookRequest,
 	verifyWebhookRequest,
 	verifyWebhookSignature,
@@ -213,7 +213,7 @@ describe("signed webhook transport", () => {
 		expect(first.headers["idempotency-key"]).toBe("job-1");
 		expect(first.body.equals(second.body)).toBe(true);
 		expect(first.headers).toEqual(second.headers);
-		expect(first.body.equals(canonicalWebhookBytes(parseOrganizationUpdatedPayload(payload())))).toBe(true);
+		expect(first.body.equals(canonicalWebhookBytes(parseOrganizationUpdatedWebhookPayload(payload())))).toBe(true);
 		expect(first.body.toString("utf8")).toContain("Updated\\nOrg\\t\\u0000");
 		expect(first.body.toString("utf8")).not.toContain(secret);
 		expect(first.headers["webhook-signature"]).toBe(webhookSignature(
@@ -243,7 +243,7 @@ describe("signed webhook transport", () => {
 
 		const request = requests[0]!;
 		const parsed = parseWebhookEndpointTestPayload(input);
-		expect(parseWebhookPayload(input)).toEqual(parsed);
+		expect(parseWebhookDeliveryPayload(input)).toEqual(parsed);
 		expect(request.body.equals(canonicalWebhookBytes(parsed))).toBe(true);
 		expect(JSON.parse(request.body.toString("utf8"))).toEqual({
 			event: parsed.event,

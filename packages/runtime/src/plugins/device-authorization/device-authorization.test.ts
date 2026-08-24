@@ -264,7 +264,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			const response = await auth.api.deviceVerify({
+			const response = await auth.api.claimDeviceUserCode({
 				query: { user_code },
 			});
 			expect("error" in response).toBe(false);
@@ -276,7 +276,7 @@ describe("device authorization flow", async () => {
 
 		it("should handle invalid user code", async () => {
 			await expect(
-				auth.api.deviceVerify({
+				auth.api.claimDeviceUserCode({
 					query: { user_code: "INVALID" },
 				}),
 			).rejects.toMatchObject({
@@ -300,7 +300,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -341,7 +341,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -429,7 +429,7 @@ describe("device authorization flow", async () => {
 					client_id: "test-client",
 				},
 			});
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code: userCode },
 				headers,
 			});
@@ -459,7 +459,7 @@ describe("device authorization flow", async () => {
 			});
 			const cleanUserCode = user_code.replace(/-/g, "");
 
-			const response = await auth.api.deviceVerify({
+			const response = await auth.api.claimDeviceUserCode({
 				query: { user_code: cleanUserCode },
 			});
 			expect("status" in response && response.status).toBe("pending");
@@ -475,7 +475,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -525,7 +525,7 @@ describe("device authorization flow", async () => {
 				},
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -565,7 +565,7 @@ describe("device authorization flow", async () => {
 				body: { client_id: "test-client" },
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -622,7 +622,7 @@ describe("device authorization flow", async () => {
 				body: { client_id: "test-client" },
 			});
 
-			await auth.api.deviceVerify({
+			await auth.api.claimDeviceUserCode({
 				query: { user_code },
 				headers,
 			});
@@ -796,7 +796,7 @@ describe("device authorization ownership gate", () => {
 			body: { client_id: "test-client" },
 		});
 
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: legitHeaders,
 		});
@@ -845,7 +845,7 @@ describe("device authorization ownership gate", () => {
 			body: { client_id: "test-client" },
 		});
 
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: claimerHeaders,
 		});
@@ -1005,7 +1005,7 @@ describe("device authorization ownership gate", () => {
 		});
 
 		// The unbound code is claimable by any signed-in user via verify
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers,
 		});
@@ -1097,7 +1097,7 @@ describe("device authorization ownership gate", () => {
 		});
 
 		simulateConcurrentClaim = true;
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: racerHeaders,
 		});
@@ -1349,7 +1349,7 @@ describe("managed device session authority", () => {
 		const { device_code, user_code } = await auth.api.deviceCode({
 			body: { client_id: "managed-device-client" },
 		});
-		await auth.api.deviceVerify({
+		await auth.api.claimDeviceUserCode({
 			query: { user_code },
 			headers: source.headers,
 		});

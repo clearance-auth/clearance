@@ -8,12 +8,22 @@
  * leaving a permanent partial connection when the API compensates.
  */
 import { createHash, randomBytes } from "node:crypto";
-import type { ManagementStore, StoreV2TopologyRepository } from "../store/types.js";
+import type {
+	ManagementStore,
+	StoreV2TopologyRepository,
+} from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
 import type { DataStoreSnapshot, SetupCapability } from "../types/resources.js";
-import { appendAuditEvent, recordEvent, type AuditEventInput } from "./audit.js";
+import {
+	appendAuditEvent,
+	recordEvent,
+	type AuditEventInput,
+} from "./audit.js";
 import { ClearanceError } from "./errors.js";
-import { inspectOrganization, inspectOrganizationAuthoritative } from "./core.js";
+import {
+	inspectOrganization,
+	inspectOrganizationAuthoritative,
+} from "./core.js";
 import type { ResourceScope } from "./scope.js";
 
 export type SetupKind = "sso" | "scim";
@@ -59,15 +69,21 @@ export function deriveSetupConnectionIds(
 	};
 }
 
-function ensureSetupLinksArray(data: { setupLinks?: SetupCapability[] }): SetupCapability[] {
+function ensureSetupLinksArray(data: {
+	setupLinks?: SetupCapability[];
+}): SetupCapability[] {
 	if (!Array.isArray(data.setupLinks)) {
 		data.setupLinks = [];
 	}
 	return data.setupLinks;
 }
 
-function isReservationActive(cap: SetupCapability, nowMs = Date.now()): boolean {
-	if (!cap.reservedAt || !cap.reservationId) return false;
+function isReservationActive(
+	cap: SetupCapability,
+	nowMs = Date.now(),
+): boolean {
+	if (!cap.reservedAt || !cap.reservationId || !cap.reservationFencingToken)
+		return false;
 	if (!cap.reservationExpiresAt) return true;
 	return new Date(cap.reservationExpiresAt).getTime() > nowMs;
 }
@@ -76,6 +92,7 @@ function clearReservationFields(cap: SetupCapability): SetupCapability {
 	const next = { ...cap };
 	delete next.reservedAt;
 	delete next.reservationId;
+	delete next.reservationFencingToken;
 	delete next.reservationExpiresAt;
 	return next;
 }
@@ -90,15 +107,19 @@ function assertRedeemableScope(
 	},
 	reject: (code: string, message: string, status?: number) => never,
 ): void {
-	if (cap.revokedAt) reject("SETUP_LINK_REVOKED", "Setup link has been revoked");
+	if (cap.revokedAt)
+		reject("SETUP_LINK_REVOKED", "Setup link has been revoked");
 	if (new Date(cap.expiresAt).getTime() <= Date.now()) {
 		reject("SETUP_LINK_EXPIRED", "Setup link has expired");
 	}
 	if (cap.useCount >= cap.maxUses || cap.redeemedAt) {
 		reject("SETUP_LINK_REPLAY", "Setup link already used");
 	}
-	if (cap.kind !== input.kind || cap.action !== "setup") {
-		reject("SETUP_LINK_SCOPE", "Setup link kind/action does not match redemption");
+	if (cap.kind !== input.kind || cap.grant !== "setup") {
+		reject(
+			"SETUP_LINK_SCOPE",
+			"Setup link kind/grant does not match redemption",
+		);
 	}
 	if (input.organizationId && input.organizationId !== cap.organizationId) {
 		reject("SETUP_LINK_SCOPE", "Setup link organization does not match");
@@ -109,7 +130,10 @@ function assertRedeemableScope(
 	if (input.environmentId && input.environmentId !== cap.environmentId) {
 		reject("SETUP_LINK_SCOPE", "Setup link environment does not match");
 	}
-	if (cap.resourceType !== "organization" || cap.resourceId !== cap.organizationId) {
+	if (
+		cap.resourceType !== "organization" ||
+		cap.resourceId !== cap.organizationId
+	) {
 		reject("SETUP_LINK_SCOPE", "Setup link resource scope is invalid");
 	}
 }
@@ -126,7 +150,10 @@ async function assertActiveCapabilityTopology(
 	cap: SetupCapability,
 	reject: (code: string, message: string, status?: number) => never,
 ): Promise<void> {
-	if (cap.resourceType !== "organization" || cap.resourceId !== cap.organizationId) {
+	if (
+		cap.resourceType !== "organization" ||
+		cap.resourceId !== cap.organizationId
+	) {
 		reject("SETUP_LINK_SCOPE", "Setup link resource scope is invalid");
 	}
 	const organization = await topology.lockOrganization({
@@ -167,10 +194,13 @@ async function mutateSetupLink<T>(
 	reject: (code: string, message: string, status?: number) => never,
 	mutate: (context: SetupLinkMutationContext) => T,
 ): Promise<T> {
-	const prepare = (data: SetupLinkMutationContext["data"]): Omit<SetupLinkMutationContext, "appendAudit"> => {
+	const prepare = (
+		data: SetupLinkMutationContext["data"],
+	): Omit<SetupLinkMutationContext, "appendAudit"> => {
 		const links = ensureSetupLinksArray(data);
 		const index = links.findIndex((candidate) => candidate.digest === digest);
-		if (index < 0) reject("SETUP_LINK_NOT_FOUND", "Setup link not found or invalid", 404);
+		if (index < 0)
+			reject("SETUP_LINK_NOT_FOUND", "Setup link not found or invalid", 404);
 		return { data, links, index, capability: links[index]! };
 	};
 
@@ -185,7 +215,8 @@ async function mutateSetupLink<T>(
 	if (!store.mutateCoordinated) {
 		throw new ClearanceError({
 			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
-			message: "Relational topology authority requires a coordinated transaction",
+			message:
+				"Relational topology authority requires a coordinated transaction",
 			stage,
 			status: 500,
 		});
@@ -194,7 +225,8 @@ async function mutateSetupLink<T>(
 		if (!topology) {
 			throw new ClearanceError({
 				code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
-				message: "Relational topology authority requires a coordinated transaction",
+				message:
+					"Relational topology authority requires a coordinated transaction",
 				stage,
 				status: 500,
 			});
@@ -208,16 +240,16 @@ async function mutateSetupLink<T>(
 async function appendSetupLinkFailureAudit(
 	store: ManagementStore,
 	input: { actor?: string; kind: SetupKind },
-	action: "redeem" | "reserve" | "commit",
+	phase: "redeem" | "reserve" | "commit",
 	reason: string,
 ): Promise<void> {
 	const audit = {
 		actor: input.actor ?? "system",
-		action: `${input.kind}.setup-link.${action}`,
+		action: `${input.kind}.setup-link.${phase}`,
 		subjectType: "setup_capability" as const,
 		outcome: "failure" as const,
 		source: "api" as const,
-		message: `Setup link ${action} rejected`,
+		message: `Setup link ${phase} rejected`,
 		metadata: { reason },
 	};
 	if (store.storeV2Topology?.authoritative) {
@@ -239,7 +271,13 @@ type SetupLinkInput = {
 	actor?: string;
 	baseUrl?: string;
 };
-type SetupLink = { url: string; expiresAt: string; token: string; tokenFingerprint: string; capabilityId: string };
+type SetupLink = {
+	url: string;
+	expiresAt: string;
+	token: string;
+	tokenFingerprint: string;
+	capabilityId: string;
+};
 
 function setupLinkAuditInput(
 	input: SetupLinkInput,
@@ -270,7 +308,12 @@ function setupLinkAuditInput(
 function buildSetupLink(
 	input: SetupLinkInput,
 	org: { id: string; projectId: string; environmentId: string },
-): { capability: SetupCapability; link: SetupLink; expiresAt: string; digest: string } {
+): {
+	capability: SetupCapability;
+	link: SetupLink;
+	expiresAt: string;
+	digest: string;
+} {
 	const token = randomBytes(32).toString("base64url");
 	const digest = digestToken(token);
 	const expiresAt = new Date(
@@ -281,7 +324,7 @@ function buildSetupLink(
 		id: newId("cap"),
 		digest,
 		kind: input.kind,
-		action: "setup",
+		grant: "setup",
 		resourceType: "organization",
 		resourceId: org.id,
 		organizationId: org.id,
@@ -303,7 +346,13 @@ function buildSetupLink(
 
 	return {
 		capability,
-		link: { url, expiresAt, token, tokenFingerprint: digest.slice(0, 16), capabilityId: capability.id },
+		link: {
+			url,
+			expiresAt,
+			token,
+			tokenFingerprint: digest.slice(0, 16),
+			capabilityId: capability.id,
+		},
 		expiresAt,
 		digest,
 	};
@@ -317,13 +366,23 @@ function createSetupLinkResolved(
 	const { capability, link, expiresAt, digest } = buildSetupLink(input, org);
 	store.mutate((data) => {
 		ensureSetupLinksArray(data).push(capability);
-		appendAuditEvent(data, setupLinkAuditInput(input, org, capability, expiresAt, digest));
+		appendAuditEvent(
+			data,
+			setupLinkAuditInput(input, org, capability, expiresAt, digest),
+		);
 	});
 	return link;
 }
 
-export function createSetupLink(store: ManagementStore, input: SetupLinkInput): SetupLink {
-	return createSetupLinkResolved(store, input, inspectOrganization(store, input.organizationId));
+export function createSetupLink(
+	store: ManagementStore,
+	input: SetupLinkInput,
+): SetupLink {
+	return createSetupLinkResolved(
+		store,
+		input,
+		inspectOrganization(store, input.organizationId),
+	);
 }
 
 /** Create a setup capability from normalized organization authority. */
@@ -349,14 +408,18 @@ export async function createSetupLinkAuthoritative(
 	if (!store.mutateCoordinated) {
 		throw new ClearanceError({
 			code: "STORE_V2_TOPOLOGY_TRANSACTION_REQUIRED",
-			message: "Relational topology authority requires a coordinated transaction",
+			message:
+				"Relational topology authority requires a coordinated transaction",
 			stage: "setup-link.create",
 			status: 500,
 		});
 	}
 	return store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
 		const organization = topology
-			? await topology.lockOrganization({ scope: input.scope, id: input.organizationId })
+			? await topology.lockOrganization({
+					scope: input.scope,
+					id: input.organizationId,
+				})
 			: null;
 		if (!organization || organization.status === "archived") {
 			throw new ClearanceError({
@@ -366,9 +429,14 @@ export async function createSetupLinkAuthoritative(
 				status: 404,
 			});
 		}
-		const { capability, link, expiresAt, digest } = buildSetupLink(input, organization);
+		const { capability, link, expiresAt, digest } = buildSetupLink(
+			input,
+			organization,
+		);
 		ensureSetupLinksArray(data).push(capability);
-		appendAudit(setupLinkAuditInput(input, organization, capability, expiresAt, digest));
+		appendAudit(
+			setupLinkAuditInput(input, organization, capability, expiresAt, digest),
+		);
 		return link;
 	});
 }
@@ -402,7 +470,12 @@ export async function redeemSetupLink(
 	};
 
 	try {
-		return await mutateSetupLink(store, digest, "setup-link.redeem", reject, ({ links, index, capability: cap, appendAudit }) => {
+		return await mutateSetupLink(
+			store,
+			digest,
+			"setup-link.redeem",
+			reject,
+			({ links, index, capability: cap, appendAudit }) => {
 			assertRedeemableScope(cap, input, reject);
 			if (isReservationActive(cap)) {
 				reject(
@@ -431,17 +504,24 @@ export async function redeemSetupLink(
 				metadata: { capabilityId: cap.id, resourceId: cap.resourceId },
 			});
 			return updated;
-		});
+			},
+		);
 	} catch (error) {
-		const code = error instanceof ClearanceError ? error.code : "SETUP_LINK_REDEEM_FAILED";
-		await appendSetupLinkFailureAudit(store, input, "redeem", code).catch(() => undefined);
+		const code =
+			error instanceof ClearanceError ? error.code : "SETUP_LINK_REDEEM_FAILED";
+		await appendSetupLinkFailureAudit(store, input, "redeem", code).catch(
+			() => undefined,
+		);
 		throw error;
 	}
 }
 
 export type ReserveSetupLinkResult = {
 	capability: SetupCapability;
+	/** Stable capability-derived identity used only for durable recovery. */
 	reservationId: string;
+	/** Unique, unguessable generation fence required to settle this lease. */
+	reservationFencingToken: string;
 };
 
 /**
@@ -464,7 +544,12 @@ export async function reserveSetupLink(
 	};
 
 	try {
-		return await mutateSetupLink(store, digest, "setup-link.reserve", reject, ({ links, index, capability: cap, appendAudit }) => {
+		return await mutateSetupLink(
+			store,
+			digest,
+			"setup-link.reserve",
+			reject,
+			({ links, index, capability: cap, appendAudit }) => {
 			assertRedeemableScope(cap, input, reject);
 			if (isReservationActive(cap)) {
 				reject(
@@ -475,12 +560,15 @@ export async function reserveSetupLink(
 			}
 			const now = Date.now();
 			const ttl = input.reservationTtlMs ?? SETUP_RESERVATION_TTL_MS;
-			// Deterministic across re-reserves of the same capability (digest lineage).
+				// Stable across re-reserves for durable recovery; each lease generation
+				// receives its own fence so an expired holder cannot settle the next one.
 			const reservationId = deriveSetupReservationId(digest);
+				const reservationFencingToken = randomBytes(32).toString("base64url");
 			const updated: SetupCapability = {
 				...clearReservationFields(cap),
 				reservedAt: new Date(now).toISOString(),
 				reservationId,
+					reservationFencingToken,
 				reservationExpiresAt: new Date(now + ttl).toISOString(),
 			};
 			links[index] = updated;
@@ -501,17 +589,24 @@ export async function reserveSetupLink(
 					reservationExpiresAt: updated.reservationExpiresAt,
 				},
 			});
-			return { capability: updated, reservationId };
-		});
+				return { capability: updated, reservationId, reservationFencingToken };
+			},
+		);
 	} catch (error) {
-		const code = error instanceof ClearanceError ? error.code : "SETUP_LINK_RESERVE_FAILED";
-		await appendSetupLinkFailureAudit(store, input, "reserve", code).catch(() => undefined);
+		const code =
+			error instanceof ClearanceError
+				? error.code
+				: "SETUP_LINK_RESERVE_FAILED";
+		await appendSetupLinkFailureAudit(store, input, "reserve", code).catch(
+			() => undefined,
+		);
 		throw error;
 	}
 }
 
 export type CommitSetupLinkInput = RedeemSetupLinkInput & {
 	reservationId: string;
+	reservationFencingToken: string;
 };
 
 /**
@@ -533,19 +628,30 @@ export async function commitSetupLink(
 	};
 
 	try {
-		return await mutateSetupLink(store, digest, "setup-link.commit", reject, ({ links, index, capability: cap, appendAudit }) => {
+		return await mutateSetupLink(
+			store,
+			digest,
+			"setup-link.commit",
+			reject,
+			({ links, index, capability: cap, appendAudit }) => {
 			if (cap.useCount >= cap.maxUses || cap.redeemedAt) {
 				reject("SETUP_LINK_REPLAY", "Setup link already used");
 			}
-			if (cap.revokedAt) reject("SETUP_LINK_REVOKED", "Setup link has been revoked");
+				if (cap.revokedAt)
+					reject("SETUP_LINK_REVOKED", "Setup link has been revoked");
 			if (new Date(cap.expiresAt).getTime() <= Date.now()) {
 				reject("SETUP_LINK_EXPIRED", "Setup link has expired");
 			}
-			if (cap.kind !== input.kind || cap.action !== "setup") {
-				reject("SETUP_LINK_SCOPE", "Setup link kind/action does not match");
+				if (cap.kind !== input.kind || cap.grant !== "setup") {
+					reject("SETUP_LINK_SCOPE", "Setup link kind/grant does not match");
 			}
 			assertRedeemableScope(cap, input, reject);
-			if (!cap.reservationId || cap.reservationId !== input.reservationId) {
+				if (
+					!cap.reservationId ||
+					cap.reservationId !== input.reservationId ||
+					!cap.reservationFencingToken ||
+					cap.reservationFencingToken !== input.reservationFencingToken
+				) {
 				reject(
 					"SETUP_LINK_RESERVATION_MISMATCH",
 					"Setup link reservation does not match this completion attempt",
@@ -583,10 +689,14 @@ export async function commitSetupLink(
 				},
 			});
 			return updated;
-		});
+			},
+		);
 	} catch (error) {
-		const code = error instanceof ClearanceError ? error.code : "SETUP_LINK_COMMIT_FAILED";
-		await appendSetupLinkFailureAudit(store, input, "commit", code).catch(() => undefined);
+		const code =
+			error instanceof ClearanceError ? error.code : "SETUP_LINK_COMMIT_FAILED";
+		await appendSetupLinkFailureAudit(store, input, "commit", code).catch(
+			() => undefined,
+		);
 		throw error;
 	}
 }
@@ -595,6 +705,7 @@ export type ReleaseSetupLinkInput = {
 	token: string;
 	kind: SetupKind;
 	reservationId: string;
+	reservationFencingToken: string;
 	actor?: string;
 };
 
@@ -617,10 +728,10 @@ export async function releaseSetupLink(
 		if (cap.useCount >= cap.maxUses || cap.redeemedAt) {
 			return cap;
 		}
-		if (cap.reservationId && cap.reservationId !== input.reservationId) {
-			return cap;
-		}
-		if (!cap.reservationId) {
+		if (
+			cap.reservationId !== input.reservationId ||
+			cap.reservationFencingToken !== input.reservationFencingToken
+		) {
 			return cap;
 		}
 		const updated = clearReservationFields(cap);
@@ -682,7 +793,9 @@ export function revokeSetupLink(
 			arr[idx] = { ...arr[idx], revokedAt };
 		}
 	});
-	const updated = (store.snapshot.setupLinks ?? []).find((c) => c.id === cap.id)!;
+	const updated = (store.snapshot.setupLinks ?? []).find(
+		(c) => c.id === cap.id,
+	)!;
 	recordEvent(store, {
 		actor: input.actor ?? "operator",
 		action: `${cap.kind}.setup-link.revoke`,
@@ -702,9 +815,11 @@ export function revokeSetupLink(
 export function listSetupLinks(
 	store: ManagementStore,
 	organizationId?: string,
-): Omit<SetupCapability, "digest">[] {
+): Omit<SetupCapability, "digest" | "reservationFencingToken">[] {
 	const links = store.snapshot.setupLinks ?? [];
 	return links
-		.filter((c) => (organizationId ? c.organizationId === organizationId : true))
-		.map(({ digest: _d, ...rest }) => rest);
+		.filter((c) =>
+			organizationId ? c.organizationId === organizationId : true,
+		)
+		.map(({ digest: _d, reservationFencingToken: _fence, ...rest }) => rest);
 }

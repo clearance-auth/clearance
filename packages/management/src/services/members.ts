@@ -14,7 +14,7 @@ import type {
 	ManagementUnitOfWork,
 } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { AuditEvent, Membership, Organization, Principal } from "../types/resources.js";
+import type { AuditEvent, Membership, Organization, User } from "../types/resources.js";
 import { appendAuditEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { resolveAssignableRole } from "./roles.js";
@@ -56,7 +56,7 @@ function requirePrincipal(
 	id: string,
 	scope: ResourceScope | undefined,
 	stage: string,
-): Principal {
+): User {
 	if (store.storeV2Principals?.authoritative) {
 		throw new ClearanceError({
 			code: "STORE_V2_PRINCIPAL_READER_REQUIRED",
@@ -317,7 +317,7 @@ export function addMember(
 /** Same transition with a transaction-bound relational principal already resolved. */
 export function addMemberWithPrincipal(
 	store: ManagementUnitOfWork,
-	principal: Principal,
+	principal: User,
 	input: AddMemberInput,
 ): Membership {
 	const stage = "orgs.members.add";

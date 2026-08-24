@@ -9,9 +9,11 @@ import * as z from "zod";
 import { setSessionCookie } from "../../../cookies";
 import {
 	constantTimeEqual,
+	createOTPVerifier,
 	generateRandomString,
 	symmetricDecrypt,
 	symmetricEncrypt,
+	verifyOTPVerifier,
 } from "../../../crypto";
 import { parseUserOutput } from "../../../db/schema";
 import {
@@ -84,8 +86,13 @@ export interface OTPOptions {
 	 * @default 5
 	 */
 	allowedAttempts?: number | undefined;
+	/**
+	 * `"keyed"` is the secure default. `"plain"` and `"hashed"` are legacy,
+	 * offline-enumerable modes and require explicit opt-in.
+	 */
 	storeOTP?:
 		| (
+				| "keyed"
 				| "plain"
 				| "encrypted"
 				| "hashed"
@@ -132,13 +139,20 @@ const send2FaOTPBodySchema = z
  */
 export const otp2fa = (options?: OTPOptions | undefined) => {
 	const opts = {
-		storeOTP: "plain",
 		digits: 6,
 		...options,
+		storeOTP: options?.storeOTP ?? "keyed",
 		period: (options?.period || 3) * 60 * 1000,
 	};
 
 	async function storeOTP(ctx: GenericEndpointContext, otp: string) {
+		if (opts.storeOTP === "keyed") {
+			return await createOTPVerifier({
+				secretConfig: ctx.context.secretConfig,
+				domain: "clearance:two-factor-otp:v1",
+				otp,
+			});
+		}
 		if (opts.storeOTP === "hashed") {
 			return await defaultKeyHasher(otp);
 		}
@@ -162,6 +176,19 @@ export const otp2fa = (options?: OTPOptions | undefined) => {
 		storedOtp: string,
 		userInput: string,
 	): Promise<[string, string]> {
+		if (opts.storeOTP === "keyed") {
+			return [
+				"true",
+				String(
+					await verifyOTPVerifier({
+						secretConfig: ctx.context.secretConfig,
+						domain: "clearance:two-factor-otp:v1",
+						otp: userInput,
+						verifier: storedOtp,
+					}),
+				),
+			];
+		}
 		if (opts.storeOTP === "hashed") {
 			// For hashed storage: hash the user input and compare with stored hash
 			return [storedOtp, await defaultKeyHasher(userInput)];

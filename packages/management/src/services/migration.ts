@@ -294,7 +294,7 @@ function checkpointManagementState(
 	};
 }
 
-export function runMigration(store: ManagementStore, planId: string, fixture: LegacyExportFixture, opts: { dryRun?: boolean } = {}): MigrationPlan {
+export function applyMigration(store: ManagementStore, planId: string, fixture: LegacyExportFixture, opts: { dryRun?: boolean } = {}): MigrationPlan {
 	const plan = migrationStatus(store, planId);
 	if (plan.source !== "legacy" || plan.fixtureChecksum !== fixtureChecksum(fixture)) throw new ClearanceError({ code: "CLEARANCE_IMPORT_CHECKPOINT_MISMATCH", message: "Fixture does not match this migration checkpoint", stage: "import.legacy.run", remediation: "Use the original fixture for this migration, or create a new import." });
 	assertMigrationRunnable(plan, "import.legacy.run");
@@ -405,7 +405,7 @@ export function rollbackMigration(store: ManagementStore, planId: string, fixtur
 		if (dependentMembership) rollbackStateConflict("membership", dependentMembership.id);
 		const dependentSession = data.sessions.find((session) => userIds.has(session.principalId));
 		if (dependentSession) rollbackStateConflict("user", dependentSession.principalId);
-		const dependentOrganizationId = data.identityConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.directoryConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.roles.find((role) => role.organizationId && organizationIds.has(role.organizationId))?.organizationId ?? data.setupLinks.find((link) => organizationIds.has(link.organizationId))?.organizationId;
+		const dependentOrganizationId = data.ssoConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.scimConnections.find((connection) => organizationIds.has(connection.organizationId))?.organizationId ?? data.roles.find((role) => role.organizationId && organizationIds.has(role.organizationId))?.organizationId ?? data.setupLinks.find((link) => organizationIds.has(link.organizationId))?.organizationId;
 		if (dependentOrganizationId) rollbackStateConflict("organization", dependentOrganizationId);
 		data.memberships = data.memberships.filter((membership) => !membershipIds.has(membership.id));
 		data.principals = data.principals.filter((principal) => !userIds.has(principal.id));

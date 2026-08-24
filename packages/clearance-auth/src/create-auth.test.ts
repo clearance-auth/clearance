@@ -25,6 +25,8 @@ let authorizationDatabaseAvailable = false;
 try {
 	await authorizationDatabaseProbe.query("SELECT 1");
 	authorizationDatabaseAvailable = true;
+} catch {
+	authorizationDatabaseAvailable = false;
 } finally {
 	await authorizationDatabaseProbe.end().catch(() => {});
 }

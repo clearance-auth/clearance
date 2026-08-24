@@ -12,7 +12,7 @@ import { appendAuditEvent } from "../services/audit.js";
 import { newId, nowIso } from "../store/json-store.js";
 import { advancingPrincipalUpdatedAt } from "../store/store-v2-principals.js";
 import type { ManagementStore } from "../store/types.js";
-import type { Principal } from "../types/resources.js";
+import type { User } from "../types/resources.js";
 import { withManagementUnitOfWork } from "../store/unit-of-work.js";
 import type { AuthRuntimeGateway } from "./auth-runtime-gateway.js";
 import type { OperationContext } from "./context.js";
@@ -62,7 +62,7 @@ async function createRelationalUser(
 	store: ManagementStore,
 	context: OperationContext,
 	input: NormalizedCreateUserInput,
-): Promise<Principal> {
+): Promise<User> {
 	const mutate = requireRelationalPrincipalMutation(store);
 	return mutate(async ({ data, principals }) => {
 		if (!principals) throw principalNotFound("users.create");
@@ -97,7 +97,7 @@ async function updateRelationalUser(
 	context: OperationContext,
 	input: UpdateUserInput,
 	status: "active" | "disabled" | undefined,
-): Promise<Principal> {
+): Promise<User> {
 	const hasName = input.name !== undefined;
 	const hasEmail = input.email !== undefined;
 	if (!hasName && !hasEmail && status === undefined) {
@@ -123,12 +123,12 @@ async function updateRelationalUser(
 				throw new ClearanceError({ code: "USER_EXISTS", message: `User ${email} already exists`, stage: "users.update", status: 409 });
 			}
 		}
-		const next: Principal = {
+		const next: User = {
 			...current,
 			...(name === undefined ? {} : { name }),
 			...(email === undefined ? {} : { email }),
 			...(status === undefined ? {} : { status }),
-			updatedAt: advancingPrincipalUpdatedAt(nowIso(), current.updatedAt),
+			updatedAt: advancingPrincipalUpdatedAt({ proposedUpdatedAt: nowIso(), storedUpdatedAt: current.updatedAt }),
 		};
 		const updated = requirePrincipalWrite(
 			await principals.update(next, { expectedUpdatedAt: current.updatedAt }),
@@ -154,7 +154,7 @@ async function disableRelationalUser(
 	store: ManagementStore,
 	context: OperationContext,
 	id: string,
-): Promise<Principal> {
+): Promise<User> {
 	const mutate = requireRelationalPrincipalMutation(store);
 	return mutate(async ({ data, principals }) => {
 		if (!principals) throw principalNotFound("users.disable");
@@ -174,7 +174,7 @@ async function disableRelationalUser(
 			await principals.disable({
 				scope: context.scope,
 				id,
-				updatedAt: advancingPrincipalUpdatedAt(now, current.updatedAt),
+				updatedAt: advancingPrincipalUpdatedAt({ proposedUpdatedAt: now, storedUpdatedAt: current.updatedAt }),
 				expectedUpdatedAt: current.updatedAt,
 			}),
 			"users.disable",
@@ -199,7 +199,7 @@ async function deleteRelationalUser(
 	store: ManagementStore,
 	context: OperationContext,
 	id: string,
-): Promise<Principal> {
+): Promise<User> {
 	const mutate = requireRelationalPrincipalMutation(store);
 	return mutate(async ({ data, principals }) => {
 		if (!principals) throw principalNotFound("users.delete");
@@ -224,7 +224,7 @@ async function deleteRelationalUser(
 			await principals.delete({
 				scope: context.scope,
 				id,
-				updatedAt: advancingPrincipalUpdatedAt(now, current.updatedAt),
+				updatedAt: advancingPrincipalUpdatedAt({ proposedUpdatedAt: now, storedUpdatedAt: current.updatedAt }),
 				expectedUpdatedAt: current.updatedAt,
 			}),
 			"users.delete",

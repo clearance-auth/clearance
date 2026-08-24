@@ -14,6 +14,7 @@ import {
 	type DeliveryKeyring,
 	type DeliveryPayloadAad,
 } from "./keyring.js";
+import type { DeliveryChannel } from "./redaction.js";
 import {
 	qualifiedDeliveryTables,
 	type DeliverySchemaOptions,
@@ -89,7 +90,7 @@ export type EnqueueDeliveryInput = {
 	actorId?: string;
 	correlationId?: string;
 	replayOf?: string;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	/** Canonical destination; plaintext is encrypted only inside payload. */
 	destination: string;
 	payload: unknown;
@@ -105,7 +106,7 @@ export type EnqueuedDelivery = {
 	eventId: string;
 	jobId: string;
 	kind: string;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	state: "queued";
 	createdAt: string;
 	semanticExpiresAt: string;
@@ -116,7 +117,7 @@ type InternalEnqueueDeliveryInput = EnqueueDeliveryInput & { webhookEndpointId?:
 export async function enqueueDeliveryInExistingTransaction(
 	transaction: DeliveryRawTransaction,
 	input: EnqueueDeliveryInput,
-	ring: DeliveryKeyring,
+	keyring: DeliveryKeyring,
 	options: DeliverySchemaOptions = {},
 ): Promise<EnqueuedDelivery> {
 	if (!transaction.rawTransactionQuery) {
@@ -128,7 +129,7 @@ export async function enqueueDeliveryInExistingTransaction(
 	return enqueueDelivery(
 		createDeliveryRawTransactionAdapter(transaction.rawTransactionQuery),
 		input,
-		ring,
+		keyring,
 		options,
 	);
 }
@@ -153,7 +154,7 @@ function captureActiveDeliveryTraceCarrier() {
 async function enqueueDeliveryInternal(
 	tx: DeliveryTransactionAdapter,
 	input: InternalEnqueueDeliveryInput,
-	ring: DeliveryKeyring,
+	keyring: DeliveryKeyring,
 	options: DeliverySchemaOptions = {},
 ): Promise<EnqueuedDelivery> {
 	if (tx[transactionAdapterBrand] !== true) {
@@ -205,14 +206,14 @@ async function enqueueDeliveryInternal(
 			throw new DeliveryError("WEBHOOK_PAYLOAD_INVALID", "Webhook payload authority is invalid");
 		}
 	}
-	const fingerprintKeyId = ring.currentFingerprintKeyId;
-	const destinationFingerprint = fingerprintDestination(input.destination, ring, fingerprintKeyId);
+	const fingerprintKeyId = keyring.currentFingerprintKeyId;
+	const destinationFingerprint = fingerprintDestination(input.destination, keyring, fingerprintKeyId);
 	const sourceFingerprint = fingerprintSource(
 		projectId,
 		environmentId,
 		kind,
 		input.sourceKey,
-		ring,
+		keyring,
 		fingerprintKeyId,
 	);
 	const sourceDedupeFingerprint = fingerprintSourceDedupe(
@@ -220,16 +221,16 @@ async function enqueueDeliveryInternal(
 		environmentId,
 		kind,
 		input.sourceKey,
-		ring,
+		keyring,
 	);
-	const legacySourceAliases = [...ring.fingerprintKeys.keys()].map((keyId) => ({
+	const legacySourceAliases = [...keyring.fingerprintKeys.keys()].map((keyId) => ({
 		keyId,
 		fingerprint: fingerprintSource(
 			projectId,
 			environmentId,
 			kind,
 			input.sourceKey,
-			ring,
+			keyring,
 			keyId,
 		),
 	}));
@@ -245,7 +246,7 @@ async function enqueueDeliveryInternal(
 		destinationFingerprint,
 		expiresAt: semanticExpiresAt,
 	};
-	const encrypted = encryptDeliveryPayload(input.payload, aad, ring);
+	const encrypted = encryptDeliveryPayload(input.payload, aad, keyring);
 	const traceCarrier = captureActiveDeliveryTraceCarrier();
 	const quotaTransaction: DeliveryRawTransaction = {
 		rawTransactionQuery: async <Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -265,7 +266,7 @@ async function enqueueDeliveryInternal(
 		 WHERE source_dedupe_version=1`,
 	);
 	const unavailableLegacyKeyId = legacyKeyIds.rows.find(
-		(row) => !ring.fingerprintKeys.has(row.source_fingerprint_key_id),
+		(row) => !keyring.fingerprintKeys.has(row.source_fingerprint_key_id),
 	)?.source_fingerprint_key_id;
 	if (unavailableLegacyKeyId) {
 		throw new DeliveryError(
@@ -422,7 +423,7 @@ async function enqueueDeliveryInternal(
 export async function enqueueDelivery(
 	tx: DeliveryTransactionAdapter,
 	input: EnqueueDeliveryInput,
-	ring: DeliveryKeyring,
+	keyring: DeliveryKeyring,
 	options: DeliverySchemaOptions = {},
 ): Promise<EnqueuedDelivery> {
 	if (Object.prototype.hasOwnProperty.call(input, "webhookEndpointId")) {
@@ -431,14 +432,14 @@ export async function enqueueDelivery(
 			"Managed webhook delivery requires endpoint authority",
 		);
 	}
-	return enqueueDeliveryInternal(tx, input, ring, options);
+	return enqueueDeliveryInternal(tx, input, keyring, options);
 }
 
 /** Package-internal authority used only after endpoint locking and config derivation. */
 export async function enqueueManagedDeliveryInExistingTransactionInternal(
 	transaction: DeliveryRawTransaction,
 	input: EnqueueDeliveryInput & { webhookEndpointId: string },
-	ring: DeliveryKeyring,
+	keyring: DeliveryKeyring,
 	options: DeliverySchemaOptions = {},
 ): Promise<EnqueuedDelivery> {
 	if (!transaction.rawTransactionQuery) {
@@ -450,7 +451,7 @@ export async function enqueueManagedDeliveryInExistingTransactionInternal(
 	return enqueueDeliveryInternal(
 		createDeliveryRawTransactionAdapter(transaction.rawTransactionQuery),
 		input,
-		ring,
+		keyring,
 		options,
 	);
 }

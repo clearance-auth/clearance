@@ -97,7 +97,7 @@ describe("managed password reset transaction", () => {
 				}),
 			).rejects.toThrow("forced password update failure");
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.not.toBeNull();
 			updatePassword.mockRestore();
 
@@ -107,7 +107,7 @@ describe("managed password reset transaction", () => {
 				}),
 			).resolves.toMatchObject({ status: true });
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.toBeNull();
 		} finally {
 			runtime.database.close();
@@ -129,7 +129,7 @@ describe("managed password reset transaction", () => {
 				}),
 			).rejects.toThrow("rollback-capable database transactions");
 			await expect(
-				context.internalAdapter.findVerificationValue(identifier),
+				context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 			).resolves.not.toBeNull();
 		} finally {
 			runtime.database.close();

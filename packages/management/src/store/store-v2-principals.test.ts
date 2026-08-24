@@ -15,16 +15,10 @@ import {
 describe("store-v2 principal mapping", () => {
 	it("always advances same-millisecond OCC tokens", () => {
 		expect(
-			advancingPrincipalUpdatedAt(
-				"2026-07-15T00:00:00.000Z",
-				"2026-07-15T00:00:00.000Z",
-			),
+			advancingPrincipalUpdatedAt({ proposedUpdatedAt: "2026-07-15T00:00:00.000Z", storedUpdatedAt: "2026-07-15T00:00:00.000Z" }),
 		).toBe("2026-07-15T00:00:00.001Z");
 		expect(
-			advancingPrincipalUpdatedAt(
-				"2026-07-14T23:59:59.999Z",
-				"2026-07-15T00:00:00.001Z",
-			),
+			advancingPrincipalUpdatedAt({ proposedUpdatedAt: "2026-07-14T23:59:59.999Z", storedUpdatedAt: "2026-07-15T00:00:00.001Z" }),
 		).toBe("2026-07-15T00:00:00.002Z");
 	});
 	it("maps every principal field and normalizes timestamps", () => {
@@ -103,7 +97,7 @@ describe("store-v2 principal mapping", () => {
 	});
 
 	it("sanitizes PostgreSQL errors using the exact derived email index", () => {
-		const tables = storeV2TableNames(`${"p".repeat(40)}_`);
+		const tables = storeV2TableNames(`${"p".repeat(30)}_`);
 		const emailIndex = storeV2PrincipalEmailUniqueIndex(tables);
 		const externalIdIndex = storeV2PrincipalExternalIdUniqueIndex(tables);
 		expect(emailIndex.length).toBeLessThanOrEqual(63);

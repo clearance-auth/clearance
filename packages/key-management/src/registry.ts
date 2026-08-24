@@ -10,7 +10,7 @@ import {
 } from "./types.js";
 
 export type KeyProviderRegistry = Readonly<{
-	providerFor(purpose: KeyPurpose): KeyEncryptionProvider;
+	requireProviderFor(purpose: KeyPurpose): KeyEncryptionProvider;
 	readiness(): Promise<Readonly<{ ready: boolean; purposes: Readonly<Record<KeyPurpose, KeyProviderReadiness>> }>>;
 }>;
 
@@ -59,7 +59,7 @@ export function createKeyProviderRegistry(
 	}
 	Object.freeze(exact);
 	return Object.freeze({
-		providerFor(purpose: KeyPurpose) {
+		requireProviderFor(purpose: KeyPurpose) {
 			const provider = exact[purpose];
 			if (!provider) {
 				throw new KeyManagementError("KEY_REGISTRY_INVALID", "Key purpose is not configured");

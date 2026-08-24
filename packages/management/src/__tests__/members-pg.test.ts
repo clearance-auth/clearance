@@ -767,7 +767,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 		const now = new Date().toISOString();
 		store.mutate((data) => {
 			for (const id of [allowedConnectionId, deniedConnectionId, revokedConnectionId]) {
-				data.identityConnections.push({
+				data.ssoConnections.push({
 					id,
 					organizationId: organization.id,
 					protocol: "oidc",
@@ -827,7 +827,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			status: 403,
 		});
 		expect(
-			store.snapshot.identityConnections.find(
+			store.snapshot.ssoConnections.find(
 				(connection) => connection.id === deniedConnectionId,
 			)?.status,
 		).toBe("active");
@@ -859,7 +859,7 @@ describe.skipIf(!available)("membership Postgres runtime + management", () => {
 			status: 403,
 		});
 		expect(
-			store.snapshot.identityConnections.find(
+			store.snapshot.ssoConnections.find(
 				(connection) => connection.id === revokedConnectionId,
 			)?.status,
 		).toBe("active");

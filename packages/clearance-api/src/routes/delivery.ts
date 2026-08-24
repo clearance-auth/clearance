@@ -6,11 +6,12 @@ import {
 	getDeliveryReadinessForManagement,
 	inspectDeliveryJobForManagement,
 	listDeliveryJobsForManagement,
+	type DeliveryChannel,
+	type DeliveryJobState,
 } from "@clearance/management";
 import { Hono, type Context } from "hono";
 import { apiOperationContext, type ScopedRouteDependencies } from "./shared.js";
 
-type DeliveryState = "queued" | "leased" | "retry" | "delivered" | "dead" | "cancelled";
 
 function requestError(
 	code: string,
@@ -89,8 +90,8 @@ export function registerDeliveryRoutes({
 				...scope,
 				...(limit === undefined ? {} : { limit: Number(limit) }),
 				...(cursor === undefined ? {} : { cursor }),
-				...(states.length === 0 ? {} : { states: states as DeliveryState[] }),
-				...(channel === undefined ? {} : { channel: channel as "email" | "webhook" }),
+				...(states.length === 0 ? {} : { states: states as DeliveryJobState[] }),
+				...(channel === undefined ? {} : { channel: channel as DeliveryChannel }),
 				...(kind === undefined ? {} : { kind }),
 			}));
 		} catch (error) {

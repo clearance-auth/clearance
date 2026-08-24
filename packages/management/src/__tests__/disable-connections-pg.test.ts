@@ -352,7 +352,7 @@ describe.skipIf(!available)(
 			const now = new Date().toISOString();
 
 			store.mutate((data: DataStoreSnapshot) => {
-				data.identityConnections.push({
+				data.ssoConnections.push({
 					id: connectionId,
 					organizationId: org.id,
 					protocol: "oidc",
@@ -397,7 +397,7 @@ describe.skipIf(!available)(
 			const now = new Date().toISOString();
 
 			store.mutate((data: DataStoreSnapshot) => {
-				data.directoryConnections.push({
+				data.scimConnections.push({
 					id: connectionId,
 					organizationId: org.id,
 					provider: "okta",
@@ -442,7 +442,7 @@ describe.skipIf(!available)(
 						updatedAt: now,
 					});
 				}
-				data.identityConnections.push({
+				data.ssoConnections.push({
 					id: connectionId,
 					organizationId: ORG_FOREIGN_ID,
 					protocol: "oidc",
@@ -493,7 +493,7 @@ describe.skipIf(!available)(
 						updatedAt: now,
 					});
 				}
-				data.directoryConnections.push({
+				data.scimConnections.push({
 					id: connectionId,
 					organizationId: ORG_FOREIGN_ID,
 					provider: "okta",
@@ -525,7 +525,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeSsoExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 
@@ -539,7 +539,7 @@ describe.skipIf(!available)(
 			expect(result.runtimeRemoved).toBe(true);
 			expect(await runtimeSsoExists(connectionId)).toBe(false);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("disabled");
 
@@ -587,7 +587,7 @@ describe.skipIf(!available)(
 			const scope = resolveOperatorScope(store);
 			const foreignId = await seedForeignSso(store);
 			const eventsBefore = store.snapshot.events.length;
-			const statusBefore = store.snapshot.identityConnections.find(
+			const statusBefore = store.snapshot.ssoConnections.find(
 				(c) => c.id === foreignId,
 			)?.status;
 
@@ -611,7 +611,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeSsoExists(foreignId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === foreignId)
+				store.snapshot.ssoConnections.find((c) => c.id === foreignId)
 					?.status,
 			).toBe(statusBefore);
 			expect(disableAudits(store, "sso.disable", foreignId)).toHaveLength(0);
@@ -638,7 +638,7 @@ describe.skipIf(!available)(
 			// Runtime delete must not stick (transaction rolled back).
 			expect(await runtimeSsoExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.identityConnections.find((c) => c.id === connectionId)
+				store.snapshot.ssoConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 			expect(disableAudits(store, "sso.disable", connectionId)).toHaveLength(0);
@@ -664,7 +664,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 
@@ -678,7 +678,7 @@ describe.skipIf(!available)(
 			expect(result.runtimeRemoved).toBe(true);
 			expect(await runtimeScimExists(connectionId)).toBe(false);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("disabled");
 
@@ -726,7 +726,7 @@ describe.skipIf(!available)(
 			const scope = resolveOperatorScope(store);
 			const foreignId = await seedForeignScim(store);
 			const eventsBefore = store.snapshot.events.length;
-			const statusBefore = store.snapshot.directoryConnections.find(
+			const statusBefore = store.snapshot.scimConnections.find(
 				(c) => c.id === foreignId,
 			)?.status;
 
@@ -743,7 +743,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(foreignId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === foreignId)
+				store.snapshot.scimConnections.find((c) => c.id === foreignId)
 					?.status,
 			).toBe(statusBefore);
 			expect(disableAudits(store, "scim.disable", foreignId)).toHaveLength(0);
@@ -769,7 +769,7 @@ describe.skipIf(!available)(
 
 			expect(await runtimeScimExists(connectionId)).toBe(true);
 			expect(
-				store.snapshot.directoryConnections.find((c) => c.id === connectionId)
+				store.snapshot.scimConnections.find((c) => c.id === connectionId)
 					?.status,
 			).toBe("active");
 			expect(disableAudits(store, "scim.disable", connectionId)).toHaveLength(0);

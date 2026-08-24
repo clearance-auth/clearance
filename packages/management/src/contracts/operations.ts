@@ -7,7 +7,7 @@ import type {
 	Membership,
 	MigrationPlan,
 	Organization,
-	Principal,
+	User,
 	Project,
 	ReadinessReport,
 } from "../types/resources.js";
@@ -32,8 +32,8 @@ import type {
 } from "../services/members-import.js";
 import type { validateRole } from "../services/roles.js";
 import type {
-	PublicDirectoryConnection,
-	PublicIdentityConnection,
+	PublicScimConnection,
+	PublicSsoConnection,
 } from "../services/redact.js";
 import type { RevokeSessionResult, SessionView } from "../services/sessions.js";
 import type { ConfigRecord, diffConfig, publicConfig } from "../services/config.js";
@@ -112,6 +112,7 @@ import type { ProductEmailTemplateKind } from "../store/product-presentation-aut
 import type {
 	DeliveryControlAction,
 	DeliveryControlPreview,
+	DeliveryChannel,
 	DeliveryJobState,
 	DeliveryQuotaStatus,
 	DeliveryReadinessSummary,
@@ -202,10 +203,6 @@ export type ManagementJsonWire<Value> =
 						? { -readonly [Key in keyof Value]: ManagementJsonWire<Value[Key]> }
 						: never;
 
-type PublicSsoIdentityConnection = Omit<PublicIdentityConnection, "protocol"> & {
-	protocol: "saml" | "oidc";
-};
-
 type WithPublicConnection<Value, Connection> =
 	Value extends { connection: unknown }
 		? Omit<Value, "connection"> & { connection: Connection }
@@ -214,13 +211,13 @@ type WithPublicConnection<Value, Connection> =
 type PublicScimTestResult<Value> =
 	Value extends { connection: unknown; proposed: unknown }
 		? Omit<Value, "connection" | "proposed"> & {
-				connection: PublicDirectoryConnection;
+				connection: PublicScimConnection;
 				proposed: Array<{
 					action: "deprovision" | "upsert";
 					email: string;
 				}>;
 		  }
-		: WithPublicConnection<Value, PublicDirectoryConnection>;
+		: WithPublicConnection<Value, PublicScimConnection>;
 
 type SetupLinkWire =
 	| (ReturnType<typeof createSetupLink> & { scope: ResourceScope })
@@ -560,7 +557,7 @@ export interface ManagementOperationServiceTypes {
 	};
 	"sso.list": {
 		input: { organizationId?: string };
-		output: { connections: PublicSsoIdentityConnection[]; scope: ResourceScope };
+		output: { connections: PublicSsoConnection[]; scope: ResourceScope };
 	};
 	"sso.create": {
 		input: {
@@ -573,20 +570,20 @@ export interface ManagementOperationServiceTypes {
 			samlEntryPoint?: string;
 			samlCertificate?: string;
 		};
-		output: { connection: PublicSsoIdentityConnection };
+		output: { connection: PublicSsoConnection };
 	};
 	"sso.configure": {
 		input: { id: string; issuer?: string; audience?: string; domain?: string; domains?: string[]; dryRun?: boolean };
 		output:
-			| { connection: PublicSsoIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicSsoIdentityConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
+			| { connection: PublicSsoConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; proposed: { issuer?: string; audience?: string; domains?: string[] }; scope: ResourceScope };
 	};
 	"sso.test": {
 		input: { id: string; fixture?: string; live?: boolean };
 		output:
-			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnection>>, PublicSsoIdentityConnection>
-			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionReal>>, PublicSsoIdentityConnection>
-			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionLive>>, PublicSsoIdentityConnection>;
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnection>>, PublicSsoConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionReal>>, PublicSsoConnection>
+			| WithPublicConnection<Awaited<ReturnType<typeof testSsoConnectionLive>>, PublicSsoConnection>;
 	};
 	"sso.setupLink.create": {
 		input: { organizationId: string };
@@ -595,25 +592,25 @@ export interface ManagementOperationServiceTypes {
 	"sso.rotate": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicSsoIdentityConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicSsoIdentityConnection; wouldChange: true; scope: ResourceScope };
+			| { connection: PublicSsoConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; wouldChange: true; scope: ResourceScope };
 	};
 	"sso.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicSsoIdentityConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
-			| { dryRun: true; connection: PublicSsoIdentityConnection; wouldChange: boolean; scope: ResourceScope };
+			| { connection: PublicSsoConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
+			| { dryRun: true; connection: PublicSsoConnection; wouldChange: boolean; scope: ResourceScope };
 	};
 	"scim.list": {
 		input: { organizationId?: string };
-		output: { connections: PublicDirectoryConnection[]; scope: ResourceScope };
+		output: { connections: PublicScimConnection[]; scope: ResourceScope };
 	};
 	"scim.create": {
 		input: { organizationId: string; provider: string; endpoint?: string };
 		output:
-			| { connection: PublicDirectoryConnection & { bearerTokenOnce: string } }
+			| { connection: PublicScimConnection & { bearerTokenOnce: string } }
 			| {
-					connection: PublicDirectoryConnection;
+					connection: PublicScimConnection;
 					oneTimeSecretsOmitted: ["connection.bearerTokenOnce"];
 			  };
 	};
@@ -639,14 +636,14 @@ export interface ManagementOperationServiceTypes {
 	"scim.rotate": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicDirectoryConnection; scope: ResourceScope }
-			| { dryRun: true; connection: PublicDirectoryConnection; wouldChange: true; scope: ResourceScope };
+			| { connection: PublicScimConnection; scope: ResourceScope }
+			| { dryRun: true; connection: PublicScimConnection; wouldChange: true; scope: ResourceScope };
 	};
 	"scim.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { connection: PublicDirectoryConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
-			| { dryRun: true; connection: PublicDirectoryConnection; wouldChange: boolean; scope: ResourceScope };
+			| { connection: PublicScimConnection; idempotent: boolean; runtimeRemoved?: boolean; scope: ResourceScope }
+			| { dryRun: true; connection: PublicScimConnection; wouldChange: boolean; scope: ResourceScope };
 	};
 	"scim.replay": {
 		input: { traceId: string; dryRun?: boolean; confirm?: boolean };
@@ -665,7 +662,7 @@ export interface ManagementOperationServiceTypes {
 			limit?: number;
 			cursor?: string;
 			states?: DeliveryJobState[];
-			channel?: "email" | "webhook";
+			channel?: DeliveryChannel;
 			kind?: string;
 		};
 		output: ScopedDeliveryJobPage;
@@ -850,7 +847,7 @@ export interface ManagementOperationServiceTypes {
 		input: { source: "legacy"; fixture: string };
 		output: { plan: MigrationPlan };
 	};
-	"migrations.run": {
+	"migrations.apply": {
 		input: { id: string; fixture: string; dryRun?: boolean };
 		output: { plan: MigrationPlan };
 	};
@@ -1004,22 +1001,22 @@ export interface ManagementOperationServiceTypes {
 	};
 	"users.list": {
 		input: { limit?: number; cursor?: string };
-		output: { users: Principal[]; nextCursor?: string | null; scope: ResourceScope };
+		output: { users: User[]; nextCursor?: string | null; scope: ResourceScope };
 	};
 	"users.inspect": {
 		input: { id: string };
-		output: { user: Principal; scope: ResourceScope };
+		output: { user: User; scope: ResourceScope };
 	};
 	"users.create": {
 		input: { email: string; name: string; password?: string; dryRun?: boolean };
 		output:
 			| { dryRun: true; email: string; name: string; scope: ResourceScope }
-			| { user: Principal; passwordSetupToken?: string; passwordSetupExpiresAt?: string };
+			| { user: User; passwordSetupToken?: string; passwordSetupExpiresAt?: string };
 	};
 	"users.update": {
 		input: { id: string; email?: string; name?: string; status?: string; dryRun?: boolean };
 		output:
-			| { user: Principal; scope: ResourceScope }
+			| { user: User; scope: ResourceScope }
 			| {
 					dryRun: true;
 					id: string;
@@ -1032,12 +1029,12 @@ export interface ManagementOperationServiceTypes {
 	"users.disable": {
 		input: { id: string; dryRun?: boolean };
 		output:
-			| { user: Principal; scope: ResourceScope }
-			| { dryRun: true; user: Principal; scope: ResourceScope };
+			| { user: User; scope: ResourceScope }
+			| { dryRun: true; user: User; scope: ResourceScope };
 	};
 	"users.delete": {
 		input: { id: string };
-		output: { user: Principal; scope: ResourceScope };
+		output: { user: User; scope: ResourceScope };
 	};
 	"users.export": {
 		input: { format?: "json" | "jsonl"; limit?: number; status?: string };
@@ -2080,10 +2077,10 @@ export const MIGRATION_OPERATIONS = Object.freeze({
 		supportsDryRun: false,
 		confirmation: "none",
 	}),
-	run: defineOperation({
-		id: "migrations.run",
-		cliPath: "migration run",
-		http: { method: "POST", path: "/v1/migrations/:id/run" },
+	apply: defineOperation({
+		id: "migrations.apply",
+		cliPath: "migration apply",
+		http: { method: "POST", path: "/v1/migrations/:id/apply" },
 		mutation: true,
 		supportsDryRun: true,
 		confirmation: "none",

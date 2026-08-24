@@ -52,7 +52,7 @@ const TRANSPORT_KEY = /^[A-Za-z][A-Za-z0-9_]*$/;
 const API_PATH = /^\/v1(?:\/(?:[A-Za-z0-9._~!$&'()*+,;=@%-]+|:[A-Za-z][A-Za-z0-9_]*))+$/;
 const HTTP_METHODS = new Set(["GET", "POST", "PATCH", "DELETE"]);
 const CONFIRMATIONS = new Set(["none", "client-required", "client-required-when-live", "server-required"]);
-const BASE_PROTECTED_HEADERS = new Set(["authorization", "idempotency-key", "accept", "content-type"]);
+const BASE_PROTECTED_HEADERS = new Set(["authorization", "operation-key", "accept", "content-type"]);
 const OPERATION_KEYS = new Set(["id", "http", "mutation", "supportsDryRun", "confirmation", "confirmationWhen", "schemas", "transport"]);
 const HTTP_KEYS = new Set(["method", "path", "currentPath"]);
 const SCHEMA_KEYS = new Set(["input", "output"]);
@@ -563,7 +563,7 @@ function callSpec(
 		headers.set("accept", "application/json");
 		if (config.authorization) headers.set("authorization", config.authorization);
 		if (body !== undefined) headers.set("content-type", "application/json");
-		if (mutation) headers.set("idempotency-key", idempotencyKey as string);
+		if (mutation) headers.set("operation-key", idempotencyKey as string);
 		if (mutation && config.csrf) headers.set(config.csrf.header, config.csrf.token);
 		let response: Response;
 		try {

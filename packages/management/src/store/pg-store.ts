@@ -103,6 +103,7 @@ import {
 	deferAuditRetentionForDraft,
 	type AuditEventInput,
 } from "../services/audit.js";
+import { ClearanceError } from "../services/errors.js";
 import type {
 	DeliveryControlMutationInput,
 	DeliveryControlAuditContext,
@@ -123,6 +124,7 @@ import type {
 } from "./types.js";
 
 const SNAPSHOT_TABLE = "clearance_management_snapshot";
+const UPGRADE_LOCK_KEY = "clearance:upgrade:global:v1";
 
 type StoreV2SnapshotPublication = Omit<StoreV2LoadResult, "storedSnapshot">;
 
@@ -671,7 +673,7 @@ export class PgStore implements ManagementStore {
 			)
 		`);
 
-		// Idempotency-Key replay records (FOLLOW.md P2.3.2). Deliberately a
+		// Operation-Key replay records (FOLLOW.md P2.3.2). Deliberately a
 		// companion table, NOT part of the JSONB snapshot: storing keys in the
 		// snapshot would inflate every subsequent write of any kind and make TTL
 		// expiry itself a snapshot mutation.
@@ -680,14 +682,23 @@ export class PgStore implements ManagementStore {
 				scope_key text NOT NULL,
 				key text NOT NULL,
 				fingerprint text NOT NULL,
-				status integer NOT NULL,
-				content_type text NOT NULL,
-				body text NOT NULL,
+				state text NOT NULL DEFAULT 'completed',
+				owner_generation bigint NOT NULL DEFAULT 0,
+				lease_expires_at timestamptz,
+				status integer NOT NULL DEFAULT 0,
+				content_type text NOT NULL DEFAULT '',
+				body text NOT NULL DEFAULT '',
 				created_at timestamptz NOT NULL DEFAULT now(),
 				expires_at timestamptz NOT NULL,
 				PRIMARY KEY (scope_key, key)
 			)
 		`);
+		// Upgrade existing replay tables in place. A pending claim fences side
+		// effects before the route executes; generation prevents a stale owner
+		// from completing after a lease has been recovered by another request.
+		await this.pool.query(`ALTER TABLE ${this.idempotencyTable} ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'completed'`);
+		await this.pool.query(`ALTER TABLE ${this.idempotencyTable} ADD COLUMN IF NOT EXISTS owner_generation bigint NOT NULL DEFAULT 0`);
+		await this.pool.query(`ALTER TABLE ${this.idempotencyTable} ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz`);
 		// SCIM bearer response-loss recovery is intentionally separate from the
 		// generic HTTP idempotency table: a persisted response body must never be
 		// used to retain a plaintext bearer token. This table keeps only a
@@ -1138,8 +1149,35 @@ export class PgStore implements ManagementStore {
 		await this.pool.end();
 	}
 
+	async withUpgradeLock<T>(fn: () => Promise<T>): Promise<T> {
+		const client = await this.pool.connect();
+		let acquired = false;
+		try {
+			const result = await client.query<{ acquired: boolean }>(
+				"SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
+				[UPGRADE_LOCK_KEY],
+			);
+			acquired = result.rows[0]?.acquired === true;
+			if (!acquired) {
+				throw new ClearanceError({
+					code: "UPGRADE_IN_PROGRESS",
+					message: "Another upgrade is already running.",
+					stage: "upgrade.lock",
+					status: 409,
+					remediation: "Wait for the active upgrade to finish, then retry.",
+				});
+			}
+			return await fn();
+		} finally {
+			if (acquired) {
+				await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [UPGRADE_LOCK_KEY]).catch(() => undefined);
+			}
+			client.release();
+		}
+	}
+
 	/**
-	 * Read a stored Idempotency-Key replay record. Expired rows are treated as
+	 * Read a stored Operation-Key replay record. Expired rows are treated as
 	 * absent (TTL is enforced on read as well as by opportunistic cleanup).
 	 */
 	async getIdempotencyRecord(
@@ -1159,7 +1197,7 @@ export class PgStore implements ManagementStore {
 		}>(
 			`SELECT fingerprint, status, content_type, body
        FROM ${this.idempotencyTable}
-       WHERE scope_key = $1 AND key = $2 AND expires_at > now()`,
+				 WHERE scope_key = $1 AND key = $2 AND state = 'completed' AND expires_at > now()`,
 			[scopeKey, key],
 		);
 		const row = r.rows[0];
@@ -1172,8 +1210,77 @@ export class PgStore implements ManagementStore {
 		};
 	}
 
+	async claimIdempotencyRecord(input: {
+		scopeKey: string; key: string; fingerprint: string; ttlMs: number; leaseMs: number;
+	}): Promise<
+		| { state: "claimed"; generation: number }
+		| { state: "pending"; generation: number }
+		| { state: "completed"; record: { scopeKey: string; key: string; fingerprint: string; status: number; contentType: string; body: string } }
+		| { state: "conflict" }
+	> {
+		await this.pool.query(`DELETE FROM ${this.idempotencyTable} WHERE expires_at <= now() AND (state <> 'pending' OR lease_expires_at <= now())`);
+		const inserted = await this.pool.query<{ owner_generation: string }>(
+			`INSERT INTO ${this.idempotencyTable}
+			 (scope_key, key, fingerprint, state, owner_generation, lease_expires_at, expires_at)
+			 VALUES ($1, $2, $3, 'pending', 1,
+			  now() + make_interval(secs => $4::double precision / 1000),
+			  now() + make_interval(secs => GREATEST($4::double precision, $5::double precision) / 1000))
+			 ON CONFLICT (scope_key, key) DO NOTHING
+			 RETURNING owner_generation`,
+			[input.scopeKey, input.key, input.fingerprint, input.leaseMs, input.ttlMs],
+		);
+		if (inserted.rows[0]) return { state: "claimed", generation: Number(inserted.rows[0].owner_generation) };
+		const recovered = await this.pool.query<{ owner_generation: string }>(
+			`UPDATE ${this.idempotencyTable}
+			 SET state = 'pending', owner_generation = owner_generation + 1,
+			     lease_expires_at = now() + make_interval(secs => $4::double precision / 1000)
+			 WHERE scope_key = $1 AND key = $2 AND fingerprint = $3
+			   AND (state = 'failed' OR (state = 'pending' AND lease_expires_at <= now()))
+			 RETURNING owner_generation`,
+			[input.scopeKey, input.key, input.fingerprint, input.leaseMs],
+		);
+		if (recovered.rows[0]) return { state: "claimed", generation: Number(recovered.rows[0].owner_generation) };
+		const current = await this.pool.query<{ fingerprint: string; state: string; owner_generation: string; status: number; content_type: string; body: string }>(
+			`SELECT fingerprint, state, owner_generation, status, content_type, body FROM ${this.idempotencyTable} WHERE scope_key = $1 AND key = $2`, [input.scopeKey, input.key],
+		);
+		const row = current.rows[0];
+		if (!row || row.fingerprint !== input.fingerprint) return { state: "conflict" };
+		if (row.state === "completed") return { state: "completed", record: { scopeKey: input.scopeKey, key: input.key, fingerprint: row.fingerprint, status: Number(row.status), contentType: row.content_type, body: row.body } };
+		return { state: "pending", generation: Number(row.owner_generation) };
+	}
+
+	async completeIdempotencyRecord(record: { scopeKey: string; key: string; fingerprint: string; status: number; contentType: string; body: string; generation: number; ttlMs: number }): Promise<boolean> {
+		const result = await this.pool.query(
+			`UPDATE ${this.idempotencyTable} SET state = 'completed', status = $5, content_type = $6, body = $7, lease_expires_at = NULL,
+			 expires_at = now() + make_interval(secs => $8::double precision / 1000)
+			 WHERE scope_key = $1 AND key = $2 AND fingerprint = $3 AND state = 'pending' AND owner_generation = $4 AND lease_expires_at > now()`,
+			[record.scopeKey, record.key, record.fingerprint, record.generation, record.status, record.contentType, record.body, record.ttlMs],
+		);
+		return result.rowCount === 1;
+	}
+
+	async renewIdempotencyRecord(input: { scopeKey: string; key: string; fingerprint: string; generation: number; ttlMs: number; leaseMs: number }): Promise<boolean> {
+		const result = await this.pool.query(
+			`UPDATE ${this.idempotencyTable}
+			 SET lease_expires_at = now() + make_interval(secs => $5::double precision / 1000),
+			     expires_at = now() + make_interval(secs => GREATEST($5::double precision, $6::double precision) / 1000)
+			 WHERE scope_key = $1 AND key = $2 AND fingerprint = $3 AND state = 'pending'
+			   AND owner_generation = $4 AND lease_expires_at > now()`,
+			[input.scopeKey, input.key, input.fingerprint, input.generation, input.leaseMs, input.ttlMs],
+		);
+		return result.rowCount === 1;
+	}
+
+	async failIdempotencyRecord(input: { scopeKey: string; key: string; fingerprint: string; generation: number }): Promise<void> {
+		await this.pool.query(
+			`UPDATE ${this.idempotencyTable} SET state = 'failed', lease_expires_at = NULL
+			 WHERE scope_key = $1 AND key = $2 AND fingerprint = $3 AND state = 'pending' AND owner_generation = $4`,
+			[input.scopeKey, input.key, input.fingerprint, input.generation],
+		);
+	}
+
 	/**
-	 * Store an Idempotency-Key replay record with a TTL. Opportunistically
+	 * Store an Operation-Key replay record with a TTL. Opportunistically
 	 * deletes expired rows first (the table stays small; expiry never touches
 	 * the snapshot). ON CONFLICT DO NOTHING: the first committed responder wins
 	 * under a same-key race.
@@ -1188,7 +1295,7 @@ export class PgStore implements ManagementStore {
 		ttlMs: number;
 	}): Promise<void> {
 		await this.pool.query(
-			`DELETE FROM ${this.idempotencyTable} WHERE expires_at <= now()`,
+			`DELETE FROM ${this.idempotencyTable} WHERE expires_at <= now() AND (state <> 'pending' OR lease_expires_at <= now())`,
 		);
 		await this.pool.query(
 			`INSERT INTO ${this.idempotencyTable}
@@ -2220,7 +2327,7 @@ export class PgStore implements ManagementStore {
 		if (!state) {
 			throw new StoreV2MigrationError(
 				"STORE_V2_PRINCIPAL_STATE_INVALID",
-				"Principal authority state metadata is missing or invalid.",
+				"User authority state metadata is missing or invalid.",
 			);
 		}
 		return state.count;

@@ -1776,7 +1776,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 								? await getAuthoritativeSessionFromCtx(ctx)
 								: ctx.context.session;
 							const verification =
-								await ctx.context.internalAdapter.findVerificationValue(
+								await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 									consentCode,
 								);
 							if (!verification) throw invalidCode();
@@ -2111,7 +2111,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 					}
 
 					const verificationValue =
-						await ctx.context.internalAdapter.findVerificationValue(
+						await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 							code.toString(),
 						);
 					if (!verificationValue) {

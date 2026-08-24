@@ -27,6 +27,7 @@ import {
 	type DeliveryJobRecord,
 	type DeliveryJobState,
 	redactedDeliveryJob,
+	type DeliveryChannel,
 	safeErrorClass,
 	safeProviderValue,
 } from "./redaction.js";
@@ -56,7 +57,7 @@ type JobRow = {
 	actor_id: string | null;
 	correlation_id: string | null;
 	webhook_endpoint_id: string | null;
-	channel: "email" | "webhook";
+	channel: DeliveryChannel;
 	state: DeliveryJobState;
 	cancel_requested: boolean;
 	attempt_count: number;
@@ -438,7 +439,7 @@ export class DeliveryStore {
 			envelope: string;
 			event_id: string;
 			kind: string;
-			channel: "email" | "webhook";
+			channel: DeliveryChannel;
 			project_id: string;
 			environment_id: string;
 			destination_fingerprint: string;
@@ -709,7 +710,7 @@ export class DeliveryStore {
 		boundedInteger(limit, "reclaim limit", 1, 1_000);
 		return this.transaction(async (client) => {
 			const rows = await client.query<{
-				id: string; event_id: string; channel: "email" | "webhook"; project_id: string;
+				id: string; event_id: string; channel: DeliveryChannel; project_id: string;
 				environment_id: string; organization_id: string | null; actor_id: string | null;
 				correlation_id: string | null; webhook_endpoint_id: string | null;
 				attempt_count: number; max_attempts: number; semantic_expires_at: Date | string;
@@ -776,7 +777,7 @@ export class DeliveryStore {
 		boundedInteger(limit, "expiry limit", 1, 1_000);
 		return this.transaction(async (client) => {
 			const expired = await client.query<{
-				id: string; event_id: string; channel: "email" | "webhook"; project_id: string;
+				id: string; event_id: string; channel: DeliveryChannel; project_id: string;
 				environment_id: string; organization_id: string | null; actor_id: string | null;
 				correlation_id: string | null; webhook_endpoint_id: string | null;
 				state: DeliveryJobState; attempt_count: number; lease_token: string | null; lease_owner: string | null;
@@ -981,7 +982,7 @@ export class DeliveryStore {
 		limit?: number;
 		cursor?: string;
 		states?: readonly DeliveryJobState[];
-		channel?: "email" | "webhook";
+		channel?: DeliveryChannel;
 		kind?: string;
 	}): Promise<DeliveryJobPage> {
 		return listDeliveryJobs(this.pool, input, this.options);

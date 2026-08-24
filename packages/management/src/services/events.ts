@@ -520,11 +520,7 @@ export function exportEvents(
 
 	if (opts.outputPath) {
 		const body = serializeExportBody(envelope, format);
-		const written = writeExportArtifact(
-			opts.outputPath,
-			body,
-			Boolean(opts.force),
-		);
+		const written = writeExportArtifact({ outputPath: opts.outputPath, body, force: Boolean(opts.force) });
 		envelope.outputPath = written;
 	}
 
@@ -596,11 +592,7 @@ export async function exportEventsOperational(
 
 	if (opts.outputPath) {
 		const body = serializeExportBody(envelope, format);
-		const written = writeExportArtifact(
-			opts.outputPath,
-			body,
-			Boolean(opts.force),
-		);
+		const written = writeExportArtifact({ outputPath: opts.outputPath, body, force: Boolean(opts.force) });
 		envelope.outputPath = written;
 	}
 
@@ -735,7 +727,7 @@ async function recordIdempotentReplayAuditAuthoritative(
 			throw traceNotFound(input.original.id, "events.replay");
 		}
 		if (original.connectionId) {
-			const connection = data.directoryConnections.find(
+			const connection = data.scimConnections.find(
 				(candidate) => candidate.id === original.connectionId,
 			);
 			const organization = connection && topology ? await topology.lockOrganization({

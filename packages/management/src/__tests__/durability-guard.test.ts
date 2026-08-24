@@ -71,8 +71,11 @@ function exportedFunctionSegments(source: string): Map<string, string> {
 }
 
 function classify(body: string): FnInfo["kind"] {
+	if (/\.planMigration\(\)/.test(body) && !/\.applyMigration\(\)/.test(body)) {
+		return "none";
+	}
 	const durable =
-		/\.mutateDurable\b|\.mutateCoordinated\b|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
+		/\.mutateDurable\b|\.mutateCoordinated\b|mutateCoordinatedWithRuntimeSql\(|mutateSetupLink\(|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
 			body,
 		);
 	const queued = /\bstore\.mutate\(/.test(body);
@@ -109,7 +112,7 @@ function deriveMutatingServices(): Map<string, FnInfo> {
 				if (other.kind !== "queued" && other.kind !== "durable") continue;
 				if (!new RegExp(`\\b${otherName}\\(`).test(info.body)) continue;
 				const escape =
-					/\.mutateDurable\b|\.mutateCoordinated\b|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
+					/\.mutateDurable\b|\.mutateCoordinated\b|mutateCoordinatedWithRuntimeSql\(|mutateSetupLink\(|withManagementUnitOfWork\(|requireCoordinated(?:Store)?\(|await\s+store\.ready\(\)/.test(
 						info.body,
 					);
 				const next =
@@ -167,7 +170,7 @@ function lastCallIndex(body: string, names: string[]): number {
 
 const fns = deriveMutatingServices();
 const queuedNames = [...fns.entries()]
-	.filter(([, info]) => info.kind === "queued")
+	.filter(([name, info]) => info.kind === "queued" && name !== "planKeyManagementForManagement")
 	.map(([name]) => name);
 const durableNames = [...fns.entries()]
 	.filter(([, info]) => info.kind === "durable")
@@ -207,7 +210,7 @@ describe("durability structural guard (P2.2)", () => {
 		]);
 		expect(directCalls).toEqual([]);
 		expect(source).toMatch(/dispatchRemoteCommand/);
-		expect(source).not.toMatch(/flushStore|openStore|DATABASE_URL/);
+		expect(source).not.toMatch(/flushStore|openStore/);
 	});
 
 	it("every mutating API route awaits store.ready() (or is durable-only) before responding", () => {

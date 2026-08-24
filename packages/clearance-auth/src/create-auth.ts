@@ -432,7 +432,7 @@ function resolveProductKeyManagement<
 	const registry = explicit?.registry ?? developmentKeyManagementRegistry(options.secret);
 	if (
 		!registry ||
-		typeof registry.providerFor !== "function" ||
+		typeof registry.requireProviderFor !== "function" ||
 		typeof registry.readiness !== "function"
 	) {
 		throw new Error("keyManagement registry is invalid");
@@ -1063,7 +1063,7 @@ export function createClearanceAuthWithTenantProductAdministration<
 			resourceId: string,
 			plaintext: string,
 		): Promise<string> {
-			return keyManagement.registry.providerFor(purpose).seal(
+			return keyManagement.registry.requireProviderFor(purpose).seal(
 				Buffer.from(plaintext, "utf8"),
 				{
 					projectId: keyManagement.projectId,
@@ -1078,7 +1078,7 @@ export function createClearanceAuthWithTenantProductAdministration<
 			envelope: string,
 		): Promise<string> {
 			return Buffer.from(
-				await keyManagement.registry.providerFor(purpose).open(envelope, {
+				await keyManagement.registry.requireProviderFor(purpose).open(envelope, {
 					projectId: keyManagement.projectId,
 					environmentId: keyManagement.environmentId,
 					resourceId,
@@ -1097,7 +1097,7 @@ export function createClearanceAuthWithTenantProductAdministration<
 				keyManagementFacade.scope,
 			);
 			const envelope = await keyManagement.registry
-				.providerFor(ONE_TIME_SECRET_REPLAY_PURPOSE)
+				.requireProviderFor(ONE_TIME_SECRET_REPLAY_PURPOSE)
 				.seal(canonicalOneTimeSecretReplayPlaintext(plaintext), {
 					...keyManagementFacade.scope,
 					resourceId,
@@ -1128,7 +1128,7 @@ export function createClearanceAuthWithTenantProductAdministration<
 				throw new Error("One-time secret replay envelope is invalid");
 			}
 			const bytes = Buffer.from(
-				await keyManagement.registry.providerFor(ONE_TIME_SECRET_REPLAY_PURPOSE).open(
+				await keyManagement.registry.requireProviderFor(ONE_TIME_SECRET_REPLAY_PURPOSE).open(
 					envelope,
 					{ ...keyManagementFacade.scope, resourceId },
 				),
@@ -2652,7 +2652,7 @@ export function createClearanceAuthWithTenantProductAdministration<
 			ONE_TIME_SECRET_REPLAY_PURPOSE,
 			"access-token-signing-key",
 		] as const).map((purpose) => {
-			const provider = keyManagement.registry.providerFor(purpose);
+			const provider = keyManagement.registry.requireProviderFor(purpose);
 			return Object.freeze({
 				purpose,
 				identity: sourceDigest(JSON.stringify({

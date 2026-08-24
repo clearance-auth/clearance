@@ -167,7 +167,7 @@ export type TenantProductReadiness = Readonly<{
 		simulation?: boolean;
 	}>[];
 	remainingCustomerActions: readonly string[];
-	signature: string;
+	reportDigest: string;
 	/** Exact enterprise configuration fingerprint evaluated by this response. */
 	stateFingerprint?: string;
 	/** A stored report is never silently treated as current after a mutation. */

@@ -36,11 +36,11 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type {
 	AuditEvent,
 	DataStoreSnapshot,
-	DirectoryConnection,
-	IdentityConnection,
+	ScimConnection,
+	SsoConnection,
 	Membership,
 	Organization,
-	Principal,
+	User,
 	SessionRecord,
 } from "./types/resources.js";
 import {
@@ -79,7 +79,6 @@ import {
 } from "./services/roles.js";
 import {
 	inspectSession,
-	normalizeSessionLimit,
 	sanitizeSessionView,
 	toSessionView,
 	type RevokeSessionResult,
@@ -89,6 +88,7 @@ import {
 import {
 	decodePageCursor,
 	encodePageCursor,
+	normalizePageLimit,
 } from "./services/pagination.js";
 import type {
 	InternalManagementCoordinatedMutationContext,
@@ -430,7 +430,7 @@ export function createManagedOrganizationLifecycleFacade(input: Readonly<{
 			const authorizationRevision = managedOrganizationRevision(
 				lifecycle.authorizationRevision,
 			);
-			const owner: Principal = {
+			const owner: User = {
 				id: ownerId,
 				projectId: scope.projectId,
 				environmentId: scope.environmentId,
@@ -455,7 +455,7 @@ export function createManagedOrganizationLifecycleFacade(input: Readonly<{
 				input.store,
 				lifecycle.transaction,
 				async ({ data, principals, topology, appendAudit }) => {
-					let principal: Principal;
+					let principal: User;
 					if (principals) {
 						const byEmail = await principals.findActiveByEmail({
 							scope,
@@ -474,7 +474,7 @@ export function createManagedOrganizationLifecycleFacade(input: Readonly<{
 								{
 									...owner,
 									createdAt: existing.createdAt,
-									updatedAt: advancingPrincipalUpdatedAt(owner.updatedAt, existing.updatedAt),
+									updatedAt: advancingPrincipalUpdatedAt({ proposedUpdatedAt: owner.updatedAt, storedUpdatedAt: existing.updatedAt }),
 								},
 								{ expectedUpdatedAt: existing.updatedAt },
 							);
@@ -570,7 +570,7 @@ export function createManagedOrganizationLifecycleFacade(input: Readonly<{
 }
 
 function tenantSsoConnection(
-	connection: IdentityConnection,
+	connection: SsoConnection,
 ): TenantProductSsoConnection {
 	if (connection.protocol !== "saml" && connection.protocol !== "oidc") {
 		throw new ClearanceError({
@@ -608,7 +608,7 @@ function tenantSsoConnection(
 }
 
 function tenantScimConnection(
-	connection: DirectoryConnection,
+	connection: ScimConnection,
 ): TenantProductScimConnection {
 	return Object.freeze({
 		id: connection.id,
@@ -777,14 +777,14 @@ export function createTenantProductAdministrationFacade(input: Readonly<{
 		async listSso({ organizationId }) {
 			await organization(organizationId);
 			return Object.freeze(
-				input.store.snapshot.identityConnections
+				input.store.snapshot.ssoConnections
 					.filter((connection) => connection.organizationId === organizationId)
 					.map(tenantSsoConnection),
 			);
 		},
 		async inspectSso({ organizationId, connectionId }) {
 			await organization(organizationId);
-			const connection = input.store.snapshot.identityConnections.find(
+			const connection = input.store.snapshot.ssoConnections.find(
 				(candidate) =>
 					candidate.id === connectionId &&
 					candidate.organizationId === organizationId,
@@ -888,14 +888,14 @@ export function createTenantProductAdministrationFacade(input: Readonly<{
 		async listScim({ organizationId }) {
 			await organization(organizationId);
 			return Object.freeze(
-				input.store.snapshot.directoryConnections
+				input.store.snapshot.scimConnections
 					.filter((connection) => connection.organizationId === organizationId)
 					.map(tenantScimConnection),
 			);
 		},
 		async inspectScim({ organizationId, connectionId }) {
 			await organization(organizationId);
-			const connection = input.store.snapshot.directoryConnections.find(
+			const connection = input.store.snapshot.scimConnections.find(
 				(candidate) =>
 					candidate.id === connectionId &&
 					candidate.organizationId === organizationId,
@@ -1053,7 +1053,7 @@ export function createTenantProductAdministrationFacade(input: Readonly<{
 					remainingCustomerActions: Object.freeze([
 						"Run an enterprise connection test to establish current readiness",
 					]),
-					signature: stateFingerprint,
+					reportDigest: stateFingerprint,
 					state: "not_run" as const,
 					stateFingerprint,
 				}) as TenantProductReadiness;
@@ -1664,7 +1664,7 @@ function authorizationOptions() {
 	};
 }
 
-export async function listUsersFromDb(): Promise<Principal[]> {
+export async function listUsersFromDb(): Promise<User[]> {
 	const b = getAuthBundle();
 	const r = await b.pool.query(
 		`select id, email, name, "createdAt", "updatedAt" from "user" order by "createdAt" desc limit 500`,
@@ -1689,7 +1689,7 @@ export async function createUserInAuth(input: {
 	/** When set, persists the runtime user into management with the same stable id */
 	managementStore?: ManagementStore;
 	operationContext?: OperationContext;
-}): Promise<Principal> {
+}): Promise<User> {
 	const b = getAuthBundle();
 	const result = await b.auth.api.signUpEmail({
 		body: {
@@ -1714,7 +1714,7 @@ export async function createUserInAuth(input: {
 		throw cause;
 	}
 	const { projectId, environmentId } = projectEnv();
-	const principal: Principal = {
+	const principal: User = {
 		id: user.id,
 		projectId,
 		environmentId,
@@ -1756,7 +1756,7 @@ export async function createUserWithPasswordSetupInAuth(input: {
 	name: string;
 	managementStore?: ManagementStore;
 	operationContext?: OperationContext;
-}): Promise<{ user: Principal; passwordSetup: PasswordSetupGrant }> {
+}): Promise<{ user: User; passwordSetup: PasswordSetupGrant }> {
 	const b = getAuthBundle();
 	const inaccessiblePassword = `Clr!${randomBytes(32).toString("base64url")}aA1`;
 	const user = await createUserInAuth({
@@ -1813,7 +1813,7 @@ export async function bridgeRuntimeUserToManagement(
 		updatedAt?: string | Date;
 	},
 	opts?: { projectId?: string; environmentId?: string },
-): Promise<Principal> {
+): Promise<User> {
 	const pe = projectEnv();
 	return syncRuntimeUserToManagementDurable(store, runtimeUser, {
 		projectId: opts?.projectId ?? pe.projectId,
@@ -2452,9 +2452,25 @@ export type SetupConnectionCompensationInput = {
 	runtimeProviderId: string;
 	organizationId: string;
 	provider: string;
+	/** Capability id and current lease generation fence authorize cleanup. */
+	capabilityId: string;
+	reservationFencingToken: string;
 	scope: ResourceScope;
 	actor?: string;
 };
+
+function currentSetupLeaseMatches(
+	data: DataStoreSnapshot,
+	input: SetupConnectionCompensationInput,
+): boolean {
+	const capability = data.setupLinks?.find((candidate) => candidate.id === input.capabilityId);
+	return Boolean(
+		capability &&
+		capability.reservationFencingToken === input.reservationFencingToken &&
+		capability.reservationExpiresAt &&
+		new Date(capability.reservationExpiresAt).getTime() > Date.now(),
+	);
+}
 
 export type SetupConnectionCompensationResult = {
 	managementRemoved: boolean;
@@ -2475,10 +2491,10 @@ function setupCompensationError(
 function exactSetupManagementConnection(
 	data: DataStoreSnapshot,
 	input: SetupConnectionCompensationInput,
-): IdentityConnection | DirectoryConnection | undefined {
+): SsoConnection | ScimConnection | undefined {
 	const connections = input.kind === "sso"
-		? data.identityConnections
-		: data.directoryConnections;
+		? data.ssoConnections
+		: data.scimConnections;
 	const byId = connections.find((connection) => connection.id === input.connectionId);
 	if (!byId) return undefined;
 	if (
@@ -2525,11 +2541,11 @@ function removeExactSetupManagementConnection(
 	const connection = exactSetupManagementConnection(data, input);
 	if (!connection) return false;
 	if (input.kind === "sso") {
-		data.identityConnections = data.identityConnections.filter(
+		data.ssoConnections = data.ssoConnections.filter(
 			(candidate) => candidate.id !== input.connectionId,
 		);
 	} else {
-		data.directoryConnections = data.directoryConnections.filter(
+		data.scimConnections = data.scimConnections.filter(
 			(candidate) => candidate.id !== input.connectionId,
 		);
 	}
@@ -2574,6 +2590,9 @@ export async function compensateSetupConnection(
 			query,
 			appendAudit,
 		}) => {
+			if (!currentSetupLeaseMatches(data, input)) {
+				return { managementRemoved: false, runtimeRemoved: false };
+			}
 			const organization = topology
 				? await topology.lockOrganization({ scope: input.scope, id: input.organizationId })
 				: data.organizations.find(
@@ -2597,6 +2616,7 @@ export async function compensateSetupConnection(
 	}
 
 	const managementRemoved = await store.mutateDurable((data) => {
+		if (!currentSetupLeaseMatches(data, input)) return false;
 		const organization = data.organizations.find(
 			(candidate) =>
 				candidate.id === input.organizationId &&
@@ -2608,6 +2628,7 @@ export async function compensateSetupConnection(
 		appendSetupCompensationAudit(data, input);
 		return removed;
 	});
+	if (!managementRemoved) return { managementRemoved: false, runtimeRemoved: false };
 	if (input.kind === "sso") {
 		await deleteSsoProviderById(input.connectionId);
 	} else {
@@ -2750,9 +2771,9 @@ export async function applyScimUsersInTransaction(input: {
 			if (emailPrincipal && emailPrincipal.id !== runtimeUserId) {
 				throw new ClearanceError({ code: "IDENTITY_EMAIL_CONFLICT", message: "SCIM user email conflicts with a management principal", stage: "scim.runtime.apply", status: 409 });
 			}
-			principal = await input.principals.insert({ id: runtimeUserId, ...scope, email, name, status: "active", createdAt: input.timestamp, updatedAt: input.timestamp } satisfies Principal);
+			principal = await input.principals.insert({ id: runtimeUserId, ...scope, email, name, status: "active", createdAt: input.timestamp, updatedAt: input.timestamp } satisfies User);
 		} else if (principal.email !== email || principal.name !== name || principal.status !== "active") {
-			const synchronized = await input.principals.update({ ...principal, email, name, status: "active", updatedAt: advancingPrincipalUpdatedAt(input.timestamp, principal.updatedAt) }, { expectedUpdatedAt: principal.updatedAt });
+			const synchronized = await input.principals.update({ ...principal, email, name, status: "active", updatedAt: advancingPrincipalUpdatedAt({ proposedUpdatedAt: input.timestamp, storedUpdatedAt: principal.updatedAt }) }, { expectedUpdatedAt: principal.updatedAt });
 			if (!synchronized) throw new ClearanceError({ code: "IDENTITY_SYNC_CONFLICT", message: "Canonical identity changed during synchronization", stage: "scim.runtime.apply", status: 409 });
 			principal = synchronized;
 			changed = true;
@@ -2839,7 +2860,7 @@ export async function listSessionsInAuth(
 ): Promise<SessionView[]> {
 	await ensureAuthMigrated();
 	const scope = opts?.scope ?? resolveOperatorScope(store);
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const b = getAuthBundle();
 	if (store.storeV2Principals?.authoritative) {
 		const reader = store.storeV2Principals.listActiveSessionsPage;
@@ -2930,7 +2951,7 @@ export async function listSessionsPageInAuth(
 ): Promise<{ sessions: SessionView[]; nextCursor: string | null }> {
 	await ensureAuthMigrated();
 	const scope = opts?.scope ?? resolveOperatorScope(store);
-	const limit = normalizeSessionLimit(opts?.limit);
+	const limit = normalizePageLimit(opts?.limit, { stage: "sessions.list", code: "SESSION_LIMIT_INVALID", defaultValue: 100, maximum: 500 });
 	const cursor = decodePageCursor(opts?.cursor, "sessions", "sessions.list");
 	const b = getAuthBundle();
 	if (store.storeV2Principals?.authoritative) {
@@ -4137,7 +4158,7 @@ async function findPrincipalInScope(
 	id: string,
 	scope: ResourceScope,
 	stage: string,
-): Promise<Principal> {
+): Promise<User> {
 	const user = principals
 		? await principals.getById({ scope, id })
 		: data.principals.find((p) => p.id === id);
@@ -4298,7 +4319,7 @@ export async function updateUserInAuth(
 		source?: LifecycleSource;
 		scope?: ResourceScope;
 	},
-): Promise<Principal> {
+): Promise<User> {
 	await ensureRuntimeLifecycleSchema();
 	const { mutateCoordinated } = requireCoordinatedStore(store);
 
@@ -4378,7 +4399,7 @@ export async function updateUserInAuth(
 		const nextName = name ?? user.name;
 		const previousUpdatedAt = user.updatedAt;
 		const principalUpdatedAt = principals
-			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			? advancingPrincipalUpdatedAt({ proposedUpdatedAt: now, storedUpdatedAt: previousUpdatedAt })
 			: now;
 		let nextBanned = Boolean(runtime.banned);
 		let nextBanReason: string | null =
@@ -4446,7 +4467,7 @@ export async function updateUserInAuth(
 		if (status !== undefined) user.status = status;
 		user.updatedAt = principalUpdatedAt;
 
-		const principal: Principal = { ...user };
+		const principal: User = { ...user };
 		if (principals) {
 			const updatedPrincipal = await principals.update(principal, {
 				expectedUpdatedAt: previousUpdatedAt,
@@ -4498,7 +4519,7 @@ export async function disableUserInAuth(
 		source?: LifecycleSource;
 		scope?: ResourceScope;
 	},
-): Promise<Principal> {
+): Promise<User> {
 	await ensureRuntimeLifecycleSchema();
 	const { mutateCoordinated } = requireCoordinatedStore(store);
 	const scope = input?.scope ?? resolveOperatorScope(store);
@@ -4509,7 +4530,7 @@ export async function disableUserInAuth(
 		await requireRuntimeUser(query, id, "users.disable");
 		const previousUpdatedAt = user.updatedAt;
 		const principalUpdatedAt = principals
-			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			? advancingPrincipalUpdatedAt({ proposedUpdatedAt: now, storedUpdatedAt: previousUpdatedAt })
 			: now;
 
 		const alreadyDisabled = user.status === "disabled";
@@ -4550,7 +4571,7 @@ export async function disableUserInAuth(
 			}
 		}
 
-		const principal: Principal = { ...user };
+		const principal: User = { ...user };
 		// Idempotent re-disable with no remaining sessions is a no-op (no audit).
 		if (
 			!alreadyDisabled ||
@@ -4593,7 +4614,7 @@ export async function deleteUserInAuth(
 		source?: LifecycleSource;
 		scope?: ResourceScope;
 	},
-): Promise<Principal> {
+): Promise<User> {
 	await ensureRuntimeLifecycleSchema();
 	const { mutateCoordinated } = requireCoordinatedStore(store);
 	const scope = input?.scope ?? resolveOperatorScope(store);
@@ -4604,7 +4625,7 @@ export async function deleteUserInAuth(
 		await requireRuntimeUser(query, id, "users.delete");
 		const previousUpdatedAt = user.updatedAt;
 		const principalUpdatedAt = principals
-			? advancingPrincipalUpdatedAt(now, previousUpdatedAt)
+			? advancingPrincipalUpdatedAt({ proposedUpdatedAt: now, storedUpdatedAt: previousUpdatedAt })
 			: now;
 
 		// Free original email for re-create; keep row for FK stability (member/sso).
@@ -4656,7 +4677,7 @@ export async function deleteUserInAuth(
 			}
 		}
 
-		const principal: Principal = { ...user };
+		const principal: User = { ...user };
 		appendAuditEvent(data, {
 			actor: input?.actor ?? "operator",
 			action: "users.delete",
@@ -5337,7 +5358,7 @@ export async function removeMemberInAuth(
 			scope,
 			stage,
 		);
-		// Principal may already be disabled; still allow remove if in scope
+		// User may already be disabled; still allow remove if in scope
 		const principal = principals
 			? await principals.getById({ scope, id: row.principalId, includeDeleted: true })
 			: data.principals.find((p) => p.id === row.principalId);
@@ -6922,16 +6943,16 @@ export async function archiveOrganizationInAuth(
 			`delete from "scimProvider" where "organizationId" = $1 returning id`,
 			[orgId],
 		);
-		const removedIdentityConnections = data.identityConnections.filter(
+		const removedSsoConnections = data.ssoConnections.filter(
 			(connection) => connection.organizationId === orgId,
 		).length;
-		const removedDirectoryConnections = data.directoryConnections.filter(
+		const removedScimConnections = data.scimConnections.filter(
 			(connection) => connection.organizationId === orgId,
 		).length;
-		data.identityConnections = data.identityConnections.filter(
+		data.ssoConnections = data.ssoConnections.filter(
 			(connection) => connection.organizationId !== orgId,
 		);
-		data.directoryConnections = data.directoryConnections.filter(
+		data.scimConnections = data.scimConnections.filter(
 			(connection) => connection.organizationId !== orgId,
 		);
 		let revokedSetupCapabilities = 0;
@@ -6945,6 +6966,7 @@ export async function archiveOrganizationInAuth(
 				capability.revokedAt = now;
 				delete capability.reservedAt;
 				delete capability.reservationId;
+				delete capability.reservationFencingToken;
 				delete capability.reservationExpiresAt;
 				revokedSetupCapabilities += 1;
 			}
@@ -7027,8 +7049,8 @@ export async function archiveOrganizationInAuth(
 					enterpriseSettlement: {
 						runtimeSsoProvidersDeleted: removedSsoProviders.rowCount ?? 0,
 						runtimeScimProvidersDeleted: removedScimProviders.rowCount ?? 0,
-						identityConnectionsRemoved: removedIdentityConnections,
-						directoryConnectionsRemoved: removedDirectoryConnections,
+						ssoConnectionsRemoved: removedSsoConnections,
+						scimConnectionsRemoved: removedScimConnections,
 						setupCapabilitiesRevoked: revokedSetupCapabilities,
 					},
 				},
@@ -7049,8 +7071,8 @@ export async function archiveOrganizationInAuth(
 				authorizationHealed ||
 				(removedSsoProviders.rowCount ?? 0) > 0 ||
 				(removedScimProviders.rowCount ?? 0) > 0 ||
-				removedIdentityConnections > 0 ||
-				removedDirectoryConnections > 0 ||
+				removedSsoConnections > 0 ||
+				removedScimConnections > 0 ||
 				revokedSetupCapabilities > 0 ||
 				settledManagementMemberships > 0;
 			if (rearchiveHealed) {
@@ -7078,10 +7100,10 @@ export async function archiveOrganizationInAuth(
 								removedSsoProviders.rowCount ?? 0,
 							runtimeScimProvidersDeleted:
 								removedScimProviders.rowCount ?? 0,
-							identityConnectionsRemoved:
-								removedIdentityConnections,
-							directoryConnectionsRemoved:
-								removedDirectoryConnections,
+							ssoConnectionsRemoved:
+								removedSsoConnections,
+							scimConnectionsRemoved:
+								removedScimConnections,
 							setupCapabilitiesRevoked:
 								revokedSetupCapabilities,
 						},

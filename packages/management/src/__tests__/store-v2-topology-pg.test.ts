@@ -141,7 +141,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				projectId: initialized.project.id,
 				environmentId: initialized.environment.id,
 				email: "imported@example.com",
-				name: "Imported Principal",
+				name: "Imported User",
 				status: "active",
 				createdAt: now,
 				updatedAt: now,
@@ -266,8 +266,8 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 				resourceCounts: {
 					organizations: 2,
 					memberships: null,
-					identityConnections: null,
-					directoryConnections: null,
+					ssoConnections: null,
+					scimConnections: null,
 					events: null,
 				},
 			},
@@ -408,7 +408,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 						projectId: scope.projectId,
 						environmentId: scope.environmentId,
 						email: "refresh-race@example.com",
-						name: "Refresh Race Principal",
+						name: "Refresh Race User",
 						status: "active",
 						createdAt: now,
 						updatedAt: now,
@@ -1210,7 +1210,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			traces: store.snapshot.traces.length,
 			events: store.resourceCounts().events,
 			principals: store.resourceCounts().principals,
-			connections: store.snapshot.identityConnections.find((connection) => connection.id === ssoA.id)?.status,
+			connections: store.snapshot.ssoConnections.find((connection) => connection.id === ssoA.id)?.status,
 		};
 		await expect(testScimConnectionAuthoritative(store, scimA.id, { scope: scopeA, dryRun: true })).rejects.toMatchObject({ code: "SCIM_NOT_FOUND" });
 		let fetchCalls = 0;
@@ -1225,7 +1225,7 @@ describe.skipIf(!available)("PgStore store-v2 topology authority", () => {
 			traces: store.snapshot.traces.length,
 			events: store.resourceCounts().events,
 			principals: store.resourceCounts().principals,
-			connections: store.snapshot.identityConnections.find((connection) => connection.id === ssoA.id)?.status,
+			connections: store.snapshot.ssoConnections.find((connection) => connection.id === ssoA.id)?.status,
 		}).toEqual(before);
 	});
 

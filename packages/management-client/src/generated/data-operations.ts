@@ -179,7 +179,7 @@ export const DATA_OPERATION_SCHEMAS = {
 		input: z.object({ source: z.literal("legacy"), fixture: legacyFixtureInputSchema }).strict(),
 		output: z.object({ plan: migrationPlanSchema }).strict(),
 	},
-	"migrations.run": {
+	"migrations.apply": {
 		input: z.object({ id: z.string(), fixture: legacyFixtureInputSchema, dryRun: z.boolean().optional() }).strict(),
 		output: z.object({ plan: migrationPlanSchema }).strict(),
 	},

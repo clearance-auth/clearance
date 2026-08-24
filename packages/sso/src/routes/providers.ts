@@ -334,7 +334,7 @@ const getSSOProviderQuerySchema = z.object({
 	providerId: z.string(),
 });
 
-export async function checkProviderAccess(
+export async function requireAuthorizedProvider(
 	ctx: {
 		context: AuthContext & {
 			session: { user: { id: string } };
@@ -404,7 +404,7 @@ export const getSSOProvider = () => {
 		async (ctx) => {
 			const { providerId } = ctx.query;
 
-			const provider = await checkProviderAccess(ctx, providerId);
+			const provider = await requireAuthorizedProvider(ctx, providerId);
 
 			return ctx.json(sanitizeProvider(provider, ctx.context.baseURL));
 		},
@@ -521,7 +521,7 @@ export const updateSSOProvider = (options: SSOOptions) => {
 				});
 			}
 
-			const existingProvider = await checkProviderAccess(ctx, providerId);
+			const existingProvider = await requireAuthorizedProvider(ctx, providerId);
 
 			const updateData: Partial<SSOProviderRecord> = {};
 			let providerIdentityBoundaryChanged =
@@ -705,7 +705,7 @@ export const deleteSSOProvider = () => {
 		async (ctx) => {
 			const { providerId } = ctx.body;
 
-			await checkProviderAccess(ctx, providerId);
+			await requireAuthorizedProvider(ctx, providerId);
 
 			await runWithTransaction(ctx.context.adapter, async () => {
 				const trx = await getCurrentAdapter(ctx.context.adapter);

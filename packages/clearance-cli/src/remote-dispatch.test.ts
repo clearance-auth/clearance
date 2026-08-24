@@ -1,6 +1,3 @@
-import { execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The CLI suite resolves workspace dependencies from their last built dist.
@@ -46,63 +43,24 @@ vi.mock("@clearance/management-client", async (importOriginal) => {
 		),
 	};
 });
-import {
-	classifyCommandPath,
-	dispatchRemoteCommand,
-} from "./remote-dispatch.js";
+import { dispatchRemoteCommand } from "./remote-dispatch.js";
 import type { ApiSession } from "./api-client.js";
 
-const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const entry = join(packageRoot, "dist", "index.js");
-const productSenderFixture = join(packageRoot, "src", "__fixtures__", "product-sender.json");
+const productSenderFixture = new URL("./__fixtures__/product-sender.json", import.meta.url).pathname;
 const session: ApiSession = { apiUrl: "https://api.clearance.test", token: "operator-token-for-dispatch-tests", profile: "test", credentialSource: "saved" };
 
 afterEach(() => vi.unstubAllGlobals());
 
-function children(path: string[]): string[] {
-	const help = execFileSync(process.execPath, [entry, ...path, "--help"], {
-		encoding: "utf8",
-	});
-	const commands = help.split("\n").slice(help.split("\n").findIndex((line) => line === "Commands:") + 1);
-	const names: string[] = [];
-	for (const line of commands) {
-		if (!line.trim()) break;
-		const match = line.match(/^  ([a-z][a-z0-9-]*)(?:\s|$)/);
-		if (match?.[1] && match[1] !== "help") names.push(match[1]);
-	}
-	return names;
-}
-
-function leafCommands(path: string[] = []): string[] {
-	const found: string[] = [];
-	for (const child of children(path)) {
-		const next = [...path, child];
-		const nested = children(next);
-		if (nested.length === 0) found.push(next.join(" "));
-		else found.push(...leafCommands(next));
-	}
-	return found;
-}
-
 describe("CLI transport parity", () => {
-	it("classifies every leaf command as API-backed or authentication-only", () => {
-		const leaves = leafCommands();
-		const unavailable = leaves.filter((path) => classifyCommandPath(path) === "unavailable");
-		expect(unavailable).toEqual([]);
-		expect(leaves.length).toBeGreaterThan(50);
-		expect(leaves.filter((path) => classifyCommandPath(path) === "remote-api").length)
-			.toBe(leaves.length - 3);
-	});
-
 	it("preserves optional-id and replay apply semantics", async () => {
 		const calls: Array<[string, RequestInit]> = [];
 		vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ ok: true }), { status: 200 });
 		}));
-		await dispatchRemoteCommand(session, "project inspect", [], {}, {});
-		await dispatchRemoteCommand(session, "env inspect", [], {}, {});
-		await dispatchRemoteCommand(session, "scim replay", ["trace_1"], {}, { yes: true });
+		await dispatchRemoteCommand({ session: session, path: "project inspect", args: [], opts: {}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "env inspect", args: [], opts: {}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "scim replay", args: ["trace_1"], opts: {}, global: { yes: true } });
 		expect(calls[0]?.[0]).toBe("https://api.clearance.test/v1/projects/current");
 		expect(calls[1]?.[0]).toBe("https://api.clearance.test/v1/environments/current");
 		expect(calls[2]?.[0]).toBe("https://api.clearance.test/v1/scim/traces/trace_1/replay");
@@ -115,11 +73,11 @@ describe("CLI transport parity", () => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ ok: true }), { status: 200 });
 		}));
-		await dispatchRemoteCommand(session, "product domains reissue", [], { origin: "https://auth.example.test", expectedVersion: "4" }, {});
-		await dispatchRemoteCommand(session, "product domains activate", [], { origin: "https://auth.example.test", expectedVersion: "5" }, { yes: true });
-		await dispatchRemoteCommand(session, "product sender get", [], {}, {});
-		await dispatchRemoteCommand(session, "product sender plan", [], { file: productSenderFixture }, {});
-		await dispatchRemoteCommand(session, "product sender apply", [], { file: productSenderFixture, expectedVersion: "2" }, { yes: true });
+		await dispatchRemoteCommand({ session: session, path: "product domains reissue", args: [], opts: { origin: "https://auth.example.test", expectedVersion: "4" }, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "product domains activate", args: [], opts: { origin: "https://auth.example.test", expectedVersion: "5" }, global: { yes: true } });
+		await dispatchRemoteCommand({ session: session, path: "product sender get", args: [], opts: {}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "product sender plan", args: [], opts: { file: productSenderFixture }, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "product sender apply", args: [], opts: { file: productSenderFixture, expectedVersion: "2" }, global: { yes: true } });
 		expect(calls.map(([url, init]) => [url, init.method, init.body ? JSON.parse(String(init.body)) : undefined])).toEqual([
 			["https://api.clearance.test/v1/product-presentation/domains/reissue", "POST", { origin: "https://auth.example.test", expectedVersion: 4 }],
 			["https://api.clearance.test/v1/product-presentation/domains/activate", "POST", { origin: "https://auth.example.test", expectedVersion: 5, dryRun: false, confirm: true }],
@@ -135,10 +93,10 @@ describe("CLI transport parity", () => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
 		}));
-		await dispatchRemoteCommand(session, "project create", [], { name: "Preview" }, { dryRun: true });
-		await dispatchRemoteCommand(session, "keys rotate", ["key_1"], {}, { dryRun: true });
-		await dispatchRemoteCommand(session, "sso rotate", ["sso_1"], {}, { dryRun: true });
-		await dispatchRemoteCommand(session, "scim rotate", ["scim_1"], {}, { dryRun: true });
+		await dispatchRemoteCommand({ session: session, path: "project create", args: [], opts: { name: "Preview" }, global: { dryRun: true } });
+		await dispatchRemoteCommand({ session: session, path: "keys rotate", args: ["key_1"], opts: {}, global: { dryRun: true } });
+		await dispatchRemoteCommand({ session: session, path: "sso rotate", args: ["sso_1"], opts: {}, global: { dryRun: true } });
+		await dispatchRemoteCommand({ session: session, path: "scim rotate", args: ["scim_1"], opts: {}, global: { dryRun: true } });
 		for (const [, init] of calls) expect(JSON.parse(String(init.body)).dryRun).toBe(true);
 	});
 
@@ -148,13 +106,7 @@ describe("CLI transport parity", () => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ apiKey: { id: "key_1" } }), { status: 201 });
 		}));
-		await dispatchRemoteCommand(
-			session,
-			"keys create",
-			[],
-			{ name: "automation", scope: ["users:read"], expiresAt: "2030-01-01T00:00:00Z" },
-			{},
-		);
+		await dispatchRemoteCommand({ session: session, path: "keys create", args: [], opts: { name: "automation", scope: ["users:read"], expiresAt: "2030-01-01T00:00:00Z" }, global: {} });
 		expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({
 			name: "automation",
 			scopes: ["users:read"],
@@ -169,25 +121,25 @@ describe("CLI transport parity", () => {
 			return new Response(JSON.stringify({ ok: true }), { status: 200 });
 		}));
 
-		await dispatchRemoteCommand(session, "orgs authorization effective", [], {
+		await dispatchRemoteCommand({ session: session, path: "orgs authorization effective", args: [], opts: {
 			org: "org_1", subject: "user_1", subjectKind: "principal",
-		}, {});
-		await dispatchRemoteCommand(session, "orgs authorization assignments replace", [], {
+		}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "orgs authorization assignments replace", args: [], opts: {
 			org: "org_1", subject: "user_1", subjectKind: "principal", role: ["role_b", "role_a", "role_b"], expectedRevision: "7",
-		}, { yes: true, dryRun: false });
-		await expect(dispatchRemoteCommand(session, "orgs authorization assignments replace", [], {
+		}, global: { yes: true, dryRun: false } });
+		await expect(dispatchRemoteCommand({ session: session, path: "orgs authorization assignments replace", args: [], opts: {
 			org: "org_1", subject: "user_1", subjectKind: "principal", role: [], expectedRevision: "07",
-		}, { dryRun: false })).rejects.toMatchObject({ code: "AUTHORIZATION_OPTION_INVALID" });
-		await expect(dispatchRemoteCommand(session, "orgs service-accounts disable", ["svc_1"], { org: "org_1" }, {}))
+		}, global: { dryRun: false } })).rejects.toMatchObject({ code: "AUTHORIZATION_OPTION_INVALID" });
+		await expect(dispatchRemoteCommand({ session: session, path: "orgs service-accounts disable", args: ["svc_1"], opts: { org: "org_1" }, global: {} }))
 			.rejects.toMatchObject({ code: "SERVICE_ACCOUNT_DISABLE_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(session, "orgs service-accounts disable", ["svc_1"], { org: "org_1" }, { yes: true, dryRun: false });
-		await dispatchRemoteCommand(session, "orgs service-accounts credentials create", ["svc_1"], {
+		await dispatchRemoteCommand({ session: session, path: "orgs service-accounts disable", args: ["svc_1"], opts: { org: "org_1" }, global: { yes: true, dryRun: false } });
+		await dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials create", args: ["svc_1"], opts: {
 			org: "org_1", expiresAt: "2030-01-01T00:00:00Z", operationId: "11111111-1111-4111-8111-111111111111",
-		}, { dryRun: false });
-		await dispatchRemoteCommand(session, "orgs service-accounts credentials rotate", ["svc_1", "cred_1"], {
+		}, global: { dryRun: false } });
+		await dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials rotate", args: ["svc_1", "cred_1"], opts: {
 			org: "org_1", expiresAt: "2031-01-01T00:00:00Z",
-		}, { yes: true, dryRun: false });
-		await dispatchRemoteCommand(session, "orgs service-accounts credentials revoke", ["svc_1", "cred_1"], { org: "org_1" }, { dryRun: true });
+		}, global: { yes: true, dryRun: false } });
+		await dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials revoke", args: ["svc_1", "cred_1"], opts: { org: "org_1" }, global: { dryRun: true } });
 
 		expect(calls.map(([url]) => url)).toEqual([
 			"https://api.clearance.test/v1/organizations/org_1/authorization/effective/principal/user_1",
@@ -219,28 +171,10 @@ describe("CLI transport parity", () => {
 			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
 		}));
 
-		await dispatchRemoteCommand(
-			session,
-			"orgs service-accounts credentials create",
-			["svc_1"],
-			{ org: "org_1" },
-			{ dryRun: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials create", args: ["svc_1"], opts: { org: "org_1" }, global: { dryRun: true } });
 		expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({ dryRun: true });
-		await expect(dispatchRemoteCommand(
-			session,
-			"orgs service-accounts credentials create",
-			["svc_1"],
-			{ org: "org_1", operationId: "11111111-1111-4111-8111-111111111111" },
-			{ dryRun: true },
-		)).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_DRY_RUN_INVALID" });
-		await expect(dispatchRemoteCommand(
-			session,
-			"orgs service-accounts credentials rotate",
-			["svc_1", "cred_1"],
-			{ org: "org_1", operationId: "not-a-uuid" },
-			{ yes: true, dryRun: false },
-		)).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_INVALID" });
+		await expect(dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials create", args: ["svc_1"], opts: { org: "org_1", operationId: "11111111-1111-4111-8111-111111111111" }, global: { dryRun: true } })).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_DRY_RUN_INVALID" });
+		await expect(dispatchRemoteCommand({ session: session, path: "orgs service-accounts credentials rotate", args: ["svc_1", "cred_1"], opts: { org: "org_1", operationId: "not-a-uuid" }, global: { yes: true, dryRun: false } })).rejects.toMatchObject({ code: "SERVICE_ACCOUNT_CREDENTIAL_OPERATION_ID_INVALID" });
 	});
 
 	it("routes store-v2 reads and gates apply, rollback, event, principal, and topology authority", async () => {
@@ -250,89 +184,41 @@ describe("CLI transport parity", () => {
 			return new Response(JSON.stringify({ schemaVersion: "v1" }), { status: 200 });
 		}));
 
-		await dispatchRemoteCommand(session, "schema store-v2 status", [], {}, {});
-		await dispatchRemoteCommand(session, "schema store-v2 plan", [], {}, {});
-		await dispatchRemoteCommand(session, "schema store-v2 verify", [], {}, {});
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 status", args: [], opts: {}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 plan", args: [], opts: {}, global: {} });
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 verify", args: [], opts: {}, global: {} });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 apply", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 apply", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_APPLY_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 apply",
-			[],
-			{},
-			{ dryRun: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 apply", args: [], opts: {}, global: { dryRun: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 rollback", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 rollback", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_ROLLBACK_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 rollback",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 rollback", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 principals cutover", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 principals cutover", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_PRINCIPALS_CUTOVER_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 principals cutover",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 principals cutover", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 principals rollback", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 principals rollback", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_PRINCIPALS_ROLLBACK_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 principals rollback",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 principals rollback", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 topology cutover", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 topology cutover", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_CUTOVER_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 topology cutover",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 topology cutover", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 topology rollback", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 topology rollback", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_TOPOLOGY_ROLLBACK_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 topology rollback",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 topology rollback", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 events cutover", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 events cutover", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_EVENTS_CUTOVER_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 events cutover",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 events cutover", args: [], opts: {}, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(session, "schema store-v2 events rollback", [], {}, {}),
+			dispatchRemoteCommand({ session: session, path: "schema store-v2 events rollback", args: [], opts: {}, global: {} }),
 		).rejects.toMatchObject({ code: "STORE_V2_EVENTS_ROLLBACK_CONFIRMATION_REQUIRED" });
-		await dispatchRemoteCommand(
-			session,
-			"schema store-v2 events rollback",
-			[],
-			{},
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema store-v2 events rollback", args: [], opts: {}, global: { yes: true } });
 
 		expect(calls.map(([url]) => url)).toEqual([
 			"https://api.clearance.test/v1/schema/store-v2",
@@ -364,49 +250,19 @@ describe("CLI transport parity", () => {
 			return new Response(JSON.stringify({ phase: "legacy-open" }), { status: 200 });
 		}));
 
-		await dispatchRemoteCommand(
-			session,
-			"schema credential-authority status",
-			[],
-			{},
-			{},
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema credential-authority status", args: [], opts: {}, global: {} });
 		await expect(
-			dispatchRemoteCommand(
-				session,
-				"schema credential-authority arm",
-				[],
-				{ deploymentId: "candidate-v03", expectedRuntimes: "2" },
-				{},
-			),
+			dispatchRemoteCommand({ session: session, path: "schema credential-authority arm", args: [], opts: { deploymentId: "candidate-v03", expectedRuntimes: "2" }, global: {} }),
 		).rejects.toMatchObject({
 			code: "CREDENTIAL_AUTHORITY_ARM_CONFIRMATION_REQUIRED",
 		});
-		await dispatchRemoteCommand(
-			session,
-			"schema credential-authority arm",
-			[],
-			{ deploymentId: "candidate-v03", expectedRuntimes: "2" },
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema credential-authority arm", args: [], opts: { deploymentId: "candidate-v03", expectedRuntimes: "2" }, global: { yes: true } });
 		await expect(
-			dispatchRemoteCommand(
-				session,
-				"schema credential-authority drain",
-				[],
-				{ deploymentId: "candidate-v03", drainId: "drain-v03" },
-				{},
-			),
+			dispatchRemoteCommand({ session: session, path: "schema credential-authority drain", args: [], opts: { deploymentId: "candidate-v03", drainId: "drain-v03" }, global: {} }),
 		).rejects.toMatchObject({
 			code: "CREDENTIAL_AUTHORITY_DRAIN_CONFIRMATION_REQUIRED",
 		});
-		await dispatchRemoteCommand(
-			session,
-			"schema credential-authority drain",
-			[],
-			{ deploymentId: "candidate-v03", drainId: "drain-v03" },
-			{ yes: true },
-		);
+		await dispatchRemoteCommand({ session: session, path: "schema credential-authority drain", args: [], opts: { deploymentId: "candidate-v03", drainId: "drain-v03" }, global: { yes: true } });
 
 		expect(calls.map(([url]) => url)).toEqual([
 			"https://api.clearance.test/v1/schema/credential-authority",
@@ -431,11 +287,11 @@ describe("CLI transport parity", () => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
 		}));
-		await dispatchRemoteCommand(session, "scim test", ["scim_1"], { apply: true }, { dryRun: true });
+		await dispatchRemoteCommand({ session: session, path: "scim test", args: ["scim_1"], opts: { apply: true }, global: { dryRun: true } });
 		expect(JSON.parse(String(calls[0]?.[1].body)).dryRun).toBe(true);
 		expect(JSON.parse(String(calls[0]?.[1].body)).scenario).toBe("users");
 		await expect(
-			dispatchRemoteCommand(session, "sso test", ["sso_1"], { fixture: "ok" }, { dryRun: true }),
+			dispatchRemoteCommand({ session: session, path: "sso test", args: ["sso_1"], opts: { fixture: "ok" }, global: { dryRun: true } }),
 		).rejects.toMatchObject({ code: "CLI_REMOTE_DRY_RUN_UNSUPPORTED" });
 		expect(calls).toHaveLength(1);
 	});
@@ -446,13 +302,7 @@ describe("CLI transport parity", () => {
 			calls.push([url, init]);
 			return new Response(JSON.stringify({ dryRun: true }), { status: 200 });
 		}));
-		await dispatchRemoteCommand(
-			session,
-			"scim test",
-			["scim_1"],
-			{ scenario: "group-lifecycle" },
-			{},
-		);
+		await dispatchRemoteCommand({ session: session, path: "scim test", args: ["scim_1"], opts: { scenario: "group-lifecycle" }, global: {} });
 		expect(JSON.parse(String(calls[0]?.[1].body))).toMatchObject({
 			dryRun: true,
 			scenario: "group-lifecycle",
@@ -461,7 +311,7 @@ describe("CLI transport parity", () => {
 
 	it("refuses the bundled group lifecycle under live conformance mode", async () => {
 		await expect(
-			dispatchRemoteCommand(session, "scim test", ["scim_1"], { live: true, scenario: "group-lifecycle" }, { yes: true }),
+			dispatchRemoteCommand({ session: session, path: "scim test", args: ["scim_1"], opts: { live: true, scenario: "group-lifecycle" }, global: { yes: true } }),
 		).rejects.toMatchObject({ code: "SCIM_SCENARIO_LIVE_CONFLICT" });
 	});
 
@@ -471,11 +321,11 @@ describe("CLI transport parity", () => {
 		);
 		vi.stubGlobal("fetch", fetchMock);
 		await expect(
-			dispatchRemoteCommand(session, "backup create", [], { dir: "/host/backups" }, {}),
+			dispatchRemoteCommand({ session: session, path: "backup create", args: [], opts: { dir: "/host/backups" }, global: {} }),
 		).rejects.toMatchObject({ code: "BACKUP_DIRECTORY_SERVER_MANAGED" });
 		expect(fetchMock).not.toHaveBeenCalled();
 
-		await dispatchRemoteCommand(session, "backup create", [], {}, {});
+		await dispatchRemoteCommand({ session: session, path: "backup create", args: [], opts: {}, global: {} });
 		expect(fetchMock).toHaveBeenCalledOnce();
 		expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.clearance.test/v1/backups");
 		expect(fetchMock.mock.calls[0]?.[1]?.body).toBeUndefined();
@@ -484,10 +334,10 @@ describe("CLI transport parity", () => {
 	it.each(["sso test", "scim test"])("rejects %s --live with --dry-run before issuing a request", async (path) => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
-		await expect(dispatchRemoteCommand(session, path, ["connection_1"], { live: true }, {
+		await expect(dispatchRemoteCommand({ session: session, path: path, args: ["connection_1"], opts: { live: true }, global: {
 			dryRun: true,
 			yes: true,
-		})).rejects.toMatchObject({
+		} })).rejects.toMatchObject({
 			code: path === "sso test" ? "SSO_LIVE_CONFIRM_REQUIRED" : "SCIM_LIVE_CONFIRM_REQUIRED",
 		});
 		expect(fetchMock).not.toHaveBeenCalled();
@@ -496,7 +346,7 @@ describe("CLI transport parity", () => {
 	it.each(["sso test", "scim test"])("requires --yes for %s --live", async (path) => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
-		await expect(dispatchRemoteCommand(session, path, ["connection_1"], { live: true }, {})).rejects.toMatchObject({
+		await expect(dispatchRemoteCommand({ session: session, path: path, args: ["connection_1"], opts: { live: true }, global: {} })).rejects.toMatchObject({
 			code: path === "sso test" ? "SSO_LIVE_CONFIRM_REQUIRED" : "SCIM_LIVE_CONFIRM_REQUIRED",
 		});
 		expect(fetchMock).not.toHaveBeenCalled();

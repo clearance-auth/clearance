@@ -116,12 +116,12 @@ export interface InternalAdapter<
 		options?: { onlyActiveSessions?: boolean | undefined } | undefined,
 	): Promise<Session[]>;
 
-	listUsers(
-		limit?: number | undefined,
-		offset?: number | undefined,
-		sortBy?: { field: string; direction: "asc" | "desc" } | undefined,
-		where?: Where[] | undefined,
-	): Promise<User[]>;
+	listUsers(options?: {
+		limit?: number | undefined;
+		offset?: number | undefined;
+		sortBy?: { field: string; direction: "asc" | "desc" } | undefined;
+		where?: Where[] | undefined;
+	}): Promise<User[]>;
 
 	countTotalUsers(where?: Where[] | undefined): Promise<number>;
 
@@ -270,7 +270,9 @@ export interface InternalAdapter<
 		challengeContext?: VerificationChallengeCreationContext,
 	): Promise<Verification>;
 
-	findVerificationValue(identifier: string): Promise<Verification | null>;
+	findVerificationValueAndPruneExpired(
+		identifier: string,
+	): Promise<Verification | null>;
 
 	deleteVerificationByIdentifier(identifier: string): Promise<void>;
 
@@ -284,7 +286,7 @@ export interface InternalAdapter<
 	 * themselves. Callers MUST gate any state change (issue session, mint
 	 * token, change password) on a non-null result.
 	 *
-	 * Replaces the racy `findVerificationValue` + `deleteVerificationByIdentifier`
+	 * Replaces the racy `findVerificationValueAndPruneExpired` + `deleteVerificationByIdentifier`
 	 * pair at single-use credential consumption sites.
 	 *
 	 * With managed authentication policy, callers must already own an active

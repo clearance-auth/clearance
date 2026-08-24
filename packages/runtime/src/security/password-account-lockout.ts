@@ -310,17 +310,16 @@ export async function verifyPasswordForSignIn(
 	password: string,
 ): Promise<boolean> {
 	const attempt = await reservePasswordAttempt(ctx, account);
-	let valid: boolean;
-	try {
-		valid = await ctx.context.password.verify({
+	const passwordMatched = await ctx.context.password
+		.verify({
 			hash: account.password!,
 			password,
+		})
+		.catch(async (error) => {
+			await attempt.cancel();
+			throw error;
 		});
-	} catch (error) {
-		await attempt.cancel();
-		throw error;
-	}
-	if (valid) valid = await attempt.recordSuccess();
-	else await attempt.recordFailure();
-	return valid;
+	const accepted = passwordMatched && (await attempt.recordSuccess());
+	if (!passwordMatched) await attempt.recordFailure();
+	return accepted;
 }

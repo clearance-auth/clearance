@@ -19,14 +19,13 @@ import type {
 	VaultSsoMutationPreview,
 	VaultSsoTestResult,
 	VaultInvitation,
+	InvitationStatus,
 	VaultOrganization,
 	VaultPasskey,
-	VaultSCIMConnection,
 	VaultServiceAccount,
 	VaultServiceAccountCredential,
 	VaultSession,
 	VaultSessionState,
-	VaultSSOProvider,
 	VaultTwoFactorMethod,
 	VaultUser,
 } from "./client";
@@ -217,7 +216,7 @@ export function parseInvitation(value: unknown): VaultInvitation {
 	return Object.freeze({
 		id: string(input.id, "invitation"),
 		email: string(input.email, "invitation"),
-		status: string(input.status, "invitation"),
+		status: oneOf(input.status, ["pending", "accepted", "rejected", "canceled"], "invitation status") as InvitationStatus,
 		...(input.role !== undefined
 			? { role: string(input.role, "invitation") }
 			: {}),
@@ -353,39 +352,6 @@ export function parseCredentialMutation(value: unknown): VaultCredentialMutation
 		secret: string(input.secret, "credential"),
 		previousRevision: string(input.previousRevision, "credential"),
 		revision: string(input.revision, "credential"),
-	});
-}
-
-export function parseSSOProvider(value: unknown): VaultSSOProvider {
-	const input = record(value, "SSO provider");
-	if (input.type !== "saml" && input.type !== "oidc") {
-		throw new TypeError("Vault received an invalid SSO provider response");
-	}
-	return Object.freeze({
-		providerId: string(input.providerId, "SSO provider"),
-		type: input.type,
-		issuer: string(input.issuer, "SSO provider"),
-		domain: string(input.domain, "SSO provider"),
-		organizationId:
-			input.organizationId === null
-				? null
-				: string(input.organizationId, "SSO provider"),
-		domainVerified:
-			typeof input.domainVerified === "boolean"
-				? input.domainVerified
-				: false,
-	});
-}
-
-export function parseSCIMConnection(value: unknown): VaultSCIMConnection {
-	const input = record(value, "SCIM connection");
-	return Object.freeze({
-		id: string(input.id, "SCIM connection"),
-		providerId: string(input.providerId, "SCIM connection"),
-		organizationId:
-			input.organizationId === null
-				? null
-				: string(input.organizationId, "SCIM connection"),
 	});
 }
 

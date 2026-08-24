@@ -248,25 +248,25 @@ describe("internal adapter test", async () => {
 		expect(hookVerificationCreateBefore).toHaveBeenCalledOnce();
 		expect(hookVerificationCreateAfter).toHaveBeenCalledOnce();
 
-		const value = await internalAdapter.findVerificationValue("test-id-1");
+		const value = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value).toMatchObject({
 			identifier: "test-id-1",
 		});
 		expect(hookVerificationDeleteBefore).toHaveBeenCalledOnce();
 		expect(hookVerificationDeleteAfter).toHaveBeenCalledOnce();
 
-		const value2 = await internalAdapter.findVerificationValue("test-id-1");
+		const value2 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value2).toBeNull();
 		await internalAdapter.createVerificationValue({
 			identifier: `test-id-1`,
 			value: "test-id-1",
 			expiresAt: new Date(Date.now() + 1000),
 		});
-		const value3 = await internalAdapter.findVerificationValue("test-id-1");
+		const value3 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value3).toMatchObject({
 			identifier: "test-id-1",
 		});
-		const value4 = await internalAdapter.findVerificationValue("test-id-1");
+		const value4 = await internalAdapter.findVerificationValueAndPruneExpired("test-id-1");
 		expect(value4).toMatchObject({
 			identifier: "test-id-1",
 		});
@@ -347,7 +347,7 @@ describe("internal adapter test", async () => {
 			expect(verification.identifier).not.toBe("reset-password:my-token-123");
 
 			// Should be able to find by original identifier
-			const found = await hashedAdapter.findVerificationValue(
+			const found = await hashedAdapter.findVerificationValueAndPruneExpired(
 				"reset-password:my-token-123",
 			);
 			expect(found).toBeDefined();
@@ -357,7 +357,7 @@ describe("internal adapter test", async () => {
 			await hashedAdapter.deleteVerificationByIdentifier(
 				"reset-password:my-token-123",
 			);
-			const deleted = await hashedAdapter.findVerificationValue(
+			const deleted = await hashedAdapter.findVerificationValueAndPruneExpired(
 				"reset-password:my-token-123",
 			);
 			expect(deleted).toBeNull();
@@ -426,7 +426,7 @@ describe("internal adapter test", async () => {
 
 			// Should still find old plain token via fallback
 			const found =
-				await hashedCtx.internalAdapter.findVerificationValue(
+				await hashedCtx.internalAdapter.findVerificationValueAndPruneExpired(
 					"old-token:abc123",
 				);
 			expect(found).toBeDefined();
@@ -1571,7 +1571,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("find-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("find-test");
 			expect(found).not.toBeNull();
 			expect(found?.identifier).toBe("find-test");
 			expect(found?.value).toBe("find-value");
@@ -1597,7 +1597,7 @@ describe("internal adapter test", async () => {
 			expect(dataMap.has("verification:secondary-only-test")).toBe(true);
 
 			dataMap.clear();
-			const found = await ctx.internalAdapter.findVerificationValue(
+			const found = await ctx.internalAdapter.findVerificationValueAndPruneExpired(
 				"secondary-only-test",
 			);
 			expect(found).toBeNull(); // Proves DB was NOT used
@@ -1651,7 +1651,7 @@ describe("internal adapter test", async () => {
 
 			dataMap.clear();
 			const found =
-				await ctx.internalAdapter.findVerificationValue("both-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("both-test");
 			expect(found).not.toBeNull();
 			expect(found?.value).toBe("both-value");
 		});
@@ -1679,7 +1679,7 @@ describe("internal adapter test", async () => {
 			dataMap.clear();
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("fallback-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("fallback-test");
 			expect(found).not.toBeNull();
 			expect(found?.value).toBe("fallback-value");
 		});
@@ -1745,7 +1745,7 @@ describe("internal adapter test", async () => {
 			};
 		}
 
-		it("should return Date objects from findVerificationValue when storage returns pre-parsed objects", async () => {
+		it("should return Date objects from findVerificationValueAndPruneExpired when storage returns pre-parsed objects", async () => {
 			const { storage } = createPreParsedStorage();
 
 			const opts = {
@@ -1763,7 +1763,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("date-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("date-test");
 			expect(found).not.toBeNull();
 			expect(found!.expiresAt).toBeInstanceOf(Date);
 			expect(found!.createdAt).toBeInstanceOf(Date);
@@ -1788,7 +1788,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("expiry-check");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("expiry-check");
 			expect(found).not.toBeNull();
 			// This comparison would silently fail if expiresAt were a string
 			// because string < Date coerces to NaN, making it always false
@@ -1816,7 +1816,7 @@ describe("internal adapter test", async () => {
 
 			// First read: safeJSONParse receives pre-parsed object from storage
 			const first =
-				await ctx.internalAdapter.findVerificationValue("multi-read-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("multi-read-test");
 			expect(first).not.toBeNull();
 			expect(first!.expiresAt).toBeInstanceOf(Date);
 			expect(first!.createdAt).toBeInstanceOf(Date);
@@ -1824,7 +1824,7 @@ describe("internal adapter test", async () => {
 
 			// Second read: verify consistency (the stored object wasn't mutated)
 			const second =
-				await ctx.internalAdapter.findVerificationValue("multi-read-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("multi-read-test");
 			expect(second).not.toBeNull();
 			expect(second!.expiresAt).toBeInstanceOf(Date);
 			expect(second!.expiresAt.getTime()).toBe(first!.expiresAt.getTime());
@@ -1848,7 +1848,7 @@ describe("internal adapter test", async () => {
 			});
 
 			const found =
-				await ctx.internalAdapter.findVerificationValue("string-field-test");
+				await ctx.internalAdapter.findVerificationValueAndPruneExpired("string-field-test");
 			expect(found).not.toBeNull();
 			// Non-date strings must NOT be converted
 			expect(found!.identifier).toBe("string-field-test");
@@ -1949,7 +1949,7 @@ describe("internal adapter test", async () => {
 
 			// The expired row must still be invalidated so a later replay cannot
 			// consume it after a cleanup pass.
-			const replay = await adapter.findVerificationValue("consume:expired");
+			const replay = await adapter.findVerificationValueAndPruneExpired("consume:expired");
 			expect(replay).toBeNull();
 		});
 
@@ -1974,7 +1974,7 @@ describe("internal adapter test", async () => {
 			expect(result).toBeNull();
 			expect(veto).toHaveBeenCalledTimes(1);
 
-			const stillThere = await adapter.findVerificationValue("consume:veto");
+			const stillThere = await adapter.findVerificationValueAndPruneExpired("consume:veto");
 			expect(stillThere).not.toBeNull();
 		});
 
@@ -2040,7 +2040,7 @@ describe("internal adapter test", async () => {
 			expect(consumed).not.toBeNull();
 			expect(consumed!.value).toBe("newer");
 
-			const leftover = await adapter.findVerificationValue("consume:multi");
+			const leftover = await adapter.findVerificationValueAndPruneExpired("consume:multi");
 			expect(leftover).toBeNull();
 		});
 

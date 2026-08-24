@@ -39,7 +39,7 @@ import {
 } from "./schema";
 import {
 	getStorageOption,
-	processIdentifier,
+	deriveStoredIdentifier,
 } from "./verification-token-storage";
 import {
 	createSessionHandle,
@@ -2801,17 +2801,7 @@ export const createInternalAdapter = (
 				),
 			);
 		},
-		listUsers: async (
-			limit?: number | undefined,
-			offset?: number | undefined,
-			sortBy?:
-				| {
-						field: string;
-						direction: "asc" | "desc";
-				  }
-				| undefined,
-			where?: Where[] | undefined,
-		) => {
+		listUsers: async ({ limit, offset, sortBy, where } = {}) => {
 			const users = await (
 				await getCurrentAdapter(adapter)
 			).findMany<User>({
@@ -4271,7 +4261,7 @@ export const createInternalAdapter = (
 				) {
 					return null;
 				}
-				const recoverConsumedCredential = async (
+				const recoverOrRevokeConsumedCredential = async (
 					consumedCredential: SessionCredential,
 					validatedAuthority: ValidatedSessionAuthority,
 				): Promise<SessionRotationResult | null> => {
@@ -4308,7 +4298,7 @@ export const createInternalAdapter = (
 					if (credential.status === "consumed") {
 						const authority = await loadValidatedSessionAuthority(credential.sessionId);
 						if (!authority) return null;
-						return recoverConsumedCredential(credential, authority);
+						return recoverOrRevokeConsumedCredential(credential, authority);
 					}
 					return null;
 				}
@@ -4322,7 +4312,7 @@ export const createInternalAdapter = (
 				if (authority.lineage.active.id !== credential.id) {
 					const transitionedCredential = await rereadExactCredential(credential);
 					if (transitionedCredential?.status === "consumed") {
-						return recoverConsumedCredential(
+						return recoverOrRevokeConsumedCredential(
 							transitionedCredential,
 							authority,
 						);
@@ -5530,7 +5520,7 @@ export const createInternalAdapter = (
 				data.identifier,
 				options.verification?.storeIdentifier,
 			);
-			const storedIdentifier = await processIdentifier(
+			const storedIdentifier = await deriveStoredIdentifier(
 				data.identifier,
 				storageOption,
 			);
@@ -5649,12 +5639,12 @@ export const createInternalAdapter = (
 			);
 			return verification as Verification;
 		},
-		findVerificationValue: async (identifier: string) => {
+		findVerificationValueAndPruneExpired: async (identifier: string) => {
 			const storageOption = getStorageOption(
 				identifier,
 				options.verification?.storeIdentifier,
 			);
-			const storedIdentifier = await processIdentifier(
+			const storedIdentifier = await deriveStoredIdentifier(
 				identifier,
 				storageOption,
 			);
@@ -5723,7 +5713,7 @@ export const createInternalAdapter = (
 				identifier,
 				options.verification?.storeIdentifier,
 			);
-			const storedIdentifier = await processIdentifier(
+			const storedIdentifier = await deriveStoredIdentifier(
 				identifier,
 				storageOption,
 			);
@@ -5745,7 +5735,7 @@ export const createInternalAdapter = (
 		 * return it. The first concurrent caller receives the latest row for the
 		 * identifier; every other caller racing against it receives `null`.
 		 *
-		 * Race-safe replacement for the `findVerificationValue` then
+		 * Race-safe replacement for the `findVerificationValueAndPruneExpired` then
 		 * `deleteVerificationByIdentifier` pair. Callers MUST gate any state
 		 * change (issue session, mint token, change password) on a non-null
 		 * return value, because consuming one row invalidates the whole
@@ -5768,11 +5758,11 @@ export const createInternalAdapter = (
 				identifier,
 				options.verification?.storeIdentifier,
 			);
-			const storedIdentifier = await processIdentifier(
+			const storedIdentifier = await deriveStoredIdentifier(
 				identifier,
 				storageOption,
 			);
-			const hashedIdentifier = await processIdentifier(identifier, "hashed");
+			const hashedIdentifier = await deriveStoredIdentifier(identifier, "hashed");
 			// Every reader recognizes the stable hashed representation and the
 			// legacy plain representation, regardless of its current write setting.
 			// Include the configured representation as well for custom hash options.
@@ -6238,7 +6228,7 @@ export const createInternalAdapter = (
 				identifier,
 				options.verification?.storeIdentifier,
 			);
-			const storedIdentifier = await processIdentifier(
+			const storedIdentifier = await deriveStoredIdentifier(
 				identifier,
 				storageOption,
 			);

@@ -1211,7 +1211,7 @@ describe.skipIf(!available)(
 				scim: 0,
 			});
 			expect(
-				store.snapshot.identityConnections.some(
+				store.snapshot.ssoConnections.some(
 					(connection) => connection.organizationId === organization.id,
 				),
 			).toBe(false);
@@ -1254,12 +1254,12 @@ describe.skipIf(!available)(
 				scim: 0,
 			});
 			expect(
-				store.snapshot.identityConnections.some(
+				store.snapshot.ssoConnections.some(
 					(connection) => connection.organizationId === organization.id,
 				),
 			).toBe(false);
 			expect(
-				store.snapshot.directoryConnections.some(
+				store.snapshot.scimConnections.some(
 					(connection) => connection.organizationId === organization.id,
 				),
 			).toBe(false);
@@ -1274,8 +1274,8 @@ describe.skipIf(!available)(
 			expect(archiveAudit?.metadata.enterpriseSettlement).toMatchObject({
 				runtimeSsoProvidersDeleted: 1,
 				runtimeScimProvidersDeleted: 1,
-				identityConnectionsRemoved: 1,
-				directoryConnectionsRemoved: 1,
+				ssoConnectionsRemoved: 1,
+				scimConnectionsRemoved: 1,
 				setupCapabilitiesRevoked: 2,
 			});
 		});
@@ -1300,8 +1300,8 @@ describe.skipIf(!available)(
 				scope,
 			});
 			const oldScimBearer = scim.bearerTokenOnce!;
-			const beforeSso = store.snapshot.identityConnections.find((row) => row.id === sso.id)!;
-			const beforeScim = store.snapshot.directoryConnections.find((row) => row.id === scim.id)!;
+			const beforeSso = store.snapshot.ssoConnections.find((row) => row.id === sso.id)!;
+			const beforeScim = store.snapshot.scimConnections.find((row) => row.id === scim.id)!;
 			const runtimeBefore = await getAuthBundle().pool.query<{
 				id: string;
 				oidcConfig: string | null;
@@ -1324,8 +1324,8 @@ describe.skipIf(!available)(
 				operationId: "22222222-2222-4222-8222-222222222222",
 			}, replayCipherGuard());
 			await store.refresh();
-			const afterSso = store.snapshot.identityConnections.find((row) => row.id === sso.id)!;
-			const afterScim = store.snapshot.directoryConnections.find((row) => row.id === scim.id)!;
+			const afterSso = store.snapshot.ssoConnections.find((row) => row.id === sso.id)!;
+			const afterScim = store.snapshot.scimConnections.find((row) => row.id === scim.id)!;
 			expect(replacementSso.clientSecretFingerprint).not.toBe(beforeSso.clientSecretFingerprint);
 			expect(afterSso.clientSecretFingerprint).toBe(replacementSso.clientSecretFingerprint);
 			expect(replacementScim.bearerTokenOnce).not.toBe(oldScimBearer);
@@ -1419,7 +1419,7 @@ describe.skipIf(!available)(
 			}, replayCipherGuard())).rejects.toMatchObject({ code: "SCIM_OPERATION_REPLAY_CONFLICT" });
 
 			await store.refresh();
-			expect(store.snapshot.directoryConnections.filter(
+			expect(store.snapshot.scimConnections.filter(
 				(connection) => connection.organizationId === organization.id,
 			)).toHaveLength(1);
 			const audit = listEvents(store, { limit: 500 }).filter(

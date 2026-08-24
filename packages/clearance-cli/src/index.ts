@@ -31,6 +31,8 @@ import {
 	EVENTS_TAIL_MIN_POLL_INTERVAL_MS,
 } from "./remote-dispatch.js";
 
+const MAX_STDIN_PASSWORD_BYTES = 4_096;
+
 const VERSION = (
 	JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
 		version: string;
@@ -41,12 +43,145 @@ function globals(cmd: Command): GlobalOpts {
 	const opts = cmd.optsWithGlobals() as GlobalOpts & Record<string, unknown>;
 	return {
 		json: Boolean(opts.json),
-		noInput: Boolean(opts.noInput),
+		noInput: opts.input === false,
 		yes: Boolean(opts.yes),
 		dryRun: Boolean(opts.dryRun),
 		profile: opts.profile as string | undefined,
 		apiUrl: opts.apiUrl as string | undefined,
 	};
+}
+
+function passwordInputError(code: string, message: string, remediation: string): ClearanceError {
+	return new ClearanceError({ code, message, stage: "cli.password-input", remediation });
+}
+
+function passwordFromInput(input: string): string {
+	const password = input.replace(/\r?\n$/, "");
+	if (Buffer.byteLength(password, "utf8") > MAX_STDIN_PASSWORD_BYTES) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_TOO_LARGE",
+			"Initial password input exceeds the 4096-byte limit.",
+			"Provide a shorter password.",
+		);
+	}
+	if (password.length === 0) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_EMPTY",
+			"Initial password input cannot be empty.",
+			"Provide a non-empty password, or omit password options to issue a setup token.",
+		);
+	}
+	return password;
+}
+
+async function readPasswordFromStdin(): Promise<string> {
+	if (process.stdin.isTTY) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_STDIN_TTY",
+			"--password-stdin requires piped standard input.",
+			"Pipe the password to standard input, or use --password-prompt in an interactive terminal.",
+		);
+	}
+	let input = "";
+	for await (const chunk of process.stdin) {
+		input += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		if (Buffer.byteLength(input, "utf8") > MAX_STDIN_PASSWORD_BYTES + 2) {
+			throw passwordInputError(
+				"USER_CREATE_PASSWORD_TOO_LARGE",
+				"Initial password input exceeds the 4096-byte limit.",
+				"Provide a shorter password.",
+			);
+		}
+	}
+	return passwordFromInput(input);
+}
+
+async function readPasswordFromPrompt(): Promise<string> {
+	if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_PROMPT_TTY_REQUIRED",
+			"--password-prompt requires an interactive terminal.",
+			"Use --password-stdin with piped input, or omit password options to issue a setup token.",
+		);
+	}
+
+	process.stderr.write("Initial password: ");
+	return new Promise<string>((resolve, reject) => {
+		let input = "";
+		const finish = (callback: () => void) => {
+			process.stdin.off("data", onData);
+			process.stdin.setRawMode(false);
+			process.stderr.write("\n");
+			callback();
+		};
+		const onData = (chunk: Buffer | string) => {
+			const characters = (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+			for (const character of characters) {
+				if (character === "\r" || character === "\n") {
+					finish(() => {
+						try {
+							resolve(passwordFromInput(input));
+						} catch (cause) {
+							reject(cause);
+						}
+					});
+					return;
+				}
+				if (character === "\u0003") {
+					finish(() => reject(passwordInputError(
+						"USER_CREATE_PASSWORD_PROMPT_CANCELLED",
+						"Initial password prompt was cancelled.",
+						"Retry with --password-prompt, --password-stdin, or omit password options to issue a setup token.",
+					)));
+					return;
+				}
+				if (character === "\u007f" || character === "\b") {
+					input = input.slice(0, -1);
+					continue;
+				}
+				if (character >= " ") input += character;
+				if (Buffer.byteLength(input, "utf8") > MAX_STDIN_PASSWORD_BYTES) {
+					finish(() => reject(passwordInputError(
+						"USER_CREATE_PASSWORD_TOO_LARGE",
+						"Initial password input exceeds the 4096-byte limit.",
+						"Provide a shorter password.",
+					)));
+					return;
+				}
+			}
+		};
+		process.stdin.setRawMode(true);
+		process.stdin.resume();
+		process.stdin.on("data", onData);
+	});
+}
+
+async function remoteCommandOptions(command: Command, global: GlobalOpts): Promise<Record<string, unknown>> {
+	const opts = command.opts() as Record<string, unknown>;
+	if (commandPath(command) !== "users create") return opts;
+	const passwordStdin = opts.passwordStdin === true;
+	const passwordPrompt = opts.passwordPrompt === true;
+	if (passwordStdin && passwordPrompt) {
+		throw passwordInputError(
+			"USER_CREATE_PASSWORD_SOURCE_CONFLICT",
+			"Use only one initial password input mode.",
+			"Choose either --password-stdin or --password-prompt, or omit both to issue a setup token.",
+		);
+	}
+	delete opts.passwordStdin;
+	delete opts.passwordPrompt;
+	if (passwordStdin) opts.password = await readPasswordFromStdin();
+	if (passwordPrompt) {
+		if (global.noInput) {
+			throw passwordInputError(
+				"USER_CREATE_PASSWORD_PROMPT_NONINTERACTIVE",
+				"--password-prompt cannot be used with --no-input.",
+				"Use --password-stdin for CI, or omit password options to issue a setup token.",
+			);
+		}
+		opts.password = await readPasswordFromPrompt();
+	}
+	return opts;
 }
 
 /**
@@ -57,6 +192,7 @@ function globals(cmd: Command): GlobalOpts {
 async function remoteCommandAction(this: Command): Promise<void> {
 	const g = globals(this);
 	try {
+		const opts = await remoteCommandOptions(this, g);
 		const session = await resolveApiSession({
 			profile: g.profile,
 			apiUrl: g.apiUrl,
@@ -70,13 +206,13 @@ async function remoteCommandAction(this: Command): Promise<void> {
 					"Run clearance login --profile <name> for the intended API origin.",
 			});
 		}
-		const result = await dispatchRemoteCommand(
+		const result = await dispatchRemoteCommand({
 			session,
-			commandPath(this),
-			this.processedArgs,
-			this.opts() as Record<string, unknown>,
-			g,
-		);
+			path: commandPath(this),
+			args: this.processedArgs,
+			opts,
+			global: g,
+		});
 		printResult(g, result);
 	} catch (cause) {
 		fail(cause, g);
@@ -213,7 +349,8 @@ async function main() {
 		.command("create")
 		.requiredOption("--email <email>")
 		.requiredOption("--name <name>")
-		.option("--password <password>", "Explicit initial password; omitted creates an expiring single-use setup token")
+		.option("--password-stdin", "Read an initial password from piped standard input (maximum 4096 bytes)", false)
+		.option("--password-prompt", "Prompt for an initial password without terminal echo (TTY only)", false)
 		.action(remoteCommandAction);
 	users
 		.command("update")
@@ -292,14 +429,14 @@ async function main() {
 	members
 		.command("update")
 		.requiredOption("--org <id>")
-		.option("--user <id>", "Principal id of the member")
+		.option("--user <id>", "User id of the member")
 		.option("--member <id>", "Membership id")
 		.requiredOption("--role <role>", "New role slug")
 		.action(remoteCommandAction);
 	members
 		.command("remove")
 		.requiredOption("--org <id>")
-		.option("--user <id>", "Principal id of the member")
+		.option("--user <id>", "User id of the member")
 		.option("--member <id>", "Membership id")
 		.action(remoteCommandAction);
 
@@ -311,7 +448,7 @@ async function main() {
 		.description("Inspect a subject's effective organization authorization");
 	authorizationEffective
 		.requiredOption("--org <id>", "Organization id")
-		.requiredOption("--subject <id>", "Principal or service-account id")
+		.requiredOption("--subject <id>", "User or service-account id")
 		.requiredOption("--subject-kind <kind>", "principal|service_account")
 		.action(remoteCommandAction);
 	const authorizationAssignments = authorization
@@ -326,7 +463,7 @@ async function main() {
 	authorizationAssignments
 		.command("replace")
 		.requiredOption("--org <id>", "Organization id")
-		.requiredOption("--subject <id>", "Principal or service-account id")
+		.requiredOption("--subject <id>", "User or service-account id")
 		.requiredOption("--subject-kind <kind>", "principal|service_account")
 		.option("--role <id>", "Role id; repeat for each assigned role", (value, previous: string[] = []) => [...previous, value], [])
 		.option("--expected-revision <revision>", "Require this current authorization revision")

@@ -11,7 +11,7 @@ import {
 	deviceCode,
 	deviceDeny,
 	deviceToken,
-	deviceVerify,
+	claimDeviceUserCode,
 } from "./routes";
 import { schema } from "./schema";
 
@@ -138,7 +138,7 @@ export const deviceAuthorization = (
 		endpoints: {
 			deviceCode: deviceCode(opts),
 			deviceToken: deviceToken(opts),
-			deviceVerify,
+			claimDeviceUserCode,
 			deviceApprove,
 			deviceDeny,
 		},

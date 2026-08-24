@@ -372,7 +372,7 @@ export function takeStagedAuthenticationContinuation(
 	return opaque;
 }
 
-export async function issueInitialStagedAuthenticationCapability(
+export async function issueStagedAuthenticationChallenge(
 	context: AuthContext,
 	seed: object,
 ): Promise<{
@@ -475,7 +475,7 @@ export async function preloadStagedAuthenticationCapability(
 	const bearer = await ctx.getSignedCookie(cookie.name, ctx.context.secret);
 	if (!bearer || !identifier(bearer, 512)) return null;
 	const identifierValue = await capabilityIdentifier(bearer);
-	const verification = await ctx.context.internalAdapter.findVerificationValue(
+	const verification = await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 		identifierValue,
 	);
 	const metadata = parseMetadata(verification?.value);

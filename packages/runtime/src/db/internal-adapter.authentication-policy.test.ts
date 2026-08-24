@@ -582,7 +582,7 @@ describe("managed verification challenge authority", () => {
 			}),
 		).rejects.toThrow("rollback database verification");
 		await expect(
-			runtime.context.internalAdapter.findVerificationValue(identifier),
+			runtime.context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.toMatchObject({ id: created.id });
 		expect(await challengeMarkers(runtime)).toHaveLength(1);
 
@@ -592,7 +592,7 @@ describe("managed verification challenge authority", () => {
 			),
 		).resolves.toMatchObject({ id: created.id });
 		await expect(
-			runtime.context.internalAdapter.findVerificationValue(identifier),
+			runtime.context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.toBeNull();
 		expect(await challengeMarkers(runtime)).toHaveLength(0);
 	});
@@ -891,7 +891,7 @@ describe("managed verification challenge authority", () => {
 		});
 		expect(await challengeMarkers(runtime)).toHaveLength(0);
 		await expect(
-			runtime.context.internalAdapter.findVerificationValue(identifier),
+			runtime.context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.toBeNull();
 	});
 
@@ -919,7 +919,7 @@ describe("managed verification challenge authority", () => {
 		).rejects.toBeInstanceOf(ManagedVerificationChallengeError);
 		expect(await challengeMarkers(runtime)).toHaveLength(0);
 		await expect(
-			runtime.context.internalAdapter.findVerificationValue(identifier),
+			runtime.context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.toBeNull();
 	});
 

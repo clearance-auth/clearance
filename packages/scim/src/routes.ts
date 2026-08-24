@@ -27,7 +27,11 @@ import * as z from "zod";
 import { getAccountId, getUserFullName, getUserPrimaryEmail } from "./mappings";
 import { isSCIMKeyManagementWriter } from "./internal/key-management-writer";
 import type { AuthMiddleware } from "./middlewares";
-import { buildUserPatch } from "./patch-operations";
+import {
+	assertUserPatchWithinLimits,
+	buildUserPatch,
+	SCIM_USER_PATCH_LIMITS,
+} from "./patch-operations";
 import { SCIMAPIError, SCIMErrorOpenAPISchemas } from "./scim-error";
 import type { DBFilter } from "./scim-filters";
 import { parseSCIMUserFilter, SCIMParseError } from "./scim-filters";
@@ -375,7 +379,7 @@ async function assertSCIMProviderAccess(
 	}
 }
 
-async function checkSCIMProviderAccess(
+async function requireAuthorizedSCIMProvider(
 	ctx: GenericEndpointContext,
 	userId: string,
 	providerId: string,
@@ -791,7 +795,7 @@ export const getSCIMProviderConnection = (opts: SCIMOptions) =>
 			const userId = ctx.context.session.user.id;
 			const requiredRole = resolveRequiredRoles(ctx, opts);
 
-			const provider = await checkSCIMProviderAccess(
+			const provider = await requireAuthorizedSCIMProvider(
 				ctx,
 				userId,
 				providerId,
@@ -843,7 +847,7 @@ export const deleteSCIMProviderConnection = (opts: SCIMOptions) =>
 			const userId = ctx.context.session.user.id;
 			const requiredRole = resolveRequiredRoles(ctx, opts);
 
-			const provider = await checkSCIMProviderAccess(
+			const provider = await requireAuthorizedSCIMProvider(
 				ctx,
 				userId,
 				providerId,
@@ -1339,9 +1343,29 @@ export const getSCIMUser = (authMiddleware: AuthMiddleware) =>
 		},
 	);
 
+const patchValueSchema = z.any().superRefine((value, ctx) => {
+	if (
+		(typeof value === "string" &&
+			new TextEncoder().encode(value).byteLength >
+				SCIM_USER_PATCH_LIMITS.maxStringBytes) ||
+		(Array.isArray(value) &&
+			value.length > SCIM_USER_PATCH_LIMITS.maxCollectionEntries) ||
+		(typeof value === "object" &&
+			value !== null &&
+			!Array.isArray(value) &&
+			Object.keys(value).length > SCIM_USER_PATCH_LIMITS.maxCollectionEntries)
+	) {
+		ctx.addIssue({
+			code: "custom",
+			message: "SCIM PATCH value exceeds supported complexity limits",
+		});
+	}
+});
+
 const patchSCIMUserBodySchema = z.object({
 	schemas: z
-		.array(z.string())
+		.array(z.string().max(SCIM_USER_PATCH_LIMITS.maxStringBytes))
+		.max(SCIM_USER_PATCH_LIMITS.maxCollectionEntries)
 		.refine(
 			(s) => s.includes("urn:ietf:params:scim:api:messages:2.0:PatchOp"),
 			{
@@ -1352,13 +1376,14 @@ const patchSCIMUserBodySchema = z.object({
 		z.object({
 			op: z
 				.string()
+				.max(16)
 				.toLowerCase()
 				.default("replace")
 				.pipe(z.enum(["replace", "add", "remove"])),
-			path: z.string().optional(),
-			value: z.any(),
+			path: z.string().max(SCIM_USER_PATCH_LIMITS.maxStringBytes).optional(),
+			value: patchValueSchema,
 		}),
-	),
+	).max(SCIM_USER_PATCH_LIMITS.maxOperations),
 });
 
 export const patchSCIMUser = (authMiddleware: AuthMiddleware) =>
@@ -1399,6 +1424,8 @@ export const patchSCIMUser = (authMiddleware: AuthMiddleware) =>
 					detail: "User not found",
 				});
 			}
+
+			assertUserPatchWithinLimits(ctx.body.Operations);
 
 			const { user: userPatch, account: accountPatch } = buildUserPatch(
 				user,

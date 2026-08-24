@@ -167,7 +167,7 @@ describe("managed update-user transactions", () => {
 		expect(failed.status).toBeGreaterThanOrEqual(500);
 		deleteAccounts.mockRestore();
 		await expect(
-			context.internalAdapter.findVerificationValue(identifier),
+			context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.not.toBeNull();
 		await expect(
 			client.getSession({ fetchOptions: { headers } }),
@@ -176,7 +176,7 @@ describe("managed update-user transactions", () => {
 		const retried = await auth.handler(request());
 		expect(retried.status).toBe(200);
 		await expect(
-			context.internalAdapter.findVerificationValue(identifier),
+			context.internalAdapter.findVerificationValueAndPruneExpired(identifier),
 		).resolves.toBeNull();
 	});
 });

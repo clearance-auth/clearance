@@ -13,6 +13,7 @@ const ENV_KEYS = [
 	"CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION",
 	"CLEARANCE_DEPLOYMENT_ID",
 	"CLEARANCE_INSTANCE_ID",
+	"CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON",
 	"CLEARANCE_PROJECT_ID",
 	"CLEARANCE_ENV_ID",
 ] as const;
@@ -32,7 +33,7 @@ afterEach(async () => {
 
 describe("management authentication-policy scope", () => {
 	it("enables policy only for an explicit immutable project and environment", async () => {
-		process.env.NODE_ENV = "production";
+		process.env.NODE_ENV = "test";
 		process.env.DATABASE_URL =
 			"postgres://clearance:clearance@127.0.0.1:5434/clearance";
 		process.env.CLEARANCE_SECRET =
@@ -40,6 +41,7 @@ describe("management authentication-policy scope", () => {
 		process.env.CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION = "digest-v1";
 		process.env.CLEARANCE_DEPLOYMENT_ID = "deployment-policy-scope";
 		process.env.CLEARANCE_INSTANCE_ID = "instance-policy-scope";
+		delete process.env.CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON;
 		delete process.env.CLEARANCE_PROJECT_ID;
 		delete process.env.CLEARANCE_ENV_ID;
 
@@ -47,8 +49,8 @@ describe("management authentication-policy scope", () => {
 		expect(
 			readInternalAuthenticationPolicy(
 				(unscopedBundle.auth as unknown as { options: object }).options,
-			),
-		).toBeUndefined();
+			)?.identity,
+		).toEqual({ projectId: "proj_default", environmentId: "env_default" });
 		await closeAuthBundle();
 		resetAuthBundle();
 

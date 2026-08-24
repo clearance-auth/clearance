@@ -31,7 +31,7 @@ import {
 	testSsoConnectionLive,
 	testSsoConnectionReal,
 } from "@clearance/management";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { requestActor } from "../request-auth.js";
 import {
@@ -168,7 +168,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const conn = store.snapshot.identityConnections.find(
+			const conn = store.snapshot.ssoConnections.find(
 				(x) => x.id === c.req.param("id"),
 			);
 			if (!conn) {
@@ -214,6 +214,7 @@ export function registerEnterpriseRoutes({
 				actor: requestActor(c),
 				source: "api",
 				scope,
+				operationId: randomUUID(),
 			});
 			await store.ready();
 			return c.json({ connection, scope });
@@ -311,7 +312,7 @@ export function registerEnterpriseRoutes({
 		try {
 			const store = await storeForRequest();
 			const scope = scopeForRequest(store, c);
-			const conn = store.snapshot.directoryConnections.find(
+			const conn = store.snapshot.scimConnections.find(
 				(x) => x.id === c.req.param("id"),
 			);
 			if (!conn) {
@@ -408,6 +409,7 @@ export function registerEnterpriseRoutes({
 				actor: requestActor(c),
 				source: "api",
 				scope,
+				operationId: randomUUID(),
 			});
 			await store.ready();
 			return c.json({ connection, scope });

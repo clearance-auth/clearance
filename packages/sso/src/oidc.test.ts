@@ -5,6 +5,18 @@ import { organization } from "@clearance/runtime/plugins";
 import { getTestInstance } from "@clearance/runtime/test";
 import { OAuth2Server } from "oauth2-mock-server";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+// This suite deliberately drives a local mock IdP. Production uses the pinned
+// transport; the test injects its local transport explicitly.
+vi.mock("@clearance/core/utils/public-egress", () => ({
+	fetchPinnedPublic: (input: string | URL, init?: RequestInit) => fetch(input, init),
+	fetchWithPublicEgressPolicy: (
+		input: string | URL,
+		init: RequestInit,
+		transport: (url: string | URL, options?: RequestInit) => Promise<Response>,
+	) => transport(input, { ...init, redirect: "manual" }),
+}));
+
 import { sso } from ".";
 import { ssoClient } from "./client";
 import {

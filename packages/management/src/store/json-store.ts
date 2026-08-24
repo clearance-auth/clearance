@@ -7,6 +7,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { ClearanceError } from "../services/errors.js";
 import type { ManagementStore } from "./types.js";
 import type { DataStoreSnapshot } from "../types/resources.js";
 import {
@@ -35,6 +36,7 @@ export class JsonStore implements ManagementStore {
 	readonly backend = "json" as const;
 	readonly path: string;
 	private data: DataStoreSnapshot;
+	private upgradeLocked = false;
 
 	constructor(path: string = defaultDataPath()) {
 		this.path = path;
@@ -61,6 +63,24 @@ export class JsonStore implements ManagementStore {
 
 	async ready(): Promise<void> {
 		/* durable after save() */
+	}
+
+	async withUpgradeLock<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.upgradeLocked) {
+			throw new ClearanceError({
+				code: "UPGRADE_IN_PROGRESS",
+				message: "Another upgrade is already running.",
+				stage: "upgrade.lock",
+				status: 409,
+				remediation: "Wait for the active upgrade to finish, then retry.",
+			});
+		}
+		this.upgradeLocked = true;
+		try {
+			return await fn();
+		} finally {
+			this.upgradeLocked = false;
+		}
 	}
 
 	/** Re-read file so another process's writes are visible (local multi-process). */

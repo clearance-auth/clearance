@@ -362,7 +362,7 @@ describe.skipIf(!available)("delivery control Postgres primitives", () => {
 		expect(await store.readiness({
 			now: new Date(start.getTime() + 1), staleAfterMs: 60_000,
 		}, readinessKeyring)).toMatchObject({
-			ready: true, schema: { current: true }, keys: { checked: true, available: true },
+			ready: true, schema: { isUpToDate: true }, keys: { checked: true, available: true },
 			workers: { freshReady: 1 },
 		});
 		const driftStore = new DeliveryStore(pool, driftOptions);
@@ -370,7 +370,7 @@ describe.skipIf(!available)("delivery control Postgres primitives", () => {
 		const tables = qualifiedDeliveryTables(driftOptions);
 		await pool.query(`DROP TABLE ${tables.job} CASCADE`);
 		await expect(driftStore.readiness({}, keyring)).resolves.toMatchObject({
-			ready: false, schema: { current: false }, reasons: ["schema_unavailable"],
+			ready: false, schema: { isUpToDate: false }, reasons: ["schema_unavailable"],
 		});
 	});
 });

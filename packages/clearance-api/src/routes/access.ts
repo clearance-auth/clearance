@@ -39,7 +39,7 @@ import {
 	type ApplicationRouteDependencies,
 } from "./shared.js";
 
-export interface AccessRouteDependencies extends ApplicationRouteDependencies {}
+export type AccessRouteDependencies = ApplicationRouteDependencies;
 
 /** Normalized authorization has one PostgreSQL authority. */
 function requireAuthorizationPostgres(store: { backend: string }): void {
@@ -780,7 +780,7 @@ export function registerAccessRoutes({
 				resourceCounts: store.resourceCounts(),
 				storeBackend: store.backend,
 				scope,
-				/** Principal scope is server-configured; headers are not authority. */
+				/** User scope is server-configured; headers are not authority. */
 				tokenBoundary: "principal-derived-scope",
 				telemetry: { remoteSinks: [], default: "disabled" },
 				auth: { mode: "bearer-operator-or-managed-api-key" },

@@ -259,7 +259,7 @@ export interface SAMLResponseParams {
  * SP/IdP construction, response validation, session creation, and redirect
  * URL computation.
  */
-export async function processSAMLResponse(
+export async function completeSAMLSignIn(
 	ctx: any,
 	params: SAMLResponseParams,
 	options?: SSOOptions,
@@ -326,7 +326,7 @@ export async function processSAMLResponse(
 
 	// 7. SP/IdP construction via helpers
 	const sp = createSP(parsedSamlConfig, ctx.context.baseURL, providerId, {
-		clockSkew: options?.saml?.clockSkew,
+		clockSkewMs: options?.saml?.clockSkewMs,
 	});
 	const idp = createIdP(parsedSamlConfig);
 
@@ -388,7 +388,7 @@ export async function processSAMLResponse(
 
 	// 11. Timestamp validation
 	validateSAMLTimestamp((extract as SAMLAssertionExtract).conditions, {
-		clockSkew: options?.saml?.clockSkew,
+		clockSkewMs: options?.saml?.clockSkewMs,
 		requireTimestamps: options?.saml?.requireTimestamps,
 		logger: ctx.context.logger,
 	});
@@ -531,9 +531,9 @@ export async function processSAMLResponse(
 	const conditions = (extract as SAMLAssertionExtract).conditions as
 		| SAMLConditions
 		| undefined;
-	const clockSkew = options?.saml?.clockSkew ?? constants.DEFAULT_CLOCK_SKEW_MS;
+	const clockSkewMs = options?.saml?.clockSkewMs ?? constants.DEFAULT_CLOCK_SKEW_MS;
 	const expiresAt = conditions?.notOnOrAfter
-		? new Date(conditions.notOnOrAfter).getTime() + clockSkew
+		? new Date(conditions.notOnOrAfter).getTime() + clockSkewMs
 		: Date.now() + constants.DEFAULT_ASSERTION_TTL_MS;
 
 	const reserved = await ctx.context.internalAdapter.reserveVerificationValue({

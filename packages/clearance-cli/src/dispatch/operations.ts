@@ -26,7 +26,7 @@ type OperationsCommandPath =
 	| CliPathOf<typeof SCHEMA_OPERATIONS>
 	| CliPathOf<typeof CONFIG_OPERATIONS>;
 
-function configCandidate(path: unknown): Record<string, string> {
+function readConfigFile(path: unknown): Record<string, string> {
 	let contents: string;
 	try {
 		contents = readFileSync(resolve(String(path)), "utf8");
@@ -137,7 +137,10 @@ export async function dispatchOperationsCommand({
 				);
 			}
 			if (global.dryRun) return { ...metadata, dryRun: true };
-			const outputPath = writeExportArtifact(String(opts.output), sql, Boolean(opts.force), {
+			const outputPath = writeExportArtifact({
+				outputPath: String(opts.output),
+				body: sql,
+				force: Boolean(opts.force),
 				stage: "schema.generate",
 				existsCode: "SCHEMA_GENERATE_EXISTS",
 				writeFailedCode: "SCHEMA_GENERATE_WRITE_FAILED",
@@ -199,11 +202,11 @@ export async function dispatchOperationsCommand({
 				dryRun: global.dryRun,
 			}, managementCallOptions(global));
 		case CONFIG_OPERATIONS.validate.cliPath: {
-			const config = opts.file ? configCandidate(opts.file) : undefined;
+			const config = opts.file ? readConfigFile(opts.file) : undefined;
 			return callManagementOperation(session, "config.validate", body({ config }));
 		}
 		case CONFIG_OPERATIONS.diff.cliPath: {
-			const config = configCandidate(opts.file);
+			const config = readConfigFile(opts.file);
 			return callManagementOperation(session, "config.diff", { config });
 		}
 	}

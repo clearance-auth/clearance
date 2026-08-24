@@ -96,7 +96,7 @@ describe("managed API key authentication", () => {
 	});
 
 	it("rejects unknown, revoked, and expired key material", async () => {
-		const { app, getStore } = await import("./server.js");
+		const { app, sharedManagementStore } = await import("./server.js");
 		const revoked = await createKey(["users:read"]);
 		const revoke = await app.request(`/v1/keys/${revoked.apiKey.id}/revoke`, {
 			method: "POST",
@@ -112,7 +112,7 @@ describe("managed API key authentication", () => {
 		}
 
 		const expiring = await createKey(["users:read"]);
-		const store = await getStore();
+		const store = await sharedManagementStore();
 		await store.mutateDurable((snapshot) => {
 			const key = snapshot.apiKeys.find((candidate) => candidate.id === expiring.apiKey.id);
 			if (!key) throw new Error("seeded API key missing");
@@ -205,7 +205,7 @@ describe("managed API key authentication", () => {
 	});
 
 	it("owns enterprise audit attribution and redacts settings for delegated keys", async () => {
-		const { app, getStore } = await import("./server.js");
+		const { app, sharedManagementStore } = await import("./server.js");
 		const created = await createKey([
 			"organizations:write",
 			"settings:read",
@@ -240,7 +240,7 @@ describe("managed API key authentication", () => {
 		});
 		expect(testResponse.status).toBe(200);
 
-		const store = await getStore();
+		const store = await sharedManagementStore();
 		await store.mutateDurable((data) => {
 			data.meta.config.serviceToken = "secret-value-must-not-leak";
 			data.meta.config.region = "test-region";
@@ -267,10 +267,10 @@ describe("managed API key authentication", () => {
 			}),
 		);
 		expect(eventsBody.events).toContainEqual(
-			expect.objectContaining({
-				action: "sso.test",
-				actor: "api",
-				source: "api",
+				expect.objectContaining({
+					action: "sso.test",
+					actor: "operator",
+					source: "api",
 			}),
 		);
 		expect(eventsBody.events).not.toContainEqual(

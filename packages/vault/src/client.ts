@@ -87,12 +87,14 @@ export type VaultOrganizationCreateInput = Readonly<{
 export type VaultInvitation = Readonly<{
 	id: string;
 	email: string;
-	status: string;
+	status: InvitationStatus;
 	role?: string;
 	organizationId?: string;
 	organizationName?: string;
 	expiresAt?: string | Date;
 }>;
+
+export type InvitationStatus = "pending" | "accepted" | "rejected" | "canceled";
 
 export type VaultPasskey = Readonly<{
 	id: string;
@@ -161,21 +163,6 @@ export type VaultServiceAccountCredential = Readonly<{
 	credentialFingerprint: string;
 	expiresAt: string | null;
 	version: number;
-}>;
-
-export type VaultSSOProvider = Readonly<{
-	providerId: string;
-	type: "saml" | "oidc";
-	issuer: string;
-	domain: string;
-	organizationId: string | null;
-	domainVerified: boolean;
-}>;
-
-export type VaultSCIMConnection = Readonly<{
-	id: string;
-	providerId: string;
-	organizationId: string | null;
 }>;
 
 export type VaultCredentialMutation = Readonly<{

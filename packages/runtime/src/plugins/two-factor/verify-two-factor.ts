@@ -57,7 +57,7 @@ export async function verifyTwoFactor(ctx: GenericEndpointContext) {
 			);
 		}
 		const verificationToken =
-			await ctx.context.internalAdapter.findVerificationValue(
+			await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 				signedTwoFactorCookie,
 			);
 		if (!verificationToken) {

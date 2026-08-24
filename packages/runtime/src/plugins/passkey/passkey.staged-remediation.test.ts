@@ -8,7 +8,7 @@ import {
 import {
   attachStagedAuthenticationContinuation,
   digestStagedAuthenticationPolicy,
-  issueInitialStagedAuthenticationCapability,
+  issueStagedAuthenticationChallenge,
   takeStagedAuthenticationContinuation,
 } from "../../internal/staged-authentication-context";
 import { convertSetCookieToCookie } from "../../test-utils/headers";
@@ -135,7 +135,7 @@ async function stagedHeaders(
   if (!seed) throw new Error("staged seed was not issued");
   const issued = await runWithTransaction(
     context.adapter,
-    () => issueInitialStagedAuthenticationCapability(context, seed),
+    () => issueStagedAuthenticationChallenge(context, seed),
   );
   const signed = await serializeSignedCookie(
     issued.cookie.name,

@@ -32,7 +32,6 @@ import {
 	USER_OPERATIONS,
 	WEBHOOK_ENDPOINT_OPERATIONS,
 } from "@clearance/management";
-import type { ApiSession } from "./api-client.js";
 import { dispatchAccessCommand } from "./dispatch/access.js";
 import { dispatchAuthenticationPolicyCommand } from "./dispatch/authentication-policy.js";
 import { dispatchCoreCommand } from "./dispatch/core.js";
@@ -47,7 +46,7 @@ import { dispatchProductPresentationCommand } from "./dispatch/product-presentat
 import { dispatchStoreV2Command } from "./dispatch/store-v2.js";
 import { error } from "./dispatch/shared.js";
 import { dispatchUserCommand } from "./dispatch/users.js";
-import type { GlobalOpts } from "./output.js";
+import type { DispatchInput } from "./dispatch/shared.js";
 
 export {
 	EVENTS_TAIL_MAX_POLL_INTERVAL_MS,
@@ -76,13 +75,13 @@ export function commandPath(command: Command): string {
 	return names.join(" ");
 }
 
-export async function dispatchRemoteCommand(
-	session: ApiSession,
-	path: string,
-	args: unknown[],
-	opts: Record<string, unknown>,
-	global: GlobalOpts,
-): Promise<unknown> {
+export async function dispatchRemoteCommand({
+	session,
+	path,
+	args,
+	opts,
+	global,
+}: DispatchInput<string>): Promise<unknown> {
 	switch (path) {
 		case SYSTEM_OPERATIONS.init.cliPath:
 		case SYSTEM_OPERATIONS.doctor.cliPath:
@@ -204,7 +203,7 @@ export async function dispatchRemoteCommand(
 			return dispatchEnterpriseCommand({ session, path, args, opts, global });
 		case IMPORT_OPERATIONS.legacy.cliPath:
 		case MIGRATION_OPERATIONS.plan.cliPath:
-		case MIGRATION_OPERATIONS.run.cliPath:
+		case MIGRATION_OPERATIONS.apply.cliPath:
 		case MIGRATION_OPERATIONS.verify.cliPath:
 		case MIGRATION_OPERATIONS.rollback.cliPath:
 		case MIGRATION_OPERATIONS.status.cliPath:

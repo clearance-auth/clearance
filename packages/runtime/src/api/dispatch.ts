@@ -30,7 +30,7 @@ import { isRequestLike } from "../utils/url";
 import { assertSessionCredentialMigrationComplete } from "../db/session-credential-migration";
 import { readInternalCredentialAuthority } from "../internal/credential-authority";
 import {
-	issueInitialStagedAuthenticationCapability,
+	issueStagedAuthenticationChallenge,
 	takeStagedAuthenticationContinuation,
 } from "../internal/staged-authentication-context";
 import {
@@ -684,7 +684,7 @@ export async function dispatchAuthEndpoint(
 							const issued = await runWithTransaction(
 								internalContext.context.adapter,
 								() =>
-									issueInitialStagedAuthenticationCapability(
+									issueStagedAuthenticationChallenge(
 										internalContext.context,
 										continuation,
 									),

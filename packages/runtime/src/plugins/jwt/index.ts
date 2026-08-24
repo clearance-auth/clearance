@@ -18,7 +18,11 @@ import {
 	JWT_ROTATION_UNAVAILABLE_CODE,
 } from "./constant";
 import { schema } from "./schema";
-import { getJwtToken, issueServiceAccountJWT, signJWT } from "./sign";
+import {
+	issueJwtAccessToken,
+	issueServiceAccountJWT,
+	signJWT,
+} from "./sign";
 import type { JwtOptions } from "./types";
 import { createJwk } from "./utils";
 import { verifyJWT as verifyJWTHelper } from "./verify";
@@ -351,7 +355,7 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 								session: rotated.session,
 								user: rotated.user,
 							};
-							const token = await getJwtToken(ctx, options, {
+							const token = await issueJwtAccessToken(ctx, options, {
 								sid: rotated.session.id,
 								session_family: rotated.familyId,
 								session_generation: rotated.rotationCounter,
@@ -396,7 +400,7 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 					ctx.setHeader("Deprecation", "true");
 					ctx.setHeader("Link", '</token>; rel="successor-version"');
 					setNoStoreTokenResponseHeaders(ctx);
-					return ctx.json({ token: await getJwtToken(ctx, options) });
+					return ctx.json({ token: await issueJwtAccessToken(ctx, options) });
 				},
 			),
 			signJWT: createAuthEndpoint.serverOnly(
@@ -476,7 +480,7 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 
 						const session = ctx.context.session || ctx.context.newSession;
 						if (session && session.session) {
-							const jwt = await getJwtToken(ctx, options);
+							const jwt = await issueJwtAccessToken(ctx, options);
 							const exposedHeaders =
 								ctx.context.responseHeaders?.get(
 									"access-control-expose-headers",
@@ -502,4 +506,4 @@ export const jwt = <O extends JwtOptions>(options?: O) => {
 	} satisfies ClearancePlugin;
 };
 
-export { getJwtToken };
+export { issueJwtAccessToken };

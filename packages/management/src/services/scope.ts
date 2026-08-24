@@ -1,5 +1,5 @@
 /**
- * Principal-derived project/environment scope for the management plane.
+ * User-derived project/environment scope for the management plane.
  *
  * Authority is never taken from client request headers. Scope is resolved from
  * server-side operator configuration and the store's initialized project/env.

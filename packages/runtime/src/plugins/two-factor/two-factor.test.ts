@@ -1441,6 +1441,59 @@ describe("twoFactorTable option", async () => {
 });
 
 describe("OTP storage modes", async () => {
+	describe("default keyed OTP storage", async () => {
+		let otp = "";
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [
+				twoFactor({
+					otpOptions: {
+						storeOTP: undefined,
+						sendOTP({ otp: sentOtp }) {
+							otp = sentOtp;
+						},
+					},
+					skipVerificationOnEnable: true,
+				}),
+			],
+		});
+
+		it("keeps an explicitly undefined storage mode secret-keyed", async () => {
+			let { headers } = await signInWithTestUser();
+			const enable = await auth.api.enableTwoFactor({
+				body: { password: testUser.password },
+				headers,
+				asResponse: true,
+			});
+			headers = convertSetCookieToCookie(enable.headers);
+			const signIn = await auth.api.signInEmail({
+				body: { email: testUser.email, password: testUser.password },
+				asResponse: true,
+			});
+			headers = convertSetCookieToCookie(signIn.headers);
+			const context = await auth.$context;
+			let storedValue = "";
+			const originalCreate =
+				context.internalAdapter.createVerificationValue.bind(
+					context.internalAdapter,
+				);
+			const createVerificationValue = vi
+				.spyOn(context.internalAdapter, "createVerificationValue")
+				.mockImplementation(async (data, challenge) => {
+					if (data.identifier.startsWith("2fa-otp-")) storedValue = data.value;
+					return await originalCreate(data, challenge);
+				});
+			try {
+				await auth.api.sendTwoFactorOTP({ headers, body: {} });
+			} finally {
+				createVerificationValue.mockRestore();
+			}
+			expect(otp).toHaveLength(6);
+			expect(storedValue).not.toContain(otp);
+			expect(storedValue).toContain("$clearance-otp$");
+		});
+	});
+
 	describe("hashed OTP storage", async () => {
 		let OTP = "";
 		const { auth, signInWithTestUser, testUser } = await getTestInstance({

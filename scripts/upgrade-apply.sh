@@ -38,6 +38,18 @@ done
 
 [[ -n "$PLAN_REF" ]] || die "--plan is required"
 
+# Serialize direct shell invocations too. The FD closes on every exit path, so
+# no stale lockfile cleanup is required. flock is required rather than silently
+# accepting concurrent destructive operations on platforms without it.
+require_cmd flock
+[[ "$PLAN_DIR" == /* ]] || die "upgrade directory must be an absolute path"
+mkdir -p "$PLAN_DIR"
+[[ -d "$PLAN_DIR" && ! -L "$PLAN_DIR" ]] || die "upgrade directory must be a real directory"
+LOCK_PATH="$PLAN_DIR/.upgrade-apply.lock"
+[[ ! -e "$LOCK_PATH" || -f "$LOCK_PATH" ]] || die "upgrade lock path is unsafe"
+exec {UPGRADE_LOCK_FD}>"$LOCK_PATH"
+flock -n "$UPGRADE_LOCK_FD" || die "another upgrade apply is already running; retry after it finishes"
+
 if [[ -f "$PLAN_REF" ]]; then
   PLAN_PATH="$PLAN_REF"
 else

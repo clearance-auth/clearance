@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runWithTransaction } from "../../context/transaction";
 import type { ClearanceOptions } from "../../types";
 import { createAdapterFactory } from "./factory";
@@ -28,12 +28,14 @@ function createTestAdapter({
 	adapter,
 	options = {},
 	transaction,
+	debugLogs,
 }: {
 	adapter: CustomAdapter;
 	options?: ClearanceOptions;
 	transaction?: <R>(
 		callback: (trx: DBTransactionAdapter<ClearanceOptions>) => Promise<R>,
 	) => Promise<R>;
+	debugLogs?: { isRunningAdapterTests: boolean };
 }) {
 	return createAdapterFactory<ClearanceOptions>({
 		config: {
@@ -53,6 +55,7 @@ function createTestAdapter({
 				return data;
 			},
 			transaction,
+			debugLogs,
 		},
 		adapter: () => adapter,
 	})({
@@ -66,6 +69,113 @@ function createTestAdapter({
 		},
 	});
 }
+
+function serializedAdapterDebugLogs(adapter: DBAdapter<ClearanceOptions>) {
+	const debugLogs = (adapter as DBAdapter<ClearanceOptions> & {
+		adapterTestDebugLogs: {
+			resetDebugLogs: () => void;
+			printDebugLogs: () => void;
+		};
+	}).adapterTestDebugLogs;
+	const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+	try {
+		debugLogs.printDebugLogs();
+		return JSON.stringify(consoleLog.mock.calls);
+	} finally {
+		consoleLog.mockRestore();
+		debugLogs.resetDebugLogs();
+	}
+}
+
+describe("createAdapterFactory debug-log redaction", () => {
+	it.each(["legacy-v1", "digest-v1"])(
+		"does not serialize credential material for %s session operations",
+		async (generation) => {
+			const sentinels = {
+				token: `${generation}-live-bearer-token`,
+				password: `${generation}-password-hash`,
+				secret: `${generation}-verification-otp`,
+				key: `${generation}-key-material`,
+			};
+			const isDigest = generation === "digest-v1";
+			const model = isDigest ? "sessionCredential" : "session";
+			const predicateField = isDigest ? "secretDigest" : "token";
+			const data = isDigest
+				? {
+						selector: "credential-selector",
+						familyId: "credential-family",
+						secretDigest: sentinels.token,
+						digestVersion: 1,
+						status: "active",
+						expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+						keyMaterial: sentinels.key,
+					}
+				: {
+						userId: "user-id",
+						expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+						token: sentinels.token,
+						password: sentinels.password,
+						verificationSecret: sentinels.secret,
+						keyMaterial: sentinels.key,
+					};
+			const adapter = createTestAdapter({
+				debugLogs: { isRunningAdapterTests: true },
+				adapter: createCustomAdapter({
+					findOne: async <T>() =>
+						({
+							id: "session-id",
+							token: sentinels.token,
+							password: sentinels.password,
+							verificationSecret: sentinels.secret,
+							keyMaterial: sentinels.key,
+						}) as T,
+					update: async <T>() =>
+						({
+							id: "session-id",
+							token: sentinels.token,
+							password: sentinels.password,
+						}) as T,
+				}),
+			});
+
+			await adapter.create({
+				model,
+				data,
+			});
+			await adapter.findOne({
+				model,
+				where: [{ field: predicateField, value: sentinels.token }],
+			});
+			await adapter.findOne({
+				model: "verification",
+				where: [{ field: "value", value: sentinels.secret }],
+			});
+			await adapter.update({
+				model,
+				where: [{ field: predicateField, value: sentinels.token }],
+				update: isDigest
+					? { secretDigest: sentinels.token, keyMaterial: sentinels.key }
+					: { token: sentinels.token, password: sentinels.password },
+			});
+			await adapter.delete({
+				model,
+				where: [{ field: predicateField, value: sentinels.token }],
+			});
+
+			const serialized = serializedAdapterDebugLogs(adapter);
+			for (const sentinel of Object.values(sentinels)) {
+				expect(serialized).not.toContain(sentinel);
+			}
+			expect(serialized).toContain(
+				isDigest ? '"model":"sessionCredentials"' : '"model":"sessions"',
+			);
+			expect(serialized).toContain('"predicateCount":1');
+			expect(serialized).toContain(
+				`"fields":["${predicateField}"]`,
+			);
+		},
+	);
+});
 
 describe("createAdapterFactory consumeOne fallback", () => {
 	it("uses transaction adapter methods without double-transforming input or output", async () => {

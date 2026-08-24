@@ -56,7 +56,7 @@ describe("configureSsoConnection scope enforcement", () => {
 
 		// Fail closed means NOTHING was written: no field change, no audit event.
 		expect(store.checksum()).toBe(checksumBefore);
-		const row = store.snapshot.identityConnections.find((c) => c.id === conn.id);
+		const row = store.snapshot.ssoConnections.find((c) => c.id === conn.id);
 		expect(row?.issuer).toBe("https://original.example.com");
 		expect(
 			store.snapshot.events.filter((e) => e.action === "sso.configure"),
@@ -105,7 +105,7 @@ describe("configureSsoConnection scope enforcement", () => {
 			(updated as unknown as Record<string, unknown>).clientSecretEncrypted,
 		).toBeUndefined();
 
-		const row = store.snapshot.identityConnections.find((c) => c.id === conn.id);
+		const row = store.snapshot.ssoConnections.find((c) => c.id === conn.id);
 		expect(row?.issuer).toBe("https://after.example.com");
 		const audits = store.snapshot.events.filter(
 			(e) => e.action === "sso.configure" && e.subjectId === conn.id,
@@ -129,7 +129,7 @@ describe("configureSsoConnection scope enforcement", () => {
 		// row through a raw mutation, then configuring: JsonStore mutates a draft,
 		// so the thrown SSO_NOT_FOUND must leave no audit event behind.
 		store.mutate((data) => {
-			data.identityConnections = data.identityConnections.filter(
+			data.ssoConnections = data.ssoConnections.filter(
 				(c) => c.id !== conn.id,
 			);
 		});

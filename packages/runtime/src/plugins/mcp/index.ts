@@ -712,7 +712,7 @@ export const mcp = (options: MCPOptions) => {
 					}
 
 					const verificationValue =
-						await ctx.context.internalAdapter.findVerificationValue(
+						await ctx.context.internalAdapter.findVerificationValueAndPruneExpired(
 							code.toString(),
 						);
 					if (!verificationValue) {

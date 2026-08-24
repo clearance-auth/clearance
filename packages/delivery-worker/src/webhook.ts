@@ -37,7 +37,10 @@ function webhookError(code: string, message: string, extra: Record<string, unkno
 	return Object.assign(new Error(message), { code, ...extra });
 }
 
+export { parseOrganizationUpdatedWebhookPayload, parseWebhookDeliveryPayload };
+/** @deprecated Use parseOrganizationUpdatedWebhookPayload. */
 export const parseOrganizationUpdatedPayload = parseOrganizationUpdatedWebhookPayload;
+/** @deprecated Use parseWebhookDeliveryPayload. */
 export const parseWebhookPayload = parseWebhookDeliveryPayload;
 export function parseWebhookEndpointTestPayload(value: unknown): WebhookEndpointTestPayload {
 	return parseDeliveryWebhookEndpointTestPayload(value);
@@ -168,7 +171,7 @@ function validateEndpoint(raw: string, allowInsecureLoopback: boolean): { url: U
 }
 
 export function webhookDestination(value: unknown): string {
-	return parseWebhookPayload(value).endpoint.url;
+	return parseWebhookDeliveryPayload(value).endpoint.url;
 }
 
 export type PinnedWebhookRequest = (input: {
@@ -247,7 +250,7 @@ export function createWebhookSender(config: WorkerConfig, dependencies: {
 	lookup?: DnsLookup; request?: PinnedWebhookRequest; now?: () => number;
 } = {}): WebhookSender {
 	return { async send(value, context) {
-		const payload = parseWebhookPayload(value);
+		const payload = parseWebhookDeliveryPayload(value);
 		if (payload.event.id !== context.eventId) throw webhookError("WEBHOOK_PAYLOAD_INVALID", "Webhook event identity differs from delivery identity");
 		const { url, loopback } = validateEndpoint(payload.endpoint.url, config.webhook.allowInsecureLoopback);
 		const pinned = await resolvePinned(url.hostname, loopback, dependencies.lookup ?? dnsLookup as DnsLookup, config.webhook.dnsTimeoutMs);

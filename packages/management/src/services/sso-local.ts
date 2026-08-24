@@ -12,7 +12,7 @@ import {
 } from "node:http";
 import type { ManagementStore } from "../store/types.js";
 import { newId, nowIso } from "../store/json-store.js";
-import type { DiagnosticTrace, IdentityConnection } from "../types/resources.js";
+import type { DiagnosticTrace, SsoConnection } from "../types/resources.js";
 import { recordEvent } from "./audit.js";
 import { ClearanceError } from "./errors.js";
 import { resolveOperatorScopeAuthoritative, type ResourceScope } from "./scope.js";
@@ -303,14 +303,14 @@ export async function verifySsoOidcLocalProtocol(
 ): Promise<{
 	pass: boolean;
 	trace: DiagnosticTrace;
-	connection: IdentityConnection;
+	connection: SsoConnection;
 	mode: "simulation";
 	evidence: typeof SSO_LOCAL_EVIDENCE_LABEL;
 	authorizationUrl: string;
 	certifiedExternalTenant: false;
 }> {
 	const conn = await resolveEnterpriseConnectionAuthoritative(store, connectionId, {
-		connections: store.snapshot.identityConnections,
+		connections: store.snapshot.ssoConnections,
 		scope: opts.scope,
 		stage: "sso.local-protocol",
 		label: "SSO",
@@ -510,13 +510,13 @@ export async function verifySsoOidcLocalProtocol(
 			}
 			const scope = opts.scope ?? await resolveOperatorScopeAuthoritative(store);
 			const connection = await store.mutateCoordinated(async ({ data, topology, appendAudit }) => {
-				const index = data.identityConnections.findIndex((candidate) => candidate.id === connectionId);
-				const current = index >= 0 ? data.identityConnections[index] : undefined;
+				const index = data.ssoConnections.findIndex((candidate) => candidate.id === connectionId);
+				const current = index >= 0 ? data.ssoConnections[index] : undefined;
 				const organization = current && topology ? await topology.lockOrganization({ scope, id: current.organizationId }) : null;
 				if (!current || !organization || organization.status === "archived") throw new ClearanceError({ code: "SSO_NOT_FOUND", message: `SSO connection ${connectionId} not found`, stage: "sso.local-protocol", status: 404 });
 				data.traces.unshift(trace);
 				const updated = { ...current, status: "testing" as const, updatedAt: nowIso() };
-				data.identityConnections[index] = updated;
+				data.ssoConnections[index] = updated;
 				appendAudit({ actor: "system", action: "sso.local-protocol", subjectType: "identity_connection", subjectId: connectionId, outcome: "success", source: "sso", organizationId: organization.id, projectId: organization.projectId, environmentId: organization.environmentId, correlationId: corr, message: SSO_LOCAL_EVIDENCE_LABEL, metadata: { mode: SSO_LOCAL_PROTOCOL_MODE, evidence: SSO_LOCAL_EVIDENCE_LABEL, certifiedExternalTenant: false } });
 				return updated;
 			});
@@ -525,11 +525,11 @@ export async function verifySsoOidcLocalProtocol(
 
 		store.mutate((data) => {
 			data.traces.unshift(trace);
-			const idx = data.identityConnections.findIndex(
+			const idx = data.ssoConnections.findIndex(
 				(c) => c.id === connectionId,
 			);
 			if (idx >= 0) {
-				data.identityConnections[idx] = {
+				data.ssoConnections[idx] = {
 					...conn,
 					status: "testing",
 					updatedAt: nowIso(),
@@ -557,7 +557,7 @@ export async function verifySsoOidcLocalProtocol(
 		return {
 			pass: true,
 			trace,
-			connection: store.snapshot.identityConnections.find(
+			connection: store.snapshot.ssoConnections.find(
 				(c) => c.id === connectionId,
 			)!,
 			mode: SSO_LOCAL_PROTOCOL_MODE,

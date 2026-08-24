@@ -9,6 +9,7 @@ import type { ClearanceAuthBundle } from "@clearance/auth";
 import type { OperationContext } from "../application/context.js";
 import { getAuthBundle } from "../auth-bridge.js";
 import { mutateCoordinatedWithRuntimeSql } from "../store/coordinated-internal.js";
+import { isCoordinatedStore } from "../store/types.js";
 import type {
 	InternalManagementCoordinatedMutationContext,
 	ManagementStore,
@@ -120,8 +121,8 @@ function translateKeyManagementError(error: unknown, stage: string): never {
 	);
 }
 
-function requireCoordinatedPostgres(store: ManagementStore, stage: string): void {
-	if (store.backend !== "postgres" || typeof store.mutateCoordinated !== "function") {
+function assertCoordinatedPostgres(store: ManagementStore, stage: string): void {
+	if (!isCoordinatedStore(store)) {
 		throw keyManagementError(
 			"KEY_MANAGEMENT_POSTGRES_REQUIRED",
 			"Key management requires the coordinated PostgreSQL management backend.",
@@ -137,7 +138,7 @@ function facade(
 	context: OperationContext,
 	stage: string,
 ): KeyManagementFacade {
-	requireCoordinatedPostgres(store, stage);
+	assertCoordinatedPostgres(store, stage);
 	const authority = getAuthBundle().keyManagement;
 	if (
 		authority.scope.projectId !== context.scope.projectId ||

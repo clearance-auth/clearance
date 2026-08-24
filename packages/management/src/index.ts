@@ -71,3 +71,8 @@ export * from "./services/fixtures.js";
 export * from "./contracts/surfaces.js";
 export * from "./contracts/operations.js";
 export * from "./auth-bridge.js";
+export type {
+	DeliveryChannel,
+	DeliveryJobState,
+	WebhookEndpointStatus,
+} from "@clearance/delivery";

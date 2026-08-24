@@ -28,7 +28,7 @@ const DATABASE_URL =
 	process.env.CLEARANCE_TEST_DATABASE_URL ??
 	process.env.DATABASE_URL ??
 	"postgres://clearance:clearance@localhost:5434/clearance";
-const TABLE = `clearance_store_v2_principal_scale_${process.pid}`;
+const TABLE = `clr_p_scale_${process.pid}`;
 const PREFIX = `${TABLE}_n_`;
 const TABLES = storeV2TableNames(PREFIX);
 const COUNTS = [5_000, 50_000] as const;
@@ -72,7 +72,7 @@ describe.skipIf(!available)("store-v2 principal and topology production-path sca
 			normalizedPrefix: PREFIX,
 		});
 		stores.push(store);
-		const initialized = initProject(store, { name: "Principal Scale", source: "cli" });
+		const initialized = initProject(store, { name: "User Scale", source: "cli" });
 		await store.ready();
 		await store.storeV2!.apply();
 		await store.storeV2!.cutoverEvents();
@@ -164,9 +164,9 @@ describe.skipIf(!available)("store-v2 principal and topology production-path sca
 						[scope.projectId, scope.environmentId, count],
 					);
 					await advanceStoreV2TopologyState(stateClient, TABLES, {
-						projectCount: 0,
-						environmentCount: 0,
-						organizationCount: count - topologyState.organizationCount,
+						projectCountDelta: 0,
+						environmentCountDelta: 0,
+						organizationCountDelta: count - topologyState.organizationCount,
 					});
 					await stateClient.query("COMMIT");
 				} catch (error) {

@@ -547,7 +547,7 @@ Follow [rfc8628#section-3.4](https://datatracker.ietf.org/doc/html/rfc8628#secti
 		},
 	);
 
-export const deviceVerify = createAuthEndpoint(
+export const claimDeviceUserCode = createAuthEndpoint(
 	"/device",
 	{
 		method: "GET",
