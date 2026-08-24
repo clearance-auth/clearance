@@ -30,6 +30,12 @@ export CLEARANCE_CREDENTIAL_KEY_ID="${CLEARANCE_CREDENTIAL_KEY_ID:-smoke-v1}"
 # This smoke stack starts from a blank database and therefore exercises only
 # the post-migration authority. Do not inherit a bridge-generation override.
 export CLEARANCE_CREDENTIAL_AUTHORITY_GENERATION=digest-v1
+export CLEARANCE_PROJECT_ID="${CLEARANCE_PROJECT_ID:-proj_default}"
+export CLEARANCE_ENV_ID="${CLEARANCE_ENV_ID:-env_default}"
+# Strict startup requires purpose-separated encryption providers and an ES256
+# signer. Derive the stable local configuration from this run's credential key;
+# production Compose always requires an operator-managed configuration instead.
+export CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON="${CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON:-$(node "$ROOT/scripts/local-key-management-config.mjs")}"
 export CLEARANCE_CONSOLE_ADMIN_USER="${CLEARANCE_CONSOLE_ADMIN_USER:-smoke-admin}"
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="${CLEARANCE_CONSOLE_ADMIN_PASSWORD:-$(rand)}"
 export CLEARANCE_CONSOLE_SESSION_SECRET="${CLEARANCE_CONSOLE_SESSION_SECRET:-$(rand)}"

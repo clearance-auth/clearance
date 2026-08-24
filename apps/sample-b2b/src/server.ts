@@ -11,6 +11,7 @@ import {
 	closeAuthBundle,
 	createManagementStore,
 	initProjectAuthoritative,
+	keyManagementRuntimeOptions,
 	provisionOrganizationInAuth,
 	recordEvent,
 	syncRuntimeOrganizationToManagementDurable,
@@ -102,6 +103,7 @@ const bundle = createClearanceAuth({
 	enableSso: true,
 	enableScim: true,
 	credentialAuthority: credentialAuthorityOptions(),
+	...keyManagementRuntimeOptions(),
 	trustedOrigins: [baseURL, "http://localhost:3100", "http://localhost:3200"],
 	socialProviders,
 	onUserCreated: async (user) => {
