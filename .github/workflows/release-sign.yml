@@ -207,7 +207,7 @@ jobs:
           }
           tar -xzf "$NPM_CLI_ARCHIVE" -C "$NPM_CLI_DIR"
           test "$(node "$NPM_CLI_DIR/package/bin/npm-cli.js" --version)" = "$NPM_CLI_VERSION"
-          echo "$NPM_CLI_DIR/package/bin" >> "$GITHUB_PATH"
+          echo "CLEARANCE_NPM_CLI=$NPM_CLI_DIR/package/bin/npm-cli.js" >> "$GITHUB_ENV"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -281,8 +281,8 @@ jobs:
         if: env.RECOVER_PUBLISHED_NPM == '1'
         run: |
           set -Eeuo pipefail
-          test "$(npm --version)" = "11.16.0"
-          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          test "$(node "$CLEARANCE_NPM_CLI" --version)" = "11.16.0"
+          test "$(node "$CLEARANCE_NPM_CLI" config get registry)" = "https://registry.npmjs.org/"
           mapfile -t PACKAGES < <(node .release-tooling/scripts/release-packages.mjs names)
           integrity_for() {
             node -e '
@@ -303,7 +303,7 @@ jobs:
           registry_integrity() {
             local package="$1" integrity=""
             for ATTEMPT in {1..120}; do
-              if integrity="$(npm view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
+              if integrity="$(node "$CLEARANCE_NPM_CLI" view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
                 && [[ -n "$integrity" ]]; then
                 printf '%s' "$integrity"
                 return 0
@@ -336,7 +336,7 @@ jobs:
             for ATTEMPT in {1..120}; do
               AUDIT_DIR="$(mktemp -d)"
               prepare_audit_tree "$AUDIT_DIR" "$@"
-              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+              if node "$CLEARANCE_NPM_CLI" audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
                 && node .release-tooling/scripts/verify-npm-provenance.mjs \
                   "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
                   dist-release/assets "$output" "$@"; then
@@ -501,8 +501,8 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -Eeuo pipefail
-          test "$(npm --version)" = "11.16.0"
-          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          test "$(node "$CLEARANCE_NPM_CLI" --version)" = "11.16.0"
+          test "$(node "$CLEARANCE_NPM_CLI" config get registry)" = "https://registry.npmjs.org/"
           mapfile -t PACKAGES < <(node scripts/release-packages.mjs names)
           tarball_for() {
             node -e '
@@ -558,7 +558,7 @@ jobs:
           registry_integrity() {
             local package="$1" integrity=""
             for ATTEMPT in {1..120}; do
-              if integrity="$(npm view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
+              if integrity="$(node "$CLEARANCE_NPM_CLI" view "${package}@${VERSION}" dist.integrity --json 2>/dev/null | tr -d '"\n')" \
                 && [[ -n "$integrity" ]]; then
                 printf '%s' "$integrity"
                 return 0
@@ -591,7 +591,7 @@ jobs:
             for ATTEMPT in {1..120}; do
               AUDIT_DIR="$(mktemp -d)"
               prepare_audit_tree "$AUDIT_DIR" "$@"
-              if npm audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
+              if node "$CLEARANCE_NPM_CLI" audit signatures --prefix "$AUDIT_DIR" --json --include-attestations > "$AUDIT_DIR/npm-audit-signatures.json" \
                 && node scripts/verify-npm-provenance.mjs \
                   "$VERSION" "$SOURCE_COMMIT" "$AUDIT_DIR/npm-audit-signatures.json" \
                   dist-release/assets "$output" "$@"; then
@@ -624,7 +624,7 @@ jobs:
             verify_provenance dist-release/assets/npm-provenance-existing.json "${EXISTING_PACKAGES[@]}"
           fi
           for PACKAGE in "${ABSENT_PACKAGES[@]}"; do
-            if ! npm publish "$(tarball_for "$PACKAGE")" --access public --provenance; then
+            if ! node "$CLEARANCE_NPM_CLI" publish "$(tarball_for "$PACKAGE")" --access public --provenance; then
               # A competing immutable publish is acceptable only when the public
               # registry readback proves it is byte-for-byte the frozen artifact.
               [[ "$(registry_status "$PACKAGE")" == "200" ]] || exit 1
@@ -656,7 +656,7 @@ jobs:
           ANON_HOME="$(mktemp -d)"
           printf 'registry=https://registry.npmjs.org/\n' > "$ANON_NPMRC"
           INSTALL_DIR="$(mktemp -d)"
-          env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" npm --userconfig "$ANON_NPMRC" \
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" node "$CLEARANCE_NPM_CLI" --userconfig "$ANON_NPMRC" \
             install --prefix "$INSTALL_DIR" --ignore-scripts --save-exact "${PACKAGES[@]/%/@$VERSION}"
           env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" INSTALL_DIR="$INSTALL_DIR" node --input-type=module <<'NODE'
           import { createRequire } from "node:module";

@@ -248,17 +248,31 @@ if (new Set(names).size !== names.length || steps.filter((step) => step.uses).so
 const identity = namedStep(steps, "Resolve version and require release signing identity");
 const clean = namedStep(steps, "Install and verify from clean source");
 const rehearsal = namedStep(steps, "Rehearse release assembly");
+const provisionNpm = namedStep(steps, "Provision integrity-pinned npm CLI");
 const recovery = namedStep(steps, "Verify recovery npm packages before signing assets");
 const staging = namedStep(steps, "Build and push staging container references");
 const finalTags = namedStep(steps, "Create final release tags from verified digests");
 const verifyContainerTags = namedStep(steps, "Verify both published container tags match the signed digests");
 const publish = namedStep(steps, "Publish public npm packages with trusted provenance");
+const anonymousInstall = namedStep(steps, "Prove anonymous public-registry install and imports");
 const terraform = steps.map((step, index) => ({ step, index })).find(({ step }) => step.uses === "hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e");
 if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terraform.index >= clean.index || clean.index >= rehearsal.index
 	|| rehearsal.index >= recovery.index || recovery.index >= staging.index || staging.index >= finalTags.index || finalTags.index >= publish.index
 	|| rehearsal.step.run !== "pnpm release:rehearse -- \"$VERSION\""
 	|| recovery.step.if !== "env.RECOVER_PUBLISHED_NPM == '1'" || publish.step.if !== "env.RECOVER_PUBLISHED_NPM != '1'") {
 	fail("release workflow must retain pinned, ordered release gates and the exact shared rehearsal invocation");
+}
+if (provisionNpm.step.env?.NPM_CLI_VERSION !== "11.16.0"
+	|| provisionNpm.step.env?.NPM_CLI_INTEGRITY !== "sha512-A74XL8OxmcegZDMWPkWb5bEQppg8HdYwW3rBD2sPoS4UQHVajfaxBkqyzLeJ3wR0kZ+5xoTjItxXaF7eIXUsyw=="
+	|| !provisionNpm.step.run?.includes('test "$(node "$NPM_CLI_DIR/package/bin/npm-cli.js" --version)" = "$NPM_CLI_VERSION"')
+	|| !provisionNpm.step.run?.includes('echo "CLEARANCE_NPM_CLI=$NPM_CLI_DIR/package/bin/npm-cli.js" >> "$GITHUB_ENV"')
+	|| !recovery.step.run?.includes('node "$CLEARANCE_NPM_CLI" view')
+	|| !recovery.step.run?.includes('node "$CLEARANCE_NPM_CLI" audit signatures')
+	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" publish')
+	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" view')
+	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" audit signatures')
+	|| !anonymousInstall.step.run?.includes('node "$CLEARANCE_NPM_CLI" --userconfig')) {
+	fail("release npm operations must use the integrity-pinned npm CLI explicitly");
 }
 if (!verifyContainerTags.step.run?.includes("requiredPlatforms")
 	|| !verifyContainerTags.step.run?.includes('docker --config "$ANON_DOCKER_CONFIG" pull --platform "$platform" "${repository}@${platform_digest}"')
