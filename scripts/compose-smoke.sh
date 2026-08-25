@@ -154,7 +154,7 @@ wait_for() {
     CLEARANCE_SAMPLE_URL="$SAMPLE_URL" \
     CLEARANCE_CONSOLE_ADMIN_USER="$CLEARANCE_CONSOLE_ADMIN_USER" \
     CLEARANCE_CONSOLE_ADMIN_PASSWORD="$CLEARANCE_CONSOLE_ADMIN_PASSWORD" \
-    npx playwright test)
+    node "$ROOT/packages/clearance-e2e/node_modules/@playwright/test/cli.js" test)
 
   # Cursor pagination acceptance (FOLLOW.md P2.3.1): create more users than
   # one page, walk cursors to exhaustion, assert no duplicates or omissions
