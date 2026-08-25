@@ -524,12 +524,16 @@ jobs:
               process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
             ' "$1"
           }
-          registry_status() {
-            local package="$1" encoded status
+          registry_status_once() {
+            local package="$1" encoded
             encoded="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$package")"
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              "https://registry.npmjs.org/${encoded}/${VERSION}" || true
+          }
+          await_registry_status() {
+            local package="$1" status
             for ATTEMPT in {1..120}; do
-              status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-                "https://registry.npmjs.org/${encoded}/${VERSION}" || true)"
+              status="$(registry_status_once "$package")"
               case "$status" in
                 200) printf '%s' "$status"; return 0 ;;
                 404)
@@ -553,6 +557,53 @@ jobs:
               esac
             done
             echo "::error::Registry did not return a conclusive response for ${package}@${VERSION}" >&2
+            return 1
+          }
+          preflight_registry_statuses() {
+            local STATUS_DIRECTORY STATUS PENDING INDEX
+            STATUS_DIRECTORY="$(mktemp -d)"
+            PREFLIGHT_STATUSES=()
+            for INDEX in "${!PACKAGES[@]}"; do
+              PREFLIGHT_STATUSES[$INDEX]=""
+            done
+            for ATTEMPT in {1..120}; do
+              PIDS=()
+              for INDEX in "${!PACKAGES[@]}"; do
+                [[ -n "${PREFLIGHT_STATUSES[$INDEX]}" ]] && continue
+                registry_status_once "${PACKAGES[$INDEX]}" > "$STATUS_DIRECTORY/$INDEX" &
+                PIDS+=("$!")
+              done
+              for PID in "${PIDS[@]}"; do
+                wait "$PID"
+              done
+              PENDING=0
+              for INDEX in "${!PACKAGES[@]}"; do
+                [[ -n "${PREFLIGHT_STATUSES[$INDEX]}" ]] && continue
+                STATUS="$(< "$STATUS_DIRECTORY/$INDEX")"
+                case "$STATUS" in
+                  200) PREFLIGHT_STATUSES[$INDEX]="200" ;;
+                  404)
+                    # npm's negative cache can briefly hide an immutable version.
+                    # Do not classify it absent until the shared readback window ends.
+                    if [[ "$ATTEMPT" -eq 120 ]]; then
+                      PREFLIGHT_STATUSES[$INDEX]="404"
+                    else
+                      PENDING=1
+                    fi
+                    ;;
+                  000|429|5??|"") PENDING=1 ;;
+                  *)
+                    echo "::error::Registry returned HTTP $STATUS for ${PACKAGES[$INDEX]}@${VERSION}" >&2
+                    return 1
+                    ;;
+                esac
+              done
+              [[ "$PENDING" -eq 0 ]] && return 0
+              [[ "$ATTEMPT" -eq 120 ]] && break
+              echo "Waiting for conclusive public-registry preflight across ${#PACKAGES[@]} packages (${ATTEMPT}/120)..." >&2
+              sleep 5
+            done
+            echo "::error::Registry did not return a conclusive response within the shared ten-minute preflight window" >&2
             return 1
           }
           registry_integrity() {
@@ -605,8 +656,10 @@ jobs:
           }
           EXISTING_PACKAGES=()
           ABSENT_PACKAGES=()
-          for PACKAGE in "${PACKAGES[@]}"; do
-            STATUS="$(registry_status "$PACKAGE")"
+          preflight_registry_statuses
+          for INDEX in "${!PACKAGES[@]}"; do
+            PACKAGE="${PACKAGES[$INDEX]}"
+            STATUS="${PREFLIGHT_STATUSES[$INDEX]}"
             if [[ "$STATUS" == "404" ]]; then
               ABSENT_PACKAGES+=("$PACKAGE")
               continue
@@ -627,7 +680,7 @@ jobs:
             if ! node "$CLEARANCE_NPM_CLI" publish "$(tarball_for "$PACKAGE")" --access public --provenance; then
               # A competing immutable publish is acceptable only when the public
               # registry readback proves it is byte-for-byte the frozen artifact.
-              [[ "$(registry_status "$PACKAGE")" == "200" ]] || exit 1
+              [[ "$(await_registry_status "$PACKAGE")" == "200" ]] || exit 1
               EXPECTED_INTEGRITY="$(integrity_for "$(tarball_for "$PACKAGE")")"
               PUBLISHED_INTEGRITY="$(registry_integrity "$PACKAGE")"
               [[ "$PUBLISHED_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
