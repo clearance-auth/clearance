@@ -252,7 +252,7 @@ const recovery = namedStep(steps, "Verify recovery npm packages before signing a
 const staging = namedStep(steps, "Build and push staging container references");
 const finalTags = namedStep(steps, "Create final release tags from verified digests");
 const publish = namedStep(steps, "Publish public npm packages with trusted provenance");
-const terraform = steps.map((step, index) => ({ step, index })).find(({ step }) => step.uses === "hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd");
+const terraform = steps.map((step, index) => ({ step, index })).find(({ step }) => step.uses === "hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e");
 if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terraform.index >= clean.index || clean.index >= rehearsal.index
 	|| rehearsal.index >= recovery.index || recovery.index >= staging.index || staging.index >= finalTags.index || finalTags.index >= publish.index
 	|| rehearsal.step.run !== "pnpm release:rehearse -- \"$VERSION\""
