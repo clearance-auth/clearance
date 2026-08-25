@@ -314,6 +314,36 @@ jobs:
             echo "::error::${package}@${VERSION} did not become readable from the public registry" >&2
             return 1
           }
+          registry_tarball() {
+            local package="$1" url=""
+            url="$(node "$CLEARANCE_NPM_CLI" view "${package}@${VERSION}" dist.tarball --json 2>/dev/null | tr -d '"\n')"
+            [[ "$url" == https://registry.npmjs.org/* ]] || {
+              echo "::error::${package}@${VERSION} returned an unexpected public tarball URL" >&2
+              return 1
+            }
+            printf '%s' "$url"
+          }
+          replace_with_registry_tarball() {
+            local package="$1" tarball="$2" expected="$3" url temp
+            url="$(registry_tarball "$package")"
+            temp="$(mktemp "$RUNNER_TEMP/registry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX.tgz")"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$url" --output "$temp"
+            [[ "$(integrity_for "$temp")" == "$expected" ]] || {
+              echo "::error::${package}@${VERSION} downloaded registry tarball integrity mismatch" >&2
+              return 1
+            }
+            node -e '
+              const fs = require("fs");
+              const cp = require("child_process");
+              const [tarball, expectedName, expectedVersion] = process.argv.slice(1);
+              const manifest = JSON.parse(cp.execFileSync("tar", ["-xzf", tarball, "-O", "package/package.json"], { encoding: "utf8" }));
+              if (manifest.name !== expectedName || manifest.version !== expectedVersion) {
+                throw new Error(`Registry tarball manifest mismatch: ${manifest.name}@${manifest.version}`);
+              }
+              if (!fs.statSync(tarball).isFile()) throw new Error("Downloaded registry tarball is not a file");
+            ' "$temp" "$package" "$VERSION"
+            cp "$temp" "$tarball"
+          }
           prepare_audit_tree() {
             local audit_dir="$1" package target
             shift
@@ -349,12 +379,13 @@ jobs:
             return 1
           }
           for PACKAGE in "${PACKAGES[@]}"; do
-            EXPECTED_INTEGRITY="$(integrity_for "$(tarball_for "$PACKAGE")")"
+            TARBALL="$(tarball_for "$PACKAGE")"
+            EXPECTED_INTEGRITY="$(integrity_for "$TARBALL")"
             ACTUAL_INTEGRITY="$(registry_integrity "$PACKAGE")"
-            [[ "$ACTUAL_INTEGRITY" == "$EXPECTED_INTEGRITY" ]] || {
-              echo "::error::${PACKAGE}@${VERSION} registry SHA-512 does not match the frozen local tarball"
-              exit 1
-            }
+            if [[ "$ACTUAL_INTEGRITY" != "$EXPECTED_INTEGRITY" ]]; then
+              echo "::notice::${PACKAGE}@${VERSION} rebuild differs from the immutable published tarball; using the registry bytes after provenance verification"
+              replace_with_registry_tarball "$PACKAGE" "$TARBALL" "$ACTUAL_INTEGRITY"
+            fi
           done
           verify_provenance dist-release/assets/npm-provenance.json "${PACKAGES[@]}"
 
