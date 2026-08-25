@@ -101,6 +101,7 @@ write_consumer_manifest() {
     const {execSync}=require('child_process');
     const pack=process.argv[1];
     const consumer=process.argv[2];
+    const packageManager=JSON.parse(fs.readFileSync(path.join(process.cwd(),'package.json'),'utf8')).packageManager;
     const deps={};
     for (const f of fs.readdirSync(pack).filter(x=>x.endsWith('.tgz'))) {
       const abs=path.join(pack,f);
@@ -111,6 +112,7 @@ write_consumer_manifest() {
       name:'clearance-tarball-consumer',
       private:true,
       type:'module',
+      packageManager,
       dependencies:deps,
       devDependencies:{
         typescript:'^5.9.3',
@@ -118,19 +120,27 @@ write_consumer_manifest() {
       },
     };
     fs.writeFileSync(path.join(consumer,'package.json'), JSON.stringify(pkg,null,2)+'\\n');
+    const workspace=[
+      'packages:',
+      '  - "."',
+      'overrides:',
+      ...Object.entries(deps).map(([name, tarball]) => '  '+JSON.stringify(name)+': '+JSON.stringify(tarball)),
+    ];
+    fs.writeFileSync(path.join(consumer,'pnpm-workspace.yaml'), workspace.join('\\n')+'\\n');
     console.log('consumer_deps='+Object.keys(deps).length);
   " "$PACK" "$CONSUMER"
 }
 
 install_consumer() {
   cd "$CONSUMER"
-  # Isolated install: no workspace, no monorepo node_modules.
+  # Isolated install: the scratch workspace binds every internal dependency to
+  # its packed tarball and cannot resolve through the monorepo workspace.
   # Generate a lockfile then reinstall frozen for determinism.
-  npm install --no-fund --no-audit --package-lock-only >/dev/null \
-    || fail "npm package-lock generation failed"
-  [[ -f package-lock.json ]] || fail "package-lock.json not generated"
-  npm ci --no-fund --no-audit \
-    || fail "npm ci frozen install failed"
+  pnpm install --workspace-root --lockfile-only --ignore-scripts --no-frozen-lockfile \
+    || fail "pnpm lockfile generation failed"
+  [[ -f pnpm-lock.yaml ]] || fail "pnpm-lock.yaml not generated"
+  pnpm install --workspace-root --frozen-lockfile --ignore-scripts \
+    || fail "pnpm frozen install failed"
   cd "$ROOT"
 }
 
