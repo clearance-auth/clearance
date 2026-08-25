@@ -711,12 +711,26 @@ jobs:
           INSTALL_DIR="$(mktemp -d)"
           env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" node "$CLEARANCE_NPM_CLI" --userconfig "$ANON_NPMRC" \
             install --prefix "$INSTALL_DIR" --ignore-scripts --save-exact "${PACKAGES[@]/%/@$VERSION}"
+          CLI_ENTRY="$(INSTALL_DIR="$INSTALL_DIR" node --input-type=module <<'NODE'
+          import { createRequire } from "node:module";
+          import path from "node:path";
+          const install = process.env.INSTALL_DIR;
+          const require = createRequire(path.join(install, "package.json"));
+          process.stdout.write(require.resolve("@clearance/cli"));
+          NODE
+          )"
+          [[ -n "$CLI_ENTRY" ]]
+          CLI_VERSION="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" node "$CLI_ENTRY" --version)"
+          [[ "$CLI_VERSION" == "$VERSION" ]] || {
+            echo "::error::Anonymous @clearance/cli reported $CLI_VERSION, expected $VERSION"
+            exit 1
+          }
           env -u NODE_AUTH_TOKEN -u NPM_TOKEN HOME="$ANON_HOME" INSTALL_DIR="$INSTALL_DIR" node --input-type=module <<'NODE'
           import { createRequire } from "node:module";
           import path from "node:path";
           const install = process.env.INSTALL_DIR;
           const require = createRequire(path.join(install, "package.json"));
-          for (const name of ["@clearance/management-client", "@clearance/observability-node", "@clearance/delivery", "@clearance/delivery-worker", "@clearance/key-management", "@clearance/verification", "@clearance/vault", "@clearance/auth", "@clearance/management", "@clearance/cli", "@clearance/api"]) {
+          for (const name of ["@clearance/management-client", "@clearance/observability-node", "@clearance/delivery", "@clearance/delivery-worker", "@clearance/key-management", "@clearance/verification", "@clearance/vault", "@clearance/auth", "@clearance/management", "@clearance/api"]) {
             await import(require.resolve(name));
           }
           const consolePackage = path.join(install, "node_modules", "@clearance", "console", "package.json");

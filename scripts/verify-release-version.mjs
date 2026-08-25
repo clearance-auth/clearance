@@ -283,6 +283,13 @@ if (provisionNpm.step.env?.NPM_CLI_VERSION !== "11.16.0"
 	|| !publish.step.run?.includes('$(await_registry_status "$PACKAGE")')) {
 	fail("release npm operations must use the integrity-pinned CLI and one shared bounded registry preflight");
 }
+const anonymousRun = anonymousInstall.step.run ?? "";
+const anonymousImportNames = anonymousRun.match(/for \(const name of \[([\s\S]*?)\]\)/)?.[1] ?? "";
+if (!anonymousRun.includes('require.resolve("@clearance/cli")')
+	|| !anonymousRun.includes('node "$CLI_ENTRY" --version')
+	|| anonymousImportNames.includes('"@clearance/cli"')) {
+	fail("anonymous release verification must execute the CLI binary separately and import only library entrypoints");
+}
 if (!verifyContainerTags.step.run?.includes("requiredPlatforms")
 	|| !verifyContainerTags.step.run?.includes('docker --config "$ANON_DOCKER_CONFIG" pull --platform "$platform" "${repository}@${platform_digest}"')
 	|| verifyContainerTags.step.run?.includes('pull --platform linux/amd64 "${repository}@${expected}"')
