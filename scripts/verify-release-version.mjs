@@ -262,12 +262,20 @@ if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terrafor
 	|| recovery.step.if !== "env.RECOVER_PUBLISHED_NPM == '1'" || publish.step.if !== "env.RECOVER_PUBLISHED_NPM != '1'") {
 	fail("release workflow must retain pinned, ordered release gates and the exact shared rehearsal invocation");
 }
+const recoveryRun = recovery.step.run ?? "";
+const recoveryMaterialization = recoveryRun.indexOf("replace_with_registry_tarball()");
+const recoveryProvenance = recoveryRun.indexOf("verify_provenance dist-release/assets/npm-provenance.json");
 if (provisionNpm.step.env?.NPM_CLI_VERSION !== "11.16.0"
 	|| provisionNpm.step.env?.NPM_CLI_INTEGRITY !== "sha512-A74XL8OxmcegZDMWPkWb5bEQppg8HdYwW3rBD2sPoS4UQHVajfaxBkqyzLeJ3wR0kZ+5xoTjItxXaF7eIXUsyw=="
 	|| !provisionNpm.step.run?.includes('test "$(node "$NPM_CLI_DIR/package/bin/npm-cli.js" --version)" = "$NPM_CLI_VERSION"')
 	|| !provisionNpm.step.run?.includes('echo "CLEARANCE_NPM_CLI=$NPM_CLI_DIR/package/bin/npm-cli.js" >> "$GITHUB_ENV"')
 	|| !recovery.step.run?.includes('node "$CLEARANCE_NPM_CLI" view')
 	|| !recovery.step.run?.includes('node "$CLEARANCE_NPM_CLI" audit signatures')
+	|| recoveryMaterialization < 0 || recoveryProvenance < recoveryMaterialization
+	|| !recoveryRun.includes('registry_tarball()')
+	|| !recoveryRun.includes('curl --fail --silent --show-error --location --proto \'=https\' --tlsv1.2')
+	|| !recoveryRun.includes('cp "$temp" "$tarball"')
+	|| !recoveryRun.includes("rebuild differs from the immutable published tarball")
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" publish')
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" view')
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" audit signatures')
