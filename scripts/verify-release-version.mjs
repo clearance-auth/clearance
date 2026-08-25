@@ -271,8 +271,17 @@ if (provisionNpm.step.env?.NPM_CLI_VERSION !== "11.16.0"
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" publish')
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" view')
 	|| !publish.step.run?.includes('node "$CLEARANCE_NPM_CLI" audit signatures')
-	|| !anonymousInstall.step.run?.includes('node "$CLEARANCE_NPM_CLI" --userconfig')) {
-	fail("release npm operations must use the integrity-pinned npm CLI explicitly");
+	|| !anonymousInstall.step.run?.includes('node "$CLEARANCE_NPM_CLI" --userconfig')
+	|| !publish.step.run?.includes('preflight_registry_statuses()')
+	|| !publish.step.run?.includes('registry_status_once "${PACKAGES[$INDEX]}" > "$STATUS_DIRECTORY/$INDEX" &')
+	|| !publish.step.run?.includes('for PID in "${PIDS[@]}"; do')
+	|| !publish.step.run?.includes('wait "$PID"')
+	|| !publish.step.run?.includes('if [[ "$ATTEMPT" -eq 120 ]]; then')
+	|| !publish.step.run?.includes('PREFLIGHT_STATUSES[$INDEX]="404"')
+	|| !publish.step.run?.includes('[[ "$ATTEMPT" -eq 120 ]] && break')
+	|| !publish.step.run?.includes('EXISTING_PACKAGES=()\nABSENT_PACKAGES=()\npreflight_registry_statuses\nfor INDEX in "${!PACKAGES[@]}"; do')
+	|| !publish.step.run?.includes('$(await_registry_status "$PACKAGE")')) {
+	fail("release npm operations must use the integrity-pinned CLI and one shared bounded registry preflight");
 }
 if (!verifyContainerTags.step.run?.includes("requiredPlatforms")
 	|| !verifyContainerTags.step.run?.includes('docker --config "$ANON_DOCKER_CONFIG" pull --platform "$platform" "${repository}@${platform_digest}"')
