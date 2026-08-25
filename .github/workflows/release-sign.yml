@@ -460,8 +460,6 @@ jobs:
             # A release image must be publicly consumable by both supported Linux
             # platforms without using the authenticated publishing credentials.
             ANON_DOCKER_CONFIG="$(mktemp -d)"
-            docker --config "$ANON_DOCKER_CONFIG" pull --platform linux/amd64 "${repository}@${expected}" >/dev/null
-            docker --config "$ANON_DOCKER_CONFIG" pull --platform linux/arm64 "${repository}@${expected}" >/dev/null
             manifest="$ANON_DOCKER_CONFIG/manifest.json"
             docker --config "$ANON_DOCKER_CONFIG" manifest inspect "${repository}@${expected}" > "$manifest"
             node -e '
@@ -470,11 +468,28 @@ jobs:
               const manifest=JSON.parse(fs.readFileSync(manifestPath,"utf8"));
               const descriptors=(manifest.manifests ?? []).map(({digest, mediaType, platform}) => ({ digest, mediaType, platform: `${platform?.os}/${platform?.architecture}` }));
               const platforms=descriptors.map(({platform}) => platform).sort();
+              const requiredPlatforms={};
               for (const wanted of ["linux/amd64", "linux/arm64"]) {
-                if (!platforms.includes(wanted)) throw new Error(`${reference} manifest list is missing ${wanted}`);
+                const matches=descriptors.filter(({platform}) => platform === wanted);
+                if (matches.length !== 1 || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest)) {
+                  throw new Error(`${reference} manifest list must contain exactly one immutable ${wanted} descriptor`);
+                }
+                requiredPlatforms[wanted]=matches[0].digest;
               }
-              fs.writeFileSync(output, `${JSON.stringify({ reference, mediaType: manifest.mediaType, descriptors, platforms }, null, 2)}\n`);
+              fs.writeFileSync(output, `${JSON.stringify({ reference, mediaType: manifest.mediaType, descriptors, platforms, requiredPlatforms }, null, 2)}\n`);
             ' "$manifest" "$platform_evidence" "${repository}@${expected}"
+            for platform in linux/amd64 linux/arm64; do
+              platform_digest="$(node -e '
+                const evidence=require(process.argv[1]);
+                const digest=evidence.requiredPlatforms?.[process.argv[2]];
+                if (!/^sha256:[0-9a-f]{64}$/.test(digest ?? "")) process.exit(1);
+                process.stdout.write(digest);
+              ' "$PWD/$platform_evidence" "$platform")"
+              # Pull each platform by its distinct child digest. Pulling the
+              # shared index digest twice with different --platform values
+              # makes Docker reject the second local ref as an overwrite.
+              docker --config "$ANON_DOCKER_CONFIG" pull --platform "$platform" "${repository}@${platform_digest}" >/dev/null
+            done
           }
           verify_tag_digest "$IMAGE" dist-release/assets/container-image.txt dist-release/assets/container-image-platforms.json
           verify_tag_digest "$BACKUP_IMAGE" dist-release/assets/backup-container-image.txt dist-release/assets/backup-container-image-platforms.json

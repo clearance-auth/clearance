@@ -251,6 +251,7 @@ const rehearsal = namedStep(steps, "Rehearse release assembly");
 const recovery = namedStep(steps, "Verify recovery npm packages before signing assets");
 const staging = namedStep(steps, "Build and push staging container references");
 const finalTags = namedStep(steps, "Create final release tags from verified digests");
+const verifyContainerTags = namedStep(steps, "Verify both published container tags match the signed digests");
 const publish = namedStep(steps, "Publish public npm packages with trusted provenance");
 const terraform = steps.map((step, index) => ({ step, index })).find(({ step }) => step.uses === "hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e");
 if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terraform.index >= clean.index || clean.index >= rehearsal.index
@@ -258,6 +259,12 @@ if (!terraform || terraform.step.with?.terraform_version !== "1.5.7" || terrafor
 	|| rehearsal.step.run !== "pnpm release:rehearse -- \"$VERSION\""
 	|| recovery.step.if !== "env.RECOVER_PUBLISHED_NPM == '1'" || publish.step.if !== "env.RECOVER_PUBLISHED_NPM != '1'") {
 	fail("release workflow must retain pinned, ordered release gates and the exact shared rehearsal invocation");
+}
+if (!verifyContainerTags.step.run?.includes("requiredPlatforms")
+	|| !verifyContainerTags.step.run?.includes('docker --config "$ANON_DOCKER_CONFIG" pull --platform "$platform" "${repository}@${platform_digest}"')
+	|| verifyContainerTags.step.run?.includes('pull --platform linux/amd64 "${repository}@${expected}"')
+	|| verifyContainerTags.step.run?.includes('pull --platform linux/arm64 "${repository}@${expected}"')) {
+	fail("release container verification must anonymously pull distinct immutable platform manifests rather than rebinding one index digest");
 }
 verifyIdentity(identity.step.run);
 const bundleSigning = namedStep(steps, "Sign package and container-digest bundle");
