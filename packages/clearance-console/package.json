@@ -1,9 +1,10 @@
 {
   "name": "@clearance/console",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Clearance operator console",
   "type": "module",
   "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/clearance-console" },
   "files": ["public", "src/server.js"],
   "scripts": {
     "build": "node -e \"console.log('console is static public assets')\"",
