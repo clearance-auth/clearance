@@ -1,6 +1,6 @@
 {
   "name": "@clearance/delivery-worker",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Separately deployable SMTP and AWS SES delivery worker for Clearance",
   "type": "module",
   "license": "MIT",

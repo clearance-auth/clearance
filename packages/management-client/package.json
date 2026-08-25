@@ -1,6 +1,6 @@
 {
   "name": "@clearance/management-client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Browser-neutral typed transport foundation for the Clearance Management API",
   "type": "module",
   "license": "MIT",

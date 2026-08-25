@@ -19,7 +19,7 @@ import {
 	type WebhookSender,
 } from "./webhook.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type FirstPartyTemplateKind = "verification" | "password-reset" | "invitation" | "email-change";
