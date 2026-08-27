@@ -1,62 +1,49 @@
 # Clearance
 
-Open-source authentication infrastructure for B2B software companies. Clearance provides enterprise SSO, SCIM, organizations, roles, audit events, and operational tooling through one CLI-first platform.
+Open-source authentication for B2B software, self-hosted on Postgres.
 
-**CLI:** `clearance` · **Packages:** `@clearance/*` · **Repository:** [clearance-auth/clearance](https://github.com/clearance-auth/clearance)
+Clearance gives your product sign-in, organizations, roles, enterprise SSO and
+SCIM, transactional delivery, and the operating tools to run them. The CLI,
+management API, and operator console use the same management plane, so your
+team can automate routine work and investigate the same state in a browser.
 
-## Built for B2B auth from day one
+**Current release:** [0.3.1](https://github.com/clearance-auth/clearance/releases/tag/v0.3.1)
 
-Clearance puts product authentication and enterprise identity operations behind one API-first control plane. Builders can ship core sign-in, add SSO and SCIM when customers demand them, and operate the same system through the CLI, API, or console without stitching together separate admin tools.
+Start with:
 
-- **A complete B2B identity model:** Manage users, organizations, memberships, custom roles, sessions, and API keys as scoped resources for multi-tenant products.
-- **Enterprise SSO and SCIM:** Configure SAML or OIDC connections and SCIM directories, then run diagnostics, readiness checks, and read-only conformance probes before rollout.
-- **An API-first CLI:** Script resource and configuration workflows with structured JSON, non-interactive flags, and authenticated `/v1/*` API contracts that behave the same in local development and CI.
-- **An operator console that matches automation:** Inspect and manage users, organizations, roles, sessions, events, and settings through the same services the CLI uses.
-- **Auditable migrations and change history:** Stream or export scoped audit events, and move imports through explicit plan, run, verify, and rollback stages.
-- **Production operations included:** Deploy on Postgres with Docker Compose or Helm, then use built-in health signals, Prometheus metrics, verified backups, restore drills, upgrades, and active rollback.
+- [`@clearance/auth`](https://www.npmjs.com/package/@clearance/auth) for the authentication runtime
+- [`@clearance/runtime`](https://www.npmjs.com/package/@clearance/runtime) for browser and server integrations
+- [`@clearance/cli`](https://www.npmjs.com/package/@clearance/cli) for operational workflows
+- [`@clearance/api`](https://www.npmjs.com/package/@clearance/api) for the management API
 
-## What you can run today
+**Project:** [clearance-auth/clearance](https://github.com/clearance-auth/clearance)
 
-| Surface | Port | How |
-|---|---|---|
-| Sample B2B app (email/password plus configured GitHub/Google login) | **13300** (Compose) / 3000 (host dev) | Compose or `pnpm dev:sample` |
-| Operator console | **13100** (Compose) / 3100 (host dev) | Compose or `pnpm dev:console` |
-| Management API | **13200** (Compose) / 3200 (host dev) | Compose or `pnpm dev:api` |
-| Postgres (production-like dependency) | **15434** | Compose |
-| CLI | — | `clearance` |
+## Build the product your customers expect
 
-## Install and authenticate the CLI
+Clearance is for teams building multi-tenant software that need a strong
+authentication foundation now and enterprise identity capabilities as their
+customers grow. Keep identity data and operations in your own Postgres
+deployment while giving product, support, and platform teams a common way to
+work.
 
-The published package is `@clearance/cli`; it installs the `clearance` command.
+| Capability | What it gives your product team |
+| --- | --- |
+| Sign-in and account security | Email and password, social sign-in, magic links, email OTP, passkeys, TOTP, recovery codes, session management, and password policy controls. |
+| Organizations and access | Organizations, memberships, invitations, custom roles and actions, API keys, and service accounts for B2B applications. |
+| Enterprise identity | SAML and OIDC connections, SCIM directories, diagnostics, readiness checks, and read-only live conformance probes. |
+| Reliable customer communication | Transactional email through SMTP or Amazon SES, signed webhooks, durable delivery, retries, and a separately deployable worker. |
+| Operator experience | A typed management API, JSON-first CLI, dark operator console, scoped audit events, imports, backups, restore drills, and upgrades. |
+| Production control | Postgres-backed deployment with Docker Compose or Helm, health and readiness endpoints, Prometheus metrics, key-management providers, and signed release assets. |
 
-```bash
-npm install --global @clearance/cli
-export CLEARANCE_OPERATOR_TOKEN='<operator-token>'
-clearance login --profile production --url https://clearance.example.com
-clearance --profile production users list
-```
+## Start locally
 
-Every operational command uses the authenticated `/v1/*` management API and its server-derived project/environment scope. The CLI reads or writes explicitly named local artifacts for import, export, and schema workflows. Backup and upgrade storage remains server-controlled, and all validation and state changes stay behind the API:
-
-```bash
-clearance --profile production init --name my-app
-clearance --profile production backup create
-```
-
-## Full stack (recommended)
+Clearance supports Node 22 and 24. The default local path requires Docker with
+Compose and starts the API, console, sample B2B app, and Postgres together.
 
 ```bash
 corepack enable
 pnpm install
-pnpm build
 
-# One command: build an isolated stack, test it end to end, then tear it down
-pnpm stack:smoke
-```
-
-For a persistent local stack:
-
-```bash
 export CLEARANCE_DB_PASSWORD="$(openssl rand -hex 32)"
 export CLEARANCE_OPERATOR_TOKEN="$(openssl rand -hex 32)"
 export CLEARANCE_SECRET="$(openssl rand -hex 32)"
@@ -65,24 +52,36 @@ export CLEARANCE_CREDENTIAL_KEY_ID=local-v1
 export CLEARANCE_CONSOLE_ADMIN_USER=admin
 export CLEARANCE_CONSOLE_ADMIN_PASSWORD="$(openssl rand -hex 32)"
 export CLEARANCE_CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
+
 pnpm stack:up
 pnpm stack:status
-
-curl http://localhost:13200/health
-curl http://localhost:13300/health     # must return {"ok":true,"app":"sample-b2b"}
-open http://localhost:13300/sign-up    # first login
-open http://localhost:13100/overview   # console
 ```
 
-`stack:up` derives a stable, purpose-separated local key-management
-configuration from `CLEARANCE_CREDENTIAL_KEY` and `CLEARANCE_CREDENTIAL_KEY_ID`.
-It also migrates a fresh Postgres credential-authority fence to `digest-v1`
-before starting the serving cohort.
-Set `CLEARANCE_KEY_MANAGEMENT_CONFIG_JSON` only when intentionally supplying
-your own local provider configuration; production requires its operator-managed
-configuration through the production overlay.
+Then open:
 
-Optional social login is enabled only when a complete provider credential pair is present. An incomplete pair fails application startup so a broken sign-in option cannot be advertised.
+- Sample B2B app: <http://localhost:13300/sign-up>
+- Operator console: <http://localhost:13100/overview>
+- Management API health: <http://localhost:13200/health>
+
+`pnpm stack:up` derives a purpose-separated local key-management
+configuration and migrates a fresh credential-authority fence before the
+serving services start. To validate the full local journey in an isolated
+stack, run `pnpm stack:smoke`.
+
+Stop the stack while retaining local data:
+
+```bash
+pnpm stack:down
+```
+
+Remove the local Postgres volume as well:
+
+```bash
+pnpm stack:destroy
+```
+
+For social sign-in, provide a complete provider credential pair before
+starting the sample application:
 
 ```bash
 # GitHub callback: http://localhost:13300/api/auth/callback/github
@@ -94,86 +93,120 @@ export CLEARANCE_GOOGLE_CLIENT_ID=...
 export CLEARANCE_GOOGLE_CLIENT_SECRET=...
 ```
 
-Stop the persistent stack while retaining the named Postgres volume and its data:
+## Add Clearance to an application
 
-```bash
-pnpm stack:down
+Use the sample B2B application's [server configuration](./apps/sample-b2b/src/server.ts)
+as the complete server reference. It configures the auth runtime, management
+services, SSO, SCIM, and key management in one working application.
+
+For a React client, the browser integration starts with the real runtime
+client:
+
+```tsx
+import { createAuthClient } from "@clearance/runtime/react";
+import { type FormEvent, useState } from "react";
+
+const authClient = createAuthClient({
+  baseURL: import.meta.env.VITE_CLEARANCE_URL ?? "http://localhost:13300",
+});
+
+export function SignInForm() {
+  const session = authClient.useSession();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  async function signIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const result = await authClient.signIn.email({ email, password });
+    if (!result.error) await session.refetch();
+  }
+
+  return (
+    <form onSubmit={signIn}>
+      <input onChange={(event) => setEmail(event.target.value)} type="email" />
+      <input onChange={(event) => setPassword(event.target.value)} type="password" />
+      <button type="submit">Sign in</button>
+    </form>
+  );
+}
 ```
 
-Destroy the persistent stack and permanently remove its named Postgres volume and local database:
+Compile-checked reference integrations are available for React, Next.js App
+Router, and Express. They show browser session handling and server-side ES256
+token verification: [framework quickstarts](./apps/framework-quickstarts/README.md).
+
+## Operate it through the CLI
+
+The published [`@clearance/cli`](https://www.npmjs.com/package/@clearance/cli)
+package installs the `clearance` command. Commands support structured JSON and
+non-interactive flags for scripts and CI.
 
 ```bash
-pnpm stack:destroy
+npm install --global @clearance/cli
+export CLEARANCE_OPERATOR_TOKEN='<operator-token>'
+clearance login --profile production --url https://auth.example.com
+
+clearance --profile production init --name my-app --json --no-input
+clearance --profile production orgs create --name Acme --json --no-input
+clearance --profile production users create \
+  --email owner@example.com --name 'Acme Owner' --json --no-input
+clearance --profile production readiness check --org <organization-id> --json --no-input
 ```
 
-## Host-run apps (existing Postgres required)
+Use the same API-backed workflows for enterprise setup, audit history,
+backups, restores, and upgrades. The [CLI source](./packages/clearance-cli)
+and [production operations guide](./docs/production-operations.md) describe
+the available commands and operating sequence.
 
-```bash
-pnpm install && pnpm build
-export CLEARANCE_SECRET="$(openssl rand -hex 32)"
-export CLEARANCE_BASE_URL=http://localhost:3000
-export CLEARANCE_API_URL=http://localhost:3200
-export CLEARANCE_OPERATOR_TOKEN="$(openssl rand -hex 32)"
-export CLEARANCE_CREDENTIAL_KEY="$(openssl rand -hex 32)"
-export CLEARANCE_CREDENTIAL_KEY_ID=local-v1
-export DATABASE_URL='postgres://clearance:replace-me@127.0.0.1:5432/clearance'
+## Deploy with control
 
-pnpm smoke   # CLI init → users/orgs → SSO/SCIM readiness → doctor
+Use Docker Compose for a single-host deployment and the Helm chart for
+Kubernetes. Both paths require explicit production secrets and key-management
+configuration. The production overlay fails closed when required operator
+inputs are missing.
 
-# terminals:
-pnpm dev:api
-pnpm dev:console
-pnpm dev:sample
-```
-
-CLI examples:
-
-```bash
-clearance init --name my-app --json --no-input
-clearance doctor --json --no-input
-clearance users create --email a@b.com --name A --json --no-input
-clearance orgs create --name Acme --json --no-input
-clearance sso create --org <id> --provider okta --protocol oidc \
-  --issuer https://example.okta.com --audience clearance-sp --json --no-input
-clearance readiness check --org <id> --json --no-input
-clearance backup create --json --no-input
-clearance upgrade check --json --no-input
-```
+- [Production operations](./docs/production-operations.md) covers TLS,
+  health checks, metrics, delivery, backups, restores, upgrades, and recovery.
+- [Helm chart](./deploy/helm/clearance/README.md) covers Kubernetes values and
+  deployment requirements.
+- [Compose deployment](./deploy/compose/docker-compose.production.yml) is the
+  single-host reference configuration.
+- [Compatibility](./COMPATIBILITY.md) maps maintained package and migration
+  import compatibility.
 
 ## Packages
 
-| Package | Role |
-|---|---|
-| `@clearance/auth` | Auth runtime identity and safe defaults |
-| `@clearance/management` | Shared application services (CLI + API + console) |
-| `@clearance/cli` | CLI package (installs the `clearance` binary) |
-| `@clearance/api` | Versioned management HTTP API (`/v1/*`) |
-| `@clearance/console` | Dark operator console |
-| `@clearance/sample-b2b` | Sample B2B app for login e2e |
+| Package | Use it for |
+| --- | --- |
+| [`@clearance/auth`](./packages/clearance-auth) | Product auth runtime and safe defaults. |
+| [`@clearance/runtime`](./packages/runtime) | Browser and server runtime integrations. |
+| [`@clearance/sso`](./packages/sso) | SAML and OIDC enterprise sign-in. |
+| [`@clearance/scim`](./packages/scim) | SCIM provisioning endpoints. |
+| [`@clearance/verification`](./packages/verification) | Server-side ES256 access-token verification. |
+| [`@clearance/management`](./packages/management) | Shared management services behind the CLI, API, and console. |
+| [`@clearance/management-client`](./packages/management-client) | Typed management API transport. |
+| [`@clearance/cli`](./packages/clearance-cli) | JSON-first operational CLI. |
+| [`@clearance/api`](./packages/clearance-api) | Versioned management HTTP API. |
+| [`@clearance/console`](./packages/clearance-console) | Operator console. |
+| [`@clearance/delivery`](./packages/delivery) | Durable transactional delivery storage. |
+| [`@clearance/delivery-worker`](./packages/delivery-worker) | SMTP and Amazon SES delivery worker. |
+| [`@clearance/key-management`](./packages/key-management) | Purpose-bound local and cloud key providers. |
+| [`@clearance/vault`](./packages/vault) | Hosted authentication and tenant self-service. |
+| [`@clearance/observability-node`](./packages/observability-node) | Opt-in OpenTelemetry bootstrap for Node services. |
 
-## Available today
+## What is next
 
-- CLI-first management for projects, users, organizations, API keys, configuration, runtime schemas, and audit events
-- An operator console for users, organizations, events, settings, and authenticated administration
-- SAML and OIDC connection setup, SCIM provisioning, diagnostics, and readiness checks, including read-only live endpoint conformance tests
-- Validated imports and migration workflows with plan, run, verify, and rollback stages
-- Self-hosted Docker Compose and Helm deployment paths backed by Postgres
-- Operational workflows for health checks, backup, restore, upgrades, and rollback
-- Public npm packages with provenance, signed release bundles, and immutable GHCR image digests
-- A sample B2B application and end-to-end verification suite for evaluating Clearance locally
+- Certified interactive SSO flows with Okta and Microsoft Entra ID.
+- Hosted-source imports and expanded environment-promotion workflows.
+- CLI-driven cloud deployment and production operations.
+- Distributed console sessions and horizontally scalable management storage.
+- Hardened live-conformance egress with DNS resolution and private-network
+  rejection.
 
-## Roadmap
+## Learn more
 
-- Certified interactive SSO flows with Okta and Microsoft Entra ID
-- Hosted-source imports and expanded environment promotion workflows
-- CLI-driven cloud deployment and production operations
-- Distributed console sessions and a horizontally scalable management data model
-- Hardened live-conformance egress with DNS resolution and private-network rejection
-- Framework integration guides for common B2B application stacks
-
-## Docs
-
-- [Beta readiness](./docs/beta-readiness.md) — release evidence and deployment checklist
-- [Security review](./docs/security-review-v0.2.1.md) — focused v0.2.1 review and verified controls
-- [COMPATIBILITY.md](./COMPATIBILITY.md) — package map
-- [LICENSE](./LICENSE) — MIT with required attribution
+- [Security policy](./SECURITY.md)
+- [Production operations](./docs/production-operations.md)
+- [Framework quickstarts](./apps/framework-quickstarts/README.md)
+- [Release notes](https://github.com/clearance-auth/clearance/releases)
+- [License and attribution](./LICENSE)
