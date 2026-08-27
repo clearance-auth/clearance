@@ -88,13 +88,19 @@ describe("management API client contract", () => {
 	});
 
 	it("uses generated transport and unwraps typed management response data", async () => {
+		const onDispatch = vi.fn();
+		const onMetadata = vi.fn();
+		const observedSession: ApiSession = {
+			...session,
+			operationObserver: { onDispatch, onMetadata },
+		};
 		const fetchMock = vi.fn(async () => new Response(JSON.stringify({
 			users: [],
 			nextCursor: null,
 			scope: { projectId: "prj_1", environmentId: "env_1" },
-		}), { status: 200 }));
+		}), { status: 200, headers: { "x-request-id": "req_actual" } }));
 		vi.stubGlobal("fetch", fetchMock);
-		await expect(callManagementOperation(session, "users.list", { limit: 10 })).resolves.toEqual({
+		await expect(callManagementOperation(observedSession, "users.list", { limit: 10 })).resolves.toEqual({
 			users: [],
 			nextCursor: null,
 			scope: { projectId: "prj_1", environmentId: "env_1" },
@@ -104,6 +110,45 @@ describe("management API client contract", () => {
 		expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${session.token}`);
 		expect(new Headers(init.headers).has("x-clearance-project-id")).toBe(false);
 		expect(new Headers(init.headers).has("x-clearance-environment-id")).toBe(false);
+		expect(onDispatch).toHaveBeenCalledOnce();
+		expect(onMetadata).toHaveBeenCalledWith({ requestId: "req_actual" });
+	});
+
+	it("preserves response request and idempotency metadata for mutation receipts", async () => {
+		const onMetadata = vi.fn();
+		vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+			dryRun: true,
+			project: { name: "Preview", slug: "preview" },
+		}, { headers: { "x-request-id": "req_mutation" } })));
+
+		await callManagementOperation({
+			...session,
+			operationObserver: { onDispatch: vi.fn(), onMetadata },
+		}, "projects.create", { name: "Preview", dryRun: true }, {
+			idempotencyKey: "operation-key-actual",
+		});
+
+		expect(onMetadata).toHaveBeenCalledWith({
+			requestId: "req_mutation",
+			idempotencyKey: "operation-key-actual",
+		});
+	});
+
+	it("labels generated-client input validation as pre-transport", async () => {
+		const fetchMock = vi.fn();
+		const onDispatch = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(callManagementOperation({
+			...session,
+			operationObserver: { onDispatch, onMetadata: vi.fn() },
+		}, "users.create", {} as never)).rejects.toMatchObject({
+			code: "MANAGEMENT_PROTOCOL_ERROR",
+			stage: "management-client.input",
+			status: 0,
+		});
+		expect(onDispatch).toHaveBeenCalledOnce();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("delegates mutation JSON and idempotency authority to the generated transport", async () => {
@@ -127,19 +172,24 @@ describe("management API client contract", () => {
 	});
 
 	it("maps generated API failures to the CLI error shape without losing remote detail", async () => {
+		const onMetadata = vi.fn();
 		vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: {
 			code: "SCOPE_MISMATCH",
 			message: "Resource is outside the principal scope.",
 			stage: "users.list",
 			remediation: "Select the intended environment.",
 			retryable: false,
-		} }), { status: 404 })));
-		await expect(callManagementOperation(session, "users.list", {})).rejects.toMatchObject({
+		} }), { status: 404, headers: { "x-request-id": "req_rejected" } })));
+		await expect(callManagementOperation({
+			...session,
+			operationObserver: { onDispatch: vi.fn(), onMetadata },
+		}, "users.list", {})).rejects.toMatchObject({
 			code: "SCOPE_MISMATCH",
 			stage: "users.list",
 			remediation: "Select the intended environment.",
 			status: 404,
 		});
+		expect(onMetadata).toHaveBeenCalledWith({ requestId: "req_rejected" });
 	});
 
 	it("maps generated transport aborts to the CLI unreachable contract", async () => {

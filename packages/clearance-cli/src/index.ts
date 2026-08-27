@@ -1,23 +1,41 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { readFileSync } from "node:fs";
+import { lstat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 import {
 	ClearanceError,
 	EVENTS_EXPORT_MAX_LIMIT,
 	EVENTS_TAIL_MAX_LIMIT,
 	USERS_EXPORT_MAX_LIMIT,
+	MANAGEMENT_OPERATIONS,
 	closeAuthBundle,
 	migrateRuntimeSchemaLocally,
 } from "@clearance/management";
-import { CliExitError, fail, printResult, type GlobalOpts } from "./output.js";
+import {
+	CLI_EXIT_CODE,
+	CliExitError,
+	fail,
+	parseOutputFormat,
+	printResult,
+	selectOutputFormat,
+	validateOutputSelector,
+	type GlobalOpts,
+	type OutputFormat,
+} from "./output.js";
 import {
 	deleteSavedCredential,
+	credentialDirectory,
 	environmentToken,
 	fetchWhoami,
 	normalizeApiUrl,
 	normalizeProfile,
+	readSavedCredential,
 	readTokenFromStdin,
 	validateAndSaveCredential,
+	verifyOperatorCredential,
+	writeSavedCredential,
 } from "./operator-auth.js";
 import { resolveApiSession } from "./api-client.js";
 import { registerDeliveryCommands } from "./delivery-command.js";
@@ -30,8 +48,131 @@ import {
 	EVENTS_TAIL_MAX_POLL_INTERVAL_MS,
 	EVENTS_TAIL_MIN_POLL_INTERVAL_MS,
 } from "./remote-dispatch.js";
+import {
+	buildCommandSpecDocument,
+	compareCommanderParity,
+	type CommandSpecRecord,
+	type SupplementalCommandSpec,
+} from "./command-spec.js";
+import { buildExperienceManifest } from "./experience-manifest.js";
+import { clearanceCommandFromArgv, OperationRunner, type OperationRunResult } from "./operation-runner.js";
+import { defaultExecutionReceiptPath, FileExecutionReceiptStore } from "./execution-receipt.js";
+import { renderCompletion, type CompletionShell } from "./completion.js";
+import {
+	completionInstallationPath,
+	inspectCompletionInstallation,
+	installCompletion,
+} from "./completion-installer.js";
+import { installClearanceAgentSkill, inspectClearanceAgentSkill } from "./agent-skill.js";
+import { runFirstRunExperience } from "./interactive.js";
+import { interactionEligibility } from "./interaction-policy.js";
+import { listHumanHelpTopics, renderHumanHelp } from "./human-help.js";
+import { renderHumanPresentation, type HumanField, type HumanTableColumn } from "./human-presentation.js";
+import { renderLocalDoctor, runLocalDoctor, type LocalFeatureInspection } from "./local-doctor.js";
+import { createRemoteWorkflowExecutor, parseTuiDeepLink, runTerminalUi } from "./tui/index.js";
+import { isEventStreamResult } from "./dispatch/events.js";
+import { readPasswordPrompt } from "./password-prompt.js";
 
 const MAX_STDIN_PASSWORD_BYTES = 4_096;
+const operationRunner = (() => {
+	try {
+		return new OperationRunner({
+			receiptStore: new FileExecutionReceiptStore(defaultExecutionReceiptPath()),
+		});
+	} catch (cause) {
+		return new OperationRunner({
+			receiptStore: { async save() { throw cause; } },
+		});
+	}
+})();
+
+type LocalMutationInput<Prepared, Result> = {
+	readonly operation: Readonly<LocalMutationContract>;
+	readonly global: Readonly<GlobalOpts>;
+	readonly target?: {
+		readonly resource?: string;
+		readonly principal?: string;
+		readonly environment?: string;
+		readonly apiOrigin?: string;
+	};
+	readonly reconciliationCommands?: readonly string[];
+	prepare(redact: (value: string) => void): Prepared | Promise<Prepared>;
+	mutate(prepared: Prepared, signal?: AbortSignal): Result | Promise<Result>;
+};
+
+type LocalMutationContract = {
+	readonly id: string;
+	readonly path: string;
+	readonly supportsDryRun: boolean;
+};
+
+const LOCAL_MUTATION_CONTRACTS = Object.freeze({
+	login: Object.freeze({ id: "authentication.login", path: "login", supportsDryRun: false }),
+	logout: Object.freeze({ id: "authentication.logout", path: "logout", supportsDryRun: false }),
+	completionInstall: Object.freeze({ id: "local.completion.install", path: "completion install", supportsDryRun: true }),
+	skillInstall: Object.freeze({ id: "local.skill.install", path: "skill install", supportsDryRun: true }),
+	schemaMigrate: Object.freeze({
+		id: "schema.migrate.local",
+		path: "schema migrate",
+		supportsDryRun: MANAGEMENT_OPERATIONS.find((operation) => operation.cliPath === "schema migrate")?.supportsDryRun === true,
+	}),
+} satisfies Record<string, LocalMutationContract>);
+
+async function runLocalMutation<Prepared, Result>(
+	input: Readonly<LocalMutationInput<Prepared, Result>>,
+) {
+	return operationRunner.run({
+		operation: {
+			id: input.operation.id,
+			path: input.operation.path,
+			mutation: true,
+			confirmation: "none",
+		},
+		command: clearanceCommandFromArgv(process.argv),
+		target: input.target,
+		dryRun: input.global.dryRun,
+		confirmed: true,
+		signal: input.global.signal,
+		reconciliationCommands: input.reconciliationCommands,
+		execute: async ({ signal, markDispatched, redact }) => {
+			if (input.global.dryRun && !input.operation.supportsDryRun) {
+				throw new ClearanceError({
+					code: "CLI_LOCAL_DRY_RUN_UNSUPPORTED",
+					message: `${input.operation.path} does not support --dry-run.`,
+					stage: "cli.dispatch",
+					status: 400,
+					remediation: "Run the command without --dry-run when you are ready to change local state.",
+				});
+			}
+			const prepared = await input.prepare(redact);
+			markDispatched();
+			return { data: await input.mutate(prepared, signal) };
+		},
+	});
+}
+
+function localMutationPresentation<Result>(
+	path: string,
+	run: OperationRunResult<Result>,
+) {
+	return operationHumanPresentation(path, true, run.data, run.receipt, {
+		status: run.receiptPersistence,
+		...(run.receiptPersistencePath ? { path: run.receiptPersistencePath } : {}),
+		...(run.receiptPersistenceError ? { error: run.receiptPersistenceError } : {}),
+	});
+}
+
+function failLocalMutation(
+	run: OperationRunResult<unknown>,
+	global: Readonly<GlobalOpts>,
+): never {
+	fail(run.cause, global, {
+		receipt: run.receipt,
+		receiptPersistence: run.receiptPersistence,
+		...(run.receiptPersistencePath ? { receiptPersistencePath: run.receiptPersistencePath } : {}),
+		...(run.receiptPersistenceError ? { receiptPersistenceError: run.receiptPersistenceError } : {}),
+	});
+}
 
 const VERSION = (
 	JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -43,6 +184,11 @@ function globals(cmd: Command): GlobalOpts {
 	const opts = cmd.optsWithGlobals() as GlobalOpts & Record<string, unknown>;
 	return {
 		json: Boolean(opts.json),
+		jsonl: Boolean(opts.jsonl),
+		quiet: Boolean(opts.quiet),
+		jq: typeof opts.jq === "string" ? opts.jq : undefined,
+		output: opts.outputFormat as OutputFormat | undefined,
+		inferredFormat: process.stdout.isTTY ? undefined : "json",
 		noInput: opts.input === false,
 		yes: Boolean(opts.yes),
 		dryRun: Boolean(opts.dryRun),
@@ -51,8 +197,221 @@ function globals(cmd: Command): GlobalOpts {
 	};
 }
 
+function humanCommandListing(commands: readonly CommandSpecRecord[]): string {
+	const lines = commands.map((command) => {
+		const description = command.description?.trim();
+		return description ? `  ${command.path}\n    ${description}` : `  ${command.path}`;
+	});
+	return ["Available Clearance commands:", ...lines, "", "Run clearance <command> --help for command details."].join("\n");
+}
+
+function supportedCompletionShell(value: unknown): value is CompletionShell {
+	return typeof value === "string" && (["bash", "zsh", "fish"] as const).includes(value as CompletionShell);
+}
+
+function detectedCompletionShell(): CompletionShell | undefined {
+	const shell = basename(process.env.SHELL?.trim() ?? "");
+	return supportedCompletionShell(shell) ? shell : undefined;
+}
+
+function shellWord(value: string): string {
+	return /^[a-zA-Z0-9_./:@%+=,-]+$/u.test(value)
+		? value
+		: `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function rawJsonCommand(): string {
+	return ["clearance", ...process.argv.slice(2), "--output-format", "json"].map(shellWord).join(" ");
+}
+
+function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? value as Readonly<Record<string, unknown>>
+		: undefined;
+}
+
+function listResult(data: unknown): {
+	name: string;
+	rows: readonly Readonly<Record<string, unknown>>[];
+	fields: readonly HumanField[];
+} | undefined {
+	const source = record(data);
+	const entry = Array.isArray(data)
+		? ["results", data] as const
+		: Object.entries(source ?? {}).find(([, value]) => Array.isArray(value));
+	if (!entry) return undefined;
+	const [name, values] = entry as readonly [string, readonly unknown[]];
+	return {
+		name,
+		rows: values.map((value) => record(value) ?? { value }),
+		fields: Object.entries(source ?? {})
+			.filter(([key]) => key !== name)
+			.map(([key, value]) => ({
+				label: key.replace(/([a-z0-9])([A-Z])/gu, "$1 $2").replace(/^./u, (character) => character.toUpperCase()),
+				value,
+				group: /cursor|page|count|total|truncated/iu.test(key) ? "Page" : "Context",
+			})),
+	};
+}
+
+function tableColumns(rows: readonly Readonly<Record<string, unknown>>[]): readonly HumanTableColumn[] {
+	const keys = [...new Set(rows.flatMap((row) => Object.keys(row).filter((key) => {
+		const value = row[key];
+		return value === null || value === undefined || typeof value !== "object";
+	})))];
+	const priority = ["id", "name", "email", "status", "type", "role", "createdAt", "updatedAt"];
+	keys.sort((left, right) => {
+		const leftIndex = priority.indexOf(left);
+		const rightIndex = priority.indexOf(right);
+		return (leftIndex < 0 ? priority.length : leftIndex) - (rightIndex < 0 ? priority.length : rightIndex)
+			|| left.localeCompare(right);
+	});
+	return keys.slice(0, 5).map((key) => ({
+		key,
+		label: key.replace(/([a-z0-9])([A-Z])/gu, "$1 $2").replace(/^./u, (character) => character.toUpperCase()),
+		minWidth: key === "id" ? 12 : 8,
+		maxWidth: key === "email" ? 36 : key === "id" ? 28 : 24,
+	}));
+}
+
+function resultFields(data: unknown, group = "Result"): readonly HumanField[] {
+	const source = record(data);
+	if (!source) return [{ label: "Value", value: data, group }];
+	return Object.entries(source).slice(0, 16).map(([key, value]) => ({
+		label: key.replace(/([a-z0-9])([A-Z])/gu, "$1 $2").replace(/^./u, (character) => character.toUpperCase()),
+		value,
+		group,
+	}));
+}
+
+function operationHumanPresentation(
+	path: string,
+	mutation: boolean,
+	data: unknown,
+	receipt: {
+		readonly receiptId: string;
+		readonly outcome: string;
+		readonly commitState: string;
+		readonly requestId: string | null;
+		readonly reconciliationCommands: readonly string[];
+	},
+	receiptPersistence: {
+		readonly status: "saved" | "not-configured" | "failed";
+		readonly path?: string;
+		readonly error?: string;
+	},
+): {
+	human: string;
+	summary: string;
+	next: readonly string[];
+	meta: { receipt: typeof receipt; receiptPersistence: typeof receiptPersistence };
+} {
+	const width = process.stdout.columns ?? 80;
+	const displayPath = path.replaceAll("-", " ").replace(/^./u, (character) => character.toUpperCase());
+	if (mutation) {
+		const fields: HumanField[] = [
+			{ label: "Operation", value: path, group: "Receipt" },
+			{ label: "Outcome", value: receipt.outcome, group: "Receipt" },
+			{ label: "Commit state", value: receipt.commitState, group: "Receipt" },
+			{ label: "Receipt ID", value: receipt.receiptId, group: "Receipt" },
+			...(receipt.requestId ? [{ label: "Request ID", value: receipt.requestId, group: "Receipt" }] : []),
+			{
+				label: "Journal",
+				value: receiptPersistence.status === "saved"
+					? `saved${receiptPersistence.path ? ` at ${receiptPersistence.path}` : ""}`
+					: receiptPersistence.error ?? receiptPersistence.status,
+				group: "Receipt",
+			},
+			...resultFields(data),
+		];
+		const summary = `${displayPath} ${receipt.outcome}.`;
+		return {
+			human: renderHumanPresentation({
+				kind: "mutation",
+				title: summary,
+				receipt: fields,
+				next: receipt.reconciliationCommands,
+			}, { width }),
+			summary,
+			next: receipt.reconciliationCommands,
+			meta: { receipt, receiptPersistence },
+		};
+	}
+	const list = listResult(data);
+	if (list) {
+		const summary = `${list.rows.length} ${list.name}.`;
+		return {
+			human: renderHumanPresentation({
+				kind: "list",
+				title: displayPath,
+				columns: tableColumns(list.rows),
+				rows: list.rows,
+				fields: list.fields,
+				empty: `No ${list.name} found.`,
+				summary,
+				rawJsonCommand: rawJsonCommand(),
+			}, { width }),
+			summary,
+			next: [],
+			meta: { receipt, receiptPersistence },
+		};
+	}
+	const summary = `${displayPath} completed.`;
+	return {
+		human: renderHumanPresentation({
+			kind: "detail",
+			title: displayPath,
+			fields: resultFields(data, "Details"),
+			summary,
+			rawJsonCommand: rawJsonCommand(),
+		}, { width }),
+		summary,
+		next: [],
+		meta: { receipt, receiptPersistence },
+	};
+}
+
+async function inspectLocalConfig(): Promise<{ state: "ready" | "absent" | "unsafe"; detail?: string }> {
+	const path = credentialDirectory(process.env);
+	try {
+		const stat = await lstat(path);
+		if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o777) !== 0o700) {
+			return { state: "unsafe", detail: `${path} must be a regular directory with mode 0700.` };
+		}
+		return { state: "ready", detail: path };
+	} catch (cause) {
+		if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent", detail: path };
+		return { state: "unsafe", detail: `${path} could not be inspected.` };
+	}
+}
+
+function featureInspection(
+	inspection: { exists: boolean; owned: boolean; path: string },
+): LocalFeatureInspection {
+	if (!inspection.exists) return { state: "missing", detail: inspection.path };
+	return inspection.owned
+		? { state: "installed", detail: inspection.path }
+		: { state: "conflict", detail: inspection.path };
+}
+
+async function inspectLocalProfile(profile: string): Promise<{
+	state: "configured" | "absent" | "unsafe";
+	apiOrigin?: string;
+}> {
+	try {
+		const saved = await readSavedCredential(process.env, profile);
+		return saved ? { state: "configured", apiOrigin: saved.apiUrl } : { state: "absent" };
+	} catch {
+		return { state: "unsafe" };
+	}
+}
+
+function localSetupError(code: string, message: string, remediation: string, status = 409): ClearanceError {
+	return new ClearanceError({ code, message, stage: "cli.local-setup", status, remediation });
+}
+
 function passwordInputError(code: string, message: string, remediation: string): ClearanceError {
-	return new ClearanceError({ code, message, stage: "cli.password-input", remediation });
+	return new ClearanceError({ code, message, stage: "cli.password-input", status: 400, remediation });
 }
 
 function passwordFromInput(input: string): string {
@@ -97,68 +456,98 @@ async function readPasswordFromStdin(): Promise<string> {
 }
 
 async function readPasswordFromPrompt(): Promise<string> {
-	if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+	const eligibility = interactionEligibility();
+	if (!eligibility.eligible || typeof process.stdin.setRawMode !== "function") {
 		throw passwordInputError(
 			"USER_CREATE_PASSWORD_PROMPT_TTY_REQUIRED",
-			"--password-prompt requires an interactive terminal.",
+			`--password-prompt requires an interactive terminal (${eligibility.reason ?? "raw-mode-unavailable"}).`,
 			"Use --password-stdin with piped input, or omit password options to issue a setup token.",
 		);
 	}
 
-	process.stderr.write("Initial password: ");
-	return new Promise<string>((resolve, reject) => {
-		let input = "";
-		const finish = (callback: () => void) => {
-			process.stdin.off("data", onData);
-			process.stdin.setRawMode(false);
-			process.stderr.write("\n");
-			callback();
-		};
-		const onData = (chunk: Buffer | string) => {
-			const characters = (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
-			for (const character of characters) {
-				if (character === "\r" || character === "\n") {
-					finish(() => {
-						try {
-							resolve(passwordFromInput(input));
-						} catch (cause) {
-							reject(cause);
-						}
-					});
-					return;
-				}
-				if (character === "\u0003") {
-					finish(() => reject(passwordInputError(
-						"USER_CREATE_PASSWORD_PROMPT_CANCELLED",
-						"Initial password prompt was cancelled.",
-						"Retry with --password-prompt, --password-stdin, or omit password options to issue a setup token.",
-					)));
-					return;
-				}
-				if (character === "\u007f" || character === "\b") {
-					input = input.slice(0, -1);
-					continue;
-				}
-				if (character >= " ") input += character;
-				if (Buffer.byteLength(input, "utf8") > MAX_STDIN_PASSWORD_BYTES) {
-					finish(() => reject(passwordInputError(
-						"USER_CREATE_PASSWORD_TOO_LARGE",
-						"Initial password input exceeds the 4096-byte limit.",
-						"Provide a shorter password.",
-					)));
-					return;
-				}
-			}
-		};
-		process.stdin.setRawMode(true);
-		process.stdin.resume();
-		process.stdin.on("data", onData);
-	});
+	return readPasswordPrompt(process.stdin, process.stderr);
+}
+
+interface NumericOptionConstraint {
+	readonly key: string;
+	readonly flag: string;
+	readonly minimum: number;
+	readonly maximum: number;
+}
+
+const NUMERIC_OPTION_CONSTRAINTS: Readonly<Record<string, readonly NumericOptionConstraint[]>> = {
+	"users list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 1_000 }],
+	"users export": [{ key: "limit", flag: "limit", minimum: 1, maximum: USERS_EXPORT_MAX_LIMIT }],
+	"orgs list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 1_000 }],
+	"events list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 1_000 }],
+	"events tail": [
+		{ key: "limit", flag: "limit", minimum: 1, maximum: EVENTS_TAIL_MAX_LIMIT },
+		{ key: "pollInterval", flag: "poll-interval", minimum: EVENTS_TAIL_MIN_POLL_INTERVAL_MS, maximum: EVENTS_TAIL_MAX_POLL_INTERVAL_MS },
+		{ key: "maxEvents", flag: "max-events", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+	],
+	"events export": [{ key: "limit", flag: "limit", minimum: 1, maximum: EVENTS_EXPORT_MAX_LIMIT }],
+	"sessions list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 500 }],
+	"delivery list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 200 }],
+	"delivery readiness": [{ key: "staleAfterMs", flag: "stale-after-ms", minimum: 1_000, maximum: 86_400_000 }],
+	"delivery replay": [{ key: "maxAttempts", flag: "max-attempts", minimum: 1, maximum: 100 }],
+	"delivery endpoints list": [{ key: "limit", flag: "limit", minimum: 1, maximum: 200 }],
+	"delivery endpoints update": [{ key: "expectedVersion", flag: "expected-version", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"delivery endpoints rotate": [{ key: "expectedVersion", flag: "expected-version", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"delivery endpoints delete": [{ key: "expectedVersion", flag: "expected-version", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"delivery endpoints test": [{ key: "expectedVersion", flag: "expected-version", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"auth-policy apply": [{ key: "expectedRevision", flag: "expected-revision", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"orgs authorization assignments replace": [{ key: "expectedRevision", flag: "expected-revision", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"product presentation apply": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"product domains reissue": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"product domains activate": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"product domains disable": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"product sender apply": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"product sender readiness": [{ key: "staleAfterMs", flag: "stale-after-ms", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }],
+	"product templates apply": [{ key: "expectedVersion", flag: "expected-version", minimum: 0, maximum: Number.MAX_SAFE_INTEGER }],
+	"schema credential-authority arm": [{ key: "expectedRuntimes", flag: "expected-runtimes", minimum: 1, maximum: 10_000 }],
+};
+
+const FORMAT_OPTION_CHOICES: Readonly<Record<string, readonly string[]>> = {
+	"users export": ["json", "jsonl"],
+	"events export": ["json", "jsonl"],
+	"orgs members import": ["json", "csv"],
+};
+
+function cliUsage(message: string, remediation: string): ClearanceError {
+	return new ClearanceError({ code: "CLI_USAGE", message, stage: "cli.usage", status: 400, remediation });
+}
+
+function normalizeRemoteInputs(path: string, values: Record<string, unknown>): Record<string, unknown> {
+	const normalized = { ...values };
+	for (const constraint of NUMERIC_OPTION_CONSTRAINTS[path] ?? []) {
+		const value = normalized[constraint.key];
+		if (value === undefined) continue;
+		const canonical = typeof value === "number"
+			? Number.isSafeInteger(value)
+			: typeof value === "string" && /^(0|[1-9]\d*)$/u.test(value);
+		const parsed = canonical ? Number(value) : Number.NaN;
+		if (!Number.isSafeInteger(parsed) || parsed < constraint.minimum || parsed > constraint.maximum) {
+			throw cliUsage(
+				`--${constraint.flag} must be an integer from ${constraint.minimum} to ${constraint.maximum}.`,
+				`Pass a valid --${constraint.flag} value.`,
+			);
+		}
+		normalized[constraint.key] = parsed;
+	}
+	const formatChoices = FORMAT_OPTION_CHOICES[path];
+	if (formatChoices && normalized.format !== undefined && !formatChoices.includes(String(normalized.format))) {
+		throw cliUsage(
+			`--format must be one of: ${formatChoices.join(", ")}.`,
+			`Pass --format ${formatChoices[0]}.`,
+		);
+	}
+	return normalized;
 }
 
 async function remoteCommandOptions(command: Command, global: GlobalOpts): Promise<Record<string, unknown>> {
 	const opts = command.opts() as Record<string, unknown>;
-	if (commandPath(command) !== "users create") return opts;
+	const path = commandPath(command);
+	if (path !== "users create") return normalizeRemoteInputs(path, opts);
 	const passwordStdin = opts.passwordStdin === true;
 	const passwordPrompt = opts.passwordPrompt === true;
 	if (passwordStdin && passwordPrompt) {
@@ -172,16 +561,46 @@ async function remoteCommandOptions(command: Command, global: GlobalOpts): Promi
 	delete opts.passwordPrompt;
 	if (passwordStdin) opts.password = await readPasswordFromStdin();
 	if (passwordPrompt) {
-		if (global.noInput) {
+		const eligibility = interactionEligibility({
+			noInput: global.noInput,
+			json: global.json,
+			machineOutput: global.jsonl || global.quiet || Boolean(global.jq) || global.output !== undefined,
+		});
+		if (!eligibility.eligible) {
 			throw passwordInputError(
 				"USER_CREATE_PASSWORD_PROMPT_NONINTERACTIVE",
-				"--password-prompt cannot be used with --no-input.",
+				`--password-prompt requires interactive input (${eligibility.reason}).`,
 				"Use --password-stdin for CI, or omit password options to issue a setup token.",
 			);
 		}
 		opts.password = await readPasswordFromPrompt();
 	}
-	return opts;
+	return normalizeRemoteInputs(path, opts);
+}
+
+function groupCommandAction(this: Command): void {
+	const g = globals(this);
+	if (selectOutputFormat(g) === "human") {
+		process.stdout.write(`${this.helpInformation()}\n`);
+		return;
+	}
+	const path = commandPath(this);
+	throw cliUsage(
+		`A subcommand is required for ${path}.`,
+		`Run clearance ${path} --help to list available subcommands.`,
+	);
+}
+
+function configureGroupActions(command: Command): void {
+	for (const child of command.commands) {
+		configureGroupActions(child);
+		// `completion` intentionally keeps its shorthand action (`completion zsh`).
+		// Every other group is navigation-only and should own a useful bare action
+		// instead of Commander's internal `(outputHelp)` error.
+		if (child.commands.length > 0 && commandPath(child) !== "completion") {
+			child.action(groupCommandAction);
+		}
+	}
 }
 
 /**
@@ -191,7 +610,15 @@ async function remoteCommandOptions(command: Command, global: GlobalOpts): Promi
  */
 async function remoteCommandAction(this: Command): Promise<void> {
 	const g = globals(this);
+	const path = commandPath(this);
+	const operation = MANAGEMENT_OPERATIONS.find((candidate) => candidate.cliPath === path);
+	let target: { principal?: string; apiOrigin?: string } = {
+		...(g.profile ? { principal: g.profile } : {}),
+		...(g.apiUrl ? { apiOrigin: g.apiUrl } : {}),
+	};
 	try {
+		validateOutputSelector(g);
+		if (!operation) throw new Error(`No canonical operation exists for ${path}.`);
 		const opts = await remoteCommandOptions(this, g);
 		const session = await resolveApiSession({
 			profile: g.profile,
@@ -202,19 +629,117 @@ async function remoteCommandAction(this: Command): Promise<void> {
 				code: "CLI_LOGIN_REQUIRED",
 				message: "An authenticated Clearance API profile is required.",
 				stage: "cli.dispatch",
+				status: 401,
 				remediation:
 					"Run clearance login --profile <name> for the intended API origin.",
 			});
 		}
-		const result = await dispatchRemoteCommand({
-			session,
-			path: commandPath(this),
-			args: this.processedArgs,
-			opts,
-			global: g,
+		target = {
+			principal: session.credentialSource === "saved" ? session.profile : "environment",
+			apiOrigin: session.apiUrl,
+		};
+		const run = await operationRunner.run({
+			operation: {
+				id: operation.id,
+				path,
+				mutation: operation.mutation,
+				confirmation: operation.confirmation,
+			},
+			command: clearanceCommandFromArgv(process.argv),
+			target,
+			dryRun: g.dryRun,
+			live: opts.live === true,
+			confirmed: g.yes,
+			signal: g.signal,
+			secretValues: typeof opts.password === "string" ? [opts.password] : [],
+			execute: async ({ signal, markDispatched }) => {
+				if (g.dryRun && !operation.supportsDryRun) {
+					throw new ClearanceError({
+						code: "CLI_REMOTE_DRY_RUN_UNSUPPORTED",
+						message: `${path} does not expose a server-side dry-run contract.`,
+						stage: "cli.dispatch",
+						status: 400,
+						remediation: "Review the target, then run the command without --dry-run.",
+					});
+				}
+				let transportStarted = false;
+				const dispatchSession = {
+					...session,
+					operationObserver: {
+						onDispatch() {
+							if (!transportStarted) {
+								transportStarted = true;
+								markDispatched();
+							}
+						},
+						onMetadata(metadata: { requestId?: string; idempotencyKey?: string }) {
+							markDispatched(metadata);
+						},
+					},
+				};
+				const data = await dispatchRemoteCommand({
+					session: dispatchSession,
+					path,
+					args: this.processedArgs,
+					opts,
+					global: { ...g, signal },
+				});
+				return { data };
+			},
 		});
-		printResult(g, result);
+		if (run.cause !== undefined) {
+			fail(run.cause, g, {
+				receipt: run.receipt,
+				receiptPersistence: run.receiptPersistence,
+				...(run.receiptPersistenceError ? { receiptPersistenceError: run.receiptPersistenceError } : {}),
+				...(run.receiptPersistencePath ? { receiptPersistencePath: run.receiptPersistencePath } : {}),
+			});
+		}
+		if (!isEventStreamResult(run.data)) {
+			printResult(g, run.data, operationHumanPresentation(
+				path,
+				operation.mutation,
+				run.data,
+				run.receipt,
+				{
+					status: run.receiptPersistence,
+					...(run.receiptPersistencePath ? { path: run.receiptPersistencePath } : {}),
+					...(run.receiptPersistenceError ? { error: run.receiptPersistenceError } : {}),
+				},
+			));
+		}
+		if (
+			path === "doctor" &&
+			run.data !== null &&
+			typeof run.data === "object" &&
+			(run.data as { ok?: unknown }).ok === false
+		) {
+			throw new CliExitError(2);
+		}
 	} catch (cause) {
+		if (cause instanceof CliExitError) throw cause;
+		if (operation?.mutation) {
+			const failed = await operationRunner.run({
+				operation: {
+					id: operation.id,
+					path,
+					mutation: true,
+					confirmation: "none",
+				},
+				command: clearanceCommandFromArgv(process.argv),
+				target,
+				dryRun: g.dryRun,
+				confirmed: true,
+				secretValues: [],
+				execute: async () => { throw cause; },
+			});
+			fail(cause, g, {
+				receipt: failed.receipt,
+				receiptPersistence: failed.receiptPersistence,
+				...(failed.receiptPersistenceError ? { receiptPersistenceError: failed.receiptPersistenceError } : {}),
+				...(failed.receiptPersistencePath ? { receiptPersistencePath: failed.receiptPersistencePath } : {}),
+			});
+		}
 		fail(cause, g);
 	}
 }
@@ -227,39 +752,47 @@ async function schemaMigrateAction(this: Command): Promise<void> {
 	}
 	const g = globals(this);
 	try {
-		if (g.profile || g.apiUrl) {
-			throw new ClearanceError({
-				code: "SCHEMA_LOCAL_MIGRATION_REMOTE_FLAGS_INVALID",
-				message: "Local schema migration cannot use an API profile or URL.",
-				stage: "schema.migrate.local",
-				remediation: "Remove --profile and --api-url from the one-shot migration command.",
-			});
-		}
-		if (!g.dryRun && !g.yes) {
-			throw new ClearanceError({
-				code: "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED",
-				message: "Local schema migration requires explicit confirmation.",
-				stage: "schema.migrate.local",
-				remediation: "Review --dry-run, then pass --local --yes.",
-			});
-		}
-		if (
-			!g.dryRun &&
-			(typeof opts.drainId !== "string" || opts.drainId.trim().length === 0)
-		) {
-			throw new ClearanceError({
-				code: "SCHEMA_MIGRATE_DRAIN_ID_REQUIRED",
-				message: "Local schema migration requires the exact armed drain ID.",
-				stage: "schema.migrate.local",
-				remediation: "Pass --local --drain-id <id> --yes from the one-shot migrator.",
-			});
-		}
-		const result = await migrateRuntimeSchemaLocally({
-			dryRun: Boolean(g.dryRun),
-			drainId: typeof opts.drainId === "string" ? opts.drainId : undefined,
+		const run = await runLocalMutation({
+			operation: LOCAL_MUTATION_CONTRACTS.schemaMigrate,
+			global: g,
+			target: { resource: "runtime-schema", environment: "local" },
+			reconciliationCommands: ["clearance schema status"],
+			prepare: () => {
+				if (g.profile || g.apiUrl) {
+					throw new ClearanceError({
+						code: "SCHEMA_LOCAL_MIGRATION_REMOTE_FLAGS_INVALID",
+						message: "Local schema migration cannot use an API profile or URL.",
+						stage: "schema.migrate.local",
+						remediation: "Remove --profile and --api-url from the one-shot migration command.",
+					});
+				}
+				if (!g.dryRun && !g.yes) {
+					throw new ClearanceError({
+						code: "SCHEMA_MIGRATE_CONFIRMATION_REQUIRED",
+						message: "Local schema migration requires explicit confirmation.",
+						stage: "schema.migrate.local",
+						remediation: "Review --dry-run, then pass --local --yes.",
+					});
+				}
+				if (!g.dryRun && (typeof opts.drainId !== "string" || opts.drainId.trim().length === 0)) {
+					throw new ClearanceError({
+						code: "SCHEMA_MIGRATE_DRAIN_ID_REQUIRED",
+						message: "Local schema migration requires the exact armed drain ID.",
+						stage: "schema.migrate.local",
+						remediation: "Pass --local --drain-id <id> --yes from the one-shot migrator.",
+					});
+				}
+				return {
+					dryRun: Boolean(g.dryRun),
+					drainId: typeof opts.drainId === "string" ? opts.drainId : undefined,
+				};
+			},
+			mutate: (migration) => migrateRuntimeSchemaLocally(migration),
 		});
-		printResult(g, result);
+		if (run.cause !== undefined) failLocalMutation(run, g);
+		printResult(g, run.data, localMutationPresentation("schema migrate", run));
 	} catch (cause) {
+		if (cause instanceof CliExitError) throw cause;
 		fail(cause, g);
 	} finally {
 		await closeAuthBundle().catch(() => undefined);
@@ -268,15 +801,145 @@ async function schemaMigrateAction(this: Command): Promise<void> {
 
 async function main() {
 	const program = new Command("clearance");
+	program.exitOverride((cause) => {
+		if (cause.code === "commander.helpDisplayed" || cause.code === "commander.version") {
+			throw new CliExitError(0);
+		}
+		throw new ClearanceError({
+			code: "CLI_USAGE",
+			message: cause.message,
+			stage: "cli.usage",
+			status: 400,
+			remediation: "Run clearance --help to see valid commands and options.",
+		});
+	});
+	// Commander otherwise writes a diagnostic before exitOverride can route it
+	// through the stable human or machine error protocol.
+	program.configureOutput({ writeErr: () => undefined });
+	program.addHelpCommand(false);
 	program
 		.version(VERSION)
 		.description("Clearance CLI — open-source auth operations")
-		.option("--json", "Stable JSON output", false)
-		.option("--no-input", "Disable prompts (CI/agents)", false)
+		.option("--json", "Deprecated raw JSON compatibility output", false)
+		.option("--jsonl", "Stable compact JSON Lines output", false)
+		.option("--quiet", "Suppress successful output", false)
+		.option("--jq <expression>", "Select machine output with the built-in jq subset")
+		.option("--output-format <format>", "Output format: human, json, jsonl, or quiet", parseOutputFormat)
+		.option("--no-input", "Disable prompts (CI/agents)")
 		.option("--yes", "Confirm destructive actions", false)
 		.option("--dry-run", "Preview mutations", false)
 		.option("--profile <name>", "Saved API profile")
 		.option("--api-url <url>", "Clearance management API origin override");
+	program.hook("preAction", (_command, actionCommand) => {
+		validateOutputSelector(globals(actionCommand));
+	});
+
+	program.action(async () => {
+		const g = globals(program);
+		const result = await runFirstRunExperience({
+			json: g.json,
+			machineOutput: Boolean(g.jsonl || g.quiet || g.jq || g.output === "json" || g.output === "jsonl" || g.output === "quiet"),
+			noInput: g.noInput,
+			callbacks: {
+				resumeProfile: async () => {
+					const profile = normalizeProfile(g.profile, process.env);
+					const saved = await readSavedCredential(process.env, profile);
+					if (!saved) return null;
+					try {
+						const whoami = await verifyOperatorCredential(saved.apiUrl, saved.token);
+						return {
+							apiUrl: saved.apiUrl,
+							profile,
+							verification: {
+								summary: `operator ${whoami.projectId}/${whoami.environmentId} at ${saved.apiUrl}`,
+								principal: "operator",
+								projectId: whoami.projectId,
+								environmentId: whoami.environmentId,
+							},
+						};
+					} catch {
+						return null;
+					}
+				},
+				verifyConnection: async ({ apiUrl, token }) => {
+					const normalizedUrl = normalizeApiUrl(apiUrl, {});
+					const whoami = await verifyOperatorCredential(normalizedUrl, token);
+					return {
+						summary: `operator ${whoami.projectId}/${whoami.environmentId} at ${normalizedUrl}`,
+						principal: "operator",
+						projectId: whoami.projectId,
+						environmentId: whoami.environmentId,
+					};
+				},
+				saveProfile: async ({ apiUrl, profile, token }) => {
+					await writeSavedCredential(
+						{ apiUrl: normalizeApiUrl(apiUrl, {}), token },
+						process.env,
+						normalizeProfile(profile, process.env),
+					);
+				},
+				installCompletion: async (shell) => {
+					const document = buildCommandSpecDocument({ program, supplementalCommands });
+					const installed = await installCompletion({
+						shell,
+						content: renderCompletion(shell, document, program.options),
+					});
+					return {
+						summary: `Shell completion ${installed.action}: ${installed.projected.path}`,
+						state: installed.action === "refreshed" ? "installed" : installed.action,
+					};
+				},
+				installSkill: async () => {
+					const installed = await installClearanceAgentSkill({
+						directory: join(homedir(), ".agents", "skills"),
+					});
+					return {
+						summary: `Agent skill ${installed.action}: ${installed.projected.path}`,
+						state: installed.action === "refreshed" ? "installed" : installed.action,
+					};
+				},
+				previewFirstOperation: async ({ profile }) => ({
+					summary: "List users from the connected environment",
+					command: `clearance --profile ${shellWord(normalizeProfile(profile, process.env))} users list`,
+				}),
+				runFirstOperation: async ({ profile }) => {
+					const selectedProfile = normalizeProfile(profile, process.env);
+					const saved = await readSavedCredential(process.env, selectedProfile);
+					if (!saved) {
+						throw localSetupError(
+							"CLI_PROFILE_NOT_SAVED",
+							`Profile ${selectedProfile} was not available after setup.`,
+							"Run clearance login, then clearance users list.",
+							70,
+						);
+					}
+					const data = await dispatchRemoteCommand({
+						session: {
+							apiUrl: saved.apiUrl,
+							token: saved.token,
+							profile: selectedProfile,
+							credentialSource: "saved",
+						},
+						path: "users list",
+						args: [],
+						opts: {},
+						global: { signal: g.signal },
+					});
+					const listed = listResult(data);
+					return { summary: listed ? `Setup complete. Found ${listed.rows.length} ${listed.name}.` : "Setup complete. First operation succeeded." };
+				},
+			},
+		});
+		if (result.status === "unavailable") {
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			const parity = compareCommanderParity(program, { supplementalCommands });
+			printResult(g, { ...document, experience: buildExperienceManifest(document), parity }, {
+				human: humanCommandListing(document.commands),
+				summary: "Clearance command discovery",
+				next: ["clearance commands", "clearance --help"],
+			});
+		}
+	});
 
 	program
 		.command("init")
@@ -287,8 +950,44 @@ async function main() {
 
 	program
 		.command("doctor")
-		.description("Installation and configuration health checks")
-		.action(remoteCommandAction);
+		.description("Check local setup and unauthenticated API reachability")
+		.option("--remote", "Run the authenticated server-side doctor instead", false)
+		.action(async function (this: Command, options: { remote?: boolean }) {
+			if (options.remote) {
+				await remoteCommandAction.call(this);
+				return;
+			}
+			const g = globals(this);
+			const shell = detectedCompletionShell();
+			const skillDirectory = join(homedir(), ".agents", "skills");
+			const result = await runLocalDoctor({
+				profile: normalizeProfile(g.profile, process.env),
+				apiOrigin: normalizeApiUrl(g.apiUrl, process.env),
+			}, {
+				cliVersion: () => VERSION,
+				inspectConfig: inspectLocalConfig,
+				inspectProfile: inspectLocalProfile,
+				inspectSkill: async () => featureInspection(await inspectClearanceAgentSkill(skillDirectory)),
+				inspectCompletion: async () => shell
+					? featureInspection(await inspectCompletionInstallation(completionInstallationPath(shell)))
+					: { state: "unavailable", detail: "Set SHELL to bash, zsh, or fish." },
+				fetch: globalThis.fetch,
+			});
+			const next = result.checks.flatMap((check) => check.status === "pass" ? [] : (
+				check.id === "profile" ? ["clearance login --profile <name>"]
+					: check.id === "completion" && shell ? [`clearance completion install ${shell}`]
+						: check.id === "skill" ? ["clearance skill install"] : []
+			));
+			printResult(g, result, {
+				human: [
+					renderLocalDoctor(result),
+					...(next.length > 0 ? [["Next:", ...next.map((command) => `  - ${command}`)].join("\n")] : []),
+				].join("\n\n"),
+				summary: result.ok ? "Local setup is healthy." : "Local setup needs attention.",
+				next,
+			});
+			if (!result.ok) throw new CliExitError(2);
+		});
 
 	program
 		.command("dev")
@@ -749,7 +1448,7 @@ async function main() {
 		.requiredOption("--fixture <path>")
 		.action(remoteCommandAction);
 	migration
-		.command("run")
+		.command("apply")
 		.requiredOption("--id <planId>")
 		.requiredOption("--fixture <path>")
 		.action(remoteCommandAction);
@@ -895,28 +1594,45 @@ async function main() {
 		.action(async (opts, cmd) => {
 			const g = globals(cmd);
 			try {
-				const profile = normalizeProfile(g.profile);
-				const apiUrl = normalizeApiUrl(opts.url);
-				const token = opts.tokenStdin ? await readTokenFromStdin() : environmentToken();
-				if (!token) {
-					throw new ClearanceError({
-						code: "CLI_TOKEN_REQUIRED",
-						message: "An operator token is required for login.",
-						stage: "operator-auth.login",
-						remediation:
-							"Set CLEARANCE_OPERATOR_TOKEN or CLEARANCE_API_TOKEN, or pass --token-stdin.",
-					});
-				}
-				const whoami = await validateAndSaveCredential(apiUrl, token, process.env, profile);
-				printResult(g, {
-					authenticated: true,
-					credentialSaved: true,
-					credentialSource: opts.tokenStdin ? "stdin" : "environment",
-					profile,
-					apiUrl,
-					whoami,
-				}, `Authenticated to ${apiUrl} as operator (${whoami.projectId}/${whoami.environmentId}).`);
+				const run = await runLocalMutation({
+					operation: LOCAL_MUTATION_CONTRACTS.login,
+					global: g,
+					target: {
+						principal: g.profile ?? "default",
+						...(typeof opts.url === "string" ? { apiOrigin: opts.url } : {}),
+					},
+					reconciliationCommands: ["clearance whoami"],
+					prepare: async (redact) => {
+						const profile = normalizeProfile(g.profile);
+						const apiUrl = normalizeApiUrl(opts.url);
+						const token = opts.tokenStdin ? await readTokenFromStdin() : environmentToken();
+						if (!token) {
+							throw new ClearanceError({
+								code: "CLI_TOKEN_REQUIRED",
+								message: "An operator token is required for login.",
+								stage: "operator-auth.login",
+								remediation: "Set CLEARANCE_OPERATOR_TOKEN or CLEARANCE_API_TOKEN, or pass --token-stdin.",
+							});
+						}
+						redact(token);
+						return { profile, apiUrl, token };
+					},
+					mutate: async ({ profile, apiUrl, token }) => {
+						const whoami = await validateAndSaveCredential(apiUrl, token, process.env, profile);
+						return {
+							authenticated: true,
+							credentialSaved: true,
+							credentialSource: opts.tokenStdin ? "stdin" : "environment",
+							profile,
+							apiUrl,
+							whoami,
+						};
+					},
+				});
+				if (run.cause !== undefined) failLocalMutation(run, g);
+				printResult(g, run.data, localMutationPresentation("login", run));
 			} catch (e) {
+				if (e instanceof CliExitError) throw e;
 				fail(e, g);
 			}
 		});
@@ -927,20 +1643,28 @@ async function main() {
 		.action(async (_, cmd) => {
 			const g = globals(cmd);
 			try {
-				const profile = normalizeProfile(g.profile);
-				const credentialRemoved = await deleteSavedCredential(process.env, profile);
-				const environmentCredentialPresent = Boolean(environmentToken());
-				const result = {
-					credentialRemoved,
-					idempotent: !credentialRemoved,
-					environmentCredentialPresent,
-					credentialSource: environmentCredentialPresent ? "environment" : "none",
-					profile,
-				};
-				const status = credentialRemoved ? "Saved operator credential removed." : "No saved operator credential was present.";
-				const environmentNote = environmentCredentialPresent ? " An environment credential remains active." : "";
-				printResult(g, result, `${status}${environmentNote}`);
+				const run = await runLocalMutation({
+					operation: LOCAL_MUTATION_CONTRACTS.logout,
+					global: g,
+					target: { principal: g.profile ?? "default" },
+					reconciliationCommands: [],
+					prepare: () => normalizeProfile(g.profile),
+					mutate: async (profile) => {
+						const credentialRemoved = await deleteSavedCredential(process.env, profile);
+						const environmentCredentialPresent = Boolean(environmentToken());
+						return {
+							credentialRemoved,
+							idempotent: !credentialRemoved,
+							environmentCredentialPresent,
+							credentialSource: environmentCredentialPresent ? "environment" : "none",
+							profile,
+						};
+					},
+				});
+				if (run.cause !== undefined) failLocalMutation(run, g);
+				printResult(g, run.data, localMutationPresentation("logout", run));
 			} catch (e) {
+				if (e instanceof CliExitError) throw e;
 				fail(e, g);
 			}
 		});
@@ -981,9 +1705,237 @@ async function main() {
 			} catch (e) {
 				fail(e, g);
 			}
+			});
+
+	const supplementalCommands = [
+		{ path: "login", executionClass: "authentication", mutation: true, confirmation: "none", supportsDryRun: LOCAL_MUTATION_CONTRACTS.login.supportsDryRun, agentNotes: ["Writes a validated credential to a named local profile."] },
+		{ path: "logout", executionClass: "authentication", mutation: true, confirmation: "none", supportsDryRun: LOCAL_MUTATION_CONTRACTS.logout.supportsDryRun, agentNotes: ["Removes only the selected saved profile credential."] },
+		{ path: "whoami", executionClass: "authentication", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "commands", executionClass: "discovery", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "help", executionClass: "discovery", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "completion generate", executionClass: "discovery", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "completion status", executionClass: "local", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "completion install", executionClass: "local", mutation: true, confirmation: "none", supportsDryRun: LOCAL_MUTATION_CONTRACTS.completionInstall.supportsDryRun, agentNotes: ["Refuses to overwrite unowned or newer completion content."] },
+		{ path: "skill status", executionClass: "local", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "skill install", executionClass: "local", mutation: true, confirmation: "none", supportsDryRun: LOCAL_MUTATION_CONTRACTS.skillInstall.supportsDryRun, agentNotes: ["Refuses to overwrite unowned skill content."] },
+		{ path: "tui", executionClass: "interactive", mutation: false, confirmation: "none", supportsDryRun: false, agentNotes: ["Requires an interactive terminal; every action displays its CLI equivalent."] },
+	] satisfies readonly SupplementalCommandSpec[];
+
+	program
+		.command("help [topic]")
+		.description("Browse curated operator help by task")
+		.action((topic: string | undefined, _options, command: Command) => {
+			const topics = listHumanHelpTopics();
+			const selected = topic ? topics.find((item) => item.id === topic) : undefined;
+			if (topic && !selected) {
+				throw new ClearanceError({
+					code: "CLI_HELP_TOPIC_NOT_FOUND",
+					message: `Unknown help topic: ${topic}`,
+					stage: "cli.help",
+					status: 400,
+					remediation: "Run clearance help to list curated topics.",
+				});
+			}
+			printResult(globals(command), selected ?? { topics }, {
+				human: renderHumanHelp(topic, process.stdout.columns ?? 80),
+				summary: topic ? `Clearance help: ${topic}` : `${topics.length} curated help topics.`,
+				next: topic ? [] : topics.map((item) => `clearance help ${item.id}`),
+			});
 		});
 
-	await program.parseAsync();
+	program
+		.command("commands")
+		.description("Describe the complete CLI surface for humans and agents")
+		.action((_, command) => {
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			const parity = compareCommanderParity(program, { supplementalCommands });
+			printResult(globals(command), { ...document, experience: buildExperienceManifest(document), parity }, {
+				human: humanCommandListing(document.commands),
+				summary: `${document.commands.length} commands; contract parity ${parity.matches ? "verified" : "failed"}.`,
+				next: ["clearance completion zsh", "clearance skill install --dry-run"],
+			});
+		});
+
+	const completion = program
+		.command("completion")
+		.description("Generate, inspect, or safely install shell completion")
+		.argument("[shell]", "Compatibility shorthand for completion generate <shell>")
+		.action((shell: string | undefined) => {
+			if (!supportedCompletionShell(shell)) {
+				throw new ClearanceError({
+					code: "CLI_USAGE",
+					message: "Choose bash, zsh, or fish.",
+					stage: "cli.usage",
+					status: 400,
+					remediation: "Run clearance completion generate zsh or clearance completion zsh.",
+				});
+			}
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			process.stdout.write(`${renderCompletion(shell, document, program.options)}\n`);
+		});
+	completion
+		.command("generate")
+		.description("Generate completion source on standard output")
+		.argument("<shell>", "bash, zsh, or fish")
+		.action((shell: string) => {
+			if (!supportedCompletionShell(shell)) {
+				throw localSetupError("CLI_COMPLETION_SHELL_INVALID", "Unsupported completion shell.", "Choose bash, zsh, or fish.", 400);
+			}
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			process.stdout.write(`${renderCompletion(shell, document, program.options)}\n`);
+		});
+	completion
+		.command("status")
+		.description("Inspect completion ownership without writing")
+		.argument("<shell>", "bash, zsh, or fish")
+		.option("--path <path>", "Exact completion file path override")
+		.action(async (shell: string, options: { path?: string }, command: Command) => {
+			if (!supportedCompletionShell(shell)) {
+				throw localSetupError("CLI_COMPLETION_SHELL_INVALID", "Unsupported completion shell.", "Choose bash, zsh, or fish.", 400);
+			}
+			const inspection = await inspectCompletionInstallation(completionInstallationPath(shell, { path: options.path }));
+			printResult(globals(command), inspection, {
+				summary: inspection.exists
+					? `Shell completion ${inspection.owned ? "is managed by Clearance" : "has an ownership conflict"}: ${inspection.path}`
+					: `Shell completion is not installed: ${inspection.path}`,
+				next: inspection.exists ? [] : [`clearance completion install ${shell}`],
+			});
+			if (inspection.exists && !inspection.owned) throw new CliExitError(CLI_EXIT_CODE.conflict);
+			if (!inspection.exists) throw new CliExitError(CLI_EXIT_CODE.checkFailed);
+		});
+	completion
+		.command("install")
+		.description("Install completion without overwriting unowned content")
+		.argument("<shell>", "bash, zsh, or fish")
+		.option("--path <path>", "Exact completion file path override")
+		.action(async (shell: string, options: { path?: string }, command: Command) => {
+			const g = globals(command);
+			const run = await runLocalMutation({
+				operation: LOCAL_MUTATION_CONTRACTS.completionInstall,
+				global: g,
+				target: { resource: options.path ?? `completion:${shell}`, environment: "local" },
+				reconciliationCommands: [`clearance completion status ${shell}`],
+				prepare: () => {
+					if (!supportedCompletionShell(shell)) {
+						throw localSetupError("CLI_COMPLETION_SHELL_INVALID", "Unsupported completion shell.", "Choose bash, zsh, or fish.", 400);
+					}
+					const document = buildCommandSpecDocument({ program, supplementalCommands });
+					return { shell, content: renderCompletion(shell, document, program.options) };
+				},
+				mutate: ({ shell: selectedShell, content }) => installCompletion({
+					shell: selectedShell,
+					content,
+					path: options.path,
+					dryRun: g.dryRun,
+				}),
+			});
+			if (run.cause !== undefined) failLocalMutation(run, g);
+			const result = run.data!;
+			const presentation = localMutationPresentation("completion install", run);
+			printResult(g, result, {
+				...presentation,
+				summary: `Shell completion ${result.action}: ${result.projected.path}`,
+				notice: result.activation,
+				next: result.action === "conflict"
+					? ["Move or rename the unowned completion file, then retry."]
+					: [],
+			});
+			if (result.action === "conflict") throw new CliExitError(CLI_EXIT_CODE.conflict);
+		});
+
+	const skill = program.command("skill").description("Manage the bundled Clearance agent skill");
+	skill.command("status")
+		.option("--directory <path>", "Agent skills root directory", join(homedir(), ".agents", "skills"))
+		.action(async (options, command) => {
+			printResult(globals(command), await inspectClearanceAgentSkill(String(options.directory)));
+		});
+	skill.command("install")
+		.option("--directory <path>", "Agent skills root directory", join(homedir(), ".agents", "skills"))
+		.action(async (options, command) => {
+			const g = globals(command);
+			const directory = String(options.directory);
+			const run = await runLocalMutation({
+				operation: LOCAL_MUTATION_CONTRACTS.skillInstall,
+				global: g,
+				target: { resource: directory, environment: "local" },
+				reconciliationCommands: ["clearance skill status"],
+				prepare: () => undefined,
+				mutate: () => installClearanceAgentSkill({ directory, dryRun: g.dryRun }),
+			});
+			if (run.cause !== undefined) failLocalMutation(run, g);
+			const result = run.data!;
+			const presentation = localMutationPresentation("skill install", run);
+			printResult(g, result, {
+				...presentation,
+				summary: `Clearance agent skill ${result.action}: ${result.projected.path}`,
+				next: result.action === "conflict" ? ["Move or rename the unowned destination, then retry."] : [],
+			});
+			if (result.action === "conflict") throw new CliExitError(CLI_EXIT_CODE.conflict);
+		});
+
+	program.command("tui")
+		.description("Open the interactive Clearance operations workspace")
+		.option("--user <id>", "Open a user")
+		.option("--organization <id>", "Open an organization")
+		.option("--event <id>", "Open an audit event")
+		.option("--delivery <id>", "Open a delivery")
+		.option("--sso <id>", "Open an SSO connection")
+		.option("--scim <id>", "Open a SCIM connection")
+		.option("--open <target...>", "Open <resource> <id> (user, organization, event, delivery, sso, or scim)")
+		.action(async (tuiOptions, command) => {
+			const g = globals(command);
+			const eligibility = interactionEligibility({
+				noInput: g.noInput,
+				json: g.json,
+				machineOutput: Boolean(g.jsonl || g.quiet || g.jq || g.output === "json" || g.output === "jsonl" || g.output === "quiet"),
+			});
+			if (!eligibility.eligible) {
+				throw new ClearanceError({
+					code: "CLI_INTERACTIVE_REQUIRED",
+					message: `The TUI requires an interactive terminal (${eligibility.reason}).`,
+					stage: "cli.tui",
+					remediation: "Run clearance tui in a terminal, or use clearance commands --output-format json for automation.",
+				});
+			}
+			const session = await resolveApiSession({ profile: g.profile, apiUrl: g.apiUrl });
+			if (!session) {
+				throw new ClearanceError({
+					code: "CLI_LOGIN_REQUIRED",
+					message: "An authenticated Clearance API profile is required.",
+					stage: "cli.tui",
+					status: 401,
+					remediation: "Run clearance login --profile <name>, then clearance --profile <name> tui.",
+				});
+			}
+			const deepLinkArgs = ["tui"];
+			for (const flag of ["user", "organization", "event", "delivery", "sso", "scim"] as const) {
+				if (typeof tuiOptions[flag] === "string") deepLinkArgs.push(`--${flag}`, tuiOptions[flag]);
+			}
+			if (Array.isArray(tuiOptions.open)) deepLinkArgs.push("--open", ...tuiOptions.open.map(String));
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			await runTerminalUi({
+				executor: createRemoteWorkflowExecutor(session, g),
+				manifest: buildExperienceManifest(document),
+				initialTarget: parseTuiDeepLink(deepLinkArgs),
+			});
+		});
+
+	configureGroupActions(program);
+
+	try {
+		await program.parseAsync();
+	} catch (cause) {
+		if (cause instanceof CommanderError) {
+			fail(new ClearanceError({
+				code: "CLI_USAGE",
+				message: cause.message,
+				stage: "cli.usage",
+				status: 400,
+				remediation: "Run clearance --help to see valid commands and options.",
+			}), globals(program));
+		}
+		fail(cause, globals(program));
+	}
 }
 
 main().catch((err) => {

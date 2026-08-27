@@ -13,6 +13,7 @@ import {
 	firstStringArgument,
 	localFile,
 	managementCallOptions,
+	requireConfirmation,
 } from "./shared.js";
 
 type ProductCommandPath =
@@ -163,6 +164,7 @@ export async function dispatchProductPresentationCommand({
 			);
 		}
 		case PRODUCT_PRESENTATION_OPERATIONS.apply.cliPath: {
+			requireConfirmation(global, "PRODUCT_PRESENTATION_APPLY_CONFIRMATION_REQUIRED", "Product presentation apply");
 			const candidate = jsonFile(opts.file, "Presentation", [
 				"productLabel",
 				"homeLabel",
@@ -180,7 +182,7 @@ export async function dispatchProductPresentationCommand({
 						logoUrl?: string | null;
 					}),
 					expectedVersion: expectedVersion(opts.expectedVersion),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);
@@ -201,24 +203,26 @@ export async function dispatchProductPresentationCommand({
 				expectedVersion: expectedVersion(opts.expectedVersion),
 			});
 		case PRODUCT_DOMAIN_OPERATIONS.activate.cliPath:
+			requireConfirmation(global, "PRODUCT_DOMAIN_ACTIVATE_CONFIRMATION_REQUIRED", "Product domain activation");
 			return callManagementOperation(
 				session,
 				"product_domains.activate",
 				{
 					origin: origin(opts.origin),
 					expectedVersion: expectedVersion(opts.expectedVersion),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);
 		case PRODUCT_DOMAIN_OPERATIONS.disable.cliPath:
+			requireConfirmation(global, "PRODUCT_DOMAIN_DISABLE_CONFIRMATION_REQUIRED", "Product domain disablement");
 			return callManagementOperation(
 				session,
 				"product_domains.disable",
 				{
 					origin: origin(opts.origin),
 					expectedVersion: expectedVersion(opts.expectedVersion),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);
@@ -231,7 +235,15 @@ export async function dispatchProductPresentationCommand({
 		case PRODUCT_SENDER_OPERATIONS.get.cliPath:
 			return callManagementOperation(session, "product_sender.get", {});
 		case PRODUCT_SENDER_OPERATIONS.plan.cliPath: { const candidate = jsonFile(opts.file, "Sender", ["displayName", "address"]); return callManagementOperation(session, "product_sender.plan", candidate as { displayName: string; address: string }); }
-		case PRODUCT_SENDER_OPERATIONS.apply.cliPath: { const candidate = jsonFile(opts.file, "Sender", ["displayName", "address"]); return callManagementOperation(session, "product_sender.apply", { ...(candidate as { displayName: string; address: string }), expectedVersion: expectedVersion(opts.expectedVersion), dryRun: global.dryRun || !global.yes }, managementCallOptions(global)); }
+		case PRODUCT_SENDER_OPERATIONS.apply.cliPath: {
+			requireConfirmation(global, "PRODUCT_SENDER_APPLY_CONFIRMATION_REQUIRED", "Product sender apply");
+			const candidate = jsonFile(opts.file, "Sender", ["displayName", "address"]);
+			return callManagementOperation(session, "product_sender.apply", {
+				...(candidate as { displayName: string; address: string }),
+				expectedVersion: expectedVersion(opts.expectedVersion),
+				dryRun: Boolean(global.dryRun),
+			}, managementCallOptions(global));
+		}
 		case PRODUCT_TEMPLATE_OPERATIONS.get.cliPath:
 			return callManagementOperation(session, "product_templates.get", {
 				kind: kind(firstStringArgument(args)),
@@ -245,6 +257,7 @@ export async function dispatchProductPresentationCommand({
 			});
 		}
 		case PRODUCT_TEMPLATE_OPERATIONS.apply.cliPath: {
+			requireConfirmation(global, "PRODUCT_TEMPLATE_APPLY_CONFIRMATION_REQUIRED", "Product template apply");
 			const candidate = jsonFile(opts.file, "Template", ["subject", "plainText", "html"]);
 			return callManagementOperation(
 				session,
@@ -254,7 +267,7 @@ export async function dispatchProductPresentationCommand({
 					subject: candidate.subject as string,
 					plainText: candidate.plainText as string, html: candidate.html as string,
 					expectedVersion: expectedVersion(opts.expectedVersion),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);

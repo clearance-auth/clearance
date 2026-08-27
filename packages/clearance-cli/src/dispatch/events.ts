@@ -1,6 +1,8 @@
 import { EVENT_OPERATIONS } from "@clearance/management";
 import { callManagementOperation } from "../api-client.js";
-import { CliExitError } from "../output.js";
+import { selectOutputFormat, successEnvelope } from "../output.js";
+import { evaluateJsonQuery } from "../json-query.js";
+import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import { writeRemoteExport } from "./export-artifact.js";
 import {
 	body,
@@ -9,10 +11,41 @@ import {
 	error,
 	firstStringArgument,
 	managementCallOptions,
+	requireConfirmation,
 } from "./shared.js";
 
 export const EVENTS_TAIL_MIN_POLL_INTERVAL_MS = 100;
 export const EVENTS_TAIL_MAX_POLL_INTERVAL_MS = 60_000;
+export const EVENTS_TAIL_STREAM_ID = "events.tail" as const;
+
+export type EventTailStopReason = "once" | "max-events" | "cancelled";
+
+/**
+ * Tagged completion returned after the dispatcher has already emitted a stream.
+ * Command hosts use the tag to avoid printing the ordinary one-result envelope.
+ */
+export interface EventStreamResult {
+	readonly eventStreamResult: true;
+	readonly stream: typeof EVENTS_TAIL_STREAM_ID;
+	readonly emitted: number;
+	readonly stopped: EventTailStopReason;
+}
+
+export function isEventStreamResult(value: unknown): value is EventStreamResult {
+	if (value === null || typeof value !== "object") return false;
+	const candidate = value as Partial<EventStreamResult>;
+	return candidate.eventStreamResult === true &&
+		candidate.stream === EVENTS_TAIL_STREAM_ID &&
+		typeof candidate.emitted === "number" &&
+		Number.isSafeInteger(candidate.emitted) &&
+		candidate.emitted >= 0 &&
+		(candidate.stopped === "once" || candidate.stopped === "max-events" || candidate.stopped === "cancelled");
+}
+
+/** Streaming commands cannot run inside a renderer that owns stdout, such as the TUI. */
+export function isStreamingEventCommandPath(path: string): boolean {
+	return path === EVENT_OPERATIONS.tail.cliPath;
+}
 
 type EventCommandPath = CliPathOf<typeof EVENT_OPERATIONS>;
 
@@ -24,10 +57,63 @@ type RemoteAuditEvent = {
 	outcome: string;
 };
 
-function emitTailEvent(json: boolean, event: RemoteAuditEvent): void {
-	process.stdout.write(json
-		? `${JSON.stringify(event)}\n`
-		: `${event.createdAt} ${event.action} actor=${event.actor} outcome=${event.outcome} id=${event.id}\n`);
+function terminalField(value: unknown): string {
+	return sanitizeTerminalText(value, { preserveNewlines: false, preserveTabs: false });
+}
+
+function emitTailEvent(global: DispatchInput<string>["global"], event: RemoteAuditEvent): void {
+	const format = selectOutputFormat(global);
+	if (format === "quiet") return;
+	if (format === "json" || format === "jsonl") {
+		// Tail is a stream: every machine event is exactly one JSON Lines record,
+		// even when the caller selected `json`. Explicit output formats use the
+		// normal envelope; legacy --json continues to expose the raw event.
+		const envelope = successEnvelope(event, { meta: { stream: EVENTS_TAIL_STREAM_ID } });
+		const legacyJson = global.json === true && global.format === undefined && global.output === undefined && !global.jq;
+		let selected: unknown = legacyJson ? event : envelope;
+		if (global.jq) {
+			try {
+				selected = evaluateJsonQuery(envelope, global.jq);
+			} catch (cause) {
+				throw error(
+					"CLI_JQ_INVALID",
+					cause instanceof Error ? cause.message : String(cause),
+					"Use selectors such as .data, .data.items[], or .data.items[0].id.",
+				);
+			}
+		}
+		process.stdout.write(`${JSON.stringify(selected)}\n`);
+		return;
+	}
+	process.stdout.write(
+		`${terminalField(event.createdAt)} ${terminalField(event.action)} actor=${terminalField(event.actor)} outcome=${terminalField(event.outcome)} id=${terminalField(event.id)}\n`,
+	);
+}
+
+function streamResult(emitted: number, stopped: EventTailStopReason): EventStreamResult {
+	return Object.freeze({
+		eventStreamResult: true as const,
+		stream: EVENTS_TAIL_STREAM_ID,
+		emitted,
+		stopped,
+	});
+}
+
+function waitForPoll(milliseconds: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return Promise.resolve(false);
+	return new Promise<boolean>((resolveWait) => {
+		let settled = false;
+		const finish = (completed: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			resolveWait(completed);
+		};
+		const abort = () => finish(false);
+		const timer = setTimeout(() => finish(true), milliseconds);
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
 function integerOption(
@@ -83,27 +169,38 @@ export async function dispatchEventCommand({
 			);
 			const seen = new Set<string>();
 			let emitted = 0;
-			const poll = async () => {
-				const response = await callManagementOperation(session, "events.tail", body({
-					limit,
-					action: opts.action,
-					organizationId: opts.org,
-				}));
+			const poll = async (): Promise<boolean> => {
+				if (global.signal?.aborted) return false;
+				let response;
+				try {
+					response = await callManagementOperation(session, "events.tail", body({
+						limit,
+						action: opts.action,
+						organizationId: opts.org,
+					}), managementCallOptions(global));
+				} catch (cause) {
+					// A caller-requested abort is normal stream completion. Transport and
+					// server failures still retain their typed error behavior.
+					if (global.signal?.aborted) return false;
+					throw cause;
+				}
 				const fresh = (response.events as RemoteAuditEvent[]).filter((event) => !seen.has(event.id)).reverse();
 				for (const event of fresh) {
 					seen.add(event.id);
 					if (maxEvents !== 0 && emitted >= maxEvents) break;
-					emitTailEvent(Boolean(global.json), event);
+					emitTailEvent(global, event);
 					emitted += 1;
 				}
+				return !global.signal?.aborted;
 			};
-			await poll();
-			if (opts.once || (maxEvents !== 0 && emitted >= maxEvents)) throw new CliExitError(0);
+			if (!await poll()) return streamResult(emitted, "cancelled");
+			if (opts.once) return streamResult(emitted, "once");
+			if (maxEvents !== 0 && emitted >= maxEvents) return streamResult(emitted, "max-events");
 			while (maxEvents === 0 || emitted < maxEvents) {
-				await new Promise((resolveDelay) => setTimeout(resolveDelay, pollInterval));
-				await poll();
+				if (!await waitForPoll(pollInterval, global.signal)) return streamResult(emitted, "cancelled");
+				if (!await poll()) return streamResult(emitted, "cancelled");
 			}
-			throw new CliExitError(0);
+			return streamResult(emitted, "max-events");
 		}
 		case EVENT_OPERATIONS.inspect.cliPath:
 			return callManagementOperation(session, "events.inspect", { id: rawId });
@@ -124,9 +221,10 @@ export async function dispatchEventCommand({
 			return writeRemoteExport(envelope, opts, "events");
 		}
 		case EVENT_OPERATIONS.replay.cliPath:
+			requireConfirmation(global, "EVENT_REPLAY_CONFIRMATION_REQUIRED", "Event replay");
 			return callManagementOperation(session, "events.replay", {
 				id: String(args[0]),
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			}, managementCallOptions(global));
 	}
 }

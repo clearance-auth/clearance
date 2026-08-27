@@ -10,6 +10,7 @@ import {
 	firstStringArgument,
 	localFile,
 	managementCallOptions,
+	requireConfirmation,
 } from "./shared.js";
 
 type AuthenticationPolicyCommandPath = CliPathOf<
@@ -151,6 +152,7 @@ export async function dispatchAuthenticationPolicyCommand({
 				}) as Parameters<typeof callManagementOperation<"authentication_policy.plan">>[2],
 			);
 		case AUTHENTICATION_POLICY_OPERATIONS.apply.cliPath:
+			requireConfirmation(global, "AUTHENTICATION_POLICY_APPLY_CONFIRMATION_REQUIRED", "Authentication policy apply");
 			return callManagementOperation(
 				session,
 				"authentication_policy.apply",
@@ -158,11 +160,12 @@ export async function dispatchAuthenticationPolicyCommand({
 					organizationId,
 					policy: policyDocument(opts, organizationId),
 					expectedRevision: expectedRevision(opts.expectedRevision),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				}) as Parameters<typeof callManagementOperation<"authentication_policy.apply">>[2],
 				managementCallOptions(global),
 			);
 		case AUTHENTICATION_POLICY_OPERATIONS.unlock.cliPath:
+			requireConfirmation(global, "AUTHENTICATION_POLICY_UNLOCK_CONFIRMATION_REQUIRED", "Authentication policy unlock");
 			return callManagementOperation(
 				session,
 				"authentication_policy.unlock",
@@ -172,7 +175,7 @@ export async function dispatchAuthenticationPolicyCommand({
 						"user-id",
 					),
 					kind: unlockKind(opts.kind),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);

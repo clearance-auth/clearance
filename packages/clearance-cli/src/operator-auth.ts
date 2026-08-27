@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { constants } from "node:fs";
 import { ClearanceError } from "@clearance/management";
+import { DEFAULT_MANAGEMENT_API_ORIGIN } from "./cli-defaults.js";
 
 const CREDENTIAL_FILENAME = "operator-credentials.json";
 const CREDENTIAL_VERSION = 1;
@@ -45,13 +46,14 @@ type AuthEnvironment = Partial<Pick<
 	| "CLEARANCE_PROFILE"
 >>;
 
-function error(code: string, message: string, remediation: string, retryable = false): ClearanceError {
+function error(code: string, message: string, remediation: string, retryable = false, status = 400): ClearanceError {
 	return new ClearanceError({
 		code,
 		message,
 		stage: "operator-auth",
 		remediation,
 		retryable,
+		status,
 	});
 }
 
@@ -154,7 +156,7 @@ function isLoopbackHost(hostname: string): boolean {
 }
 
 export function normalizeApiUrl(candidate: string | undefined, env: AuthEnvironment = process.env): string {
-	const value = candidate?.trim() || env.CLEARANCE_API_URL?.trim() || "http://localhost:3200";
+	const value = candidate?.trim() || env.CLEARANCE_API_URL?.trim() || DEFAULT_MANAGEMENT_API_ORIGIN;
 	let url: URL;
 	try {
 		url = new URL(value);
@@ -374,18 +376,18 @@ export async function fetchWhoami(apiUrl: string, token: string): Promise<Operat
 			signal: controller.signal,
 		});
 		if (response.status === 401) {
-			throw error("CLI_AUTH_UNAUTHORIZED", "Clearance API rejected the operator credential.", "Provide a valid operator token and try again.");
+			throw error("CLI_AUTH_UNAUTHORIZED", "Clearance API rejected the operator credential.", "Provide a valid operator token and try again.", false, 401);
 		}
 		if (!response.ok) {
-			throw error("CLI_WHOAMI_FAILED", "Clearance API could not verify the operator credential.", "Check the API URL and operator access, then try again.", response.status >= 500);
+			throw error("CLI_WHOAMI_FAILED", "Clearance API could not verify the operator credential.", "Check the API URL and operator access, then try again.", response.status >= 500, response.status);
 		}
 		return parseWhoami(await response.json());
 	} catch (cause) {
 		if (cause instanceof ClearanceError) throw cause;
 		if ((cause as Error).name === "AbortError") {
-			throw error("CLI_API_TIMEOUT", "Clearance API verification timed out.", "Check API reachability and try again.", true);
+			throw error("CLI_API_TIMEOUT", "Clearance API verification timed out.", "Check API reachability and try again.", true, 504);
 		}
-		throw error("CLI_API_UNREACHABLE", "Clearance API could not be reached.", "Check the API URL and network connection, then try again.", true);
+		throw error("CLI_API_UNREACHABLE", "Clearance API could not be reached.", "Check the API URL and network connection, then try again.", true, 503);
 	} finally {
 		clearTimeout(timer);
 	}
@@ -397,6 +399,16 @@ export async function validateAndSaveCredential(
 	env: AuthEnvironment = process.env,
 	profile?: string,
 ): Promise<OperatorWhoami> {
+	const whoami = await verifyOperatorCredential(apiUrl, token);
+	await writeSavedCredential({ apiUrl, token }, env, profile);
+	return whoami;
+}
+
+/** Verify a credential is suitable for a saved operator profile without writing it. */
+export async function verifyOperatorCredential(
+	apiUrl: string,
+	token: string,
+): Promise<OperatorWhoami> {
 	const whoami = await fetchWhoami(apiUrl, token);
 	if (whoami.operator.type !== "operator") {
 		throw error(
@@ -405,6 +417,5 @@ export async function validateAndSaveCredential(
 			"Use managed API keys through CLEARANCE_API_TOKEN with an explicit CLEARANCE_API_URL.",
 		);
 	}
-	await writeSavedCredential({ apiUrl, token }, env, profile);
 	return whoami;
 }
