@@ -7,7 +7,7 @@ permissions: {}
 
 jobs:
   promote:
-    if: github.repository_owner == 'clearance' && github.ref == 'refs/heads/next'
+    if: github.repository_owner == 'clearance-auth' && github.ref == 'refs/heads/next'
     runs-on: ubuntu-latest
     permissions:
       contents: write
