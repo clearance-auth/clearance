@@ -10,7 +10,11 @@ cleanup() { find "$TMP" -depth -delete 2>/dev/null || true; }
 trap cleanup EXIT
 
 # Shipping Clearance product packages (not inherited clearance runtime).
-mapfile -t PACKAGES < <(node scripts/release-packages.mjs names)
+# macOS ships Bash 3.2, which does not provide mapfile.
+PACKAGES=()
+while IFS= read -r package_name; do
+  PACKAGES+=("$package_name")
+done < <(node scripts/release-packages.mjs names)
 
 fail() {
   echo "SMOKE_PACK_FAILED: $*" >&2
@@ -28,7 +32,7 @@ required_dist_for() {
     "@clearance/key-management") echo "dist/index.mjs dist/index.d.mts" ;;
     "@clearance/verification") echo "dist/index.js dist/index.d.ts README.md" ;;
     "@clearance/vault") echo "dist/index.js dist/index.d.ts dist/styles.css" ;;
-    "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
+    "@clearance/cli") echo "dist/index.js dist/skills/clearance/SKILL.md dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
     "@clearance/api") echo "dist/server.js" ;;
     "@clearance/console") echo "src/server.js public/index.html public/app.js public/setup.html public/setup.js public/styles.css" ;;
     *) return 1 ;;
@@ -129,7 +133,10 @@ for pkg in "${PACKAGES[@]}"; do
   verify_tarball "$pkg"
 done
 
-mapfile -t RUNTIME_CLOSURE_PACKAGES < <(node scripts/release-packages.mjs runtime-closure-names)
+RUNTIME_CLOSURE_PACKAGES=()
+while IFS= read -r package_name; do
+  RUNTIME_CLOSURE_PACKAGES+=("$package_name")
+done < <(node scripts/release-packages.mjs runtime-closure-names)
 for pkg in "${RUNTIME_CLOSURE_PACKAGES[@]}"; do
   node scripts/verify-release-runtime-closure.mjs "$(tarball_for "$pkg")"
 done

@@ -10,7 +10,7 @@ import {
 	type OutputFormatOptions,
 } from "./output-format.js";
 import { renderHumanError, renderHumanSuccess } from "./output-human.js";
-import { evaluateJsonQuery } from "./json-query.js";
+import { evaluateJsonQuery, validateJsonQuery } from "./json-query.js";
 
 export { CLI_EXIT_CODE, exitCodeForClearanceError } from "./output-exit-codes.js";
 export {
@@ -29,6 +29,20 @@ export interface GlobalOpts extends OutputFormatOptions {
 	dryRun?: boolean;
 	profile?: string;
 	apiUrl?: string;
+	/** Cancellation propagated by interactive or embedding callers. */
+	signal?: AbortSignal;
+}
+
+/** Increment only when the serialized machine envelope changes. */
+export const OUTPUT_PROTOCOL_VERSION = 1 as const;
+export const OUTPUT_PROTOCOL = "clearance.cli.output" as const;
+
+export interface NextAction {
+	readonly action: "run-command" | "follow-up";
+	readonly command: string | null;
+	readonly description: string | null;
+	readonly mutation: boolean | null;
+	readonly confirmationRequired: boolean | null;
 }
 
 export interface OutputMeta {
@@ -36,11 +50,14 @@ export interface OutputMeta {
 }
 
 export interface SuccessEnvelope<T = unknown> {
+	readonly protocol: typeof OUTPUT_PROTOCOL;
+	readonly protocolVersion: typeof OUTPUT_PROTOCOL_VERSION;
 	readonly ok: true;
 	readonly data: T;
 	readonly summary: string | null;
 	readonly notice: string | null;
 	readonly next: readonly string[];
+	readonly actions: readonly NextAction[];
 	readonly meta: Readonly<OutputMeta>;
 }
 
@@ -53,8 +70,11 @@ export interface ErrorDetail {
 }
 
 export interface ErrorEnvelope {
+	readonly protocol: typeof OUTPUT_PROTOCOL;
+	readonly protocolVersion: typeof OUTPUT_PROTOCOL_VERSION;
 	readonly ok: false;
 	readonly error: ErrorDetail;
+	readonly actions: readonly NextAction[];
 	readonly meta: Readonly<OutputMeta>;
 }
 
@@ -66,7 +86,20 @@ export interface ResultPresentation {
 	readonly summary?: string | null;
 	readonly notice?: string | null;
 	readonly next?: readonly string[];
+	readonly actions?: readonly NextAction[];
 	readonly meta?: Readonly<OutputMeta>;
+}
+
+function actionFromLegacyStep(step: string): NextAction {
+	const normalized = step.trim();
+	const isCommand = normalized === "clearance" || normalized.startsWith("clearance ");
+	return Object.freeze({
+		action: isCommand ? "run-command" : "follow-up",
+		command: isCommand ? normalized : null,
+		description: isCommand ? null : normalized,
+		mutation: null,
+		confirmationRequired: null,
+	});
 }
 
 export class CliExitError extends Error {
@@ -87,11 +120,16 @@ export function successEnvelope<T>(
 		? { human: presentation, summary: presentation }
 		: presentation;
 	return {
+		protocol: OUTPUT_PROTOCOL,
+		protocolVersion: OUTPUT_PROTOCOL_VERSION,
 		ok: true,
 		data,
 		summary: normalized.summary ?? normalized.human ?? null,
 		notice: normalized.notice ?? null,
 		next: normalized.next ? [...normalized.next] : [],
+		actions: normalized.actions
+			? normalized.actions.map((action) => Object.freeze({ ...action }))
+			: (normalized.next ?? []).map(actionFromLegacyStep),
 		meta: normalized.meta ? { ...normalized.meta } : {},
 	};
 }
@@ -99,6 +137,8 @@ export function successEnvelope<T>(
 export function errorEnvelope(err: unknown, meta: Readonly<OutputMeta> = {}): ErrorEnvelope {
 	if (isClearanceError(err)) {
 		return {
+			protocol: OUTPUT_PROTOCOL,
+			protocolVersion: OUTPUT_PROTOCOL_VERSION,
 			ok: false,
 			error: {
 				code: err.code,
@@ -107,10 +147,13 @@ export function errorEnvelope(err: unknown, meta: Readonly<OutputMeta> = {}): Er
 				retryable: err.retryable,
 				remediation: err.remediation,
 			},
+			actions: err.remediation ? [actionFromLegacyStep(err.remediation)] : [],
 			meta: { ...meta },
 		};
 	}
 	return {
+		protocol: OUTPUT_PROTOCOL,
+		protocolVersion: OUTPUT_PROTOCOL_VERSION,
 		ok: false,
 		error: {
 			code: "INTERNAL",
@@ -119,6 +162,7 @@ export function errorEnvelope(err: unknown, meta: Readonly<OutputMeta> = {}): Er
 			retryable: false,
 			remediation: null,
 		},
+		actions: [],
 		meta: { ...meta },
 	};
 }
@@ -165,7 +209,23 @@ export function printResult(
 	process.stdout.write(`${rendered}\n`);
 }
 
-export function fail(err: unknown, opts: GlobalOpts): never {
+/** Fail a malformed selector before an action can cross a mutation boundary. */
+export function validateOutputSelector(opts: Readonly<GlobalOpts>): void {
+	if (!opts.jq) return;
+	try {
+		validateJsonQuery(opts.jq);
+	} catch (cause) {
+		throw new ClearanceError({
+			code: "CLI_JQ_INVALID",
+			message: cause instanceof Error ? cause.message : String(cause),
+			stage: "cli.output",
+			status: 400,
+			remediation: "Use selectors such as .data, .data.items[], or .data.items[0].id.",
+		});
+	}
+}
+
+export function fail(err: unknown, opts: GlobalOpts, meta: Readonly<OutputMeta> = {}): never {
 	// A CliExitError means fail() already emitted a structured document and is
 	// unwinding. Re-throw untouched so a catch block that funnels back into
 	// fail() can never emit a second JSON document on stdout (--json contract:
@@ -173,7 +233,7 @@ export function fail(err: unknown, opts: GlobalOpts): never {
 	if (err instanceof CliExitError) {
 		throw err;
 	}
-	const envelope = errorEnvelope(err);
+	const envelope = errorEnvelope(err, meta);
 	const format = selectOutputFormat(opts);
 	if (format === "json" || format === "jsonl") writeMachineEnvelope(format, envelope);
 	else process.stderr.write(`${renderHumanError(envelope.error)}\n`);

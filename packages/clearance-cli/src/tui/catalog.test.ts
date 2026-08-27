@@ -4,6 +4,12 @@ import { actionsFor, WORKFLOW_ACTIONS, WORKFLOW_AREAS } from "./catalog.js";
 
 describe("workflow catalog", () => {
 	it("covers every top-level workflow area", () => {
+		expect(WORKFLOW_AREAS).toEqual([
+			"Overview",
+			"People",
+			"Security",
+			"Operations",
+		]);
 		for (const area of WORKFLOW_AREAS) expect(actionsFor(area).length).toBeGreaterThan(0);
 	});
 
@@ -50,7 +56,15 @@ describe("workflow catalog", () => {
 	});
 
 	it("searches labels, descriptions, and exact paths within one area", () => {
-		expect(actionsFor("Events & delivery", "delivery retry").map((action) => action.id)).toContain("delivery-retry");
+		expect(actionsFor("Security", "delivery retry").map((action) => action.id)).toContain("delivery-retry");
 		expect(actionsFor("Overview", "delivery retry")).toEqual([]);
+		expect(WORKFLOW_ACTIONS.find((action) => action.id === "events-replay")?.description).toBe("Re-run an event diagnostic trace.");
+	});
+
+	it("keeps production operations transparent and guarded", () => {
+		const restore = WORKFLOW_ACTIONS.find((action) => action.id === "backup-restore");
+		expect(restore?.invocation({ id: "backup_1", target: "clearance_restore_a" }, { profile: "prod" }).command)
+			.toBe("clearance --profile prod --yes backup restore --id backup_1 --target clearance_restore_a");
+		expect(restore?.risk).toBe("destructive");
 	});
 });

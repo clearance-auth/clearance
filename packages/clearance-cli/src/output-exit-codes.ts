@@ -11,7 +11,7 @@ export const CLI_EXIT_CODE = {
 	internal: 70,
 	conflict: 73,
 	authentication: 77,
-	permission: 77,
+	permission: 78,
 	temporaryFailure: 75,
 } as const;
 

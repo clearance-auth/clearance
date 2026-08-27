@@ -190,6 +190,8 @@ export async function dispatchAccessCommand({
 		case AUTHORIZATION_OPERATIONS.assignmentsReplace.cliPath: {
 			const subjectKind = authorizationSubjectKind(opts.subjectKind);
 			const expectedRevision = optionalExpectedRevision(opts.expectedRevision);
+			const roleIds = sortedRoleIds(opts.role);
+			requireConfirmation(global, "AUTHORIZATION_ASSIGNMENTS_CONFIRMATION_REQUIRED", "Authorization assignment replacement");
 			return callManagementOperation(
 				session,
 				"authorization.assignments.replace",
@@ -197,9 +199,9 @@ export async function dispatchAccessCommand({
 					organizationId: String(opts.org),
 					subjectKind,
 					subjectId: String(opts.subject),
-					roleIds: sortedRoleIds(opts.role),
+					roleIds,
 					expectedRevision,
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				}) as {
 					organizationId: string;
 					subjectKind: AuthorizationSubjectKind;
@@ -212,9 +214,10 @@ export async function dispatchAccessCommand({
 			);
 		}
 		case AUTHORIZATION_OPERATIONS.reconcile.cliPath:
+			requireConfirmation(global, "AUTHORIZATION_RECONCILE_CONFIRMATION_REQUIRED", "Authorization reconciliation");
 			return callManagementOperation(session, "authorization.reconcile", {
 				organizationId: String(opts.org),
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			}, managementCallOptions(global));
 		case SERVICE_ACCOUNT_OPERATIONS.list.cliPath:
 			return callManagementOperation(session, "service-accounts.list", {

@@ -360,7 +360,7 @@ describe.skipIf(!available)("delivery trace propagation with PostgreSQL", () => 
 			expect(raw).not.toHaveLength(0);
 			const traceSpans = raw.filter((span) => span.spanContext().traceId === remoteTraceId);
 			expect(traceSpans).not.toHaveLength(0);
-			expect(traceSpans.some((span) => span.attributes["db.system"] === "postgresql")).toBe(true);
+			expect(traceSpans.some((span) => span.attributes["db.system.name"] === "postgresql")).toBe(true);
 			expect(traceSpans.some((span) =>
 				span.attributes["http.request.method"] === "POST" ||
 				span.attributes["http.method"] === "POST"

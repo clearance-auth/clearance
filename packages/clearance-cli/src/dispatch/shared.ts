@@ -20,7 +20,7 @@ export function firstStringArgument(args: readonly unknown[]): string {
 }
 
 export function error(code: string, message: string, remediation: string): ClearanceError {
-	return new ClearanceError({ code, message, stage: "cli.dispatch", remediation });
+	return new ClearanceError({ code, message, stage: "cli.dispatch", status: 400, remediation });
 }
 
 export function body(values: Record<string, unknown>): Record<string, unknown> {
@@ -28,8 +28,14 @@ export function body(values: Record<string, unknown>): Record<string, unknown> {
 }
 
 /** The generated client handles policy; dispatchers only forward CLI intent. */
-export function managementCallOptions(global: Readonly<GlobalOpts>): { readonly confirm?: true } {
-	return global.yes && !global.dryRun ? { confirm: true } : {};
+export function managementCallOptions(global: Readonly<GlobalOpts>): {
+	readonly confirm?: true;
+	readonly signal?: AbortSignal;
+} {
+	return {
+		...(global.yes && !global.dryRun ? { confirm: true as const } : {}),
+		...(global.signal ? { signal: global.signal } : {}),
+	};
 }
 
 export function localFile(path: unknown, code: string, label: string): string {

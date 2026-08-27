@@ -15,10 +15,12 @@ esac
 SCRATCH="$(mktemp -d "${BASE}/clearance-smoke-import.XXXXXX")"
 PACK="$SCRATCH/tarballs"
 CONSUMER="$SCRATCH/consumer"
+export CLEARANCE_CLI_CONFIG_DIR="$SCRATCH/cli-config"
 cleanup() { rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
-mkdir -p "$PACK" "$CONSUMER"
+mkdir -p "$PACK" "$CONSUMER" "$CLEARANCE_CLI_CONFIG_DIR"
+chmod 700 "$CLEARANCE_CLI_CONFIG_DIR"
 
 fail() {
   echo "SMOKE_IMPORT_FAILED: $*" >&2
@@ -42,7 +44,7 @@ required_dist_for() {
     "@clearance/key-management") echo "dist/index.mjs dist/index.d.mts" ;;
     "@clearance/verification") echo "dist/index.js dist/index.d.ts README.md" ;;
     "@clearance/vault") echo "dist/index.js dist/index.d.ts dist/styles.css" ;;
-    "@clearance/cli") echo "dist/index.js dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
+    "@clearance/cli") echo "dist/index.js dist/skills/clearance/SKILL.md dist/ops/scripts/upgrade-plan.sh dist/ops/scripts/upgrade-preflight.sh dist/ops/scripts/upgrade-apply.sh dist/ops/scripts/upgrade-verify.sh dist/ops/scripts/upgrade-rollback.sh dist/ops/scripts/scim-legacy-preflight.sh dist/ops/scripts/validate-production-env.sh dist/ops/scripts/backup-create.sh dist/ops/scripts/backup-verify.sh dist/ops/scripts/backup-restore-verify.sh dist/ops/scripts/lib/ops-common.sh dist/ops/deploy/upgrades/steps/0.2.1/apply.sh dist/ops/deploy/compose/docker-compose.production.yml" ;;
     "@clearance/api") echo "dist/server.js" ;;
     "@clearance/console") echo "src/server.js public/index.html public/app.js public/setup.html public/setup.js public/styles.css" ;;
     *) return 1 ;;

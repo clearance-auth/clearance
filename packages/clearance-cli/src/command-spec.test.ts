@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { MIGRATION_OPERATIONS } from "@clearance/management";
 import {
 	COMMAND_SPEC_VERSION,
@@ -39,6 +39,14 @@ describe("command spec registry", () => {
 			mutation: true,
 			confirmation: "none",
 			supportsDryRun: true,
+			idempotency: "automatic-operation-key",
+			retrySafety: "reconcile-before-retry",
+			result: {
+				protocol: "clearance.cli.output",
+				protocolVersion: 1,
+				shape: "management-operation-output",
+				operationId: "migrations.apply",
+			},
 		});
 		expect(apply?.agentNotes).toContain(
 			"Use --dry-run to preview the mutation when appropriate.",
@@ -117,5 +125,27 @@ describe("command spec registry", () => {
 				"migration status",
 				"migration verify",
 			]);
+	});
+
+	it("publishes derivable input types, choices, files, and secrets", () => {
+		const program = new Command("clearance");
+		program.command("users").command("create <email>")
+			.option("--password <password>", "Initial password")
+			.option("--file <file>", "Input document")
+			.addOption(new Option("--kind <kind>", "Account kind").choices(["human", "service"]))
+			.option("--tag <tag...>", "Tags");
+		const [leaf] = collectCommanderLeaves(program);
+
+		expect(leaf?.arguments[0]).toMatchObject({
+			name: "email",
+			valueType: "string",
+			inputKind: "value",
+		});
+		expect(leaf?.options).toEqual(expect.arrayContaining([
+			expect.objectContaining({ flags: "--password <password>", inputKind: "secret" }),
+			expect.objectContaining({ flags: "--file <file>", inputKind: "file" }),
+			expect.objectContaining({ flags: "--kind <kind>", choices: ["human", "service"] }),
+			expect.objectContaining({ flags: "--tag <tag...>", valueType: "string-array" }),
+		]));
 	});
 });

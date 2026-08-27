@@ -7,7 +7,7 @@ description: Operate Clearance auth projects, environments, users, organizations
 
 # Clearance CLI
 
-Start with `clearance commands --json`. It is the machine-readable command contract: use its paths, arguments, options, mutation status, confirmation requirements, and dry-run support to choose a command. Then use `clearance <command> --help` only when you need human detail. Prefer read-only discovery first: `whoami`, `project list`, `env inspect`, and resource `list` or `inspect` commands.
+Start with `clearance commands --output-format json`. It is the machine-readable command contract: use its paths, typed inputs, secret/file markers, result shape, mutation status, confirmation requirements, dry-run support, idempotency, and retry safety to choose a command. Then use `clearance <command> --help` only when you need human detail. Prefer read-only discovery first: `whoami`, `project list`, `env inspect`, and resource `list` or `inspect` commands.
 
 ## Session selection
 
@@ -15,7 +15,7 @@ Start with `clearance commands --json`. It is the machine-readable command contr
 
 ## Output and errors
 
-Use `--json` for automation. It emits one JSON document to stdout for either a result or error. Human results use stdout; human errors use stderr. Exit code `0` means success and every nonzero exit means failure. `--jq <expression>` selects from machine output and its result is the stdout contract. Do not parse human prose, assume a stable field beyond the documented JSON response, or expose bearer tokens, passwords, credentials, or secret-returning output in logs.
+Use `--output-format json` for automation. It emits one versioned `clearance.cli.output` envelope to stdout with `ok`, `data` or `error`, structured `actions`, and metadata. `--jq <expression>` selects from that envelope and its result becomes stdout. Legacy `--json` is deprecated-compatible: success remains the raw command result while errors use the versioned envelope. Migrate scripts to `--output-format json` before relying on envelope fields. Human results use stdout; human errors use stderr. Exit `0` means success, `77` means authentication failed, `78` means permission was denied, and every other nonzero exit means failure. Do not parse human prose or expose bearer tokens, passwords, credentials, or secret-returning output in logs.
 
 ## Identifiers and concurrency
 
@@ -28,15 +28,15 @@ Start with `--dry-run` when a command supports it. `--yes` is explicit confirmat
 ## Common workflows
 
 ```sh
-clearance whoami --json
-clearance commands --json
-clearance users list --limit 100 --json
-clearance users create --email user@example.com --name "Example User" --no-input --json
-clearance orgs authorization reconcile --org <org-id> --dry-run --json
-clearance orgs authorization reconcile --org <org-id> --yes --no-input --json
-clearance auth-policy plan --file policy.json --json
+clearance whoami --output-format json
+clearance commands --output-format json
+clearance users list --limit 100 --output-format json
+clearance users create --email user@example.com --name "Example User" --no-input --output-format json
+clearance orgs authorization reconcile --org <org-id> --dry-run --output-format json
+clearance orgs authorization reconcile --org <org-id> --yes --no-input --output-format json
+clearance auth-policy plan --file policy.json --output-format json
 ```
 
 ## High-risk safeguards
 
-Use the exact production profile or HTTPS origin and verify it with `whoami` before mutation. Keep `--dry-run` output with the change record. Never perform destructive actions, archive/revoke/delete/disable, credential rotation, or live migration without explicit user authorization, target verification, and the command's required `--yes` or confirmation token. Do not retry a mutation with a newly invented idempotency key, expected version, plan ID, drain ID, or confirmation token. Stop on an ambiguous result and inspect the resource or audit events first.
+Use the exact production profile or HTTPS origin and verify it with `whoami` before mutation. Keep `--dry-run` output with the change record. Never perform destructive actions, archive/revoke/delete/disable, credential rotation, or live migration without explicit user authorization, target verification, and the command's required `--yes` or confirmation token. Missing confirmation fails closed and never silently becomes a successful dry run. Preserve operation receipts. On an `indeterminate` outcome, run the receipt's reconciliation commands before any retry and reuse the original idempotency key when the interface permits it. Do not invent a new idempotency key, expected version, plan ID, drain ID, or confirmation token.

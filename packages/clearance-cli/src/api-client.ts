@@ -23,11 +23,25 @@ type ManagementOperation<Id extends ManagementOperationId> = (typeof MANAGEMENT_
 export type ManagementOperationCallOptions<Id extends ManagementOperationId> =
 	ManagementCallOptions<ManagementOperation<Id>>;
 
+export interface ManagementTransportMetadata {
+	readonly requestId?: string;
+	readonly idempotencyKey?: string;
+}
+
+export interface ManagementTransportObserver {
+	/** The generated client is about to validate and enter its fetch path. */
+	onDispatch(): void;
+	/** Response or retry metadata learned after dispatch. */
+	onMetadata(metadata: Readonly<ManagementTransportMetadata>): void;
+}
+
 export type ApiSession = {
 	apiUrl: string;
 	token: string;
 	profile: string;
 	credentialSource: "environment" | "saved";
+	/** Per-invocation observer. It is never persisted or sent over the wire. */
+	operationObserver?: ManagementTransportObserver;
 };
 
 function cliError(code: string, message: string, remediation: string, retryable = false): ClearanceError {
@@ -108,9 +122,20 @@ export async function callManagementOperation<Id extends ManagementOperationId>(
 			bearerToken: session.token,
 			registry: MANAGEMENT_OPERATION_REGISTRY,
 		});
+		session.operationObserver?.onDispatch();
 		const response = await client.call(id, input, { ...options, signal: controller.signal });
+		session.operationObserver?.onMetadata({
+			...(response.requestId ? { requestId: response.requestId } : {}),
+			...(response.idempotencyKey ? { idempotencyKey: response.idempotencyKey } : {}),
+		});
 		return response.data;
 	} catch (cause) {
+		if (cause instanceof ManagementApiError) {
+			session.operationObserver?.onMetadata({
+				...(cause.requestId ? { requestId: cause.requestId } : {}),
+				...(cause.idempotencyKey ? { idempotencyKey: cause.idempotencyKey } : {}),
+			});
+		}
 		if (timedOut) {
 			throw cliError(
 				"CLI_API_TIMEOUT",
@@ -131,7 +156,9 @@ export async function callManagementOperation<Id extends ManagementOperationId>(
 			throw new ClearanceError({
 				code: cause.code,
 				message: cause.message,
-				stage: cause.stage ?? "cli.api",
+				stage: cause.stage === "management-client.protocol" && cause.status === 0
+					? "management-client.input"
+					: cause.stage ?? "cli.api",
 				remediation: cause.remediation ?? "Check the selected profile, API health, and operator authorization.",
 				retryable: cause.retryable,
 				status: cause.status,

@@ -71,7 +71,7 @@ export async function dispatchEnterpriseCommand({
 				issuer: opts.issuer,
 				audience: opts.audience,
 				domain: opts.domain,
-				dryRun: global.dryRun,
+				dryRun: Boolean(global.dryRun),
 			}) as Parameters<typeof callManagementOperation<"sso.configure">>[2], managementCallOptions(global));
 		case SSO_OPERATIONS.test.cliPath:
 			if (opts.live && opts.fixture) {
@@ -159,9 +159,10 @@ export async function dispatchEnterpriseCommand({
 				dryRun: global.dryRun,
 			}, managementCallOptions(global));
 		case SCIM_OPERATIONS.replay.cliPath:
+			requireConfirmation(global, "SCIM_REPLAY_CONFIRM_REQUIRED", "SCIM replay");
 			return callManagementOperation(session, "scim.replay", {
 				traceId: rawId,
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			}, managementCallOptions(global));
 		case READINESS_OPERATIONS.check.cliPath:
 			requireRemoteMutation(global, path);

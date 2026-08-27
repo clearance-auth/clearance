@@ -7,7 +7,19 @@ import type {
 import { Command } from "commander";
 
 /** Increment only when the serialized command record contract changes. */
-export const COMMAND_SPEC_VERSION = 1 as const;
+export const COMMAND_SPEC_VERSION = 2 as const;
+
+export type CommandValueType = "boolean" | "string" | "number" | "string-array";
+export type CommandInputKind = "value" | "file" | "secret" | "secret-file";
+export type CommandRetrySafety = "safe" | "reconcile-before-retry" | "not-declared";
+export type CommandIdempotency = "none" | "automatic-operation-key" | "not-declared";
+
+export interface CommandResultSpec {
+	readonly protocol: "clearance.cli.output";
+	readonly protocolVersion: 1;
+	readonly shape: "management-operation-output" | "command-defined";
+	readonly operationId?: ManagementOperationId;
+}
 
 export type CommandExecutionClass =
 	| "management-api"
@@ -25,6 +37,9 @@ export interface CommandSpecRecord {
 	readonly mutation: boolean;
 	readonly confirmation: OperationConfirmation;
 	readonly supportsDryRun: boolean;
+	readonly idempotency: CommandIdempotency;
+	readonly retrySafety: CommandRetrySafety;
+	readonly result: CommandResultSpec;
 	readonly agentNotes: readonly string[];
 	readonly usage?: string;
 	readonly arguments: readonly CommandArgumentSpec[];
@@ -37,6 +52,9 @@ export interface CommandArgumentSpec {
 	readonly required: boolean;
 	readonly variadic: boolean;
 	readonly defaultValue?: unknown;
+	readonly valueType: CommandValueType;
+	readonly choices: readonly string[];
+	readonly inputKind: CommandInputKind;
 }
 
 export interface CommandOptionSpec {
@@ -46,6 +64,9 @@ export interface CommandOptionSpec {
 	readonly optional: boolean;
 	readonly variadic: boolean;
 	readonly defaultValue?: unknown;
+	readonly valueType: CommandValueType;
+	readonly choices: readonly string[];
+	readonly inputKind: CommandInputKind;
 }
 
 /**
@@ -79,7 +100,7 @@ export interface CommanderLeaf {
 
 type CanonicalOperation = Pick<
 	ManagementOperation<ManagementOperationId>,
-	"id" | "cliPath" | "mutation" | "confirmation" | "supportsDryRun"
+	"id" | "cliPath" | "http" | "mutation" | "confirmation" | "supportsDryRun"
 >;
 
 export interface BuildCommandSpecOptions {
@@ -112,6 +133,36 @@ function normalizePath(path: string): string {
 function optionalDescription(description: string | undefined): string | undefined {
 	const normalized = description?.trim();
 	return normalized ? normalized : undefined;
+}
+
+function inputKind(name: string): CommandInputKind {
+	const normalized = name.toLowerCase().replace(/[<>\[\]]/gu, "");
+	const secret = /(^|[-_])(password|secret|token|private[-_]?key|api[-_]?key)([-_]|$)/u.test(normalized);
+	const file = /(^|[-_])(file|fixture|policy|config)([-_]|$)/u.test(normalized);
+	if (secret && file) return "secret-file";
+	if (secret) return "secret";
+	return file ? "file" : "value";
+}
+
+function valueType(value: {
+	readonly required?: boolean;
+	readonly optional?: boolean;
+	readonly variadic: boolean;
+	readonly defaultValue?: unknown;
+}): CommandValueType {
+	if (value.variadic) return "string-array";
+	if (typeof value.defaultValue === "number") return "number";
+	if (value.required === false && value.optional === false) return "boolean";
+	return "string";
+}
+
+function resultForOperation(operationId?: ManagementOperationId): CommandResultSpec {
+	return Object.freeze({
+		protocol: "clearance.cli.output",
+		protocolVersion: 1,
+		shape: operationId ? "management-operation-output" : "command-defined",
+		...(operationId ? { operationId } : {}),
+	});
 }
 
 function notesForOperation(operation: CanonicalOperation): readonly string[] {
@@ -154,6 +205,9 @@ export function collectCommanderLeaves(program: Command): readonly CommanderLeaf
 					description: optionalDescription(argument.description),
 					required: argument.required,
 					variadic: argument.variadic,
+					valueType: valueType(argument),
+					choices: Object.freeze([...(argument.argChoices ?? [])]),
+					inputKind: inputKind(argument.name()),
 					...(argument.defaultValue === undefined ? {} : { defaultValue: argument.defaultValue as unknown }),
 				}))),
 				options: Object.freeze(child.options.map((option) => Object.freeze({
@@ -162,6 +216,9 @@ export function collectCommanderLeaves(program: Command): readonly CommanderLeaf
 					required: option.required,
 					optional: option.optional,
 					variadic: option.variadic,
+					valueType: valueType(option),
+					choices: Object.freeze([...(option.argChoices ?? [])]),
+					inputKind: inputKind(option.long ?? option.flags),
 					...(option.defaultValue === undefined ? {} : { defaultValue: option.defaultValue as unknown }),
 				}))),
 			}));
@@ -197,6 +254,9 @@ export function buildCommandSpecDocument(
 			mutation: operation.mutation,
 			confirmation: operation.confirmation,
 			supportsDryRun: operation.supportsDryRun,
+			idempotency: operation.mutation ? "automatic-operation-key" : "none",
+			retrySafety: operation.mutation ? "reconcile-before-retry" : "safe",
+			result: resultForOperation(operation.id),
 			agentNotes: notesForOperation(operation),
 			usage: details?.usage,
 			arguments: details?.arguments ?? [],
@@ -219,6 +279,9 @@ export function buildCommandSpecDocument(
 			mutation: supplemental.mutation,
 			confirmation: supplemental.confirmation,
 			supportsDryRun: supplemental.supportsDryRun,
+			idempotency: supplemental.mutation ? "not-declared" : "none",
+			retrySafety: supplemental.mutation ? "not-declared" : "safe",
+			result: resultForOperation(),
 			agentNotes: Object.freeze([...(supplemental.agentNotes ?? [])]),
 			usage: details?.usage,
 			arguments: details?.arguments ?? [],
@@ -234,6 +297,9 @@ export function buildCommandSpecDocument(
 			required: option.required,
 			optional: option.optional,
 			variadic: option.variadic,
+			valueType: valueType(option),
+			choices: Object.freeze([...(option.argChoices ?? [])]),
+			inputKind: inputKind(option.long ?? option.flags),
 			...(option.defaultValue === undefined ? {} : { defaultValue: option.defaultValue as unknown }),
 		}))),
 		commands: Object.freeze(

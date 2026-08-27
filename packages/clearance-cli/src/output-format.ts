@@ -1,3 +1,5 @@
+import { InvalidArgumentError } from "commander";
+
 export const OUTPUT_FORMATS = ["human", "json", "jsonl", "quiet"] as const;
 
 export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
@@ -9,7 +11,7 @@ export interface OutputFormatOptions {
 	output?: OutputFormat | string;
 	/** Lowest-priority format inferred from an unattended stdout stream. */
 	inferredFormat?: OutputFormat;
-	/** Backwards-compatible `--json` flag. */
+	/** Deprecated-compatible `--json`: raw successes, versioned envelope errors. */
 	json?: boolean;
 	jsonl?: boolean;
 	quiet?: boolean;
@@ -23,14 +25,15 @@ export function isOutputFormat(value: unknown): value is OutputFormat {
 
 export function parseOutputFormat(value: string): OutputFormat {
 	if (isOutputFormat(value)) return value;
-	throw new TypeError(
+	throw new InvalidArgumentError(
 		`Unknown output format ${JSON.stringify(value)}. Expected one of: ${OUTPUT_FORMATS.join(", ")}.`,
 	);
 }
 
 /**
- * Resolve old and new CLI flags to one output mode. Explicit format selectors
- * win over compatibility booleans so callers can migrate incrementally.
+ * Resolve old and new CLI flags to one output mode. `--output-format json` is
+ * canonical. Explicit format selectors win so `--json` callers can migrate
+ * without changing success payloads until they opt into the envelope.
  */
 export function selectOutputFormat(opts: Readonly<OutputFormatOptions>): OutputFormat {
 	if (opts.format !== undefined) return opts.format;

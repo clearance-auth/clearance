@@ -11,9 +11,10 @@ function run(args: string[], input = ""): { status: number; stdout: string } {
 		return {
 			status: 0,
 			stdout: execFileSync(process.execPath, ["--import", "tsx", entry, ...args, "--json", "--no-input"], {
-			encoding: "utf8",
-			input,
-			env: { ...process.env, CLEARANCE_OPERATOR_TOKEN: "", CLEARANCE_API_TOKEN: "" },
+				encoding: "utf8",
+				input,
+				timeout: 15_000,
+				env: { ...process.env, CLEARANCE_OPERATOR_TOKEN: "", CLEARANCE_API_TOKEN: "" },
 		}),
 		};
 	} catch (cause: unknown) {
@@ -35,4 +36,15 @@ describe("CLI initial password input", () => {
 		});
 		expect(result.stdout).not.toContain(input.trim());
 	}, 30_000);
+
+	it("fails a noninteractive password prompt promptly without echoing input", () => {
+		const result = run([
+			"users", "create", "--email", "person@example.test", "--name", "Person",
+			"--password-prompt",
+		]);
+		expect(result.status).toBe(CLI_EXIT_CODE.invalidInput);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			error: { code: "USER_CREATE_PASSWORD_PROMPT_NONINTERACTIVE" },
+		});
+	}, 20_000);
 });

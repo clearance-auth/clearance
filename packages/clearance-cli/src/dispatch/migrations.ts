@@ -30,7 +30,7 @@ export async function dispatchMigrationCommand({
 				"imports.legacy",
 				{
 					fixture: localFile(opts.file, "CLEARANCE_IMPORT_FILE_UNREADABLE", "Legacy import file"),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);
