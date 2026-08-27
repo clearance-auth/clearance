@@ -10,6 +10,7 @@ import {
 	error,
 	firstStringArgument,
 	managementCallOptions,
+	requireConfirmation,
 	requireRemoteMutation,
 } from "./shared.js";
 
@@ -179,23 +180,26 @@ export async function dispatchDeliveryCommand({
 		case DELIVERY_OPERATIONS.quotas.cliPath:
 			return callManagementOperation(session, "delivery.quotas.get", {});
 		case DELIVERY_OPERATIONS.cancel.cliPath:
+			requireConfirmation(global, "DELIVERY_CANCEL_CONFIRMATION_REQUIRED", "Delivery cancellation");
 			return callManagementOperation(session, "delivery.jobs.cancel", {
 				id,
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			}, managementCallOptions(global));
 		case DELIVERY_OPERATIONS.retry.cliPath:
+			requireConfirmation(global, "DELIVERY_RETRY_CONFIRMATION_REQUIRED", "Delivery retry");
 			return callManagementOperation(session, "delivery.jobs.retry", {
 				id,
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			}, managementCallOptions(global));
 		case DELIVERY_OPERATIONS.replay.cliPath:
+			requireConfirmation(global, "DELIVERY_REPLAY_CONFIRMATION_REQUIRED", "Delivery replay");
 			return callManagementOperation(
 				session,
 				"delivery.jobs.replay",
 				body({
 					id,
 					maxAttempts: boundedInteger(opts.maxAttempts, "max-attempts", 1, 100),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				}) as { id: string; maxAttempts?: number; dryRun?: boolean },
 				managementCallOptions(global),
 			);
@@ -278,10 +282,15 @@ export async function dispatchDeliveryCommand({
 				: path === WEBHOOK_ENDPOINT_OPERATIONS.delete.cliPath
 					? "delivery.webhook_endpoints.delete"
 					: "delivery.webhook_endpoints.test";
+			requireConfirmation(
+				global,
+				"WEBHOOK_ENDPOINT_CONFIRMATION_REQUIRED",
+				`Webhook endpoint ${path.split(" ").at(-1) ?? "mutation"}`,
+			);
 			const input = {
 				id: endpointIdentifier(id),
 				expectedVersion: endpointVersion(opts.expectedVersion),
-				dryRun: global.dryRun || !global.yes,
+				dryRun: Boolean(global.dryRun),
 			};
 			if (operationId === "delivery.webhook_endpoints.rotate") {
 				return callManagementOperation(session, operationId, input, managementCallOptions(global));

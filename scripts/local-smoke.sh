@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="${SCRATCH_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/clearance-local-smoke.XXXXXX")}"
 mkdir -p "$SCRATCH"
+export CLEARANCE_CLI_CONFIG_DIR="$SCRATCH/cli-config"
+mkdir -p "$CLEARANCE_CLI_CONFIG_DIR"
+chmod 700 "$CLEARANCE_CLI_CONFIG_DIR"
 cd "$ROOT"
 
 export CLEARANCE_SECRET="${CLEARANCE_SECRET:-local-dev-secret-change-in-prod-32}"

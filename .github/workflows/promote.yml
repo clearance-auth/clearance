@@ -1,13 +1,18 @@
 name: Promote Beta to Stable
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable Clearance release version"
+        required: true
+        type: string
 
 permissions: {}
 
 jobs:
   promote:
-    if: github.repository_owner == 'clearance' && github.ref == 'refs/heads/next'
+    if: github.repository_owner == 'clearance-auth' && github.ref == 'refs/heads/next'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,21 +41,15 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Exit pre-release and version
+      - name: Version stable release
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -f .changeset/pre.json ]; then
-            pnpm changeset pre exit
-          else
-            echo "Already out of pre-release mode (retrying previous run?)"
-          fi
-          pnpm ci:version
+          VERSION: ${{ inputs.version }}
+        run: node scripts/version-release.mjs "$VERSION"
 
       - name: Read version
         id: version
         run: |
-          VERSION=$(node -e "console.log(require('./packages/runtime/package.json').version.replace(/[^0-9.]/g, ''))")
+          VERSION=$(node -e "console.log(require('./packages/clearance-cli/package.json').version)")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Promoting to v$VERSION"
 

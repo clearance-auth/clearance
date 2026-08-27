@@ -10,6 +10,7 @@ import {
 	type DispatchInput,
 	firstStringArgument,
 	managementCallOptions,
+	requireConfirmation,
 	requireRemoteMutation,
 } from "./shared.js";
 
@@ -62,7 +63,7 @@ export async function dispatchCoreCommand({
 					name: opts.name,
 					projectId: opts.projectId,
 					kind: opts.kind,
-					dryRun: global.dryRun,
+					dryRun: Boolean(global.dryRun),
 				}) as {
 					name: string;
 					projectId?: string;
@@ -72,13 +73,14 @@ export async function dispatchCoreCommand({
 				managementCallOptions(global),
 			);
 		case ENVIRONMENT_OPERATIONS.promote.cliPath:
+			requireConfirmation(global, "ENVIRONMENT_PROMOTE_CONFIRMATION_REQUIRED", "Environment promotion");
 			return callManagementOperation(
 				session,
 				"environments.promote",
 				body({
 					to: opts.to,
 					from: opts.from,
-					dryRun: global.dryRun || !global.yes,
+					dryRun: global.dryRun,
 				}) as { to: string; from?: string; dryRun?: boolean },
 				managementCallOptions(global),
 			);

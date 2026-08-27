@@ -5,6 +5,7 @@ import {
 	type DispatchInput,
 	error,
 	managementCallOptions,
+	requireConfirmation,
 } from "./shared.js";
 
 type KeyManagementCommandPath = CliPathOf<typeof KEY_MANAGEMENT_OPERATIONS>;
@@ -30,12 +31,13 @@ export async function dispatchKeyManagementCommand({
 		case KEY_MANAGEMENT_OPERATIONS.plan.cliPath:
 			return callManagementOperation(session, "key_management.plan", {});
 		case KEY_MANAGEMENT_OPERATIONS.apply.cliPath:
+			requireConfirmation(global, "KEY_MANAGEMENT_APPLY_CONFIRMATION_REQUIRED", "Key-management apply");
 			return callManagementOperation(
 				session,
 				"key_management.apply",
 				{
 					expectedPlanId: expectedPlanId(opts.expectedPlan),
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				},
 				managementCallOptions(global),
 			);

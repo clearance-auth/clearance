@@ -11,6 +11,7 @@ import {
 	normalizeApiUrl,
 	readSavedCredential,
 	validateAndSaveCredential,
+	verifyOperatorCredential,
 	writeSavedCredential,
 } from "./operator-auth.js";
 
@@ -54,11 +55,21 @@ describe("Clearance CLI operator credentials", () => {
 		expect(await readSavedCredential(env)).toEqual({ version: 1, apiUrl: "http://localhost:3200", token: TOKEN });
 	});
 
+	it("can verify an operator before the caller elects to save the profile", async () => {
+		const env = testEnv();
+		vi.stubGlobal("fetch", vi.fn(async () => whoamiResponse()));
+		await expect(verifyOperatorCredential("http://localhost:3200", TOKEN)).resolves.toMatchObject({
+			projectId: "proj_cli_test",
+		});
+		expect(existsSync(credentialPath(env))).toBe(false);
+	});
+
 	it("does not persist a credential when validation is unauthorized or unreachable, without leaking the token", async () => {
 		const env = testEnv();
 		vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 401 })));
 		await expect(validateAndSaveCredential("http://localhost:3200", TOKEN, env)).rejects.toMatchObject({
 			code: "CLI_AUTH_UNAUTHORIZED",
+			status: 401,
 		});
 		expect(existsSync(credentialPath(env))).toBe(false);
 
@@ -66,7 +77,7 @@ describe("Clearance CLI operator credentials", () => {
 		try {
 			await fetchWhoami("http://localhost:3200", TOKEN);
 		} catch (cause) {
-			expect(cause).toMatchObject({ code: "CLI_API_UNREACHABLE" });
+			expect(cause).toMatchObject({ code: "CLI_API_UNREACHABLE", status: 503 });
 			expect(String(cause)).not.toContain(TOKEN);
 		}
 	});

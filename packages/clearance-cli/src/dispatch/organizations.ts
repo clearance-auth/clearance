@@ -76,12 +76,13 @@ export async function dispatchOrganizationCommand({
 				id: rawId,
 				name: opts.name,
 				slug: opts.slug,
-				dryRun: global.dryRun,
+				dryRun: Boolean(global.dryRun),
 			}) as { id: string; name?: string; slug?: string; dryRun?: boolean }, managementCallOptions(global));
 		case ORGANIZATION_OPERATIONS.archive.cliPath:
+			requireConfirmation(global, "ORGANIZATION_ARCHIVE_CONFIRMATION_REQUIRED", "Organization archive");
 			return callManagementOperation(session, "organizations.archive", {
 				id: rawId,
-				dryRun: global.dryRun || !global.yes,
+				dryRun: global.dryRun,
 			}, managementCallOptions(global));
 		case MEMBER_OPERATIONS.list.cliPath:
 			return callManagementOperation(session, "organizations.members.list", {
@@ -131,7 +132,7 @@ export async function dispatchOrganizationCommand({
 					organizationId: String(opts.org),
 					content: localFile(opts.file, "MEMBER_IMPORT_FILE_UNREADABLE", "Member import file"),
 					format,
-					dryRun: global.dryRun || !global.yes,
+					dryRun: Boolean(global.dryRun),
 				}, managementCallOptions(global));
 		}
 	}

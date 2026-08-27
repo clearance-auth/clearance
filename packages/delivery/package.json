@@ -1,10 +1,14 @@
 {
   "name": "@clearance/delivery",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Postgres-native transactional delivery storage and worker core for Clearance",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/delivery" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/delivery"
+  },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {
@@ -14,7 +18,9 @@
       "default": "./dist/index.mjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsdown",
     "test": "vitest run",

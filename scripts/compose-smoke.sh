@@ -7,6 +7,9 @@ SCRATCH="${SCRATCH_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/clearance-compose-smoke.XXX
 PROJECT="clearance-smoke-${$}"
 CLI_NODE="$ROOT/packages/clearance-cli/dist/index.js"
 LOG="$SCRATCH/compose-smoke.log"
+export CLEARANCE_CLI_CONFIG_DIR="$SCRATCH/cli-config"
+mkdir -p "$CLEARANCE_CLI_CONFIG_DIR"
+chmod 700 "$CLEARANCE_CLI_CONFIG_DIR"
 
 rand() { openssl rand -hex 32; }
 BASE_PORT="${CLEARANCE_SMOKE_BASE_PORT:-$((22000 + ($$ % 10000)))}"
@@ -93,7 +96,10 @@ wait_for() {
 
   [[ -f "$CLI_NODE" ]] || pnpm build
   "${COMPOSE[@]}" config --quiet
-  if ! COMPOSE_PROJECT_NAME="$PROJECT" bash "$ROOT/scripts/local-stack.sh" bootstrap; then
+  # Bootstrap runs the CLI inside the non-root API image. Give its canonical
+  # receipt journal a container-local writable home instead of leaking the
+  # host scratch path (which resolves under the image's read-only /app tree).
+  if ! CLEARANCE_CLI_CONFIG_DIR="/tmp/clearance-cli-config" COMPOSE_PROJECT_NAME="$PROJECT" bash "$ROOT/scripts/local-stack.sh" bootstrap; then
     "${COMPOSE[@]}" ps --all >&2 || true
     "${COMPOSE[@]}" logs --no-color >&2 || true
     exit 1

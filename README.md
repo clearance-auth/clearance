@@ -7,7 +7,7 @@ SCIM, transactional delivery, and the operating tools to run them. The CLI,
 management API, and operator console use the same management plane, so your
 team can automate routine work and investigate the same state in a browser.
 
-**Current release:** [0.3.1](https://github.com/clearance-auth/clearance/releases/tag/v0.3.1)
+**Current release:** [0.4.0](https://github.com/clearance-auth/clearance/releases/tag/v0.4.0)
 
 Start with:
 
@@ -32,7 +32,7 @@ work.
 | Organizations and access | Organizations, memberships, invitations, custom roles and actions, API keys, and service accounts for B2B applications. |
 | Enterprise identity | SAML and OIDC connections, SCIM directories, diagnostics, readiness checks, and read-only live conformance probes. |
 | Reliable customer communication | Transactional email through SMTP or Amazon SES, signed webhooks, durable delivery, retries, and a separately deployable worker. |
-| Operator experience | A typed management API, JSON-first CLI, dark operator console, scoped audit events, imports, backups, restore drills, and upgrades. |
+| Operator experience | A typed management API, task-oriented CLI and TUI, dark operator console, scoped audit events, imports, backups, restore drills, and upgrades. |
 | Production control | Postgres-backed deployment with Docker Compose or Helm, health and readiness endpoints, Prometheus metrics, key-management providers, and signed release assets. |
 
 ## Start locally
@@ -138,20 +138,114 @@ token verification: [framework quickstarts](./apps/framework-quickstarts/README.
 ## Operate it through the CLI
 
 The published [`@clearance/cli`](https://www.npmjs.com/package/@clearance/cli)
-package installs the `clearance` command. Commands support structured JSON and
-non-interactive flags for scripts and CI.
+package installs the `clearance` command. Run `clearance` in a terminal to
+start the guided setup. It verifies a connection before saving a named profile,
+accepts the token through hidden input, offers shell completion and the bundled
+agent skill, then previews a first read operation before offering to run it. A
+valid saved profile resumes with useful next commands. An absent profile or a
+credential that no longer verifies returns to connection setup.
 
 ```bash
 npm install --global @clearance/cli
+clearance
+
+# Or connect a remote profile explicitly.
 export CLEARANCE_OPERATOR_TOKEN='<operator-token>'
 clearance login --profile production --url https://auth.example.com
+unset CLEARANCE_OPERATOR_TOKEN
 
-clearance --profile production init --name my-app --json --no-input
-clearance --profile production orgs create --name Acme --json --no-input
+clearance --profile production init --name my-app --output-format json --no-input
+clearance --profile production orgs create --name Acme --output-format json --no-input
 clearance --profile production users create \
-  --email owner@example.com --name 'Acme Owner' --json --no-input
-clearance --profile production readiness check --org <organization-id> --json --no-input
+  --email owner@example.com --name 'Acme Owner' --output-format json --no-input
+clearance --profile production readiness check \
+  --org <organization-id> --output-format json --no-input
 ```
+
+For normal API-backed commands, authentication is resolved in this order:
+
+1. `CLEARANCE_OPERATOR_TOKEN`, then the compatibility
+   `CLEARANCE_API_TOKEN`, with `--api-url` or `CLEARANCE_API_URL` required.
+2. The saved profile selected by `--profile`, then `CLEARANCE_PROFILE`, then
+   `default`.
+
+An explicit `--profile` cannot be combined with an environment token. A saved
+profile remains bound to its saved origin, so an inconsistent `--api-url` is
+rejected. Interactive setup, `login`, and the unauthenticated local doctor use
+the Compose management API at `http://localhost:13200` when no origin is
+provided. Remote HTTP is rejected; loopback HTTP remains available for local
+development.
+
+Human output is task-oriented: lists render as bounded tables, detail views
+group fields, empty results explain what was searched, and mutations finish
+with an outcome and receipt. Untrusted terminal text is sanitized and declared
+secrets are redacted from errors and receipts. When stdout is piped, the CLI
+selects JSON. Use `--output-format human|json|jsonl|quiet` to choose explicitly,
+`--jq '.data.id'` for built-in field selection, and `--no-input` or
+`CLEARANCE_NONINTERACTIVE=1` to guarantee that no prompt is opened.
+
+```bash
+clearance doctor                               # local files, profile, tools, and unauthenticated API health
+clearance --profile production doctor --remote # authenticated server checks
+clearance help profiles                        # curated task help
+clearance commands --output-format json        # command contract and experience manifest
+
+clearance completion generate zsh              # print completion source
+clearance completion status zsh                # inspect ownership without writing
+clearance completion install zsh               # install without replacing unowned content
+clearance skill status                         # inspect the bundled agent skill
+clearance skill install --dry-run               # preview its owned installation
+```
+
+Explicit `--output-format json` and inferred piped JSON use an `ok`, `data`,
+`summary`, `notice`, `next`, `actions`, and `meta` envelope with a protocol
+name and version. The legacy `--json` flag continues to emit the raw result
+on success for compatibility; its errors still use the versioned envelope.
+Errors include a stable code, stage, retryability, and remediation, with
+distinct process statuses for invalid input, authentication, temporary
+failure, service failure, and failed health checks. `clearance commands`
+publishes the complete parser-derived command and safety contract together
+with the same versioned experience manifest consumed by agents and the TUI.
+
+Canonical management operations and CLI-owned mutations run through the same
+receipt-producing runner. Commands whose manifest entry requires confirmation
+reject live execution until `--yes` is present. `--dry-run` skips live
+confirmation only for commands that declare dry-run support; unsupported
+previews fail before dispatch. Each receipt records the target, safe command,
+dispatch state, request and idempotency identifiers when available, outcome,
+commit state, and recovery commands. Live mutations verify that the private
+append-only journal is writable before dispatch. Its default is
+`operation-receipts.jsonl` in the Clearance CLI configuration directory; set
+`CLEARANCE_RECEIPT_PATH` to an absolute path to override it.
+
+### Terminal workspace
+
+```bash
+clearance --profile production tui
+clearance --profile production tui --user <user-id>
+clearance --profile production tui --organization <organization-id>
+clearance --profile production tui --open event <event-id>
+```
+
+The TUI opens to a quiet, resource-oriented workspace with four destinations:
+Overview, People, Security, and Operations. The default view keeps verified
+identity details on demand and hides routine polling, while connectivity,
+stale-data, and mutation-outcome problems remain visible. Search, resource
+detail, the exact equivalent CLI command, target review, dry-run availability,
+confirmation, durable outcomes, and recovery guidance appear as the task
+requires them.
+
+Deep links support `--user`, `--organization`, `--event`, `--delivery`,
+`--sso`, and `--scim`. The equivalent generic form is
+`--open <resource> <id>`, where resource is `user`, `organization`, `event`,
+`delivery`, `sso`, or `scim`.
+
+`clearance events tail` is intentionally a CLI stream rather than a TUI
+action. It polls for new scoped events, suppresses duplicate event IDs, and
+stops on Ctrl-C, `--once`, or `--max-events <n>`. Human output is one safe line
+per event. Machine output is one JSON Lines record per event, including when
+`--output-format json` is selected; legacy `--json` keeps each event in its raw
+shape.
 
 Use the same API-backed workflows for enterprise setup, audit history,
 backups, restores, and upgrades. The [CLI source](./packages/clearance-cli)
@@ -185,7 +279,7 @@ inputs are missing.
 | [`@clearance/verification`](./packages/verification) | Server-side ES256 access-token verification. |
 | [`@clearance/management`](./packages/management) | Shared management services behind the CLI, API, and console. |
 | [`@clearance/management-client`](./packages/management-client) | Typed management API transport. |
-| [`@clearance/cli`](./packages/clearance-cli) | JSON-first operational CLI. |
+| [`@clearance/cli`](./packages/clearance-cli) | Task-oriented human, agent, and TUI operations. |
 | [`@clearance/api`](./packages/clearance-api) | Versioned management HTTP API. |
 | [`@clearance/console`](./packages/clearance-console) | Operator console. |
 | [`@clearance/delivery`](./packages/delivery) | Durable transactional delivery storage. |

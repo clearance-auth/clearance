@@ -1,6 +1,6 @@
 {
   "name": "@clearance/key-management",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Purpose-bound local and cloud key management providers for Clearance",
   "type": "module",
   "license": "MIT",

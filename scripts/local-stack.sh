@@ -24,6 +24,7 @@ docker compose up -d --wait postgres
 docker compose run --rm --no-deps \
 	-e CLEARANCE_INSTANCE_ID=local-credential-migrator \
 	-e CLEARANCE_CREDENTIAL_DRAIN_ID="$drain_id" \
+	-e CLEARANCE_CLI_CONFIG_DIR=/tmp/clearance-cli-config \
 	api node packages/clearance-cli/dist/index.js --json --no-input --yes \
 	schema migrate --local --drain-id "$drain_id"
 
@@ -49,9 +50,12 @@ const project=value?.project?.id, environment=value?.environment?.id;
 if(typeof project!=="string"||!project||typeof environment!=="string"||!environment)process.exit(1);
 process.stdout.write(`${project}\n${environment}`);
 ' "$init_response")"
-mapfile -t scope_parts <<<"$scope"
-(( ${#scope_parts[@]} == 2 )) || { echo "Local init returned an incomplete operator scope" >&2; exit 1; }
-CLEARANCE_PROJECT_ID="${scope_parts[0]}"
-CLEARANCE_ENV_ID="${scope_parts[1]}"
+[[ "$scope" == *$'\n'* ]] || { echo "Local init returned an incomplete operator scope" >&2; exit 1; }
+CLEARANCE_PROJECT_ID="${scope%%$'\n'*}"
+CLEARANCE_ENV_ID="${scope#*$'\n'}"
+[[ -n "$CLEARANCE_PROJECT_ID" && -n "$CLEARANCE_ENV_ID" && "$CLEARANCE_ENV_ID" != *$'\n'* ]] || {
+	echo "Local init returned an incomplete operator scope" >&2
+	exit 1
+}
 export CLEARANCE_PROJECT_ID CLEARANCE_ENV_ID
 exec docker compose up -d --force-recreate api sample-b2b console

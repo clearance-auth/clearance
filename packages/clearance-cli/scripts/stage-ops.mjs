@@ -1,10 +1,11 @@
-import { chmodSync, copyFileSync, cpSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageRoot, "../..");
 const outputRoot = resolve(packageRoot, "dist/ops");
+const skillOutputRoot = resolve(packageRoot, "dist/skills");
 const scripts = [
 	"backup-create.sh",
 	"backup-restore-verify.sh",
@@ -19,7 +20,9 @@ const scripts = [
 ];
 
 rmSync(outputRoot, { recursive: true, force: true });
+rmSync(skillOutputRoot, { recursive: true, force: true });
 mkdirSync(resolve(outputRoot, "scripts/lib"), { recursive: true });
+cpSync(resolve(packageRoot, "skills"), skillOutputRoot, { recursive: true });
 
 for (const script of scripts) {
 	const target = resolve(outputRoot, "scripts", script);
@@ -40,5 +43,8 @@ copyFileSync(
 	resolve(repoRoot, "deploy/compose/docker-compose.production.yml"),
 	resolve(outputRoot, "deploy/compose/docker-compose.production.yml"),
 );
-chmodSync(resolve(outputRoot, "deploy/upgrades/steps/0.2.0/apply.sh"), 0o755);
-chmodSync(resolve(outputRoot, "deploy/upgrades/steps/0.2.1/apply.sh"), 0o755);
+for (const entry of readdirSync(resolve(outputRoot, "deploy/upgrades/steps"), { withFileTypes: true })) {
+	if (!entry.isDirectory()) continue;
+	const apply = resolve(outputRoot, "deploy/upgrades/steps", entry.name, "apply.sh");
+	if (existsSync(apply)) chmodSync(apply, 0o755);
+}
