@@ -1,10 +1,14 @@
 {
   "name": "@clearance/cli",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Clearance CLI — operate auth projects, enterprise connections, migrations, and deploys",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/clearance-cli" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/clearance-cli"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -16,7 +20,7 @@
     "dist"
   ],
   "scripts": {
-		"build": "tsc -p tsconfig.json && node scripts/stage-ops.mjs && chmod +x dist/index.js",
+    "build": "tsc -p tsconfig.json && node scripts/stage-ops.mjs && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "vitest run --maxWorkers=1",
     "typecheck": "tsc -p tsconfig.json --noEmit"

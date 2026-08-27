@@ -1,6 +1,6 @@
 {
   "name": "@clearance/verification",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Strict server-side verification for Clearance ES256 access tokens",
   "type": "module",
   "license": "MIT",

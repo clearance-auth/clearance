@@ -1,6 +1,6 @@
 {
   "name": "@clearance/observability-node",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Opt-in Node.js OpenTelemetry bootstrap for Clearance services",
   "type": "module",
   "license": "MIT",

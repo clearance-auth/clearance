@@ -1,10 +1,14 @@
 {
   "name": "@clearance/auth",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Clearance auth runtime with bundled, audited fork code and Clearance defaults",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/clearance-auth/clearance", "directory": "packages/clearance-auth" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clearance-auth/clearance",
+    "directory": "packages/clearance-auth"
+  },
   "main": "./dist/index.mjs",
   "types": "./types/index.d.ts",
   "exports": {
@@ -30,7 +34,10 @@
       "default": "./dist/management-internal.mjs"
     }
   },
-  "files": ["dist", "types"],
+  "files": [
+    "dist",
+    "types"
+  ],
   "scripts": {
     "build": "tsdown && tsc -p tsconfig.types.json",
     "test": "vitest run",

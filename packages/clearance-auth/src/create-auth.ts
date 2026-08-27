@@ -114,7 +114,7 @@ import type {
 	TenantProductSsoConnection,
 } from "./public-types/index.js";
 
-export const CLEARANCE_AUTH_VERSION = "0.3.1";
+export const CLEARANCE_AUTH_VERSION = "0.4.0";
 export const RUNTIME_BASELINE = {
 	package: "@clearance/runtime",
 	version: "1.6.23",

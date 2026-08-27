@@ -7,7 +7,7 @@ SCIM, transactional delivery, and the operating tools to run them. The CLI,
 management API, and operator console use the same management plane, so your
 team can automate routine work and investigate the same state in a browser.
 
-**Current release:** [0.3.1](https://github.com/clearance-auth/clearance/releases/tag/v0.3.1)
+**Current release:** [0.4.0](https://github.com/clearance-auth/clearance/releases/tag/v0.4.0)
 
 Start with:
 
