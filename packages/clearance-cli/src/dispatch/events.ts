@@ -1,6 +1,7 @@
 import { EVENT_OPERATIONS } from "@clearance/management";
 import { callManagementOperation } from "../api-client.js";
-import { CliExitError } from "../output.js";
+import { CliExitError, selectOutputFormat, successEnvelope } from "../output.js";
+import { evaluateJsonQuery } from "../json-query.js";
 import { writeRemoteExport } from "./export-artifact.js";
 import {
 	body,
@@ -24,10 +25,31 @@ type RemoteAuditEvent = {
 	outcome: string;
 };
 
-function emitTailEvent(json: boolean, event: RemoteAuditEvent): void {
-	process.stdout.write(json
-		? `${JSON.stringify(event)}\n`
-		: `${event.createdAt} ${event.action} actor=${event.actor} outcome=${event.outcome} id=${event.id}\n`);
+function emitTailEvent(global: DispatchInput<string>["global"], event: RemoteAuditEvent): void {
+	const format = selectOutputFormat(global);
+	if (format === "quiet") return;
+	if (format === "json" || format === "jsonl") {
+		// Tail is a stream: every machine event is exactly one JSON Lines record,
+		// even when the caller selected `json`. Explicit output formats use the
+		// normal envelope; legacy --json continues to expose the raw event.
+		const envelope = successEnvelope(event, { meta: { stream: "events.tail" } });
+		const legacyJson = global.json === true && global.format === undefined && global.output === undefined && !global.jq;
+		let selected: unknown = legacyJson ? event : envelope;
+		if (global.jq) {
+			try {
+				selected = evaluateJsonQuery(envelope, global.jq);
+			} catch (cause) {
+				throw error(
+					"CLI_JQ_INVALID",
+					cause instanceof Error ? cause.message : String(cause),
+					"Use selectors such as .data, .data.items[], or .data.items[0].id.",
+				);
+			}
+		}
+		process.stdout.write(`${JSON.stringify(selected)}\n`);
+		return;
+	}
+	process.stdout.write(`${event.createdAt} ${event.action} actor=${event.actor} outcome=${event.outcome} id=${event.id}\n`);
 }
 
 function integerOption(
@@ -93,7 +115,7 @@ export async function dispatchEventCommand({
 				for (const event of fresh) {
 					seen.add(event.id);
 					if (maxEvents !== 0 && emitted >= maxEvents) break;
-					emitTailEvent(Boolean(global.json), event);
+					emitTailEvent(global, event);
 					emitted += 1;
 				}
 			};

@@ -138,8 +138,9 @@ token verification: [framework quickstarts](./apps/framework-quickstarts/README.
 ## Operate it through the CLI
 
 The published [`@clearance/cli`](https://www.npmjs.com/package/@clearance/cli)
-package installs the `clearance` command. Commands support structured JSON and
-non-interactive flags for scripts and CI.
+package installs the `clearance` command. Run `clearance` in a terminal for
+guided, copyable workflows or `clearance tui` for the operations workspace.
+Every interactive action has an equivalent command for scripts and agents.
 
 ```bash
 npm install --global @clearance/cli
@@ -152,6 +153,25 @@ clearance --profile production users create \
   --email owner@example.com --name 'Acme Owner' --json --no-input
 clearance --profile production readiness check --org <organization-id> --json --no-input
 ```
+
+The CLI selects readable terminal output for people and JSON when stdout is
+piped. Use `--output-format human|json|jsonl|quiet` to choose explicitly,
+`--jq '.data.id'` for built-in field selection, and `--no-input` or
+`CLEARANCE_NONINTERACTIVE=1` to guarantee that no prompt is opened.
+
+```bash
+clearance commands --json                 # versioned command and safety catalog
+clearance completion zsh                  # bash, zsh, and fish are supported
+clearance skill install --dry-run --json  # inspect the agent-skill installation
+clearance --profile production tui        # interactive operations workspace
+```
+
+Explicit `--output-format json` and inferred piped JSON use an `ok`, `data`,
+`summary`, `notice`, `next`, and `meta` envelope. The legacy `--json` flag
+continues to emit the raw result for compatibility. Errors include a stable
+code, stage, retryability, and remediation, with distinct process statuses for
+invalid input, authentication, temporary failure, service failure, and failed
+health checks.
 
 Use the same API-backed workflows for enterprise setup, audit history,
 backups, restores, and upgrades. The [CLI source](./packages/clearance-cli)

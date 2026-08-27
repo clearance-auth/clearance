@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
 	ClearanceError,
 	EVENTS_EXPORT_MAX_LIMIT,
@@ -9,7 +11,14 @@ import {
 	closeAuthBundle,
 	migrateRuntimeSchemaLocally,
 } from "@clearance/management";
-import { CliExitError, fail, printResult, type GlobalOpts } from "./output.js";
+import {
+	CliExitError,
+	fail,
+	parseOutputFormat,
+	printResult,
+	type GlobalOpts,
+	type OutputFormat,
+} from "./output.js";
 import {
 	deleteSavedCredential,
 	environmentToken,
@@ -30,6 +39,17 @@ import {
 	EVENTS_TAIL_MAX_POLL_INTERVAL_MS,
 	EVENTS_TAIL_MIN_POLL_INTERVAL_MS,
 } from "./remote-dispatch.js";
+import {
+	buildCommandSpecDocument,
+	compareCommanderParity,
+	type CommandSpecRecord,
+	type SupplementalCommandSpec,
+} from "./command-spec.js";
+import { renderCompletion, type CompletionShell } from "./completion.js";
+import { installClearanceAgentSkill, inspectClearanceAgentSkill } from "./agent-skill.js";
+import { runGuidedInteraction } from "./interactive.js";
+import { interactionEligibility } from "./interaction-policy.js";
+import { createRemoteWorkflowExecutor, runTerminalUi } from "./tui/index.js";
 
 const MAX_STDIN_PASSWORD_BYTES = 4_096;
 
@@ -43,12 +63,25 @@ function globals(cmd: Command): GlobalOpts {
 	const opts = cmd.optsWithGlobals() as GlobalOpts & Record<string, unknown>;
 	return {
 		json: Boolean(opts.json),
+		jsonl: Boolean(opts.jsonl),
+		quiet: Boolean(opts.quiet),
+		jq: typeof opts.jq === "string" ? opts.jq : undefined,
+		output: opts.outputFormat as OutputFormat | undefined,
+		inferredFormat: process.stdout.isTTY ? undefined : "json",
 		noInput: opts.input === false,
 		yes: Boolean(opts.yes),
 		dryRun: Boolean(opts.dryRun),
 		profile: opts.profile as string | undefined,
 		apiUrl: opts.apiUrl as string | undefined,
 	};
+}
+
+function humanCommandListing(commands: readonly CommandSpecRecord[]): string {
+	const lines = commands.map((command) => {
+		const description = command.description?.trim();
+		return description ? `  ${command.path}\n    ${description}` : `  ${command.path}`;
+	});
+	return ["Available Clearance commands:", ...lines, "", "Run clearance <command> --help for command details."].join("\n");
 }
 
 function passwordInputError(code: string, message: string, remediation: string): ClearanceError {
@@ -97,10 +130,11 @@ async function readPasswordFromStdin(): Promise<string> {
 }
 
 async function readPasswordFromPrompt(): Promise<string> {
-	if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+	const eligibility = interactionEligibility();
+	if (!eligibility.eligible || typeof process.stdin.setRawMode !== "function") {
 		throw passwordInputError(
 			"USER_CREATE_PASSWORD_PROMPT_TTY_REQUIRED",
-			"--password-prompt requires an interactive terminal.",
+			`--password-prompt requires an interactive terminal (${eligibility.reason ?? "raw-mode-unavailable"}).`,
 			"Use --password-stdin with piped input, or omit password options to issue a setup token.",
 		);
 	}
@@ -172,10 +206,15 @@ async function remoteCommandOptions(command: Command, global: GlobalOpts): Promi
 	delete opts.passwordPrompt;
 	if (passwordStdin) opts.password = await readPasswordFromStdin();
 	if (passwordPrompt) {
-		if (global.noInput) {
+		const eligibility = interactionEligibility({
+			noInput: global.noInput,
+			json: global.json,
+			machineOutput: global.jsonl || global.quiet || Boolean(global.jq) || global.output !== undefined,
+		});
+		if (!eligibility.eligible) {
 			throw passwordInputError(
 				"USER_CREATE_PASSWORD_PROMPT_NONINTERACTIVE",
-				"--password-prompt cannot be used with --no-input.",
+				`--password-prompt requires interactive input (${eligibility.reason}).`,
 				"Use --password-stdin for CI, or omit password options to issue a setup token.",
 			);
 		}
@@ -214,6 +253,14 @@ async function remoteCommandAction(this: Command): Promise<void> {
 			global: g,
 		});
 		printResult(g, result);
+		if (
+			commandPath(this) === "doctor" &&
+			result !== null &&
+			typeof result === "object" &&
+			(result as { ok?: unknown }).ok === false
+		) {
+			throw new CliExitError(2);
+		}
 	} catch (cause) {
 		fail(cause, g);
 	}
@@ -272,11 +319,33 @@ async function main() {
 		.version(VERSION)
 		.description("Clearance CLI — open-source auth operations")
 		.option("--json", "Stable JSON output", false)
-		.option("--no-input", "Disable prompts (CI/agents)", false)
+		.option("--jsonl", "Stable compact JSON Lines output", false)
+		.option("--quiet", "Suppress successful output", false)
+		.option("--jq <expression>", "Select machine output with the built-in jq subset")
+		.option("--output-format <format>", "Output format: human, json, jsonl, or quiet", parseOutputFormat)
+		.option("--no-input", "Disable prompts (CI/agents)")
 		.option("--yes", "Confirm destructive actions", false)
 		.option("--dry-run", "Preview mutations", false)
 		.option("--profile <name>", "Saved API profile")
 		.option("--api-url <url>", "Clearance management API origin override");
+
+	program.action(async () => {
+		const g = globals(program);
+		const result = await runGuidedInteraction({
+			json: g.json,
+			machineOutput: Boolean(g.jsonl || g.quiet || g.jq || g.output === "json" || g.output === "jsonl" || g.output === "quiet"),
+			noInput: g.noInput,
+		});
+		if (result.status === "unavailable") {
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			const parity = compareCommanderParity(program, { supplementalCommands });
+			printResult(g, { ...document, parity }, {
+				human: humanCommandListing(document.commands),
+				summary: "Clearance command discovery",
+				next: ["clearance commands", "clearance --help"],
+			});
+		}
+	});
 
 	program
 		.command("init")
@@ -749,7 +818,7 @@ async function main() {
 		.requiredOption("--fixture <path>")
 		.action(remoteCommandAction);
 	migration
-		.command("run")
+		.command("apply")
 		.requiredOption("--id <planId>")
 		.requiredOption("--fixture <path>")
 		.action(remoteCommandAction);
@@ -981,9 +1050,124 @@ async function main() {
 			} catch (e) {
 				fail(e, g);
 			}
+			});
+
+	const supplementalCommands = [
+		{ path: "login", executionClass: "authentication", mutation: true, confirmation: "none", supportsDryRun: false, agentNotes: ["Writes a validated credential to a named local profile."] },
+		{ path: "logout", executionClass: "authentication", mutation: true, confirmation: "none", supportsDryRun: false, agentNotes: ["Removes only the selected saved profile credential."] },
+		{ path: "whoami", executionClass: "authentication", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "commands", executionClass: "discovery", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "completion", executionClass: "discovery", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "skill status", executionClass: "local", mutation: false, confirmation: "none", supportsDryRun: false },
+		{ path: "skill install", executionClass: "local", mutation: true, confirmation: "none", supportsDryRun: true, agentNotes: ["Refuses to overwrite unowned skill content."] },
+		{ path: "tui", executionClass: "interactive", mutation: false, confirmation: "none", supportsDryRun: false, agentNotes: ["Requires an interactive terminal; every action displays its CLI equivalent."] },
+	] satisfies readonly SupplementalCommandSpec[];
+
+	program
+		.command("commands")
+		.description("Describe the complete CLI surface for humans and agents")
+		.action((_, command) => {
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			const parity = compareCommanderParity(program, { supplementalCommands });
+			printResult(globals(command), { ...document, parity }, {
+				human: humanCommandListing(document.commands),
+				summary: `${document.commands.length} commands; contract parity ${parity.matches ? "verified" : "failed"}.`,
+				next: ["clearance completion zsh", "clearance skill install --dry-run"],
+			});
 		});
 
-	await program.parseAsync();
+	program
+		.command("completion")
+		.description("Generate shell completion source")
+		.argument("<shell>", "bash, zsh, or fish")
+		.action((shell: string) => {
+			if (!(["bash", "zsh", "fish"] as const).includes(shell as CompletionShell)) {
+				throw new ClearanceError({
+					code: "CLI_USAGE",
+					message: "Unsupported shell. Choose bash, zsh, or fish.",
+					stage: "cli.usage",
+					status: 400,
+					remediation: "Run clearance completion bash, clearance completion zsh, or clearance completion fish.",
+				});
+			}
+			const document = buildCommandSpecDocument({ program, supplementalCommands });
+			process.stdout.write(`${renderCompletion(shell as CompletionShell, document, program.options)}\n`);
+		});
+
+	const skill = program.command("skill").description("Manage the bundled Clearance agent skill");
+	skill.command("status")
+		.option("--directory <path>", "Agent skills root directory", join(homedir(), ".agents", "skills"))
+		.action(async (options, command) => {
+			printResult(globals(command), await inspectClearanceAgentSkill(String(options.directory)));
+		});
+	skill.command("install")
+		.option("--directory <path>", "Agent skills root directory", join(homedir(), ".agents", "skills"))
+		.action(async (options, command) => {
+			const g = globals(command);
+			const result = await installClearanceAgentSkill({ directory: String(options.directory), dryRun: g.dryRun });
+			printResult(g, result, {
+				summary: `Clearance agent skill ${result.action}: ${result.projected.path}`,
+				next: result.action === "conflict" ? ["Move or rename the unowned destination, then retry."] : [],
+			});
+			if (result.action === "conflict") throw new CliExitError(64);
+		});
+
+	program.command("tui")
+		.description("Open the interactive Clearance operations workspace")
+		.action(async (_, command) => {
+			const g = globals(command);
+			const eligibility = interactionEligibility({
+				noInput: g.noInput,
+				json: g.json,
+				machineOutput: Boolean(g.jsonl || g.quiet || g.jq || g.output),
+			});
+			if (!eligibility.eligible) {
+				throw new ClearanceError({
+					code: "CLI_INTERACTIVE_REQUIRED",
+					message: `The TUI requires an interactive terminal (${eligibility.reason}).`,
+					stage: "cli.tui",
+					remediation: "Run clearance tui in a terminal, or use clearance commands --json for automation.",
+				});
+			}
+			const session = await resolveApiSession({ profile: g.profile, apiUrl: g.apiUrl });
+			if (!session) {
+				throw new ClearanceError({
+					code: "CLI_LOGIN_REQUIRED",
+					message: "An authenticated Clearance API profile is required.",
+					stage: "cli.tui",
+					remediation: "Run clearance login --profile <name>, then clearance --profile <name> tui.",
+				});
+			}
+			await runTerminalUi({ executor: createRemoteWorkflowExecutor(session, g) });
+		});
+
+	program.exitOverride((cause) => {
+		if (cause.code === "commander.helpDisplayed" || cause.code === "commander.version") {
+			throw new CliExitError(0);
+		}
+		throw new ClearanceError({
+			code: "CLI_USAGE",
+			message: cause.message,
+			stage: "cli.usage",
+			status: 400,
+			remediation: "Run clearance --help to see valid commands and options.",
+		});
+	});
+
+	try {
+		await program.parseAsync();
+	} catch (cause) {
+		if (cause instanceof CommanderError) {
+			fail(new ClearanceError({
+				code: "CLI_USAGE",
+				message: cause.message,
+				stage: "cli.usage",
+				status: 400,
+				remediation: "Run clearance --help to see valid commands and options.",
+			}), globals(program));
+		}
+		fail(cause, globals(program));
+	}
 }
 
 main().catch((err) => {

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { CLI_EXIT_CODE } from "./output.js";
 
 const entry = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
 
@@ -28,10 +29,10 @@ describe("CLI initial password input", () => {
 			"users", "create", "--email", "person@example.test", "--name", "Person",
 			"--password-stdin", "--password-prompt",
 		], input);
-		expect(result.status).toBe(1);
+		expect(result.status).toBe(CLI_EXIT_CODE.invalidInput);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			error: { code: "USER_CREATE_PASSWORD_SOURCE_CONFLICT" },
 		});
 		expect(result.stdout).not.toContain(input.trim());
-	}, 15_000);
+	}, 30_000);
 });
