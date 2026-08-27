@@ -171,7 +171,7 @@ inputs are missing.
   deployment requirements.
 - [Compose deployment](./deploy/compose/docker-compose.production.yml) is the
   single-host reference configuration.
-- [Compatibility](./COMPATIBILITY.md) maps maintained package and migration
+- [Compatibility](./docs/compatibility.md) maps maintained package and migration
   import compatibility.
 
 ## Packages
