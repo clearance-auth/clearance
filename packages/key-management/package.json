@@ -39,7 +39,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1089.0",
+    "@aws-sdk/client-kms": "^3.1111.0",
     "@google-cloud/kms": "^5.7.0"
   }
 }
