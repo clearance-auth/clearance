@@ -59,7 +59,7 @@
     }
   },
   "dependencies": {
-    "zod": "^4.3.6"
+    "zod": "^4.6.4"
   },
   "devDependencies": {
     "@clearance/core": "workspace:*",
