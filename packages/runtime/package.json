@@ -541,7 +541,7 @@
     "happy-dom": "^20.11.2",
     "listhen": "^1.10.1",
     "msw": "^2.12.10",
-    "next": "^16.3.1",
+    "next": "^16.3.8",
     "oauth2-mock-server": "^8.2.2",
     "react": "catalog:react19",
     "react-dom": "catalog:react19",
