@@ -35,7 +35,7 @@
   },
   "devDependencies": {
     "tsdown": "catalog:",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.15",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
@@ -43,6 +43,6 @@
     "access": "public"
   },
   "dependencies": {
-    "zod": "^4.3.6"
+    "zod": "^4.6.5"
   }
 }
