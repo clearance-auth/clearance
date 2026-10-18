@@ -12,8 +12,8 @@
   "dependencies": {
     "@clearance/runtime": "workspace:*",
     "@clearance/verification": "workspace:*",
-    "express": "^5.2.1",
-    "next": "^16.3.1",
+    "express": "^5.3.0",
+    "next": "^16.4.0",
     "react": "catalog:react19",
     "react-dom": "catalog:react19"
   },
@@ -22,8 +22,8 @@
     "@types/node": "^22.20.1",
     "@types/react": "catalog:react19",
     "@types/react-dom": "catalog:react19",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.15",
     "typescript": "catalog:",
-    "vite": "8.2.1"
+    "vite": "8.3.4"
   }
 }

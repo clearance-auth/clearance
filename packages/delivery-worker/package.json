@@ -32,12 +32,12 @@
     "@clearance/delivery": "workspace:*",
     "@clearance/observability-node": "workspace:*",
     "nodemailer": "^9.0.1",
-    "pg": "^8.23.0"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
     "@types/nodemailer": "^7.0.1",
-    "@types/pg": "^8.21.0",
+    "@types/pg": "^8.23.1",
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
