@@ -24,6 +24,6 @@
     "@types/react-dom": "catalog:react19",
     "tsx": "^4.23.12",
     "typescript": "catalog:",
-    "vite": "8.2.1"
+    "vite": "8.2.4"
   }
 }
