@@ -538,7 +538,7 @@
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@opentelemetry/sdk-trace-node": "^1.30.0",
-    "happy-dom": "^20.11.2",
+    "happy-dom": "^21.0.4",
     "listhen": "^1.10.1",
     "msw": "^2.12.10",
     "next": "^16.3.1",
