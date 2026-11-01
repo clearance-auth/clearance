@@ -158,25 +158,25 @@
   "dependencies": {
     "@opentelemetry/semantic-conventions": "^1.39.0",
     "@standard-schema/spec": "^1.1.0",
-    "zod": "^4.3.6"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@clearance/utils": "workspace:^",
     "@better-fetch/fetch": "catalog:",
-    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api": "^1.10.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@opentelemetry/sdk-trace-node": "^1.30.0",
     "@clearance/call": "workspace:^",
-    "@cloudflare/workers-types": "^5.20260819.1",
-    "jose": "^6.2.9",
+    "@cloudflare/workers-types": "^5.20261025.1",
+    "jose": "^6.2.13",
     "kysely": "catalog:",
-    "nanostores": "^1.5.0",
+    "nanostores": "^1.5.5",
     "tsdown": "catalog:"
   },
   "peerDependencies": {
     "@clearance/utils": "workspace:^",
     "@better-fetch/fetch": "catalog:",
-    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api": "^1.10.0",
     "@clearance/call": "workspace:^",
     "@cloudflare/workers-types": ">=4",
     "jose": "^6.1.0",

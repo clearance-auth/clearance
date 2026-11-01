@@ -30,11 +30,11 @@
   "dependencies": {
     "@clearance/management": "workspace:*",
     "@clearance/observability-node": "workspace:*",
-    "hono": "^4.13.2"
+    "hono": "^4.13.14"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.15",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }
