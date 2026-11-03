@@ -48,7 +48,7 @@
     "@clearance/key-management": "workspace:*",
     "kysely": "catalog:",
     "pg": "^8.23.0",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@clearance/delivery-worker": "workspace:*",

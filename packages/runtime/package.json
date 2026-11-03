@@ -524,7 +524,7 @@
     "kysely": "catalog:",
     "nanostores": "^1.5.0",
     "tldts": "^7.4.10",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@lynx-js/react": "^0.124.0",
