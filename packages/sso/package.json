@@ -65,7 +65,7 @@
     }
   },
   "dependencies": {
-    "fast-xml-parser": "^5.11.0",
+    "fast-xml-parser": "^5.12.0",
     "jose": "^6.2.9",
     "samlify": "^2.13.1",
     "tldts": "^7.4.10",
