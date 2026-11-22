@@ -49,7 +49,7 @@
   "peerDependencies": {
     "@clearance/core": "workspace:^",
     "@clearance/utils": "workspace:^",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.4"
   },
   "peerDependenciesMeta": {
     "drizzle-orm": {
@@ -59,7 +59,7 @@
   "devDependencies": {
     "@clearance/core": "workspace:*",
     "@clearance/utils": "workspace:^",
-    "drizzle-orm": "^0.45.2",
+    "drizzle-orm": "^0.45.4",
     "tsdown": "catalog:",
     "typescript": "catalog:"
   }
